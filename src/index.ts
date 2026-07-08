@@ -1,4 +1,5 @@
 export * from "./branches/regenerate";
+export * from "./cli";
 export * from "./config";
 export * from "./contracts";
 export * from "./gjc/rpc-frames";

@@ -4,11 +4,24 @@ Experimental TS/Bun adapter that treats GJC session JSONL/artifacts as the sourc
 
 ## OpenWebUI setup
 
+Start the adapter service with Bun:
+
+```sh
+GJC_OPENWEBUI_BIND_HOST=127.0.0.1 \
+GJC_OPENWEBUI_BIND_PORT=8765 \
+GJC_OPENWEBUI_ADAPTER_API_TOKEN=<adapter-openai-key> \
+GJC_OPENWEBUI_API_TOKEN=<openwebui-api-token> \
+GJC_OPENWEBUI_OWNER_USER_ID=<openwebui-user-id> \
+GJC_OPENWEBUI_PROJECTS="/home/me/src/my-repo|my-repo" \
+GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS="/home/me/src" \
+bun run start
+```
+
 Configure OpenWebUI to use the adapter as an OpenAI-compatible backend:
 
 ```env
 OPENAI_API_BASE_URL=http://127.0.0.1:8765/v1
-OPENAI_API_KEY=<adapter-token>
+OPENAI_API_KEY=<adapter-openai-key>
 ENABLE_OPENAI_API=True
 ```
 
@@ -31,6 +44,8 @@ Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. B
 
 Register one project per working directory. The adapter validates the real path against an allowed root before exposing the project as a model and OpenWebUI folder.
 
+For the service entrypoint, set `GJC_OPENWEBUI_PROJECTS` to a semicolon-separated list of `cwd|name|folderId|sessionRoot` entries. Only `cwd` is required; configured paths must resolve under `GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS`.
+
 ```ts
 import { registerProjectDirectory, resolveAllowedRoots } from "openwebui-gjc-adapter";
 
@@ -52,6 +67,7 @@ The model id is `gjc/<project-name>` by default. Historical imports place projec
 - OpenWebUI chat rows and chat messages are projection/cache records.
 - Adapter metadata is stored under `gjc_adapter`; user-visible OpenWebUI fields such as title/rating are preserved on reprojection.
 - The live gateway uses `/v1/models` and `/v1/chat/completions`.
+- The package entrypoint wires chat completions through the GJC RPC turn runner and stores OpenWebUI chat-to-GJC session mappings in a file-backed store under `GJC_OPENWEBUI_SESSION_ROOT`.
 - GJC tool/MCP/skill/workflow progress is delivered as OpenWebUI message events through the adapter event sink.
 - Workflow gates can be rendered as assistant-visible pending-gate text and validated with the exported gate primitives; wire those primitives into the deployment's event sink/continuation policy before claiming automatic gate approval handling.
 - Regenerate/branch only proceeds when owner, project, session, and message lineage metadata match; otherwise the adapter forks safely.

@@ -3,6 +3,7 @@ import {
 	handleChatCompletions,
 	type LiveGatewayRunner,
 	type LiveGatewayRunnerInput,
+	LiveGatewayUnavailableError,
 } from "../src/live/chat-completions";
 import { buildModelList } from "../src/live/models";
 import type { OpenAIChatCompletionRequest } from "../src/live/openai-types";
@@ -208,6 +209,32 @@ describe("live OpenAI-compatible chat completions", () => {
 					message: "Unknown GJC model: gjc/missing",
 					type: "invalid_request_error",
 					code: "model_not_found",
+				},
+			},
+		});
+	});
+
+	it("returns OpenAI-style unavailable errors when no concrete live runner is wired", async () => {
+		const result = await handleChatCompletions({
+			request,
+			headers: chatHeaders,
+			projects: [project],
+			owner,
+			runner: {
+				run() {
+					throw new LiveGatewayUnavailableError("GJC live runner is not configured for this service.");
+				},
+			},
+		});
+
+		expect(result).toEqual({
+			ok: false,
+			status: 503,
+			body: {
+				error: {
+					message: "GJC live runner is not configured for this service.",
+					type: "server_error",
+					code: "live_runner_unavailable",
 				},
 			},
 		});

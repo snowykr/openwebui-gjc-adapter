@@ -23,18 +23,21 @@ describe("adapter config contracts", () => {
 		const config = loadAdapterConfig({});
 		expect(config.bindHost).toBe("127.0.0.1");
 		expect(config.bindPort).toBe(8765);
+		expect(config.adapterApiToken).toBeUndefined();
 		expect(config.openWebUIBaseUrl).toBe("http://localhost:8080");
 		expect(config.openWebUIApiToken).toBeUndefined();
 		expect(config.statePath).toBe(".gjc/openwebui-adapter");
 		expect(config.gjcCommand).toBe("gjc");
 		expect(config.sessionRoot).toBe(process.cwd());
 		expect(config.allowedProjectRoots).toEqual([process.cwd()]);
+		expect(config.projects).toEqual([]);
 	});
 
 	test("parses configured env values and colon-separated roots", () => {
 		const config = loadAdapterConfig({
 			GJC_OPENWEBUI_BIND_HOST: "0.0.0.0",
 			GJC_OPENWEBUI_BIND_PORT: "4321",
+			GJC_OPENWEBUI_ADAPTER_API_TOKEN: "adapter-token",
 			GJC_OPENWEBUI_BASE_URL: "https://openwebui.example.test",
 			GJC_OPENWEBUI_API_TOKEN: "token",
 			GJC_OPENWEBUI_ADMIN_EMAIL: "admin@example.test",
@@ -45,10 +48,12 @@ describe("adapter config contracts", () => {
 			GJC_OPENWEBUI_SESSION_ROOT: "/tmp/sessions",
 			GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS: "/repo/a:/repo/b:",
 			GJC_OPENWEBUI_ARTIFACT_BASE_URL: "https://artifacts.example.test/base",
+			GJC_OPENWEBUI_PROJECTS: "/repo/a|Project A|folder-a|/sessions/a;/repo/b|Project B",
 		});
 		expect(config).toEqual({
 			bindHost: "0.0.0.0",
 			bindPort: 4321,
+			adapterApiToken: "adapter-token",
 			openWebUIBaseUrl: "https://openwebui.example.test",
 			openWebUIApiToken: "token",
 			openWebUIAdminEmail: "admin@example.test",
@@ -59,7 +64,20 @@ describe("adapter config contracts", () => {
 			sessionRoot: "/tmp/sessions",
 			allowedProjectRoots: ["/repo/a", "/repo/b"],
 			artifactBaseUrl: "https://artifacts.example.test/base",
+			projects: [
+				{ cwd: "/repo/a", name: "Project A", openWebUIFolderId: "folder-a", sessionRoot: "/sessions/a" },
+				{ cwd: "/repo/b", name: "Project B" },
+			],
 		});
+	});
+
+	test("rejects malformed configured project entries", () => {
+		expect(() => loadAdapterConfig({ GJC_OPENWEBUI_PROJECTS: "|" })).toThrow(
+			"GJC_OPENWEBUI_PROJECTS entry 1 must include a non-empty cwd",
+		);
+		expect(() => loadAdapterConfig({ GJC_OPENWEBUI_PROJECTS: "/repo|Name|folder|session|extra" })).toThrow(
+			"GJC_OPENWEBUI_PROJECTS entry 1 has too many fields",
+		);
 	});
 
 	test("rejects invalid ports", () => {
@@ -72,10 +90,14 @@ describe("adapter config contracts", () => {
 		const diagnostic = buildStartupDiagnostics(loadAdapterConfig({}));
 		expect(diagnostic.status).toBe("degraded");
 		expect(diagnostic.missingAuth).toBe(true);
+		expect(diagnostic.missingAdapterApiToken).toBe(true);
 		expect(diagnostic.missingAllowedProjectRoots).toBe(false);
 		expect(diagnostic.expectedHeaderNames).toEqual([...REQUIRED_OPENWEBUI_HEADER_NAMES]);
 		expect(diagnostic.messages).toContain(
 			"GJC_OPENWEBUI_API_TOKEN is not set; OpenWebUI API calls are not authenticated.",
+		);
+		expect(diagnostic.messages).toContain(
+			"GJC_OPENWEBUI_ADAPTER_API_TOKEN is not set; inbound OpenAI-compatible calls are not authenticated.",
 		);
 	});
 });

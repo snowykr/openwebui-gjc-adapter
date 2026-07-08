@@ -3,6 +3,7 @@ import { REQUIRED_OPENWEBUI_HEADER_NAMES, type RequiredOpenWebUIHeaderName } fro
 export interface AdapterConfig {
 	bindHost: string;
 	bindPort: number;
+	adapterApiToken?: string;
 	openWebUIBaseUrl: string;
 	openWebUIApiToken?: string;
 	openWebUIAdminEmail?: string;
@@ -13,11 +14,20 @@ export interface AdapterConfig {
 	sessionRoot: string;
 	allowedProjectRoots: string[];
 	artifactBaseUrl?: string;
+	projects: AdapterProjectConfig[];
+}
+
+export interface AdapterProjectConfig {
+	readonly cwd: string;
+	readonly name?: string;
+	readonly openWebUIFolderId?: string;
+	readonly sessionRoot?: string;
 }
 
 export interface StartupDiagnostic {
 	status: "ok" | "degraded";
 	missingAuth: boolean;
+	missingAdapterApiToken: boolean;
 	missingAllowedProjectRoots: boolean;
 	expectedHeaderNames: RequiredOpenWebUIHeaderName[];
 	messages: string[];
@@ -80,6 +90,50 @@ function parseAllowedProjectRoots(value: string | undefined, fallbackRoot: strin
 		.filter(root => root.length > 0);
 }
 
+function parseConfiguredProjects(value: string | undefined): AdapterProjectConfig[] {
+	if (value === undefined || value.trim().length === 0) {
+		return [];
+	}
+	return value
+		.split(";")
+		.map(entry => entry.trim())
+		.filter(entry => entry.length > 0)
+		.map((entry, index) => parseProjectEntry(entry, index + 1));
+}
+
+function parseProjectEntry(entry: string, entryNumber: number): AdapterProjectConfig {
+	const fields = entry.split("|");
+	if (fields.length > 4) {
+		throw new Error(`GJC_OPENWEBUI_PROJECTS entry ${entryNumber} has too many fields`);
+	}
+	const cwd = requiredProjectField(fields[0], entryNumber, "cwd");
+	const name = optionalProjectField(fields[1]);
+	const openWebUIFolderId = optionalProjectField(fields[2]);
+	const sessionRoot = optionalProjectField(fields[3]);
+	return {
+		cwd,
+		...(name === undefined ? {} : { name }),
+		...(openWebUIFolderId === undefined ? {} : { openWebUIFolderId }),
+		...(sessionRoot === undefined ? {} : { sessionRoot }),
+	};
+}
+
+function requiredProjectField(value: string | undefined, entryNumber: number, fieldName: string): string {
+	const field = optionalProjectField(value);
+	if (field === undefined) {
+		throw new Error(`GJC_OPENWEBUI_PROJECTS entry ${entryNumber} must include a non-empty ${fieldName}`);
+	}
+	return field;
+}
+
+function optionalProjectField(value: string | undefined): string | undefined {
+	if (value === undefined) {
+		return undefined;
+	}
+	const trimmed = value.trim();
+	return trimmed.length === 0 ? undefined : trimmed;
+}
+
 export function loadAdapterConfig(env: Record<string, string | undefined> = process.env): AdapterConfig {
 	const currentWorkingDirectory = process.cwd();
 	const config: AdapterConfig = {
@@ -89,6 +143,7 @@ export function loadAdapterConfig(env: Record<string, string | undefined> = proc
 			"GJC_OPENWEBUI_BIND_HOST",
 		),
 		bindPort: parsePort(optionalEnv(env, "GJC_OPENWEBUI_BIND_PORT")),
+		adapterApiToken: optionalNonEmptyString(optionalEnv(env, "GJC_OPENWEBUI_ADAPTER_API_TOKEN")),
 		openWebUIBaseUrl: parseUrl(
 			optionalEnv(env, "GJC_OPENWEBUI_BASE_URL"),
 			DEFAULT_OPENWEBUI_BASE_URL,
@@ -118,6 +173,7 @@ export function loadAdapterConfig(env: Record<string, string | undefined> = proc
 			currentWorkingDirectory,
 		),
 		artifactBaseUrl: optionalNonEmptyString(optionalEnv(env, "GJC_OPENWEBUI_ARTIFACT_BASE_URL")),
+		projects: parseConfiguredProjects(optionalEnv(env, "GJC_OPENWEBUI_PROJECTS")),
 	};
 	if (config.artifactBaseUrl !== undefined) {
 		config.artifactBaseUrl = parseUrl(
@@ -131,8 +187,14 @@ export function loadAdapterConfig(env: Record<string, string | undefined> = proc
 
 export function buildStartupDiagnostics(config: AdapterConfig): StartupDiagnostic {
 	const missingAuth = config.openWebUIApiToken === undefined;
+	const missingAdapterApiToken = config.adapterApiToken === undefined;
 	const missingAllowedProjectRoots = config.allowedProjectRoots.length === 0;
 	const messages: string[] = [];
+	if (missingAdapterApiToken) {
+		messages.push(
+			"GJC_OPENWEBUI_ADAPTER_API_TOKEN is not set; inbound OpenAI-compatible calls are not authenticated.",
+		);
+	}
 	if (missingAuth) {
 		messages.push("GJC_OPENWEBUI_API_TOKEN is not set; OpenWebUI API calls are not authenticated.");
 	}
@@ -140,8 +202,9 @@ export function buildStartupDiagnostics(config: AdapterConfig): StartupDiagnosti
 		messages.push("No allowed project roots are configured.");
 	}
 	return {
-		status: missingAuth || missingAllowedProjectRoots ? "degraded" : "ok",
+		status: missingAdapterApiToken || missingAuth || missingAllowedProjectRoots ? "degraded" : "ok",
 		missingAuth,
+		missingAdapterApiToken,
 		missingAllowedProjectRoots,
 		expectedHeaderNames: [...REQUIRED_OPENWEBUI_HEADER_NAMES],
 		messages,

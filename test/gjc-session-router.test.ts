@@ -155,6 +155,33 @@ describe("routeGjcTurn", () => {
 		});
 	});
 
+	test("rejects persisted session files outside the project session root", async () => {
+		const runner = new FakeGjcTurnRunner();
+		const mappings = new SessionMappingStore();
+		const project = createProject();
+		mappings.set({
+			chatId: "chat-1",
+			projectId: project.id,
+			sessionId: "session-1",
+			sessionFile: "/tmp/outside-session.jsonl",
+			rawFrameCursor: 2,
+			eventCursor: 1,
+			operationId: "message-1",
+		});
+
+		await expect(
+			routeGjcTurn({
+				project,
+				chatId: "chat-1",
+				userMessageId: "message-2",
+				text: "again",
+				runner,
+				mappings,
+			}),
+		).rejects.toThrow("outside project session root");
+		expect(runner.switches).toHaveLength(0);
+	});
+
 	test("keeps one mapping and does not rerun duplicate operations", async () => {
 		const runner = new FakeGjcTurnRunner();
 		const mappings = new SessionMappingStore();

@@ -48,6 +48,43 @@ describe("project registry primitives", () => {
 		);
 	});
 
+	test("realpath-validates configured session roots against allowed roots", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-project-session-root-"));
+		const allowedDirectory = path.join(workspace, "allowed");
+		const projectDirectory = path.join(allowedDirectory, "project");
+		const sessionDirectory = path.join(allowedDirectory, "sessions");
+		const outsideDirectory = path.join(workspace, "outside-sessions");
+		await fs.mkdir(projectDirectory, { recursive: true });
+		await fs.mkdir(sessionDirectory);
+		await fs.mkdir(outsideDirectory);
+		const allowedRoots = await resolveAllowedRoots([allowedDirectory]);
+
+		const registered = await registerProjectDirectory(
+			{ cwd: projectDirectory, sessionRoot: sessionDirectory },
+			allowedRoots,
+		);
+		expect(registered.sessionRoot).toBe(await fs.realpath(sessionDirectory));
+
+		await expect(
+			registerProjectDirectory({ cwd: projectDirectory, sessionRoot: outsideDirectory }, allowedRoots),
+		).rejects.toThrow("outside allowed artifact roots");
+	});
+
+	test("realpath-validates the default project session root against allowed roots", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-default-session-root-"));
+		const allowedDirectory = path.join(workspace, "allowed");
+		const projectDirectory = path.join(allowedDirectory, "project");
+		const outsideDirectory = path.join(workspace, "outside-sessions");
+		await fs.mkdir(projectDirectory, { recursive: true });
+		await fs.mkdir(outsideDirectory);
+		await fs.symlink(outsideDirectory, path.join(projectDirectory, ".gjc"));
+		const allowedRoots = await resolveAllowedRoots([allowedDirectory]);
+
+		await expect(registerProjectDirectory({ cwd: projectDirectory }, allowedRoots)).rejects.toThrow(
+			"outside allowed artifact roots",
+		);
+	});
+
 	test("builds OpenWebUI folder metadata projection", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-project-metadata-"));
 		const allowedRoots = await resolveAllowedRoots([workspace]);
@@ -62,6 +99,7 @@ describe("project registry primitives", () => {
 				projectId: "workspace",
 				cwd: await fs.realpath(workspace),
 				modelId: "gjc/workspace",
+				sessionRoot: path.join(await fs.realpath(workspace), ".gjc", "sessions"),
 			},
 		});
 	});

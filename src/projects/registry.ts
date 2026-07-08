@@ -53,6 +53,10 @@ export async function registerProjectDirectory(
 	now: Date = new Date(),
 ): Promise<RegisteredProject> {
 	const cwd = await assertPathInsideAllowedRoots(input.cwd, allowedRoots);
+	const sessionRoot = await assertPathInsideAllowedRoots(
+		input.sessionRoot ?? path.join(cwd, ".gjc", "sessions"),
+		allowedRoots,
+	);
 	const id = createProjectId(input.name ?? cwd);
 	const allowedRoot = findAllowedRoot(cwd, allowedRoots);
 
@@ -62,7 +66,7 @@ export async function registerProjectDirectory(
 		cwd,
 		modelId: `gjc/${id}`,
 		openWebUIFolderId: input.openWebUIFolderId,
-		sessionRoot: input.sessionRoot,
+		sessionRoot,
 		allowedRoot,
 		createdAt: new Date(now),
 	};
@@ -74,7 +78,7 @@ export function buildProjectFolderMetadata(project: RegisteredProject): ProjectF
 			projectId: project.id,
 			cwd: project.cwd,
 			modelId: project.modelId,
-			sessionRoot: project.sessionRoot,
+			...(project.sessionRoot === undefined ? {} : { sessionRoot: project.sessionRoot }),
 		},
 	};
 }

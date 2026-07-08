@@ -1,7 +1,12 @@
 import { type AdapterHealthCheck, buildHealthReport } from "./health";
-import { handleChatCompletions, type LiveGatewayEventSink, type LiveGatewayRunner } from "./live/chat-completions";
+import {
+	handleChatCompletions,
+	type LiveChatCompletionsResult,
+	type LiveGatewayEventSink,
+	type LiveGatewayRunner,
+} from "./live/chat-completions";
+import { parseChatCompletionRequest } from "./live/chat-request-parser";
 import { buildModelList } from "./live/models";
-import type { OpenAIChatCompletionRequest } from "./live/openai-types";
 import type { OpenWebUIOwnerContext } from "./openwebui/auth";
 import type { OpenWebUIHeaderInput } from "./openwebui/headers";
 import type { RegisteredProject } from "./projects/registry";
@@ -18,6 +23,8 @@ export interface AdapterRouteDependencies {
 	readonly owner: OpenWebUIOwnerContext;
 	readonly runner: LiveGatewayRunner;
 	readonly eventSink?: LiveGatewayEventSink;
+	readonly adapterApiToken?: string;
+	readonly requireAdapterApiToken?: boolean;
 }
 
 type AdapterRequestHandlerOptions = {
@@ -54,12 +61,16 @@ export function createAdapterRequestHandler(
 			return jsonResponse(report, { status: report.status === "ok" ? 200 : 503 });
 		}
 		if (routes !== undefined && request.method === "GET" && url.pathname === "/v1/models") {
+			const authError = authenticateAdapterRequest(request, routes.adapterApiToken, routes.requireAdapterApiToken);
+			if (authError !== undefined) return authError;
 			return jsonResponse(buildModelList(routes.projects));
 		}
 		if (routes !== undefined && request.method === "POST" && url.pathname === "/v1/chat/completions") {
-			let body: OpenAIChatCompletionRequest;
+			const authError = authenticateAdapterRequest(request, routes.adapterApiToken, routes.requireAdapterApiToken);
+			if (authError !== undefined) return authError;
+			let body: unknown;
 			try {
-				body = (await request.json()) as OpenAIChatCompletionRequest;
+				body = await request.json();
 			} catch {
 				return jsonResponse(
 					{
@@ -72,14 +83,42 @@ export function createAdapterRequestHandler(
 					{ status: 400 },
 				);
 			}
-			const result = await handleChatCompletions({
-				request: body,
-				headers: headersFromRequest(request),
-				projects: routes.projects,
-				owner: routes.owner,
-				runner: routes.runner,
-				eventSink: routes.eventSink,
-			});
+			const parsed = parseChatCompletionRequest(body);
+			if (!parsed.ok) {
+				return jsonResponse(
+					{
+						error: {
+							message: parsed.message,
+							type: "invalid_request_error",
+							code: "invalid_request_body",
+						},
+					},
+					{ status: 400 },
+				);
+			}
+			let result: LiveChatCompletionsResult;
+			try {
+				result = await handleChatCompletions({
+					request: parsed.request,
+					headers: headersFromRequest(request),
+					projects: routes.projects,
+					owner: routes.owner,
+					runner: routes.runner,
+					eventSink: routes.eventSink,
+				});
+			} catch (error) {
+				const message = error instanceof Error ? error.message : "GJC live runner failed.";
+				return jsonResponse(
+					{
+						error: {
+							message,
+							type: "server_error",
+							code: "live_runner_error",
+						},
+					},
+					{ status: 503 },
+				);
+			}
 			if (!result.ok) return jsonResponse(result.body, { status: result.status });
 			if ("stream" in result) {
 				return new Response(result.stream, {
@@ -95,6 +134,38 @@ export function createAdapterRequestHandler(
 
 function headersFromRequest(request: Request): OpenWebUIHeaderInput {
 	return request.headers;
+}
+
+function authenticateAdapterRequest(
+	request: Request,
+	adapterApiToken: string | undefined,
+	required = false,
+): Response | undefined {
+	if (adapterApiToken === undefined && required) {
+		return jsonResponse(
+			{
+				error: {
+					message: "Adapter API token is not configured.",
+					type: "server_error",
+					code: "adapter_api_token_unconfigured",
+				},
+			},
+			{ status: 503 },
+		);
+	}
+	if (adapterApiToken === undefined) return undefined;
+	const expected = `Bearer ${adapterApiToken}`;
+	if (request.headers.get("authorization") === expected) return undefined;
+	return jsonResponse(
+		{
+			error: {
+				message: "Adapter API token is missing or invalid.",
+				type: "authentication_error",
+				code: "invalid_api_key",
+			},
+		},
+		{ status: 401 },
+	);
 }
 
 function isHealthCheckList(

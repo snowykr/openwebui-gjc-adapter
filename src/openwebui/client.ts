@@ -1,5 +1,14 @@
 import { OPENWEBUI_METADATA_NAMESPACE } from "./persistence-contract";
 
+export type { OpenWebUIHttpClientConfig, PostOpenWebUIMessageEventInput } from "./http-client";
+export {
+	OpenWebUIHttpClient,
+	OpenWebUIHttpConfigurationError,
+	OpenWebUIHttpError,
+	OpenWebUITransportError,
+} from "./http-client";
+export { OpenWebUIInvalidResponseError } from "./http-parsers";
+
 export interface OpenWebUIAdapterMetadata {
 	operation_id: string;
 	owner_user_id: string;

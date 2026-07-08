@@ -34,6 +34,10 @@ export interface LiveGatewayRunner {
 	run(input: LiveGatewayRunnerInput): Promise<LiveGatewayRunnerResult> | LiveGatewayRunnerResult;
 }
 
+export class LiveGatewayUnavailableError extends Error {
+	readonly code = "live_runner_unavailable";
+}
+
 export interface LiveGatewayEventDeliveryInput {
 	readonly chatId: string;
 	readonly messageId: string;
@@ -47,7 +51,7 @@ export type LiveGatewayEventSink = (input: LiveGatewayEventDeliveryInput) => Pro
 export type LiveChatCompletionsResult =
 	| { readonly ok: true; readonly status: 200; readonly body: OpenAIChatCompletionResponse }
 	| { readonly ok: true; readonly status: 200; readonly stream: AsyncIterable<string> }
-	| { readonly ok: false; readonly status: 400 | 401 | 404; readonly body: OpenAIErrorResponse };
+	| { readonly ok: false; readonly status: 400 | 401 | 404 | 503; readonly body: OpenAIErrorResponse };
 
 export interface OpenAIErrorResponse {
 	readonly error: {
@@ -121,15 +125,23 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 		);
 	}
 
-	const runnerResult = await input.runner.run({
-		project,
-		prompt,
-		chatId: headers.chatId,
-		messageId: headers.messageId,
-		userMessageId: headers.userMessageId,
-		userMessageParentId: headers.userMessageParentId,
-		continued: headers.userMessageParentId !== null,
-	});
+	let runnerResult: LiveGatewayRunnerResult;
+	try {
+		runnerResult = await input.runner.run({
+			project,
+			prompt,
+			chatId: headers.chatId,
+			messageId: headers.messageId,
+			userMessageId: headers.userMessageId,
+			userMessageParentId: headers.userMessageParentId,
+			continued: headers.userMessageParentId !== null,
+		});
+	} catch (error) {
+		if (error instanceof LiveGatewayUnavailableError) {
+			return errorResult(503, "server_error", error.code, error.message);
+		}
+		throw error;
+	}
 
 	await deliverRunnerEvents({
 		eventSink: input.eventSink,
@@ -224,7 +236,12 @@ function buildCompletion(input: {
 	};
 }
 
-function errorResult(status: 400 | 401 | 404, type: string, code: string, message: string): LiveChatCompletionsResult {
+function errorResult(
+	status: 400 | 401 | 404 | 503,
+	type: string,
+	code: string,
+	message: string,
+): LiveChatCompletionsResult {
 	return {
 		ok: false,
 		status,

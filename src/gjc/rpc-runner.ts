@@ -71,3 +71,46 @@ export interface GjcTurnRunner {
 export function getProjectSessionRoot(project: RegisteredProject): string {
 	return project.sessionRoot ?? `${project.cwd}/.gjc/sessions`;
 }
+
+export interface GjcRpcRunnerClientOptions {
+	readonly cwd: string;
+	readonly sessionRoot: string;
+	readonly cliPath?: string;
+}
+
+export interface GjcRpcTransportState {
+	readonly sessionId: string;
+	readonly sessionFile?: string;
+	readonly activeLeaf?: string;
+	readonly rawFrameCursor?: number;
+	readonly eventCursor?: number;
+	readonly messageCount?: number;
+}
+
+export interface GjcRpcRunnerTransportEvent {
+	readonly type: string;
+	readonly id?: string;
+	readonly toolCallId?: string;
+	readonly toolName?: string;
+	readonly message?: unknown;
+}
+
+export interface GjcRpcRunnerTransport {
+	start(): Promise<void>;
+	stop(): void;
+	newSession(): Promise<undefined | { readonly cancelled: boolean }>;
+	switchSession(sessionPath: string): Promise<undefined | { readonly cancelled: boolean }>;
+	getState(): Promise<GjcRpcTransportState>;
+	promptAndWait(message: string, timeoutMs?: number): Promise<readonly GjcRpcRunnerTransportEvent[]>;
+	getLastAssistantText(): Promise<string | null>;
+}
+
+export type GjcRpcRunnerClientFactory = (options: GjcRpcRunnerClientOptions) => GjcRpcRunnerTransport;
+
+export interface CreateGjcRpcTurnRunnerInput {
+	readonly clientFactory?: GjcRpcRunnerClientFactory;
+	readonly cliPath?: string;
+	readonly turnTimeoutMs?: number;
+}
+
+export { createGjcRpcTurnRunner, GjcRpcRunnerError } from "./rpc-client-runner";
