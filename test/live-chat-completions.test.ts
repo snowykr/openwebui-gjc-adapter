@@ -166,6 +166,31 @@ describe("live OpenAI-compatible chat completions", () => {
 		]);
 	});
 
+	it("persists final assistant content to the injected message sink", async () => {
+		const persisted: unknown[] = [];
+		const result = await handleChatCompletions({
+			request,
+			headers: chatHeaders,
+			projects: [project],
+			owner,
+			runner: fixedRunner("GJC_UI_REAL_BACKEND_OK"),
+			messageSink(input: unknown) {
+				persisted.push(input);
+			},
+		});
+
+		expect(result.ok).toBe(true);
+		expect(persisted).toEqual([
+			{
+				chatId: "chat-1",
+				messageId: "assistant-1",
+				ownerUserId: "owner-1",
+				projectId: "demo",
+				content: "GJC_UI_REAL_BACKEND_OK",
+			},
+		]);
+	});
+
 	it("encodes streaming chunks and final DONE sentinel", async () => {
 		const result = await handleChatCompletions({
 			request: { ...request, stream: true },

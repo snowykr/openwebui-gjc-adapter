@@ -100,6 +100,11 @@ describe("OpenWebUIHttpClient", () => {
 				messageId: "message-1",
 				event: buildOpenWebUIStatusEvent({ description: "Running GJC", done: false }),
 			});
+			await client.updateMessageContent({
+				chatId: "chat-1",
+				messageId: "message-1",
+				content: "final assistant content",
+			});
 
 			expect(fixture.requests).toEqual([
 				{
@@ -145,6 +150,12 @@ describe("OpenWebUIHttpClient", () => {
 						type: "status",
 						data: { description: "Running GJC", done: false },
 					},
+				},
+				{
+					method: "POST",
+					path: "/api/v1/chats/chat-1/messages/message-1",
+					authorization: "Bearer token-1",
+					body: { content: "final assistant content" },
 				},
 			]);
 		} finally {

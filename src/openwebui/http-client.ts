@@ -19,6 +19,12 @@ export interface PostOpenWebUIMessageEventInput {
 	readonly event: OpenWebUIMessageEvent;
 }
 
+export interface UpdateOpenWebUIMessageContentInput {
+	readonly chatId: string;
+	readonly messageId: string;
+	readonly content: string;
+}
+
 interface OpenWebUIHttpRequest {
 	readonly method: "GET" | "PUT" | "POST";
 	readonly path: string;
@@ -130,6 +136,14 @@ export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 			method: "POST",
 			path: openWebUIApiPath(["chats", input.chatId, "messages", input.messageId, "event"]),
 			body: input.event,
+		});
+	}
+
+	async updateMessageContent(input: UpdateOpenWebUIMessageContentInput): Promise<void> {
+		await this.#sendJson({
+			method: "POST",
+			path: openWebUIApiPath(["chats", input.chatId, "messages", input.messageId]),
+			body: { content: input.content },
 		});
 	}
 

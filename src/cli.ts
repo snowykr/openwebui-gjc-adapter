@@ -4,7 +4,7 @@ import { type AdapterConfig, buildStartupDiagnostics, loadAdapterConfig } from "
 import { createGjcRpcTurnRunner, type GjcTurnRunner } from "./gjc/rpc-runner";
 import { FileBackedSessionMappingStore, type SessionMappingStore } from "./gjc/session-router";
 import type { AdapterHealthCheck } from "./health";
-import type { LiveGatewayEventSink } from "./live/chat-completions";
+import type { LiveGatewayEventSink, LiveGatewayMessageSink } from "./live/chat-completions";
 import { createGjcRoutingLiveGatewayRunner } from "./live/gjc-routing-runner";
 import { buildOpenWebUIAuthStartupDiagnostic, type OpenWebUIOwnerContext } from "./openwebui/auth";
 import { OpenWebUIHttpClient } from "./openwebui/client";
@@ -18,6 +18,7 @@ export interface BuildAdapterServerOptionsDependencies {
 	readonly turnRunner?: GjcTurnRunner;
 	readonly mappings?: SessionMappingStore;
 	readonly eventSink?: LiveGatewayEventSink;
+	readonly messageSink?: LiveGatewayMessageSink;
 }
 
 export async function buildAdapterServerOptionsFromEnv(
@@ -30,7 +31,9 @@ export async function buildAdapterServerOptionsFromEnv(
 	const turnRunner =
 		dependencies.turnRunner ?? createGjcRpcTurnRunner({ cliPath: resolveGjcCliPath(config.gjcCommand) });
 	const mappings = dependencies.mappings ?? new FileBackedSessionMappingStore(buildSessionMappingStorePath(config));
-	const eventSink = dependencies.eventSink ?? buildOpenWebUIEventSink(config);
+	const openWebUIClient = buildOpenWebUIClient(config);
+	const eventSink = dependencies.eventSink ?? buildOpenWebUIEventSink(openWebUIClient);
+	const messageSink = dependencies.messageSink ?? buildOpenWebUIMessageSink(openWebUIClient);
 	return {
 		host: config.bindHost,
 		port: config.bindPort,
@@ -42,6 +45,7 @@ export async function buildAdapterServerOptionsFromEnv(
 			requireAdapterApiToken: true,
 			...(config.adapterApiToken === undefined ? {} : { adapterApiToken: config.adapterApiToken }),
 			...(eventSink === undefined ? {} : { eventSink }),
+			...(messageSink === undefined ? {} : { messageSink }),
 		},
 	};
 }
@@ -97,13 +101,28 @@ function buildSessionMappingStorePath(config: AdapterConfig): string {
 	return path.join(config.sessionRoot, SESSION_MAPPING_STORE_FILE);
 }
 
-function buildOpenWebUIEventSink(config: AdapterConfig): LiveGatewayEventSink | undefined {
+function buildOpenWebUIClient(config: AdapterConfig): OpenWebUIHttpClient | undefined {
 	if (config.openWebUIApiToken === undefined) return undefined;
-	const client = new OpenWebUIHttpClient({ baseUrl: config.openWebUIBaseUrl, apiToken: config.openWebUIApiToken });
+	return new OpenWebUIHttpClient({ baseUrl: config.openWebUIBaseUrl, apiToken: config.openWebUIApiToken });
+}
+
+function buildOpenWebUIEventSink(client: OpenWebUIHttpClient | undefined): LiveGatewayEventSink | undefined {
+	if (client === undefined) return undefined;
 	return async input => {
 		for (const event of input.events) {
 			await client.postMessageEvent({ chatId: input.chatId, messageId: input.messageId, event });
 		}
+	};
+}
+
+function buildOpenWebUIMessageSink(client: OpenWebUIHttpClient | undefined): LiveGatewayMessageSink | undefined {
+	if (client === undefined) return undefined;
+	return async input => {
+		await client.updateMessageContent({
+			chatId: input.chatId,
+			messageId: input.messageId,
+			content: input.content,
+		});
 	};
 }
 
