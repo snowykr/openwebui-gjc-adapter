@@ -5,6 +5,7 @@ import { type AllowedRoot, assertPathInsideAllowedRoots } from "../security/path
 export interface RegisteredProject {
 	readonly id: string;
 	readonly name: string;
+	readonly openWebUIFolderName?: string;
 	readonly cwd: string;
 	readonly modelId: `gjc/${string}`;
 	readonly openWebUIFolderId?: string;
@@ -48,14 +49,31 @@ export function createProjectId(nameOrCwd: string): string {
 }
 
 export function disambiguateRegisteredProjects(projects: readonly RegisteredProject[]): readonly RegisteredProject[] {
-	const counts = new Map<string, number>();
+	const idCounts = new Map<string, number>();
+	const nameCounts = new Map<string, number>();
 	for (const project of projects) {
-		counts.set(project.id, (counts.get(project.id) ?? 0) + 1);
+		idCounts.set(project.id, (idCounts.get(project.id) ?? 0) + 1);
+		nameCounts.set(project.name, (nameCounts.get(project.name) ?? 0) + 1);
 	}
-	return projects.map(project => {
-		if ((counts.get(project.id) ?? 0) <= 1) return project;
-		const id = `${project.id}-${projectPathFingerprint(project.cwd)}`;
-		return { ...project, id, modelId: `gjc/${id}` };
+	const withDisambiguatedNames = projects.map(project => {
+		if ((nameCounts.get(project.name) ?? 0) <= 1) return project;
+		return { ...project, openWebUIFolderName: disambiguatedFolderName(project) };
+	});
+	const folderNameCounts = new Map<string, number>();
+	for (const project of withDisambiguatedNames) {
+		const folderName = project.openWebUIFolderName ?? project.name;
+		folderNameCounts.set(folderName, (folderNameCounts.get(folderName) ?? 0) + 1);
+	}
+
+	return withDisambiguatedNames.map(project => {
+		const id =
+			(idCounts.get(project.id) ?? 0) <= 1 ? project.id : `${project.id}-${projectPathFingerprint(project.cwd)}`;
+		const folderName = project.openWebUIFolderName ?? project.name;
+		const openWebUIFolderName =
+			(folderNameCounts.get(folderName) ?? 0) <= 1
+				? folderName
+				: `${folderName} ${projectPathFingerprint(project.cwd)}`;
+		return { ...project, id, modelId: `gjc/${id}`, openWebUIFolderName };
 	});
 }
 
@@ -75,6 +93,7 @@ export async function registerProjectDirectory(
 	return {
 		id,
 		name: input.name ?? path.basename(cwd),
+		openWebUIFolderName: input.name ?? path.basename(cwd),
 		cwd,
 		modelId: `gjc/${id}`,
 		openWebUIFolderId: input.openWebUIFolderId,
@@ -118,4 +137,16 @@ function isPathInsideRoot(targetPath: string, rootPath: string): boolean {
 
 function projectPathFingerprint(cwd: string): string {
 	return createHash("sha256").update(cwd).digest("hex").slice(0, 8);
+}
+
+function disambiguatedFolderName(project: RegisteredProject): string {
+	return `${project.name} (${projectFolderLabel(project)})`;
+}
+
+function projectFolderLabel(project: RegisteredProject): string {
+	const relativePath = path.relative(project.allowedRoot, project.cwd);
+	if (relativePath !== "" && !relativePath.startsWith("..") && !path.isAbsolute(relativePath)) {
+		return relativePath;
+	}
+	return projectPathFingerprint(project.cwd);
 }

@@ -29,6 +29,7 @@ describe("project registry primitives", () => {
 
 		expect(project.id).toBe("my-app");
 		expect(project.name).toBe("My App!");
+		expect(project.openWebUIFolderName).toBe("My App!");
 		expect(project.modelId).toBe("gjc/my-app");
 	});
 
@@ -47,6 +48,7 @@ describe("project registry primitives", () => {
 		expect(projects.map(project => project.name)).toEqual(["Same", "Same"]);
 		expect(new Set(projects.map(project => project.id)).size).toBe(2);
 		expect(new Set(projects.map(project => project.modelId)).size).toBe(2);
+		expect(projects.map(project => project.openWebUIFolderName)).toEqual(["Same (alpha/Same)", "Same (beta/Same)"]);
 		expect(projects.every(project => project.id.startsWith("same-"))).toBe(true);
 		expect(projects.map(project => buildProjectFolderMetadata(project).gjc_adapter.projectId)).toEqual(
 			projects.map(project => project.id),

@@ -117,7 +117,7 @@ export async function syncProjectSessionsToOpenWebUI(
 function projectedProjectReference(project: RegisteredProject): ProjectedProjectReference {
 	return {
 		id: project.id,
-		name: project.name,
+		name: project.openWebUIFolderName ?? project.name,
 		...(project.openWebUIFolderId === undefined ? {} : { folderId: project.openWebUIFolderId }),
 		metadata: { ...buildProjectFolderMetadata(project) },
 	};
