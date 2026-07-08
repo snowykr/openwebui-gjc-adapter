@@ -1,76 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import {
-	InMemoryOpenWebUIProjectionRepository,
-	OpenWebUIHttpClient,
-	OpenWebUIHttpError,
-} from "../src/openwebui/client";
+import { OpenWebUIHttpClient } from "../src/openwebui/client";
 import { buildOpenWebUIStatusEvent } from "../src/openwebui/events";
-
-const baseChat = {
-	id: "chat-1",
-	owner_user_id: "owner-1",
-	folder_id: "folder-1",
-	title: "Adapter title",
-	metadata: { gjc_adapter: { operation_id: "upsert-chat" } },
-	history: { messages: {}, currentId: null },
-};
-
-describe("InMemoryOpenWebUIProjectionRepository", () => {
-	test("scopes folders and chats by owner id", async () => {
-		const repository = new InMemoryOpenWebUIProjectionRepository();
-
-		await repository.upsertFolder({
-			id: "folder-1",
-			owner_user_id: "owner-1",
-			name: "Owner 1 folder",
-			metadata: {},
-		});
-		await repository.upsertFolder({
-			id: "folder-1",
-			owner_user_id: "owner-2",
-			name: "Owner 2 folder",
-			metadata: {},
-		});
-		await repository.upsertChat(baseChat);
-		await repository.upsertChat({ ...baseChat, owner_user_id: "owner-2", title: "Other owner title" });
-
-		expect(await repository.getChat("owner-1", "chat-1")).toMatchObject({
-			owner_user_id: "owner-1",
-			title: "Adapter title",
-		});
-		expect(await repository.getChat("owner-2", "chat-1")).toMatchObject({
-			owner_user_id: "owner-2",
-			title: "Other owner title",
-		});
-		expect(await repository.getChat("owner-3", "chat-1")).toBeUndefined();
-	});
-
-	test("preserves non-adapter chat metadata, rating, and title on adapter upsert", async () => {
-		const repository = new InMemoryOpenWebUIProjectionRepository();
-
-		await repository.upsertChat({
-			...baseChat,
-			title: "User renamed title",
-			rating: 5,
-			metadata: { user_note: "keep me", gjc_adapter: { operation_id: "old" } },
-		});
-		await repository.upsertChat({
-			...baseChat,
-			title: "Adapter replacement title",
-			rating: 1,
-			metadata: { gjc_adapter: { operation_id: "new" } },
-		});
-
-		expect(await repository.getChat("owner-1", "chat-1")).toMatchObject({
-			title: "User renamed title",
-			rating: 5,
-			metadata: {
-				user_note: "keep me",
-				gjc_adapter: { operation_id: "new" },
-			},
-		});
-	});
-});
+import { startRecordingServer } from "./openwebui-http-fixture";
+import { baseChat } from "./openwebui-test-fixtures";
 
 describe("OpenWebUIHttpClient", () => {
 	test("upserts projection records and posts message events over authenticated HTTP", async () => {
@@ -108,36 +40,56 @@ describe("OpenWebUIHttpClient", () => {
 
 			expect(fixture.requests).toEqual([
 				{
-					method: "PUT",
+					method: "GET",
 					path: "/api/v1/folders/folder-1",
 					authorization: "Bearer token-1",
+					body: null,
+				},
+				{
+					method: "GET",
+					path: "/api/v1/folders/",
+					authorization: "Bearer token-1",
+					body: null,
+				},
+				{
+					method: "POST",
+					path: "/api/v1/folders/",
+					authorization: "Bearer token-1",
 					body: {
-						id: "folder-1",
-						owner_user_id: "owner-1",
 						name: "Owner 1 folder",
-						metadata: { gjc_adapter: { project_id: "project-1" } },
+						meta: { gjc_adapter: { project_id: "project-1" } },
 					},
 				},
 				{
-					method: "PUT",
-					path: "/api/v1/chats/chat-1",
-					authorization: "Bearer token-1",
-					body: baseChat,
-				},
-				{
-					method: "PUT",
-					path: "/api/v1/chats/chat-1/messages",
+					method: "POST",
+					path: "/api/v1/folders/folder-1/update",
 					authorization: "Bearer token-1",
 					body: {
-						owner_user_id: "owner-1",
-						messages: [
+						name: "Owner 1 folder",
+						meta: { gjc_adapter: { project_id: "project-1" } },
+					},
+				},
+				{
+					method: "GET",
+					path: "/api/v1/chats/chat-1",
+					authorization: "Bearer token-1",
+					body: null,
+				},
+				{
+					method: "POST",
+					path: "/api/v1/chats/import",
+					authorization: "Bearer token-1",
+					body: {
+						chats: [
 							{
-								id: "message-1",
-								chat_id: "chat-1",
-								owner_user_id: "owner-1",
-								role: "assistant",
-								content: "hello",
-								metadata: { gjc_adapter: { projected_message_id: "entry-1" } },
+								chat: {
+									title: "Adapter title",
+									metadata: { gjc_adapter: { operation_id: "upsert-chat" } },
+									meta: { gjc_adapter: { operation_id: "upsert-chat" } },
+									history: { messages: {}, currentId: null },
+								},
+								folder_id: "folder-1",
+								meta: { gjc_adapter: { operation_id: "upsert-chat" } },
 							},
 						],
 					},
@@ -163,51 +115,98 @@ describe("OpenWebUIHttpClient", () => {
 		}
 	});
 
-	test("throws typed HTTP errors on non-2xx OpenWebUI responses", async () => {
-		const fixture = startRecordingServer({ failPath: "/api/v1/chats/chat-1", status: 503 });
+	test("parses real OpenWebUI chat responses that wrap history under chat and meta under meta", async () => {
+		const fixture = startRecordingServer({
+			responseBody: {
+				id: "real-chat-1",
+				user_id: "owner-1",
+				title: "Real chat",
+				folder_id: "folder-1",
+				meta: { gjc_adapter: { project_id: "project-1" } },
+				chat: {
+					title: "Real chat",
+					history: {
+						currentId: "message-1",
+						messages: {
+							"message-1": { id: "message-1", role: "assistant", content: "from openwebui" },
+						},
+					},
+				},
+			},
+		});
 		const client = new OpenWebUIHttpClient({ baseUrl: fixture.baseUrl, apiToken: "token-1" });
 
 		try {
-			let caught: unknown;
-			try {
-				await client.upsertChat(baseChat);
-			} catch (error) {
-				if (!(error instanceof Error)) throw error;
-				caught = error;
-			}
-
-			expect(caught).toBeInstanceOf(OpenWebUIHttpError);
-			expect(caught).toMatchObject({
-				name: "OpenWebUIHttpError",
-				method: "PUT",
-				path: "/api/v1/chats/chat-1",
-				status: 503,
-				responseBody: '{"error":"forced failure"}',
+			await expect(client.getChat("owner-1", "real-chat-1")).resolves.toMatchObject({
+				id: "real-chat-1",
+				owner_user_id: "owner-1",
+				folder_id: "folder-1",
+				metadata: { gjc_adapter: { project_id: "project-1" } },
+				history: {
+					currentId: "message-1",
+					messages: {
+						"message-1": {
+							id: "message-1",
+							chat_id: "real-chat-1",
+							owner_user_id: "owner-1",
+							role: "assistant",
+							content: "from openwebui",
+							metadata: {},
+						},
+					},
+				},
 			});
 		} finally {
 			fixture.stop();
 		}
 	});
 
-	test("reads chats and returns undefined for missing OpenWebUI chats", async () => {
-		const fixture = startRecordingServer({ responseBody: baseChat, notFoundPath: "/api/v1/chats/missing" });
+	test("moves existing OpenWebUI chats into the projected folder when updating imports", async () => {
+		const fixture = startRecordingServer({
+			responseBody: {
+				id: "real-chat-1",
+				user_id: "owner-1",
+				title: "Old chat",
+				folder_id: null,
+				meta: {},
+				chat: {
+					title: "Old chat",
+					history: { messages: {}, currentId: null },
+				},
+			},
+		});
 		const client = new OpenWebUIHttpClient({ baseUrl: fixture.baseUrl, apiToken: "token-1" });
 
 		try {
-			await expect(client.getChat("owner-1", "chat-1")).resolves.toEqual(baseChat);
-			await expect(client.getChat("owner-1", "missing")).resolves.toBeUndefined();
+			await client.upsertChat({ ...baseChat, id: "real-chat-1" });
+
 			expect(fixture.requests).toEqual([
 				{
 					method: "GET",
-					path: "/api/v1/chats/chat-1?owner_user_id=owner-1",
+					path: "/api/v1/chats/real-chat-1",
 					authorization: "Bearer token-1",
 					body: null,
 				},
 				{
-					method: "GET",
-					path: "/api/v1/chats/missing?owner_user_id=owner-1",
+					method: "POST",
+					path: "/api/v1/chats/real-chat-1",
 					authorization: "Bearer token-1",
-					body: null,
+					body: {
+						chat: {
+							title: "Adapter title",
+							metadata: { gjc_adapter: { operation_id: "upsert-chat" } },
+							meta: { gjc_adapter: { operation_id: "upsert-chat" } },
+							history: { messages: {}, currentId: null },
+						},
+						folder_id: "folder-1",
+						meta: { gjc_adapter: { operation_id: "upsert-chat" } },
+					},
+				},
+				{
+					method: "POST",
+					path: "/api/v1/chats/real-chat-1/folder",
+					authorization: "Bearer token-1",
+					body: { folder_id: "folder-1" },
 				},
 			]);
 		} finally {
@@ -215,64 +214,38 @@ describe("OpenWebUIHttpClient", () => {
 		}
 	});
 
-	test("rejects malformed OpenWebUI chat responses before returning them", async () => {
+	test("stores adapter metadata inside the OpenWebUI chat body for update routes", async () => {
 		const fixture = startRecordingServer({
-			responseBody: { id: "chat-1", history: { messages: {}, currentId: null } },
+			responseBody: {
+				id: "real-chat-1",
+				user_id: "owner-1",
+				title: "Old chat",
+				folder_id: "folder-1",
+				meta: { gjc_adapter: { operation_id: "old" } },
+				chat: {
+					title: "Old chat",
+					metadata: { gjc_adapter: { operation_id: "old" } },
+					history: { messages: {}, currentId: null },
+				},
+			},
 		});
 		const client = new OpenWebUIHttpClient({ baseUrl: fixture.baseUrl, apiToken: "token-1" });
 
 		try {
-			await expect(client.getChat("owner-1", "chat-1")).rejects.toMatchObject({
-				name: "OpenWebUIInvalidResponseError",
-				path: "/api/v1/chats/chat-1?owner_user_id=owner-1",
-				detail: "chat.owner_user_id must be a string",
+			const updated = await client.upsertChat({ ...baseChat, id: "real-chat-1" });
+
+			expect(updated.metadata).toMatchObject({ gjc_adapter: { operation_id: "upsert-chat" } });
+			expect(
+				fixture.requests.find(request => request.method === "POST" && request.path === "/api/v1/chats/real-chat-1")
+					?.body,
+			).toMatchObject({
+				chat: {
+					metadata: { gjc_adapter: { operation_id: "upsert-chat" } },
+					meta: { gjc_adapter: { operation_id: "upsert-chat" } },
+				},
 			});
 		} finally {
 			fixture.stop();
 		}
 	});
 });
-
-interface RecordedRequest {
-	readonly method: string;
-	readonly path: string;
-	readonly authorization: string | null;
-	readonly body: unknown;
-}
-
-type RecordingServerOptions = Readonly<{
-	failPath?: string;
-	notFoundPath?: string;
-	responseBody?: unknown;
-	status?: number;
-}>;
-
-function startRecordingServer(options: RecordingServerOptions = {}) {
-	const requests: RecordedRequest[] = [];
-	const server = Bun.serve({
-		port: 0,
-		async fetch(request) {
-			const url = new URL(request.url);
-			const body: unknown = request.method === "GET" ? null : await request.json();
-			requests.push({
-				method: request.method,
-				path: `${url.pathname}${url.search}`,
-				authorization: request.headers.get("authorization"),
-				body,
-			});
-			if (url.pathname === options.notFoundPath) {
-				return Response.json({ error: "not found" }, { status: 404 });
-			}
-			if (url.pathname === options.failPath) {
-				return Response.json({ error: "forced failure" }, { status: options.status ?? 500 });
-			}
-			return Response.json(options.responseBody ?? { ok: true });
-		},
-	});
-
-	return {
-		baseUrl: `http://${server.hostname}:${server.port}`,
-		requests,
-		stop: () => server.stop(true),
-	};
-}

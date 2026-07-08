@@ -22,7 +22,7 @@ export interface AssistantTextFrame {
 }
 
 export interface ProgressFrame {
-	readonly kind: "tool_progress" | "mcp_progress" | "skill_progress";
+	readonly kind: "tool_progress" | "mcp_progress" | "skill_progress" | "subagent_progress";
 	readonly label: string;
 	readonly phase: "start" | "progress" | "end";
 	readonly hidden?: boolean;
@@ -68,6 +68,7 @@ export function projectAgentFrame(frame: ProjectableAgentFrame, sse: OpenAISsePr
 		case "tool_progress":
 		case "mcp_progress":
 		case "skill_progress":
+		case "subagent_progress":
 			return {
 				sseChunks: [],
 				events: [

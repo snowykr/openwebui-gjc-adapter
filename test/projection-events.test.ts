@@ -32,6 +32,21 @@ describe("projectAgentFrame", () => {
 		});
 	});
 
+	test("maps subagent progress to visible status events", () => {
+		expect(
+			projectAgentFrame({ kind: "subagent_progress", label: "GJC agent started", phase: "start" }, sse).events,
+		).toEqual([
+			{
+				type: "status",
+				data: {
+					description: "GJC agent started",
+					done: false,
+					gjc_adapter: { frameKind: "subagent_progress", phase: "start", metadata: {} },
+				},
+			},
+		]);
+	});
+
 	test("maps source and citation as single documented event objects", () => {
 		const source = { source: { name: "README" }, metadata: { line: 4 } };
 		const citation = { document: ["doc"], metadata: { score: 0.8 } };

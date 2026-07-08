@@ -90,12 +90,14 @@ function turnEventToProjectableFrame(event: GjcTurnEvent): ProjectableAgentFrame
 	if (classified.kind === "workflow_gate" || event.type === "workflow_gate") {
 		return {
 			kind: "skill_progress",
-			label: event.text ?? projectPendingWorkflowGateMessage(pendingGateFromEvent(event)),
+			label: boundedText(projectPendingWorkflowGateMessage(pendingGateFromEvent(event))),
 			phase: "start",
 			hidden: false,
 			metadata: {
-				eventType: event.type,
-				gateId: classified.kind === "workflow_gate" ? (classified.gateId ?? event.id ?? null) : (event.id ?? null),
+				eventType: boundedText(event.type),
+				gateId: boundedNullableText(
+					classified.kind === "workflow_gate" ? (classified.gateId ?? event.id ?? null) : (event.id ?? null),
+				),
 			},
 		};
 	}
@@ -108,18 +110,25 @@ function turnEventToProjectableFrame(event: GjcTurnEvent): ProjectableAgentFrame
 	if (event.type.includes("tool")) {
 		return progressFrame("tool_progress", event);
 	}
-	return { kind: "unsupported", frameType: event.type, metadata: { id: event.id, text: event.text } };
+	if (event.type.includes("agent")) {
+		return progressFrame("subagent_progress", event);
+	}
+	return {
+		kind: "unsupported",
+		frameType: boundedText(event.type),
+		metadata: { id: boundedNullableText(event.id ?? null), textPresent: event.text !== undefined },
+	};
 }
 
 function progressFrame(
-	kind: "tool_progress" | "mcp_progress" | "skill_progress",
+	kind: "tool_progress" | "mcp_progress" | "skill_progress" | "subagent_progress",
 	event: GjcTurnEvent,
 ): ProjectableAgentFrame {
 	return {
 		kind,
-		label: event.text ?? event.type,
+		label: boundedText(event.type),
 		phase: event.type.includes("end") || event.type.includes("complete") ? "end" : "progress",
-		metadata: { eventType: event.type, id: event.id ?? null },
+		metadata: { eventType: boundedText(event.type), id: boundedNullableText(event.id ?? null) },
 	};
 }
 
@@ -138,4 +147,12 @@ function buildEventPayloadHash(events: readonly OpenWebUIMessageEvent[]): string
 	return buildProjectionPayloadHash({
 		eventsJson: JSON.stringify(events),
 	});
+}
+
+function boundedNullableText(value: string | null): string | null {
+	return value === null ? null : boundedText(value);
+}
+
+function boundedText(value: string, maxLength = 80): string {
+	return value.length <= maxLength ? value : `${value.slice(0, maxLength - 3)}...`;
 }

@@ -29,9 +29,8 @@ export interface OpenAIModelListEntry {
 export interface ProjectFolderMetadata {
 	readonly gjc_adapter: {
 		readonly projectId: string;
-		readonly cwd: string;
 		readonly modelId: string;
-		readonly sessionRoot?: string;
+		readonly projectName: string;
 	};
 }
 
@@ -76,9 +75,8 @@ export function buildProjectFolderMetadata(project: RegisteredProject): ProjectF
 	return {
 		gjc_adapter: {
 			projectId: project.id,
-			cwd: project.cwd,
 			modelId: project.modelId,
-			...(project.sessionRoot === undefined ? {} : { sessionRoot: project.sessionRoot }),
+			projectName: project.name,
 		},
 	};
 }

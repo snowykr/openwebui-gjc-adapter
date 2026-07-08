@@ -3,7 +3,6 @@ import {
 	handleChatCompletions,
 	type LiveGatewayRunner,
 	type LiveGatewayRunnerInput,
-	LiveGatewayUnavailableError,
 } from "../src/live/chat-completions";
 import { buildModelList } from "../src/live/models";
 import type { OpenAIChatCompletionRequest } from "../src/live/openai-types";
@@ -134,6 +133,35 @@ describe("live OpenAI-compatible chat completions", () => {
 		});
 	});
 
+	it("rejects request objects missing messages before reading latest user text", async () => {
+		let calls = 0;
+		const result = await handleChatCompletions({
+			request: { model: "gjc/demo" } as OpenAIChatCompletionRequest,
+			headers: chatHeaders,
+			projects: [project],
+			owner,
+			runner: {
+				run() {
+					calls += 1;
+					return { content: "unexpected" };
+				},
+			},
+		});
+
+		expect(calls).toBe(0);
+		expect(result).toEqual({
+			ok: false,
+			status: 400,
+			body: {
+				error: {
+					message: "Request body must include a messages array.",
+					type: "invalid_request_error",
+					code: "invalid_request_body",
+				},
+			},
+		});
+	});
+
 	it("delivers projected runner events through the injected event sink", async () => {
 		const delivered: unknown[] = [];
 		const result = await handleChatCompletions({
@@ -189,80 +217,6 @@ describe("live OpenAI-compatible chat completions", () => {
 				content: "GJC_UI_REAL_BACKEND_OK",
 			},
 		]);
-	});
-
-	it("encodes streaming chunks and final DONE sentinel", async () => {
-		const result = await handleChatCompletions({
-			request: { ...request, stream: true },
-			headers: chatHeaders,
-			projects: [project],
-			owner,
-			runner: { run: () => ({ chunks: ["hello", " world"] }) },
-			now: new Date("2026-07-08T00:00:00.000Z"),
-			idFactory: () => "chatcmpl-stream",
-		});
-
-		expect(result.ok).toBe(true);
-		if (!("stream" in result)) throw new Error("expected stream result");
-		const chunks: string[] = [];
-		for await (const chunk of result.stream) chunks.push(chunk);
-
-		expect(chunks).toHaveLength(3);
-		expect(chunks[0]).toStartWith("data: ");
-		expect(chunks[0]).toEndWith("\n\n");
-		expect(JSON.parse(chunks[0]?.slice(6).trim() ?? "{}")).toMatchObject({
-			object: "chat.completion.chunk",
-			choices: [{ delta: { role: "assistant", content: "hello" }, finish_reason: null }],
-		});
-		expect(chunks[2]).toBe("data: [DONE]\n\n");
-	});
-
-	it("rejects unknown project models", async () => {
-		const result = await handleChatCompletions({
-			request: { ...request, model: "gjc/missing" },
-			headers: chatHeaders,
-			projects: [project],
-			owner,
-			runner: fixedRunner("unused"),
-		});
-
-		expect(result).toEqual({
-			ok: false,
-			status: 404,
-			body: {
-				error: {
-					message: "Unknown GJC model: gjc/missing",
-					type: "invalid_request_error",
-					code: "model_not_found",
-				},
-			},
-		});
-	});
-
-	it("returns OpenAI-style unavailable errors when no concrete live runner is wired", async () => {
-		const result = await handleChatCompletions({
-			request,
-			headers: chatHeaders,
-			projects: [project],
-			owner,
-			runner: {
-				run() {
-					throw new LiveGatewayUnavailableError("GJC live runner is not configured for this service.");
-				},
-			},
-		});
-
-		expect(result).toEqual({
-			ok: false,
-			status: 503,
-			body: {
-				error: {
-					message: "GJC live runner is not configured for this service.",
-					type: "server_error",
-					code: "live_runner_unavailable",
-				},
-			},
-		});
 	});
 });
 

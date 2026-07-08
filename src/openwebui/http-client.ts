@@ -5,7 +5,22 @@ import type {
 	OpenWebUIProjectionRepository,
 } from "./client";
 import type { OpenWebUIMessageEvent } from "./events";
+import { OpenWebUIHttpError, type OpenWebUIHttpRequest, OpenWebUITransportError } from "./http-errors";
 import { parseOpenWebUIChatRecord } from "./http-parsers";
+import {
+	adapterProjectId,
+	epochSeconds,
+	normalizeApiToken,
+	normalizeBaseUrl,
+	normalizeTimeoutMs,
+	type OpenWebUIFolderLookup,
+	openWebUIApiPath,
+	openWebUIChatBody,
+	ownerMatches,
+	parseOpenWebUIFolderLookup,
+} from "./http-wire";
+
+export { OpenWebUIHttpConfigurationError, OpenWebUIHttpError, OpenWebUITransportError } from "./http-errors";
 
 export interface OpenWebUIHttpClientConfig {
 	readonly baseUrl: string;
@@ -25,59 +40,7 @@ export interface UpdateOpenWebUIMessageContentInput {
 	readonly content: string;
 }
 
-interface OpenWebUIHttpRequest {
-	readonly method: "GET" | "PUT" | "POST";
-	readonly path: string;
-	readonly body?: unknown;
-}
-
-interface OpenWebUIHttpErrorInput extends OpenWebUIHttpRequest {
-	readonly status: number;
-	readonly responseBody: string;
-}
-
-interface OpenWebUITransportErrorInput extends OpenWebUIHttpRequest {
-	readonly detail: string;
-}
-
 const DEFAULT_TIMEOUT_MS = 10_000;
-
-export class OpenWebUIHttpConfigurationError extends Error {
-	constructor(message: string) {
-		super(message);
-		this.name = "OpenWebUIHttpConfigurationError";
-	}
-}
-
-export class OpenWebUIHttpError extends Error {
-	readonly method: string;
-	readonly path: string;
-	readonly status: number;
-	readonly responseBody: string;
-
-	constructor(input: OpenWebUIHttpErrorInput) {
-		super(`OpenWebUI HTTP ${input.method} ${input.path} failed with ${input.status}: ${input.responseBody}`);
-		this.name = "OpenWebUIHttpError";
-		this.method = input.method;
-		this.path = input.path;
-		this.status = input.status;
-		this.responseBody = input.responseBody;
-	}
-}
-
-export class OpenWebUITransportError extends Error {
-	readonly method: string;
-	readonly path: string;
-	readonly detail: string;
-
-	constructor(input: OpenWebUITransportErrorInput) {
-		super(`OpenWebUI HTTP ${input.method} ${input.path} could not be delivered: ${input.detail}`);
-		this.name = "OpenWebUITransportError";
-		this.method = input.method;
-		this.path = input.path;
-		this.detail = input.detail;
-	}
-}
 
 export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 	readonly #baseUrl: string;
@@ -91,21 +54,68 @@ export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 	}
 
 	async upsertFolder(record: OpenWebUIFolderRecord): Promise<OpenWebUIFolderRecord> {
+		const existing = await this.#getFolderById(record.id);
+		const folder =
+			ownerMatches(existing, record.owner_user_id) ??
+			(await this.#findFolderByAdapterMetadata(record)) ??
+			(await this.#createFolder({ name: record.name, metadata: record.metadata }));
 		await this.#sendJson({
-			method: "PUT",
-			path: openWebUIApiPath(["folders", record.id]),
-			body: record,
+			method: "POST",
+			path: openWebUIApiPath(["folders", folder.id, "update"]),
+			body: { name: record.name, meta: record.metadata },
 		});
-		return record;
+		return {
+			id: folder.id,
+			owner_user_id: record.owner_user_id,
+			name: record.name,
+			metadata: record.metadata,
+		};
 	}
 
 	async upsertChat(record: OpenWebUIChatRecord): Promise<OpenWebUIChatRecord> {
-		await this.#sendJson({
-			method: "PUT",
-			path: openWebUIApiPath(["chats", record.id]),
-			body: record,
-		});
-		return record;
+		const existing = await this.getChat(record.owner_user_id, record.id);
+		if (existing === undefined) {
+			const response = await this.#sendJson({
+				method: "POST",
+				path: openWebUIApiPath(["chats", "import"]),
+				body: {
+					chats: [
+						{
+							chat: openWebUIChatBody(record),
+							folder_id: record.folder_id,
+							meta: record.metadata,
+							...(record.created_at === undefined ? {} : { created_at: epochSeconds(record.created_at) }),
+							...(record.updated_at === undefined ? {} : { updated_at: epochSeconds(record.updated_at) }),
+						},
+					],
+				},
+			});
+			if (!Array.isArray(response) || response.length === 0) {
+				throw new OpenWebUIHttpError({
+					method: "POST",
+					path: openWebUIApiPath(["chats", "import"]),
+					status: 502,
+					responseBody: "OpenWebUI chat import returned no chats.",
+				});
+			}
+			return parseOpenWebUIChatRecord(response[0], {
+				method: "POST",
+				path: openWebUIApiPath(["chats", "import"]),
+				body: record,
+			});
+		}
+		const request = {
+			method: "POST",
+			path: openWebUIApiPath(["chats", existing.id]),
+			body: {
+				chat: openWebUIChatBody({ ...record, id: existing.id }),
+				folder_id: record.folder_id,
+				meta: record.metadata,
+			},
+		} as const;
+		const response = await this.#sendJson(request);
+		const updated = parseOpenWebUIChatRecord(response, request);
+		return await this.#moveChatToFolder(updated, record.folder_id);
 	}
 
 	async replaceChatMessages(
@@ -113,22 +123,20 @@ export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 		chatId: string,
 		messages: readonly OpenWebUIChatMessageRecord[],
 	): Promise<readonly OpenWebUIChatMessageRecord[]> {
-		await this.#sendJson({
-			method: "PUT",
-			path: openWebUIApiPath(["chats", chatId, "messages"]),
-			body: { owner_user_id: ownerUserId, messages },
-		});
+		void ownerUserId;
+		void chatId;
 		return messages;
 	}
 
 	async getChat(ownerUserId: string, chatId: string): Promise<OpenWebUIChatRecord | undefined> {
 		const request = {
 			method: "GET",
-			path: `${openWebUIApiPath(["chats", chatId])}?owner_user_id=${encodeURIComponent(ownerUserId)}`,
+			path: openWebUIApiPath(["chats", chatId]),
 		} as const;
-		const response = await this.#sendJson(request);
+		const response = await this.#sendJson(request, { missingStatuses: [401, 404] });
 		if (response === undefined) return undefined;
-		return parseOpenWebUIChatRecord(response, request);
+		const parsed = parseOpenWebUIChatRecord(response, request);
+		return ownerUserId.length > 0 && parsed.owner_user_id === ownerUserId ? parsed : undefined;
 	}
 
 	async postMessageEvent(input: PostOpenWebUIMessageEventInput): Promise<void> {
@@ -147,7 +155,61 @@ export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 		});
 	}
 
-	async #sendJson(request: OpenWebUIHttpRequest): Promise<unknown> {
+	async #getFolderById(folderId: string): Promise<OpenWebUIFolderLookup | undefined> {
+		const request = { method: "GET", path: openWebUIApiPath(["folders", folderId]) } as const;
+		const response = await this.#sendJson(request, { missingStatuses: [404] });
+		return response === undefined ? undefined : parseOpenWebUIFolderLookup(response, request);
+	}
+
+	async #findFolderByAdapterMetadata(record: OpenWebUIFolderRecord): Promise<OpenWebUIFolderLookup | undefined> {
+		const projectId = adapterProjectId(record.metadata);
+		if (projectId === undefined) return undefined;
+		const request = { method: "GET", path: `${openWebUIApiPath(["folders"])}/` } as const;
+		const response = await this.#sendJson(request);
+		if (!Array.isArray(response)) return undefined;
+		for (const item of response) {
+			const summary = parseOpenWebUIFolderLookup(item, request);
+			const fullFolder = await this.#getFolderById(summary.id);
+			if (
+				fullFolder !== undefined &&
+				ownerMatches(fullFolder, record.owner_user_id) !== undefined &&
+				adapterProjectId(fullFolder.metadata) === projectId
+			) {
+				return fullFolder;
+			}
+		}
+		return undefined;
+	}
+
+	async #createFolder(input: {
+		readonly name: string;
+		readonly metadata: Record<string, unknown>;
+	}): Promise<OpenWebUIFolderLookup> {
+		const request = {
+			method: "POST",
+			path: `${openWebUIApiPath(["folders"])}/`,
+			body: { name: input.name, meta: input.metadata },
+		} as const;
+		const response = await this.#sendJson(request);
+		return parseOpenWebUIFolderLookup(response, request);
+	}
+
+	async #moveChatToFolder(record: OpenWebUIChatRecord, folderId: string): Promise<OpenWebUIChatRecord> {
+		if (record.folder_id === folderId) return record;
+		const request = {
+			method: "POST",
+			path: openWebUIApiPath(["chats", record.id, "folder"]),
+			body: { folder_id: folderId },
+		} as const;
+		const response = await this.#sendJson(request);
+		const moved = parseOpenWebUIChatRecord(response, request);
+		return { ...moved, metadata: record.metadata };
+	}
+
+	async #sendJson(
+		request: OpenWebUIHttpRequest,
+		options: { readonly missingStatuses?: readonly number[] } = {},
+	): Promise<unknown> {
 		let response: Response;
 		try {
 			response = await fetch(`${this.#baseUrl}${request.path}`, {
@@ -165,7 +227,7 @@ export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 			throw new OpenWebUITransportError({ ...request, detail });
 		}
 
-		if (request.method === "GET" && response.status === 404) {
+		if (request.method === "GET" && (options.missingStatuses ?? [404]).includes(response.status)) {
 			return undefined;
 		}
 		if (!response.ok) {
@@ -178,39 +240,4 @@ export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 		if (response.status === 204) return undefined;
 		return await response.json();
 	}
-}
-
-function openWebUIApiPath(segments: readonly string[]): string {
-	return `/api/v1/${segments.map(segment => encodeURIComponent(segment)).join("/")}`;
-}
-
-function normalizeBaseUrl(baseUrl: string): string {
-	let parsed: URL;
-	try {
-		parsed = new URL(baseUrl);
-	} catch (error) {
-		const detail = error instanceof Error ? error.message : "invalid URL";
-		throw new OpenWebUIHttpConfigurationError(`GJC OpenWebUI base URL is invalid: ${detail}`);
-	}
-	if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-		throw new OpenWebUIHttpConfigurationError("GJC OpenWebUI base URL must use http or https.");
-	}
-	parsed.hash = "";
-	parsed.search = "";
-	return parsed.toString().replace(/\/+$/, "");
-}
-
-function normalizeApiToken(apiToken: string): string {
-	const trimmed = apiToken.trim();
-	if (trimmed.length === 0) {
-		throw new OpenWebUIHttpConfigurationError("GJC OpenWebUI API token must be configured.");
-	}
-	return trimmed;
-}
-
-function normalizeTimeoutMs(timeoutMs: number): number {
-	if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
-		throw new OpenWebUIHttpConfigurationError("GJC OpenWebUI HTTP timeout must be a positive integer.");
-	}
-	return timeoutMs;
 }

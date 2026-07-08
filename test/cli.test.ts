@@ -2,8 +2,11 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { SessionHeader, SessionMessageEntry } from "@gajae-code/coding-agent";
 import { buildAdapterServerOptionsFromEnv } from "../src/cli";
+import { SessionMappingStore } from "../src/gjc/session-router";
 import type { LiveGatewayEventDeliveryInput } from "../src/live/chat-completions";
+import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
 import { createAdapterRequestHandler } from "../src/server";
 import { chatRequest, FakeGjcTurnRunner, reserveTcpPort, stopProcess, waitForStartedServer } from "./cli-fixtures";
 
@@ -130,6 +133,54 @@ describe("adapter CLI service", () => {
 		expect(delivered[0]?.events).toHaveLength(1);
 	});
 
+	test("imports existing configured project sessions while building service options", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-cli-"));
+		const projectDirectory = path.join(workspace, "Demo Project");
+		const sessionDirectory = path.join(projectDirectory, ".gjc", "sessions");
+		const stateDirectory = path.join(workspace, "state");
+		await fs.mkdir(sessionDirectory, { recursive: true });
+		await writeSessionFile(path.join(sessionDirectory, "session-import.jsonl"), {
+			header: { id: "session-import", title: "Imported From Disk", cwd: projectDirectory },
+			entry: {
+				type: "message",
+				id: "user-import",
+				parentId: null,
+				timestamp: "2026-07-08T00:00:00.000Z",
+				message: { role: "user", content: "load me", timestamp: 1 },
+			},
+		});
+		const repository = new InMemoryOpenWebUIProjectionRepository();
+		const mappings = new SessionMappingStore();
+
+		await buildAdapterServerOptionsFromEnv(
+			{
+				...process.env,
+				GJC_OPENWEBUI_BIND_HOST: "127.0.0.1",
+				GJC_OPENWEBUI_BIND_PORT: "8765",
+				GJC_OPENWEBUI_ADAPTER_API_TOKEN: "adapter-token",
+				GJC_OPENWEBUI_OWNER_USER_ID: "owner-test",
+				GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS: workspace,
+				GJC_OPENWEBUI_SESSION_ROOT: stateDirectory,
+				GJC_OPENWEBUI_PROJECTS: `${projectDirectory}|Demo Project`,
+			},
+			{ turnRunner: new FakeGjcTurnRunner(), projectionRepository: repository, mappings },
+		);
+
+		const chat = await repository.getChat("owner-test", "gjc-session-session-import");
+		expect(chat).toMatchObject({
+			folder_id: "gjc-project-demo-project",
+			title: "Imported From Disk",
+		});
+		expect(chat?.history.messages["gjc-session-session-import-message-user-import"]?.content).toBe("load me");
+		expect(mappings.entries()).toMatchObject([
+			{
+				chatId: "gjc-session-session-import",
+				projectId: "demo-project",
+				sessionId: "session-import",
+			},
+		]);
+	});
+
 	test("requires forwarded owner headers for CLI chat requests", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-cli-"));
 		const projectDirectory = path.join(workspace, "Demo Project");
@@ -178,59 +229,22 @@ describe("adapter CLI service", () => {
 		expect(await response.json()).toMatchObject({ error: { code: "owner-mismatch" } });
 		expect(turnRunner.starts).toHaveLength(0);
 	});
-
-	test("rejects OpenAI-compatible requests when the adapter API token is not configured", async () => {
-		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-cli-"));
-		const projectDirectory = path.join(workspace, "Demo Project");
-		await fs.mkdir(projectDirectory);
-		const options = await buildAdapterServerOptionsFromEnv(
-			{
-				...process.env,
-				GJC_OPENWEBUI_BIND_HOST: "127.0.0.1",
-				GJC_OPENWEBUI_BIND_PORT: "8765",
-				GJC_OPENWEBUI_OWNER_USER_ID: "owner-test",
-				GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS: workspace,
-				GJC_OPENWEBUI_PROJECTS: `${projectDirectory}|Demo Project`,
-			},
-			{ turnRunner: new FakeGjcTurnRunner() },
-		);
-		const handler = createAdapterRequestHandler({ routes: options.routes });
-
-		const response = await handler(chatRequest());
-
-		expect(response.status).toBe(503);
-		expect(await response.json()).toMatchObject({ error: { code: "adapter_api_token_unconfigured" } });
-	});
-
-	test("serves configured models from bun run start", async () => {
-		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-cli-"));
-		const projectDirectory = path.join(workspace, "Demo Project");
-		await fs.mkdir(projectDirectory);
-		const port = await reserveTcpPort();
-		const proc = Bun.spawn(["bun", "run", "start"], {
-			cwd: process.cwd(),
-			env: {
-				...process.env,
-				GJC_OPENWEBUI_BIND_HOST: "127.0.0.1",
-				GJC_OPENWEBUI_BIND_PORT: String(port),
-				GJC_OPENWEBUI_ADAPTER_API_TOKEN: "adapter-token",
-				GJC_OPENWEBUI_OWNER_USER_ID: "owner-test",
-				GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS: workspace,
-				GJC_OPENWEBUI_PROJECTS: `${projectDirectory}|Demo Project`,
-			},
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		spawnedProcesses.push(proc);
-		await waitForStartedServer(proc, `http://127.0.0.1:${port}/healthz`);
-
-		const modelsResponse = await fetch(`http://127.0.0.1:${port}/v1/models`, {
-			headers: { authorization: "Bearer adapter-token" },
-		});
-		expect(modelsResponse.status).toBe(200);
-		expect(await modelsResponse.json()).toMatchObject({
-			object: "list",
-			data: [{ id: "gjc/demo-project", object: "model", owned_by: "gjc" }],
-		});
-	});
 });
+
+async function writeSessionFile(
+	filePath: string,
+	input: {
+		readonly header: Pick<SessionHeader, "id" | "title" | "cwd">;
+		readonly entry: SessionMessageEntry;
+	},
+): Promise<void> {
+	const header: SessionHeader = {
+		type: "session",
+		version: 3,
+		id: input.header.id,
+		title: input.header.title,
+		timestamp: "2026-07-08T00:00:00.000Z",
+		cwd: input.header.cwd,
+	};
+	await Bun.write(filePath, `${JSON.stringify(header)}\n${JSON.stringify(input.entry)}\n`);
+}

@@ -108,6 +108,15 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 		};
 	}
 
+	if (!Array.isArray(input.request.messages)) {
+		return errorResult(
+			400,
+			"invalid_request_error",
+			"invalid_request_body",
+			"Request body must include a messages array.",
+		);
+	}
+
 	const prompt = latestUserText(input.request.messages);
 	if (prompt === null) {
 		return errorResult(

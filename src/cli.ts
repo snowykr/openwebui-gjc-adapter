@@ -7,7 +7,8 @@ import type { AdapterHealthCheck } from "./health";
 import type { LiveGatewayEventSink, LiveGatewayMessageSink } from "./live/chat-completions";
 import { createGjcRoutingLiveGatewayRunner } from "./live/gjc-routing-runner";
 import { buildOpenWebUIAuthStartupDiagnostic, type OpenWebUIOwnerContext } from "./openwebui/auth";
-import { OpenWebUIHttpClient } from "./openwebui/client";
+import { OpenWebUIHttpClient, type OpenWebUIProjectionRepository } from "./openwebui/client";
+import { syncProjectSessionsToOpenWebUI } from "./projection/session-sync";
 import { type RegisteredProject, registerProjectDirectory } from "./projects/registry";
 import { resolveAllowedRoots } from "./security/paths";
 import { type AdapterServerHandle, type AdapterServerOptions, startAdapterServer } from "./server";
@@ -19,6 +20,7 @@ export interface BuildAdapterServerOptionsDependencies {
 	readonly mappings?: SessionMappingStore;
 	readonly eventSink?: LiveGatewayEventSink;
 	readonly messageSink?: LiveGatewayMessageSink;
+	readonly projectionRepository?: OpenWebUIProjectionRepository;
 }
 
 export async function buildAdapterServerOptionsFromEnv(
@@ -32,6 +34,15 @@ export async function buildAdapterServerOptionsFromEnv(
 		dependencies.turnRunner ?? createGjcRpcTurnRunner({ cliPath: resolveGjcCliPath(config.gjcCommand) });
 	const mappings = dependencies.mappings ?? new FileBackedSessionMappingStore(buildSessionMappingStorePath(config));
 	const openWebUIClient = buildOpenWebUIClient(config);
+	const projectionRepository = dependencies.projectionRepository ?? openWebUIClient;
+	if (projectionRepository !== undefined) {
+		await syncProjectSessionsToOpenWebUI({
+			repository: projectionRepository,
+			ownerUserId: owner.ownerUserId,
+			projects,
+			mappings,
+		});
+	}
 	const eventSink = dependencies.eventSink ?? buildOpenWebUIEventSink(openWebUIClient);
 	const messageSink = dependencies.messageSink ?? buildOpenWebUIMessageSink(openWebUIClient);
 	return {

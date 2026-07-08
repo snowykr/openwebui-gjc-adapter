@@ -86,7 +86,6 @@ const mergeAdapterMetadata = (existing: OpenWebUIMetadata, next: OpenWebUIMetada
 	...next,
 	...existing,
 	[OPENWEBUI_METADATA_NAMESPACE]: {
-		...((existing[OPENWEBUI_METADATA_NAMESPACE] as OpenWebUIMetadata | undefined) ?? {}),
 		...((next[OPENWEBUI_METADATA_NAMESPACE] as OpenWebUIMetadata | undefined) ?? {}),
 	},
 });

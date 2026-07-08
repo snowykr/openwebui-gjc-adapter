@@ -29,6 +29,7 @@ class FakeGjcTurnRunner implements GjcTurnRunner {
 		rawFrameCursor: 7,
 		eventCursor: 3,
 	};
+	events: GjcTurnResult["events"] = [{ type: "assistant", text: "assistant from gjc" }];
 
 	async startNewSession(input: GjcStartNewSessionInput): Promise<GjcSessionAddress & GjcTurnResult> {
 		this.starts.push(input);
@@ -39,7 +40,7 @@ class FakeGjcTurnRunner implements GjcTurnRunner {
 			chatId: input.chatId,
 			sessionId: "session-1",
 			text: `new:${input.text}`,
-			events: [{ type: "assistant", text: `new:${input.text}` }],
+			events: this.events,
 			sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
 			activeLeaf: "leaf-1",
 			rawFrameCursor: 7,
@@ -51,7 +52,7 @@ class FakeGjcTurnRunner implements GjcTurnRunner {
 		this.continues.push(input);
 		return {
 			text: `continued:${input.text}`,
-			events: [{ type: "assistant", text: `continued:${input.text}` }],
+			events: this.events,
 			sessionFile: input.sessionFile,
 			activeLeaf: "leaf-2",
 			rawFrameCursor: input.rawFrameCursor + 5,

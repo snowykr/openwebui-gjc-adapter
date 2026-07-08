@@ -97,9 +97,8 @@ describe("project registry primitives", () => {
 		expect(buildProjectFolderMetadata(project)).toEqual({
 			gjc_adapter: {
 				projectId: "workspace",
-				cwd: await fs.realpath(workspace),
 				modelId: "gjc/workspace",
-				sessionRoot: path.join(await fs.realpath(workspace), ".gjc", "sessions"),
+				projectName: "Workspace",
 			},
 		});
 	});
