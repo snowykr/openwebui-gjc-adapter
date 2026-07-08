@@ -5,6 +5,7 @@ import * as path from "node:path";
 import {
 	buildProjectFolderMetadata,
 	createProjectId,
+	disambiguateRegisteredProjects,
 	listProjectModels,
 	registerProjectDirectory,
 } from "../src/projects/registry";
@@ -29,6 +30,27 @@ describe("project registry primitives", () => {
 		expect(project.id).toBe("my-app");
 		expect(project.name).toBe("My App!");
 		expect(project.modelId).toBe("gjc/my-app");
+	});
+
+	test("disambiguates registered projects with the same display slug by real cwd", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-project-collision-"));
+		const firstDirectory = path.join(workspace, "alpha", "Same");
+		const secondDirectory = path.join(workspace, "beta", "Same");
+		await fs.mkdir(firstDirectory, { recursive: true });
+		await fs.mkdir(secondDirectory, { recursive: true });
+		const allowedRoots = await resolveAllowedRoots([workspace]);
+		const firstProject = await registerProjectDirectory({ cwd: firstDirectory }, allowedRoots);
+		const secondProject = await registerProjectDirectory({ cwd: secondDirectory }, allowedRoots);
+
+		const projects = disambiguateRegisteredProjects([firstProject, secondProject]);
+
+		expect(projects.map(project => project.name)).toEqual(["Same", "Same"]);
+		expect(new Set(projects.map(project => project.id)).size).toBe(2);
+		expect(new Set(projects.map(project => project.modelId)).size).toBe(2);
+		expect(projects.every(project => project.id.startsWith("same-"))).toBe(true);
+		expect(projects.map(project => buildProjectFolderMetadata(project).gjc_adapter.projectId)).toEqual(
+			projects.map(project => project.id),
+		);
 	});
 
 	test("realpath-validates cwd against allowed roots", async () => {

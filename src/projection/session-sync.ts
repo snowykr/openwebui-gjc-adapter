@@ -84,7 +84,7 @@ export async function syncProjectSessionsToOpenWebUI(
 					project: projectReference,
 					projectedChat: {
 						...projectedChat,
-						...(existingChatId === undefined ? {} : { openWebUIChatId: existingChatId }),
+						openWebUIChatId: existingChatId ?? historicalChatId(project.id, loaded.header.id),
 					},
 				});
 				input.mappings?.upsert({
@@ -121,6 +121,10 @@ function projectedProjectReference(project: RegisteredProject): ProjectedProject
 		...(project.openWebUIFolderId === undefined ? {} : { folderId: project.openWebUIFolderId }),
 		metadata: { ...buildProjectFolderMetadata(project) },
 	};
+}
+
+function historicalChatId(projectId: string, sessionId: string): string {
+	return `gjc-project-${projectId}-session-${sessionId}`;
 }
 
 async function listSessionFiles(project: RegisteredProject): Promise<readonly string[]> {

@@ -2,12 +2,12 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { SessionHeader, SessionMessageEntry } from "@gajae-code/coding-agent";
 import { SessionMappingStore } from "../src/gjc/session-router";
 import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
 import { syncProjectSessionsToOpenWebUI } from "../src/projection/session-sync";
 import { registerProjectDirectory } from "../src/projects/registry";
 import { resolveAllowedRoots } from "../src/security/paths";
+import { messageEntry, writeSessionFile } from "./session-sync-fixtures";
 
 const tempDirs: string[] = [];
 
@@ -49,14 +49,14 @@ describe("syncProjectSessionsToOpenWebUI", () => {
 				{
 					projectId: "project-one",
 					sessionId: "session-one",
-					chatId: "gjc-session-session-one",
+					chatId: "gjc-project-project-one-session-session-one",
 					folderId: "gjc-project-project-one",
 					messageCount: 2,
 				},
 			],
 			skipped: [],
 		});
-		const chat = await repository.getChat("owner-1", "gjc-session-session-one");
+		const chat = await repository.getChat("owner-1", "gjc-project-project-one-session-session-one");
 		expect(chat).toMatchObject({
 			folder_id: "gjc-project-project-one",
 			title: "Imported One",
@@ -70,7 +70,7 @@ describe("syncProjectSessionsToOpenWebUI", () => {
 		]);
 		expect(mappings.entries()).toMatchObject([
 			{
-				chatId: "gjc-session-session-one",
+				chatId: "gjc-project-project-one-session-session-one",
 				projectId: "project-one",
 				sessionId: "session-one",
 				rawFrameCursor: 0,
@@ -121,8 +121,12 @@ describe("syncProjectSessionsToOpenWebUI", () => {
 				code: "empty_session_file",
 			}),
 		]);
-		expect((await repository.getChat("owner-1", "gjc-session-session-a"))?.folder_id).toBe("gjc-project-project-a");
-		expect((await repository.getChat("owner-1", "gjc-session-session-b"))?.folder_id).toBe("gjc-project-project-b");
+		expect((await repository.getChat("owner-1", "gjc-project-project-a-session-session-a"))?.folder_id).toBe(
+			"gjc-project-project-a",
+		);
+		expect((await repository.getChat("owner-1", "gjc-project-project-b-session-session-b"))?.folder_id).toBe(
+			"gjc-project-project-b",
+		);
 	});
 
 	test("skips duplicate session ids in one project instead of overwriting imported history", async () => {
@@ -160,7 +164,7 @@ describe("syncProjectSessionsToOpenWebUI", () => {
 				code: "duplicate_session_id",
 			}),
 		]);
-		const chat = await repository.getChat("owner-1", "gjc-session-session-duplicate");
+		const chat = await repository.getChat("owner-1", "gjc-project-project-duplicate-session-session-duplicate");
 		expect(Object.values(chat?.history.messages ?? {}).map(message => message.content)).toEqual(["first history"]);
 	});
 
@@ -212,57 +216,3 @@ describe("syncProjectSessionsToOpenWebUI", () => {
 		});
 	});
 });
-
-async function writeSessionFile(
-	filePath: string,
-	input: {
-		readonly header: Pick<SessionHeader, "id" | "title" | "cwd">;
-		readonly entries: readonly SessionMessageEntry[];
-	},
-): Promise<void> {
-	const header: SessionHeader = {
-		type: "session",
-		version: 3,
-		id: input.header.id,
-		title: input.header.title,
-		timestamp: "2026-07-08T00:00:00.000Z",
-		cwd: input.header.cwd,
-	};
-	await Bun.write(filePath, `${[header, ...input.entries].map(entry => JSON.stringify(entry)).join("\n")}\n`);
-}
-
-function messageEntry(
-	id: string,
-	parentId: string | null,
-	role: "user" | "assistant",
-	content: string,
-): SessionMessageEntry {
-	return {
-		type: "message",
-		id,
-		parentId,
-		timestamp: "2026-07-08T00:00:00.000Z",
-		message: agentMessage(role, content),
-	};
-}
-
-function agentMessage(role: "user" | "assistant", content: string): SessionMessageEntry["message"] {
-	if (role === "user") return { role, content, timestamp: 1 };
-	return {
-		role,
-		content: [{ type: "text", text: content }],
-		api: "openai-responses",
-		provider: "gjc",
-		model: "gjc-test",
-		usage: {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 0,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
-		stopReason: "stop",
-		timestamp: 1,
-	};
-}

@@ -9,7 +9,7 @@ import { createGjcRoutingLiveGatewayRunner } from "./live/gjc-routing-runner";
 import { buildOpenWebUIAuthStartupDiagnostic, type OpenWebUIOwnerContext } from "./openwebui/auth";
 import { OpenWebUIHttpClient, type OpenWebUIProjectionRepository } from "./openwebui/client";
 import { syncProjectSessionsToOpenWebUI } from "./projection/session-sync";
-import { type RegisteredProject, registerProjectDirectory } from "./projects/registry";
+import { disambiguateRegisteredProjects, type RegisteredProject, registerProjectDirectory } from "./projects/registry";
 import { resolveAllowedRoots } from "./security/paths";
 import { type AdapterServerHandle, type AdapterServerOptions, startAdapterServer } from "./server";
 
@@ -83,7 +83,7 @@ async function loadConfiguredProjects(config: AdapterConfig): Promise<Registered
 			),
 		);
 	}
-	return projects;
+	return [...disambiguateRegisteredProjects(projects)];
 }
 
 function buildRuntimeHealthChecks(config: AdapterConfig): AdapterHealthCheck[] {

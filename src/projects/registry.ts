@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as path from "node:path";
 import { type AllowedRoot, assertPathInsideAllowedRoots } from "../security/paths";
 
@@ -44,6 +45,18 @@ export function createProjectId(nameOrCwd: string): string {
 		.replace(/^-+|-+$/g, "");
 
 	return slug.length > 0 ? slug : "project";
+}
+
+export function disambiguateRegisteredProjects(projects: readonly RegisteredProject[]): readonly RegisteredProject[] {
+	const counts = new Map<string, number>();
+	for (const project of projects) {
+		counts.set(project.id, (counts.get(project.id) ?? 0) + 1);
+	}
+	return projects.map(project => {
+		if ((counts.get(project.id) ?? 0) <= 1) return project;
+		const id = `${project.id}-${projectPathFingerprint(project.cwd)}`;
+		return { ...project, id, modelId: `gjc/${id}` };
+	});
 }
 
 export async function registerProjectDirectory(
@@ -101,4 +114,8 @@ function findAllowedRoot(cwd: string, allowedRoots: readonly AllowedRoot[]): str
 function isPathInsideRoot(targetPath: string, rootPath: string): boolean {
 	const relativePath = path.relative(rootPath, targetPath);
 	return relativePath === "" || (!relativePath.startsWith("..") && !path.isAbsolute(relativePath));
+}
+
+function projectPathFingerprint(cwd: string): string {
+	return createHash("sha256").update(cwd).digest("hex").slice(0, 8);
 }

@@ -166,7 +166,7 @@ describe("adapter CLI service", () => {
 			{ turnRunner: new FakeGjcTurnRunner(), projectionRepository: repository, mappings },
 		);
 
-		const chat = await repository.getChat("owner-test", "gjc-session-session-import");
+		const chat = await repository.getChat("owner-test", "gjc-project-demo-project-session-session-import");
 		expect(chat).toMatchObject({
 			folder_id: "gjc-project-demo-project",
 			title: "Imported From Disk",
@@ -174,7 +174,7 @@ describe("adapter CLI service", () => {
 		expect(chat?.history.messages["gjc-session-session-import-message-user-import"]?.content).toBe("load me");
 		expect(mappings.entries()).toMatchObject([
 			{
-				chatId: "gjc-session-session-import",
+				chatId: "gjc-project-demo-project-session-session-import",
 				projectId: "demo-project",
 				sessionId: "session-import",
 			},
