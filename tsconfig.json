@@ -1,0 +1,25 @@
+{
+	"compilerOptions": {
+		"target": "ES2024",
+		"module": "ESNext",
+		"lib": ["ES2024", "DOM.AsyncIterable"],
+		"moduleResolution": "Bundler",
+		"moduleDetection": "force",
+		"strict": true,
+		"skipLibCheck": true,
+		"allowArbitraryExtensions": true,
+		"verbatimModuleSyntax": true,
+		"noEmit": true,
+		"declaration": true,
+		"declarationMap": true,
+		"sourceMap": true,
+		"inlineSources": true,
+		"resolveJsonModule": true,
+		"esModuleInterop": true,
+		"forceConsistentCasingInFileNames": true,
+		"types": ["bun"],
+		"assumeChangesOnlyAffectDirectDependencies": true
+	},
+	"include": ["src", "test"],
+	"exclude": ["node_modules", "dist"]
+}

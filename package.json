@@ -1,0 +1,86 @@
+{
+	"type": "module",
+	"name": "openwebui-gjc-adapter",
+	"version": "0.1.0",
+	"description": "GJC-primary OpenWebUI adapter with OpenAI-compatible live gateway",
+	"homepage": "https://github.com/snowykr/openwebui-gjc-adapter#readme",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/snowykr/openwebui-gjc-adapter.git"
+	},
+	"bugs": {
+		"url": "https://github.com/snowykr/openwebui-gjc-adapter/issues"
+	},
+	"packageManager": "bun@1.3.14",
+	"main": "./src/index.ts",
+	"types": "./src/index.ts",
+	"scripts": {
+		"check": "biome check . && bun run check:types",
+		"check:types": "tsgo -p tsconfig.json --noEmit",
+		"lint": "biome lint .",
+		"test": "bun test",
+		"fix": "biome check --write --unsafe .",
+		"fmt": "biome format --write ."
+	},
+	"dependencies": {
+		"@gajae-code/ai": "0.9.0",
+		"@gajae-code/coding-agent": "0.9.0"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.4.14",
+		"@types/bun": "^1.3.14",
+		"@typescript/native-preview": "7.0.0-dev.20260505.1",
+		"typescript": "^6.0.3"
+	},
+	"engines": {
+		"bun": ">=1.3.14"
+	},
+	"files": [
+		"src",
+		"README.md",
+		"CHANGELOG.md"
+	],
+	"exports": {
+		".": {
+			"types": "./src/index.ts",
+			"import": "./src/index.ts"
+		},
+		"./*": {
+			"types": "./src/*.ts",
+			"import": "./src/*.ts"
+		},
+		"./branches/*": {
+			"types": "./src/branches/*.ts",
+			"import": "./src/branches/*.ts"
+		},
+		"./openwebui/*": {
+			"types": "./src/openwebui/*.ts",
+			"import": "./src/openwebui/*.ts"
+		},
+		"./state/*": {
+			"types": "./src/state/*.ts",
+			"import": "./src/state/*.ts"
+		},
+		"./security/*": {
+			"types": "./src/security/*.ts",
+			"import": "./src/security/*.ts"
+		},
+		"./gjc/*": {
+			"types": "./src/gjc/*.ts",
+			"import": "./src/gjc/*.ts"
+		},
+		"./live/*": {
+			"types": "./src/live/*.ts",
+			"import": "./src/live/*.ts"
+		},
+		"./projection/*": {
+			"types": "./src/projection/*.ts",
+			"import": "./src/projection/*.ts"
+		},
+		"./projects/*": {
+			"types": "./src/projects/*.ts",
+			"import": "./src/projects/*.ts"
+		}
+	}
+}
