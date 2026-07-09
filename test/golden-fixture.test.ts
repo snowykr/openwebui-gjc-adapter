@@ -2,19 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Message } from "@gajae-code/ai";
-import type { SessionEntry, SessionHeader, SessionMessageEntry } from "@gajae-code/coding-agent";
 import { resolveBranchRegenerateAction } from "../src/branches/regenerate";
-import type {
-	GjcContinueSessionInput,
-	GjcSessionAddress,
-	GjcSessionState,
-	GjcSessionStateInput,
-	GjcStartNewSessionInput,
-	GjcSwitchSessionInput,
-	GjcTurnResult,
-	GjcTurnRunner,
-} from "../src/gjc/rpc-runner";
 import { FileBackedSessionMappingStore } from "../src/gjc/session-router";
 import { handleChatCompletions } from "../src/live/chat-completions";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
@@ -39,9 +27,17 @@ import { registerProjectDirectory } from "../src/projects/registry";
 import { resolveAllowedRoots } from "../src/security/paths";
 import { FileBackedOutboxStore } from "../src/state/outbox";
 import { reconcilePendingOperations } from "../src/state/reconciler";
-
-const ownerUserId = "owner-1";
-const createdAt = new Date("2026-07-08T00:00:00.000Z");
+import {
+	createdAt,
+	deliveredEvents,
+	failGate,
+	GoldenTurnRunner,
+	goldenEntries,
+	goldenHeader,
+	liveHeaders,
+	ownerUserId,
+	sseInput,
+} from "./golden-fixture-fixtures";
 
 describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 	test("projects historical sessions, live events, gates, artifacts, routing, crash repair, and safe lineage", async () => {
@@ -65,23 +61,8 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 		const project = await registerProjectDirectory({ cwd, name: "Golden" }, allowedRoots, createdAt);
 		expect(buildModelList([project]).data[0]).toMatchObject({ id: "gjc", owned_by: "gjc" });
 
-		const header: SessionHeader = {
-			type: "session",
-			version: 3,
-			id: "session-golden",
-			title: "Golden session",
-			timestamp: "2026-07-08T00:00:00.000Z",
-			cwd,
-		};
-		const entries: SessionEntry[] = [
-			messageEntry("u-root", null, "user", "Register this project"),
-			customEntry("migration-v2", "u-root", "migration", { from: "legacy-openwebui-chat" }),
-			messageEntry("a-left", "migration-v2", "assistant", "Imported branch"),
-			messageEntry("a-right", "u-root", "assistant", "Active branch"),
-			customEntry("blob-ref", "a-right", "blob", { bytes: 1048576, path: "blob://cold" }),
-			customEntry("cold-spill", "blob-ref", "cold-spill", { reason: "large transcript" }),
-			messageEntry("u-leaf", "cold-spill", "user", "Continue live"),
-		];
+		const header = goldenHeader(cwd);
+		const entries = goldenEntries();
 		const projected = projectGjcSessionToOpenWebUIChat({ sessionFile, header, entries });
 		expect(projected.history.currentId).toBe("u-leaf");
 		expect(projected.history.messages["u-root"]?.childrenIds).toEqual(["a-left", "a-right"]);
@@ -264,103 +245,3 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 		expect(await Bun.file(sessionFile).text()).toBe(originalJsonl);
 	});
 });
-
-const sseInput = { id: "chatcmpl-golden", created: 1783468800, model: "gjc/golden" };
-const deliveredEvents: { events: readonly { type: string }[] }[] = [];
-
-class GoldenTurnRunner implements GjcTurnRunner {
-	readonly starts: GjcStartNewSessionInput[] = [];
-	readonly continues: GjcContinueSessionInput[] = [];
-	readonly switches: GjcSwitchSessionInput[] = [];
-	readonly states: GjcSessionStateInput[] = [];
-
-	constructor(private readonly sessionFile: string) {}
-
-	async startNewSession(input: GjcStartNewSessionInput): Promise<GjcSessionAddress & GjcTurnResult> {
-		this.starts.push(input);
-		return {
-			cwd: input.cwd,
-			sessionRoot: input.sessionRoot,
-			projectId: input.projectId,
-			chatId: input.chatId,
-			sessionId: "session-live",
-			text: "started",
-			events: [{ type: "tool_execution_end", text: "Tool finished", id: "tool-1" }],
-			sessionFile: this.sessionFile,
-			activeLeaf: "assistant-1",
-			rawFrameCursor: 1,
-			eventCursor: 1,
-		};
-	}
-
-	async continueSession(input: GjcContinueSessionInput): Promise<GjcTurnResult> {
-		this.continues.push(input);
-		return {
-			text: "continued",
-			events: [{ type: "workflow_gate", text: "Approve continuation", id: "gate-live" }],
-			sessionFile: input.sessionFile,
-			activeLeaf: "assistant-2",
-			rawFrameCursor: input.rawFrameCursor + 1,
-			eventCursor: input.eventCursor + 1,
-		};
-	}
-
-	async switchSession(input: GjcSwitchSessionInput): Promise<void> {
-		this.switches.push(input);
-	}
-
-	async getState(input: GjcSessionStateInput): Promise<GjcSessionState> {
-		this.states.push(input);
-		return { sessionFile: input.sessionFile, activeLeaf: "assistant-1", rawFrameCursor: 1, eventCursor: 1 };
-	}
-}
-
-function liveHeaders(
-	chatId: string,
-	messageId: string,
-	userMessageId: string,
-	parentId: string | null,
-): Record<string, string> {
-	return {
-		"X-OpenWebUI-Chat-Id": chatId,
-		"X-OpenWebUI-Message-Id": messageId,
-		"X-OpenWebUI-User-Message-Id": userMessageId,
-		"X-OpenWebUI-User-Message-Parent-Id": parentId ?? "",
-		"X-OpenWebUI-User-Id": ownerUserId,
-	};
-}
-
-function messageEntry(
-	id: string,
-	parentId: string | null,
-	role: Message["role"],
-	content: Message["content"],
-): SessionMessageEntry {
-	return {
-		type: "message",
-		id,
-		parentId,
-		timestamp: "2026-07-08T00:00:00.000Z",
-		message: { role, content, timestamp: 1783468800000 } as Message,
-	};
-}
-
-function customEntry(
-	id: string,
-	parentId: string | null,
-	customType: string,
-	data: Record<string, unknown>,
-): SessionEntry {
-	return {
-		type: "custom",
-		id,
-		parentId,
-		timestamp: "2026-07-08T00:00:00.000Z",
-		customType,
-		data,
-	} as SessionEntry;
-}
-
-function failGate() {
-	throw new Error("expected pending gate");
-}
