@@ -101,6 +101,15 @@ describe("adapter CLI service", () => {
 		const turnRunner = new FakeGjcTurnRunner();
 		turnRunner.events = [{ type: "tool_execution_start", id: "tool-1", text: "bash" }];
 		const delivered: LiveGatewayEventDeliveryInput[] = [];
+		const repository = new InMemoryOpenWebUIProjectionRepository();
+		await repository.upsertChat({
+			id: "chat-1",
+			owner_user_id: "owner-test",
+			folder_id: "gjc-project-demo-project",
+			title: "Demo Project chat",
+			metadata: {},
+			history: { currentId: null, messages: {} },
+		});
 		const options = await buildAdapterServerOptionsFromEnv(
 			{
 				...process.env,
@@ -115,6 +124,7 @@ describe("adapter CLI service", () => {
 			},
 			{
 				turnRunner,
+				projectionRepository: repository,
 				eventSink: input => {
 					delivered.push(input);
 				},

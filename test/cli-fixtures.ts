@@ -99,7 +99,7 @@ export function chatRequest(
 	return new Request("http://adapter.test/v1/chat/completions", {
 		method: "POST",
 		headers,
-		body: JSON.stringify({ model: "gjc/demo-project", messages: [{ role: "user", content: "hello" }] }),
+		body: JSON.stringify({ model: "gjc", messages: [{ role: "user", content: "hello" }] }),
 	});
 }
 

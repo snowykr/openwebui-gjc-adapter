@@ -42,7 +42,7 @@ Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. B
 
 ## Registering projects
 
-Register one project per working directory. The adapter validates the real path against an allowed root before exposing the project as a model and OpenWebUI folder.
+Register one project per working directory. The adapter validates the real path against an allowed root before exposing the project as an OpenWebUI folder/projection.
 
 For the service entrypoint, set `GJC_OPENWEBUI_PROJECTS` to a semicolon-separated list of `cwd|name|folderId|sessionRoot` entries. Only `cwd` is required; configured paths must resolve under `GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS`.
 
@@ -59,9 +59,9 @@ const project = await registerProjectDirectory(
 );
 ```
 
-The model id is `gjc/<project-name>` by default. Historical imports place projected sessions under folder id `gjc-project-<project-id>` and chat id `gjc-project-<project-id>-session-<session-id>` unless OpenWebUI assigns runtime ids.
+OpenWebUI should use the stable `gjc` model id. Project folders are not advertised as models; the adapter resolves the GJC working directory from the OpenWebUI chat folder. Historical imports place projected sessions under folder id `gjc-project-<project-id>` and chat id `gjc-project-<project-id>-session-<session-id>` unless OpenWebUI assigns runtime ids.
 
-Inside OpenWebUI, use the `gjc/projects` model for project administration:
+Inside OpenWebUI, send these slash-style commands in a normal `gjc` chat for project administration:
 
 ```text
 /gjc project link /home/me/src/my-repo

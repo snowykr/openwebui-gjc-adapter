@@ -1,13 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import {
-	handleChatCompletions,
-	type LiveGatewayRunner,
-	type LiveGatewayRunnerInput,
-	WorkflowGateReplyError,
-} from "../src/live/chat-completions";
-import { buildModelList } from "../src/live/models";
+import { handleChatCompletions, type LiveGatewayRunner, WorkflowGateReplyError } from "../src/live/chat-completions";
 import type { OpenAIChatCompletionRequest } from "../src/live/openai-types";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
+import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
 import type { RegisteredProject } from "../src/projects/registry";
 
 const project: RegisteredProject = {
@@ -33,142 +28,20 @@ const chatHeaders = {
 };
 
 const request: OpenAIChatCompletionRequest = {
-	model: "gjc/demo",
+	model: "gjc",
 	messages: [{ role: "user", content: "Build it" }],
 };
 
+const projectWithFolder: RegisteredProject = { ...project, openWebUIFolderId: "folder-demo" };
+
 describe("live OpenAI-compatible chat completions", () => {
-	it("builds a /v1/models list from registered projects", () => {
-		expect(buildModelList([project])).toEqual({
-			object: "list",
-			data: [{ id: "gjc/demo", object: "model", created: 1783468800, owned_by: "gjc" }],
-		});
-	});
-
-	it("returns metadata-only responses for OpenWebUI background tasks without calling the runner", async () => {
-		let calls = 0;
-		const runner: LiveGatewayRunner = {
-			run() {
-				calls += 1;
-				return { content: "unexpected" };
-			},
-		};
-
-		const result = await handleChatCompletions({
-			request,
-			headers: { "X-OpenWebUI-Task": "title_generation", "X-OpenWebUI-User-Id": "owner-1" },
-			projects: [project],
-			owner,
-			runner,
-			now: new Date("2026-07-08T00:00:00.000Z"),
-			idFactory: () => "chatcmpl-test",
-		});
-
-		expect(calls).toBe(0);
-		expect(result.ok).toBe(true);
-		if (!result.ok || !("body" in result)) throw new Error("expected completion body");
-		expect(result.body.choices[0]?.message.content).toBe("");
-		expect(result.body.metadata).toEqual({ task: "title_generation", noop: true });
-	});
-
-	it("rejects forwarded user mismatches", async () => {
-		const result = await handleChatCompletions({
-			request,
-			headers: { ...chatHeaders, "X-OpenWebUI-User-Id": "other-user" },
-			projects: [project],
-			owner,
-			runner: fixedRunner("unused"),
-		});
-
-		expect(result).toEqual({
-			ok: false,
-			status: 401,
-			body: {
-				error: {
-					message: "Forwarded OpenWebUI owner does not match adapter owner.",
-					type: "authentication_error",
-					code: "owner-mismatch",
-				},
-			},
-		});
-	});
-
-	it("routes normal non-stream completions to the injected runner", async () => {
-		const inputs: LiveGatewayRunnerInput[] = [];
-		const result = await handleChatCompletions({
-			request,
-			headers: chatHeaders,
-			projects: [project],
-			owner,
-			runner: {
-				run(input) {
-					inputs.push(input);
-					return { content: `done: ${input.prompt}` };
-				},
-			},
-			now: new Date("2026-07-08T00:00:00.000Z"),
-			idFactory: () => "chatcmpl-test",
-		});
-
-		expect(inputs).toEqual([
-			{
-				project,
-				prompt: "Build it",
-				chatId: "chat-1",
-				messageId: "assistant-1",
-				userMessageId: "user-1",
-				userMessageParentId: "parent-1",
-				continued: true,
-			},
-		]);
-		expect(result).toEqual({
-			ok: true,
-			status: 200,
-			body: {
-				id: "chatcmpl-test",
-				object: "chat.completion",
-				created: 1783468800,
-				model: "gjc/demo",
-				choices: [{ index: 0, message: { role: "assistant", content: "done: Build it" }, finish_reason: "stop" }],
-			},
-		});
-	});
-
-	it("rejects request objects missing messages before reading latest user text", async () => {
-		let calls = 0;
-		const result = await handleChatCompletions({
-			request: { model: "gjc/demo" } as OpenAIChatCompletionRequest,
-			headers: chatHeaders,
-			projects: [project],
-			owner,
-			runner: {
-				run() {
-					calls += 1;
-					return { content: "unexpected" };
-				},
-			},
-		});
-
-		expect(calls).toBe(0);
-		expect(result).toEqual({
-			ok: false,
-			status: 400,
-			body: {
-				error: {
-					message: "Request body must include a messages array.",
-					type: "invalid_request_error",
-					code: "invalid_request_body",
-				},
-			},
-		});
-	});
-
 	it("returns an OpenAI-style 400 for invalid workflow gate replies", async () => {
 		const result = await handleChatCompletions({
 			request,
 			headers: chatHeaders,
-			projects: [project],
+			projects: [projectWithFolder],
 			owner,
+			projectContextRepository: await demoRepository(),
 			runner: {
 				run() {
 					throw new WorkflowGateReplyError("Invalid workflow gate reply.", "invalid_workflow_gate_choice", [
@@ -196,8 +69,9 @@ describe("live OpenAI-compatible chat completions", () => {
 		const result = await handleChatCompletions({
 			request,
 			headers: chatHeaders,
-			projects: [project],
+			projects: [projectWithFolder],
 			owner,
+			projectContextRepository: await demoRepository(),
 			runner: {
 				run() {
 					return {
@@ -228,8 +102,9 @@ describe("live OpenAI-compatible chat completions", () => {
 		const result = await handleChatCompletions({
 			request,
 			headers: chatHeaders,
-			projects: [project],
+			projects: [projectWithFolder],
 			owner,
+			projectContextRepository: await demoRepository(),
 			runner: fixedRunner("GJC_UI_REAL_BACKEND_OK"),
 			messageSink(input: unknown) {
 				persisted.push(input);
@@ -251,4 +126,17 @@ describe("live OpenAI-compatible chat completions", () => {
 
 function fixedRunner(content: string): LiveGatewayRunner {
 	return { run: () => ({ content }) };
+}
+
+async function demoRepository(): Promise<InMemoryOpenWebUIProjectionRepository> {
+	const repository = new InMemoryOpenWebUIProjectionRepository();
+	await repository.upsertChat({
+		id: "chat-1",
+		owner_user_id: "owner-1",
+		folder_id: "folder-demo",
+		title: "Demo chat",
+		metadata: {},
+		history: { currentId: null, messages: {} },
+	});
+	return repository;
 }

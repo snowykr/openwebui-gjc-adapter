@@ -2,13 +2,13 @@ import { buildModelList } from "../live/models";
 import type {
 	OpenAIChatCompletionRequest,
 	OpenAIChatCompletionResponse,
-	OpenAIModelEntry,
 	OpenAIModelListResponse,
 } from "../live/openai-types";
+import { GJC_OPENWEBUI_MODEL_ID } from "../live/project-context";
 import { type OpenWebUIOwnerContext, validateForwardedOwnerUserId } from "../openwebui/auth";
 import type { OpenWebUIHeaderInput } from "../openwebui/headers";
 import { parseOpenWebUIHeaders } from "../openwebui/headers";
-import { ADMIN_PROJECT_MODEL_ID, ProjectLinkError, type ProjectLinkService } from "./link-service";
+import { ProjectLinkError, type ProjectLinkService } from "./link-service";
 import type { RegisteredProject } from "./registry";
 
 export interface ProjectAdminRouteResult {
@@ -28,9 +28,9 @@ export function buildProjectModelList(
 	projects: readonly RegisteredProject[],
 	includeProjectAdmin: boolean,
 ): OpenAIModelListResponse {
-	const projectModels = buildModelList(projects).data;
-	if (!includeProjectAdmin) return { object: "list", data: projectModels };
-	return { object: "list", data: [adminProjectModelEntry(), ...projectModels] };
+	void projects;
+	void includeProjectAdmin;
+	return buildModelList();
 }
 
 export async function parseProjectAdminJsonRequest(request: Request): Promise<ProjectAdminJsonResult> {
@@ -115,6 +115,11 @@ export async function handleProjectAdminChatCompletion(
 	}
 }
 
+export function isProjectAdminChatCompletionRequest(request: OpenAIChatCompletionRequest): boolean {
+	const command = latestUserText(request);
+	return request.model === GJC_OPENWEBUI_MODEL_ID && (command?.startsWith("/gjc project ") ?? false);
+}
+
 function parseProjectLinkBody(body: unknown):
 	| {
 			readonly ok: true;
@@ -159,19 +164,19 @@ async function executeProjectCommand(service: ProjectLinkService, command: strin
 		await service.reconcileOpenWebUIFolderLinks();
 		const projects = service.listProjects();
 		if (projects.length === 0) return "No GJC projects are linked.";
-		return projects.map(project => `${project.status}: ${project.modelId} ${project.cwd}`).join("\n");
+		return projects.map(project => `${project.status}: ${project.id} ${project.cwd}`).join("\n");
 	}
 	const linkPrefix = "/gjc project link ";
 	if (command.startsWith(linkPrefix)) {
 		const cwd = command.slice(linkPrefix.length).trim();
 		const result = await service.linkProject({ cwd });
-		return `Linked ${result.project.modelId}. Imported ${result.sync.imported.length} session(s).`;
+		return `Linked ${result.project.id}. Imported ${result.sync.imported.length} session(s).`;
 	}
 	const unlinkPrefix = "/gjc project unlink ";
 	if (command.startsWith(unlinkPrefix)) {
 		const projectId = command.slice(unlinkPrefix.length).trim();
 		const result = await service.unlinkProject(projectId);
-		return `Unlinked ${result.project.modelId}. Local GJC files were left untouched.`;
+		return `Unlinked ${result.project.id}. Local GJC files were left untouched.`;
 	}
 	throw new ProjectLinkError(
 		"Supported commands: /gjc project list, /gjc project link <path>, /gjc project unlink <id>.",
@@ -201,17 +206,8 @@ function chatResponse(content: string): OpenAIChatCompletionResponse {
 		id: `chatcmpl-${Date.now()}`,
 		object: "chat.completion",
 		created: Math.floor(Date.now() / 1000),
-		model: ADMIN_PROJECT_MODEL_ID,
+		model: GJC_OPENWEBUI_MODEL_ID,
 		choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
-	};
-}
-
-function adminProjectModelEntry(): OpenAIModelEntry {
-	return {
-		id: ADMIN_PROJECT_MODEL_ID,
-		object: "model",
-		created: 1783468800,
-		owned_by: "gjc",
 	};
 }
 

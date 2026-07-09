@@ -1,83 +1,27 @@
-import { type OpenWebUIOwnerContext, validateForwardedOwnerUserId } from "../openwebui/auth";
-import type { OpenWebUIMessageEvent } from "../openwebui/events";
-import type { OpenWebUIHeaderInput } from "../openwebui/headers";
+import { validateForwardedOwnerUserId } from "../openwebui/auth";
 import { parseOpenWebUIHeaders } from "../openwebui/headers";
-import type { RegisteredProject } from "../projects/registry";
+import {
+	type HandleChatCompletionsInput,
+	type LiveChatCompletionsResult,
+	type LiveGatewayRunnerResult,
+	LiveGatewayUnavailableError,
+	WorkflowGateReplyError,
+} from "./chat-completions-types";
 import { latestUserText } from "./chat-content";
-import {
-	deliverContentAfterChunks,
-	deliverFinalAssistantContent,
-	deliverRunnerEvents,
-	type LiveGatewayEventSink,
-	type LiveGatewayMessageSink,
-} from "./chat-delivery";
-import {
-	buildCompletion,
-	buildOpenAIErrorResponse,
-	encodeChatCompletionSse,
-	type OpenAIErrorResponse,
-} from "./chat-response-format";
-import { appendResolvedFileContexts, type LiveGatewayFileContextResolver } from "./file-contexts";
-import { findProjectByModelId } from "./models";
-import type { OpenAIChatCompletionRequest, OpenAIChatCompletionResponse } from "./openai-types";
+import { deliverContentAfterChunks, deliverFinalAssistantContent, deliverRunnerEvents } from "./chat-delivery";
+import { buildCompletion, buildOpenAIErrorResponse, encodeChatCompletionSse } from "./chat-response-format";
+import { appendResolvedFileContexts } from "./file-contexts";
+import { isGjcOpenWebUIModelId, resolveLiveProjectContext } from "./project-context";
 
+export type {
+	HandleChatCompletionsInput,
+	LiveChatCompletionsResult,
+	LiveGatewayRunner,
+	LiveGatewayRunnerInput,
+	LiveGatewayRunnerResult,
+} from "./chat-completions-types";
 export type { LiveGatewayEventDeliveryInput, LiveGatewayEventSink, LiveGatewayMessageSink } from "./chat-delivery";
-
-export interface LiveGatewayRunnerInput {
-	readonly project: RegisteredProject;
-	readonly prompt: string;
-	readonly chatId: string;
-	readonly messageId: string;
-	readonly userMessageId: string;
-	readonly userMessageParentId: string | null;
-	readonly continued: boolean;
-}
-
-export type LiveGatewayRunnerResult =
-	| { readonly content: string; readonly chunks?: undefined; readonly events?: readonly OpenWebUIMessageEvent[] }
-	| {
-			readonly content?: undefined;
-			readonly chunks: AsyncIterable<string> | Iterable<string>;
-			readonly events?: readonly OpenWebUIMessageEvent[];
-	  };
-
-export interface LiveGatewayRunner {
-	run(input: LiveGatewayRunnerInput): Promise<LiveGatewayRunnerResult> | LiveGatewayRunnerResult;
-}
-
-export class LiveGatewayUnavailableError extends Error {
-	readonly code = "live_runner_unavailable";
-}
-
-export class WorkflowGateReplyError extends Error {
-	constructor(
-		message: string,
-		readonly code: string,
-		readonly errors: readonly string[],
-	) {
-		super(message);
-		this.name = "WorkflowGateReplyError";
-	}
-}
-
-export type LiveChatCompletionsResult =
-	| { readonly ok: true; readonly status: 200; readonly body: OpenAIChatCompletionResponse }
-	| { readonly ok: true; readonly status: 200; readonly stream: AsyncIterable<string> }
-	| { readonly ok: false; readonly status: 400 | 401 | 404 | 503; readonly body: OpenAIErrorResponse };
-
-export interface HandleChatCompletionsInput {
-	readonly request: OpenAIChatCompletionRequest;
-	readonly headers: OpenWebUIHeaderInput;
-	readonly projects: readonly RegisteredProject[];
-	readonly owner: OpenWebUIOwnerContext;
-	readonly runner: LiveGatewayRunner;
-	readonly now?: Date;
-	readonly idFactory?: () => string;
-	readonly outbox?: unknown;
-	readonly eventSink?: LiveGatewayEventSink;
-	readonly messageSink?: LiveGatewayMessageSink;
-	readonly fileContextResolver?: LiveGatewayFileContextResolver;
-}
+export { LiveGatewayUnavailableError, WorkflowGateReplyError };
 
 export async function handleChatCompletions(input: HandleChatCompletionsInput): Promise<LiveChatCompletionsResult> {
 	const headers = parseOpenWebUIHeaders(input.headers);
@@ -100,13 +44,12 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 		);
 	}
 
-	const project = findProjectByModelId(input.projects, input.request.model);
-	if (project === null) {
-		return errorResult(404, "invalid_request_error", "model_not_found", `Unknown GJC model: ${input.request.model}`);
-	}
-
 	const created = Math.floor((input.now ?? new Date()).getTime() / 1000);
 	const id = input.idFactory?.() ?? `chatcmpl-${created}`;
+	if (!isGjcOpenWebUIModelId(input.request.model)) {
+		return unknownModelResult(input.request.model);
+	}
+
 	if (headers.isBackgroundTask) {
 		return {
 			ok: true,
@@ -139,6 +82,19 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 			"A chat completion requires a user message with text content.",
 		);
 	}
+	const projectContext = await resolveLiveProjectContext({
+		projects: input.projects,
+		modelId: input.request.model,
+		ownerUserId: input.owner.ownerUserId,
+		chatId: headers.chatId,
+		repository: input.projectContextRepository,
+		neutralWorkspace: input.neutralWorkspace,
+		now: input.now,
+	});
+	if (!projectContext.ok) {
+		return errorResult(503, "server_error", projectContext.code, projectContext.message);
+	}
+	const project = projectContext.project;
 	let prompt: string;
 	try {
 		prompt = await appendResolvedFileContexts({
@@ -243,6 +199,10 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 		status: 200,
 		body: buildCompletion({ id, created, model: input.request.model, content }),
 	};
+}
+
+function unknownModelResult(modelId: string): LiveChatCompletionsResult {
+	return errorResult(404, "invalid_request_error", "model_not_found", `Unknown GJC model: ${modelId}`);
 }
 
 function errorResult(

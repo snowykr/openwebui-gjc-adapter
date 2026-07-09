@@ -43,7 +43,7 @@ describe("createAdapterRequestHandler chat completion errors", () => {
 			},
 		});
 
-		const response = await handler(chatRequest({ model: "gjc/demo" }));
+		const response = await handler(chatRequest({ model: "gjc" }));
 
 		expect(calls).toBe(0);
 		expect(response.status).toBe(400);
@@ -69,9 +69,7 @@ describe("createAdapterRequestHandler chat completion errors", () => {
 			},
 		});
 
-		const response = await handler(
-			chatRequest({ model: "gjc/demo", messages: [{ role: "user", content: "hello" }] }),
-		);
+		const response = await handler(chatRequest({ model: "gjc", messages: [{ role: "user", content: "hello" }] }));
 
 		expect(response.status).toBe(503);
 		expect(response.headers.get("content-type")).toStartWith("application/json");
@@ -98,7 +96,7 @@ describe("createAdapterRequestHandler chat completion errors", () => {
 
 		const response = await handler(
 			chatRequest({
-				model: "gjc/demo",
+				model: "gjc",
 				messages: [{ role: "user", content: "hello" }],
 				files: [{ id: "file-1", name: "secret.pdf", type: "application/pdf", documents: [] }],
 			}),
@@ -129,15 +127,13 @@ describe("createAdapterRequestHandler chat completion errors", () => {
 			},
 		});
 
-		const invalidRole = await handler(
-			chatRequest({ model: "gjc/demo", messages: [{ role: "bad", content: "hello" }] }),
-		);
+		const invalidRole = await handler(chatRequest({ model: "gjc", messages: [{ role: "bad", content: "hello" }] }));
 		const invalidContent = await handler(
-			chatRequest({ model: "gjc/demo", messages: [{ role: "user", content: [{ type: "image", text: "nope" }] }] }),
+			chatRequest({ model: "gjc", messages: [{ role: "user", content: [{ type: "image", text: "nope" }] }] }),
 		);
 		const invalidModel = await handler(chatRequest({ model: 123, messages: [{ role: "user", content: "hello" }] }));
 		const invalidStream = await handler(
-			chatRequest({ model: "gjc/demo", stream: "yes", messages: [{ role: "user", content: "hello" }] }),
+			chatRequest({ model: "gjc", stream: "yes", messages: [{ role: "user", content: "hello" }] }),
 		);
 
 		expect(calls).toBe(0);

@@ -1,33 +1,23 @@
-import type { RegisteredProject } from "../projects/registry";
 import type { OpenAIModelEntry, OpenAIModelListResponse } from "./openai-types";
+import { GJC_OPENWEBUI_MODEL_ID } from "./project-context";
 
 export type LiveGatewayModelEntry = OpenAIModelEntry;
 
 export function buildModelList(
-	input: readonly RegisteredProject[] | readonly LiveGatewayModelEntry[],
+	input: readonly unknown[] | readonly LiveGatewayModelEntry[] = [],
 ): OpenAIModelListResponse {
+	void input;
 	return {
 		object: "list",
-		data: input.map(entry => (isRegisteredProject(entry) ? modelFromProject(entry) : entry)),
+		data: [defaultGjcModelEntry()],
 	};
 }
 
-export function findProjectByModelId(
-	projects: readonly RegisteredProject[],
-	modelId: string,
-): RegisteredProject | null {
-	return projects.find(project => project.modelId === modelId) ?? null;
-}
-
-function modelFromProject(project: RegisteredProject): OpenAIModelEntry {
+function defaultGjcModelEntry(): OpenAIModelEntry {
 	return {
-		id: project.modelId,
+		id: GJC_OPENWEBUI_MODEL_ID,
 		object: "model",
-		created: Math.floor(project.createdAt.getTime() / 1000),
+		created: 1783468800,
 		owned_by: "gjc",
 	};
-}
-
-function isRegisteredProject(entry: RegisteredProject | LiveGatewayModelEntry): entry is RegisteredProject {
-	return "modelId" in entry;
 }

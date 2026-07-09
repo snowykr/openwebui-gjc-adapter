@@ -9,17 +9,19 @@ import {
 import { parseChatCompletionRequest } from "./live/chat-request-parser";
 import type { LiveGatewayFileContextResolver } from "./live/file-contexts";
 import type { OpenWebUIOwnerContext } from "./openwebui/auth";
+import type { OpenWebUIProjectionRepository } from "./openwebui/client";
 import {
 	buildProjectModelList,
 	handleProjectAdminChatCompletion,
 	handleProjectLinkRequest,
 	handleProjectListRequest,
 	handleProjectUnlinkRequest,
+	isProjectAdminChatCompletionRequest,
 	isProjectUnlinkPath,
 	parseProjectAdminJsonRequest,
 	projectIdFromUnlinkPath,
 } from "./projects/admin-routes";
-import { ADMIN_PROJECT_MODEL_ID, type ProjectLinkService } from "./projects/link-service";
+import type { ProjectLinkService } from "./projects/link-service";
 import type { RegisteredProject } from "./projects/registry";
 export interface AdapterServerOptions {
 	host: string;
@@ -34,6 +36,7 @@ export interface AdapterRouteDependencies {
 	readonly owner: OpenWebUIOwnerContext;
 	readonly runner: LiveGatewayRunner;
 	readonly projectLinkService?: ProjectLinkService;
+	readonly projectContextRepository?: OpenWebUIProjectionRepository;
 	readonly eventSink?: LiveGatewayEventSink;
 	readonly messageSink?: LiveGatewayMessageSink;
 	readonly fileContextResolver?: LiveGatewayFileContextResolver;
@@ -142,7 +145,7 @@ export function createAdapterRequestHandler(
 					{ status: 400 },
 				);
 			}
-			if (routes.projectLinkService !== undefined && parsed.request.model === ADMIN_PROJECT_MODEL_ID) {
+			if (routes.projectLinkService !== undefined && isProjectAdminChatCompletionRequest(parsed.request)) {
 				const result = await handleProjectAdminChatCompletion(
 					routes.projectLinkService,
 					parsed.request,
@@ -162,6 +165,7 @@ export function createAdapterRequestHandler(
 					eventSink: routes.eventSink,
 					messageSink: routes.messageSink,
 					fileContextResolver: routes.fileContextResolver,
+					projectContextRepository: routes.projectContextRepository,
 				});
 			} catch (error) {
 				const message = error instanceof Error ? error.message : "GJC live runner failed.";

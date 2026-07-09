@@ -94,7 +94,7 @@ describe("adapter CLI project reconciliation", () => {
 		const projectList = await projectListResponse.json();
 
 		expect(modelIds(models)).not.toContain("gjc/deleted-during-runtime");
-		expect(projectListText(projectList)).toContain("unlinked: gjc/deleted-during-runtime");
+		expect(projectListText(projectList)).toContain("unlinked: deleted-during-runtime");
 		expect(store.getProject("deleted-during-runtime")).toMatchObject({ status: "unlinked" });
 	});
 });
@@ -122,7 +122,7 @@ function projectListRequest(): Request {
 	return new Request(source.url, {
 		method: "POST",
 		headers: source.headers,
-		body: JSON.stringify({ model: "gjc/projects", messages: [{ role: "user", content: "/gjc project list" }] }),
+		body: JSON.stringify({ model: "gjc", messages: [{ role: "user", content: "/gjc project list" }] }),
 	});
 }
 

@@ -10,7 +10,7 @@ describe("createAdapterRequestHandler streaming", () => {
 		});
 
 		const response = await handler(
-			chatRequest({ model: "gjc/demo", stream: true, messages: [{ role: "user", content: "hello" }] }),
+			chatRequest({ model: "gjc", stream: true, messages: [{ role: "user", content: "hello" }] }),
 		);
 
 		expect(response.status).toBe(200);

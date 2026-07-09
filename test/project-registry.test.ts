@@ -6,7 +6,6 @@ import {
 	buildProjectFolderMetadata,
 	createProjectId,
 	disambiguateRegisteredProjects,
-	listProjectModels,
 	registerProjectDirectory,
 } from "../src/projects/registry";
 import { resolveAllowedRoots } from "../src/security/paths";
@@ -125,39 +124,5 @@ describe("project registry primitives", () => {
 				projectName: "Workspace",
 			},
 		});
-	});
-
-	test("lists OpenAI-compatible project model entries", async () => {
-		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-project-models-"));
-		const firstDirectory = path.join(workspace, "First");
-		const secondDirectory = path.join(workspace, "Second");
-		await fs.mkdir(firstDirectory);
-		await fs.mkdir(secondDirectory);
-		const allowedRoots = await resolveAllowedRoots([workspace]);
-		const firstProject = await registerProjectDirectory(
-			{ cwd: firstDirectory },
-			allowedRoots,
-			new Date("2026-07-08T12:00:00.000Z"),
-		);
-		const secondProject = await registerProjectDirectory(
-			{ cwd: secondDirectory, name: "Second Project" },
-			allowedRoots,
-			new Date("2026-07-08T12:00:05.000Z"),
-		);
-
-		expect(listProjectModels([firstProject, secondProject])).toEqual([
-			{
-				id: "gjc/first",
-				object: "model",
-				created: 1783512000,
-				owned_by: "gjc",
-			},
-			{
-				id: "gjc/second-project",
-				object: "model",
-				created: 1783512005,
-				owned_by: "gjc",
-			},
-		]);
 	});
 });

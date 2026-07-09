@@ -5,7 +5,7 @@ import * as path from "node:path";
 import type { LiveGatewayRunner } from "../src/live/chat-completions";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
-import { ADMIN_PROJECT_MODEL_ID, ProjectLinkService } from "../src/projects/link-service";
+import { ProjectLinkService } from "../src/projects/link-service";
 import { SqliteProjectRegistrationStore } from "../src/projects/registration-store";
 import { resolveAllowedRoots } from "../src/security/paths";
 import { createAdapterRequestHandler } from "../src/server";
@@ -25,7 +25,7 @@ describe("project admin route security boundaries", () => {
 		const response = await handler(
 			chatCommandRequest(
 				{
-					model: ADMIN_PROJECT_MODEL_ID,
+					model: "gjc",
 					messages: [{ role: "user", content: `/gjc project link ${projectDirectory}` }],
 				},
 				{ userId: "owner-2" },
@@ -42,7 +42,7 @@ describe("project admin route security boundaries", () => {
 		const response = await handler(
 			chatCommandRequest(
 				{
-					model: ADMIN_PROJECT_MODEL_ID,
+					model: "gjc",
 					messages: [{ role: "user", content: `/gjc project link ${projectDirectory}` }],
 				},
 				{ task: "title" },

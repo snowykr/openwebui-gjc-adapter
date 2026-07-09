@@ -79,6 +79,7 @@ export async function buildAdapterServerOptionsFromEnv(
 				return projectLinkService.listLinkedProjects();
 			},
 			projectLinkService,
+			...(projectionRepository === undefined ? {} : { projectContextRepository: projectionRepository }),
 			owner,
 			runner: createGjcRoutingLiveGatewayRunner({ turnRunner, mappings, ownerUserId: owner.ownerUserId }),
 			requireAdapterApiToken: true,

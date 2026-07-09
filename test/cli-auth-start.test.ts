@@ -67,7 +67,6 @@ describe("adapter CLI auth and start", () => {
 		expect(modelsResponse.status).toBe(200);
 		const body = (await modelsResponse.json()) as { object: string; data: { id: string }[] };
 		expect(body.object).toBe("list");
-		expect(body.data.map(model => model.id)).toContain("gjc/projects");
-		expect(body.data.map(model => model.id)).toContain("gjc/demo-project");
+		expect(body.data.map(model => model.id)).toEqual(["gjc"]);
 	});
 });

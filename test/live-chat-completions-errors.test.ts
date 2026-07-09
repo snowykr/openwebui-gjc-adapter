@@ -31,7 +31,7 @@ const chatHeaders = {
 };
 
 const request: OpenAIChatCompletionRequest = {
-	model: "gjc/demo",
+	model: "gjc",
 	messages: [{ role: "user", content: "Build it" }],
 };
 

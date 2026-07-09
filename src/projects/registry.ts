@@ -21,13 +21,6 @@ export interface RegisterProjectDirectoryInput {
 	readonly sessionRoot?: string;
 }
 
-export interface OpenAIModelListEntry {
-	readonly id: string;
-	readonly object: "model";
-	readonly created: number;
-	readonly owned_by: "gjc";
-}
-
 export interface ProjectFolderMetadata {
 	readonly gjc_adapter: {
 		readonly projectId: string;
@@ -111,15 +104,6 @@ export function buildProjectFolderMetadata(project: RegisteredProject): ProjectF
 			projectName: project.name,
 		},
 	};
-}
-
-export function listProjectModels(projects: readonly RegisteredProject[]): OpenAIModelListEntry[] {
-	return projects.map(project => ({
-		id: project.modelId,
-		object: "model",
-		created: Math.floor(project.createdAt.getTime() / 1000),
-		owned_by: "gjc",
-	}));
 }
 
 function findAllowedRoot(cwd: string, allowedRoots: readonly AllowedRoot[]): string {

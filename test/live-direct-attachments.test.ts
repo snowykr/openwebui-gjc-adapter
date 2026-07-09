@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { handleChatCompletions, type LiveGatewayRunnerInput } from "../src/live/chat-completions";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
+import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
 import type { RegisteredProject } from "../src/projects/registry";
 
 const project: RegisteredProject = {
@@ -25,12 +26,14 @@ const chatHeaders = {
 	"X-OpenWebUI-User-Id": "owner-1",
 };
 
+const projectWithFolder: RegisteredProject = { ...project, openWebUIFolderId: "folder-demo" };
+
 describe("live direct OpenWebUI attachments", () => {
 	test("resolves XML OpenWebUI file ids before invoking the runner", async () => {
 		const inputs: LiveGatewayRunnerInput[] = [];
 		const result = await handleChatCompletions({
 			request: {
-				model: "gjc/demo",
+				model: "gjc",
 				messages: [
 					{
 						role: "user",
@@ -40,8 +43,9 @@ describe("live direct OpenWebUI attachments", () => {
 				],
 			},
 			headers: chatHeaders,
-			projects: [project],
+			projects: [projectWithFolder],
 			owner,
+			projectContextRepository: await demoRepository(),
 			runner: {
 				run(input) {
 					inputs.push(input);
@@ -68,13 +72,14 @@ describe("live direct OpenWebUI attachments", () => {
 		const resolverInputs: unknown[] = [];
 		const result = await handleChatCompletions({
 			request: {
-				model: "gjc/demo",
+				model: "gjc",
 				messages: [{ role: "user", content: "첨부 PDF를 직접 읽어서 sentinel을 찾아줘" }],
 				files: [{ id: "file-1", name: "uploaded.pdf", type: "application/pdf", documents: [] }],
 			},
 			headers: chatHeaders,
-			projects: [project],
+			projects: [projectWithFolder],
 			owner,
+			projectContextRepository: await demoRepository(),
 			runner: {
 				run(input) {
 					inputs.push(input);
@@ -96,7 +101,7 @@ describe("live direct OpenWebUI attachments", () => {
 		expect(resolverInputs).toEqual([
 			{
 				reference: { id: "file-1", name: "uploaded.pdf", type: "application/pdf" },
-				project,
+				project: projectWithFolder,
 				chatId: "chat-1",
 				userMessageId: "user-1",
 			},
@@ -113,7 +118,7 @@ describe("live direct OpenWebUI attachments", () => {
 		const resolverInputs: unknown[] = [];
 		const result = await handleChatCompletions({
 			request: {
-				model: "gjc/demo",
+				model: "gjc",
 				messages: [{ role: "user", content: "첨부 원본도 직접 읽어줘" }],
 				files: [
 					{
@@ -126,8 +131,9 @@ describe("live direct OpenWebUI attachments", () => {
 				],
 			},
 			headers: chatHeaders,
-			projects: [project],
+			projects: [projectWithFolder],
 			owner,
+			projectContextRepository: await demoRepository(),
 			runner: {
 				run(input) {
 					inputs.push(input);
@@ -151,3 +157,16 @@ describe("live direct OpenWebUI attachments", () => {
 		expect(inputs[0]?.prompt).toContain("OpenWebUI extracted text already present");
 	});
 });
+
+async function demoRepository(): Promise<InMemoryOpenWebUIProjectionRepository> {
+	const repository = new InMemoryOpenWebUIProjectionRepository();
+	await repository.upsertChat({
+		id: "chat-1",
+		owner_user_id: "owner-1",
+		folder_id: "folder-demo",
+		title: "Demo chat",
+		metadata: {},
+		history: { currentId: null, messages: {} },
+	});
+	return repository;
+}

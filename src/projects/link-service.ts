@@ -11,8 +11,6 @@ import type {
 import type { RegisteredProject, RegisterProjectDirectoryInput } from "./registry";
 import { registerProjectDirectory } from "./registry";
 
-export const ADMIN_PROJECT_MODEL_ID = "gjc/projects";
-
 export interface ProjectLinkServiceOptions {
 	readonly allowedRoots: readonly AllowedRoot[];
 	readonly store: SqliteProjectRegistrationStore;

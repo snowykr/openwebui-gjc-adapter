@@ -6,7 +6,7 @@ import { SessionMappingStore } from "../src/gjc/session-router";
 import type { LiveGatewayRunner } from "../src/live/chat-completions";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
-import { ADMIN_PROJECT_MODEL_ID, ProjectLinkService } from "../src/projects/link-service";
+import { ProjectLinkService } from "../src/projects/link-service";
 import { SqliteProjectRegistrationStore } from "../src/projects/registration-store";
 import { resolveAllowedRoots } from "../src/security/paths";
 import { createAdapterRequestHandler } from "../src/server";
@@ -63,7 +63,7 @@ describe("project admin routes", () => {
 			project: { id: "admin-project", status: "linked", modelId: "gjc/admin-project" },
 			sync: { imported: [{ sessionId: "session-one" }] },
 		});
-		expect(await modelIds(handler)).toContain("gjc/admin-project");
+		expect(await modelIds(handler)).toEqual(["gjc"]);
 
 		const unlinked = await handler(
 			new Request("http://adapter.test/admin/projects/admin-project/unlink", {
@@ -73,7 +73,7 @@ describe("project admin routes", () => {
 		);
 		expect(unlinked.status).toBe(200);
 		expect(await unlinked.json()).toMatchObject({ project: { id: "admin-project", status: "unlinked" } });
-		expect(await modelIds(handler)).not.toContain("gjc/admin-project");
+		expect(await modelIds(handler)).toEqual(["gjc"]);
 		expect(await fs.stat(sessionFile)).toBeTruthy();
 		expect(await repository.getChat("owner-1", "gjc-project-admin-project-session-session-one")).toBeUndefined();
 
@@ -84,13 +84,13 @@ describe("project admin routes", () => {
 			}),
 		);
 		expect(relinked.status).toBe(200);
-		expect(await modelIds(handler)).toContain("gjc/admin-project");
+		expect(await modelIds(handler)).toEqual(["gjc"]);
 		expect(await repository.getChat("owner-1", "gjc-project-admin-project-session-session-one")).toMatchObject({
 			title: "Admin Session",
 		});
 	});
 
-	test("supports OpenWebUI chat slash commands through the admin model", async () => {
+	test("supports OpenWebUI chat slash commands through the regular gjc model", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-admin-"));
 		tempDirs.push(workspace);
 		const projectDirectory = path.join(workspace, "Slash Project");
@@ -114,25 +114,25 @@ describe("project admin routes", () => {
 
 		const linked = await handler(
 			chatCommandRequest({
-				model: ADMIN_PROJECT_MODEL_ID,
+				model: "gjc",
 				messages: [{ role: "user", content: `/gjc project link ${projectDirectory}` }],
 			}),
 		);
 		expect(linked.status).toBe(200);
 		const linkedBody = (await linked.json()) as ChatCompletionBody;
-		expect(linkedBody.choices[0].message.content).toContain("Linked gjc/slash-project");
-		expect(await modelIds(handler)).toContain("gjc/slash-project");
+		expect(linkedBody.choices[0].message.content).toContain("Linked slash-project");
+		expect(await modelIds(handler)).toEqual(["gjc"]);
 
 		const unlinked = await handler(
 			chatCommandRequest({
-				model: ADMIN_PROJECT_MODEL_ID,
+				model: "gjc",
 				messages: [{ role: "user", content: "/gjc project unlink slash-project" }],
 			}),
 		);
 		expect(unlinked.status).toBe(200);
 		const unlinkedBody = (await unlinked.json()) as ChatCompletionBody;
-		expect(unlinkedBody.choices[0].message.content).toContain("Unlinked gjc/slash-project");
-		expect(await modelIds(handler)).not.toContain("gjc/slash-project");
+		expect(unlinkedBody.choices[0].message.content).toContain("Unlinked slash-project");
+		expect(await modelIds(handler)).toEqual(["gjc"]);
 	});
 
 	test("rejects admin link requests outside allowed roots", async () => {

@@ -63,7 +63,7 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 
 		const allowedRoots = await resolveAllowedRoots([root]);
 		const project = await registerProjectDirectory({ cwd, name: "Golden" }, allowedRoots, createdAt);
-		expect(buildModelList([project]).data[0]).toMatchObject({ id: "gjc/golden", owned_by: "gjc" });
+		expect(buildModelList([project]).data[0]).toMatchObject({ id: "gjc", owned_by: "gjc" });
 
 		const header: SessionHeader = {
 			type: "session",
@@ -181,10 +181,19 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 		const turnRunner = new GoldenTurnRunner(sessionFile);
 		const mappings = new FileBackedSessionMappingStore(join(root, "mappings.json"));
 		const liveRunner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings, outbox, ownerUserId });
+		await repository.upsertChat({
+			id: "chat-live",
+			owner_user_id: ownerUserId,
+			folder_id: firstImport.folderId,
+			title: "Live Golden",
+			metadata: {},
+			history: { currentId: null, messages: {} },
+		});
 		const firstLive = await handleChatCompletions({
-			request: { model: project.modelId, messages: [{ role: "user", content: "start" }] },
+			request: { model: "gjc", messages: [{ role: "user", content: "start" }] },
 			headers: liveHeaders("chat-live", "assistant-1", "user-1", null),
 			projects: [project],
+			projectContextRepository: repository,
 			owner: { ownerUserId, singleOwnerLocalMode: false },
 			runner: liveRunner,
 			eventSink(event) {
@@ -193,9 +202,10 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 		});
 		expect(firstLive.ok).toBe(true);
 		const continued = await handleChatCompletions({
-			request: { model: project.modelId, messages: [{ role: "user", content: "continue" }] },
+			request: { model: "gjc", messages: [{ role: "user", content: "continue" }] },
 			headers: liveHeaders("chat-live", "assistant-2", "user-2", "user-1"),
 			projects: [project],
+			projectContextRepository: repository,
 			owner: { ownerUserId, singleOwnerLocalMode: false },
 			runner: liveRunner,
 			eventSink(event) {
@@ -208,7 +218,7 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 		expect(deliveredEvents.some(event => event.events.some(item => item.type === "status"))).toBe(true);
 
 		const background = await handleChatCompletions({
-			request: { model: project.modelId, messages: [{ role: "user", content: "title" }] },
+			request: { model: "gjc", messages: [{ role: "user", content: "title" }] },
 			headers: {
 				...liveHeaders("chat-live", "assistant-bg", "user-bg", null),
 				"X-OpenWebUI-Task": "title_generation",

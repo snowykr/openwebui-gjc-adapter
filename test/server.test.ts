@@ -33,7 +33,7 @@ describe("createAdapterRequestHandler", () => {
 		expect(response.status).toBe(200);
 		expect(await response.json()).toEqual({
 			object: "list",
-			data: [{ id: "gjc/demo", object: "model", created: 1783468800, owned_by: "gjc" }],
+			data: [{ id: "gjc", object: "model", created: 1783468800, owned_by: "gjc" }],
 		});
 	});
 
@@ -85,7 +85,7 @@ describe("createAdapterRequestHandler", () => {
 					"X-OpenWebUI-User-Message-Parent-Id": "",
 					"X-OpenWebUI-User-Id": "owner-1",
 				},
-				body: JSON.stringify({ model: "gjc/demo", messages: [{ role: "user", content: "hello" }] }),
+				body: JSON.stringify({ model: "gjc", messages: [{ role: "user", content: "hello" }] }),
 			}),
 		);
 

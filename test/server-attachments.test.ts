@@ -20,11 +20,11 @@ describe("createAdapterRequestHandler attachments", () => {
 		});
 
 		const invalidFiles = await handler(
-			chatRequest({ model: "gjc/demo", messages: [{ role: "user", content: "hello" }], files: ["file-1"] }),
+			chatRequest({ model: "gjc", messages: [{ role: "user", content: "hello" }], files: ["file-1"] }),
 		);
 		const invalidImage = await handler(
 			chatRequest({
-				model: "gjc/demo",
+				model: "gjc",
 				messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: 123 } }] }],
 			}),
 		);
@@ -60,7 +60,7 @@ describe("createAdapterRequestHandler attachments", () => {
 
 		const response = await handler(
 			chatRequest({
-				model: "gjc/demo",
+				model: "gjc",
 				messages: [
 					{
 						role: "user",
@@ -107,7 +107,7 @@ describe("createAdapterRequestHandler attachments", () => {
 
 		const response = await handler(
 			chatRequest({
-				model: "gjc/demo",
+				model: "gjc",
 				messages: [
 					{
 						role: "user",

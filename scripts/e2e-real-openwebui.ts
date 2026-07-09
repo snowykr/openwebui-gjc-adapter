@@ -32,15 +32,15 @@ async function run(ctx: E2EContext): Promise<void> {
 
 	const adapterModels = await ctx.getJson(`${ctx.config.adapterBaseUrl}/v1/models`, ctx.adapterHeaders());
 	const modelIds = modelIdsFrom(adapterModels.body);
-	ctx.record("adapter models include project admin", modelIds.includes("gjc/projects"), modelIds.join(", "));
+	ctx.record(
+		"adapter models expose stable gjc model only",
+		modelIds.includes("gjc") && modelIds.every(modelId => modelId === "gjc" || !modelId.startsWith("gjc/")),
+		modelIds.join(", "),
+	);
 
 	const openWebUIModels = await ctx.getJson(`${ctx.config.openWebUIBaseUrl}/api/v1/models`, ctx.openWebUIHeaders());
 	const openWebUIModelIds = modelIdsFrom(openWebUIModels.body);
-	ctx.record(
-		"OpenWebUI sees GJC project model",
-		openWebUIModelIds.includes("gjc/gajae-code-openwebui"),
-		openWebUIModelIds.join(", "),
-	);
+	ctx.record("OpenWebUI sees stable GJC model", openWebUIModelIds.includes("gjc"), openWebUIModelIds.join(", "));
 
 	const relinkReal = await ctx.postJson(`${ctx.config.adapterBaseUrl}/admin/projects/link`, ctx.adapterHeaders(), {
 		cwd: ctx.config.realProjectDir,
@@ -56,22 +56,22 @@ async function run(ctx: E2EContext): Promise<void> {
 	const projectList = await projectCommand(ctx, "/gjc project list", "real-list");
 	ctx.record(
 		"slash command lists linked projects",
-		projectList.includes("linked: gjc/gajae-code-openwebui"),
-		`linked project present: ${projectList.includes("linked: gjc/gajae-code-openwebui")}`,
+		projectList.includes("linked: gajae-code-openwebui"),
+		`linked project present: ${projectList.includes("linked: gajae-code-openwebui")}`,
 	);
 
 	const fixture = await createPreviousProjectFixture(ctx);
 	const fixtureLinkText = await projectCommand(ctx, `/gjc project link ${fixture.cwd}`, "fixture-link");
 	ctx.record(
 		"slash command links previous project directory",
-		fixtureLinkText.includes(`Linked ${fixture.modelId}.`) && fixtureLinkText.includes("Imported 1 session"),
+		fixtureLinkText.includes(`Linked ${fixture.projectId}.`) && fixtureLinkText.includes("Imported 1 session"),
 		fixtureLinkText,
 	);
 
 	const afterFixtureLink = await ctx.getJson(`${ctx.config.adapterBaseUrl}/v1/models`, ctx.adapterHeaders());
 	ctx.record(
-		"linked previous project appears as model",
-		modelIdsFrom(afterFixtureLink.body).includes(fixture.modelId),
+		"linked previous project does not appear as model",
+		modelIdsFrom(afterFixtureLink.body).every(modelId => modelId === "gjc" || !modelId.startsWith("gjc/")),
 		modelIdsFrom(afterFixtureLink.body).join(", "),
 	);
 
@@ -126,9 +126,8 @@ async function run(ctx: E2EContext): Promise<void> {
 
 	const finalModels = await ctx.getJson(`${ctx.config.adapterBaseUrl}/v1/models`, ctx.adapterHeaders());
 	ctx.record(
-		"final model list keeps real project linked",
-		modelIdsFrom(finalModels.body).includes("gjc/gajae-code-openwebui") &&
-			!modelIdsFrom(finalModels.body).includes(fixture.modelId),
+		"final model list stays project-free",
+		modelIdsFrom(finalModels.body).includes("gjc") && !modelIdsFrom(finalModels.body).includes(fixture.modelId),
 		modelIdsFrom(finalModels.body).join(", "),
 	);
 
@@ -170,7 +169,7 @@ async function projectCommand(ctx: E2EContext, command: string, suffix: string):
 	const response = await ctx.postJson(
 		`${ctx.config.adapterBaseUrl}/v1/chat/completions`,
 		ctx.adapterHeaders(ctx.openWebUIForwardHeaders()),
-		{ model: "gjc/projects", stream: false, messages: [{ role: "user", content: command }] },
+		{ model: "gjc", stream: false, messages: [{ role: "user", content: command }] },
 	);
 	if (response.status !== 200)
 		throw new Error(`Project command failed (${response.status}): ${describeJson(response.body)}`);
@@ -187,7 +186,7 @@ async function openWebUIChatWithFile(
 	const textId = requireString(textUpload.id, "text upload id");
 	const imageId = requireString(imageUpload.id, "image upload id");
 	const payload = {
-		model: "gjc/gajae-code-openwebui",
+		model: "gjc",
 		stream: false,
 		messages: [
 			{
