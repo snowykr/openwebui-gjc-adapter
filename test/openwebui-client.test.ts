@@ -248,4 +248,34 @@ describe("OpenWebUIHttpClient", () => {
 			fixture.stop();
 		}
 	});
+
+	test("reads processed OpenWebUI file text for adapter prompt context", async () => {
+		const fixture = startRecordingServer({
+			responseBody: {
+				id: "file-1",
+				filename: "uploaded.pdf",
+				data: {
+					status: "completed",
+					content: "needle=OPENWEBUI_FILE_TEXT_OK",
+				},
+			},
+		});
+		const client = new OpenWebUIHttpClient({ baseUrl: fixture.baseUrl, apiToken: "token-1" });
+
+		try {
+			await expect(client.getFileContent("file-1")).resolves.toEqual({
+				id: "file-1",
+				filename: "uploaded.pdf",
+				content: "needle=OPENWEBUI_FILE_TEXT_OK",
+			});
+			expect(fixture.requests).toContainEqual({
+				method: "GET",
+				path: "/api/v1/files/file-1",
+				authorization: "Bearer token-1",
+				body: null,
+			});
+		} finally {
+			fixture.stop();
+		}
+	});
 });

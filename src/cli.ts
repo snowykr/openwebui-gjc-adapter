@@ -4,7 +4,11 @@ import { type AdapterConfig, buildStartupDiagnostics, loadAdapterConfig } from "
 import { createGjcRpcTurnRunner, type GjcTurnRunner } from "./gjc/rpc-runner";
 import { FileBackedSessionMappingStore, type SessionMappingStore } from "./gjc/session-router";
 import type { AdapterHealthCheck } from "./health";
-import type { LiveGatewayEventSink, LiveGatewayMessageSink } from "./live/chat-completions";
+import type {
+	LiveGatewayEventSink,
+	LiveGatewayFileContextResolver,
+	LiveGatewayMessageSink,
+} from "./live/chat-completions";
 import { createGjcRoutingLiveGatewayRunner } from "./live/gjc-routing-runner";
 import { buildOpenWebUIAuthStartupDiagnostic, type OpenWebUIOwnerContext } from "./openwebui/auth";
 import { OpenWebUIHttpClient, type OpenWebUIProjectionRepository } from "./openwebui/client";
@@ -31,7 +35,11 @@ export async function buildAdapterServerOptionsFromEnv(
 	const projects = await loadConfiguredProjects(config);
 	const owner = buildOwnerContext(config);
 	const turnRunner =
-		dependencies.turnRunner ?? createGjcRpcTurnRunner({ cliPath: resolveGjcCliPath(config.gjcCommand) });
+		dependencies.turnRunner ??
+		createGjcRpcTurnRunner({
+			cliPath: resolveGjcCliPath(config.gjcCommand),
+			turnTimeoutMs: config.turnTimeoutMs,
+		});
 	const mappings = dependencies.mappings ?? new FileBackedSessionMappingStore(buildSessionMappingStorePath(config));
 	const openWebUIClient = buildOpenWebUIClient(config);
 	const projectionRepository = dependencies.projectionRepository ?? openWebUIClient;
@@ -45,6 +53,7 @@ export async function buildAdapterServerOptionsFromEnv(
 	}
 	const eventSink = dependencies.eventSink ?? buildOpenWebUIEventSink(openWebUIClient);
 	const messageSink = dependencies.messageSink ?? buildOpenWebUIMessageSink(openWebUIClient);
+	const fileContextResolver = buildOpenWebUIFileContextResolver(openWebUIClient);
 	return {
 		host: config.bindHost,
 		port: config.bindPort,
@@ -57,6 +66,7 @@ export async function buildAdapterServerOptionsFromEnv(
 			...(config.adapterApiToken === undefined ? {} : { adapterApiToken: config.adapterApiToken }),
 			...(eventSink === undefined ? {} : { eventSink }),
 			...(messageSink === undefined ? {} : { messageSink }),
+			...(fileContextResolver === undefined ? {} : { fileContextResolver }),
 		},
 	};
 }
@@ -135,6 +145,13 @@ function buildOpenWebUIMessageSink(client: OpenWebUIHttpClient | undefined): Liv
 			content: input.content,
 		});
 	};
+}
+
+function buildOpenWebUIFileContextResolver(
+	client: OpenWebUIHttpClient | undefined,
+): LiveGatewayFileContextResolver | undefined {
+	if (client === undefined) return undefined;
+	return fileId => client.getFileContent(fileId);
 }
 
 function resolveGjcCliPath(gjcCommand: string): string {

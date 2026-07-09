@@ -6,7 +6,7 @@ import type {
 } from "./client";
 import type { OpenWebUIMessageEvent } from "./events";
 import { OpenWebUIHttpError, type OpenWebUIHttpRequest, OpenWebUITransportError } from "./http-errors";
-import { parseOpenWebUIChatRecord } from "./http-parsers";
+import { parseOpenWebUIChatRecord, parseOpenWebUIFileContent } from "./http-parsers";
 import {
 	adapterProjectId,
 	epochSeconds,
@@ -38,6 +38,12 @@ export interface UpdateOpenWebUIMessageContentInput {
 	readonly chatId: string;
 	readonly messageId: string;
 	readonly content: string;
+}
+
+export interface OpenWebUIFileContent {
+	readonly id: string;
+	readonly filename?: string;
+	readonly content?: string;
 }
 
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -153,6 +159,15 @@ export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 			path: openWebUIApiPath(["chats", input.chatId, "messages", input.messageId]),
 			body: { content: input.content },
 		});
+	}
+
+	async getFileContent(fileId: string): Promise<OpenWebUIFileContent | undefined> {
+		const request = {
+			method: "GET",
+			path: openWebUIApiPath(["files", fileId]),
+		} as const;
+		const response = await this.#sendJson(request, { missingStatuses: [401, 404] });
+		return response === undefined ? undefined : parseOpenWebUIFileContent(response, request);
 	}
 
 	async #getFolderById(folderId: string): Promise<OpenWebUIFolderLookup | undefined> {

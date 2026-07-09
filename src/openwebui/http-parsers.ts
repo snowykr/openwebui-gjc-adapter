@@ -1,4 +1,5 @@
 import type { OpenWebUIChatRecord } from "./client";
+import type { OpenWebUIFileContent } from "./http-client";
 
 export interface ParseOpenWebUIHttpRequest {
 	readonly method: string;
@@ -68,6 +69,20 @@ function parseHistory(
 		throw invalidResponse(request, "chat.history.currentId must be a string or null");
 	}
 	return { messages: parsedMessages, currentId };
+}
+
+export function parseOpenWebUIFileContent(value: unknown, request: ParseOpenWebUIHttpRequest): OpenWebUIFileContent {
+	if (!isRecord(value)) throw invalidResponse(request, "file response must be a JSON object");
+	const id = requireString(value.id, request, "file.id");
+	const filename = optionalString(value.filename, request, "file.filename");
+	const data =
+		value.data === undefined || value.data === null ? undefined : requireRecord(value.data, request, "file.data");
+	const content = data === undefined ? undefined : optionalString(data.content, request, "file.data.content");
+	return {
+		id,
+		...(filename === undefined ? {} : { filename }),
+		...(content === undefined ? {} : { content }),
+	};
 }
 
 function parseHistoryMessage(

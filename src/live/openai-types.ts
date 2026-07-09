@@ -6,9 +6,42 @@ export interface OpenAIChatMessage {
 	readonly name?: string;
 }
 
-export interface OpenAIChatContentPart {
+export type OpenAIChatAttachmentDocument = {
+	readonly content: string;
+};
+
+export type OpenAIChatAttachment = {
+	readonly type?: string;
+	readonly id?: string;
+	readonly name?: string;
+	readonly url?: string;
+	readonly content?: string;
+	readonly documents: readonly OpenAIChatAttachmentDocument[];
+};
+
+export type OpenAIChatContentPart =
+	| OpenAIChatTextContentPart
+	| OpenAIChatImageUrlContentPart
+	| OpenAIChatFileContentPart;
+
+export interface OpenAIChatTextContentPart {
 	readonly type: "text";
 	readonly text: string;
+}
+
+export interface OpenAIChatImageUrlObject {
+	readonly url: string;
+	readonly detail?: string;
+}
+
+export interface OpenAIChatImageUrlContentPart {
+	readonly type: "image_url";
+	readonly image_url: string | OpenAIChatImageUrlObject;
+}
+
+export interface OpenAIChatFileContentPart {
+	readonly type: "file";
+	readonly file: OpenAIChatAttachment;
 }
 
 export interface OpenAIChatCompletionRequest {
@@ -16,6 +49,7 @@ export interface OpenAIChatCompletionRequest {
 	readonly messages: readonly OpenAIChatMessage[];
 	readonly stream?: boolean;
 	readonly metadata?: Record<string, unknown>;
+	readonly files?: readonly OpenAIChatAttachment[];
 }
 
 export interface OpenAIModelEntry {

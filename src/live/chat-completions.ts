@@ -3,7 +3,12 @@ import type { OpenWebUIMessageEvent } from "../openwebui/events";
 import type { OpenWebUIHeaderInput } from "../openwebui/headers";
 import { parseOpenWebUIHeaders } from "../openwebui/headers";
 import type { RegisteredProject } from "../projects/registry";
-import { latestUserText } from "./chat-content";
+import {
+	appendResolvedOpenWebUIFileContext,
+	latestUserText,
+	openWebUIFileReferences,
+	type ResolvedOpenWebUIFileContext,
+} from "./chat-content";
 import {
 	deliverContentAfterChunks,
 	deliverFinalAssistantContent,
@@ -44,6 +49,10 @@ export interface LiveGatewayRunner {
 	run(input: LiveGatewayRunnerInput): Promise<LiveGatewayRunnerResult> | LiveGatewayRunnerResult;
 }
 
+export type LiveGatewayFileContextResolver = (
+	fileId: string,
+) => Promise<ResolvedOpenWebUIFileContext | undefined> | ResolvedOpenWebUIFileContext | undefined;
+
 export class LiveGatewayUnavailableError extends Error {
 	readonly code = "live_runner_unavailable";
 }
@@ -64,6 +73,7 @@ export interface HandleChatCompletionsInput {
 	readonly outbox?: unknown;
 	readonly eventSink?: LiveGatewayEventSink;
 	readonly messageSink?: LiveGatewayMessageSink;
+	readonly fileContextResolver?: LiveGatewayFileContextResolver;
 }
 
 export async function handleChatCompletions(input: HandleChatCompletionsInput): Promise<LiveChatCompletionsResult> {
@@ -117,8 +127,8 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 		);
 	}
 
-	const prompt = latestUserText(input.request.messages);
-	if (prompt === null) {
+	const latestPrompt = latestUserText(input.request.messages, input.request.files);
+	if (latestPrompt === null) {
 		return errorResult(
 			400,
 			"invalid_request_error",
@@ -126,6 +136,12 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 			"A chat completion requires a user message with text content.",
 		);
 	}
+	const prompt = await appendResolvedFileContexts({
+		prompt: latestPrompt,
+		messages: input.request.messages,
+		files: input.request.files,
+		resolver: input.fileContextResolver,
+	});
 
 	let runnerResult: LiveGatewayRunnerResult;
 	try {
@@ -221,6 +237,27 @@ function errorResult(
 		status,
 		body: buildOpenAIErrorResponse({ message, type, code }),
 	};
+}
+
+async function appendResolvedFileContexts(input: {
+	readonly prompt: string;
+	readonly messages: OpenAIChatCompletionRequest["messages"];
+	readonly files?: OpenAIChatCompletionRequest["files"];
+	readonly resolver?: LiveGatewayFileContextResolver;
+}): Promise<string> {
+	if (input.resolver === undefined) return input.prompt;
+	const resolved: ResolvedOpenWebUIFileContext[] = [];
+	for (const reference of openWebUIFileReferences(input.messages, input.files ?? [])) {
+		const file = await input.resolver(reference.id);
+		if (file !== undefined) {
+			resolved.push({
+				id: file.id,
+				filename: file.filename ?? reference.name,
+				...(file.content === undefined ? {} : { content: file.content }),
+			});
+		}
+	}
+	return appendResolvedOpenWebUIFileContext(input.prompt, resolved);
 }
 
 function toUnixSeconds(date: Date): number {

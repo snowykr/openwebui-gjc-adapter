@@ -28,6 +28,7 @@ describe("adapter config contracts", () => {
 		expect(config.openWebUIApiToken).toBeUndefined();
 		expect(config.statePath).toBe(".gjc/openwebui-adapter");
 		expect(config.gjcCommand).toBe("gjc");
+		expect(config.turnTimeoutMs).toBe(180_000);
 		expect(config.sessionRoot).toBe(process.cwd());
 		expect(config.allowedProjectRoots).toEqual([process.cwd()]);
 		expect(config.projects).toEqual([]);
@@ -45,6 +46,7 @@ describe("adapter config contracts", () => {
 			GJC_OPENWEBUI_OWNER_USER_ID: "owner-1",
 			GJC_OPENWEBUI_STATE_PATH: "/tmp/state",
 			GJC_OPENWEBUI_GJC_COMMAND: "/usr/local/bin/gjc",
+			GJC_OPENWEBUI_TURN_TIMEOUT_MS: "240000",
 			GJC_OPENWEBUI_SESSION_ROOT: "/tmp/sessions",
 			GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS: "/repo/a:/repo/b:",
 			GJC_OPENWEBUI_ARTIFACT_BASE_URL: "https://artifacts.example.test/base",
@@ -61,6 +63,7 @@ describe("adapter config contracts", () => {
 			ownerUserId: "owner-1",
 			statePath: "/tmp/state",
 			gjcCommand: "/usr/local/bin/gjc",
+			turnTimeoutMs: 240_000,
 			sessionRoot: "/tmp/sessions",
 			allowedProjectRoots: ["/repo/a", "/repo/b"],
 			artifactBaseUrl: "https://artifacts.example.test/base",
@@ -84,6 +87,15 @@ describe("adapter config contracts", () => {
 		expect(() => loadAdapterConfig({ GJC_OPENWEBUI_BIND_PORT: "0" })).toThrow();
 		expect(() => loadAdapterConfig({ GJC_OPENWEBUI_BIND_PORT: "65536" })).toThrow();
 		expect(() => loadAdapterConfig({ GJC_OPENWEBUI_BIND_PORT: "12.5" })).toThrow();
+	});
+
+	test("rejects invalid GJC turn timeouts", () => {
+		expect(() => loadAdapterConfig({ GJC_OPENWEBUI_TURN_TIMEOUT_MS: "0" })).toThrow(
+			"GJC_OPENWEBUI_TURN_TIMEOUT_MS must be a positive integer",
+		);
+		expect(() => loadAdapterConfig({ GJC_OPENWEBUI_TURN_TIMEOUT_MS: "12.5" })).toThrow(
+			"GJC_OPENWEBUI_TURN_TIMEOUT_MS must be a positive integer",
+		);
 	});
 
 	test("builds startup diagnostics without throwing for missing auth", () => {

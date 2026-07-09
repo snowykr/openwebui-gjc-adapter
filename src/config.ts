@@ -11,6 +11,7 @@ export interface AdapterConfig {
 	ownerUserId?: string;
 	statePath: string;
 	gjcCommand: string;
+	turnTimeoutMs: number;
 	sessionRoot: string;
 	allowedProjectRoots: string[];
 	artifactBaseUrl?: string;
@@ -38,6 +39,7 @@ const DEFAULT_BIND_PORT = 8765;
 const DEFAULT_OPENWEBUI_BASE_URL = "http://localhost:8080";
 const DEFAULT_STATE_PATH = ".gjc/openwebui-adapter";
 const DEFAULT_GJC_COMMAND = "gjc";
+const DEFAULT_TURN_TIMEOUT_MS = 180_000;
 
 function requireNonEmptyString(value: string | undefined, fallback: string, name: string): string {
 	const candidate = value ?? fallback;
@@ -63,6 +65,15 @@ function parsePort(value: string | undefined): number {
 	const parsed = Number(value);
 	if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65_535) {
 		throw new Error("GJC_OPENWEBUI_BIND_PORT must be an integer between 1 and 65535");
+	}
+	return parsed;
+}
+
+function parsePositiveInteger(value: string | undefined, fallback: number, name: string): number {
+	if (value === undefined || value.trim().length === 0) return fallback;
+	const parsed = Number(value);
+	if (!Number.isInteger(parsed) || parsed <= 0) {
+		throw new Error(`${name} must be a positive integer`);
 	}
 	return parsed;
 }
@@ -162,6 +173,11 @@ export function loadAdapterConfig(env: Record<string, string | undefined> = proc
 			optionalEnv(env, "GJC_OPENWEBUI_GJC_COMMAND"),
 			DEFAULT_GJC_COMMAND,
 			"GJC_OPENWEBUI_GJC_COMMAND",
+		),
+		turnTimeoutMs: parsePositiveInteger(
+			optionalEnv(env, "GJC_OPENWEBUI_TURN_TIMEOUT_MS"),
+			DEFAULT_TURN_TIMEOUT_MS,
+			"GJC_OPENWEBUI_TURN_TIMEOUT_MS",
 		),
 		sessionRoot: requireNonEmptyString(
 			optionalEnv(env, "GJC_OPENWEBUI_SESSION_ROOT"),

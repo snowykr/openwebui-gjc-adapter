@@ -1,4 +1,11 @@
-import type { OpenAIChatCompletionRequest, OpenAIChatContentPart, OpenAIChatMessage } from "./openai-types";
+import type {
+	OpenAIChatAttachment,
+	OpenAIChatAttachmentDocument,
+	OpenAIChatCompletionRequest,
+	OpenAIChatContentPart,
+	OpenAIChatImageUrlObject,
+	OpenAIChatMessage,
+} from "./openai-types";
 
 export type ChatCompletionRequestParseResult =
 	| { readonly ok: true; readonly request: OpenAIChatCompletionRequest }
@@ -14,10 +21,19 @@ export function parseChatCompletionRequest(value: unknown): ChatCompletionReques
 	const messages = parseMessages(value.messages);
 	if (!messages.ok) return invalidChatCompletionRequest(messages.message);
 
-	const request: OpenAIChatCompletionRequest = {
+	let request: OpenAIChatCompletionRequest = {
 		model: value.model,
 		messages: messages.value,
 	};
+	if (value.metadata !== undefined) {
+		if (!isRecord(value.metadata)) return invalidChatCompletionRequest("Request metadata must be a JSON object.");
+		request = { ...request, metadata: parseMetadata(value.metadata) };
+	}
+	if (value.files !== undefined) {
+		const files = parseFiles(value.files);
+		if (!files.ok) return invalidChatCompletionRequest(files.message);
+		request = { ...request, files: files.value };
+	}
 	if (value.stream !== undefined && typeof value.stream !== "boolean") {
 		return invalidChatCompletionRequest("Request stream must be a boolean when provided.");
 	}
@@ -62,7 +78,7 @@ function parseMessageContent(
 	| { readonly ok: false; readonly message: string } {
 	if (typeof value === "string" || value === null) return { ok: true, value };
 	if (!Array.isArray(value))
-		return invalidMessage("Request message content must be a string, null, or text parts array.");
+		return invalidMessage("Request message content must be a string, null, or supported content parts array.");
 	const parts: OpenAIChatContentPart[] = [];
 	for (const partValue of value) {
 		const part = parseContentPart(partValue);
@@ -76,10 +92,112 @@ function parseContentPart(
 	value: unknown,
 ): { readonly ok: true; readonly value: OpenAIChatContentPart } | { readonly ok: false; readonly message: string } {
 	if (!isRecord(value)) return invalidMessage("Request content parts must be JSON objects.");
-	if (value.type !== "text" || typeof value.text !== "string") {
-		return invalidMessage("Request content parts must include type text and a text string.");
+	if (value.type === "text") {
+		if (typeof value.text !== "string")
+			return invalidMessage("Request text content parts must include a text string.");
+		return { ok: true, value: { type: "text", text: value.text } };
 	}
-	return { ok: true, value: { type: "text", text: value.text } };
+	if (value.type === "image_url") return parseImageUrlPart(value);
+	if (value.type === "file") return parseFilePart(value);
+	return invalidMessage("Request content parts must include a supported type: text, image_url, or file.");
+}
+
+function parseImageUrlPart(
+	value: Record<string, unknown>,
+): { readonly ok: true; readonly value: OpenAIChatContentPart } | { readonly ok: false; readonly message: string } {
+	const imageUrl = parseImageUrl(value.image_url);
+	if (!imageUrl.ok) return imageUrl;
+	return { ok: true, value: { type: "image_url", image_url: imageUrl.value } };
+}
+
+function parseImageUrl(
+	value: unknown,
+):
+	| { readonly ok: true; readonly value: string | OpenAIChatImageUrlObject }
+	| { readonly ok: false; readonly message: string } {
+	if (typeof value === "string") return { ok: true, value };
+	if (!isRecord(value) || typeof value.url !== "string") {
+		return invalidMessage(
+			"Request image_url content parts must include an image_url string or object with a url string.",
+		);
+	}
+	if (value.detail !== undefined && typeof value.detail !== "string") {
+		return invalidMessage("Request image_url detail must be a string when provided.");
+	}
+	return typeof value.detail === "string"
+		? { ok: true, value: { url: value.url, detail: value.detail } }
+		: { ok: true, value: { url: value.url } };
+}
+
+function parseFilePart(
+	value: Record<string, unknown>,
+): { readonly ok: true; readonly value: OpenAIChatContentPart } | { readonly ok: false; readonly message: string } {
+	if (!isRecord(value.file)) return invalidMessage("Request file content parts must include a file JSON object.");
+	return { ok: true, value: { type: "file", file: normalizeAttachment(value.file) } };
+}
+
+function parseFiles(
+	value: unknown,
+):
+	| { readonly ok: true; readonly value: readonly OpenAIChatAttachment[] }
+	| { readonly ok: false; readonly message: string } {
+	if (!Array.isArray(value)) return invalidMessage("Request files must be an array when provided.");
+	const files: OpenAIChatAttachment[] = [];
+	for (const fileValue of value) {
+		if (!isRecord(fileValue)) return invalidMessage("Request files entries must be JSON objects.");
+		files.push(normalizeAttachment(fileValue));
+	}
+	return { ok: true, value: files };
+}
+
+function normalizeAttachment(value: Record<string, unknown>): OpenAIChatAttachment {
+	const type = stringField(value, "type");
+	const id = firstStringField(value, ["id", "file_id"]);
+	const name = firstStringField(value, ["name", "filename", "title"]);
+	const url = firstStringField(value, ["url", "path"]);
+	const content = firstStringField(value, ["content", "text", "document"]);
+	const attachment: OpenAIChatAttachment = { documents: normalizeDocuments(value.docs) };
+	return {
+		...attachment,
+		...(type === null ? {} : { type }),
+		...(id === null ? {} : { id }),
+		...(name === null ? {} : { name }),
+		...(url === null ? {} : { url }),
+		...(content === null ? {} : { content }),
+	};
+}
+
+function normalizeDocuments(value: unknown): readonly OpenAIChatAttachmentDocument[] {
+	if (!Array.isArray(value)) return [];
+	const documents: OpenAIChatAttachmentDocument[] = [];
+	for (const entry of value) {
+		const content = documentContent(entry);
+		if (content !== null) documents.push({ content });
+	}
+	return documents;
+}
+
+function documentContent(value: unknown): string | null {
+	if (typeof value === "string" && value.length > 0) return value;
+	if (!isRecord(value)) return null;
+	return firstStringField(value, ["content", "text", "page_content", "document"]);
+}
+
+function parseMetadata(value: Record<string, unknown>): Record<string, unknown> {
+	return { ...value };
+}
+
+function firstStringField(value: Record<string, unknown>, names: readonly string[]): string | null {
+	for (const name of names) {
+		const field = stringField(value, name);
+		if (field !== null) return field;
+	}
+	return null;
+}
+
+function stringField(value: Record<string, unknown>, name: string): string | null {
+	const field = value[name];
+	return typeof field === "string" && field.length > 0 ? field : null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

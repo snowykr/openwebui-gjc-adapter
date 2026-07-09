@@ -3,6 +3,7 @@ import {
 	handleChatCompletions,
 	type LiveChatCompletionsResult,
 	type LiveGatewayEventSink,
+	type LiveGatewayFileContextResolver,
 	type LiveGatewayMessageSink,
 	type LiveGatewayRunner,
 } from "./live/chat-completions";
@@ -25,6 +26,7 @@ export interface AdapterRouteDependencies {
 	readonly runner: LiveGatewayRunner;
 	readonly eventSink?: LiveGatewayEventSink;
 	readonly messageSink?: LiveGatewayMessageSink;
+	readonly fileContextResolver?: LiveGatewayFileContextResolver;
 	readonly adapterApiToken?: string;
 	readonly requireAdapterApiToken?: boolean;
 }
@@ -108,6 +110,7 @@ export function createAdapterRequestHandler(
 					runner: routes.runner,
 					eventSink: routes.eventSink,
 					messageSink: routes.messageSink,
+					fileContextResolver: routes.fileContextResolver,
 				});
 			} catch (error) {
 				const message = error instanceof Error ? error.message : "GJC live runner failed.";
