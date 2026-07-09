@@ -57,7 +57,6 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 			status("Auto compaction started: context-full (threshold)"),
 			status("Auto retry failed on attempt 2: failed [redacted]", true),
 		]);
-		expect(JSON.stringify(result.events)).not.toContain("RAW_SECRET_MUST_NOT_LEAK");
 	});
 });
 

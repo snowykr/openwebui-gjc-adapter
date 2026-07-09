@@ -38,7 +38,7 @@ Add the required custom headers on the OpenAI connection:
 }
 ```
 
-Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. Background task calls such as title generation are no-ops and must not create GJC sessions.
+Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. Use `@gajae-code/coding-agent` 0.9.4 or newer so the adapter can consume `RpcClient.onSessionEvent` and project full GJC TUI/session progress into OpenWebUI. Background task calls such as title generation are no-ops and must not create GJC sessions.
 
 ## Registering projects
 
@@ -87,7 +87,8 @@ Deleting an adapter-created project folder in the OpenWebUI sidebar is treated a
 - Adapter metadata is stored under `gjc_adapter`; user-visible OpenWebUI fields such as title/rating are preserved on reprojection.
 - The live gateway uses `/v1/models` and `/v1/chat/completions`.
 - The package entrypoint wires chat completions through the GJC RPC turn runner and stores OpenWebUI chat-to-GJC session mappings in a file-backed store under `GJC_OPENWEBUI_SESSION_ROOT`.
-- GJC tool/MCP/skill/workflow progress is delivered as OpenWebUI message events through the adapter event sink.
+- With GJC 0.9.4 or newer, full session events from `RpcClient.onSessionEvent` are delivered as bounded OpenWebUI message events through the adapter event sink. This includes thinking lifecycle, tool/MCP execution, subagent messages, todo reminders, goal updates, notices, retry, compaction, and workflow progress.
+- Raw tool arguments/results and secret-looking text are not emitted directly; the adapter preserves bounded labels, counts, phases, and status descriptions for display.
 - Workflow gates can be rendered as assistant-visible pending-gate text and validated with the exported gate primitives; wire those primitives into the deployment's event sink/continuation policy before claiming automatic gate approval handling.
 - Regenerate/branch only proceeds when owner, project, session, and message lineage metadata match; otherwise the adapter forks safely.
 
