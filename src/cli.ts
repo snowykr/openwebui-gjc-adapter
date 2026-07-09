@@ -11,8 +11,10 @@ import { buildOpenWebUIAuthStartupDiagnostic, type OpenWebUIOwnerContext } from 
 import { OpenWebUIHttpClient, type OpenWebUIProjectionRepository } from "./openwebui/client";
 import { createOpenWebUIFileContextResolver } from "./openwebui/file-context-resolver";
 import { syncProjectSessionsToOpenWebUI } from "./projection/session-sync";
+import { ProjectLinkService } from "./projects/link-service";
+import { SqliteProjectRegistrationStore } from "./projects/registration-store";
 import { disambiguateRegisteredProjects, type RegisteredProject, registerProjectDirectory } from "./projects/registry";
-import { resolveAllowedRoots } from "./security/paths";
+import { type AllowedRoot, resolveAllowedRoots } from "./security/paths";
 import { type AdapterServerHandle, type AdapterServerOptions, startAdapterServer } from "./server";
 
 const SESSION_MAPPING_STORE_FILE = "openwebui-session-mappings.json";
@@ -23,6 +25,7 @@ export interface BuildAdapterServerOptionsDependencies {
 	readonly eventSink?: LiveGatewayEventSink;
 	readonly messageSink?: LiveGatewayMessageSink;
 	readonly projectionRepository?: OpenWebUIProjectionRepository;
+	readonly projectRegistrationStore?: SqliteProjectRegistrationStore;
 }
 
 export async function buildAdapterServerOptionsFromEnv(
@@ -30,7 +33,8 @@ export async function buildAdapterServerOptionsFromEnv(
 	dependencies: BuildAdapterServerOptionsDependencies = {},
 ): Promise<AdapterServerOptions> {
 	const config = loadAdapterConfig(env);
-	const projects = await loadConfiguredProjects(config);
+	const allowedRoots = await resolveAllowedRoots(config.allowedProjectRoots);
+	const projects = await loadConfiguredProjects(config, allowedRoots);
 	const owner = buildOwnerContext(config);
 	const turnRunner =
 		dependencies.turnRunner ??
@@ -41,11 +45,22 @@ export async function buildAdapterServerOptionsFromEnv(
 	const mappings = dependencies.mappings ?? new FileBackedSessionMappingStore(buildSessionMappingStorePath(config));
 	const openWebUIClient = buildOpenWebUIClient(config);
 	const projectionRepository = dependencies.projectionRepository ?? openWebUIClient;
+	const projectStore =
+		dependencies.projectRegistrationStore ??
+		new SqliteProjectRegistrationStore(buildProjectRegistrationStorePath(config));
+	const projectLinkService = new ProjectLinkService({
+		allowedRoots,
+		store: projectStore,
+		ownerUserId: owner.ownerUserId,
+		repository: projectionRepository,
+		mappings,
+	});
+	projectLinkService.seedConfiguredProjects(projects);
 	if (projectionRepository !== undefined) {
 		await syncProjectSessionsToOpenWebUI({
 			repository: projectionRepository,
 			ownerUserId: owner.ownerUserId,
-			projects,
+			projects: projectLinkService.listLinkedProjects(),
 			mappings,
 		});
 	}
@@ -57,7 +72,9 @@ export async function buildAdapterServerOptionsFromEnv(
 		port: config.bindPort,
 		checks: buildRuntimeHealthChecks(config),
 		routes: {
-			projects,
+			projects: [...projectLinkService.listLinkedProjects()],
+			projectProvider: () => projectLinkService.listLinkedProjects(),
+			projectLinkService,
 			owner,
 			runner: createGjcRoutingLiveGatewayRunner({ turnRunner, mappings, ownerUserId: owner.ownerUserId }),
 			requireAdapterApiToken: true,
@@ -75,8 +92,10 @@ export async function startAdapterServiceFromEnv(
 	return startAdapterServer(await buildAdapterServerOptionsFromEnv(env));
 }
 
-async function loadConfiguredProjects(config: AdapterConfig): Promise<RegisteredProject[]> {
-	const allowedRoots = await resolveAllowedRoots(config.allowedProjectRoots);
+async function loadConfiguredProjects(
+	config: AdapterConfig,
+	allowedRoots: readonly AllowedRoot[],
+): Promise<RegisteredProject[]> {
 	const projects: RegisteredProject[] = [];
 	for (const project of config.projects) {
 		projects.push(
@@ -118,6 +137,10 @@ function buildRuntimeHealthChecks(config: AdapterConfig): AdapterHealthCheck[] {
 
 function buildSessionMappingStorePath(config: AdapterConfig): string {
 	return path.join(config.sessionRoot, SESSION_MAPPING_STORE_FILE);
+}
+
+function buildProjectRegistrationStorePath(config: AdapterConfig): string {
+	return path.join(config.statePath, "adapter-state.sqlite");
 }
 
 function buildOpenWebUIClient(config: AdapterConfig): OpenWebUIHttpClient | undefined {

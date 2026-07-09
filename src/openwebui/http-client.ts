@@ -6,6 +6,8 @@ import type {
 } from "./client";
 import type { OpenWebUIMessageEvent } from "./events";
 import { OpenWebUIHttpError } from "./http-errors";
+import type { OpenWebUIFileBytes, OpenWebUIFileContent } from "./http-file-types";
+import { replaceOpenWebUIChatMessages } from "./http-message-writer";
 import { parseOpenWebUIChatRecord, parseOpenWebUIFileContent } from "./http-parsers";
 import { createOpenWebUITransport, type OpenWebUITransport } from "./http-transport";
 import {
@@ -22,6 +24,7 @@ import {
 } from "./http-wire";
 
 export { OpenWebUIHttpConfigurationError, OpenWebUIHttpError, OpenWebUITransportError } from "./http-errors";
+export type { OpenWebUIFileBytes, OpenWebUIFileContent } from "./http-file-types";
 
 export interface OpenWebUIHttpClientConfig {
 	readonly baseUrl: string;
@@ -41,20 +44,7 @@ export interface UpdateOpenWebUIMessageContentInput {
 	readonly content: string;
 }
 
-export interface OpenWebUIFileContent {
-	readonly id: string;
-	readonly filename?: string;
-	readonly content?: string;
-}
-
-export interface OpenWebUIFileBytes {
-	readonly id: string;
-	readonly bytes: Uint8Array;
-	readonly contentType?: string;
-}
-
 const DEFAULT_TIMEOUT_MS = 10_000;
-
 export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 	readonly #transport: OpenWebUITransport;
 
@@ -137,8 +127,7 @@ export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 		messages: readonly OpenWebUIChatMessageRecord[],
 	): Promise<readonly OpenWebUIChatMessageRecord[]> {
 		void ownerUserId;
-		void chatId;
-		return messages;
+		return await replaceOpenWebUIChatMessages(this.#transport, chatId, messages);
 	}
 
 	async getChat(ownerUserId: string, chatId: string): Promise<OpenWebUIChatRecord | undefined> {
@@ -150,6 +139,23 @@ export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 		if (response === undefined) return undefined;
 		const parsed = parseOpenWebUIChatRecord(response, request);
 		return ownerUserId.length > 0 && parsed.owner_user_id === ownerUserId ? parsed : undefined;
+	}
+
+	async deleteFolder(
+		ownerUserId: string,
+		folderId: string,
+		options: { readonly deleteContents: boolean; readonly expectedProjectId?: string },
+	): Promise<void> {
+		const existing = await this.#getFolderById(folderId);
+		if (existing === undefined || ownerMatches(existing, ownerUserId) === undefined) return;
+		if (
+			options.expectedProjectId !== undefined &&
+			adapterProjectId(existing.metadata) !== options.expectedProjectId
+		) {
+			return;
+		}
+		const path = `${openWebUIApiPath(["folders", folderId])}?delete_contents=${options.deleteContents ? "true" : "false"}`;
+		await this.#transport.sendJson({ method: "DELETE", path }, { missingStatuses: [404] });
 	}
 
 	async postMessageEvent(input: PostOpenWebUIMessageEventInput): Promise<void> {

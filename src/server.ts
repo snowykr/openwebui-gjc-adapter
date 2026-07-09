@@ -8,11 +8,19 @@ import {
 } from "./live/chat-completions";
 import { parseChatCompletionRequest } from "./live/chat-request-parser";
 import type { LiveGatewayFileContextResolver } from "./live/file-contexts";
-import { buildModelList } from "./live/models";
 import type { OpenWebUIOwnerContext } from "./openwebui/auth";
-import type { OpenWebUIHeaderInput } from "./openwebui/headers";
+import {
+	buildProjectModelList,
+	handleProjectAdminChatCompletion,
+	handleProjectLinkRequest,
+	handleProjectListRequest,
+	handleProjectUnlinkRequest,
+	isProjectUnlinkPath,
+	parseProjectAdminJsonRequest,
+	projectIdFromUnlinkPath,
+} from "./projects/admin-routes";
+import { ADMIN_PROJECT_MODEL_ID, type ProjectLinkService } from "./projects/link-service";
 import type { RegisteredProject } from "./projects/registry";
-
 export interface AdapterServerOptions {
 	host: string;
 	port: number;
@@ -22,8 +30,10 @@ export interface AdapterServerOptions {
 
 export interface AdapterRouteDependencies {
 	readonly projects: readonly RegisteredProject[];
+	readonly projectProvider?: ProjectProvider;
 	readonly owner: OpenWebUIOwnerContext;
 	readonly runner: LiveGatewayRunner;
+	readonly projectLinkService?: ProjectLinkService;
 	readonly eventSink?: LiveGatewayEventSink;
 	readonly messageSink?: LiveGatewayMessageSink;
 	readonly fileContextResolver?: LiveGatewayFileContextResolver;
@@ -35,6 +45,10 @@ type AdapterRequestHandlerOptions = {
 	readonly checks?: readonly AdapterHealthCheck[];
 	readonly routes?: AdapterRouteDependencies;
 };
+
+type ProjectProvider =
+	| readonly RegisteredProject[]
+	| (() => readonly RegisteredProject[] | Promise<readonly RegisteredProject[]>);
 
 export interface AdapterServerHandle {
 	url: string;
@@ -67,7 +81,35 @@ export function createAdapterRequestHandler(
 		if (routes !== undefined && request.method === "GET" && url.pathname === "/v1/models") {
 			const authError = authenticateAdapterRequest(request, routes.adapterApiToken, routes.requireAdapterApiToken);
 			if (authError !== undefined) return authError;
-			return jsonResponse(buildModelList(routes.projects));
+			return jsonResponse(
+				buildProjectModelList(await resolveRouteProjects(routes), routes.projectLinkService !== undefined),
+			);
+		}
+		if (routes?.projectLinkService !== undefined && request.method === "GET" && url.pathname === "/admin/projects") {
+			const authError = authenticateAdapterRequest(request, routes.adapterApiToken, routes.requireAdapterApiToken);
+			if (authError !== undefined) return authError;
+			const result = handleProjectListRequest(routes.projectLinkService);
+			return jsonResponse(result.body, { status: result.status });
+		}
+		if (
+			routes?.projectLinkService !== undefined &&
+			request.method === "POST" &&
+			url.pathname === "/admin/projects/link"
+		) {
+			const authError = authenticateAdapterRequest(request, routes.adapterApiToken, routes.requireAdapterApiToken);
+			if (authError !== undefined) return authError;
+			const body = await parseProjectAdminJsonRequest(request);
+			if (!body.ok) return jsonResponse(body.result.body, { status: body.result.status });
+			const result = await handleProjectLinkRequest(routes.projectLinkService, body.value);
+			return jsonResponse(result.body, { status: result.status });
+		}
+		if (routes?.projectLinkService !== undefined && request.method === "POST" && isProjectUnlinkPath(url.pathname)) {
+			const authError = authenticateAdapterRequest(request, routes.adapterApiToken, routes.requireAdapterApiToken);
+			if (authError !== undefined) return authError;
+			const projectId = projectIdFromUnlinkPath(url.pathname);
+			if (!projectId.ok) return jsonResponse(projectId.result.body, { status: projectId.result.status });
+			const result = await handleProjectUnlinkRequest(routes.projectLinkService, projectId.value);
+			return jsonResponse(result.body, { status: result.status });
 		}
 		if (routes !== undefined && request.method === "POST" && url.pathname === "/v1/chat/completions") {
 			const authError = authenticateAdapterRequest(request, routes.adapterApiToken, routes.requireAdapterApiToken);
@@ -100,12 +142,21 @@ export function createAdapterRequestHandler(
 					{ status: 400 },
 				);
 			}
+			if (routes.projectLinkService !== undefined && parsed.request.model === ADMIN_PROJECT_MODEL_ID) {
+				const result = await handleProjectAdminChatCompletion(
+					routes.projectLinkService,
+					parsed.request,
+					request.headers,
+					routes.owner,
+				);
+				return jsonResponse(result.body, { status: result.status });
+			}
 			let result: LiveChatCompletionsResult;
 			try {
 				result = await handleChatCompletions({
 					request: parsed.request,
-					headers: headersFromRequest(request),
-					projects: routes.projects,
+					headers: request.headers,
+					projects: await resolveRouteProjects(routes),
 					owner: routes.owner,
 					runner: routes.runner,
 					eventSink: routes.eventSink,
@@ -138,8 +189,12 @@ export function createAdapterRequestHandler(
 	};
 }
 
-function headersFromRequest(request: Request): OpenWebUIHeaderInput {
-	return request.headers;
+async function resolveProjects(provider: ProjectProvider): Promise<readonly RegisteredProject[]> {
+	return typeof provider === "function" ? await provider() : provider;
+}
+
+async function resolveRouteProjects(routes: AdapterRouteDependencies): Promise<readonly RegisteredProject[]> {
+	return routes.projectProvider === undefined ? routes.projects : await resolveProjects(routes.projectProvider);
 }
 
 function authenticateAdapterRequest(

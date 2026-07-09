@@ -12,7 +12,6 @@ export interface ProjectedProjectReference {
 	folderId?: string;
 	metadata?: OpenWebUIMetadata;
 }
-
 export interface ProjectedChatMessage {
 	id: string;
 	role: string;
@@ -23,12 +22,10 @@ export interface ProjectedChatMessage {
 	childrenIds?: readonly string[];
 	metadata?: OpenWebUIMetadata;
 }
-
 export interface ProjectedChatHistory {
 	messages: Record<string, ProjectedChatMessage>;
 	currentId: string | null;
 }
-
 export interface ProjectedChat {
 	id: string;
 	openWebUIChatId?: string;
@@ -39,14 +36,12 @@ export interface ProjectedChat {
 	messages?: readonly ProjectedChatMessage[];
 	history?: ProjectedChatHistory;
 }
-
 export interface ImportProjectedSessionInput {
 	repository: OpenWebUIProjectionRepository;
 	ownerUserId: string;
 	project: ProjectedProjectReference;
 	projectedChat: ProjectedChat;
 }
-
 export interface ImportProjectedSessionResult {
 	folderId: string;
 	chatId: string;
@@ -57,7 +52,6 @@ const folderIdForProject = (projectId: string): string => `gjc-project-${project
 const chatIdForSession = (sessionId: string): string => `gjc-session-${sessionId}`;
 const messageIdForProjectedMessage = (sessionId: string, messageId: string): string =>
 	`gjc-session-${sessionId}-message-${messageId}`;
-
 const mergeProjectedMetadata = (
 	metadata: OpenWebUIMetadata | undefined,
 	operationId: string,
@@ -80,13 +74,11 @@ const projectedMessages = (projectedChat: ProjectedChat): readonly ProjectedChat
 	if (projectedChat.history !== undefined) return Object.values(projectedChat.history.messages);
 	return [];
 };
-
 const createdAtForMessage = (message: ProjectedChatMessage): string | undefined => {
 	if (message.created_at !== undefined) return message.created_at;
 	if (message.timestamp !== undefined) return new Date(message.timestamp).toISOString();
 	return undefined;
 };
-
 const projectedMessageKey = (projectedChat: ProjectedChat, messageId: string): string =>
 	messageIdForProjectedMessage(projectedChat.id, messageId);
 
@@ -201,7 +193,13 @@ export const importProjectedSession = async ({
 		history: chatHistoryForProjectedChat(projectedChat, messages),
 	};
 
-	const storedChat = await repository.upsertChat(chat);
+	let storedChat = await repository.upsertChat(chat);
+	if (historyReferencesDifferentChat(storedChat)) {
+		storedChat = await repository.upsertChat({
+			...storedChat,
+			history: chatHistoryWithStoredChatId(storedChat),
+		});
+	}
 	const storedMessages = await repository.replaceChatMessages(
 		ownerUserId,
 		storedChat.id,
@@ -232,3 +230,19 @@ export const upsertProjectedProjectFolder = async ({
 	});
 	return folder.id;
 };
+
+function historyReferencesDifferentChat(chat: OpenWebUIChatRecord): boolean {
+	return Object.values(chat.history.messages).some(message => message.chat_id !== chat.id);
+}
+
+function chatHistoryWithStoredChatId(chat: OpenWebUIChatRecord): OpenWebUIChatRecord["history"] {
+	return {
+		currentId: chat.history.currentId,
+		messages: Object.fromEntries(
+			Object.entries(chat.history.messages).map(([id, message]) => [
+				id,
+				{ ...message, chat_id: chat.id, owner_user_id: chat.owner_user_id },
+			]),
+		),
+	};
+}

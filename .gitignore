@@ -13,6 +13,7 @@ coverage/
 .codegraph
 .gjc/
 .omo/
+openwebui-session-mappings.json
 
 # Logs and OS files
 *.log

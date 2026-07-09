@@ -25,6 +25,7 @@ describe("adapter CLI auth and start", () => {
 				GJC_OPENWEBUI_BIND_PORT: "8765",
 				GJC_OPENWEBUI_OWNER_USER_ID: "owner-test",
 				GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS: workspace,
+				GJC_OPENWEBUI_STATE_PATH: path.join(workspace, "adapter-state"),
 				GJC_OPENWEBUI_PROJECTS: `${projectDirectory}|Demo Project`,
 			},
 			{ turnRunner: new FakeGjcTurnRunner() },
@@ -51,6 +52,7 @@ describe("adapter CLI auth and start", () => {
 				GJC_OPENWEBUI_ADAPTER_API_TOKEN: "adapter-token",
 				GJC_OPENWEBUI_OWNER_USER_ID: "owner-test",
 				GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS: workspace,
+				GJC_OPENWEBUI_STATE_PATH: path.join(workspace, "adapter-state"),
 				GJC_OPENWEBUI_PROJECTS: `${projectDirectory}|Demo Project`,
 			},
 			stdout: "pipe",
@@ -63,9 +65,9 @@ describe("adapter CLI auth and start", () => {
 			headers: { authorization: "Bearer adapter-token" },
 		});
 		expect(modelsResponse.status).toBe(200);
-		expect(await modelsResponse.json()).toMatchObject({
-			object: "list",
-			data: [{ id: "gjc/demo-project", object: "model", owned_by: "gjc" }],
-		});
+		const body = (await modelsResponse.json()) as { object: string; data: { id: string }[] };
+		expect(body.object).toBe("list");
+		expect(body.data.map(model => model.id)).toContain("gjc/projects");
+		expect(body.data.map(model => model.id)).toContain("gjc/demo-project");
 	});
 });

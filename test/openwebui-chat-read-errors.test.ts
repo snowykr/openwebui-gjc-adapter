@@ -56,6 +56,28 @@ describe("OpenWebUIHttpClient read errors", () => {
 		}
 	});
 
+	test("throws typed HTTP errors for missing write targets", async () => {
+		const fixture = startRecordingServer({ notFoundPath: "/api/v1/chats/chat-1/messages/message-1/event" });
+		const client = new OpenWebUIHttpClient({ baseUrl: fixture.baseUrl, apiToken: "token-1" });
+
+		try {
+			await expect(
+				client.postMessageEvent({
+					chatId: "chat-1",
+					messageId: "message-1",
+					event: { type: "status", data: { description: "missing", done: false } },
+				}),
+			).rejects.toMatchObject({
+				name: "OpenWebUIHttpError",
+				method: "POST",
+				path: "/api/v1/chats/chat-1/messages/message-1/event",
+				status: 404,
+			});
+		} finally {
+			fixture.stop();
+		}
+	});
+
 	test("rejects malformed OpenWebUI chat responses before returning them", async () => {
 		const fixture = startRecordingServer({
 			responseBody: { id: "chat-1", history: { messages: {}, currentId: null } },

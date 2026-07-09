@@ -96,6 +96,16 @@ describe("OpenWebUIHttpClient", () => {
 				},
 				{
 					method: "POST",
+					path: "/api/v1/chats/chat-1/messages/message-1",
+					authorization: "Bearer token-1",
+					body: {
+						role: "assistant",
+						content: "hello",
+						metadata: { gjc_adapter: { projected_message_id: "entry-1" } },
+					},
+				},
+				{
+					method: "POST",
 					path: "/api/v1/chats/chat-1/messages/message-1/event",
 					authorization: "Bearer token-1",
 					body: {

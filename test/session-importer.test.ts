@@ -8,7 +8,6 @@ const project = {
 	name: "Project One",
 	metadata: { color: "blue" },
 };
-
 const projectedChat = {
 	id: "session-1",
 	title: "GJC Session",
@@ -28,7 +27,6 @@ describe("importProjectedSession", () => {
 			project,
 			projectedChat,
 		});
-
 		const chat = await repository.getChat("owner-1", result.chatId);
 
 		expect(result).toEqual({

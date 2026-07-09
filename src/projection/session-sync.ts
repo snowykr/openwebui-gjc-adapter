@@ -106,6 +106,7 @@ export async function syncProjectSessionsToOpenWebUI(
 				});
 			} catch (error) {
 				const narrowedError = error instanceof Error ? error : new Error("Unknown session import failure");
+				if (!(narrowedError instanceof GjcSessionLoadError)) throw narrowedError;
 				skipped.push(skippedSession(project.id, filePath, narrowedError));
 			}
 		}

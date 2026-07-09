@@ -1,5 +1,5 @@
 export interface OpenWebUIHttpRequest {
-	readonly method: "GET" | "POST";
+	readonly method: "DELETE" | "GET" | "POST";
 	readonly path: string;
 	readonly body?: unknown;
 }

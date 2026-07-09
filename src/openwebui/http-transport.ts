@@ -29,7 +29,7 @@ export function createOpenWebUITransport(config: OpenWebUITransportConfig): Open
 				accept: "application/json",
 				...(request.body === undefined ? {} : { "content-type": "application/json" }),
 			});
-			if (isMissingGetResponse(request, response, options.missingStatuses)) return undefined;
+			if (isMissingResponse(request, response, options.missingStatuses)) return undefined;
 			await assertOpenWebUIResponseOk(request, response);
 			if (response.status === 204) return undefined;
 			return await response.json();
@@ -38,7 +38,7 @@ export function createOpenWebUITransport(config: OpenWebUITransportConfig): Open
 			const response = await sendOpenWebUIRequest(config, request, {
 				accept: "application/octet-stream, */*",
 			});
-			if (isMissingGetResponse(request, response, options.missingStatuses)) return undefined;
+			if (isMissingResponse(request, response, options.missingStatuses)) return undefined;
 			await assertOpenWebUIResponseOk(request, response);
 			return {
 				bytes: new Uint8Array(await response.arrayBuffer()),
@@ -69,12 +69,13 @@ async function sendOpenWebUIRequest(
 	}
 }
 
-function isMissingGetResponse(
+function isMissingResponse(
 	request: OpenWebUIHttpRequest,
 	response: Response,
 	missingStatuses: readonly number[] | undefined,
 ): boolean {
-	return request.method === "GET" && (missingStatuses ?? [404]).includes(response.status);
+	if (missingStatuses !== undefined) return missingStatuses.includes(response.status);
+	return request.method === "GET" && response.status === 404;
 }
 
 async function assertOpenWebUIResponseOk(request: OpenWebUIHttpRequest, response: Response): Promise<void> {

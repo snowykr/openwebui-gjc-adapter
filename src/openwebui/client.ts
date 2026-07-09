@@ -73,6 +73,11 @@ export interface OpenWebUIProjectionRepository {
 		messages: readonly OpenWebUIChatMessageRecord[],
 	): Promise<readonly OpenWebUIChatMessageRecord[]>;
 	getChat(ownerUserId: string, chatId: string): Promise<OpenWebUIChatRecord | undefined>;
+	deleteFolder?(
+		ownerUserId: string,
+		folderId: string,
+		options: { readonly deleteContents: boolean; readonly expectedProjectId?: string },
+	): Promise<void>;
 }
 
 const mergeMetadata = (existing: OpenWebUIMetadata, next: OpenWebUIMetadata): OpenWebUIMetadata => ({
@@ -190,7 +195,37 @@ export class InMemoryOpenWebUIProjectionRepository implements OpenWebUIProjectio
 		return chat ? cloneChat(chat) : undefined;
 	}
 
+	async deleteFolder(
+		ownerUserId: string,
+		folderId: string,
+		options: { readonly deleteContents: boolean; readonly expectedProjectId?: string },
+	): Promise<void> {
+		const folderKey = this.#ownerScopedKey(ownerUserId, folderId);
+		const folder = this.#folders.get(folderKey);
+		if (folder === undefined) return;
+		if (options.expectedProjectId !== undefined && adapterProjectId(folder.metadata) !== options.expectedProjectId) {
+			return;
+		}
+		this.#folders.delete(folderKey);
+		if (!options.deleteContents) return;
+		for (const [key, chat] of this.#chats.entries()) {
+			if (chat.owner_user_id === ownerUserId && chat.folder_id === folderId) {
+				this.#chats.delete(key);
+				this.#messagesByChatId.delete(this.#ownerScopedKey(ownerUserId, chat.id));
+			}
+		}
+	}
+
 	#ownerScopedKey(ownerUserId: string, id: string): string {
 		return `${ownerUserId}:${id}`;
 	}
+}
+
+function adapterProjectId(metadata: OpenWebUIMetadata): string | undefined {
+	const adapter = metadata[OPENWEBUI_METADATA_NAMESPACE];
+	if (typeof adapter !== "object" || adapter === null || Array.isArray(adapter)) return undefined;
+	const record = adapter as Record<string, unknown>;
+	if (typeof record.projectId === "string") return record.projectId;
+	if (typeof record.project_id === "string") return record.project_id;
+	return undefined;
 }
