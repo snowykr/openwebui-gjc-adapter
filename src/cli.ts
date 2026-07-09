@@ -10,6 +10,7 @@ import { createGjcRoutingLiveGatewayRunner } from "./live/gjc-routing-runner";
 import { buildOpenWebUIAuthStartupDiagnostic, type OpenWebUIOwnerContext } from "./openwebui/auth";
 import { OpenWebUIHttpClient, type OpenWebUIProjectionRepository } from "./openwebui/client";
 import { createOpenWebUIFileContextResolver } from "./openwebui/file-context-resolver";
+import { OpenWebUIPromptHintClient } from "./openwebui/prompt-hints";
 import { syncProjectSessionsToOpenWebUI } from "./projection/session-sync";
 import { ProjectLinkService } from "./projects/link-service";
 import { SqliteProjectRegistrationStore } from "./projects/registration-store";
@@ -44,6 +45,10 @@ export async function buildAdapterServerOptionsFromEnv(
 		});
 	const mappings = dependencies.mappings ?? new FileBackedSessionMappingStore(buildSessionMappingStorePath(config));
 	const openWebUIClient = buildOpenWebUIClient(config);
+	const promptHintClient = buildOpenWebUIPromptHintClient(config);
+	if (promptHintClient !== undefined) {
+		await promptHintClient.seedGjcPromptHints();
+	}
 	const projectionRepository = dependencies.projectionRepository ?? openWebUIClient;
 	const projectStore =
 		dependencies.projectRegistrationStore ??
@@ -146,6 +151,11 @@ function buildProjectRegistrationStorePath(config: AdapterConfig): string {
 function buildOpenWebUIClient(config: AdapterConfig): OpenWebUIHttpClient | undefined {
 	if (config.openWebUIApiToken === undefined) return undefined;
 	return new OpenWebUIHttpClient({ baseUrl: config.openWebUIBaseUrl, apiToken: config.openWebUIApiToken });
+}
+
+function buildOpenWebUIPromptHintClient(config: AdapterConfig): OpenWebUIPromptHintClient | undefined {
+	if (config.openWebUIApiToken === undefined) return undefined;
+	return new OpenWebUIPromptHintClient({ baseUrl: config.openWebUIBaseUrl, apiToken: config.openWebUIApiToken });
 }
 
 function buildOpenWebUIEventSink(client: OpenWebUIHttpClient | undefined): LiveGatewayEventSink | undefined {
