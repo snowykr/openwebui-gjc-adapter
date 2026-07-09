@@ -1,15 +1,44 @@
 import { RpcClient } from "@gajae-code/coding-agent/modes/rpc/rpc-client";
-import type { GjcRpcRunnerClientOptions, GjcRpcRunnerTransport, GjcRpcRunnerTransportEvent } from "./rpc-runner";
+import type {
+	GjcRpcRunnerClientOptions,
+	GjcRpcRunnerTransport,
+	GjcRpcRunnerTransportEvent,
+	GjcRpcTransportState,
+} from "./rpc-runner";
+
+export interface RpcClientTransportClient {
+	start(): Promise<void>;
+	stop(): void;
+	newSession(): Promise<{ readonly cancelled: boolean }>;
+	switchSession(sessionPath: string): Promise<{ readonly cancelled: boolean }>;
+	getState(): Promise<GjcRpcTransportState>;
+	prompt(message: string): Promise<void>;
+	onEvent(listener: (event: GjcRpcRunnerTransportEvent) => void): () => void;
+	onWorkflowGate(listener: (gate: GjcRpcRunnerTransportEvent) => void): () => void;
+	respondGate(gateId: string, answer: unknown, idempotencyKey?: string): Promise<unknown>;
+	getLastAssistantText(): Promise<string | null>;
+	getStderr(): string;
+}
+
+interface FullSessionEventRpcClient {
+	onSessionEvent(listener: (event: GjcRpcRunnerTransportEvent) => void): () => void;
+}
 
 export function createDefaultRpcTransport(options: GjcRpcRunnerClientOptions): GjcRpcRunnerTransport {
-	return new RpcClientTransport(options);
+	return createRpcTransportFromClient(
+		new RpcClient({ cwd: options.cwd, sessionDir: options.sessionRoot, cliPath: options.cliPath }),
+	);
+}
+
+export function createRpcTransportFromClient(client: RpcClientTransportClient): GjcRpcRunnerTransport {
+	return new RpcClientTransport(client);
 }
 
 class RpcClientTransport implements GjcRpcRunnerTransport {
-	readonly #client: RpcClient;
+	readonly #client: RpcClientTransportClient;
 
-	constructor(options: GjcRpcRunnerClientOptions) {
-		this.#client = new RpcClient({ cwd: options.cwd, sessionDir: options.sessionRoot, cliPath: options.cliPath });
+	constructor(client: RpcClientTransportClient) {
+		this.#client = client;
 	}
 
 	async start(): Promise<void> {
@@ -52,10 +81,17 @@ class RpcClientTransport implements GjcRpcRunnerTransport {
 				cleanup();
 				resolve(value);
 			};
-			unsubscribeEvent = this.#client.onEvent(event => {
-				events.push(event);
-				if (event.type === "agent_end") finish([...events]);
-			});
+			if (supportsFullSessionEvents(this.#client)) {
+				unsubscribeEvent = this.#client.onSessionEvent(event => {
+					events.push(event);
+					if (event.type === "agent_end") finish([...events]);
+				});
+			} else {
+				unsubscribeEvent = this.#client.onEvent(event => {
+					events.push(event);
+					if (event.type === "agent_end") finish([...events]);
+				});
+			}
 			unsubscribeGate = this.#client.onWorkflowGate(gate => {
 				finish([...events, gate]);
 			});
@@ -88,4 +124,10 @@ class RpcClientTransport implements GjcRpcRunnerTransport {
 	async getLastAssistantText(): Promise<string | null> {
 		return this.#client.getLastAssistantText();
 	}
+}
+
+function supportsFullSessionEvents(
+	client: RpcClientTransportClient,
+): client is RpcClientTransportClient & FullSessionEventRpcClient {
+	return "onSessionEvent" in client && typeof client.onSessionEvent === "function";
 }

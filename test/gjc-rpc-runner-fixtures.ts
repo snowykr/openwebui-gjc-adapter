@@ -2,6 +2,7 @@ import type {
 	GjcRpcRunnerClientFactory,
 	GjcRpcRunnerClientOptions,
 	GjcRpcRunnerTransport,
+	GjcRpcRunnerTransportEvent,
 	GjcRpcTransportState,
 } from "../src/gjc/rpc-runner";
 
@@ -25,25 +26,6 @@ type FakeCall =
 	| { readonly type: "on_workflow_gate" }
 	| { readonly type: "get_last_assistant_text" }
 	| { readonly type: "stop" };
-
-type GjcRpcRunnerTransportEvent =
-	| {
-			readonly type: "message_update";
-			readonly message: { readonly content: readonly [{ readonly type: "text"; readonly text: string }] };
-	  }
-	| { readonly type: "tool_execution_start"; readonly toolCallId: string; readonly toolName: string }
-	| {
-			readonly type: "workflow_gate";
-			readonly gate_id: string;
-			readonly stage: string;
-			readonly kind: string;
-			readonly schema_hash: string;
-			readonly schema: unknown;
-			readonly options?: unknown;
-			readonly context: unknown;
-			readonly created_at?: string;
-			readonly required: true;
-	  };
 
 export class FakeRpcTransport implements GjcRpcRunnerTransport {
 	readonly calls: FakeCall[] = [];

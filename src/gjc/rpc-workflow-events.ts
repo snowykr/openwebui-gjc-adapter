@@ -1,5 +1,6 @@
 import { GjcRpcRunnerError } from "./rpc-errors";
 import type { GjcRpcRunnerTransport, GjcRpcRunnerTransportEvent } from "./rpc-runner";
+import { sanitizeSessionEventText, sessionEventPayload } from "./session-event-payload";
 
 export async function promptAndCollectWorkflowGates(
 	client: GjcRpcRunnerTransport,
@@ -24,11 +25,12 @@ export async function promptAndCollectWorkflowGates(
 }
 
 export function toTurnEvent(event: GjcRpcRunnerTransportEvent) {
+	const payload = workflowGatePayload(event) ?? sessionEventPayload(event);
 	return {
 		type: event.type,
 		...(eventText(event) === undefined ? {} : { text: eventText(event) }),
 		...(eventId(event) === undefined ? {} : { id: eventId(event) }),
-		...(workflowGatePayload(event) === undefined ? {} : { payload: workflowGatePayload(event) }),
+		...(payload === undefined ? {} : { payload }),
 	};
 }
 
@@ -82,16 +84,22 @@ function eventId(event: GjcRpcRunnerTransportEvent): string | undefined {
 
 function eventText(event: GjcRpcRunnerTransportEvent): string | undefined {
 	if (event.toolName !== undefined) return event.toolName;
-	const message = recordValue(event.message);
+	if (event.type === "message_update") return messageContentText(event.message);
+	if (sessionEventPayload(event) !== undefined) return undefined;
+	return messageContentText(event.message);
+}
+
+function messageContentText(value: unknown): string | undefined {
+	const message = recordValue(value);
 	const content = message?.content;
-	if (typeof content === "string") return content;
+	if (typeof content === "string") return sanitizeSessionEventText(content);
 	if (!Array.isArray(content)) return undefined;
 	const texts: string[] = [];
 	for (const item of content) {
 		const block = recordValue(item);
 		if (block?.type === "text" && typeof block.text === "string") texts.push(block.text);
 	}
-	return texts.length === 0 ? undefined : texts.join("");
+	return texts.length === 0 ? undefined : sanitizeSessionEventText(texts.join(""));
 }
 
 function workflowGatePayload(event: GjcRpcRunnerTransportEvent): Readonly<Record<string, unknown>> | undefined {

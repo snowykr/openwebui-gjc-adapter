@@ -14,6 +14,7 @@ import {
 } from "../projection/workflow-gates";
 import { buildProjectionPayloadHash, type OutboxStore } from "../state/outbox";
 import { type LiveGatewayRunnerInput, type LiveGatewayRunnerResult, WorkflowGateReplyError } from "./chat-completions";
+import { sessionEventToProjectableFrame } from "./session-event-frames";
 
 export interface WorkflowGateTurnDependencies {
 	readonly turnRunner: GjcTurnRunner;
@@ -150,6 +151,8 @@ export function buildEventPayloadHash(events: readonly OpenWebUIMessageEvent[]):
 
 function turnEventToProjectableFrame(event: GjcTurnEvent): ProjectableAgentFrame | null {
 	const classified = classifyRpcFrame({ type: event.type, id: event.id, text: event.text });
+	const sessionFrame = sessionEventToProjectableFrame(event);
+	if (sessionFrame !== undefined) return sessionFrame;
 	if (event.type === "message_update" || event.type === "assistant_text" || event.type === "assistant") return null;
 	if (classified.kind === "workflow_gate" || event.type === "workflow_gate") {
 		const pendingGate = pendingGateFromEvent(event);
