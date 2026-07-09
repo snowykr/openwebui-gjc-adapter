@@ -4,14 +4,12 @@ import { type AdapterConfig, buildStartupDiagnostics, loadAdapterConfig } from "
 import { createGjcRpcTurnRunner, type GjcTurnRunner } from "./gjc/rpc-runner";
 import { FileBackedSessionMappingStore, type SessionMappingStore } from "./gjc/session-router";
 import type { AdapterHealthCheck } from "./health";
-import type {
-	LiveGatewayEventSink,
-	LiveGatewayFileContextResolver,
-	LiveGatewayMessageSink,
-} from "./live/chat-completions";
+import type { LiveGatewayEventSink, LiveGatewayMessageSink } from "./live/chat-completions";
+import type { LiveGatewayFileContextResolver } from "./live/file-contexts";
 import { createGjcRoutingLiveGatewayRunner } from "./live/gjc-routing-runner";
 import { buildOpenWebUIAuthStartupDiagnostic, type OpenWebUIOwnerContext } from "./openwebui/auth";
 import { OpenWebUIHttpClient, type OpenWebUIProjectionRepository } from "./openwebui/client";
+import { createOpenWebUIFileContextResolver } from "./openwebui/file-context-resolver";
 import { syncProjectSessionsToOpenWebUI } from "./projection/session-sync";
 import { disambiguateRegisteredProjects, type RegisteredProject, registerProjectDirectory } from "./projects/registry";
 import { resolveAllowedRoots } from "./security/paths";
@@ -151,7 +149,7 @@ function buildOpenWebUIFileContextResolver(
 	client: OpenWebUIHttpClient | undefined,
 ): LiveGatewayFileContextResolver | undefined {
 	if (client === undefined) return undefined;
-	return fileId => client.getFileContent(fileId);
+	return createOpenWebUIFileContextResolver(client);
 }
 
 function resolveGjcCliPath(gjcCommand: string): string {

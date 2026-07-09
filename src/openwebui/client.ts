@@ -1,6 +1,8 @@
 import { OPENWEBUI_METADATA_NAMESPACE } from "./persistence-contract";
 
 export type {
+	OpenWebUIFileBytes,
+	OpenWebUIFileContent,
 	OpenWebUIHttpClientConfig,
 	PostOpenWebUIMessageEventInput,
 	UpdateOpenWebUIMessageContentInput,

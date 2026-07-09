@@ -3,12 +3,7 @@ import type { OpenWebUIMessageEvent } from "../openwebui/events";
 import type { OpenWebUIHeaderInput } from "../openwebui/headers";
 import { parseOpenWebUIHeaders } from "../openwebui/headers";
 import type { RegisteredProject } from "../projects/registry";
-import {
-	appendResolvedOpenWebUIFileContext,
-	latestUserText,
-	openWebUIFileReferences,
-	type ResolvedOpenWebUIFileContext,
-} from "./chat-content";
+import { latestUserText } from "./chat-content";
 import {
 	deliverContentAfterChunks,
 	deliverFinalAssistantContent,
@@ -22,6 +17,7 @@ import {
 	encodeChatCompletionSse,
 	type OpenAIErrorResponse,
 } from "./chat-response-format";
+import { appendResolvedFileContexts, type LiveGatewayFileContextResolver } from "./file-contexts";
 import { findProjectByModelId } from "./models";
 import type { OpenAIChatCompletionRequest, OpenAIChatCompletionResponse } from "./openai-types";
 
@@ -48,10 +44,6 @@ export type LiveGatewayRunnerResult =
 export interface LiveGatewayRunner {
 	run(input: LiveGatewayRunnerInput): Promise<LiveGatewayRunnerResult> | LiveGatewayRunnerResult;
 }
-
-export type LiveGatewayFileContextResolver = (
-	fileId: string,
-) => Promise<ResolvedOpenWebUIFileContext | undefined> | ResolvedOpenWebUIFileContext | undefined;
 
 export class LiveGatewayUnavailableError extends Error {
 	readonly code = "live_runner_unavailable";
@@ -102,7 +94,7 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 		return errorResult(404, "invalid_request_error", "model_not_found", `Unknown GJC model: ${input.request.model}`);
 	}
 
-	const created = toUnixSeconds(input.now ?? new Date());
+	const created = Math.floor((input.now ?? new Date()).getTime() / 1000);
 	const id = input.idFactory?.() ?? `chatcmpl-${created}`;
 	if (headers.isBackgroundTask) {
 		return {
@@ -136,12 +128,25 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 			"A chat completion requires a user message with text content.",
 		);
 	}
-	const prompt = await appendResolvedFileContexts({
-		prompt: latestPrompt,
-		messages: input.request.messages,
-		files: input.request.files,
-		resolver: input.fileContextResolver,
-	});
+	let prompt: string;
+	try {
+		prompt = await appendResolvedFileContexts({
+			prompt: latestPrompt,
+			messages: input.request.messages,
+			files: input.request.files,
+			project,
+			chatId: headers.chatId,
+			userMessageId: headers.userMessageId,
+			resolver: input.fileContextResolver,
+		});
+	} catch {
+		return errorResult(
+			503,
+			"server_error",
+			"attachment_resolution_failed",
+			"OpenWebUI attachment files could not be resolved.",
+		);
+	}
 
 	let runnerResult: LiveGatewayRunnerResult;
 	try {
@@ -237,29 +242,4 @@ function errorResult(
 		status,
 		body: buildOpenAIErrorResponse({ message, type, code }),
 	};
-}
-
-async function appendResolvedFileContexts(input: {
-	readonly prompt: string;
-	readonly messages: OpenAIChatCompletionRequest["messages"];
-	readonly files?: OpenAIChatCompletionRequest["files"];
-	readonly resolver?: LiveGatewayFileContextResolver;
-}): Promise<string> {
-	if (input.resolver === undefined) return input.prompt;
-	const resolved: ResolvedOpenWebUIFileContext[] = [];
-	for (const reference of openWebUIFileReferences(input.messages, input.files ?? [])) {
-		const file = await input.resolver(reference.id);
-		if (file !== undefined) {
-			resolved.push({
-				id: file.id,
-				filename: file.filename ?? reference.name,
-				...(file.content === undefined ? {} : { content: file.content }),
-			});
-		}
-	}
-	return appendResolvedOpenWebUIFileContext(input.prompt, resolved);
-}
-
-function toUnixSeconds(date: Date): number {
-	return Math.floor(date.getTime() / 1000);
 }

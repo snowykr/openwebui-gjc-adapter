@@ -16,6 +16,12 @@ export type RecordingServerOptions = Readonly<{
 	}[];
 	notFoundPath?: string;
 	responseBody?: unknown;
+	binaryResponses?: readonly {
+		readonly path: string;
+		readonly body: Uint8Array;
+		readonly contentType: string;
+		readonly status?: number;
+	}[];
 	status?: number;
 }>;
 
@@ -38,6 +44,13 @@ export function startRecordingServer(options: RecordingServerOptions = {}) {
 			}
 			if (url.pathname === options.failPath) {
 				return Response.json({ error: "forced failure" }, { status: options.status ?? 500 });
+			}
+			const binaryResponse = options.binaryResponses?.find(response => response.path === url.pathname);
+			if (request.method === "GET" && binaryResponse !== undefined) {
+				return new Response(binaryResponse.body, {
+					status: binaryResponse.status ?? 200,
+					headers: { "content-type": binaryResponse.contentType },
+				});
 			}
 			const configuredFolder = options.folders?.find(folder => `/api/v1/folders/${folder.id}` === url.pathname);
 			if (request.method === "GET" && configuredFolder !== undefined) {

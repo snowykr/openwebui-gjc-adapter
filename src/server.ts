@@ -3,11 +3,11 @@ import {
 	handleChatCompletions,
 	type LiveChatCompletionsResult,
 	type LiveGatewayEventSink,
-	type LiveGatewayFileContextResolver,
 	type LiveGatewayMessageSink,
 	type LiveGatewayRunner,
 } from "./live/chat-completions";
 import { parseChatCompletionRequest } from "./live/chat-request-parser";
+import type { LiveGatewayFileContextResolver } from "./live/file-contexts";
 import { buildModelList } from "./live/models";
 import type { OpenWebUIOwnerContext } from "./openwebui/auth";
 import type { OpenWebUIHeaderInput } from "./openwebui/headers";

@@ -12,12 +12,6 @@ export interface OpenWebUIFileReference {
 	readonly type?: string;
 }
 
-export interface ResolvedOpenWebUIFileContext {
-	readonly id: string;
-	readonly filename?: string;
-	readonly content?: string;
-}
-
 export function latestUserText(
 	messages: readonly OpenAIChatMessage[],
 	files: readonly OpenAIChatAttachment[] = [],
@@ -40,26 +34,12 @@ export function openWebUIFileReferences(
 ): readonly OpenWebUIFileReference[] {
 	const references = new Map<string, OpenWebUIFileReference>();
 	for (const file of files) {
-		if (attachmentContent(file) !== null) continue;
 		addAttachmentReference(references, file);
 	}
 	for (const message of messages) {
 		collectMessageFileReferences(references, message);
 	}
 	return [...references.values()];
-}
-
-export function appendResolvedOpenWebUIFileContext(
-	prompt: string,
-	files: readonly ResolvedOpenWebUIFileContext[],
-): string {
-	const entries = files
-		.map(formatResolvedFileContext)
-		.filter((entry): entry is string => entry !== null)
-		.join("\n\n");
-	if (entries.length === 0) return prompt;
-	const contextBlock = untrustedContextBlock("OpenWebUI resolved file content", entries);
-	return prompt.length > 0 ? `${contextBlock}\n\n${prompt}` : contextBlock;
 }
 
 function openWebUIContextText(messages: readonly OpenAIChatMessage[]): string | null {
@@ -100,7 +80,7 @@ function collectMessageFileReferences(
 	}
 	if (content === null) return;
 	for (const part of content) {
-		if (part.type === "file" && attachmentContent(part.file) === null) {
+		if (part.type === "file") {
 			addAttachmentReference(references, part.file);
 		}
 	}
@@ -150,15 +130,6 @@ function fileIdFromValue(value: string): string | null {
 	const filePathMatch = /\/files\/([^/?#]+)/.exec(trimmed);
 	if (filePathMatch?.[1] !== undefined) return filePathMatch[1];
 	return trimmed;
-}
-
-function formatResolvedFileContext(file: ResolvedOpenWebUIFileContext): string | null {
-	if (file.content === undefined || file.content.length === 0) return null;
-	const name = file.filename === undefined ? "" : `, name=${boundedText(file.filename)}`;
-	return [
-		`[OpenWebUI file: id=${boundedText(file.id)}${name}]`,
-		boundedText(file.content, MAX_ATTACHMENT_CONTENT_LENGTH),
-	].join("\n");
 }
 
 function partText(part: OpenAIChatContentPart): string {

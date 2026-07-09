@@ -5,8 +5,9 @@ import type {
 	OpenWebUIProjectionRepository,
 } from "./client";
 import type { OpenWebUIMessageEvent } from "./events";
-import { OpenWebUIHttpError, type OpenWebUIHttpRequest, OpenWebUITransportError } from "./http-errors";
+import { OpenWebUIHttpError } from "./http-errors";
 import { parseOpenWebUIChatRecord, parseOpenWebUIFileContent } from "./http-parsers";
+import { createOpenWebUITransport, type OpenWebUITransport } from "./http-transport";
 import {
 	adapterProjectId,
 	epochSeconds,
@@ -46,17 +47,23 @@ export interface OpenWebUIFileContent {
 	readonly content?: string;
 }
 
+export interface OpenWebUIFileBytes {
+	readonly id: string;
+	readonly bytes: Uint8Array;
+	readonly contentType?: string;
+}
+
 const DEFAULT_TIMEOUT_MS = 10_000;
 
 export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
-	readonly #baseUrl: string;
-	readonly #apiToken: string;
-	readonly #timeoutMs: number;
+	readonly #transport: OpenWebUITransport;
 
 	constructor(config: OpenWebUIHttpClientConfig) {
-		this.#baseUrl = normalizeBaseUrl(config.baseUrl);
-		this.#apiToken = normalizeApiToken(config.apiToken);
-		this.#timeoutMs = normalizeTimeoutMs(config.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+		this.#transport = createOpenWebUITransport({
+			baseUrl: normalizeBaseUrl(config.baseUrl),
+			apiToken: normalizeApiToken(config.apiToken),
+			timeoutMs: normalizeTimeoutMs(config.timeoutMs ?? DEFAULT_TIMEOUT_MS),
+		});
 	}
 
 	async upsertFolder(record: OpenWebUIFolderRecord): Promise<OpenWebUIFolderRecord> {
@@ -65,7 +72,7 @@ export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 			ownerMatches(existing, record.owner_user_id) ??
 			(await this.#findFolderByAdapterMetadata(record)) ??
 			(await this.#createFolder({ name: record.name, metadata: record.metadata }));
-		await this.#sendJson({
+		await this.#transport.sendJson({
 			method: "POST",
 			path: openWebUIApiPath(["folders", folder.id, "update"]),
 			body: { name: record.name, meta: record.metadata },
@@ -81,7 +88,7 @@ export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 	async upsertChat(record: OpenWebUIChatRecord): Promise<OpenWebUIChatRecord> {
 		const existing = await this.getChat(record.owner_user_id, record.id);
 		if (existing === undefined) {
-			const response = await this.#sendJson({
+			const response = await this.#transport.sendJson({
 				method: "POST",
 				path: openWebUIApiPath(["chats", "import"]),
 				body: {
@@ -119,7 +126,7 @@ export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 				meta: record.metadata,
 			},
 		} as const;
-		const response = await this.#sendJson(request);
+		const response = await this.#transport.sendJson(request);
 		const updated = parseOpenWebUIChatRecord(response, request);
 		return await this.#moveChatToFolder(updated, record.folder_id);
 	}
@@ -139,14 +146,14 @@ export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 			method: "GET",
 			path: openWebUIApiPath(["chats", chatId]),
 		} as const;
-		const response = await this.#sendJson(request, { missingStatuses: [401, 404] });
+		const response = await this.#transport.sendJson(request, { missingStatuses: [401, 404] });
 		if (response === undefined) return undefined;
 		const parsed = parseOpenWebUIChatRecord(response, request);
 		return ownerUserId.length > 0 && parsed.owner_user_id === ownerUserId ? parsed : undefined;
 	}
 
 	async postMessageEvent(input: PostOpenWebUIMessageEventInput): Promise<void> {
-		await this.#sendJson({
+		await this.#transport.sendJson({
 			method: "POST",
 			path: openWebUIApiPath(["chats", input.chatId, "messages", input.messageId, "event"]),
 			body: input.event,
@@ -154,7 +161,7 @@ export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 	}
 
 	async updateMessageContent(input: UpdateOpenWebUIMessageContentInput): Promise<void> {
-		await this.#sendJson({
+		await this.#transport.sendJson({
 			method: "POST",
 			path: openWebUIApiPath(["chats", input.chatId, "messages", input.messageId]),
 			body: { content: input.content },
@@ -166,13 +173,27 @@ export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 			method: "GET",
 			path: openWebUIApiPath(["files", fileId]),
 		} as const;
-		const response = await this.#sendJson(request, { missingStatuses: [401, 404] });
+		const response = await this.#transport.sendJson(request, { missingStatuses: [401, 404] });
 		return response === undefined ? undefined : parseOpenWebUIFileContent(response, request);
+	}
+
+	async getFileBytes(fileId: string): Promise<OpenWebUIFileBytes | undefined> {
+		const request = {
+			method: "GET",
+			path: openWebUIApiPath(["files", fileId, "content"]),
+		} as const;
+		const response = await this.#transport.sendBinary(request, { missingStatuses: [401, 404] });
+		if (response === undefined) return undefined;
+		return {
+			id: fileId,
+			bytes: response.bytes,
+			...(response.contentType === null ? {} : { contentType: response.contentType }),
+		};
 	}
 
 	async #getFolderById(folderId: string): Promise<OpenWebUIFolderLookup | undefined> {
 		const request = { method: "GET", path: openWebUIApiPath(["folders", folderId]) } as const;
-		const response = await this.#sendJson(request, { missingStatuses: [404] });
+		const response = await this.#transport.sendJson(request, { missingStatuses: [404] });
 		return response === undefined ? undefined : parseOpenWebUIFolderLookup(response, request);
 	}
 
@@ -180,7 +201,7 @@ export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 		const projectId = adapterProjectId(record.metadata);
 		if (projectId === undefined) return undefined;
 		const request = { method: "GET", path: `${openWebUIApiPath(["folders"])}/` } as const;
-		const response = await this.#sendJson(request);
+		const response = await this.#transport.sendJson(request);
 		if (!Array.isArray(response)) return undefined;
 		for (const item of response) {
 			const summary = parseOpenWebUIFolderLookup(item, request);
@@ -205,7 +226,7 @@ export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 			path: `${openWebUIApiPath(["folders"])}/`,
 			body: { name: input.name, meta: input.metadata },
 		} as const;
-		const response = await this.#sendJson(request);
+		const response = await this.#transport.sendJson(request);
 		return parseOpenWebUIFolderLookup(response, request);
 	}
 
@@ -216,43 +237,8 @@ export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 			path: openWebUIApiPath(["chats", record.id, "folder"]),
 			body: { folder_id: folderId },
 		} as const;
-		const response = await this.#sendJson(request);
+		const response = await this.#transport.sendJson(request);
 		const moved = parseOpenWebUIChatRecord(response, request);
 		return { ...moved, metadata: record.metadata };
-	}
-
-	async #sendJson(
-		request: OpenWebUIHttpRequest,
-		options: { readonly missingStatuses?: readonly number[] } = {},
-	): Promise<unknown> {
-		let response: Response;
-		try {
-			response = await fetch(`${this.#baseUrl}${request.path}`, {
-				method: request.method,
-				headers: {
-					accept: "application/json",
-					authorization: `Bearer ${this.#apiToken}`,
-					...(request.body === undefined ? {} : { "content-type": "application/json" }),
-				},
-				...(request.body === undefined ? {} : { body: JSON.stringify(request.body) }),
-				signal: AbortSignal.timeout(this.#timeoutMs),
-			});
-		} catch (error) {
-			const detail = error instanceof Error ? `${error.name}: ${error.message}` : "non-Error fetch failure";
-			throw new OpenWebUITransportError({ ...request, detail });
-		}
-
-		if (request.method === "GET" && (options.missingStatuses ?? [404]).includes(response.status)) {
-			return undefined;
-		}
-		if (!response.ok) {
-			throw new OpenWebUIHttpError({
-				...request,
-				status: response.status,
-				responseBody: await response.text(),
-			});
-		}
-		if (response.status === 204) return undefined;
-		return await response.json();
 	}
 }
