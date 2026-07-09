@@ -198,7 +198,7 @@ function firstDefinedValidSessionFile(
 	return undefined;
 }
 
-function validateSessionFile(project: RegisteredProject, sessionFile: string | undefined): string | undefined {
+export function validateSessionFile(project: RegisteredProject, sessionFile: string | undefined): string | undefined {
 	if (sessionFile === undefined) return undefined;
 	const sessionRoot = getProjectSessionRoot(project);
 	const resolvedSessionRoot = resolveExistingOrProspectivePath(sessionRoot);

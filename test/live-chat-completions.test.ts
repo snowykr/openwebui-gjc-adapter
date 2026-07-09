@@ -3,6 +3,7 @@ import {
 	handleChatCompletions,
 	type LiveGatewayRunner,
 	type LiveGatewayRunnerInput,
+	WorkflowGateReplyError,
 } from "../src/live/chat-completions";
 import { buildModelList } from "../src/live/models";
 import type { OpenAIChatCompletionRequest } from "../src/live/openai-types";
@@ -157,6 +158,34 @@ describe("live OpenAI-compatible chat completions", () => {
 					message: "Request body must include a messages array.",
 					type: "invalid_request_error",
 					code: "invalid_request_body",
+				},
+			},
+		});
+	});
+
+	it("returns an OpenAI-style 400 for invalid workflow gate replies", async () => {
+		const result = await handleChatCompletions({
+			request,
+			headers: chatHeaders,
+			projects: [project],
+			owner,
+			runner: {
+				run() {
+					throw new WorkflowGateReplyError("Invalid workflow gate reply.", "invalid_workflow_gate_choice", [
+						"9 is not a valid workflow gate choice. Choose a number from 1 to 3.",
+					]);
+				},
+			},
+		});
+
+		expect(result).toEqual({
+			ok: false,
+			status: 400,
+			body: {
+				error: {
+					message: "Invalid workflow gate reply.",
+					type: "invalid_request_error",
+					code: "invalid_workflow_gate_choice",
 				},
 			},
 		});

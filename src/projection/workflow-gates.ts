@@ -1,41 +1,29 @@
-export type WorkflowGateStatus = "pending" | "accepted" | "rejected";
+import { jsonValueFromReply, validateWorkflowGateAnswer } from "./workflow-gate-schema";
+import type {
+	JsonObject,
+	PendingWorkflowGate,
+	WorkflowGateAnswer,
+	WorkflowGateOption,
+	WorkflowGateReplyResolution,
+	WorkflowGateResolution,
+	WorkflowGateSchema,
+} from "./workflow-gate-types";
 
-export interface PendingWorkflowGate {
-	readonly gateId: string;
-	readonly schemaHash: string;
-	readonly idempotencyKey: string;
-	readonly boundUserMessageId: string | null;
-	readonly status: WorkflowGateStatus;
-	readonly schema: WorkflowGateSchema;
-}
-
-export type WorkflowGateSchema =
-	| {
-			readonly type?: "object";
-			readonly required?: readonly string[];
-			readonly properties?: Record<string, WorkflowGatePropertySchema>;
-			readonly enum?: readonly JsonValue[];
-	  }
-	| WorkflowGatePropertySchema;
-
-export interface WorkflowGatePropertySchema {
-	readonly type?: "string" | "boolean" | "number" | "integer" | "object";
-	readonly enum?: readonly JsonValue[];
-	readonly required?: readonly string[];
-	readonly properties?: Record<string, WorkflowGatePropertySchema>;
-}
-
-export type JsonValue = string | number | boolean | null | readonly JsonValue[] | { readonly [key: string]: JsonValue };
-export type WorkflowGateAnswer = JsonValue;
-
-export type WorkflowGateResolution =
-	| { readonly status: "accepted"; readonly gate: PendingWorkflowGate }
-	| {
-			readonly status: "rejected";
-			readonly reason: "no_pending_gate" | "ambiguous_pending_gate" | "invalid_answer";
-			readonly gate?: PendingWorkflowGate;
-			readonly errors?: readonly string[];
-	  };
+export { pendingWorkflowGateFromEvent } from "./workflow-gate-normalize";
+export type {
+	JsonObject,
+	JsonValue,
+	PendingWorkflowGate,
+	WorkflowGateAnswer,
+	WorkflowGateKind,
+	WorkflowGateOption,
+	WorkflowGatePropertySchema,
+	WorkflowGateReplyResolution,
+	WorkflowGateResolution,
+	WorkflowGateSchema,
+	WorkflowGateStage,
+	WorkflowGateStatus,
+} from "./workflow-gate-types";
 
 export class WorkflowGateStore {
 	readonly #gates: PendingWorkflowGate[] = [];
@@ -62,18 +50,41 @@ export class WorkflowGateStore {
 		if (index >= 0) this.#gates[index] = updated;
 	}
 }
+
 export function projectPendingWorkflowGateMessage(gate: PendingWorkflowGate): string {
 	const prompt = gatePrompt(gate);
+	const options = gate.options ?? [];
+	const optionLines = options.map((option, index) => {
+		const description = option.description === undefined ? "" : ` - ${option.description}`;
+		return `${index + 1}. ${stripLeadingChoiceNumber(option.label)}${description}`;
+	});
+	const answerHint =
+		options.length > 0
+			? `Reply with a number from 1 to ${options.length} to continue this GJC session.`
+			: "Reply with the requested approval, rejection, or answer to continue this GJC session.";
 	return [
 		"### GJC workflow gate pending",
 		"",
 		prompt,
+		...(optionLines.length === 0 ? [] : ["", ...optionLines]),
 		"",
 		`Gate ID: ${gate.gateId}`,
 		`Schema hash: ${gate.schemaHash}`,
 		"",
-		"Reply with the requested approval, rejection, or answer to continue this GJC session.",
+		answerHint,
 	].join("\n");
+}
+
+export function answerFromWorkflowGateReply(gate: PendingWorkflowGate, replyText: string): WorkflowGateReplyResolution {
+	const trimmed = replyText.trim();
+	const options = gate.options ?? [];
+	if (options.length > 0) return answerFromChoice(gate, options, trimmed);
+
+	const parsedJson = jsonValueFromReply(trimmed);
+	const answer = parsedJson === undefined ? primitiveAnswerFromReply(gate.schema, trimmed) : parsedJson;
+	const errors = validateWorkflowGateAnswer(gate.schema, answer);
+	if (errors.length > 0) return { ok: false, reason: "invalid_answer", errors };
+	return { ok: true, answer };
 }
 
 export function resolveWorkflowGateAnswer(input: {
@@ -95,70 +106,49 @@ export function resolveWorkflowGateAnswer(input: {
 	return { status: "accepted", gate: accepted };
 }
 
-function validateWorkflowGateAnswer(schema: WorkflowGateSchema, answer: WorkflowGateAnswer): readonly string[] {
-	return validateSchema(schema, answer, "answer");
+function answerFromChoice(
+	gate: PendingWorkflowGate,
+	options: readonly WorkflowGateOption[],
+	trimmed: string,
+): WorkflowGateReplyResolution {
+	const selectedOption = optionFromReply(options, trimmed);
+	if (selectedOption !== null) return { ok: true, answer: answerFromOption(gate, selectedOption) };
+	if (!/^\d+$/.test(trimmed)) {
+		const schemaAnswer = nonChoiceAnswerFromOptionGate(gate, trimmed);
+		if (schemaAnswer !== null) return schemaAnswer;
+	}
+	return {
+		ok: false,
+		reason: "invalid_answer",
+		errors: [`${trimmed} is not a valid workflow gate choice. Choose a number from 1 to ${options.length}.`],
+	};
 }
 
-function validateSchema(schema: WorkflowGateSchema, value: WorkflowGateAnswer, path: string): readonly string[] {
-	const errors: string[] = [];
-	if (schema.enum !== undefined && !schema.enum.some(option => jsonEquals(option, value))) {
-		errors.push(`${path} must be one of ${schema.enum.map(String).join(", ")}`);
-	}
-
-	if (schema.type === undefined) {
-		if ("required" in schema || "properties" in schema) validateObjectSchema(schema, value, path, errors);
-		return errors;
-	}
-
-	switch (schema.type) {
-		case "string":
-			if (typeof value !== "string" || value.length === 0) errors.push(`${path} must be a non-empty string`);
-			break;
-		case "boolean":
-			if (typeof value !== "boolean") errors.push(`${path} must be a boolean`);
-			break;
-		case "number":
-			if (typeof value !== "number" || !Number.isFinite(value)) errors.push(`${path} must be a finite number`);
-			break;
-		case "integer":
-			if (typeof value !== "number" || !Number.isInteger(value)) errors.push(`${path} must be an integer`);
-			break;
-		case "object":
-			validateObjectSchema(schema, value, path, errors);
-			break;
-	}
-
-	return errors;
+function nonChoiceAnswerFromOptionGate(gate: PendingWorkflowGate, trimmed: string): WorkflowGateReplyResolution | null {
+	const clarifyQuestion = clarifyQuestionFromReply(trimmed);
+	const candidate =
+		clarifyQuestion === null
+			? deepInterviewOtherAnswer(gate, trimmed)
+			: ({ action: "clarify", question: clarifyQuestion } satisfies WorkflowGateAnswer);
+	if (candidate === null) return null;
+	const errors = validateWorkflowGateAnswer(gate.schema, candidate);
+	return errors.length === 0 ? { ok: true, answer: candidate } : null;
 }
 
-function validateObjectSchema(
-	schema: WorkflowGateSchema,
-	value: WorkflowGateAnswer,
-	path: string,
-	errors: string[],
-): void {
-	if (!isRecord(value)) {
-		errors.push(`${path} must be an object`);
-		return;
-	}
+function deepInterviewOtherAnswer(gate: PendingWorkflowGate, trimmed: string): WorkflowGateAnswer | null {
+	if (!isSelectedArraySchema(gate.schema) || trimmed.length === 0) return null;
+	return { selected: [], other: true, custom: trimmed };
+}
 
-	for (const key of schema.required ?? []) {
-		if (!(key in value)) {
-			errors.push(`${path}.${key} is required`);
-			continue;
-		}
-		const property = schema.properties?.[key];
-		if (property !== undefined)
-			errors.push(...validateSchema(property, value[key] as WorkflowGateAnswer, `${path}.${key}`));
-	}
-
-	for (const [key, property] of Object.entries(schema.properties ?? {})) {
-		if ((schema.required ?? []).includes(key) || !(key in value)) continue;
-		errors.push(...validateSchema(property, value[key] as WorkflowGateAnswer, `${path}.${key}`));
-	}
+function clarifyQuestionFromReply(trimmed: string): string | null {
+	const match = /^clarify:\s*(.+)$/iu.exec(trimmed);
+	const question = match?.[1]?.trim();
+	return question === undefined || question.length === 0 ? null : question;
 }
 
 function gatePrompt(gate: PendingWorkflowGate): string {
+	const prompt = stringJsonField(gate.context, "prompt") ?? stringJsonField(gate.context, "title");
+	if (prompt !== undefined) return prompt;
 	const schema = gate.schema;
 	if (schema.enum !== undefined) return `Choose one of: ${schema.enum.map(String).join(", ")}`;
 	if (schema.type === "boolean") return "Answer true/false for this approval gate.";
@@ -166,10 +156,53 @@ function gatePrompt(gate: PendingWorkflowGate): string {
 	return "Answer this workflow gate using the requested structured values.";
 }
 
-function isRecord(value: WorkflowGateAnswer): value is { readonly [key: string]: JsonValue } {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
+function optionFromReply(options: readonly WorkflowGateOption[], trimmed: string): WorkflowGateOption | null {
+	if (/^\d+$/.test(trimmed)) {
+		const index = Number.parseInt(trimmed, 10) - 1;
+		return options[index] ?? null;
+	}
+	for (const option of options) {
+		if (option.label === trimmed || String(option.value) === trimmed) return option;
+	}
+	return null;
 }
 
-function jsonEquals(left: JsonValue, right: JsonValue): boolean {
-	return JSON.stringify(left) === JSON.stringify(right);
+function answerFromOption(gate: PendingWorkflowGate, option: WorkflowGateOption): WorkflowGateAnswer {
+	if (isSelectedArraySchema(gate.schema)) return { selected: [String(option.value)] };
+	const singlePropertyAnswer = singleRequiredPropertyAnswer(gate.schema, option.value);
+	if (singlePropertyAnswer !== null) return singlePropertyAnswer;
+	return option.value;
+}
+
+function isSelectedArraySchema(schema: WorkflowGateSchema): boolean {
+	return schema.type === "object" && schema.properties?.selected?.type === "array";
+}
+
+function singleRequiredPropertyAnswer(
+	schema: WorkflowGateSchema,
+	value: WorkflowGateAnswer,
+): WorkflowGateAnswer | null {
+	if (schema.type !== "object" || schema.required?.length !== 1) return null;
+	const key = schema.required[0];
+	if (key === undefined || schema.properties?.[key] === undefined) return null;
+	const answer = { [key]: value };
+	return validateWorkflowGateAnswer(schema, answer).length === 0 ? answer : null;
+}
+
+function primitiveAnswerFromReply(schema: WorkflowGateSchema, trimmed: string): WorkflowGateAnswer {
+	if (schema.type === "boolean") return trimmed === "true" ? true : trimmed === "false" ? false : trimmed;
+	if (schema.type === "number" || schema.type === "integer") {
+		const numeric = Number(trimmed);
+		return Number.isFinite(numeric) ? numeric : trimmed;
+	}
+	return trimmed;
+}
+
+function stringJsonField(record: JsonObject | undefined, key: string): string | undefined {
+	const value = record?.[key];
+	return typeof value === "string" ? value : undefined;
+}
+
+function stripLeadingChoiceNumber(label: string): string {
+	return label.replace(/^\s*\d+[.)]\s+/, "");
 }

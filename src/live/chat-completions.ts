@@ -49,6 +49,17 @@ export class LiveGatewayUnavailableError extends Error {
 	readonly code = "live_runner_unavailable";
 }
 
+export class WorkflowGateReplyError extends Error {
+	constructor(
+		message: string,
+		readonly code: string,
+		readonly errors: readonly string[],
+	) {
+		super(message);
+		this.name = "WorkflowGateReplyError";
+	}
+}
+
 export type LiveChatCompletionsResult =
 	| { readonly ok: true; readonly status: 200; readonly body: OpenAIChatCompletionResponse }
 	| { readonly ok: true; readonly status: 200; readonly stream: AsyncIterable<string> }
@@ -162,6 +173,9 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 	} catch (error) {
 		if (error instanceof LiveGatewayUnavailableError) {
 			return errorResult(503, "server_error", error.code, error.message);
+		}
+		if (error instanceof WorkflowGateReplyError) {
+			return errorResult(400, "invalid_request_error", error.code, error.message);
 		}
 		throw error;
 	}

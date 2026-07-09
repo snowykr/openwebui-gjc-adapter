@@ -16,6 +16,13 @@ type FakeCall =
 	| { readonly type: "switch_session"; readonly sessionPath: string }
 	| { readonly type: "get_state" }
 	| { readonly type: "prompt"; readonly message: string }
+	| {
+			readonly type: "respond_gate";
+			readonly gateId: string;
+			readonly answer: unknown;
+			readonly idempotencyKey?: string;
+	  }
+	| { readonly type: "on_workflow_gate" }
 	| { readonly type: "get_last_assistant_text" }
 	| { readonly type: "stop" };
 
@@ -24,14 +31,33 @@ type GjcRpcRunnerTransportEvent =
 			readonly type: "message_update";
 			readonly message: { readonly content: readonly [{ readonly type: "text"; readonly text: string }] };
 	  }
-	| { readonly type: "tool_execution_start"; readonly toolCallId: string; readonly toolName: string };
+	| { readonly type: "tool_execution_start"; readonly toolCallId: string; readonly toolName: string }
+	| {
+			readonly type: "workflow_gate";
+			readonly gate_id: string;
+			readonly stage: string;
+			readonly kind: string;
+			readonly schema_hash: string;
+			readonly schema: unknown;
+			readonly options?: unknown;
+			readonly context: unknown;
+			readonly created_at?: string;
+			readonly required: true;
+	  };
 
 export class FakeRpcTransport implements GjcRpcRunnerTransport {
 	readonly calls: FakeCall[] = [];
 	readonly states: GjcRpcTransportState[];
 	readonly promptEvents: readonly GjcRpcRunnerTransportEvent[][];
 	readonly assistantTexts: readonly string[];
+	respondGateResult: unknown = {
+		gate_id: "gate",
+		status: "accepted",
+		answer_hash: "sha256:answer",
+		resolved_at: "2026-07-09T00:00:00.000Z",
+	};
 	failCommand: FakeCall["type"] | undefined;
+	workflowGateOnPrompt: GjcRpcRunnerTransportEvent | undefined;
 
 	#stateIndex = 0;
 	#promptIndex = 0;
@@ -75,9 +101,31 @@ export class FakeRpcTransport implements GjcRpcRunnerTransport {
 
 	async promptAndWait(message: string): Promise<readonly GjcRpcRunnerTransportEvent[]> {
 		this.record({ type: "prompt", message });
+		const workflowGate = this.workflowGateOnPrompt;
+		if (workflowGate !== undefined) queueMicrotask(() => this.#workflowGateListener?.(workflowGate));
 		const events = this.promptEvents[this.#promptIndex] ?? [];
 		this.#promptIndex += 1;
 		return events;
+	}
+
+	#workflowGateListener: ((gate: GjcRpcRunnerTransportEvent) => void) | undefined;
+
+	onWorkflowGate(listener: (gate: GjcRpcRunnerTransportEvent) => void): () => void {
+		this.record({ type: "on_workflow_gate" });
+		this.#workflowGateListener = listener;
+		return () => {
+			this.#workflowGateListener = undefined;
+		};
+	}
+
+	async respondGate(gateId: string, answer: unknown, idempotencyKey?: string): Promise<unknown> {
+		this.record({
+			type: "respond_gate",
+			gateId,
+			answer,
+			...(idempotencyKey === undefined ? {} : { idempotencyKey }),
+		});
+		return this.respondGateResult;
 	}
 
 	async getLastAssistantText(): Promise<string | null> {

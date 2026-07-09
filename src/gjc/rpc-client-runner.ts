@@ -1,10 +1,11 @@
-import { RpcClient } from "@gajae-code/coding-agent/modes/rpc/rpc-client";
+import { createDefaultRpcTransport } from "./rpc-client-transport";
+import { GjcRpcRunnerError } from "./rpc-errors";
 import type {
 	CreateGjcRpcTurnRunnerInput,
 	GjcContinueSessionInput,
+	GjcRespondWorkflowGateInput,
 	GjcRpcRunnerClientOptions,
 	GjcRpcRunnerTransport,
-	GjcRpcRunnerTransportEvent,
 	GjcRpcTransportState,
 	GjcSessionAddress,
 	GjcSessionState,
@@ -15,20 +16,18 @@ import type {
 	GjcTurnResult,
 	GjcTurnRunner,
 } from "./rpc-runner";
+import {
+	assertAcceptedWorkflowGateResolution,
+	callRespondGate,
+	promptAndCollectWorkflowGates,
+	toTurnEvent,
+} from "./rpc-workflow-events";
 
 interface StartedClient {
 	readonly client: GjcRpcRunnerTransport;
 }
 
-export class GjcRpcRunnerError extends Error {
-	readonly command: string;
-
-	constructor(command: string, message: string) {
-		super(`GJC RPC ${command} failed: ${message}`);
-		this.name = "GjcRpcRunnerError";
-		this.command = command;
-	}
-}
+export { GjcRpcRunnerError };
 
 export function createGjcRpcTurnRunner(input: CreateGjcRpcTurnRunnerInput = {}): GjcTurnRunner {
 	return new RpcBackedGjcTurnRunner(
@@ -84,6 +83,24 @@ class RpcBackedGjcTurnRunner implements GjcTurnRunner {
 		return mapSessionState(state, 0, 0);
 	}
 
+	async respondWorkflowGate(input: GjcRespondWorkflowGateInput): Promise<GjcTurnResult> {
+		const client = await this.getOrStartClient(sessionClientKey(input), input);
+		if (client.respondGate === undefined) {
+			throw new GjcRpcRunnerError("workflow_gate_response", "RPC transport does not support workflow gates");
+		}
+		const resolution = await runRpcCommand("workflow_gate_response", () =>
+			callRespondGate(client, input.gateId, input.answer, input.idempotencyKey),
+		);
+		assertAcceptedWorkflowGateResolution(resolution);
+		const state = await runRpcCommand("get_state", () => client.getState());
+		const assistantText = await runRpcCommand("get_last_assistant_text", () => client.getLastAssistantText());
+		return {
+			...mapSessionState(state, input.rawFrameCursor, input.eventCursor),
+			text: assistantText ?? "",
+			events: assistantText === null ? [] : [{ type: "assistant", text: assistantText }],
+		};
+	}
+
 	async runTurn(input: GjcStartNewSessionInput | GjcContinueSessionInput): Promise<GjcTurnResult> {
 		if ("sessionId" in input) return this.continueSession(input);
 		return this.startNewSession(input);
@@ -113,7 +130,9 @@ class RpcBackedGjcTurnRunner implements GjcTurnRunner {
 		baseRawFrameCursor: number,
 		baseEventCursor: number,
 	): Promise<GjcTurnResult & { readonly sessionId: string }> {
-		const rawEvents = await runRpcCommand("prompt", () => client.promptAndWait(text, this.turnTimeoutMs));
+		const rawEvents = await runRpcCommand("prompt", () =>
+			promptAndCollectWorkflowGates(client, text, this.turnTimeoutMs),
+		);
 		const state = await runRpcCommand("get_state", () => client.getState());
 		const assistantText = await runRpcCommand("get_last_assistant_text", () => client.getLastAssistantText());
 		const events = rawEvents.map(toTurnEvent);
@@ -124,46 +143,6 @@ class RpcBackedGjcTurnRunner implements GjcTurnRunner {
 			events,
 		};
 	}
-}
-
-class RpcClientTransport implements GjcRpcRunnerTransport {
-	readonly #client: RpcClient;
-
-	constructor(options: GjcRpcRunnerClientOptions) {
-		this.#client = new RpcClient({ cwd: options.cwd, sessionDir: options.sessionRoot, cliPath: options.cliPath });
-	}
-
-	async start(): Promise<void> {
-		await this.#client.start();
-	}
-
-	stop(): void {
-		this.#client.stop();
-	}
-
-	async newSession(): Promise<{ readonly cancelled: boolean }> {
-		return this.#client.newSession();
-	}
-
-	async switchSession(sessionPath: string): Promise<{ readonly cancelled: boolean }> {
-		return this.#client.switchSession(sessionPath);
-	}
-
-	async getState(): Promise<GjcRpcTransportState> {
-		return this.#client.getState();
-	}
-
-	async promptAndWait(message: string, timeoutMs?: number): Promise<readonly GjcRpcRunnerTransportEvent[]> {
-		return this.#client.promptAndWait(message, undefined, timeoutMs);
-	}
-
-	async getLastAssistantText(): Promise<string | null> {
-		return this.#client.getLastAssistantText();
-	}
-}
-
-function createDefaultRpcTransport(options: GjcRpcRunnerClientOptions): GjcRpcRunnerTransport {
-	return new RpcClientTransport(options);
 }
 
 async function runRpcCommand<T>(command: string, operation: () => Promise<T>): Promise<T> {
@@ -191,46 +170,12 @@ function mapSessionState(state: GjcRpcTransportState, rawFrameCursor: number, ev
 	};
 }
 
-function toTurnEvent(event: GjcRpcRunnerTransportEvent): GjcTurnEvent {
-	return {
-		type: event.type,
-		...(eventText(event) === undefined ? {} : { text: eventText(event) }),
-		...(eventId(event) === undefined ? {} : { id: eventId(event) }),
-	};
-}
-
-function eventId(event: GjcRpcRunnerTransportEvent): string | undefined {
-	return event.toolCallId ?? event.id;
-}
-
-function eventText(event: GjcRpcRunnerTransportEvent): string | undefined {
-	if (event.toolName !== undefined) return event.toolName;
-	const message = recordValue(event.message);
-	const content = message?.content;
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return undefined;
-	const texts: string[] = [];
-	for (const item of content) {
-		const block = recordValue(item);
-		if (block?.type === "text" && typeof block.text === "string") texts.push(block.text);
-	}
-	return texts.length === 0 ? undefined : texts.join("");
-}
-
 function lastEventText(events: readonly GjcTurnEvent[]): string | undefined {
 	for (let index = events.length - 1; index >= 0; index -= 1) {
 		const text = events[index]?.text;
 		if (text !== undefined) return text;
 	}
 	return undefined;
-}
-
-function recordValue(value: unknown): Record<string, unknown> | undefined {
-	return isRecord(value) ? value : undefined;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function stripSessionId(result: GjcTurnResult & { readonly sessionId: string }): GjcTurnResult {

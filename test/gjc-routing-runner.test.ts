@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
 	GjcContinueSessionInput,
+	GjcRespondWorkflowGateInput,
 	GjcSessionAddress,
 	GjcSessionState,
 	GjcSessionStateInput,
@@ -22,6 +23,7 @@ class FakeGjcTurnRunner implements GjcTurnRunner {
 	readonly continues: GjcContinueSessionInput[] = [];
 	readonly switches: GjcSwitchSessionInput[] = [];
 	readonly states: GjcSessionStateInput[] = [];
+	readonly gateResponses: GjcRespondWorkflowGateInput[] = [];
 
 	state: GjcSessionState = {
 		sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
@@ -68,9 +70,179 @@ class FakeGjcTurnRunner implements GjcTurnRunner {
 		this.states.push(input);
 		return this.state;
 	}
+
+	async respondWorkflowGate(input: GjcRespondWorkflowGateInput): Promise<GjcTurnResult> {
+		this.gateResponses.push(input);
+		return {
+			text: "workflow gate accepted",
+			events: [{ type: "assistant", text: "workflow gate accepted" }],
+			sessionFile: input.sessionFile,
+			activeLeaf: "leaf-gate",
+			rawFrameCursor: input.rawFrameCursor,
+			eventCursor: input.eventCursor,
+		};
+	}
 }
 
 describe("createGjcRoutingLiveGatewayRunner", () => {
+	test("surfaces workflow gate options as the assistant message", async () => {
+		const turnRunner = new FakeGjcTurnRunner();
+		turnRunner.events = [deepInterviewWorkflowGateEvent];
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings: new SessionMappingStore() });
+
+		const result = await runner.run({
+			project,
+			prompt: "/deep-interview",
+			chatId: "chat-1",
+			messageId: "assistant-1",
+			userMessageId: "user-1",
+			userMessageParentId: null,
+			continued: false,
+		});
+
+		expect(result.content).toContain("Choose authentication method");
+		expect(result.content).toContain("1. JWT");
+		expect(result.content).toContain("Reply with a number");
+	});
+
+	test("routes numbered workflow gate replies back to GJC instead of continuing the session", async () => {
+		const turnRunner = new FakeGjcTurnRunner();
+		const mappings = new SessionMappingStore();
+		mappings.set({
+			chatId: "chat-1",
+			projectId: project.id,
+			sessionId: "session-1",
+			sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
+			activeLeaf: "leaf-1",
+			rawFrameCursor: 7,
+			eventCursor: 3,
+			operationId: "user-1",
+			assistantText: "pending",
+			events: [deepInterviewWorkflowGateEvent],
+		});
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings });
+
+		const result = await runner.run({
+			project,
+			prompt: "1",
+			chatId: "chat-1",
+			messageId: "assistant-2",
+			userMessageId: "user-2",
+			userMessageParentId: "user-1",
+			continued: true,
+		});
+
+		expect(result).toEqual({ content: "workflow gate accepted" });
+		expect(turnRunner.continues).toHaveLength(0);
+		expect(turnRunner.gateResponses).toMatchObject([
+			{
+				gateId: "gate-deep-1",
+				answer: { selected: ["JWT"] },
+				idempotencyKey: "chat-1:user-2",
+				userMessageId: "user-2",
+			},
+		]);
+	});
+
+	test("rejects invalid numbered workflow gate replies without answering GJC", async () => {
+		const turnRunner = new FakeGjcTurnRunner();
+		const mappings = new SessionMappingStore();
+		mappings.set({
+			chatId: "chat-1",
+			projectId: project.id,
+			sessionId: "session-1",
+			sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
+			activeLeaf: "leaf-1",
+			rawFrameCursor: 7,
+			eventCursor: 3,
+			operationId: "user-1",
+			assistantText: "pending",
+			events: [deepInterviewWorkflowGateEvent],
+		});
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings });
+
+		await expect(
+			runner.run({
+				project,
+				prompt: "9",
+				chatId: "chat-1",
+				messageId: "assistant-2",
+				userMessageId: "user-2",
+				userMessageParentId: "user-1",
+				continued: true,
+			}),
+		).rejects.toThrow("Invalid workflow gate reply");
+		expect(turnRunner.gateResponses).toHaveLength(0);
+		expect(turnRunner.continues).toHaveLength(0);
+	});
+
+	test("rejects workflow gate replies when the stored session file is outside the project session root", async () => {
+		const turnRunner = new FakeGjcTurnRunner();
+		const mappings = new SessionMappingStore();
+		mappings.set({
+			chatId: "chat-1",
+			projectId: project.id,
+			sessionId: "session-1",
+			sessionFile: "/tmp/outside-session.jsonl",
+			activeLeaf: "leaf-1",
+			rawFrameCursor: 7,
+			eventCursor: 3,
+			operationId: "user-1",
+			assistantText: "pending",
+			events: [deepInterviewWorkflowGateEvent],
+		});
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings });
+
+		await expect(
+			runner.run({
+				project,
+				prompt: "1",
+				chatId: "chat-1",
+				messageId: "assistant-2",
+				userMessageId: "user-2",
+				userMessageParentId: "user-1",
+				continued: true,
+			}),
+		).rejects.toThrow("outside project session root");
+		expect(turnRunner.gateResponses).toHaveLength(0);
+	});
+
+	test("routes numbered approval gate replies as structured decisions", async () => {
+		const turnRunner = new FakeGjcTurnRunner();
+		const mappings = new SessionMappingStore();
+		mappings.set({
+			chatId: "chat-1",
+			projectId: project.id,
+			sessionId: "session-1",
+			sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
+			activeLeaf: "leaf-1",
+			rawFrameCursor: 7,
+			eventCursor: 3,
+			operationId: "user-1",
+			assistantText: "pending",
+			events: [decisionWorkflowGateEvent],
+		});
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings });
+
+		await runner.run({
+			project,
+			prompt: "1",
+			chatId: "chat-1",
+			messageId: "assistant-2",
+			userMessageId: "user-2",
+			userMessageParentId: "user-1",
+			continued: true,
+		});
+
+		expect(turnRunner.gateResponses).toMatchObject([
+			{
+				gateId: "gate-plan-1",
+				answer: { decision: "approve" },
+				idempotencyKey: "chat-1:user-2",
+			},
+		]);
+	});
+
 	test("continues mapped HTTP-style turns through switchSession and getState", async () => {
 		const turnRunner = new FakeGjcTurnRunner();
 		const mappings = new SessionMappingStore();
@@ -210,3 +382,57 @@ const project: RegisteredProject = {
 	allowedRoot: "/workspace",
 	createdAt: new Date("2026-07-08T00:00:00.000Z"),
 };
+
+const deepInterviewWorkflowGateEvent = {
+	type: "workflow_gate",
+	id: "gate-deep-1",
+	payload: {
+		gateId: "gate-deep-1",
+		stage: "deep-interview",
+		kind: "question",
+		schemaHash: "sha256:deep",
+		idempotencyKey: "idem-deep-1",
+		context: { prompt: "Choose authentication method" },
+		options: [
+			{ label: "JWT", value: "JWT" },
+			{ label: "OAuth2", value: "OAuth2" },
+			{ label: "Session cookies", value: "Session cookies" },
+		],
+		schema: {
+			type: "object",
+			required: ["selected"],
+			additionalProperties: false,
+			properties: {
+				selected: {
+					type: "array",
+					minItems: 1,
+					items: { type: "string", enum: ["JWT", "OAuth2", "Session cookies"] },
+				},
+			},
+		},
+	},
+} as const;
+
+const decisionWorkflowGateEvent = {
+	type: "workflow_gate",
+	id: "gate-plan-1",
+	payload: {
+		gateId: "gate-plan-1",
+		stage: "ralplan",
+		kind: "approval",
+		schemaHash: "sha256:decision",
+		context: { prompt: "Approve this plan?" },
+		options: [
+			{ label: "Approve", value: "approve" },
+			{ label: "Reject", value: "reject" },
+		],
+		schema: {
+			type: "object",
+			required: ["decision"],
+			additionalProperties: false,
+			properties: {
+				decision: { type: "string", enum: ["approve", "reject"] },
+			},
+		},
+	},
+} as const;

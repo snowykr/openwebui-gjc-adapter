@@ -140,6 +140,60 @@ describe("createGjcRoutingLiveGatewayRunner event projection", () => {
 			}),
 		]);
 	});
+
+	test("projects workflow gates with structured OpenWebUI status metadata", async () => {
+		const turnRunner = new FakeGjcTurnRunner();
+		turnRunner.events = [
+			{
+				type: "workflow_gate",
+				id: "gate-plan-1",
+				payload: {
+					gateId: "gate-plan-1",
+					stage: "ralplan",
+					kind: "approval",
+					schemaHash: "sha256:decision",
+					createdAt: "2026-07-09T00:00:00.000Z",
+					required: true,
+					context: { prompt: "Approve this plan?" },
+					options: [{ label: "Approve", value: "approve" }],
+					schema: {
+						type: "object",
+						required: ["decision"],
+						properties: { decision: { type: "string", enum: ["approve"] } },
+					},
+				},
+			},
+		];
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings: new SessionMappingStore() });
+
+		const result = await runner.run({
+			project,
+			prompt: "/ralplan",
+			chatId: "chat-1",
+			messageId: "assistant-1",
+			userMessageId: "user-1",
+			userMessageParentId: null,
+			continued: false,
+		});
+
+		expect(result.events).toEqual([
+			expect.objectContaining({
+				type: "status",
+				data: expect.objectContaining({
+					gjc_adapter: expect.objectContaining({
+						workflow_gate: expect.objectContaining({
+							gateId: "gate-plan-1",
+							stage: "ralplan",
+							kind: "approval",
+							schemaHash: "sha256:decision",
+							createdAt: "2026-07-09T00:00:00.000Z",
+							required: true,
+						}),
+					}),
+				}),
+			}),
+		]);
+	});
 });
 
 const project: RegisteredProject = {
