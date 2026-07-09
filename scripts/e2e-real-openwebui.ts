@@ -1,7 +1,10 @@
 import { access, mkdir, writeFile } from "node:fs/promises";
 import * as path from "node:path";
+import { createProjectId } from "../src/projects/registry";
+import { providerChatThroughOpenWebUI } from "./e2e-openwebui-provider-chat";
 import {
 	choiceText,
+	describeJson,
 	E2EContext,
 	type HttpJson,
 	importedCount,
@@ -10,10 +13,10 @@ import {
 	requireString,
 	syncedSessionCount,
 	tinyPng,
+	uploadDetail,
 } from "./e2e-real-openwebui-support";
 
 const context = await E2EContext.create();
-
 try {
 	await run(context);
 	await writeSummary(context);
@@ -54,7 +57,7 @@ async function run(ctx: E2EContext): Promise<void> {
 	ctx.record(
 		"slash command lists linked projects",
 		projectList.includes("linked: gjc/gajae-code-openwebui"),
-		projectList,
+		`linked project present: ${projectList.includes("linked: gjc/gajae-code-openwebui")}`,
 	);
 
 	const fixture = await createPreviousProjectFixture(ctx);
@@ -107,16 +110,18 @@ async function run(ctx: E2EContext): Promise<void> {
 		"text/plain",
 		`needle=E2E_FILE_OK_${ctx.config.runId}\n`,
 	);
-	ctx.record("OpenWebUI text file upload", typeof textUpload.id === "string", JSON.stringify(textUpload));
+	ctx.record("OpenWebUI text file upload", typeof textUpload.id === "string", uploadDetail(textUpload));
 
 	const imageUpload = await ctx.uploadFile("e2e-upload-image.png", "image/png", tinyPng());
-	ctx.record("OpenWebUI image upload", typeof imageUpload.id === "string", JSON.stringify(imageUpload));
+	ctx.record("OpenWebUI image upload", typeof imageUpload.id === "string", uploadDetail(imageUpload));
 
 	const fileContext = await openWebUIChatWithFile(ctx, textUpload, imageUpload);
+	const fileContextText = choiceText(fileContext.body);
+	const hasFileContextSentinel = fileContextText.includes(`E2E_FILE_OK_${ctx.config.runId}`);
 	ctx.record(
 		"OpenWebUI chat forwards file/image context to GJC",
-		fileContext.status === 200,
-		`HTTP ${fileContext.status}`,
+		fileContext.status === 200 && hasFileContextSentinel,
+		`HTTP ${fileContext.status}, sentinel ${hasFileContextSentinel ? "present" : "missing"}`,
 	);
 
 	const finalModels = await ctx.getJson(`${ctx.config.adapterBaseUrl}/v1/models`, ctx.adapterHeaders());
@@ -131,7 +136,7 @@ async function run(ctx: E2EContext): Promise<void> {
 }
 
 async function createPreviousProjectFixture(ctx: E2EContext) {
-	const projectId = `previous-work-project-${ctx.config.runId}`;
+	const projectId = createProjectId(`Previous Work Project ${ctx.config.runId}`);
 	const cwd = path.join(ctx.config.artifactDir, `Previous Work Project ${ctx.config.runId}`);
 	const sessionRoot = path.join(cwd, ".gjc", "sessions");
 	await mkdir(sessionRoot, { recursive: true });
@@ -161,7 +166,6 @@ async function createPreviousProjectFixture(ctx: E2EContext) {
 	await writeFile(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
 	return { cwd, modelId: `gjc/${projectId}`, projectId, sessionFile };
 }
-
 async function projectCommand(ctx: E2EContext, command: string, suffix: string): Promise<string> {
 	const response = await ctx.postJson(
 		`${ctx.config.adapterBaseUrl}/v1/chat/completions`,
@@ -169,7 +173,7 @@ async function projectCommand(ctx: E2EContext, command: string, suffix: string):
 		{ model: "gjc/projects", stream: false, messages: [{ role: "user", content: command }] },
 	);
 	if (response.status !== 200)
-		throw new Error(`Project command failed (${response.status}): ${JSON.stringify(response.body)}`);
+		throw new Error(`Project command failed (${response.status}): ${describeJson(response.body)}`);
 	const text = choiceText(response.body);
 	await ctx.writeJson(`project-command-${suffix}.json`, response.body);
 	return text;
@@ -185,10 +189,6 @@ async function openWebUIChatWithFile(
 	const payload = {
 		model: "gjc/gajae-code-openwebui",
 		stream: false,
-		chat_id: `e2e-file-context-${ctx.config.runId}`,
-		parent_id: null,
-		id: `assistant-e2e-${ctx.config.runId}`,
-		assistant_message_id: `assistant-e2e-${ctx.config.runId}`,
 		messages: [
 			{
 				role: "user",
@@ -218,12 +218,13 @@ async function openWebUIChatWithFile(
 		background_tasks: {},
 	};
 	await ctx.writeJson("openwebui-chat-request.json", payload);
-	const response = await ctx.postJson(
-		`${ctx.config.openWebUIBaseUrl}/api/chat/completions`,
-		ctx.openWebUIHeaders(),
-		payload,
-		180_000,
-	);
+	const response = await providerChatThroughOpenWebUI(ctx, payload, {
+		chatId: `e2e-file-context-${ctx.config.runId}`,
+		userMessageId: `user-e2e-${ctx.config.runId}`,
+		assistantMessageId: `assistant-e2e-${ctx.config.runId}`,
+		title: `E2E file context ${ctx.config.runId}`,
+		userContent: `E2E attachment QA. Reply with E2E_FILE_OK_${ctx.config.runId}.`,
+	});
 	await ctx.writeJson("openwebui-chat-response.json", response.body);
 	return response;
 }

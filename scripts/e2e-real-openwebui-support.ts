@@ -66,7 +66,7 @@ export class E2EContext {
 		const body: unknown = await response.json();
 		await this.writeJson(`upload-${filename}.json`, body);
 		if (response.status !== 200 || !isRecord(body)) {
-			throw new Error(`Upload failed (${response.status}): ${JSON.stringify(body)}`);
+			throw new Error(`Upload failed (${response.status}): ${describeJson(body)}`);
 		}
 		return body;
 	}
@@ -105,7 +105,7 @@ export class E2EContext {
 	}
 
 	async writeJson(filename: string, value: unknown): Promise<void> {
-		await writeFile(path.join(this.config.artifactDir, filename), `${JSON.stringify(value, null, 2)}\n`);
+		await writeFile(this.artifactPath(filename), `${JSON.stringify(value, null, 2)}\n`);
 	}
 
 	private async requestJson(url: string, init: RequestInit & { readonly timeoutMs?: number }): Promise<HttpJson> {
@@ -113,6 +113,13 @@ export class E2EContext {
 		const text = await response.text();
 		const body: unknown = text.length === 0 ? null : JSON.parse(text);
 		return { status: response.status, body };
+	}
+
+	private artifactPath(filename: string): string {
+		const root = path.resolve(this.config.artifactDir);
+		const output = path.resolve(root, sanitizeArtifactName(filename));
+		if (path.relative(root, output).startsWith("..")) throw new Error(`Unsafe artifact path: ${filename}`);
+		return output;
 	}
 }
 
@@ -140,6 +147,21 @@ export function choiceText(value: unknown): string {
 	return first.message.content;
 }
 
+export function describeJson(value: unknown): string {
+	if (!isRecord(value)) return typeof value;
+	return `object keys: ${Object.keys(value).sort().join(", ")}`;
+}
+
+export function uploadDetail(upload: JsonRecord): string {
+	const filename = typeof upload.filename === "string" ? upload.filename : "unknown";
+	const status = typeof upload.status === "boolean" ? upload.status : "unknown";
+	const contentType =
+		typeof upload.meta === "object" && upload.meta !== null && "content_type" in upload.meta
+			? String(upload.meta.content_type)
+			: "unknown";
+	return `filename ${filename}, content_type ${contentType}, status ${status}`;
+}
+
 export function requireString(value: unknown, name: string): string {
 	if (typeof value !== "string" || value.length === 0) throw new Error(`${name} must be a non-empty string.`);
 	return value;
@@ -157,6 +179,15 @@ export function tinyPng(): Uint8Array {
 	]);
 }
 
+export function sanitizeArtifactName(value: string): string {
+	const safe = value
+		.trim()
+		.replace(/[^A-Za-z0-9._-]+/g, "-")
+		.replace(/^[.-]+/g, "")
+		.replace(/[.-]+$/g, "");
+	return safe.length === 0 ? "artifact" : safe.slice(0, 120);
+}
+
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 60_000): Promise<Response> {
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -168,7 +199,7 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 60_0
 }
 
 function readConfig(): Config {
-	const runId = process.env.E2E_RUN_ID ?? String(Date.now());
+	const runId = sanitizeArtifactName(process.env.E2E_RUN_ID ?? String(Date.now()));
 	const artifactDir = process.env.E2E_ARTIFACT_DIR ?? path.resolve(".omo", "runtime", `e2e-real-openwebui-${runId}`);
 	return {
 		adapterBaseUrl: process.env.E2E_ADAPTER_BASE_URL ?? "http://127.0.0.1:8765",
