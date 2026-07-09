@@ -88,7 +88,7 @@ export function createAdapterRequestHandler(
 		if (routes?.projectLinkService !== undefined && request.method === "GET" && url.pathname === "/admin/projects") {
 			const authError = authenticateAdapterRequest(request, routes.adapterApiToken, routes.requireAdapterApiToken);
 			if (authError !== undefined) return authError;
-			const result = handleProjectListRequest(routes.projectLinkService);
+			const result = await handleProjectListRequest(routes.projectLinkService);
 			return jsonResponse(result.body, { status: result.status });
 		}
 		if (

@@ -32,13 +32,24 @@ describe("OpenWebUI prompt hints", () => {
 				"/api/v1/prompts/create",
 				"/api/v1/prompts/create",
 				"/api/v1/prompts/create",
+				"/api/v1/prompts/create",
+				"/api/v1/prompts/create",
+				"/api/v1/prompts/create",
+				"/api/v1/prompts/create",
 			]);
 			expect(fixture.prompts.map(prompt => prompt.command)).toEqual([
 				"gjc-project-link",
 				"gjc-project-list",
 				"gjc-project-unlink",
+				"gjc-skill-deep-interview",
+				"gjc-skill-ralplan",
+				"gjc-skill-ultragoal",
+				"gjc-skill-team",
 			]);
 			expect(fixture.prompts[0]?.content).toBe("/gjc project link {{PROJECT_PATH}}");
+			expect(fixture.prompts.find(prompt => prompt.command === "gjc-skill-ralplan")?.content).toBe(
+				"/skill:ralplan {{TASK}}",
+			);
 		} finally {
 			fixture.stop();
 		}
@@ -73,10 +84,14 @@ describe("OpenWebUI prompt hints", () => {
 		try {
 			const result = await client.seedGjcPromptHints();
 
-			expect(result).toEqual({ created: 1, updated: 1, unchanged: 1, skipped: 0 });
+			expect(result).toEqual({ created: 5, updated: 1, unchanged: 1, skipped: 0 });
 			expect(fixture.requests.map(request => request.path)).toEqual([
 				"/api/v1/prompts/list?page=1",
 				"/api/v1/prompts/id/prompt-link/update",
+				"/api/v1/prompts/create",
+				"/api/v1/prompts/create",
+				"/api/v1/prompts/create",
+				"/api/v1/prompts/create",
 				"/api/v1/prompts/create",
 			]);
 			expect(fixture.prompts.find(prompt => prompt.command === "gjc-project-link")?.content).toBe(
@@ -116,10 +131,14 @@ describe("OpenWebUI prompt hints", () => {
 		try {
 			const result = await client.seedGjcPromptHints();
 
-			expect(result).toEqual({ created: 2, updated: 0, unchanged: 1, skipped: 0 });
+			expect(result).toEqual({ created: 6, updated: 0, unchanged: 1, skipped: 0 });
 			expect(fixture.requests.map(request => request.path)).toEqual([
 				"/api/v1/prompts/list?page=1",
 				"/api/v1/prompts/list?page=2",
+				"/api/v1/prompts/create",
+				"/api/v1/prompts/create",
+				"/api/v1/prompts/create",
+				"/api/v1/prompts/create",
 				"/api/v1/prompts/create",
 				"/api/v1/prompts/create",
 			]);
@@ -146,9 +165,13 @@ describe("OpenWebUI prompt hints", () => {
 		try {
 			const result = await client.seedGjcPromptHints();
 
-			expect(result).toEqual({ created: 2, updated: 0, unchanged: 0, skipped: 1 });
+			expect(result).toEqual({ created: 6, updated: 0, unchanged: 0, skipped: 1 });
 			expect(fixture.requests.map(request => request.path)).toEqual([
 				"/api/v1/prompts/list?page=1",
+				"/api/v1/prompts/create",
+				"/api/v1/prompts/create",
+				"/api/v1/prompts/create",
+				"/api/v1/prompts/create",
 				"/api/v1/prompts/create",
 				"/api/v1/prompts/create",
 			]);

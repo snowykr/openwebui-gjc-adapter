@@ -55,7 +55,6 @@ export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 			timeoutMs: normalizeTimeoutMs(config.timeoutMs ?? DEFAULT_TIMEOUT_MS),
 		});
 	}
-
 	async upsertFolder(record: OpenWebUIFolderRecord): Promise<OpenWebUIFolderRecord> {
 		const existing = await this.#getFolderById(record.id);
 		const folder =
@@ -74,7 +73,6 @@ export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 			metadata: record.metadata,
 		};
 	}
-
 	async upsertChat(record: OpenWebUIChatRecord): Promise<OpenWebUIChatRecord> {
 		const existing = await this.getChat(record.owner_user_id, record.id);
 		if (existing === undefined) {
@@ -120,7 +118,6 @@ export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 		const updated = parseOpenWebUIChatRecord(response, request);
 		return await this.#moveChatToFolder(updated, record.folder_id);
 	}
-
 	async replaceChatMessages(
 		ownerUserId: string,
 		chatId: string,
@@ -130,6 +127,11 @@ export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 		return await replaceOpenWebUIChatMessages(this.#transport, chatId, messages);
 	}
 
+	async getFolder(ownerUserId: string, folderId: string): Promise<OpenWebUIFolderRecord | undefined> {
+		const folder = ownerMatches(await this.#getFolderById(folderId), ownerUserId);
+		if (folder === undefined) return undefined;
+		return { id: folder.id, owner_user_id: ownerUserId, name: folder.name, metadata: folder.metadata };
+	}
 	async getChat(ownerUserId: string, chatId: string): Promise<OpenWebUIChatRecord | undefined> {
 		const request = {
 			method: "GET",
@@ -157,7 +159,6 @@ export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 		const path = `${openWebUIApiPath(["folders", folderId])}?delete_contents=${options.deleteContents ? "true" : "false"}`;
 		await this.#transport.sendJson({ method: "DELETE", path }, { missingStatuses: [404] });
 	}
-
 	async postMessageEvent(input: PostOpenWebUIMessageEventInput): Promise<void> {
 		await this.#transport.sendJson({
 			method: "POST",
@@ -165,7 +166,6 @@ export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 			body: input.event,
 		});
 	}
-
 	async updateMessageContent(input: UpdateOpenWebUIMessageContentInput): Promise<void> {
 		await this.#transport.sendJson({
 			method: "POST",

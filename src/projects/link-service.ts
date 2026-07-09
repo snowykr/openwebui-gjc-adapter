@@ -31,6 +31,15 @@ export interface ProjectUnlinkResult {
 	readonly projectionRemoved: boolean;
 }
 
+export interface ProjectReconcileResult {
+	readonly checked: number;
+	readonly unlinked: readonly ProjectRegistration[];
+}
+
+export interface ProjectReconcileInput {
+	readonly projectIds?: ReadonlySet<string>;
+}
+
 const EMPTY_SYNC_RESULT: SyncProjectSessionsResult = { folders: [], imported: [], skipped: [] };
 
 export class ProjectLinkService {
@@ -97,6 +106,41 @@ export class ProjectLinkService {
 
 	listLinkedProjects(): readonly ProjectRegistration[] {
 		return this.#store.listLinkedProjects().filter(project => this.#isProjectAllowed(project));
+	}
+
+	async syncLinkedProjects(): Promise<SyncProjectSessionsResult> {
+		if (this.#repository === undefined) return EMPTY_SYNC_RESULT;
+		const sync = await syncProjectSessionsToOpenWebUI({
+			repository: this.#repository,
+			ownerUserId: this.#ownerUserId,
+			projects: this.listLinkedProjects(),
+			mappings: this.#mappings,
+		});
+		for (const folder of sync.folders) {
+			const project = this.#store.getProject(folder.projectId);
+			if (project !== undefined && project.openWebUIFolderId !== folder.folderId) {
+				this.#store.updateOpenWebUIFolderId(project.id, folder.folderId);
+			}
+		}
+		return sync;
+	}
+
+	async reconcileOpenWebUIFolderLinks(input: ProjectReconcileInput = {}): Promise<ProjectReconcileResult> {
+		const getFolder = this.#repository?.getFolder;
+		if (getFolder === undefined) return { checked: 0, unlinked: [] };
+		let checked = 0;
+		const unlinked: ProjectRegistration[] = [];
+		for (const project of this.listLinkedProjects()) {
+			if (input.projectIds !== undefined && !input.projectIds.has(project.id)) continue;
+			if (project.openWebUIFolderId === undefined) continue;
+			checked += 1;
+			const folder = await getFolder.call(this.#repository, this.#ownerUserId, project.openWebUIFolderId);
+			if (folder !== undefined) continue;
+			const updated = this.#store.unlinkProject(project.id);
+			if (updated === undefined) throw new Error(`Failed to unlink project registration: ${project.id}`);
+			unlinked.push(updated);
+		}
+		return { checked, unlinked };
 	}
 
 	async #syncProject(project: ProjectRegistration): Promise<SyncProjectSessionsResult> {

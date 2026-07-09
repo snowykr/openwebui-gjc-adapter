@@ -72,6 +72,7 @@ export interface OpenWebUIProjectionRepository {
 		chatId: string,
 		messages: readonly OpenWebUIChatMessageRecord[],
 	): Promise<readonly OpenWebUIChatMessageRecord[]>;
+	getFolder?(ownerUserId: string, folderId: string): Promise<OpenWebUIFolderRecord | undefined>;
 	getChat(ownerUserId: string, chatId: string): Promise<OpenWebUIChatRecord | undefined>;
 	deleteFolder?(
 		ownerUserId: string,
@@ -193,6 +194,11 @@ export class InMemoryOpenWebUIProjectionRepository implements OpenWebUIProjectio
 	async getChat(ownerUserId: string, chatId: string): Promise<OpenWebUIChatRecord | undefined> {
 		const chat = this.#chats.get(this.#ownerScopedKey(ownerUserId, chatId));
 		return chat ? cloneChat(chat) : undefined;
+	}
+
+	async getFolder(ownerUserId: string, folderId: string): Promise<OpenWebUIFolderRecord | undefined> {
+		const folder = this.#folders.get(this.#ownerScopedKey(ownerUserId, folderId));
+		return folder ? cloneFolder(folder) : undefined;
 	}
 
 	async deleteFolder(

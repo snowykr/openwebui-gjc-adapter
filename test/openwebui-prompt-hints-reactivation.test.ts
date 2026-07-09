@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { OpenWebUIPromptHintClient } from "../src/openwebui/prompt-hints";
+import { GJC_OPENWEBUI_PROMPT_HINTS, OpenWebUIPromptHintClient } from "../src/openwebui/prompt-hints";
 
 describe("OpenWebUI prompt hint reactivation", () => {
 	test("reactivates disabled adapter-owned prompt hints", async () => {
@@ -9,13 +9,17 @@ describe("OpenWebUI prompt hint reactivation", () => {
 		try {
 			const result = await client.seedGjcPromptHints();
 
-			expect(result).toEqual({ created: 2, updated: 1, unchanged: 0, skipped: 0 });
+			expect(result).toEqual({
+				created: GJC_OPENWEBUI_PROMPT_HINTS.length - 1,
+				updated: 1,
+				unchanged: 0,
+				skipped: 0,
+			});
 			expect(fixture.requests.map(request => request.path)).toEqual([
 				"/api/v1/prompts/list?page=1",
 				"/api/v1/prompts/id/prompt-link/update",
 				"/api/v1/prompts/id/prompt-link/toggle",
-				"/api/v1/prompts/create",
-				"/api/v1/prompts/create",
+				...Array.from({ length: GJC_OPENWEBUI_PROMPT_HINTS.length - 1 }, () => "/api/v1/prompts/create"),
 			]);
 			expect(fixture.prompt.is_active).toBe(true);
 		} finally {

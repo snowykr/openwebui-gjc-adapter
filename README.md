@@ -59,7 +59,26 @@ const project = await registerProjectDirectory(
 );
 ```
 
-The model id is `gjc/<project-name>` by default. Historical imports place projected sessions under folder id `gjc-project-<project-id>` and chat id `gjc-session-<session-id>`.
+The model id is `gjc/<project-name>` by default. Historical imports place projected sessions under folder id `gjc-project-<project-id>` and chat id `gjc-project-<project-id>-session-<session-id>` unless OpenWebUI assigns runtime ids.
+
+Inside OpenWebUI, use the `gjc/projects` model for project administration:
+
+```text
+/gjc project link /home/me/src/my-repo
+/gjc project list
+/gjc project unlink my-repo
+```
+
+The adapter also seeds OpenWebUI Workspace Prompt hints for those project commands and for canonical GJC workflows:
+
+```text
+/skill:deep-interview {{REQUEST}}
+/skill:ralplan {{TASK}}
+/skill:ultragoal {{GOAL}}
+/skill:team {{TASK}}
+```
+
+Deleting an adapter-created project folder in the OpenWebUI sidebar is treated as an unlink of the OpenWebUI projection only. Local folders, `.gjc` sessions, and GJC history are not deleted. If the same project path is linked again later, the adapter imports the existing session history again.
 
 ## Runtime contract
 

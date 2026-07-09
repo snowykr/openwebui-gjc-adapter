@@ -2,13 +2,13 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { SessionHeader, SessionMessageEntry } from "@gajae-code/coding-agent";
 import { buildAdapterServerOptionsFromEnv } from "../src/cli";
 import { SessionMappingStore } from "../src/gjc/session-router";
 import type { LiveGatewayEventDeliveryInput } from "../src/live/chat-completions";
 import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
 import { createAdapterRequestHandler } from "../src/server";
 import { chatRequest, FakeGjcTurnRunner, reserveTcpPort, stopProcess, waitForStartedServer } from "./cli-fixtures";
+import { messageEntry, writeSessionFile } from "./session-sync-fixtures";
 
 const spawnedProcesses: Bun.Subprocess[] = [];
 
@@ -143,13 +143,7 @@ describe("adapter CLI service", () => {
 		await fs.mkdir(sessionDirectory, { recursive: true });
 		await writeSessionFile(path.join(sessionDirectory, "session-import.jsonl"), {
 			header: { id: "session-import", title: "Imported From Disk", cwd: projectDirectory },
-			entry: {
-				type: "message",
-				id: "user-import",
-				parentId: null,
-				timestamp: "2026-07-08T00:00:00.000Z",
-				message: { role: "user", content: "load me", timestamp: 1 },
-			},
+			entries: [messageEntry("user-import", null, "user", "load me")],
 		});
 		const repository = new InMemoryOpenWebUIProjectionRepository();
 		const mappings = new SessionMappingStore();
@@ -235,21 +229,3 @@ describe("adapter CLI service", () => {
 		expect(turnRunner.starts).toHaveLength(0);
 	});
 });
-
-async function writeSessionFile(
-	filePath: string,
-	input: {
-		readonly header: Pick<SessionHeader, "id" | "title" | "cwd">;
-		readonly entry: SessionMessageEntry;
-	},
-): Promise<void> {
-	const header: SessionHeader = {
-		type: "session",
-		version: 3,
-		id: input.header.id,
-		title: input.header.title,
-		timestamp: "2026-07-08T00:00:00.000Z",
-		cwd: input.header.cwd,
-	};
-	await Bun.write(filePath, `${JSON.stringify(header)}\n${JSON.stringify(input.entry)}\n`);
-}

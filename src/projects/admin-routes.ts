@@ -80,7 +80,8 @@ export async function handleProjectUnlinkRequest(
 	}
 }
 
-export function handleProjectListRequest(service: ProjectLinkService): ProjectAdminRouteResult {
+export async function handleProjectListRequest(service: ProjectLinkService): Promise<ProjectAdminRouteResult> {
+	await service.reconcileOpenWebUIFolderLinks();
 	return { status: 200, body: { projects: service.listProjects() } };
 }
 
@@ -155,6 +156,7 @@ function optionalStringField<T extends string>(
 
 async function executeProjectCommand(service: ProjectLinkService, command: string): Promise<string> {
 	if (command === "/gjc project list") {
+		await service.reconcileOpenWebUIFolderLinks();
 		const projects = service.listProjects();
 		if (projects.length === 0) return "No GJC projects are linked.";
 		return projects.map(project => `${project.status}: ${project.modelId} ${project.cwd}`).join("\n");

@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { buildAdapterServerOptionsFromEnv } from "../src/cli";
 import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
+import { GJC_OPENWEBUI_PROMPT_HINTS } from "../src/openwebui/prompt-hints";
 import { FakeGjcTurnRunner } from "./cli-fixtures";
 
 describe("adapter CLI prompt hints", () => {
@@ -31,15 +32,11 @@ describe("adapter CLI prompt hints", () => {
 
 			expect(fixture.requests.map(request => request.path)).toEqual([
 				"/api/v1/prompts/list?page=1",
-				"/api/v1/prompts/create",
-				"/api/v1/prompts/create",
-				"/api/v1/prompts/create",
+				...GJC_OPENWEBUI_PROMPT_HINTS.map(() => "/api/v1/prompts/create"),
 			]);
-			expect(fixture.prompts.map(prompt => prompt.command)).toEqual([
-				"gjc-project-link",
-				"gjc-project-list",
-				"gjc-project-unlink",
-			]);
+			expect(fixture.prompts.map(prompt => prompt.command)).toEqual(
+				GJC_OPENWEBUI_PROMPT_HINTS.map(prompt => prompt.command),
+			);
 		} finally {
 			fixture.stop();
 		}

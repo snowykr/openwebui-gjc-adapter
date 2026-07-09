@@ -1,20 +1,15 @@
+import { GJC_OPENWEBUI_PROMPT_HINTS, type OpenWebUIPromptHint } from "./gjc-prompt-hints";
 import { OpenWebUIHttpError, type OpenWebUIHttpRequest } from "./http-errors";
 import { createOpenWebUITransport, type OpenWebUITransport } from "./http-transport";
 import { normalizeApiToken, normalizeBaseUrl, normalizeTimeoutMs, openWebUIApiPath } from "./http-wire";
 import { OPENWEBUI_METADATA_NAMESPACE } from "./persistence-contract";
 
+export { GJC_OPENWEBUI_PROMPT_HINTS, type OpenWebUIPromptHint } from "./gjc-prompt-hints";
+
 export interface OpenWebUIPromptHintClientConfig {
 	readonly baseUrl: string;
 	readonly apiToken: string;
 	readonly timeoutMs?: number;
-}
-
-export interface OpenWebUIPromptHint {
-	readonly command: string;
-	readonly name: string;
-	readonly content: string;
-	readonly tags: readonly string[];
-	readonly meta: Record<string, unknown>;
 }
 
 export interface SeedPromptHintsResult {
@@ -41,42 +36,6 @@ interface OpenWebUIPromptPage {
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const OPENWEBUI_PROMPT_PAGE_SIZE = 30;
-const PROMPT_META = {
-	[OPENWEBUI_METADATA_NAMESPACE]: { prompt_hint: true },
-} as const;
-
-export const GJC_OPENWEBUI_PROMPT_HINTS: readonly OpenWebUIPromptHint[] = [
-	{
-		command: "gjc-project-link",
-		name: "GJC: Link project folder",
-		content: "/gjc project link {{PROJECT_PATH}}",
-		tags: ["gjc", "project"],
-		meta: {
-			...PROMPT_META,
-			description: "Link a local folder into OpenWebUI and import its GJC session history.",
-		},
-	},
-	{
-		command: "gjc-project-list",
-		name: "GJC: List linked project folders",
-		content: "/gjc project list",
-		tags: ["gjc", "project"],
-		meta: {
-			...PROMPT_META,
-			description: "Show the GJC project folders currently linked into OpenWebUI.",
-		},
-	},
-	{
-		command: "gjc-project-unlink",
-		name: "GJC: Unlink project folder",
-		content: "/gjc project unlink {{PROJECT_ID}}",
-		tags: ["gjc", "project"],
-		meta: {
-			...PROMPT_META,
-			description: "Remove a project folder from OpenWebUI display without deleting local GJC history.",
-		},
-	},
-];
 
 export class OpenWebUIPromptHintClient {
 	readonly #transport: OpenWebUITransport;

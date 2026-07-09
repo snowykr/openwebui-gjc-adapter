@@ -11,7 +11,6 @@ import { buildOpenWebUIAuthStartupDiagnostic, type OpenWebUIOwnerContext } from 
 import { OpenWebUIHttpClient, type OpenWebUIProjectionRepository } from "./openwebui/client";
 import { createOpenWebUIFileContextResolver } from "./openwebui/file-context-resolver";
 import { OpenWebUIPromptHintClient } from "./openwebui/prompt-hints";
-import { syncProjectSessionsToOpenWebUI } from "./projection/session-sync";
 import { ProjectLinkService } from "./projects/link-service";
 import { SqliteProjectRegistrationStore } from "./projects/registration-store";
 import { disambiguateRegisteredProjects, type RegisteredProject, registerProjectDirectory } from "./projects/registry";
@@ -60,14 +59,11 @@ export async function buildAdapterServerOptionsFromEnv(
 		repository: projectionRepository,
 		mappings,
 	});
+	const previouslyLinkedProjectIds = new Set(projectLinkService.listLinkedProjects().map(project => project.id));
 	projectLinkService.seedConfiguredProjects(projects);
 	if (projectionRepository !== undefined) {
-		await syncProjectSessionsToOpenWebUI({
-			repository: projectionRepository,
-			ownerUserId: owner.ownerUserId,
-			projects: projectLinkService.listLinkedProjects(),
-			mappings,
-		});
+		await projectLinkService.reconcileOpenWebUIFolderLinks({ projectIds: previouslyLinkedProjectIds });
+		await projectLinkService.syncLinkedProjects();
 	}
 	const eventSink = dependencies.eventSink ?? buildOpenWebUIEventSink(openWebUIClient);
 	const messageSink = dependencies.messageSink ?? buildOpenWebUIMessageSink(openWebUIClient);
@@ -78,7 +74,10 @@ export async function buildAdapterServerOptionsFromEnv(
 		checks: buildRuntimeHealthChecks(config),
 		routes: {
 			projects: [...projectLinkService.listLinkedProjects()],
-			projectProvider: () => projectLinkService.listLinkedProjects(),
+			projectProvider: async () => {
+				await projectLinkService.reconcileOpenWebUIFolderLinks();
+				return projectLinkService.listLinkedProjects();
+			},
 			projectLinkService,
 			owner,
 			runner: createGjcRoutingLiveGatewayRunner({ turnRunner, mappings, ownerUserId: owner.ownerUserId }),

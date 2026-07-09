@@ -91,6 +91,52 @@ describe("project link registration", () => {
 		});
 	});
 
+	test("reconciles OpenWebUI folder deletion as an unlink without deleting local history", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-link-reconcile-"));
+		tempDirs.push(workspace);
+		const projectDirectory = path.join(workspace, "Deleted In UI");
+		const sessionRoot = path.join(projectDirectory, ".gjc", "sessions");
+		const sessionFile = path.join(sessionRoot, "session-one.jsonl");
+		await fs.mkdir(sessionRoot, { recursive: true });
+		await writeSessionFile(sessionFile, {
+			header: { id: "session-one", title: "Restorable Session", cwd: projectDirectory },
+			entries: [
+				messageEntry("user-1", null, "user", "old prompt"),
+				messageEntry("assistant-1", "user-1", "assistant", "old answer"),
+			],
+		});
+		const repository = new FolderIdRemappingRepository("openwebui-deleted-folder-runtime");
+		const service = new ProjectLinkService({
+			allowedRoots: await resolveAllowedRoots([workspace]),
+			store: new SqliteProjectRegistrationStore(":memory:"),
+			repository,
+			mappings: new SessionMappingStore(),
+			ownerUserId: "owner-1",
+		});
+		await service.linkProject({ cwd: projectDirectory, name: "Deleted In UI" });
+
+		await repository.deleteFolder("owner-1", "openwebui-deleted-folder-runtime", {
+			deleteContents: true,
+			expectedProjectId: "deleted-in-ui",
+		});
+		const result = await service.reconcileOpenWebUIFolderLinks();
+
+		expect(result).toMatchObject({
+			checked: 1,
+			unlinked: [{ id: "deleted-in-ui", status: "unlinked" }],
+		});
+		expect(service.listLinkedProjects()).toEqual([]);
+		expect(await fs.stat(sessionFile)).toBeTruthy();
+		expect(await repository.getChat("owner-1", "gjc-project-deleted-in-ui-session-session-one")).toBeUndefined();
+
+		await service.linkProject({ cwd: projectDirectory, name: "Deleted In UI" });
+
+		expect(service.listLinkedProjects()).toMatchObject([{ id: "deleted-in-ui", status: "linked" }]);
+		expect(await repository.getChat("owner-1", "gjc-project-deleted-in-ui-session-session-one")).toMatchObject({
+			title: "Restorable Session",
+		});
+	});
+
 	test("unlinks the actual OpenWebUI folder id returned by projection import", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-link-service-"));
 		tempDirs.push(workspace);
@@ -182,6 +228,10 @@ class FolderIdRemappingRepository implements OpenWebUIProjectionRepository {
 
 	async getChat(ownerUserId: string, chatId: string): Promise<OpenWebUIChatRecord | undefined> {
 		return await this.#inner.getChat(ownerUserId, chatId);
+	}
+
+	async getFolder(ownerUserId: string, folderId: string): Promise<OpenWebUIFolderRecord | undefined> {
+		return await this.#inner.getFolder(ownerUserId, folderId);
 	}
 
 	async deleteFolder(
