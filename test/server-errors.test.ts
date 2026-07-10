@@ -154,7 +154,6 @@ const project: RegisteredProject = {
 	id: "demo",
 	name: "Demo",
 	cwd: "/work/demo",
-	modelId: "gjc/demo",
 	allowedRoot: "/work",
 	createdAt: new Date("2026-07-08T00:00:00.000Z"),
 };

@@ -60,7 +60,7 @@ describe("project admin routes", () => {
 		);
 		expect(linked.status).toBe(200);
 		expect(await linked.json()).toMatchObject({
-			project: { id: "admin-project", status: "linked", modelId: "gjc/admin-project" },
+			project: { id: "admin-project", status: "linked" },
 			sync: { imported: [{ sessionId: "session-one" }] },
 		});
 		expect(await modelIds(handler)).toEqual(["gjc"]);

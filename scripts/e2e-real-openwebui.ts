@@ -32,15 +32,11 @@ async function run(ctx: E2EContext): Promise<void> {
 
 	const adapterModels = await ctx.getJson(`${ctx.config.adapterBaseUrl}/v1/models`, ctx.adapterHeaders());
 	const modelIds = modelIdsFrom(adapterModels.body);
-	ctx.record(
-		"adapter models expose stable gjc model only",
-		modelIds.includes("gjc") && modelIds.every(modelId => modelId === "gjc" || !modelId.startsWith("gjc/")),
-		modelIds.join(", "),
-	);
+	ctx.record("adapter models expose only gjc", hasOnlyGjcModel(modelIds), modelIds.join(", "));
 
 	const openWebUIModels = await ctx.getJson(`${ctx.config.openWebUIBaseUrl}/api/v1/models`, ctx.openWebUIHeaders());
 	const openWebUIModelIds = modelIdsFrom(openWebUIModels.body);
-	ctx.record("OpenWebUI sees stable GJC model", openWebUIModelIds.includes("gjc"), openWebUIModelIds.join(", "));
+	ctx.record("OpenWebUI sees only stable GJC model", hasOnlyGjcModel(openWebUIModelIds), openWebUIModelIds.join(", "));
 
 	const relinkReal = await ctx.postJson(`${ctx.config.adapterBaseUrl}/admin/projects/link`, ctx.adapterHeaders(), {
 		cwd: ctx.config.realProjectDir,
@@ -68,25 +64,18 @@ async function run(ctx: E2EContext): Promise<void> {
 		fixtureLinkText,
 	);
 
-	const afterFixtureLink = await ctx.getJson(`${ctx.config.adapterBaseUrl}/v1/models`, ctx.adapterHeaders());
-	ctx.record(
-		"linked previous project does not appear as model",
-		modelIdsFrom(afterFixtureLink.body).every(modelId => modelId === "gjc" || !modelId.startsWith("gjc/")),
-		modelIdsFrom(afterFixtureLink.body).join(", "),
-	);
-
 	const fixtureUnlinkText = await projectCommand(ctx, `/gjc project unlink ${fixture.projectId}`, "fixture-unlink");
 	ctx.record(
 		"unlink hides project without deleting local history",
 		fixtureUnlinkText.includes("Local GJC files were left untouched.") && (await fileExists(fixture.sessionFile)),
 		fixtureUnlinkText,
 	);
-
-	const afterFixtureUnlink = await ctx.getJson(`${ctx.config.adapterBaseUrl}/v1/models`, ctx.adapterHeaders());
+	const modelsAfterUnlink = await ctx.getJson(`${ctx.config.adapterBaseUrl}/v1/models`, ctx.adapterHeaders());
+	const modelIdsAfterUnlink = modelIdsFrom(modelsAfterUnlink.body);
 	ctx.record(
-		"unlinked previous project model disappears",
-		!modelIdsFrom(afterFixtureUnlink.body).includes(fixture.modelId),
-		modelIdsFrom(afterFixtureUnlink.body).join(", "),
+		"models stay canonical after unlink",
+		hasOnlyGjcModel(modelIdsAfterUnlink),
+		modelIdsAfterUnlink.join(", "),
 	);
 
 	const relinkFixture = await ctx.postJson(`${ctx.config.adapterBaseUrl}/admin/projects/link`, ctx.adapterHeaders(), {
@@ -96,6 +85,13 @@ async function run(ctx: E2EContext): Promise<void> {
 		"admin relink imports previous project again",
 		relinkFixture.status === 200 && syncedSessionCount(relinkFixture.body) >= 1,
 		`HTTP ${relinkFixture.status}, imported ${importedCount(relinkFixture.body)}, synced ${syncedSessionCount(relinkFixture.body)}`,
+	);
+	const modelsAfterRelink = await ctx.getJson(`${ctx.config.adapterBaseUrl}/v1/models`, ctx.adapterHeaders());
+	const modelIdsAfterRelink = modelIdsFrom(modelsAfterRelink.body);
+	ctx.record(
+		"models stay canonical after relink",
+		hasOnlyGjcModel(modelIdsAfterRelink),
+		modelIdsAfterRelink.join(", "),
 	);
 
 	const fixtureCleanupText = await projectCommand(ctx, `/gjc project unlink ${fixture.projectId}`, "fixture-cleanup");
@@ -122,13 +118,6 @@ async function run(ctx: E2EContext): Promise<void> {
 		"OpenWebUI chat forwards file/image context to GJC",
 		fileContext.status === 200 && hasFileContextSentinel,
 		`HTTP ${fileContext.status}, sentinel ${hasFileContextSentinel ? "present" : "missing"}`,
-	);
-
-	const finalModels = await ctx.getJson(`${ctx.config.adapterBaseUrl}/v1/models`, ctx.adapterHeaders());
-	ctx.record(
-		"final model list stays project-free",
-		modelIdsFrom(finalModels.body).includes("gjc") && !modelIdsFrom(finalModels.body).includes(fixture.modelId),
-		modelIdsFrom(finalModels.body).join(", "),
 	);
 
 	ctx.assertAllChecks();
@@ -163,7 +152,7 @@ async function createPreviousProjectFixture(ctx: E2EContext) {
 		},
 	];
 	await writeFile(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
-	return { cwd, modelId: `gjc/${projectId}`, projectId, sessionFile };
+	return { cwd, projectId, sessionFile };
 }
 async function projectCommand(ctx: E2EContext, command: string, suffix: string): Promise<string> {
 	const response = await ctx.postJson(
@@ -176,6 +165,10 @@ async function projectCommand(ctx: E2EContext, command: string, suffix: string):
 	const text = choiceText(response.body);
 	await ctx.writeJson(`project-command-${suffix}.json`, response.body);
 	return text;
+}
+
+function hasOnlyGjcModel(modelIds: readonly string[]): boolean {
+	return modelIds.length === 1 && modelIds[0] === "gjc";
 }
 
 async function openWebUIChatWithFile(

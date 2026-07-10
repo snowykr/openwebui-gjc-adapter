@@ -88,12 +88,9 @@ describe("adapter CLI project reconciliation", () => {
 			expectedProjectId: "deleted-during-runtime",
 		});
 
-		const modelsResponse = await handler(authenticatedRequest("http://adapter.test/v1/models"));
-		const models = await modelsResponse.json();
 		const projectListResponse = await handler(projectListRequest());
 		const projectList = await projectListResponse.json();
 
-		expect(modelIds(models)).not.toContain("gjc/deleted-during-runtime");
 		expect(projectListText(projectList)).toContain("unlinked: deleted-during-runtime");
 		expect(store.getProject("deleted-during-runtime")).toMatchObject({ status: "unlinked" });
 	});
@@ -113,10 +110,6 @@ function envFor(workspace: string, projects: string): Record<string, string | un
 	};
 }
 
-function authenticatedRequest(url: string): Request {
-	return new Request(url, { headers: { authorization: "Bearer adapter-token" } });
-}
-
 function projectListRequest(): Request {
 	const source = chatRequest();
 	return new Request(source.url, {
@@ -124,11 +117,6 @@ function projectListRequest(): Request {
 		headers: source.headers,
 		body: JSON.stringify({ model: "gjc", messages: [{ role: "user", content: "/gjc project list" }] }),
 	});
-}
-
-function modelIds(value: unknown): readonly string[] {
-	if (!isRecord(value) || !Array.isArray(value.data)) return [];
-	return value.data.map(item => (isRecord(item) && typeof item.id === "string" ? item.id : "")).filter(Boolean);
 }
 
 function projectListText(value: unknown): string {

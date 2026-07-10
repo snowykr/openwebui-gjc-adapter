@@ -18,7 +18,6 @@ type ProjectRegistrationRow = {
 	name: string;
 	open_webui_folder_name: string | null;
 	cwd: string;
-	model_id: string;
 	open_webui_folder_id: string | null;
 	allowed_root: string;
 	session_root: string | null;
@@ -59,15 +58,14 @@ export class SqliteProjectRegistrationStore {
 	linkProject(project: RegisteredProject, source: ProjectRegistrationSource): ProjectRegistration {
 		const existing = this.#getByCwd(project.cwd);
 		const assigned = existing === undefined ? this.#assignProjectIdentity(project) : { ...project, id: existing.id };
-		const normalized = { ...assigned, modelId: `gjc/${assigned.id}` as const };
-		this.#updateProjectFields(normalized.id, normalized, "linked", source);
-		const linked = this.getProject(normalized.id);
-		if (linked === undefined) throw new Error(`Failed to persist project registration: ${normalized.id}`);
+		this.#updateProjectFields(assigned.id, assigned, "linked", source);
+		const linked = this.getProject(assigned.id);
+		if (linked === undefined) throw new Error(`Failed to persist project registration: ${assigned.id}`);
 		return linked;
 	}
 
-	unlinkProject(projectIdOrModelIdOrCwd: string): ProjectRegistration | undefined {
-		const existing = this.#findProject(projectIdOrModelIdOrCwd);
+	unlinkProject(projectIdOrCwd: string): ProjectRegistration | undefined {
+		const existing = this.#findProject(projectIdOrCwd);
 		if (existing === undefined) return undefined;
 		const now = new Date().toISOString();
 		this.#db
@@ -87,8 +85,8 @@ export class SqliteProjectRegistrationStore {
 		return updated;
 	}
 
-	getProject(projectIdOrModelIdOrCwd: string): ProjectRegistration | undefined {
-		return this.#findProject(projectIdOrModelIdOrCwd);
+	getProject(projectIdOrCwd: string): ProjectRegistration | undefined {
+		return this.#findProject(projectIdOrCwd);
 	}
 
 	listProjects(): readonly ProjectRegistration[] {
@@ -110,22 +108,37 @@ export class SqliteProjectRegistrationStore {
 	}
 
 	#ensureSchema(): void {
-		this.#db.exec(`
-			CREATE TABLE IF NOT EXISTS project_registration (
-				id TEXT PRIMARY KEY,
-				name TEXT NOT NULL,
-				open_webui_folder_name TEXT,
-				cwd TEXT NOT NULL UNIQUE,
-				model_id TEXT NOT NULL UNIQUE,
-				open_webui_folder_id TEXT,
-				allowed_root TEXT NOT NULL,
-				session_root TEXT,
-				created_at TEXT NOT NULL,
-				updated_at TEXT NOT NULL,
-				source TEXT NOT NULL CHECK (source IN ('env', 'admin')),
-				status TEXT NOT NULL CHECK (status IN ('linked', 'unlinked'))
-			)
-		`);
+		this.#db.exec(projectRegistrationSchema());
+		this.#migrateLegacyModelIdColumn();
+	}
+
+	#migrateLegacyModelIdColumn(): void {
+		const columns = this.#db
+			.query("PRAGMA table_info(project_registration)")
+			.all()
+			.map(row => tableColumnName(row));
+		if (!columns.includes("model_id")) return;
+		const legacyTable = `project_registration_legacy_${Date.now()}`;
+		this.#db.exec("BEGIN");
+		try {
+			this.#db.exec(`ALTER TABLE project_registration RENAME TO ${legacyTable}`);
+			this.#db.exec(projectRegistrationSchema());
+			this.#db.exec(`
+				INSERT INTO project_registration (
+					id, name, open_webui_folder_name, cwd, open_webui_folder_id,
+					allowed_root, session_root, created_at, updated_at, source, status
+				)
+				SELECT
+					id, name, open_webui_folder_name, cwd, open_webui_folder_id,
+					allowed_root, session_root, created_at, updated_at, source, status
+				FROM ${legacyTable}
+			`);
+			this.#db.exec(`DROP TABLE ${legacyTable}`);
+			this.#db.exec("COMMIT");
+		} catch (error) {
+			this.#db.exec("ROLLBACK");
+			throw error;
+		}
 	}
 
 	#updateProjectFields(
@@ -140,17 +153,16 @@ export class SqliteProjectRegistrationStore {
 		this.#db
 			.query(
 				`INSERT INTO project_registration (
-					id, name, open_webui_folder_name, cwd, model_id, open_webui_folder_id,
-					allowed_root, session_root, created_at, updated_at, source, status
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-				ON CONFLICT(id) DO UPDATE SET
-					name = excluded.name,
-					open_webui_folder_name = excluded.open_webui_folder_name,
-					cwd = excluded.cwd,
-					model_id = excluded.model_id,
-					open_webui_folder_id = excluded.open_webui_folder_id,
-					allowed_root = excluded.allowed_root,
-					session_root = excluded.session_root,
+						id, name, open_webui_folder_name, cwd, open_webui_folder_id,
+						allowed_root, session_root, created_at, updated_at, source, status
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+					ON CONFLICT(id) DO UPDATE SET
+						name = excluded.name,
+						open_webui_folder_name = excluded.open_webui_folder_name,
+						cwd = excluded.cwd,
+						open_webui_folder_id = excluded.open_webui_folder_id,
+						allowed_root = excluded.allowed_root,
+						session_root = excluded.session_root,
 					updated_at = excluded.updated_at,
 					source = excluded.source,
 					status = excluded.status`,
@@ -160,7 +172,6 @@ export class SqliteProjectRegistrationStore {
 				project.name,
 				project.openWebUIFolderName ?? null,
 				project.cwd,
-				`gjc/${id}`,
 				project.openWebUIFolderId ?? null,
 				project.allowedRoot,
 				project.sessionRoot ?? null,
@@ -175,14 +186,11 @@ export class SqliteProjectRegistrationStore {
 		const sameId = this.#getById(project.id);
 		if (sameId === undefined || sameId.cwd === project.cwd) return project;
 		const fingerprintedId = `${project.id}-${projectPathFingerprint(project.cwd)}`;
-		return { ...project, id: fingerprintedId, modelId: `gjc/${fingerprintedId}` };
+		return { ...project, id: fingerprintedId };
 	}
 
-	#findProject(projectIdOrModelIdOrCwd: string): ProjectRegistration | undefined {
-		const id = projectIdOrModelIdOrCwd.startsWith("gjc/")
-			? projectIdOrModelIdOrCwd.slice("gjc/".length)
-			: projectIdOrModelIdOrCwd;
-		return this.#getById(id) ?? this.#getByCwd(projectIdOrModelIdOrCwd);
+	#findProject(projectIdOrCwd: string): ProjectRegistration | undefined {
+		return this.#getById(projectIdOrCwd) ?? this.#getByCwd(projectIdOrCwd);
 	}
 
 	#getById(id: string): ProjectRegistration | undefined {
@@ -201,7 +209,6 @@ export class SqliteProjectRegistrationStore {
 			name: row.name,
 			...(row.open_webui_folder_name === null ? {} : { openWebUIFolderName: row.open_webui_folder_name }),
 			cwd: row.cwd,
-			modelId: row.model_id as `gjc/${string}`,
 			...(row.open_webui_folder_id === null ? {} : { openWebUIFolderId: row.open_webui_folder_id }),
 			allowedRoot: row.allowed_root,
 			...(row.session_root === null ? {} : { sessionRoot: row.session_root }),
@@ -215,6 +222,31 @@ export class SqliteProjectRegistrationStore {
 
 function projectPathFingerprint(cwd: string): string {
 	return createHash("sha256").update(cwd).digest("hex").slice(0, 8);
+}
+
+function projectRegistrationSchema(): string {
+	return `
+		CREATE TABLE IF NOT EXISTS project_registration (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			open_webui_folder_name TEXT,
+			cwd TEXT NOT NULL UNIQUE,
+			open_webui_folder_id TEXT,
+			allowed_root TEXT NOT NULL,
+			session_root TEXT,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			source TEXT NOT NULL CHECK (source IN ('env', 'admin')),
+			status TEXT NOT NULL CHECK (status IN ('linked', 'unlinked'))
+		)
+	`;
+}
+
+function tableColumnName(row: unknown): string {
+	if (typeof row !== "object" || row === null || !("name" in row) || typeof row.name !== "string") {
+		throw new Error("SQLite PRAGMA table_info returned an invalid row.");
+	}
+	return row.name;
 }
 
 function preserveRuntimeFolderId(project: RegisteredProject, existing: ProjectRegistration): RegisteredProject {

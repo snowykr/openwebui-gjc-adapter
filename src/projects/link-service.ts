@@ -87,10 +87,10 @@ export class ProjectLinkService {
 		}
 	}
 
-	async unlinkProject(projectIdOrModelIdOrCwd: string): Promise<ProjectUnlinkResult> {
-		const existing = this.#store.getProject(projectIdOrModelIdOrCwd);
+	async unlinkProject(projectIdOrCwd: string): Promise<ProjectUnlinkResult> {
+		const existing = this.#store.getProject(projectIdOrCwd);
 		if (existing === undefined) {
-			throw new ProjectLinkError(`Project is not registered: ${projectIdOrModelIdOrCwd}`, "project_not_found");
+			throw new ProjectLinkError(`Project is not registered: ${projectIdOrCwd}`, "project_not_found");
 		}
 		const projectionRemoved = await this.#removeProjection(existing);
 		const project = this.#store.unlinkProject(existing.id);

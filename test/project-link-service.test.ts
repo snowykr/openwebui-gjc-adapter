@@ -70,7 +70,6 @@ describe("project link registration", () => {
 		});
 
 		const linked = await service.linkProject({ cwd: projectDirectory, name: "Demo Project" });
-		expect(linked.project.modelId).toBe("gjc/demo-project");
 		expect(linked.sync.imported).toMatchObject([{ sessionId: "session-one", messageCount: 2 }]);
 		expect(await repository.getChat("owner-1", "gjc-project-demo-project-session-session-one")).toMatchObject({
 			folder_id: "gjc-project-demo-project",

@@ -20,7 +20,7 @@ afterEach(async () => {
 
 describe("project admin route security boundaries", () => {
 	test("rejects admin slash commands from a different forwarded OpenWebUI owner", async () => {
-		const { handler, projectDirectory } = await adminHandlerForTempProject("Owner Mismatch");
+		const { handler, projectDirectory, service } = await adminHandlerForTempProject("Owner Mismatch");
 
 		const response = await handler(
 			chatCommandRequest(
@@ -33,11 +33,11 @@ describe("project admin route security boundaries", () => {
 		);
 
 		expect(response.status).toBe(401);
-		expect(await modelIds(handler)).not.toContain("gjc/owner-mismatch");
+		expect(service.listLinkedProjects()).toEqual([]);
 	});
 
 	test("does not execute admin slash commands for OpenWebUI background tasks", async () => {
-		const { handler, projectDirectory } = await adminHandlerForTempProject("Background Task");
+		const { handler, projectDirectory, service } = await adminHandlerForTempProject("Background Task");
 
 		const response = await handler(
 			chatCommandRequest(
@@ -50,7 +50,7 @@ describe("project admin route security boundaries", () => {
 		);
 
 		expect(response.status).toBe(200);
-		expect(await modelIds(handler)).not.toContain("gjc/background-task");
+		expect(service.listLinkedProjects()).toEqual([]);
 	});
 
 	test("rejects malformed unlink path encoding with a client error", async () => {
@@ -87,7 +87,7 @@ describe("project admin route security boundaries", () => {
 			metadata: {},
 			history: { messages: {}, currentId: null },
 		});
-		const handler = await buildHandler(workspace, repository);
+		const { handler } = await buildHandler(workspace, repository);
 
 		const linked = await handler(
 			jsonRequest("http://adapter.test/admin/projects/link", {
@@ -115,7 +115,7 @@ async function adminHandlerForTempProject(name: string) {
 	tempDirs.push(workspace);
 	const projectDirectory = path.join(workspace, name);
 	await fs.mkdir(projectDirectory);
-	return { handler: await buildHandler(workspace), projectDirectory };
+	return { ...(await buildHandler(workspace)), projectDirectory };
 }
 
 async function buildHandler(workspace: string, repository?: InMemoryOpenWebUIProjectionRepository) {
@@ -125,7 +125,7 @@ async function buildHandler(workspace: string, repository?: InMemoryOpenWebUIPro
 		...(repository === undefined ? {} : { repository }),
 		ownerUserId: "owner-1",
 	});
-	return createAdapterRequestHandler({
+	const handler = createAdapterRequestHandler({
 		routes: {
 			projects: [],
 			projectProvider: () => service.listLinkedProjects(),
@@ -136,6 +136,7 @@ async function buildHandler(workspace: string, repository?: InMemoryOpenWebUIPro
 			requireAdapterApiToken: true,
 		},
 	});
+	return { handler, service };
 }
 
 function fixedRunner(content: string): LiveGatewayRunner {
@@ -169,13 +170,4 @@ function chatCommandRequest(
 		headers,
 		body: JSON.stringify(body),
 	});
-}
-
-async function modelIds(handler: (request: Request) => Response | Promise<Response>): Promise<string[]> {
-	const response = await handler(
-		new Request("http://adapter.test/v1/models", { headers: { authorization: "Bearer adapter-token" } }),
-	);
-	expect(response.status).toBe(200);
-	const body = (await response.json()) as { data: { id: string }[] };
-	return body.data.map(model => model.id);
 }

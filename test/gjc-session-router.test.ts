@@ -218,7 +218,6 @@ function createProject(): RegisteredProject {
 		id: "project",
 		name: "Project",
 		cwd: "/workspace/project",
-		modelId: "gjc/project",
 		allowedRoot: "/workspace",
 		createdAt: new Date("2026-07-08T00:00:00.000Z"),
 	};

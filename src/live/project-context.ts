@@ -76,7 +76,6 @@ async function neutralProject(workspace: string, now: Date): Promise<RegisteredP
 		name: "OpenWebUI",
 		openWebUIFolderName: "OpenWebUI",
 		cwd,
-		modelId: "gjc/openwebui",
 		allowedRoot: cwd,
 		sessionRoot,
 		createdAt: new Date(now),

@@ -91,7 +91,6 @@ function registeredProject(cwd: string): RegisteredProject {
 		id: "demo",
 		name: "Demo",
 		cwd,
-		modelId: "gjc/demo",
 		allowedRoot: path.dirname(cwd),
 		createdAt: new Date("2026-07-09T00:00:00.000Z"),
 	};

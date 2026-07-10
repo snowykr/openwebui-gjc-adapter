@@ -7,7 +7,6 @@ export interface RegisteredProject {
 	readonly name: string;
 	readonly openWebUIFolderName?: string;
 	readonly cwd: string;
-	readonly modelId: `gjc/${string}`;
 	readonly openWebUIFolderId?: string;
 	readonly allowedRoot: string;
 	readonly sessionRoot?: string;
@@ -24,7 +23,6 @@ export interface RegisterProjectDirectoryInput {
 export interface ProjectFolderMetadata {
 	readonly gjc_adapter: {
 		readonly projectId: string;
-		readonly modelId: string;
 		readonly projectName: string;
 	};
 }
@@ -66,7 +64,7 @@ export function disambiguateRegisteredProjects(projects: readonly RegisteredProj
 			(folderNameCounts.get(folderName) ?? 0) <= 1
 				? folderName
 				: `${folderName} ${projectPathFingerprint(project.cwd)}`;
-		return { ...project, id, modelId: `gjc/${id}`, openWebUIFolderName };
+		return { ...project, id, openWebUIFolderName };
 	});
 }
 
@@ -88,7 +86,6 @@ export async function registerProjectDirectory(
 		name: input.name ?? path.basename(cwd),
 		openWebUIFolderName: input.name ?? path.basename(cwd),
 		cwd,
-		modelId: `gjc/${id}`,
 		openWebUIFolderId: input.openWebUIFolderId,
 		sessionRoot,
 		allowedRoot,
@@ -100,7 +97,6 @@ export function buildProjectFolderMetadata(project: RegisteredProject): ProjectF
 	return {
 		gjc_adapter: {
 			projectId: project.id,
-			modelId: project.modelId,
 			projectName: project.name,
 		},
 	};

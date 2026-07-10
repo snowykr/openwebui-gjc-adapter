@@ -1,9 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import {
-	handleChatCompletions,
-	type LiveGatewayRunner,
-	LiveGatewayUnavailableError,
-} from "../src/live/chat-completions";
+import { handleChatCompletions, LiveGatewayUnavailableError } from "../src/live/chat-completions";
 import type { OpenAIChatCompletionRequest } from "../src/live/openai-types";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import type { RegisteredProject } from "../src/projects/registry";
@@ -12,7 +8,6 @@ const project: RegisteredProject = {
 	id: "demo",
 	name: "Demo",
 	cwd: "/work/demo",
-	modelId: "gjc/demo",
 	allowedRoot: "/work",
 	createdAt: new Date("2026-07-08T00:00:00.000Z"),
 };
@@ -62,28 +57,6 @@ describe("live OpenAI-compatible chat completion errors", () => {
 		expect(chunks[2]).toBe("data: [DONE]\n\n");
 	});
 
-	it("rejects unknown project models", async () => {
-		const result = await handleChatCompletions({
-			request: { ...request, model: "gjc/missing" },
-			headers: chatHeaders,
-			projects: [project],
-			owner,
-			runner: fixedRunner("unused"),
-		});
-
-		expect(result).toEqual({
-			ok: false,
-			status: 404,
-			body: {
-				error: {
-					message: "Unknown GJC model: gjc/missing",
-					type: "invalid_request_error",
-					code: "model_not_found",
-				},
-			},
-		});
-	});
-
 	it("returns OpenAI-style unavailable errors when no concrete live runner is wired", async () => {
 		const result = await handleChatCompletions({
 			request,
@@ -110,7 +83,3 @@ describe("live OpenAI-compatible chat completion errors", () => {
 		});
 	});
 });
-
-function fixedRunner(content: string): LiveGatewayRunner {
-	return { run: () => ({ content }) };
-}

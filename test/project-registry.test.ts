@@ -11,7 +11,7 @@ import {
 import { resolveAllowedRoots } from "../src/security/paths";
 
 describe("project registry primitives", () => {
-	test("creates stable basename slugs and model ids", async () => {
+	test("creates stable basename slugs", async () => {
 		expect(createProjectId("/work/My App!")).toBe("my-app");
 		expect(createProjectId("../Already Slugged")).toBe("already-slugged");
 
@@ -29,7 +29,6 @@ describe("project registry primitives", () => {
 		expect(project.id).toBe("my-app");
 		expect(project.name).toBe("My App!");
 		expect(project.openWebUIFolderName).toBe("My App!");
-		expect(project.modelId).toBe("gjc/my-app");
 	});
 
 	test("disambiguates registered projects with the same display slug by real cwd", async () => {
@@ -46,7 +45,6 @@ describe("project registry primitives", () => {
 
 		expect(projects.map(project => project.name)).toEqual(["Same", "Same"]);
 		expect(new Set(projects.map(project => project.id)).size).toBe(2);
-		expect(new Set(projects.map(project => project.modelId)).size).toBe(2);
 		expect(projects.map(project => project.openWebUIFolderName)).toEqual(["Same (alpha/Same)", "Same (beta/Same)"]);
 		expect(projects.every(project => project.id.startsWith("same-"))).toBe(true);
 		expect(projects.map(project => buildProjectFolderMetadata(project).gjc_adapter.projectId)).toEqual(
@@ -120,7 +118,6 @@ describe("project registry primitives", () => {
 		expect(buildProjectFolderMetadata(project)).toEqual({
 			gjc_adapter: {
 				projectId: "workspace",
-				modelId: "gjc/workspace",
 				projectName: "Workspace",
 			},
 		});

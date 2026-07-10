@@ -17,7 +17,6 @@ const project: RegisteredProject = {
 	id: "demo",
 	name: "Demo",
 	cwd: "/work/demo",
-	modelId: "gjc/demo",
 	allowedRoot: "/work",
 	createdAt: new Date("2026-07-08T00:00:00.000Z"),
 };
@@ -46,6 +45,26 @@ describe("live chat project context", () => {
 		});
 	});
 
+	it("rejects noncanonical gjc submodel request ids without calling the runner", async () => {
+		let calls = 0;
+		const result = await handleChatCompletions({
+			request: { ...request, model: "gjc/noncanonical" },
+			headers: chatHeaders,
+			projects: [projectWithFolder],
+			owner,
+			projectContextRepository: await demoRepository(),
+			runner: {
+				run() {
+					calls += 1;
+					return { content: "unexpected" };
+				},
+			},
+		});
+
+		expect(calls).toBe(0);
+		expect(result).toMatchObject({ ok: false, status: 404, body: { error: { code: "model_not_found" } } });
+	});
+
 	it("returns metadata-only responses for OpenWebUI background tasks without calling the runner", async () => {
 		let calls = 0;
 		const runner: LiveGatewayRunner = {
@@ -70,25 +89,6 @@ describe("live chat project context", () => {
 		if (!result.ok || !("body" in result)) throw new Error("expected completion body");
 		expect(result.body.choices[0]?.message.content).toBe("");
 		expect(result.body.metadata).toEqual({ task: "title_generation", noop: true });
-	});
-
-	it("rejects project model ids for OpenWebUI background tasks", async () => {
-		let calls = 0;
-		const result = await handleChatCompletions({
-			request: { ...request, model: "gjc/demo" },
-			headers: { "X-OpenWebUI-Task": "title_generation", "X-OpenWebUI-User-Id": "owner-1" },
-			projects: [project],
-			owner,
-			runner: {
-				run() {
-					calls += 1;
-					return { content: "unexpected" };
-				},
-			},
-		});
-
-		expect(calls).toBe(0);
-		expect(result).toMatchObject({ ok: false, status: 404, body: { error: { code: "model_not_found" } } });
 	});
 
 	it("rejects forwarded user mismatches", async () => {
@@ -152,26 +152,6 @@ describe("live chat project context", () => {
 		} finally {
 			await rm(neutralWorkspace, { force: true, recursive: true });
 		}
-	});
-
-	it("rejects project model ids instead of treating project names as models", async () => {
-		let calls = 0;
-		const result = await handleChatCompletions({
-			request: { ...request, model: "gjc/demo" },
-			headers: chatHeaders,
-			projects: [projectWithFolder],
-			owner,
-			projectContextRepository: await demoRepository(),
-			runner: {
-				run() {
-					calls += 1;
-					return { content: "unexpected" };
-				},
-			},
-		});
-
-		expect(calls).toBe(0);
-		expect(result).toMatchObject({ ok: false, status: 404, body: { error: { code: "model_not_found" } } });
 	});
 
 	it("rejects request objects missing messages before reading latest user text", async () => {
