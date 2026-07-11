@@ -228,17 +228,25 @@ function buildOwnerContext(config: AdapterConfig): OpenWebUIOwnerContext {
 		singleOwnerLocalMode: false,
 	};
 }
+export interface RunCliDependencies extends CliDependencies {
+	/** Test seam for observing the fully composed installed server options. */
+	readonly startConfiguredServer?: (
+		options: AdapterServerOptions,
+	) => AdapterServerHandle | Promise<AdapterServerHandle>;
+}
 
 export async function runCli(
 	argv: readonly string[] = process.argv.slice(2),
-	dependencies: CliDependencies = {},
+	dependencies: RunCliDependencies = {},
 ): Promise<number> {
 	if (isInstalledCommand(argv)) {
 		return runInstalledCli(argv, {
 			...dependencies,
 			startServer:
 				dependencies.startServer ??
-				(async config => startAdapterServer(await buildInstalledAdapterServerOptions(config))),
+				(dependencies.startConfiguredServer
+					? async config => dependencies.startConfiguredServer!(await buildInstalledAdapterServerOptions(config))
+					: async config => startAdapterServer(await buildInstalledAdapterServerOptions(config))),
 		});
 	}
 	try {

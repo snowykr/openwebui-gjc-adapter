@@ -1,5 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, openSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	openSync,
+	readFileSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,6 +27,7 @@ import {
 	writeInstalledConfig,
 } from "../src/configure/private-config";
 import { renderExistingSystemdUnit } from "../src/configure/systemd";
+import type { AdapterServerOptions } from "../src/server";
 
 function tempPath(): { directory: string; config: string; cleanup: () => void } {
 	const directory = mkdtempSync(join(tmpdir(), "gjc-configure-cli-"));
@@ -98,7 +108,13 @@ describe("configure CLI grammar and acknowledgements", () => {
 	});
 	test("routes serve --config through the installed lifecycle and escapes each systemd argument", async () => {
 		const t = tempPath();
+		const originalFetch = globalThis.fetch;
 		try {
+			globalThis.fetch = (async () =>
+				new Response(JSON.stringify({ id: "gjc-project-default", name: "default", items: [] }), {
+					status: 200,
+				})) as unknown as typeof fetch;
+			mkdirSync(join(t.directory, "workspace"));
 			writeInstalledConfig(
 				{
 					version: 1,
@@ -106,24 +122,48 @@ describe("configure CLI grammar and acknowledgements", () => {
 					installationId: "install",
 					adapterToken: "adapter",
 					readinessToken: "ready",
+					openWebUIApiToken: "openwebui-api-token",
 					openWebUIApiUrl: "http://localhost:8080",
 					adapterProviderUrl: "http://adapter:8765/v1",
 					bindHost: "127.0.0.1",
 					bindPort: 8765,
+					projectRoot: join(t.directory, "workspace"),
 				},
 				t.config,
 			);
 			const output = sink();
+			let captured: AdapterServerOptions | undefined;
 			const result = await runCli(["serve", "--config", t.config], {
 				stdout: output,
-				startServer: config => {
-					expect(config.adapterApiToken).toBe("adapter");
-					expect(config.gjcCommand).toBe("gjc");
+				startConfiguredServer: options => {
+					captured = options;
 					return { url: "http://127.0.0.1:8765", stop: async () => {} };
 				},
 			});
 			expect(result).toBe(0);
 			expect(output.values).toEqual(["http://127.0.0.1:8765\n"]);
+			expect(captured).toMatchObject({
+				runtime: {
+					adapterToken: "adapter",
+					readinessToken: "ready",
+					readiness: {
+						openWebUIAuthenticated: false,
+						promptHintsSeeded: false,
+						mode: "existing",
+						generation: "install",
+					},
+					openWebUIBaseUrl: "http://localhost:8080",
+					openWebUIApiToken: "openwebui-api-token",
+				},
+				routes: {
+					requireAdapterApiToken: true,
+					adapterApiToken: "adapter",
+				},
+			});
+			expect(captured?.routes?.projectContextRepository).toBeDefined();
+			expect(captured?.routes?.eventSink).toBeDefined();
+			expect(captured?.routes?.messageSink).toBeDefined();
+			expect(captured?.routes?.fileContextResolver).toBeDefined();
 			expect(
 				renderExistingSystemdUnit({
 					workingDirectory: "/srv/adapter files",
@@ -148,6 +188,7 @@ describe("configure CLI grammar and acknowledgements", () => {
 				).toThrow("systemd unit values must not contain NUL, CR, or LF");
 			}
 		} finally {
+			globalThis.fetch = originalFetch;
 			t.cleanup();
 		}
 	});
@@ -189,6 +230,63 @@ describe("configure CLI grammar and acknowledgements", () => {
 			});
 		} finally {
 			globalThis.fetch = originalFetch;
+			t.cleanup();
+		}
+	});
+	test("generates the existing-mode systemd unit through production deployment", async () => {
+		const t = tempPath();
+		const originalEnvironment = {
+			HOME: process.env.HOME,
+			XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+			XDG_STATE_HOME: process.env.XDG_STATE_HOME,
+		};
+		const originalFetch = globalThis.fetch;
+		try {
+			process.env.HOME = t.directory;
+			process.env.XDG_CONFIG_HOME = join(t.directory, "xdg-config");
+			process.env.XDG_STATE_HOME = join(t.directory, "xdg-state");
+			globalThis.fetch = (async () => new Response(null, { status: 200 })) as unknown as typeof fetch;
+
+			const result = await runCli(
+				[
+					"configure",
+					"existing",
+					"--config",
+					t.config,
+					"--openwebui-url=http://openwebui.test",
+					"--adapter-ingress-url=http://adapter.test",
+					"--project-root",
+					join(t.directory, "workspace"),
+					`--openwebui-api-token-fd=${secretFd(t.directory, "existing-api-token", "openwebui-api-token")}`,
+				],
+				{
+					systemctl: args =>
+						args[2] === "is-enabled" ? "disabled" : args[2] === "is-active" ? "inactive" : undefined,
+					configureOpenWebUI: async () =>
+						({
+							state: INITIAL_BOOTSTRAP_STATE,
+							apiKey: "openwebui-api-token",
+							openAIConnections: [],
+							ownerUserId: "owner",
+						}) as never,
+				},
+			);
+
+			expect(result).toBe(0);
+			const unit = readFileSync(
+				join(t.directory, "xdg-config", "systemd", "user", "openwebui-gjc-adapter-existing.service"),
+				"utf8",
+			);
+			const sourceRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+			expect(unit).toContain(
+				`ExecStart=${process.execPath} ${join(sourceRoot, "src", "cli.ts")} serve --config ${t.config}`,
+			);
+		} finally {
+			globalThis.fetch = originalFetch;
+			for (const [name, value] of Object.entries(originalEnvironment)) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
 			t.cleanup();
 		}
 	});
