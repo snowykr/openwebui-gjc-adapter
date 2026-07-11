@@ -12,7 +12,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildInstalledAdapterServerOptions, runCli } from "../src/cli";
 import type { AdapterConfig } from "../src/config";
@@ -300,6 +300,64 @@ describe("configure CLI grammar and acknowledgements", () => {
 			expect(unit).toContain(
 				`ExecStart=${process.execPath} ${join(sourceRoot, "src", "cli.ts")} serve --config ${t.config}`,
 			);
+		} finally {
+			globalThis.fetch = originalFetch;
+			for (const [name, value] of Object.entries(originalEnvironment)) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
+			t.cleanup();
+		}
+	});
+	test("resolves a relative config path before rendering existing-mode systemd units", async () => {
+		const t = tempPath();
+		const directory = realpathSync(t.directory);
+		const config = join(directory, "config.json");
+		const configArgument = relative(process.cwd(), config);
+		const originalEnvironment = {
+			HOME: process.env.HOME,
+			XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+			XDG_STATE_HOME: process.env.XDG_STATE_HOME,
+		};
+		const originalFetch = globalThis.fetch;
+		try {
+			process.env.HOME = directory;
+			process.env.XDG_CONFIG_HOME = join(directory, "xdg-config");
+			process.env.XDG_STATE_HOME = join(directory, "xdg-state");
+			globalThis.fetch = (async () => new Response(null, { status: 200 })) as unknown as typeof fetch;
+
+			expect(
+				await runCli(
+					[
+						"configure",
+						"existing",
+						"--config",
+						configArgument,
+						"--openwebui-url=http://openwebui.test",
+						"--adapter-ingress-url=http://adapter.test",
+						"--project-root",
+						join(directory, "workspace"),
+						`--openwebui-api-token-fd=${secretFd(directory, "relative-api-token", "openwebui-api-token")}`,
+					],
+					{
+						systemctl: args =>
+							args[2] === "is-enabled" ? "disabled" : args[2] === "is-active" ? "inactive" : undefined,
+						configureOpenWebUI: async () =>
+							({
+								state: INITIAL_BOOTSTRAP_STATE,
+								apiKey: "openwebui-api-token",
+								openAIConnections: [],
+								ownerUserId: "owner",
+							}) as never,
+					},
+				),
+			).toBe(0);
+			const unit = readFileSync(
+				join(directory, "xdg-config", "systemd", "user", "openwebui-gjc-adapter-existing.service"),
+				"utf8",
+			);
+			expect(unit).toContain(`WorkingDirectory=${dirname(config)}`);
+			expect(unit).toContain(`serve --config ${config}`);
 		} finally {
 			globalThis.fetch = originalFetch;
 			for (const [name, value] of Object.entries(originalEnvironment)) {

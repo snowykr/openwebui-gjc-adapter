@@ -14,7 +14,7 @@ import {
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { ReadStream as TtyReadStream, WriteStream as TtyWriteStream } from "node:tty";
 import { fileURLToPath } from "node:url";
@@ -1053,7 +1053,7 @@ export async function runInstalledCli(
 	try {
 		const command = parseCliArguments(argv);
 		const options = "options" in command ? (command.options ?? {}) : {};
-		const path = optionValue(options, "config") ?? defaultConfigPath();
+		const path = resolve(optionValue(options, "config") ?? defaultConfigPath());
 		if (command.kind === "configure") {
 			const unlock = acquireConfigLock(path);
 			let unlockRoute: (() => void) | undefined;
