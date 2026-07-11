@@ -185,6 +185,44 @@ describe("OpenWebUI v0.10 setup contract", () => {
 		expect(signupCalls).toBe(1);
 		expect(apiKeyAuthorizations).toEqual(["session", "session"]);
 	});
+	test("recovers a signup that completed before its session checkpoint was persisted", async () => {
+		const t = setup();
+		let persisted = INITIAL_BOOTSTRAP_STATE;
+		let checkpointAttempts = 0;
+		t.input.state = {
+			read: async () => persisted,
+			write: async next => {
+				if (checkpointAttempts++ === 0) throw new Error("simulated process termination before checkpoint");
+				persisted = { ...persisted, ...next };
+			},
+		};
+		const original = t.input.http.request;
+		let signupCalls = 0;
+		const apiKeyAuthorizations: string[] = [];
+		t.input.http.request = async <_T>(method: string, path: string, body?: unknown, authorization?: string) => {
+			if (path === "/api/v1/auths/signup") {
+				signupCalls++;
+				if (signupCalls === 2) throw new Error("administrator account already exists");
+			}
+			if (path === "/api/v1/auths/signin") {
+				t.calls.push([method, path, body, authorization]);
+				return { token: "recovered-session" } as _T;
+			}
+			if (path === "/api/v1/auths/api_key") apiKeyAuthorizations.push(authorization ?? "");
+			return original(method, path, body, authorization);
+		};
+
+		await expect(configureOpenWebUI(t.input)).rejects.toThrow("simulated process termination before checkpoint");
+		expect(persisted.openWebUIApiToken).toBeUndefined();
+
+		const result = await configureOpenWebUI(t.input);
+		expect(result.apiKey).toBe("key");
+		expect(signupCalls).toBe(2);
+		expect(t.calls.filter(call => call[1] === "/api/v1/auths/signin")).toHaveLength(1);
+		expect(apiKeyAuthorizations).toEqual(["recovered-session"]);
+		expect(persisted.openWebUIApiToken).toBe("key");
+		expect(JSON.stringify(persisted)).not.toContain("password");
+	});
 	test("recovers controller bootstrap completion with no API key by signing up once", async () => {
 		const t = setup();
 		let persisted: BootstrapState = { ...INITIAL_BOOTSTRAP_STATE, phase: "bootstrap", bootstrapComplete: true };

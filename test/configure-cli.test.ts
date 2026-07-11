@@ -208,12 +208,13 @@ describe("configure CLI grammar and acknowledgements", () => {
 			t.cleanup();
 		}
 	});
-	test("builds installed server options with readiness-gated runtime credentials", async () => {
+	test("builds installed server options without contacting a temporarily unavailable OpenWebUI", async () => {
 		const t = tempPath();
 		const originalFetch = globalThis.fetch;
 		try {
-			globalThis.fetch = (async () =>
-				new Response(JSON.stringify({ items: [] }), { status: 200 })) as unknown as typeof fetch;
+			globalThis.fetch = (async () => {
+				throw new Error("OpenWebUI is still starting");
+			}) as unknown as typeof fetch;
 			const options = await buildInstalledAdapterServerOptions({
 				bindHost: "127.0.0.1",
 				bindPort: 8765,
@@ -231,7 +232,7 @@ describe("configure CLI grammar and acknowledgements", () => {
 				allowedProjectRoots: [t.directory],
 				projects: [],
 			} satisfies AdapterConfig);
-			expect(options.runtime).toEqual({
+			expect(options.runtime).toMatchObject({
 				adapterToken: "adapter-token",
 				readinessToken: "readiness-token",
 				readiness: {
@@ -244,6 +245,7 @@ describe("configure CLI grammar and acknowledgements", () => {
 				openWebUIBaseUrl: "http://openwebui.test",
 				openWebUIApiToken: "openwebui-api-token",
 			});
+			expect(options.runtime?.initialize).toBeFunction();
 		} finally {
 			globalThis.fetch = originalFetch;
 			t.cleanup();
@@ -431,6 +433,63 @@ describe("configure CLI grammar and acknowledgements", () => {
 				if (value === undefined) delete process.env[name];
 				else process.env[name] = value;
 			}
+			t.cleanup();
+		}
+	});
+	test("does not journal a fresh existing installation until its OpenWebUI target validates", async () => {
+		const t = tempPath();
+		const projectRoot = join(t.directory, "workspace");
+		try {
+			expect(
+				await runCli(
+					[
+						"configure",
+						"existing",
+						"--config",
+						t.config,
+						"--openwebui-url=http://unreachable.test",
+						"--adapter-ingress-url=http://gateway.test",
+						"--project-root",
+						projectRoot,
+						`--openwebui-api-token-fd=${secretFd(t.directory, "invalid-existing-token", "api-token")}`,
+					],
+					{
+						configureOpenWebUI: async () => {
+							throw new Error("OpenWebUI target is unreachable");
+						},
+						systemctl: args =>
+							args[2] === "is-enabled" ? "disabled" : args[2] === "is-active" ? "inactive" : "",
+					},
+				),
+			).toBe(1);
+			expect(existsSync(t.config)).toBe(false);
+			expect(existsSync(`${t.config}.bootstrap.json`)).toBe(false);
+			expect(existsSync(`${t.config}.recovery.json`)).toBe(false);
+			expect(existsSync(projectRoot)).toBe(false);
+
+			expect(
+				await runCli(
+					[
+						"configure",
+						"existing",
+						"--config",
+						t.config,
+						"--openwebui-url=http://corrected.test",
+						"--adapter-ingress-url=http://gateway.test",
+						"--project-root",
+						projectRoot,
+						`--openwebui-api-token-fd=${secretFd(t.directory, "corrected-existing-token", "api-token")}`,
+					],
+					{
+						deployment: {
+							managed: async () => ({ completed: true as const, mode: "managed" as const }),
+							existing: async () => ({ completed: true as const, mode: "existing" as const }),
+							reset: async () => ({ completed: true as const, mode: "reset" as const }),
+						},
+					},
+				),
+			).toBe(0);
+		} finally {
 			t.cleanup();
 		}
 	});
@@ -1761,6 +1820,71 @@ describe("configure CLI grammar and acknowledgements", () => {
 					"systemctl --user start openwebui-gjc-adapter-existing.service",
 				]),
 			);
+		} finally {
+			t.cleanup();
+		}
+	});
+	test("keeps the restored bootstrap state when a replacement deployment rolls back", async () => {
+		const t = tempPath();
+		const projectRoot = join(t.directory, "workspace");
+		const originalBootstrap = JSON.stringify({
+			...INITIAL_BOOTSTRAP_STATE,
+			phase: "complete",
+			bootstrapComplete: true,
+			apiKeyCreated: true,
+			openAIConfigured: true,
+			routeVerified: true,
+			ownershipVerified: true,
+			ownerUserId: "managed-owner",
+			openWebUIApiToken: "managed-api-token",
+			openAIConnectionIds: ["0"],
+		});
+		try {
+			writeInstalledConfig(
+				{
+					version: 1,
+					mode: "managed",
+					installationId: "installed-managed",
+					adapterToken: "adapter-token",
+					readinessToken: "readiness-token",
+					openWebUIApiToken: "managed-api-token",
+					openWebUIApiUrl: "http://localhost:8080",
+					adapterProviderUrl: "http://adapter:8765/v1",
+					bindHost: "0.0.0.0",
+					bindPort: 8765,
+				},
+				t.config,
+			);
+			writeFileSync(`${t.config}.bootstrap.json`, originalBootstrap);
+			chmodSync(`${t.config}.bootstrap.json`, 0o600);
+
+			expect(
+				await runCli(
+					[
+						"configure",
+						"existing",
+						"--config",
+						t.config,
+						"--openwebui-url=http://replacement.test",
+						"--adapter-ingress-url=http://gateway.test",
+						"--project-root",
+						projectRoot,
+						"--reset",
+						"--reset-proof=route-change",
+						`--openwebui-api-token-fd=${secretFd(t.directory, "replacement-token", "api-token")}`,
+					],
+					{
+						confirmReset: () => true,
+						systemctl: args =>
+							args[2] === "is-enabled" ? "disabled" : args[2] === "is-active" ? "inactive" : "",
+						configureOpenWebUI: async () => {
+							throw new Error("replacement setup failed");
+						},
+					},
+				),
+			).toBe(1);
+			expect(JSON.parse(readFileSync(`${t.config}.bootstrap.json`, "utf8"))).toEqual(JSON.parse(originalBootstrap));
+			expect(existsSync(`${t.config}.recovery.json`)).toBe(false);
 		} finally {
 			t.cleanup();
 		}

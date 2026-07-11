@@ -70,7 +70,15 @@ export interface DeploymentLifecycle {
 		uiPort: number;
 		recovery?: { readonly controllerRecoveryRequired: boolean; readonly controllerQuiesced?: boolean };
 	}): Promise<DeploymentResult> | DeploymentResult;
-	existing(input: { config: InstalledConfig }): Promise<DeploymentResult> | DeploymentResult;
+	existing(input: {
+		config: InstalledConfig;
+		validation?: { readonly apiKey: string; readonly ownerUserId: string };
+	}): Promise<DeploymentResult> | DeploymentResult;
+	validateExisting?(input: {
+		config: InstalledConfig;
+	}):
+		| Promise<{ readonly apiKey: string; readonly ownerUserId: string }>
+		| { readonly apiKey: string; readonly ownerUserId: string };
 	reset(input: ResetRequest): Promise<DeploymentResult> | DeploymentResult;
 }
 export interface CliDependencies {
@@ -608,28 +616,14 @@ function productionDeployment(
 		password: string,
 		uiPort: number,
 		recovery?: { readonly controllerRecoveryRequired: boolean; readonly controllerQuiesced?: boolean },
+		validation?: { readonly apiKey: string; readonly ownerUserId: string },
 	) => {
 		const client = http(config);
 		if (config.mode === "managed") {
 			installFiles(config, uiPort);
 		}
 		if (config.mode === "existing") {
-			const setup = await setupOpenWebUI({
-				http: client,
-				state,
-				writeCheckpoints: false,
-				maintenance: { begin: async () => {}, end: async () => {} },
-				adapterUrl: config.adapterProviderUrl,
-				adapterToken: config.adapterToken,
-				adminEmail: "",
-				adminPassword: "",
-				installationId: config.installationId,
-				openWebUIApiToken: config.openWebUIApiToken,
-				mode: "existing",
-			});
-			if (config.ownerUserId !== undefined && config.ownerUserId !== setup.ownerUserId) {
-				throw new Error("OpenWebUI API token belongs to a different owner");
-			}
+			const setup = validation ?? (await validateExisting(config));
 			config.ownerUserId = setup.ownerUserId;
 			config.openWebUIApiToken = setup.apiKey;
 			writeInstalledConfig(config, path);
@@ -790,6 +784,7 @@ function productionDeployment(
 		if (!tx) return [];
 		const errors: Error[] = [];
 		const checkpoint = await state.read();
+		const pendingBeforeRollback = tx.previous ? readPendingRecoveryJournal(path) : undefined;
 		const bootstrapPath = `${path}.bootstrap.json`;
 		const bootstrapBeforeRollback = existsSync(bootstrapPath) ? readFileSync(bootstrapPath) : undefined;
 		const attempt = (action: () => void) => {
@@ -813,7 +808,7 @@ function productionDeployment(
 				errors.push(error instanceof Error ? error : new Error(String(error)));
 			}
 		}
-		if (bootstrapBeforeRollback !== undefined)
+		if (bootstrapBeforeRollback !== undefined && !tx.previous)
 			attempt(() => writeFileSync(bootstrapPath, bootstrapBeforeRollback, { mode: 0o600 }));
 		attempt(() => run(["systemctl", "--user", "daemon-reload"]));
 		const unit = routeControllerUnitName(tx.priorMode);
@@ -821,7 +816,7 @@ function productionDeployment(
 		if (tx.controllers.active) attempt(() => run(["systemctl", "--user", "start", unit]));
 		if (errors.length === 0 && tx.previous) {
 			attempt(() => {
-				const pending = readPendingRecoveryJournal(path);
+				const pending = pendingBeforeRollback;
 				if (pending === undefined) throw new Error("rollback recovery journal is missing");
 				markDurableDeploymentSnapshotComplete(path, pending.transactionId);
 				clearPendingRecoveryJournal(path);
@@ -850,7 +845,26 @@ function productionDeployment(
 		rmSync(join(userUnitDirectory, `${routeControllerUnitName(priorMode)}`), { force: true });
 		if (priorMode === "managed") rmSync(composeFile, { force: true });
 	};
+	const validateExisting = async (config: InstalledConfig) => {
+		const setup = await setupOpenWebUI({
+			http: http(config),
+			state,
+			writeCheckpoints: false,
+			maintenance: { begin: async () => {}, end: async () => {} },
+			adapterUrl: config.adapterProviderUrl,
+			adapterToken: config.adapterToken,
+			adminEmail: "",
+			adminPassword: "",
+			installationId: config.installationId,
+			openWebUIApiToken: config.openWebUIApiToken,
+			mode: "existing",
+		});
+		if (config.ownerUserId !== undefined && config.ownerUserId !== setup.ownerUserId)
+			throw new Error("OpenWebUI API token belongs to a different owner");
+		return { apiKey: setup.apiKey, ownerUserId: setup.ownerUserId };
+	};
 	return {
+		validateExisting: async input => validateExisting(input.config),
 		managed: async input => {
 			const pending = readPendingRecoveryJournal(path);
 			const priorMode = pending?.priorMode ?? "managed";
@@ -907,7 +921,7 @@ function productionDeployment(
 				priorControllerActive: tx.controllers.active,
 			});
 			try {
-				await runDeployment(input.config, "", "", 8080);
+				await runDeployment(input.config, "", "", 8080, undefined, input.validation);
 				retirePriorMode(tx.priorMode, "existing");
 				transaction = undefined;
 			} catch (error) {
@@ -1406,6 +1420,10 @@ async function configure(
 		bindPort,
 		projectRoot,
 	};
+	const existingValidation =
+		mode === "existing" && previous === undefined && pending === undefined && options.reset !== true
+			? await deployment.validateExisting?.({ config })
+			: undefined;
 	const pendingRecovery: PendingRecoveryRecord = pending ?? {
 		version: 1,
 		mode,
@@ -1484,7 +1502,10 @@ async function configure(
 		result =
 			mode === "managed"
 				? await deployment.managed({ config, adminEmail, adminPassword, uiPort, recovery })
-				: await deployment.existing({ config });
+				: await deployment.existing({
+						config,
+						...(existingValidation === undefined ? {} : { validation: existingValidation }),
+					});
 	} catch (error) {
 		if (previous) writeInstalledConfig(previous, path);
 		else rmSync(path, { force: true });

@@ -53,6 +53,7 @@ export interface AdapterRuntimeConfig {
 	readonly openWebUIBaseUrl?: string;
 	/** Persisted OpenWebUI API token; never included in responses or diagnostics. */
 	readonly openWebUIApiToken?: string;
+	readonly initialize?: () => Promise<void>;
 }
 
 export interface AdapterRouteDependencies {
@@ -129,7 +130,18 @@ export async function initializeRuntimeReadiness(runtime: AdapterRuntimeConfig):
 	};
 	for (let attempt = 0; attempt < 3; attempt += 1) {
 		result = await initializeRuntimeReadinessAttempt(baseUrl, runtime.openWebUIApiToken, result);
-		if (result.openWebUIAuthenticated && result.promptHintsSeeded) return result;
+		if (result.openWebUIAuthenticated && result.promptHintsSeeded) {
+			try {
+				await runtime.initialize?.();
+				return result;
+			} catch {
+				result = {
+					...result,
+					promptHintsSeeded: false,
+					reason: "OpenWebUI runtime initialization is pending",
+				};
+			}
+		}
 		if (attempt < 2) await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 100 : 250));
 	}
 	return result;

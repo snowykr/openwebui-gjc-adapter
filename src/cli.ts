@@ -39,6 +39,9 @@ export interface BuildAdapterServerOptionsDependencies {
 	readonly projectionRepository?: OpenWebUIProjectionRepository;
 	readonly projectRegistrationStore?: SqliteProjectRegistrationStore;
 }
+interface BuildAdapterServerOptionsBehavior {
+	readonly deferOpenWebUIInitialization?: boolean;
+}
 
 export async function buildAdapterServerOptionsFromEnv(
 	env: Record<string, string | undefined> = process.env,
@@ -50,6 +53,7 @@ export async function buildAdapterServerOptionsFromEnv(
 export async function buildAdapterServerOptions(
 	config: AdapterConfig,
 	dependencies: BuildAdapterServerOptionsDependencies = {},
+	behavior: BuildAdapterServerOptionsBehavior = {},
 ): Promise<AdapterServerOptions> {
 	const allowedRoots = await resolveAllowedRoots(config.allowedProjectRoots);
 	const projects = await loadConfiguredProjects(config, allowedRoots);
@@ -63,7 +67,7 @@ export async function buildAdapterServerOptions(
 	const mappings = dependencies.mappings ?? new FileBackedSessionMappingStore(buildSessionMappingStorePath(config));
 	const openWebUIClient = buildOpenWebUIClient(config);
 	const promptHintClient = buildOpenWebUIPromptHintClient(config);
-	if (promptHintClient !== undefined) {
+	if (promptHintClient !== undefined && !behavior.deferOpenWebUIInitialization) {
 		await promptHintClient.seedGjcPromptHints();
 	}
 	const projectionRepository = dependencies.projectionRepository ?? openWebUIClient;
@@ -79,7 +83,7 @@ export async function buildAdapterServerOptions(
 	});
 	const previouslyLinkedProjectIds = new Set(projectLinkService.listLinkedProjects().map(project => project.id));
 	projectLinkService.seedConfiguredProjects(projects);
-	if (projectionRepository !== undefined) {
+	if (projectionRepository !== undefined && !behavior.deferOpenWebUIInitialization) {
 		await projectLinkService.reconcileOpenWebUIFolderLinks({ projectIds: previouslyLinkedProjectIds });
 		await projectLinkService.syncLinkedProjects();
 	}
@@ -110,10 +114,12 @@ export async function buildAdapterServerOptions(
 }
 
 export async function buildInstalledAdapterServerOptions(config: AdapterConfig): Promise<AdapterServerOptions> {
-	const options = await buildAdapterServerOptions(config);
+	const options = await buildAdapterServerOptions(config, {}, { deferOpenWebUIInitialization: true });
 	if (config.adapterToken === undefined || config.readinessToken === undefined || config.mode === undefined) {
 		throw new Error("installed adapter configuration is missing runtime credentials or mode");
 	}
+	const promptHintClient = buildOpenWebUIPromptHintClient(config);
+	const projectLinkService = options.routes?.projectLinkService;
 	return {
 		...options,
 		runtime: {
@@ -128,6 +134,16 @@ export async function buildInstalledAdapterServerOptions(config: AdapterConfig):
 			},
 			openWebUIBaseUrl: config.openWebUIBaseUrl,
 			openWebUIApiToken: config.openWebUIApiToken,
+			initialize: async () => {
+				if (promptHintClient !== undefined) await promptHintClient.seedGjcPromptHints();
+				if (projectLinkService !== undefined) {
+					const previouslyLinkedProjectIds = new Set(
+						projectLinkService.listLinkedProjects().map(project => project.id),
+					);
+					await projectLinkService.reconcileOpenWebUIFolderLinks({ projectIds: previouslyLinkedProjectIds });
+					await projectLinkService.syncLinkedProjects();
+				}
+			},
 		},
 	};
 }

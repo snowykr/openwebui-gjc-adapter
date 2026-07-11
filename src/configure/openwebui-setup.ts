@@ -19,6 +19,10 @@ export interface SignupRequest {
 	readonly name: string;
 	readonly profile_image_url: string;
 }
+export interface SigninRequest {
+	readonly email: string;
+	readonly password: string;
+}
 export interface AuthUser {
 	readonly id: string;
 	readonly email?: string;
@@ -121,14 +125,24 @@ export async function configureOpenWebUI(input: OpenWebUISetupInput): Promise<Op
 		if (!input.installationId.trim()) throw new Error("installationId must be non-empty");
 		let apiKey = state.apiKeyCreated ? (state.openWebUIApiToken ?? input.openWebUIApiToken) : undefined;
 		let sessionToken = !state.apiKeyCreated ? state.openWebUIApiToken : undefined;
+		let recoveredSession = false;
 		if (!state.apiKeyCreated) {
 			if (!sessionToken?.trim()) {
-				const session = await input.http.request<SessionResponse>("POST", "/api/v1/auths/signup", {
-					email: input.adminEmail,
-					password: input.adminPassword,
-					name: input.adminEmail,
-					profile_image_url: "",
-				} satisfies SignupRequest);
+				let session: SessionResponse;
+				try {
+					session = await input.http.request<SessionResponse>("POST", "/api/v1/auths/signup", {
+						email: input.adminEmail,
+						password: input.adminPassword,
+						name: input.adminEmail,
+						profile_image_url: "",
+					} satisfies SignupRequest);
+				} catch {
+					recoveredSession = true;
+					session = await input.http.request<SessionResponse>("POST", "/api/v1/auths/signin", {
+						email: input.adminEmail,
+						password: input.adminPassword,
+					} satisfies SigninRequest);
+				}
 				sessionToken = session?.token ?? session?.access_token;
 				if (!sessionToken?.trim()) throw new Error("OpenWebUI signup did not return a session token");
 				// Keep only the short-lived session credential so an interrupted key
@@ -150,8 +164,11 @@ export async function configureOpenWebUI(input: OpenWebUISetupInput): Promise<Op
 		}
 		if (!apiKey?.trim()) throw new Error("managed mode requires an authenticated API key");
 		const authUser = await input.http.request<AuthUser | AuthUser[]>("GET", "/api/v1/auths/", undefined, apiKey);
-		const ownerUserId = (Array.isArray(authUser) ? authUser[0]?.id : authUser?.id)?.trim();
+		const authenticatedUser = Array.isArray(authUser) ? authUser[0] : authUser;
+		const ownerUserId = authenticatedUser?.id?.trim();
 		if (!ownerUserId) throw new Error("OpenWebUI did not return the authenticated owner user ID");
+		if (recoveredSession && authenticatedUser?.role?.toLowerCase() !== "admin")
+			throw new Error("managed signup recovery requires an OpenWebUI administrator account");
 		const apiKeyPhase = state.apiKeyCreated ? state.phase : "api-key";
 		state = advanceBootstrapState(state, apiKeyPhase, {
 			bootstrapComplete: true,
