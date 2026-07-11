@@ -458,8 +458,12 @@ function markDurableDeploymentSnapshotComplete(path: string, transactionId: stri
 function managedDockerRunner(managedDocker?: CommandRunner): CommandRunner {
 	return (
 		managedDocker ?? {
-			run: async (command: string, args: readonly string[]) => {
+			run: async (command: string, args: readonly string[], options) => {
 				try {
+					if (options?.output === "inherit") {
+						execFileSync(command, [...args], { stdio: ["ignore", "inherit", "inherit"] });
+						return { exitCode: 0, stdout: "", stderr: "" };
+					}
 					const stdout = execFileSync(command, [...args], { stdio: ["ignore", "pipe", "pipe"] }).toString();
 					return { exitCode: 0, stdout, stderr: "" };
 				} catch (error) {
@@ -677,7 +681,7 @@ function productionDeployment(
 				preflight: async () => {
 					const image = process.env.GJC_ADAPTER_IMAGE ?? "openwebui-gjc-adapter:local";
 					const plan = managedAdapterImagePlan(image, join(packageRoot, "Dockerfile.adapter"), packageRoot);
-					const result = await docker.run(plan.build[0], plan.build[1]);
+					const result = await docker.run(plan.build[0], plan.build[1], { output: "inherit" });
 					if (result.exitCode !== 0)
 						throw new Error(`docker build failed${result.stderr ? `: ${result.stderr.trim()}` : ""}`);
 				},

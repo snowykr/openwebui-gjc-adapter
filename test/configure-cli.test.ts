@@ -369,7 +369,11 @@ describe("configure CLI grammar and acknowledgements", () => {
 	});
 	test("builds the managed adapter from the package root", async () => {
 		const t = tempPath();
-		const calls: Array<{ command: string; args: readonly string[] }> = [];
+		const calls: Array<{
+			command: string;
+			args: readonly string[];
+			options?: { readonly output?: "inherit" };
+		}> = [];
 		try {
 			const result = await runCli(
 				[
@@ -382,8 +386,8 @@ describe("configure CLI grammar and acknowledgements", () => {
 				],
 				{
 					managedDocker: {
-						run: async (command, args) => {
-							calls.push({ command, args });
+						run: async (command, args, options?) => {
+							calls.push({ command, args, options });
 							return {
 								exitCode: 0,
 								stdout: args.includes("ps") ? "openwebui\n" : '[] "/var/lib/docker"',
@@ -433,6 +437,7 @@ describe("configure CLI grammar and acknowledgements", () => {
 				"openwebui-gjc-adapter:local",
 				packageRoot,
 			]);
+			expect(build?.options).toEqual({ output: "inherit" });
 		} finally {
 			t.cleanup();
 		}

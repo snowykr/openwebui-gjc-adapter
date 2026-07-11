@@ -3,8 +3,11 @@ export interface CommandResult {
 	readonly stdout: string;
 	readonly stderr: string;
 }
+export interface CommandRunOptions {
+	readonly output?: "inherit";
+}
 export interface CommandRunner {
-	run(command: string, args: readonly string[]): Promise<CommandResult>;
+	run(command: string, args: readonly string[], options?: CommandRunOptions): Promise<CommandResult>;
 }
 export interface ManagedComposeCheckInput {
 	readonly docker?: CommandRunner;
