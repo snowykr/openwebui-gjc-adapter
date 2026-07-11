@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildStartupDiagnostics, loadAdapterConfig, loadInstalledAdapterConfig } from "../src/config";
@@ -121,7 +121,7 @@ describe("adapter config contracts", () => {
 		);
 	});
 	test("uses container runtime paths only for managed installed configurations", () => {
-		const directory = mkdtempSync(join(tmpdir(), "gjc-installed-config-"));
+		const directory = realpathSync(mkdtempSync(join(tmpdir(), "gjc-installed-config-")));
 		const file = join(directory, "config.json");
 		const base: InstalledConfig = {
 			version: 1,
@@ -143,12 +143,13 @@ describe("adapter config contracts", () => {
 				adapterApiToken: "adapter",
 				gjcCommand: "gjc",
 			});
-			writeInstalledConfig({ ...base, mode: "existing", bindHost: "127.0.0.1" }, file);
+			writeInstalledConfig({ ...base, mode: "existing", bindHost: "127.0.0.1", ownerUserId: "owner-test" }, file);
 			const existing = loadInstalledAdapterConfig(file);
 			expect(existing.statePath).toBe(".gjc/openwebui-adapter");
 			expect(existing.sessionRoot).toBe(join(DEFAULT_EXISTING_PROJECT_ROOT, ".gjc", "sessions"));
 			expect(existing.allowedProjectRoots).toEqual([DEFAULT_EXISTING_PROJECT_ROOT]);
 			expect(existing.gjcCommand).toBe("gjc");
+			expect(existing.ownerUserId).toBe("owner-test");
 		} finally {
 			rmSync(directory, { recursive: true, force: true });
 		}

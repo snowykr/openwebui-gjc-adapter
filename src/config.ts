@@ -255,6 +255,7 @@ export function loadInstalledAdapterConfig(path?: string): AdapterConfig {
 		readinessToken: installed.readinessToken,
 		mode: installed.mode,
 		installationId: installed.installationId,
+		ownerUserId: installed.ownerUserId,
 		statePath: managed ? "/var/lib/gjc" : ".gjc/openwebui-adapter",
 		gjcCommand: "gjc",
 		turnTimeoutMs: DEFAULT_TURN_TIMEOUT_MS,
