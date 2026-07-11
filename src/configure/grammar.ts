@@ -90,6 +90,8 @@ export function parseCliArguments(argv: readonly string[]): CliCommand {
 		(options["openwebui-api-token-fd"] !== undefined || options["adapter-ingress-url"] !== undefined)
 	)
 		throw new CliUsageError("managed configuration does not accept existing-route credentials");
+	if (mode === "managed" && options["openwebui-url"] !== undefined)
+		throw new CliUsageError("managed configuration does not accept openwebui-url");
 	if (mode === "managed" && options["bind-port"] !== undefined)
 		throw new CliUsageError("managed configuration does not accept bind-port customization");
 	if (mode === "existing" && (options["admin-email-fd"] !== undefined || options["admin-password-fd"] !== undefined))

@@ -555,6 +555,9 @@ function productionDeployment(
 		writeFileSync(`${directory}/adapter-token`, `${config.adapterToken}\n`, { mode: 0o600 });
 		chmodSync(`${directory}/adapter-token`, 0o600);
 		if (config.mode === "managed") {
+			const dockerBinary = Bun.which("docker", { PATH: process.env.PATH });
+			if (!dockerBinary && managedDocker === undefined)
+				throw new Error("Docker executable is not available on PATH");
 			const adapterImage = process.env.GJC_ADAPTER_IMAGE ?? "openwebui-gjc-adapter:local";
 			for (const runtimePath of ["state", "session", "workspace"])
 				mkdirSync(join(directory, runtimePath), { recursive: true, mode: 0o700 });
@@ -571,7 +574,12 @@ function productionDeployment(
 			writeFileSync(composeFile, compose, { mode: 0o600 });
 			writeFileSync(
 				unitFile,
-				renderSystemdComposeUnit({ workingDirectory: directory, composeFile, name: "openwebui-gjc-adapter" }),
+				renderSystemdComposeUnit({
+					workingDirectory: directory,
+					composeFile,
+					name: "openwebui-gjc-adapter",
+					dockerBinary: dockerBinary ?? "docker",
+				}),
 				{ mode: 0o600 },
 			);
 			mkdirSync(userUnitDirectory, { recursive: true, mode: 0o700 });

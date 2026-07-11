@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+	chmodSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -99,6 +100,11 @@ describe("configure CLI grammar and acknowledgements", () => {
 			options: { "admin-email-fd": "3", "admin-password-fd": "4" },
 		});
 		expect(() => parseCliArguments(["configure", "managed", "--admin-email-fd"])).toThrow(CliUsageError);
+	});
+	test("rejects managed OpenWebUI URL overrides because managed runtime uses its Compose peer", () => {
+		expect(() => parseCliArguments(["configure", "managed", "--openwebui-url=https://other.example"])).toThrow(
+			"managed configuration does not accept openwebui-url",
+		);
 	});
 	test("rejects bind-host customization because ingress remains mode-controlled", async () => {
 		const error = sink();
@@ -366,6 +372,68 @@ describe("configure CLI grammar and acknowledgements", () => {
 			t.cleanup();
 		}
 	});
+	test("writes the Docker executable resolved during managed installation into the systemd unit", async () => {
+		const t = tempPath();
+		const originalEnvironment = {
+			HOME: process.env.HOME,
+			XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+			PATH: process.env.PATH,
+		};
+		try {
+			const dockerDirectory = join(t.directory, "docker-bin");
+			const dockerBinary = join(dockerDirectory, "docker");
+			mkdirSync(dockerDirectory);
+			writeFileSync(dockerBinary, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+			chmodSync(dockerBinary, 0o700);
+			process.env.HOME = t.directory;
+			process.env.XDG_CONFIG_HOME = join(t.directory, "xdg-config");
+			process.env.PATH = dockerDirectory;
+
+			const result = await runCli(
+				[
+					"configure",
+					"managed",
+					"--config",
+					t.config,
+					`--admin-email-fd=${secretFd(t.directory, "docker-email", "admin@example.test")}`,
+					`--admin-password-fd=${secretFd(t.directory, "docker-password", "password")}`,
+				],
+				{
+					managedDocker: { run: async () => ({ exitCode: 0, stdout: '[] "/var/lib/docker"', stderr: "" }) },
+					systemctl: args =>
+						args[2] === "is-enabled" ? "disabled" : args[2] === "is-active" ? "inactive" : undefined,
+					probeManagedAdapter: () => {},
+					configureOpenWebUI: async () =>
+						({
+							state: {
+								...INITIAL_BOOTSTRAP_STATE,
+								phase: "openai",
+								bootstrapComplete: true,
+								apiKeyCreated: true,
+								openAIConfigured: true,
+								openAIConnectionIds: ["0"],
+								ownerUserId: "owner",
+								openWebUIApiToken: "api-token",
+							},
+							apiKey: "api-token",
+							openAIConnections: [],
+							ownerUserId: "owner",
+						}) as never,
+				},
+			);
+
+			expect(result).toBe(0);
+			expect(
+				readFileSync(join(t.directory, "xdg-config", "systemd", "user", "openwebui-gjc-adapter.service"), "utf8"),
+			).toContain(`ExecStart=${dockerBinary} compose`);
+		} finally {
+			for (const [name, value] of Object.entries(originalEnvironment)) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
+			t.cleanup();
+		}
+	});
 
 	test("configures managed route and preserves token on same-mode rerun", async () => {
 		const t = tempPath();
@@ -445,12 +513,12 @@ describe("configure CLI grammar and acknowledgements", () => {
 				await runCli(
 					[
 						"configure",
-						"managed",
+						"existing",
 						"--config",
 						t.config,
 						"--openwebui-url=http://one.test",
-						`--admin-email-fd=${secretFd(t.directory, "email-url-1", "admin@example.test")}`,
-						`--admin-password-fd=${secretFd(t.directory, "password-url-1", "password")}`,
+						"--adapter-ingress-url=http://adapter.test",
+						`--openwebui-api-token-fd=${secretFd(t.directory, "api-url-1", "api-token")}`,
 					],
 					dependencies,
 				),
@@ -459,12 +527,12 @@ describe("configure CLI grammar and acknowledgements", () => {
 				await runCli(
 					[
 						"configure",
-						"managed",
+						"existing",
 						"--config",
 						t.config,
 						"--openwebui-url=http://two.test",
-						`--admin-email-fd=${secretFd(t.directory, "email-url-2", "admin@example.test")}`,
-						`--admin-password-fd=${secretFd(t.directory, "password-url-2", "password")}`,
+						"--adapter-ingress-url=http://adapter.test",
+						`--openwebui-api-token-fd=${secretFd(t.directory, "api-url-2", "api-token")}`,
 					],
 					dependencies,
 				),
@@ -1267,7 +1335,6 @@ describe("configure CLI grammar and acknowledgements", () => {
 					"managed",
 					"--config",
 					t.config,
-					"--openwebui-url=http://one.test",
 					`--admin-email-fd=${secretFd(t.directory, "cross-email-1", "admin@example.test")}`,
 					`--admin-password-fd=${secretFd(t.directory, "cross-password-1", "password")}`,
 				],
@@ -1300,7 +1367,7 @@ describe("configure CLI grammar and acknowledgements", () => {
 					t.config,
 					"--reset",
 					"--reset-proof=route-change",
-					"--openwebui-url=http://one.test",
+					"--openwebui-url=http://localhost:8080",
 					"--adapter-ingress-url=http://gateway.test",
 					`--openwebui-api-token-fd=${secretFd(t.directory, "cross-api-1", "token-1")}`,
 				],
@@ -1319,7 +1386,7 @@ describe("configure CLI grammar and acknowledgements", () => {
 						"existing",
 						"--config",
 						t.config,
-						"--openwebui-url=http://one.test",
+						"--openwebui-url=http://localhost:8080",
 						"--adapter-ingress-url=http://gateway.test",
 						`--openwebui-api-token-fd=${secretFd(t.directory, "cross-api-2", "token-2")}`,
 					],
