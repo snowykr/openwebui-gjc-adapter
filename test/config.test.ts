@@ -120,7 +120,7 @@ describe("adapter config contracts", () => {
 			"GJC_OPENWEBUI_ADAPTER_API_TOKEN is not set; inbound OpenAI-compatible calls are not authenticated.",
 		);
 	});
-	test("uses container runtime paths only for managed installed configurations", () => {
+	test("keeps the managed installed session root within allowed roots", () => {
 		const directory = realpathSync(mkdtempSync(join(tmpdir(), "gjc-installed-config-")));
 		const file = join(directory, "config.json");
 		const base: InstalledConfig = {
@@ -139,7 +139,7 @@ describe("adapter config contracts", () => {
 			expect(loadInstalledAdapterConfig(file)).toMatchObject({
 				statePath: "/var/lib/gjc",
 				sessionRoot: "/run/gjc-session",
-				allowedProjectRoots: ["/workspace"],
+				allowedProjectRoots: ["/workspace", "/run/gjc-session"],
 				adapterApiToken: "adapter",
 				gjcCommand: "gjc",
 			});

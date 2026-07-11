@@ -260,7 +260,7 @@ export function loadInstalledAdapterConfig(path?: string): AdapterConfig {
 		gjcCommand: "gjc",
 		turnTimeoutMs: DEFAULT_TURN_TIMEOUT_MS,
 		sessionRoot: managed ? "/run/gjc-session" : `${projectRoot}/.gjc/sessions`,
-		allowedProjectRoots: [projectRoot],
+		allowedProjectRoots: managed ? [projectRoot, "/run/gjc-session"] : [projectRoot],
 		projects: [
 			{
 				cwd: projectRoot,
