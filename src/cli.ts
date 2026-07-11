@@ -19,6 +19,17 @@ import { type AllowedRoot, resolveAllowedRoots } from "./security/paths";
 import { type AdapterServerHandle, type AdapterServerOptions, startAdapterServer } from "./server";
 
 const SESSION_MAPPING_STORE_FILE = "openwebui-session-mappings.json";
+const TOP_LEVEL_USAGE = `Usage: openwebui-gjc-adapter [command]
+
+Without a command, starts the adapter service from environment configuration.
+
+Commands:
+  configure managed   Configure a managed local OpenWebUI installation
+  configure existing  Configure an adapter for an existing OpenWebUI installation
+  serve --config PATH Start an installed adapter service
+  probe-ready         Check an installed adapter service readiness
+  credentials show adapter-token  Display an installed adapter token
+`;
 
 export interface BuildAdapterServerOptionsDependencies {
 	readonly turnRunner?: GjcTurnRunner;
@@ -239,6 +250,10 @@ export async function runCli(
 	argv: readonly string[] = process.argv.slice(2),
 	dependencies: RunCliDependencies = {},
 ): Promise<number> {
+	if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h")) {
+		(dependencies.stdout ?? process.stdout).write(TOP_LEVEL_USAGE);
+		return 0;
+	}
 	if (isInstalledCommand(argv)) {
 		return runInstalledCli(argv, {
 			...dependencies,

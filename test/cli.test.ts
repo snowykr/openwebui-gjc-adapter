@@ -42,6 +42,26 @@ describe("adapter CLI service", () => {
 		});
 	});
 
+	test("prints top-level help without starting the environment-configured service", async () => {
+		const proc = Bun.spawn(["bun", "run", "src/cli.ts", "--help"], {
+			cwd: process.cwd(),
+			env: {
+				...process.env,
+				GJC_OPENWEBUI_BIND_HOST: "127.0.0.1",
+				GJC_OPENWEBUI_BIND_PORT: String(await reserveTcpPort()),
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		spawnedProcesses.push(proc);
+
+		const exitCode = await Promise.race([proc.exited, Bun.sleep(1_000).then(() => -1)]);
+
+		expect(exitCode).toBe(0);
+		if (!(proc.stdout instanceof ReadableStream)) throw new Error("expected CLI stdout");
+		expect(await new Response(proc.stdout).text()).toContain("Usage: openwebui-gjc-adapter");
+	});
+
 	test("routes chat completions through an injected GJC turn runner when building options", async () => {
 		// Given: a configured project and a fake GJC turn runner injected at the CLI boundary.
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-cli-"));
