@@ -66,20 +66,26 @@ jobs:
         with:
           bun-version: 1.3.14
       - run: bun install --frozen-lockfile
+      - name: Materialize trusted PR base policy source
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: git worktree add --detach "$RUNNER_TEMP/base" "$BASE_SHA"
       - name: Reject blocked lifecycle scripts
         run: |
           set +e
           bun pm untrusted > "$RUNNER_TEMP/bun-untrusted.txt" 2>&1
-          status=$?
+          exit_code=$?
           set -e
-          bun scripts/ci-bun-untrusted-policy.ts "$status" "$RUNNER_TEMP/bun-untrusted.txt"
+          policy_root="$GITHUB_WORKSPACE"
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then policy_root="$RUNNER_TEMP/base"; fi
+          bun --cwd "$policy_root" ./scripts/ci-bun-untrusted-policy.ts "$exit_code" "$RUNNER_TEMP/bun-untrusted.txt"
       - name: Reject unreviewed dependency changes
         if: github.event_name == 'pull_request'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          git worktree add --detach "$RUNNER_TEMP/base" "$BASE_SHA"
           BASE_ROOT="$RUNNER_TEMP/base" HEAD_ROOT="$GITHUB_WORKSPACE" BASE_SHA="$BASE_SHA" HEAD_SHA="$HEAD_SHA" bun --cwd "$RUNNER_TEMP/base" ./scripts/ci-dependency-diff-policy.ts
   package-consumer:
     name: Package consumer (probationary)
