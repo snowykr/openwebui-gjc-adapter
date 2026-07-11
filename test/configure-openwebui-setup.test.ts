@@ -117,7 +117,23 @@ describe("OpenWebUI v0.10 setup contract", () => {
 		const t = setup("existing");
 		const result = await configureOpenWebUI(t.input);
 		expect(result.apiKey).toBe("supplied");
-		expect(t.calls).toEqual([["GET", "/api/v1/auths/", undefined, "supplied"]]);
+		expect(t.calls).toEqual([
+			["GET", "/api/version", undefined, undefined],
+			["GET", "/api/v1/auths/", undefined, "supplied"],
+		]);
+	});
+	test("rejects existing mode against an unsupported OpenWebUI version before token validation", async () => {
+		const t = setup("existing");
+		const original = t.input.http.request;
+		t.input.http.request = async <T>(method: string, path: string, body?: unknown, authorization?: string) => {
+			if (path === "/api/version") {
+				t.calls.push([method, path, body, authorization]);
+				return { version: "0.9.9" } as T;
+			}
+			return original(method, path, body, authorization);
+		};
+		await expect(configureOpenWebUI(t.input)).rejects.toThrow("below required v0.10.0");
+		expect(t.calls).toEqual([["GET", "/api/version", undefined, undefined]]);
 	});
 	test("rejects a foreign nonempty provider list", async () => {
 		const t = setup("managed", {

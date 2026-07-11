@@ -227,6 +227,8 @@ describe("bootstrap reset and maintenance", () => {
 			resetBootstrapState(state, "route", { failedPhase: "route", evidence: "route verification failed" }),
 		).toEqual({
 			version: 1,
+			failedPhase: "route",
+			failureEvidence: "route verification failed",
 			phase: "route",
 			bootstrapComplete: true,
 			apiKeyCreated: true,

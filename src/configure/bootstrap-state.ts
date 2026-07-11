@@ -291,6 +291,8 @@ export function resetBootstrapState(
 	const retained = new Set(BOOTSTRAP_PHASES.slice(0, BOOTSTRAP_PHASES.indexOf(failedPhase)));
 	return {
 		version: 1,
+		failedPhase,
+		failureEvidence: proof.evidence,
 		phase: failedPhase,
 		bootstrapComplete:
 			retained.has("bootstrap") && (failedPhase !== "api-key" || state.openWebUIApiToken !== undefined),

@@ -97,37 +97,28 @@ export function buildExistingAdapterUrl(host: string, port = 8765): string {
 }
 
 export async function configureOpenWebUI(input: OpenWebUISetupInput): Promise<OpenWebUISetupResult> {
-	let existingOwnerUserId: string | undefined;
-	let existingToken: string | undefined;
 	if (input.mode === "existing") {
-		existingToken = input.openWebUIApiToken?.trim();
-		if (!existingToken) throw new Error("existing mode requires an OpenWebUI API token");
-		const authUser = await input.http.request<AuthUser | AuthUser[]>(
-			"GET",
-			"/api/v1/auths/",
-			undefined,
-			existingToken,
-		);
-		const authenticatedUser = Array.isArray(authUser) ? authUser[0] : authUser;
-		existingOwnerUserId = authenticatedUser?.id?.trim();
-		if (!existingOwnerUserId) throw new Error("OpenWebUI did not return the authenticated owner user ID");
-		if (authenticatedUser?.role?.toLowerCase() !== "admin")
-			throw new Error("existing mode requires an OpenWebUI administrator token");
-	}
-	return withExclusiveMaintenance(input.maintenance, async () => {
-		let state = (await input.state.read()) ?? { ...INITIAL_STATE };
-		if (!input.installationId.trim()) throw new Error("installationId must be non-empty");
-		if (input.mode === "existing") {
-			return {
-				state,
-				apiKey: existingToken as string,
-				openAIConnections: [],
-				ownerUserId: existingOwnerUserId as string,
-			};
-		}
 		const version = await input.http.request<OpenWebUIVersionResponse>("GET", "/api/version");
 		if (!version || !atLeast010(version.version))
 			throw new Error(`OpenWebUI ${version?.version ?? "unknown"} is below required v0.10.0`);
+		const apiKey = input.openWebUIApiToken?.trim();
+		if (!apiKey) throw new Error("existing mode requires an OpenWebUI API token");
+		const authUser = await input.http.request<AuthUser | AuthUser[]>("GET", "/api/v1/auths/", undefined, apiKey);
+		const authenticatedUser = Array.isArray(authUser) ? authUser[0] : authUser;
+		const ownerUserId = authenticatedUser?.id?.trim();
+		if (!ownerUserId) throw new Error("OpenWebUI did not return the authenticated owner user ID");
+		if (authenticatedUser?.role?.toLowerCase() !== "admin")
+			throw new Error("existing mode requires an OpenWebUI administrator token");
+		const state = (await input.state.read()) ?? { ...INITIAL_STATE };
+		if (!input.installationId.trim()) throw new Error("installationId must be non-empty");
+		return { state, apiKey, openAIConnections: [], ownerUserId };
+	}
+	return withExclusiveMaintenance(input.maintenance, async () => {
+		const version = await input.http.request<OpenWebUIVersionResponse>("GET", "/api/version");
+		if (!version || !atLeast010(version.version))
+			throw new Error(`OpenWebUI ${version?.version ?? "unknown"} is below required v0.10.0`);
+		let state = (await input.state.read()) ?? { ...INITIAL_STATE };
+		if (!input.installationId.trim()) throw new Error("installationId must be non-empty");
 		let apiKey = state.apiKeyCreated ? (state.openWebUIApiToken ?? input.openWebUIApiToken) : undefined;
 		let sessionToken = !state.apiKeyCreated ? state.openWebUIApiToken : undefined;
 		if (!state.apiKeyCreated) {

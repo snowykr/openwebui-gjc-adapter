@@ -684,6 +684,9 @@ describe("configure CLI grammar and acknowledgements", () => {
 			);
 			expect(missing).toBe(1);
 			expect(events).toEqual([]);
+			expect(existsSync(t.config)).toBe(false);
+			expect(existsSync(`${t.config}.bootstrap.json`)).toBe(false);
+			expect(existsSync(`${t.config}.recovery.json`)).toBe(false);
 			const rejected = await runCli(
 				[
 					"configure",
@@ -699,6 +702,9 @@ describe("configure CLI grammar and acknowledgements", () => {
 			);
 			expect(rejected).toBe(1);
 			expect(events).toEqual([]);
+			expect(existsSync(t.config)).toBe(false);
+			expect(existsSync(`${t.config}.bootstrap.json`)).toBe(false);
+			expect(existsSync(`${t.config}.recovery.json`)).toBe(false);
 			const result = await runCli(
 				[
 					"configure",
@@ -758,6 +764,13 @@ describe("configure CLI grammar and acknowledgements", () => {
 			expect(readInstalledConfig(t.config)).toEqual(original);
 			expect(existsSync(`${t.config}.recovery.json`)).toBe(true);
 			expect(readFileSync(`${t.config}.recovery.json`, "utf8")).not.toContain("password");
+			const bootstrapPath = `${t.config}.bootstrap.json`;
+			const bootstrap = JSON.parse(readFileSync(bootstrapPath, "utf8"));
+			delete bootstrap.pendingRecovery;
+			writeFileSync(bootstrapPath, JSON.stringify(bootstrap));
+			const completedRecovery = JSON.parse(readFileSync(`${t.config}.recovery.json`, "utf8"));
+			completedRecovery.status = "complete";
+			writeFileSync(`${t.config}.recovery.json`, JSON.stringify(completedRecovery));
 			const recovered = await runCli(
 				[
 					"configure",
@@ -1405,6 +1418,7 @@ describe("configure CLI grammar and acknowledgements", () => {
 		try {
 			const dependencies = {
 				configureOpenWebUI,
+				confirmReset: () => true,
 				systemctl,
 				probeManagedAdapter,
 				managedReadinessDelayMs: 0,
@@ -1443,6 +1457,8 @@ describe("configure CLI grammar and acknowledgements", () => {
 				linkage: pending.linkage,
 			});
 			expect(journal.transactionId).toBe(pending.transactionId);
+			const { failedPhase: _failedPhase, failureEvidence: _failureEvidence, ...retryBootstrap } = bootstrap;
+			writeFileSync(`${t.config}.bootstrap.json`, JSON.stringify(retryBootstrap));
 			const expected = {
 				installationId: pending.installationId,
 				adapterToken: pending.adapterToken,
@@ -1457,6 +1473,8 @@ describe("configure CLI grammar and acknowledgements", () => {
 						"managed",
 						"--config",
 						t.config,
+						"--reset",
+						"--reset-proof=route-retry",
 						`--admin-email-fd=${secretFd(t.directory, "fresh-email-2", "admin@example.test")}`,
 						`--admin-password-fd=${secretFd(t.directory, "fresh-password-2", "password")}`,
 					],

@@ -238,7 +238,9 @@ function deploymentSnapshot(path: string, userUnitDirectory: string): FileSnapsh
 	]);
 }
 const RECOVERY_SNAPSHOT_VERSION = 1;
+type DurableSnapshotStatus = "prepared" | "complete";
 type DurableSnapshotJournal = {
+	readonly status: DurableSnapshotStatus;
 	readonly version: 1;
 	readonly transactionId: string;
 	readonly snapshots: readonly {
@@ -268,6 +270,7 @@ function writeDurableDeploymentSnapshot(path: string, userUnitDirectory: string,
 	const journal: DurableSnapshotJournal = {
 		version: RECOVERY_SNAPSHOT_VERSION,
 		transactionId,
+		status: "prepared",
 		snapshots: snapshots.map(snapshot => ({
 			path: snapshot.path,
 			...(snapshot.content === undefined ? {} : { content: snapshot.content.toString("base64") }),
@@ -296,7 +299,9 @@ function writeDurableDeploymentSnapshot(path: string, userUnitDirectory: string,
 }
 function readDurableDeploymentSnapshot(
 	path: string,
-): { readonly transactionId: string; readonly snapshots: FileSnapshot[] } | undefined {
+):
+	| { readonly transactionId: string; readonly status: DurableSnapshotStatus; readonly snapshots: FileSnapshot[] }
+	| undefined {
 	try {
 		const value: unknown = JSON.parse(readFileSync(recoverySnapshotPath(path), "utf8"));
 		if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("journal must be an object");
@@ -305,10 +310,12 @@ function readDurableDeploymentSnapshot(
 			journal.version !== RECOVERY_SNAPSHOT_VERSION ||
 			typeof journal.transactionId !== "string" ||
 			journal.transactionId.trim().length === 0 ||
-			!Array.isArray(journal.snapshots)
+			!Array.isArray(journal.snapshots) ||
+			(journal.status !== undefined && journal.status !== "prepared" && journal.status !== "complete")
 		)
 			throw new Error("invalid recovery snapshot");
-		if (Object.keys(journal).sort().join(",") !== "snapshots,transactionId,version")
+		const journalKeys = Object.keys(journal).sort().join(",");
+		if (journalKeys !== "snapshots,transactionId,version" && journalKeys !== "snapshots,status,transactionId,version")
 			throw new Error("recovery snapshot contains unknown fields");
 		const userUnitDirectory = join(
 			process.env.XDG_CONFIG_HOME ?? join(process.env.HOME ?? "", ".config"),
@@ -403,7 +410,11 @@ function readDurableDeploymentSnapshot(
 			}
 		}
 		if (seen.size !== expected.size) throw new Error("recovery snapshot path coverage is incomplete");
-		return { transactionId: journal.transactionId, snapshots };
+		return {
+			transactionId: journal.transactionId,
+			status: journal.status === "complete" ? "complete" : "prepared",
+			snapshots,
+		};
 	} catch (error) {
 		if (error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT")
 			return undefined;
@@ -412,6 +423,29 @@ function readDurableDeploymentSnapshot(
 }
 function clearDurableDeploymentSnapshot(path: string): void {
 	rmSync(recoverySnapshotPath(path), { force: true });
+}
+function markDurableDeploymentSnapshotComplete(path: string, transactionId: string): void {
+	const current = readDurableDeploymentSnapshot(path);
+	if (current === undefined) throw new Error("recovery snapshot is missing");
+	if (current.transactionId !== transactionId) throw new Error("recovery snapshot transaction IDs do not match");
+	if (current.status === "complete") return;
+	const value = JSON.parse(readFileSync(recoverySnapshotPath(path), "utf8")) as Record<string, unknown>;
+	const target = recoverySnapshotPath(path);
+	const temporary = `${target}.${process.pid}.tmp`;
+	const fd = openSync(temporary, "w", 0o600);
+	try {
+		writeFileSync(fd, `${JSON.stringify({ ...value, status: "complete" })}\n`);
+		fsyncSync(fd);
+	} finally {
+		closeSync(fd);
+	}
+	renameSync(temporary, target);
+	const directoryFd = openSync(dirname(target), "r");
+	try {
+		fsyncSync(directoryFd);
+	} finally {
+		closeSync(directoryFd);
+	}
 }
 function managedDockerRunner(managedDocker?: CommandRunner): CommandRunner {
 	return (
@@ -913,7 +947,7 @@ function productionDeployment(
 						current.ownerUserId !== undefined &&
 						current.openWebUIApiToken !== undefined
 							? "route"
-							: undefined);
+							: current.phase);
 					if (
 						failedPhase === undefined ||
 						failedPhase === "complete" ||
@@ -1076,10 +1110,21 @@ function readPendingRecoveryJournal(path: string): PendingRecoveryRecord | undef
 function validateRecoveryPair(path: string, pending: PendingRecoveryRecord | undefined): void {
 	const snapshot = readDurableDeploymentSnapshot(path);
 	if (pending === undefined && snapshot === undefined) return;
+	if (pending === undefined && snapshot?.status === "complete") {
+		// The deployment fsynced completion before removing the journal. An orphaned
+		// completed snapshot is safe to retire; prepared snapshots remain fail-closed.
+		clearDurableDeploymentSnapshot(path);
+		return;
+	}
 	if (pending === undefined || snapshot === undefined)
 		throw new Error("pending recovery and recovery snapshot must be present together");
 	if (snapshot.transactionId !== pending.transactionId)
 		throw new Error("pending recovery and recovery snapshot transaction IDs do not match");
+	if (snapshot.status === "complete") {
+		clearPendingRecoveryJournal(path);
+		clearDurableDeploymentSnapshot(path);
+		return;
+	}
 	const configSnapshot = snapshot.snapshots.find(item => item.path === path && item.content !== undefined);
 	let captured: InstalledConfig | undefined;
 	if (configSnapshot !== undefined) {
@@ -1231,8 +1276,9 @@ async function configure(
 		});
 		if (!checks.passed) throw new Error(checks.failures.join("; "));
 	}
-	const pending = readPendingRecoveryJournal(path);
+	let pending = readPendingRecoveryJournal(path);
 	validateRecoveryPair(path, pending);
+	pending = readPendingRecoveryJournal(path);
 	if (existsSync(path) && (lstatSync(path).isSymbolicLink() || lstatSync(path).isDirectory()))
 		throw new Error("config artifact must be a regular file or absent");
 	const previous = existsSync(path) ? readInstalledConfig(path) : undefined;
@@ -1363,6 +1409,28 @@ async function configure(
 		controllerQuiesced: false,
 		linkage: `${mode}:${config.installationId}:${config.openWebUIApiUrl}:${config.adapterProviderUrl}:${uiPort}${projectRoot === undefined ? "" : `:${projectRoot}`}${mode === "existing" ? `:${bindPort}` : ""}:${previous?.mode ?? mode}:disabled:inactive:${options.reset === true && (mode === "managed" || previous?.mode === "managed") ? "recovery-required" : "controller-live"}:controller-live`,
 	};
+	let resetProof: string | undefined;
+	let resetFailedPhase: BootstrapPhase | undefined;
+	if (options.reset === true) {
+		const proof = optionValue(options, "reset-proof");
+		if (!proof) throw new Error("reset requires --reset-proof evidence");
+		const confirmed = await (dependencies.confirmReset ?? ((m, p) => confirmOnControllingTty(`RESET ${m} ${p}`)))(
+			mode,
+			proof,
+		);
+		if (!confirmed) throw new Error("reset requires confirmation of the failed phase on the controlling /dev/tty");
+		resetProof = proof;
+		resetFailedPhase =
+			bootstrapCheckpoint?.failedPhase ??
+			(bootstrapCheckpoint?.phase !== undefined && bootstrapCheckpoint.phase !== "complete"
+				? bootstrapCheckpoint.phase
+				: bootstrapCheckpoint?.phase === "complete" &&
+						bootstrapCheckpoint.apiKeyCreated &&
+						bootstrapCheckpoint.ownerUserId !== undefined &&
+						bootstrapCheckpoint.openWebUIApiToken !== undefined
+					? "route"
+					: undefined);
+	}
 	if (!existsSync(recoverySnapshotPath(path))) {
 		const userUnitDirectory = join(
 			process.env.XDG_CONFIG_HOME ?? join(process.env.HOME ?? "", ".config"),
@@ -1379,14 +1447,14 @@ async function configure(
 			...(pendingRecovery.controllerQuiesced ? { controllerQuiesced: true } : {}),
 		};
 	if (options.reset === true) {
-		const proof = optionValue(options, "reset-proof");
-		if (!proof) throw new Error("reset requires --reset-proof evidence");
-		const confirmed = await (dependencies.confirmReset ?? ((m, p) => confirmOnControllingTty(`RESET ${m} ${p}`)))(
-			mode,
-			proof,
-		);
-		if (!confirmed) throw new Error("reset requires confirmation of the failed phase on the controlling /dev/tty");
-		const resetInput = { priorMode: pendingRecovery.priorMode, targetMode: mode, proof: { evidence: proof } };
+		const resetInput = {
+			priorMode: pendingRecovery.priorMode,
+			targetMode: mode,
+			proof: {
+				evidence: resetProof as string,
+				...(resetFailedPhase === undefined ? {} : { failedPhase: resetFailedPhase }),
+			},
+		};
 		const result = await deployment.reset(resetInput);
 		if (result.completed !== true || result.mode !== "reset")
 			throw new Error("deployment reset did not complete successfully");
@@ -1408,6 +1476,7 @@ async function configure(
 	if (result.completed !== true || result.mode !== mode)
 		throw new Error(`${mode} deployment lifecycle did not complete successfully`);
 	writeInstalledConfig(config, path);
+	markDurableDeploymentSnapshotComplete(path, pendingRecovery.transactionId);
 	clearPendingRecoveryJournal(path);
 	clearDurableDeploymentSnapshot(path);
 }
