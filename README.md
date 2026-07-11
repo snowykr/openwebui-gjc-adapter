@@ -95,18 +95,3 @@ Deleting an adapter-created project folder in the OpenWebUI sidebar is treated a
 ## Operator notes
 
 Keep the adapter session/project store on persistent storage. Do not give the adapter an allowed root broader than the directories intended for GJC operation. Artifact links are resolved with realpath containment and symlink escapes are rejected.
-## Real OpenWebUI E2E
-
-`Real OpenWebUI E2E` is a manual, default-branch-only workflow. Before dispatching it, configure the protected `real-openwebui-e2e` GitHub environment with these variables:
-
-- `E2E_ADAPTER_BASE_URL`
-- `E2E_OPENWEBUI_BASE_URL`
-- `E2E_REAL_PROJECT_DIR`
-
-Configure these environment secrets:
-
-- `E2E_ADAPTER_API_TOKEN`
-- `E2E_OPENWEBUI_API_TOKEN`
-- `E2E_OPENWEBUI_OWNER_USER_ID`
-
-Use a dedicated OpenWebUI test account and an adapter/OpenWebUI deployment intended for E2E traffic. `E2E_REAL_PROJECT_DIR` must be a project directory available to the adapter and permitted by its configured allowed roots. Environment protection should restrict who can approve access to these credentials. The workflow uploads its E2E evidence even when the run fails.
