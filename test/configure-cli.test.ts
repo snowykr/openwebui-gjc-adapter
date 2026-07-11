@@ -481,6 +481,7 @@ describe("configure CLI grammar and acknowledgements", () => {
 			const deployment = {
 				managed: async (_input: unknown) => ({ completed: true as const, mode: "managed" as const }),
 				existing: async (input: { config: InstalledConfig }) => {
+					if (input.config.openWebUIApiUrl === "http://two.test") expect(input.config.ownerUserId).toBeUndefined();
 					events.push(`existing:${input.config.openWebUIApiUrl}:${input.config.openWebUIApiUrl}`);
 					return { completed: true as const, mode: "existing" as const };
 				},
@@ -508,6 +509,7 @@ describe("configure CLI grammar and acknowledgements", () => {
 					deployment,
 				}),
 			).toBe(0);
+			writeInstalledConfig({ ...readInstalledConfig(t.config), ownerUserId: "old-owner" }, t.config);
 			const replacement = [
 				"configure",
 				"existing",
@@ -1268,16 +1270,19 @@ describe("configure CLI grammar and acknowledgements", () => {
 					"managed",
 					"--config",
 					t.config,
+					"--openwebui-url=http://one.test",
 					`--admin-email-fd=${secretFd(t.directory, "cross-email-1", "admin@example.test")}`,
 					`--admin-password-fd=${secretFd(t.directory, "cross-password-1", "password")}`,
 				],
 				successfulManagedDependencies(),
 			);
+			writeInstalledConfig({ ...readInstalledConfig(t.config), ownerUserId: "managed-owner" }, t.config);
 			let target: InstalledConfig | undefined;
 			const events: string[] = [];
 			const failing = {
 				managed: async (_input: unknown) => ({ completed: true as const, mode: "managed" as const }),
 				existing: async (input: { config: InstalledConfig }) => {
+					expect(input.config.ownerUserId).toBe("managed-owner");
 					target = input.config;
 					throw new Error("cross-route deployment failed");
 				},

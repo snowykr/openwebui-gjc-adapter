@@ -1377,11 +1377,14 @@ async function configure(
 	)
 		throw new Error("pending recovery project root does not match retry input");
 	if (mode === "existing") rejectProjectRootArtifactOverlap(projectRoot!, path);
+	const retainsTargetOwner = previous === undefined || previous.openWebUIApiUrl === openWebUIApiUrl;
 	const config: InstalledConfig = {
 		version: 1,
 		mode,
 		installationId: pending?.installationId ?? previous?.installationId ?? generateAdapterToken(),
-		ownerUserId: previous?.ownerUserId ?? bootstrapCheckpoint?.ownerUserId,
+		...(retainsTargetOwner && (previous?.ownerUserId ?? bootstrapCheckpoint?.ownerUserId) !== undefined
+			? { ownerUserId: previous?.ownerUserId ?? bootstrapCheckpoint?.ownerUserId }
+			: {}),
 		adapterToken: pending?.adapterToken ?? (previous?.mode === mode ? previous.adapterToken : generateAdapterToken()),
 		readinessToken: pending?.readinessToken ?? previous?.readinessToken ?? generateAdapterToken(),
 		openWebUIApiToken:
