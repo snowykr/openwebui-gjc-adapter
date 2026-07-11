@@ -326,7 +326,11 @@ describe("configure CLI grammar and acknowledgements", () => {
 					managedDocker: {
 						run: async (command, args) => {
 							calls.push({ command, args });
-							return { exitCode: 0, stdout: '[] "/var/lib/docker"', stderr: "" };
+							return {
+								exitCode: 0,
+								stdout: args.includes("ps") ? "openwebui\n" : '[] "/var/lib/docker"',
+								stderr: "",
+							};
 						},
 					},
 					systemctl: args =>
@@ -425,7 +429,13 @@ describe("configure CLI grammar and acknowledgements", () => {
 					{
 						systemctl,
 						managedReadinessDelayMs: 0,
-						managedDocker: { run: async () => ({ exitCode: 0, stdout: '[] "/var/lib/docker"', stderr: "" }) },
+						managedDocker: {
+							run: async (_command, args) => ({
+								exitCode: 0,
+								stdout: args.includes("ps") ? "openwebui\n" : '[] "/var/lib/docker"',
+								stderr: "",
+							}),
+						},
 						probeManagedAdapter: () => {},
 					},
 				),
@@ -433,6 +443,40 @@ describe("configure CLI grammar and acknowledgements", () => {
 			expect(versionRequests).toBe(23);
 		} finally {
 			globalThis.fetch = originalFetch;
+			t.cleanup();
+		}
+	});
+	test("does not configure OpenWebUI before the managed Compose target is running", async () => {
+		const t = tempPath();
+		const config = join(realpathSync(t.directory), "config.json");
+		let setupCalls = 0;
+		const systemctl = (args: readonly string[]) =>
+			args[2] === "is-enabled" ? "disabled" : args[2] === "is-active" ? "inactive" : undefined;
+		try {
+			expect(
+				await runCli(
+					[
+						"configure",
+						"managed",
+						"--config",
+						config,
+						`--admin-email-fd=${secretFd(t.directory, "ownership-email", "admin@example.test")}`,
+						`--admin-password-fd=${secretFd(t.directory, "ownership-password", "password")}`,
+					],
+					{
+						systemctl,
+						managedReadinessDelayMs: 0,
+						managedDocker: { run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) },
+						probeManagedAdapter: () => {},
+						configureOpenWebUI: async () => {
+							setupCalls++;
+							throw new Error("OpenWebUI setup must not execute before the managed target runs");
+						},
+					},
+				),
+			).toBe(1);
+			expect(setupCalls).toBe(0);
+		} finally {
 			t.cleanup();
 		}
 	});
@@ -463,7 +507,13 @@ describe("configure CLI grammar and acknowledgements", () => {
 					`--admin-password-fd=${secretFd(t.directory, "docker-password", "password")}`,
 				],
 				{
-					managedDocker: { run: async () => ({ exitCode: 0, stdout: '[] "/var/lib/docker"', stderr: "" }) },
+					managedDocker: {
+						run: async (_command, args) => ({
+							exitCode: 0,
+							stdout: args.includes("ps") ? "openwebui\n" : '[] "/var/lib/docker"',
+							stderr: "",
+						}),
+					},
 					systemctl: args =>
 						args[2] === "is-enabled" ? "disabled" : args[2] === "is-active" ? "inactive" : undefined,
 					probeManagedAdapter: () => {},
@@ -1588,7 +1638,10 @@ describe("configure CLI grammar and acknowledgements", () => {
 	});
 	test("runs fresh production rollback with durable bootstrap checkpoint and retries exact identity", async () => {
 		const t = tempPath();
+		const config = join(realpathSync(t.directory), "config.json");
 		let readinessFailures = 10;
+		let managedTargetRunning = true;
+		let providerSetupCalls = 0;
 		const systemctl = (args: readonly string[]) =>
 			args.includes("is-enabled") ? "disabled" : args.includes("is-active") ? "inactive" : "";
 		const probeManagedAdapter = () => {
@@ -1599,6 +1652,7 @@ describe("configure CLI grammar and acknowledgements", () => {
 		};
 		const configureOpenWebUI = async (input: any) => {
 			const current = await input.state.read();
+			if (input.stopAfter === "provider") providerSetupCalls++;
 			if (input.stopAfter !== "provider")
 				await input.state.write({
 					...current,
@@ -1631,24 +1685,30 @@ describe("configure CLI grammar and acknowledgements", () => {
 				systemctl,
 				probeManagedAdapter,
 				managedReadinessDelayMs: 0,
-				managedDocker: { run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) },
+				managedDocker: {
+					run: async (_command: string, args: readonly string[]) => ({
+						exitCode: 0,
+						stdout: args.includes("ps") && managedTargetRunning ? "openwebui\n" : "",
+						stderr: "",
+					}),
+				},
 			};
 			const failed = await runCli(
 				[
 					"configure",
 					"managed",
 					"--config",
-					t.config,
+					config,
 					`--admin-email-fd=${secretFd(t.directory, "fresh-email-1", "admin@example.test")}`,
 					`--admin-password-fd=${secretFd(t.directory, "fresh-password-1", "password")}`,
 				],
 				dependencies,
 			);
 			expect(failed).toBe(1);
-			expect(existsSync(t.config)).toBe(false);
-			const bootstrap = JSON.parse(readFileSync(`${t.config}.bootstrap.json`, "utf8"));
+			expect(existsSync(config)).toBe(false);
+			const bootstrap = JSON.parse(readFileSync(`${config}.bootstrap.json`, "utf8"));
 			const pending = bootstrap.pendingRecovery;
-			const journal = JSON.parse(readFileSync(`${t.config}.recovery.json`, "utf8"));
+			const journal = JSON.parse(readFileSync(`${config}.recovery.json`, "utf8"));
 			expect(bootstrap).toMatchObject({
 				phase: "route",
 				bootstrapComplete: true,
@@ -1667,7 +1727,7 @@ describe("configure CLI grammar and acknowledgements", () => {
 			});
 			expect(journal.transactionId).toBe(pending.transactionId);
 			const { failedPhase: _failedPhase, failureEvidence: _failureEvidence, ...retryBootstrap } = bootstrap;
-			writeFileSync(`${t.config}.bootstrap.json`, JSON.stringify(retryBootstrap));
+			writeFileSync(`${config}.bootstrap.json`, JSON.stringify(retryBootstrap));
 			const expected = {
 				installationId: pending.installationId,
 				adapterToken: pending.adapterToken,
@@ -1675,28 +1735,33 @@ describe("configure CLI grammar and acknowledgements", () => {
 				openWebUIApiUrl: pending.targetUrl,
 				adapterProviderUrl: pending.providerUrl,
 			};
-			expect(
-				await runCli(
+			const retry = (proof: string, suffix: string) =>
+				runCli(
 					[
 						"configure",
 						"managed",
 						"--config",
-						t.config,
+						config,
 						"--reset",
-						"--reset-proof=route-retry",
-						`--admin-email-fd=${secretFd(t.directory, "fresh-email-2", "admin@example.test")}`,
-						`--admin-password-fd=${secretFd(t.directory, "fresh-password-2", "password")}`,
+						`--reset-proof=${proof}`,
+						`--admin-email-fd=${secretFd(t.directory, `fresh-email-${suffix}`, "admin@example.test")}`,
+						`--admin-password-fd=${secretFd(t.directory, `fresh-password-${suffix}`, "password")}`,
 					],
 					dependencies,
-				),
-			).toBe(0);
-			expect(readInstalledConfig(t.config)).toMatchObject({
+				);
+			const providerCallsBeforeTargetFailure = providerSetupCalls;
+			managedTargetRunning = false;
+			expect(await retry("route-target-missing", "2")).toBe(1);
+			expect(providerSetupCalls).toBe(providerCallsBeforeTargetFailure);
+			managedTargetRunning = true;
+			expect(await retry("ownership-retry", "3")).toBe(0);
+			expect(readInstalledConfig(config)).toMatchObject({
 				...expected,
 				ownerUserId: "bootstrap-owner",
 				openWebUIApiToken: "bootstrap-api-key",
 			});
-			expect(JSON.parse(readFileSync(`${t.config}.bootstrap.json`, "utf8")).pendingRecovery).toBeUndefined();
-			expect(existsSync(`${t.config}.recovery.json`)).toBe(false);
+			expect(JSON.parse(readFileSync(`${config}.bootstrap.json`, "utf8")).pendingRecovery).toBeUndefined();
+			expect(existsSync(`${config}.recovery.json`)).toBe(false);
 		} finally {
 			t.cleanup();
 		}

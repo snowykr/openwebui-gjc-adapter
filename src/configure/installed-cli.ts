@@ -531,6 +531,33 @@ function productionDeployment(
 	};
 	const managedOpenWebUIStartupAttempts = 60;
 	const managedOpenWebUIStartupDelayMs = managedReadinessDelayMs ?? 1_000;
+	const waitForManagedOpenWebUITarget = async () => {
+		let failure: unknown;
+		for (let attempt = 0; attempt < managedOpenWebUIStartupAttempts; attempt++) {
+			try {
+				const result = await docker.run("docker", [
+					"compose",
+					"-f",
+					composeFile,
+					"-p",
+					"openwebui-gjc-adapter",
+					"ps",
+					"--status",
+					"running",
+					"--services",
+					"openwebui",
+				]);
+				if (result.exitCode !== 0) throw new Error("failed to inspect the managed OpenWebUI service");
+				if (result.stdout.trim() !== "openwebui") throw new Error("managed OpenWebUI service is not running");
+				return;
+			} catch (error) {
+				failure = error;
+				if (attempt + 1 < managedOpenWebUIStartupAttempts)
+					await new Promise(resolve => setTimeout(resolve, managedOpenWebUIStartupDelayMs));
+			}
+		}
+		throw failure;
+	};
 	const http = (config: InstalledConfig) => ({
 		request: async <T>(method: string, endpoint: string, body?: unknown, authorization?: string): Promise<T> => {
 			const token = authorization ?? config.openWebUIApiToken;
@@ -659,6 +686,7 @@ function productionDeployment(
 					run(["systemctl", "--user", "enable", "--now", "openwebui-gjc-adapter.service"]);
 				},
 				apiKey: async () => {
+					await waitForManagedOpenWebUITarget();
 					const setup = await setupOpenWebUI({
 						http: client,
 						state,
@@ -691,6 +719,7 @@ function productionDeployment(
 					await waitForAdapterReady(() => managedProbe(composeFile), 10, managedReadinessDelayMs);
 				},
 				provider: async () => {
+					await waitForManagedOpenWebUITarget();
 					const setup = await setupOpenWebUI({
 						http: client,
 						state,
