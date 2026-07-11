@@ -43,7 +43,7 @@ describe("adapter CLI service", () => {
 	});
 
 	test("prints top-level help without starting the environment-configured service", async () => {
-		const proc = Bun.spawn(["bun", "run", "src/cli.ts", "--help"], {
+		const proc = Bun.spawn(["bun", "bin/openwebui-gjc-adapter", "--help"], {
 			cwd: process.cwd(),
 			env: {
 				...process.env,
