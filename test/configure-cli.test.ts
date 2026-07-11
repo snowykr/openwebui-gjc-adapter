@@ -745,7 +745,7 @@ describe("configure CLI grammar and acknowledgements", () => {
 			t.cleanup();
 		}
 	});
-	test("retains an exact recovery snapshot across a failed retry", async () => {
+	test("retires a self-consistent recovery snapshot orphaned before its journal", async () => {
 		const t = tempPath();
 		try {
 			const first = await runCli(
@@ -789,9 +789,6 @@ describe("configure CLI grammar and acknowledgements", () => {
 			const bootstrap = JSON.parse(readFileSync(bootstrapPath, "utf8"));
 			delete bootstrap.pendingRecovery;
 			writeFileSync(bootstrapPath, JSON.stringify(bootstrap));
-			const completedRecovery = JSON.parse(readFileSync(`${t.config}.recovery.json`, "utf8"));
-			completedRecovery.status = "complete";
-			writeFileSync(`${t.config}.recovery.json`, JSON.stringify(completedRecovery));
 			const recovered = await runCli(
 				[
 					"configure",

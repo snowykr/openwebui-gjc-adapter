@@ -1115,9 +1115,9 @@ function readPendingRecoveryJournal(path: string): PendingRecoveryRecord | undef
 function validateRecoveryPair(path: string, pending: PendingRecoveryRecord | undefined): void {
 	const snapshot = readDurableDeploymentSnapshot(path);
 	if (pending === undefined && snapshot === undefined) return;
-	if (pending === undefined && snapshot?.status === "complete") {
-		// The deployment fsynced completion before removing the journal. An orphaned
-		// completed snapshot is safe to retire; prepared snapshots remain fail-closed.
+	if (pending === undefined && snapshot !== undefined) {
+		// Snapshot creation precedes journal creation. Without the journal no deployment
+		// mutation can have started, so either self-consistent snapshot is safe to retire.
 		clearDurableDeploymentSnapshot(path);
 		return;
 	}
