@@ -98,6 +98,29 @@ export async function buildAdapterServerOptions(
 	};
 }
 
+export async function buildInstalledAdapterServerOptions(config: AdapterConfig): Promise<AdapterServerOptions> {
+	const options = await buildAdapterServerOptions(config);
+	if (config.adapterToken === undefined || config.readinessToken === undefined || config.mode === undefined) {
+		throw new Error("installed adapter configuration is missing runtime credentials or mode");
+	}
+	return {
+		...options,
+		runtime: {
+			adapterToken: config.adapterToken,
+			readinessToken: config.readinessToken,
+			readiness: {
+				openWebUIAuthenticated: false,
+				promptHintsSeeded: false,
+				mode: config.mode,
+				generation: config.installationId,
+				reason: "OpenWebUI runtime initialization is pending",
+			},
+			openWebUIBaseUrl: config.openWebUIBaseUrl,
+			openWebUIApiToken: config.openWebUIApiToken,
+		},
+	};
+}
+
 export async function startAdapterServiceFromEnv(
 	env: Record<string, string | undefined> = process.env,
 ): Promise<AdapterServerHandle> {
@@ -214,7 +237,8 @@ export async function runCli(
 		return runInstalledCli(argv, {
 			...dependencies,
 			startServer:
-				dependencies.startServer ?? (async config => startAdapterServer(await buildAdapterServerOptions(config))),
+				dependencies.startServer ??
+				(async config => startAdapterServer(await buildInstalledAdapterServerOptions(config))),
 		});
 	}
 	try {
@@ -235,8 +259,8 @@ function isInstalledCommand(argv: readonly string[]): boolean {
 	return (
 		argv[0] === "configure" ||
 		argv[0] === "probe-ready" ||
-		(argv[0] === "credentials" && argv[1] === "show" && argv[2] === "adapter-token") ||
-		(argv[0] === "serve" && (argv[1] === "--config" || argv[1]?.startsWith("--config=")))
+		argv[0] === "serve" ||
+		(argv[0] === "credentials" && argv[1] === "show" && argv[2] === "adapter-token")
 	);
 }
 

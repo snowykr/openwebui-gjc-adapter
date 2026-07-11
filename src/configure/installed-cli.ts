@@ -512,7 +512,8 @@ function productionDeployment(
 			throw failure;
 		},
 	});
-	const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+	const sourceRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+	const packageRoot = dirname(sourceRoot);
 	const installerUid = typeof process.getuid === "function" ? process.getuid() : 1000;
 	const installerGid = typeof process.getgid === "function" ? process.getgid() : 1000;
 	const installFiles = (config: InstalledConfig, uiPort: number) => {
@@ -549,7 +550,7 @@ function productionDeployment(
 				renderExistingSystemdUnit({
 					workingDirectory: directory,
 					name: "openwebui-gjc-adapter-existing",
-					adapterCommand: [process.execPath, join(packageRoot, "cli.ts"), "serve", "--config", path],
+					adapterCommand: [process.execPath, join(sourceRoot, "cli.ts"), "serve", "--config", path],
 				}),
 				{ mode: 0o600 },
 			);

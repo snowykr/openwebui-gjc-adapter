@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, openSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { runCli } from "../src/cli";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { buildInstalledAdapterServerOptions, runCli } from "../src/cli";
+import type { AdapterConfig } from "../src/config";
 import { type BootstrapState, INITIAL_BOOTSTRAP_STATE, parseBootstrapState } from "../src/configure/bootstrap-state";
 import { openSecretFile } from "../src/configure/credentials";
 import { CliUsageError, parseCliArguments } from "../src/configure/grammar";
@@ -134,6 +136,124 @@ describe("configure CLI grammar and acknowledgements", () => {
 					],
 				}),
 			).toContain('ExecStart=/usr/bin/bun "/srv/adapter files/src/cli.ts" serve --config "/tmp/config file.json"');
+			expect(
+				renderExistingSystemdUnit({
+					workingDirectory: "/srv/adapter",
+					adapterCommand: ["adapter%name", "$HOME", "tab\tvalue", 'quote"value', "back\\slash", ""],
+				}),
+			).toContain('ExecStart="adapter%%name" "$$HOME" "tab\tvalue" "quote\\"value" "back\\\\slash" ""');
+			for (const lineBreak of ["bad\0value", "bad\rvalue", "bad\nvalue"]) {
+				expect(() =>
+					renderExistingSystemdUnit({ workingDirectory: "/srv/adapter", adapterCommand: ["adapter", lineBreak] }),
+				).toThrow("systemd unit values must not contain NUL, CR, or LF");
+			}
+		} finally {
+			t.cleanup();
+		}
+	});
+	test("builds installed server options with readiness-gated runtime credentials", async () => {
+		const t = tempPath();
+		const originalFetch = globalThis.fetch;
+		try {
+			globalThis.fetch = (async () =>
+				new Response(JSON.stringify({ items: [] }), { status: 200 })) as unknown as typeof fetch;
+			const options = await buildInstalledAdapterServerOptions({
+				bindHost: "127.0.0.1",
+				bindPort: 8765,
+				adapterApiToken: "adapter-token",
+				adapterToken: "adapter-token",
+				readinessToken: "readiness-token",
+				mode: "existing",
+				installationId: "installation-1",
+				openWebUIBaseUrl: "http://openwebui.test",
+				openWebUIApiToken: "openwebui-api-token",
+				statePath: t.directory,
+				gjcCommand: "gjc",
+				turnTimeoutMs: 1_000,
+				sessionRoot: t.directory,
+				allowedProjectRoots: [t.directory],
+				projects: [],
+			} satisfies AdapterConfig);
+			expect(options.runtime).toEqual({
+				adapterToken: "adapter-token",
+				readinessToken: "readiness-token",
+				readiness: {
+					openWebUIAuthenticated: false,
+					promptHintsSeeded: false,
+					mode: "existing",
+					generation: "installation-1",
+					reason: "OpenWebUI runtime initialization is pending",
+				},
+				openWebUIBaseUrl: "http://openwebui.test",
+				openWebUIApiToken: "openwebui-api-token",
+			});
+		} finally {
+			globalThis.fetch = originalFetch;
+			t.cleanup();
+		}
+	});
+	test("builds the managed adapter from the package root", async () => {
+		const t = tempPath();
+		const calls: Array<{ command: string; args: readonly string[] }> = [];
+		try {
+			const result = await runCli(
+				[
+					"configure",
+					"managed",
+					"--config",
+					t.config,
+					`--admin-email-fd=${secretFd(t.directory, "build-email", "admin@example.test")}`,
+					`--admin-password-fd=${secretFd(t.directory, "build-password", "password")}`,
+				],
+				{
+					managedDocker: {
+						run: async (command, args) => {
+							calls.push({ command, args });
+							return { exitCode: 0, stdout: '[] "/var/lib/docker"', stderr: "" };
+						},
+					},
+					systemctl: args =>
+						args[2] === "is-enabled" ? "disabled" : args[2] === "is-active" ? "inactive" : undefined,
+					probeManagedAdapter: () => {},
+					configureOpenWebUI: async input =>
+						({
+							state:
+								input.stopAfter === "api-key"
+									? {
+											...INITIAL_BOOTSTRAP_STATE,
+											phase: "api-key",
+											bootstrapComplete: true,
+											apiKeyCreated: true,
+											ownerUserId: "owner",
+											openWebUIApiToken: "api-token",
+										}
+									: {
+											...INITIAL_BOOTSTRAP_STATE,
+											phase: "openai",
+											bootstrapComplete: true,
+											apiKeyCreated: true,
+											openAIConfigured: true,
+											openAIConnectionIds: ["0"],
+											ownerUserId: "owner",
+											openWebUIApiToken: "api-token",
+										},
+							apiKey: "api-token",
+							openAIConnections: [],
+							ownerUserId: "owner",
+						}) as never,
+				},
+			);
+			expect(result).toBe(0);
+			const build = calls.find(call => call.command === "docker" && call.args[0] === "build");
+			const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+			expect(build?.args).toEqual([
+				"build",
+				"--file",
+				join(packageRoot, "Dockerfile.adapter"),
+				"--tag",
+				"openwebui-gjc-adapter:local",
+				packageRoot,
+			]);
 		} finally {
 			t.cleanup();
 		}

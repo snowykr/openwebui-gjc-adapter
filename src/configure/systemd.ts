@@ -37,7 +37,11 @@ function renderHostUnit(
 	return `[Unit]\nDescription=${escapeUnitValue(input.description ?? defaultDescription)}\nAfter=network-online.target\nWants=network-online.target\nStartLimitIntervalSec=5min\nStartLimitBurst=5\n\n[Service]\nType=simple\nWorkingDirectory=${escapeUnitValue(input.workingDirectory)}\nExecStart=${input.adapterCommand?.map(escapeUnitValue).join(" ")}\nRestart=always\nRestartSec=5s\n\n[Install]\nWantedBy=${wantedBy}\n# unit name: ${escapeUnitValue(name)}\n`;
 }
 function escapeUnitValue(value: string): string {
-	return value.length === 0 || /[\s"'\\]/.test(value)
-		? `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`
-		: value;
+	if (/[\0\r\n]/.test(value)) throw new Error("systemd unit values must not contain NUL, CR, or LF");
+	const escaped = value
+		.replaceAll("%", "%%")
+		.replaceAll("$", () => "$$")
+		.replaceAll("\\", "\\\\")
+		.replaceAll('"', '\\"');
+	return value.length === 0 || /[\s"'\\$%]/.test(value) ? `"${escaped}"` : escaped;
 }

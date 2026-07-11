@@ -82,12 +82,16 @@ describe("createAdapterRequestHandler", () => {
 		const ready = await handler(
 			new Request("http://adapter.test/readyz", { headers: { authorization: "Bearer readiness-token" } }),
 		);
+		const providerOnReadiness = await handler(
+			new Request("http://adapter.test/readyz", { headers: { authorization: "Bearer provider-token" } }),
+		);
 		const provider = await handler(
 			new Request("http://adapter.test/v1/models", { headers: { authorization: "Bearer provider-token" } }),
 		);
 
 		expect(unauthorized.status).toBe(401);
 		expect(ready.status).toBe(200);
+		expect(providerOnReadiness.status).toBe(401);
 		expect(await ready.json()).toMatchObject({ status: "ready", identity: { mode: "managed" } });
 		expect(provider.status).toBe(200);
 	});
