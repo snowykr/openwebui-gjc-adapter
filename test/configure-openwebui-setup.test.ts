@@ -113,6 +113,28 @@ describe("OpenWebUI v0.10 setup contract", () => {
 		});
 		expect(JSON.stringify(persisted)).not.toContain("password");
 	});
+	test("keeps a supplied durable API key out of a rerun checkpoint's session flow", async () => {
+		const t = setup();
+		let state: BootstrapState = {
+			...INITIAL_BOOTSTRAP_STATE,
+			phase: "api-key",
+			bootstrapComplete: true,
+			openWebUIApiToken: "durable-key",
+		};
+		t.input.openWebUIApiToken = "durable-key";
+		t.input.state = {
+			read: async () => state,
+			write: async next => {
+				state = { ...state, ...next };
+			},
+		};
+
+		const result = await configureOpenWebUI({ ...t.input, stopAfter: "api-key" });
+
+		expect(result.apiKey).toBe("durable-key");
+		expect(t.calls.filter(call => call[1] === "/api/v1/auths/api_key")).toHaveLength(0);
+		expect(t.calls.find(call => call[1] === "/api/v1/auths/")?.[3]).toBe("durable-key");
+	});
 	test("existing mode only validates supplied owner token", async () => {
 		const t = setup("existing");
 		const result = await configureOpenWebUI(t.input);

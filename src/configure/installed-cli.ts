@@ -1453,7 +1453,8 @@ async function configure(
 		readinessToken: pending?.readinessToken ?? previous?.readinessToken ?? generateAdapterToken(),
 		openWebUIApiToken:
 			mode === "managed"
-				? (previous?.openWebUIApiToken ?? bootstrapCheckpoint?.openWebUIApiToken)
+				? (previous?.openWebUIApiToken ??
+					(bootstrapCheckpoint?.apiKeyCreated ? bootstrapCheckpoint.openWebUIApiToken : undefined))
 				: openWebUIApiToken,
 		openWebUIApiUrl,
 		adapterProviderUrl,

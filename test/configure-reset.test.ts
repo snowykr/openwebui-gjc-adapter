@@ -114,9 +114,9 @@ describe("bootstrap reset and maintenance", () => {
 		});
 		const calls: string[] = [];
 		const store = {
-			read: async () => state,
+			read: async () => parseBootstrapState(state),
 			write: async (next: typeof state) => {
-				state = next;
+				state = parseBootstrapState(next);
 			},
 		};
 		await runPhaseAwareDeployment({
@@ -143,6 +143,45 @@ describe("bootstrap reset and maintenance", () => {
 		expect(calls).toEqual(["preflight", "bootstrap", "api-key", "route", "ownership"]);
 		expect(state.ownerUserId).toBe("owner");
 		expect(state.openWebUIApiToken).toBe("token");
+	});
+
+	test("keeps a completed-install rerun checkpoint parseable when preflight fails", async () => {
+		let state = advanceBootstrapState(INITIAL_BOOTSTRAP_STATE, "complete", {
+			bootstrapComplete: true,
+			apiKeyCreated: true,
+			openAIConfigured: true,
+			routeVerified: true,
+			ownershipVerified: true,
+		});
+		const store = {
+			read: async () => parseBootstrapState(state),
+			write: async (next: typeof state) => {
+				state = parseBootstrapState(next);
+			},
+		};
+		await expect(
+			runPhaseAwareDeployment({
+				state: store,
+				phases: {
+					preflight: async () => {
+						throw new Error("preflight retry failed");
+					},
+					bootstrap: async () => {},
+					apiKey: async () => {},
+					readiness: async () => {},
+					provider: async () => {},
+				},
+			}),
+		).rejects.toThrow("preflight retry failed");
+		expect(state).toMatchObject({
+			phase: "preflight",
+			bootstrapComplete: false,
+			apiKeyCreated: false,
+			openAIConfigured: false,
+			routeVerified: false,
+			ownershipVerified: false,
+			failedPhase: "preflight",
+		});
 	});
 
 	test("records a failed phase before invoking it for recovery", async () => {

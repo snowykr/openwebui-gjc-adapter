@@ -1671,6 +1671,24 @@ describe("configure CLI grammar and acknowledgements", () => {
 			const journal = JSON.parse(readFileSync(`${t.config}.recovery.json`, "utf8"));
 			expect(pending.transactionId).toBe(journal.transactionId);
 			const adapterToken = pending.adapterToken;
+			const {
+				failedPhase: _failedPhase,
+				failureEvidence: _failureEvidence,
+				...checkpoint
+			} = JSON.parse(readFileSync(`${t.config}.bootstrap.json`, "utf8"));
+			writeFileSync(
+				`${t.config}.bootstrap.json`,
+				JSON.stringify({
+					...checkpoint,
+					phase: "bootstrap",
+					bootstrapComplete: true,
+					apiKeyCreated: false,
+					openAIConfigured: false,
+					routeVerified: false,
+					ownershipVerified: false,
+					openWebUIApiToken: "signup-session",
+				}),
+			);
 			expect(
 				await runCli(
 					[
@@ -1685,6 +1703,7 @@ describe("configure CLI grammar and acknowledgements", () => {
 						deployment: {
 							managed: async (input: { config: InstalledConfig }) => {
 								expect(input.config.adapterToken).toBe(adapterToken);
+								expect(input.config.openWebUIApiToken).toBeUndefined();
 								return { completed: true as const, mode: "managed" as const };
 							},
 							existing: async (_input: unknown) => ({ completed: true as const, mode: "existing" as const }),

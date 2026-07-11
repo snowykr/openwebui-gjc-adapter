@@ -123,10 +123,10 @@ export async function configureOpenWebUI(input: OpenWebUISetupInput): Promise<Op
 			throw new Error(`OpenWebUI ${version?.version ?? "unknown"} is below required v0.10.0`);
 		let state = (await input.state.read()) ?? { ...INITIAL_STATE };
 		if (!input.installationId.trim()) throw new Error("installationId must be non-empty");
-		let apiKey = state.apiKeyCreated ? (state.openWebUIApiToken ?? input.openWebUIApiToken) : undefined;
-		let sessionToken = !state.apiKeyCreated ? state.openWebUIApiToken : undefined;
+		let apiKey = state.apiKeyCreated ? (state.openWebUIApiToken ?? input.openWebUIApiToken) : input.openWebUIApiToken;
+		let sessionToken = apiKey === undefined && !state.apiKeyCreated ? state.openWebUIApiToken : undefined;
 		let recoveredSession = false;
-		if (!state.apiKeyCreated) {
+		if (!apiKey?.trim()) {
 			if (!sessionToken?.trim()) {
 				let session: SessionResponse;
 				try {

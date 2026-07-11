@@ -77,7 +77,7 @@ export async function runPhaseAwareDeployment(input: PhaseAwareDeploymentInput):
 			}
 			continue;
 		}
-		state = advanceBootstrapState(state, phase);
+		state = rerunCompleted ? checkpointCompletedInstallRerun(state, phase) : advanceBootstrapState(state, phase);
 		await input.state.write(state);
 		try {
 			const facts = await input.phases[adapter]();
@@ -100,6 +100,16 @@ export async function runPhaseAwareDeployment(input: PhaseAwareDeploymentInput):
 }
 function phaseOrder(phase: BootstrapPhase): number {
 	return ["preflight", "bootstrap", "api-key", "openai", "route", "ownership", "complete"].indexOf(phase);
+}
+function checkpointCompletedInstallRerun(state: BootstrapState, phase: BootstrapPhase): BootstrapState {
+	const checkpoint = phaseOrder(phase);
+	return advanceBootstrapState(state, phase, {
+		bootstrapComplete: checkpoint > phaseOrder("bootstrap"),
+		apiKeyCreated: checkpoint > phaseOrder("api-key"),
+		openAIConfigured: checkpoint > phaseOrder("openai"),
+		routeVerified: checkpoint > phaseOrder("route"),
+		ownershipVerified: checkpoint > phaseOrder("ownership"),
+	});
 }
 function phasePatch(phase: BootstrapPhase): Partial<BootstrapState> {
 	return phase === "bootstrap"
