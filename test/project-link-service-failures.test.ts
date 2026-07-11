@@ -4,7 +4,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type {
 	OpenWebUIChatMessageRecord,
-	OpenWebUIChatOwnerResolution,
 	OpenWebUIChatRecord,
 	OpenWebUIFolderRecord,
 	OpenWebUIProjectionRepository,
@@ -114,12 +113,6 @@ class FailingDeleteRepository implements OpenWebUIProjectionRepository {
 
 	async getChat(): Promise<OpenWebUIChatRecord | undefined> {
 		return undefined;
-	}
-	async resolveChatOwner(
-		_ownerUserId: string,
-		_chatId: string,
-	): Promise<OpenWebUIChatOwnerResolution> {
-		return { kind: "missing" };
 	}
 
 	async deleteFolder(): Promise<void> {

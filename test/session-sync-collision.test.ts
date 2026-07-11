@@ -5,7 +5,6 @@ import * as path from "node:path";
 import {
 	InMemoryOpenWebUIProjectionRepository,
 	type OpenWebUIChatMessageRecord,
-	type OpenWebUIChatOwnerResolution,
 	type OpenWebUIChatRecord,
 	type OpenWebUIFolderRecord,
 	type OpenWebUIProjectionRepository,
@@ -41,12 +40,6 @@ class RecordingOpenWebUIProjectionRepository implements OpenWebUIProjectionRepos
 
 	async getChat(ownerUserId: string, chatId: string): Promise<OpenWebUIChatRecord | undefined> {
 		return this.#repository.getChat(ownerUserId, chatId);
-	}
-	async resolveChatOwner(
-		_ownerUserId: string,
-		_chatId: string,
-	): Promise<OpenWebUIChatOwnerResolution> {
-		return { kind: "missing" };
 	}
 }
 

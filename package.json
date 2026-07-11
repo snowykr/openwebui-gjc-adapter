@@ -21,7 +21,6 @@
 		"check:types": "tsgo -p tsconfig.json --noEmit",
 		"lint": "biome lint .",
 		"test": "bun test",
-		"e2e:runner-openwebui": "bun run scripts/e2e-runner-openwebui.ts",
 		"fix": "biome check --write --unsafe .",
 		"fmt": "biome format --write ."
 	},

@@ -95,10 +95,3 @@ Deleting an adapter-created project folder in the OpenWebUI sidebar is treated a
 ## Operator notes
 
 Keep the adapter session/project store on persistent storage. Do not give the adapter an allowed root broader than the directories intended for GJC operation. Artifact links are resolved with realpath containment and symlink escapes are rejected.
-## Runner OpenWebUI E2E
-
-`Runner OpenWebUI E2E` runs on pull requests to `main`, `main` pushes, and zero-input manual dispatches. It provisions OpenWebUI `v0.10.2@sha256:9fcea9c6e32ab60b0498f3986c6cdf651ddbe61db48d2213a3d28048ddd673d4` on a fresh, dedicated Docker bridge network. OpenWebUI is published only to runner loopback; the adapter binds only to the inspected bridge gateway.
-
-The workflow creates all credentials per run, masks the generated values and sign-in JWT, and scans redacted failure diagnostics for exact secret literals before the failure-only upload. It verifies OpenWebUI model discovery and the deterministic `/gjc project list` provider route. It deliberately does not make a live GJC/model turn.
-
-No GitHub environment, repository secret, external adapter, project path, or model credential is required. After this replacement is merged and source/workflow references are confirmed absent, a repository administrator must audit uses, variables, secrets, and protection rules of the old `real-openwebui-e2e` environment. Delete that environment only after confirming it is unused and unshared.
