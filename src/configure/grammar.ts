@@ -75,6 +75,8 @@ export function parseCliArguments(argv: readonly string[]): CliCommand {
 		const equals = argument.indexOf("=");
 		const name = equals < 0 ? argument.slice(2) : argument.slice(2, equals);
 		if (!optionNames.has(name)) throw new CliUsageError(`unknown option: --${name}`);
+		if (name === "bind-host")
+			throw new CliUsageError("--bind-host is not supported; the adapter bind host is selected by deployment mode");
 		if (name === "reset" && equals < 0) {
 			options[name] = true;
 			continue;

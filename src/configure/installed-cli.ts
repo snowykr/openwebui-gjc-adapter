@@ -820,7 +820,7 @@ function productionDeployment(
 				};
 			updatePendingRecoveryJournal(path, {
 				controllerRecoveryRequired: true,
-				controllerQuiesced: false,
+				controllerQuiesced: pending?.controllerQuiesced ?? false,
 				priorControllerEnabled: tx.controllers.enabled,
 				priorControllerActive: tx.controllers.active,
 			});
@@ -855,7 +855,7 @@ function productionDeployment(
 				};
 			updatePendingRecoveryJournal(path, {
 				controllerRecoveryRequired: true,
-				controllerQuiesced: false,
+				controllerQuiesced: pending?.controllerQuiesced ?? false,
 				priorControllerEnabled: tx.controllers.enabled,
 				priorControllerActive: tx.controllers.active,
 			});
@@ -878,12 +878,19 @@ function productionDeployment(
 			const evidence = input.proof.evidence;
 			if (!evidence.trim()) throw new Error("reset requires proof for the persisted failed phase");
 			const previous = existsSync(path) ? readInstalledConfig(path) : undefined;
+			const controllers = controllerState(input.priorMode);
 			transaction = {
 				snapshots: deploymentSnapshot(path, userUnitDirectory),
 				previous,
 				priorMode: input.priorMode,
-				controllers: controllerState(input.priorMode),
+				controllers,
 			};
+			updatePendingRecoveryJournal(path, {
+				controllerRecoveryRequired: true,
+				controllerQuiesced: false,
+				priorControllerEnabled: controllers.enabled,
+				priorControllerActive: controllers.active,
+			});
 			try {
 				if (input.priorMode === "managed") {
 					const current = await state.read();
@@ -908,6 +915,12 @@ function productionDeployment(
 				const unit = routeControllerUnitName(input.priorMode);
 				run(["systemctl", "--user", "stop", unit]);
 				run(["systemctl", "--user", "disable", unit]);
+				updatePendingRecoveryJournal(path, {
+					controllerRecoveryRequired: true,
+					controllerQuiesced: true,
+					priorControllerEnabled: controllers.enabled,
+					priorControllerActive: controllers.active,
+				});
 				return { completed: true, mode: "reset" };
 			} catch (error) {
 				const rollbackErrors = await rollback(transaction, input.targetMode);

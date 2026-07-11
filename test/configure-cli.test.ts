@@ -100,6 +100,16 @@ describe("configure CLI grammar and acknowledgements", () => {
 		});
 		expect(() => parseCliArguments(["configure", "managed", "--admin-email-fd"])).toThrow(CliUsageError);
 	});
+	test("rejects bind-host customization because ingress remains mode-controlled", async () => {
+		const error = sink();
+		expect(() => parseCliArguments(["configure", "existing", "--bind-host=0.0.0.0"])).toThrow(
+			"--bind-host is not supported; the adapter bind host is selected by deployment mode",
+		);
+		expect(await runCli(["configure", "existing", "--bind-host=0.0.0.0"], { stderr: error })).toBe(2);
+		expect(error.values).toEqual([
+			"--bind-host is not supported; the adapter bind host is selected by deployment mode\n",
+		]);
+	});
 	test("accepts the documented custom-config readiness probe", () => {
 		expect(parseCliArguments(["probe-ready", "--config", "/tmp/custom-config.json"])).toEqual({
 			kind: "probe-ready",
@@ -1528,6 +1538,74 @@ describe("configure CLI grammar and acknowledgements", () => {
 			} finally {
 				t.cleanup();
 			}
+		}
+	});
+	test("journals actual controller state through reset quiescence before a production interruption", async () => {
+		const t = tempPath();
+		const projectRoot = join(t.directory, "workspace");
+		let capturedPending: Record<string, unknown> | undefined;
+		const systemctlCalls: string[] = [];
+		try {
+			mkdirSync(projectRoot);
+			writeInstalledConfig(
+				{
+					version: 1,
+					mode: "existing",
+					installationId: "installed-existing",
+					adapterToken: "adapter-token",
+					readinessToken: "readiness-token",
+					openWebUIApiToken: "api-token",
+					openWebUIApiUrl: "http://one.test",
+					adapterProviderUrl: "http://gateway.test/v1",
+					bindHost: "127.0.0.1",
+					bindPort: 8765,
+					projectRoot,
+				},
+				t.config,
+			);
+			const result = await runCli(
+				[
+					"configure",
+					"existing",
+					"--config",
+					t.config,
+					"--openwebui-url=http://two.test",
+					"--adapter-ingress-url=http://gateway.test",
+					"--reset",
+					"--reset-proof=route-change",
+					`--openwebui-api-token-fd=${secretFd(t.directory, "reset-api-token", "api-token")}`,
+				],
+				{
+					confirmReset: () => true,
+					systemctl: args => {
+						systemctlCalls.push(args.join(" "));
+						if (args[2] === "is-enabled") return "enabled";
+						if (args[2] === "is-active") return "active";
+						return "";
+					},
+					configureOpenWebUI: async () => {
+						capturedPending = JSON.parse(readFileSync(`${t.config}.bootstrap.json`, "utf8")).pendingRecovery;
+						throw new Error("simulated interruption after reset quiescence");
+					},
+				},
+			);
+			expect(result).toBe(1);
+			expect(capturedPending).toMatchObject({
+				priorControllerEnabled: true,
+				priorControllerActive: true,
+				controllerRecoveryRequired: true,
+				controllerQuiesced: true,
+			});
+			expect(systemctlCalls).toEqual(
+				expect.arrayContaining([
+					"systemctl --user stop openwebui-gjc-adapter-existing.service",
+					"systemctl --user disable openwebui-gjc-adapter-existing.service",
+					"systemctl --user enable openwebui-gjc-adapter-existing.service",
+					"systemctl --user start openwebui-gjc-adapter-existing.service",
+				]),
+			);
+		} finally {
+			t.cleanup();
 		}
 	});
 
