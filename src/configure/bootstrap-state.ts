@@ -294,8 +294,7 @@ export function resetBootstrapState(
 		failedPhase,
 		failureEvidence: proof.evidence,
 		phase: failedPhase,
-		bootstrapComplete:
-			retained.has("bootstrap") && (failedPhase !== "api-key" || state.openWebUIApiToken !== undefined),
+		bootstrapComplete: retained.has("bootstrap"),
 		apiKeyCreated: retained.has("api-key"),
 		...(retained.has("api-key") && state.ownerUserId !== undefined ? { ownerUserId: state.ownerUserId } : {}),
 		...(retained.has("api-key") && state.openWebUIApiToken !== undefined

@@ -251,6 +251,22 @@ describe("bootstrap reset and maintenance", () => {
 		});
 	});
 
+	test("keeps bootstrap complete when retrying an API-key failure without a session token", () => {
+		const state = advanceBootstrapState(INITIAL_BOOTSTRAP_STATE, "api-key", {
+			bootstrapComplete: true,
+		});
+		const reset = resetBootstrapState(state, "api-key", {
+			failedPhase: "api-key",
+			evidence: "API-key creation failed before sign-in completed",
+		});
+		expect(reset).toMatchObject({
+			phase: "api-key",
+			bootstrapComplete: true,
+			apiKeyCreated: false,
+		});
+		expect(parseBootstrapState(reset)).toEqual(reset);
+	});
+
 	test("always ends exclusive maintenance, including a failed action", async () => {
 		const events: string[] = [];
 		const boundary = {
