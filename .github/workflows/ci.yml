@@ -33,13 +33,6 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run check
 
-  legacy-check:
-    name: CI / check
-    needs: check
-    if: always()
-    runs-on: ubuntu-24.04
-    steps:
-      - run: test "${{ needs.check.result }}" = success
 
   test:
     name: Test
@@ -58,13 +51,6 @@ jobs:
           key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
       - run: bun install --frozen-lockfile
       - run: bun run test
-  legacy-test:
-    name: CI / test
-    needs: test
-    if: always()
-    runs-on: ubuntu-24.04
-    steps:
-      - run: test "${{ needs.test.result }}" = success
 
   supply-chain:
     name: Supply chain (probationary)
