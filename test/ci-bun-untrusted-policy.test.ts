@@ -9,7 +9,7 @@ const fixture = (name: string) =>
 describe("evaluateBunUntrustedPolicy", () => {
 	test("accepts only Bun 1.3.14 clean output", () => {
 		expect(evaluateBunUntrustedPolicy(0, fixture("clean.txt"))).toEqual({ ok: true });
-		expect(evaluateBunUntrustedPolicy(0, "No untrusted dependencies found\r\n")).toEqual({ ok: true });
+		expect(evaluateBunUntrustedPolicy(0, fixture("clean.txt").replaceAll("\n", "\r\n"))).toEqual({ ok: true });
 	});
 
 	test("rejects blocked lifecycle scripts", () => {

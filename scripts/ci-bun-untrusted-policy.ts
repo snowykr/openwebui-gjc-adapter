@@ -2,7 +2,8 @@ export type UntrustedPolicyResult =
 	| { readonly ok: true }
 	| { readonly ok: false; readonly diagnostic: "UNTRUSTED_DEPENDENCIES" | "UNTRUSTED_OUTPUT_INVALID" };
 
-const cleanOutput = "No untrusted dependencies found";
+const cleanOutput =
+	'bun pm untrusted v1.3.14 (0d9b296a)\n\nFound 0 untrusted dependencies with scripts.\n\nThis means all packages with scripts are in "trustedDependencies" or none of your dependencies have scripts.\n\nFor more information, visit https://bun.com/docs/install/lifecycle#trusteddependencies';
 
 export function evaluateBunUntrustedPolicy(exitCode: number, output: string): UntrustedPolicyResult {
 	if (exitCode !== 0) {

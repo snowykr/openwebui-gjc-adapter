@@ -82,7 +82,7 @@ jobs:
       - name: Reject blocked lifecycle scripts
         run: |
           set +e
-          bun pm untrusted > "$RUNNER_TEMP/bun-untrusted.txt"
+          bun pm untrusted > "$RUNNER_TEMP/bun-untrusted.txt" 2>&1
           status=$?
           set -e
           bun scripts/ci-bun-untrusted-policy.ts "$status" "$RUNNER_TEMP/bun-untrusted.txt"
