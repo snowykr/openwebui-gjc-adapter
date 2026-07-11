@@ -1,5 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { buildStartupDiagnostics, loadAdapterConfig } from "../src/config";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { buildStartupDiagnostics, loadAdapterConfig, loadInstalledAdapterConfig } from "../src/config";
+import {
+	DEFAULT_EXISTING_PROJECT_ROOT,
+	type InstalledConfig,
+	writeInstalledConfig,
+} from "../src/configure/private-config";
 import {
 	MIN_OPENWEBUI_VERSION,
 	REQUIRED_OPENWEBUI_HEADER_NAMES,
@@ -77,5 +85,37 @@ describe("adapter config contracts", () => {
 		expect(diagnostic.messages).toContain(
 			"GJC_OPENWEBUI_API_TOKEN is not set; OpenWebUI API calls are not authenticated.",
 		);
+	});
+	test("uses container runtime paths only for managed installed configurations", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-installed-config-"));
+		const file = join(directory, "config.json");
+		const base: InstalledConfig = {
+			version: 1,
+			mode: "managed",
+			installationId: "install",
+			adapterToken: "adapter",
+			readinessToken: "ready",
+			openWebUIApiUrl: "http://localhost:8080",
+			adapterProviderUrl: "http://adapter:8765/v1",
+			bindHost: "0.0.0.0",
+			bindPort: 8765,
+		};
+		try {
+			writeInstalledConfig({ ...base, mode: "managed" }, file);
+			expect(loadInstalledAdapterConfig(file)).toMatchObject({
+				statePath: "/var/lib/gjc",
+				sessionRoot: "/run/gjc-session",
+				allowedProjectRoots: ["/workspace"],
+				gjcCommand: "/opt/openwebui-gjc-adapter/node_modules/.bin/gjc",
+			});
+			writeInstalledConfig({ ...base, mode: "existing", bindHost: "127.0.0.1" }, file);
+			const existing = loadInstalledAdapterConfig(file);
+			expect(existing.statePath).toBe(".gjc/openwebui-adapter");
+			expect(existing.sessionRoot).toBe(join(DEFAULT_EXISTING_PROJECT_ROOT, ".gjc", "sessions"));
+			expect(existing.allowedProjectRoots).toEqual([DEFAULT_EXISTING_PROJECT_ROOT]);
+			expect(existing.gjcCommand).toBe("gjc");
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
 	});
 });

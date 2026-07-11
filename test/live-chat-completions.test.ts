@@ -32,15 +32,15 @@ const chatHeaders = {
 };
 
 const request: OpenAIChatCompletionRequest = {
-	model: "gjc/demo",
+	model: "gjc",
 	messages: [{ role: "user", content: "Build it" }],
 };
 
 describe("live OpenAI-compatible chat completions", () => {
-	it("builds a /v1/models list from registered projects", () => {
-		expect(buildModelList([project])).toEqual({
+	it("advertises the sole gjc model", () => {
+		expect(buildModelList()).toEqual({
 			object: "list",
-			data: [{ id: "gjc/demo", object: "model", created: 1783468800, owned_by: "gjc" }],
+			data: [{ id: "gjc", object: "model", created: 0, owned_by: "gjc" }],
 		});
 	});
 
@@ -127,7 +127,7 @@ describe("live OpenAI-compatible chat completions", () => {
 				id: "chatcmpl-test",
 				object: "chat.completion",
 				created: 1783468800,
-				model: "gjc/demo",
+				model: "gjc",
 				choices: [{ index: 0, message: { role: "assistant", content: "done: Build it" }, finish_reason: "stop" }],
 			},
 		});
@@ -191,7 +191,7 @@ describe("live OpenAI-compatible chat completions", () => {
 		expect(chunks[2]).toBe("data: [DONE]\n\n");
 	});
 
-	it("rejects unknown project models", async () => {
+	it("rejects project-qualified model IDs", async () => {
 		const result = await handleChatCompletions({
 			request: { ...request, model: "gjc/missing" },
 			headers: chatHeaders,
@@ -199,7 +199,6 @@ describe("live OpenAI-compatible chat completions", () => {
 			owner,
 			runner: fixedRunner("unused"),
 		});
-
 		expect(result).toEqual({
 			ok: false,
 			status: 404,

@@ -1,3 +1,4 @@
+import { OPENWEBUI_HEADER_DESCRIPTORS, type OpenWebUIHeaderName } from "../contracts";
 export interface OpenWebUIHeaderValues {
 	chatId: string;
 	messageId: string;
@@ -21,35 +22,23 @@ export type OpenWebUIHeaderParseResult =
 	| ({ ok: false; errors: readonly OpenWebUIHeaderError[] } & OpenWebUIHeaderValues);
 
 export type OpenWebUIHeaderInput = Headers | Record<string, string | readonly string[] | null | undefined>;
-export type OpenWebUIHeaderName =
-	| "X-OpenWebUI-Chat-Id"
-	| "X-OpenWebUI-Message-Id"
-	| "X-OpenWebUI-User-Message-Id"
-	| "X-OpenWebUI-User-Message-Parent-Id"
-	| "X-OpenWebUI-Task"
-	| "X-OpenWebUI-User-Id";
 
-const REQUIRED_NORMAL_CHAT_HEADERS: readonly OpenWebUIHeaderName[] = [
-	"X-OpenWebUI-Chat-Id",
-	"X-OpenWebUI-Message-Id",
-	"X-OpenWebUI-User-Message-Id",
-	"X-OpenWebUI-User-Message-Parent-Id",
-];
+export type { OpenWebUIHeaderName } from "../contracts";
 
-const TASK_HEADER: OpenWebUIHeaderName = "X-OpenWebUI-Task";
-const OPTIONAL_USER_HEADER: OpenWebUIHeaderName = "X-OpenWebUI-User-Id";
+const REQUIRED_NORMAL_CHAT_HEADERS = OPENWEBUI_HEADER_DESCRIPTORS.filter(
+	descriptor => descriptor.requiredFor === "normal-chat",
+).map(descriptor => descriptor.name);
+const TASK_HEADER = OPENWEBUI_HEADER_DESCRIPTORS.find(descriptor => descriptor.requiredFor === "background-task")
+	?.name as OpenWebUIHeaderName;
+const OPTIONAL_USER_HEADER = OPENWEBUI_HEADER_DESCRIPTORS.find(descriptor => descriptor.requiredFor === "optional")
+	?.name as OpenWebUIHeaderName;
 const PLACEHOLDER_PATTERN = /^\{\{[A-Z0-9_]+\}\}$/;
 
 type HeaderValueField = keyof MutableHeaderValues;
 
-const FIELD_BY_HEADER: Record<OpenWebUIHeaderName, HeaderValueField> = {
-	"X-OpenWebUI-Chat-Id": "chatId",
-	"X-OpenWebUI-Message-Id": "messageId",
-	"X-OpenWebUI-User-Message-Id": "userMessageId",
-	"X-OpenWebUI-User-Message-Parent-Id": "userMessageParentId",
-	"X-OpenWebUI-Task": "task",
-	"X-OpenWebUI-User-Id": "userId",
-};
+const FIELD_BY_HEADER = Object.fromEntries(
+	OPENWEBUI_HEADER_DESCRIPTORS.map(descriptor => [descriptor.name, descriptor.field]),
+) as Record<OpenWebUIHeaderName, HeaderValueField>;
 
 interface HeaderLookup {
 	get(name: OpenWebUIHeaderName): string | null;
@@ -70,10 +59,10 @@ export function parseOpenWebUIHeaders(input: OpenWebUIHeaderInput): OpenWebUIHea
 	const task = readHeaderValue(headers, TASK_HEADER);
 	const isBackgroundTask = task !== null;
 	const values: MutableHeaderValues = {
-		chatId: readHeaderValue(headers, "X-OpenWebUI-Chat-Id"),
-		messageId: readHeaderValue(headers, "X-OpenWebUI-Message-Id"),
-		userMessageId: readHeaderValue(headers, "X-OpenWebUI-User-Message-Id"),
-		userMessageParentId: readHeaderValue(headers, "X-OpenWebUI-User-Message-Parent-Id"),
+		chatId: readHeaderValue(headers, OPENWEBUI_HEADER_DESCRIPTORS[0].name),
+		messageId: readHeaderValue(headers, OPENWEBUI_HEADER_DESCRIPTORS[1].name),
+		userMessageId: readHeaderValue(headers, OPENWEBUI_HEADER_DESCRIPTORS[2].name),
+		userMessageParentId: readHeaderValue(headers, OPENWEBUI_HEADER_DESCRIPTORS[3].name),
 		userId: readHeaderValue(headers, OPTIONAL_USER_HEADER),
 		task,
 	};
@@ -84,7 +73,7 @@ export function parseOpenWebUIHeaders(input: OpenWebUIHeaderInput): OpenWebUIHea
 			const value = values[FIELD_BY_HEADER[name]];
 			if (!headers.has(name)) {
 				errors.push(buildHeaderError(name, "missing"));
-			} else if (value === null && name !== "X-OpenWebUI-User-Message-Parent-Id") {
+			} else if (value === null && name !== OPENWEBUI_HEADER_DESCRIPTORS[3].name) {
 				errors.push(buildHeaderError(name, "empty"));
 			}
 		}

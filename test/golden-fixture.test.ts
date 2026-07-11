@@ -63,7 +63,7 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 
 		const allowedRoots = await resolveAllowedRoots([root]);
 		const project = await registerProjectDirectory({ cwd, name: "Golden" }, allowedRoots, createdAt);
-		expect(buildModelList([project]).data[0]).toMatchObject({ id: "gjc/golden", owned_by: "gjc" });
+		expect(buildModelList().data[0]).toMatchObject({ id: "gjc", owned_by: "gjc" });
 
 		const header: SessionHeader = {
 			type: "session",
@@ -182,7 +182,7 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 		const mappings = new FileBackedSessionMappingStore(join(root, "mappings.json"));
 		const liveRunner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings, outbox, ownerUserId });
 		const firstLive = await handleChatCompletions({
-			request: { model: project.modelId, messages: [{ role: "user", content: "start" }] },
+			request: { model: "gjc", messages: [{ role: "user", content: "start" }] },
 			headers: liveHeaders("chat-live", "assistant-1", "user-1", null),
 			projects: [project],
 			owner: { ownerUserId, singleOwnerLocalMode: false },
@@ -193,7 +193,7 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 		});
 		expect(firstLive.ok).toBe(true);
 		const continued = await handleChatCompletions({
-			request: { model: project.modelId, messages: [{ role: "user", content: "continue" }] },
+			request: { model: "gjc", messages: [{ role: "user", content: "continue" }] },
 			headers: liveHeaders("chat-live", "assistant-2", "user-2", "user-1"),
 			projects: [project],
 			owner: { ownerUserId, singleOwnerLocalMode: false },
@@ -208,7 +208,7 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 		expect(deliveredEvents.some(event => event.events.some(item => item.type === "status"))).toBe(true);
 
 		const background = await handleChatCompletions({
-			request: { model: project.modelId, messages: [{ role: "user", content: "title" }] },
+			request: { model: "gjc", messages: [{ role: "user", content: "title" }] },
 			headers: {
 				...liveHeaders("chat-live", "assistant-bg", "user-bg", null),
 				"X-OpenWebUI-Task": "title_generation",
@@ -255,7 +255,7 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 	});
 });
 
-const sseInput = { id: "chatcmpl-golden", created: 1783468800, model: "gjc/golden" };
+const sseInput = { id: "chatcmpl-golden", created: 1783468800, model: "gjc" };
 const deliveredEvents: { events: readonly { type: string }[] }[] = [];
 
 class GoldenTurnRunner implements GjcTurnRunner {

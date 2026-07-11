@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { LiveGatewayRunner } from "../src/live/chat-completions";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import type { RegisteredProject } from "../src/projects/registry";
-import { createAdapterRequestHandler } from "../src/server";
+import { createAdapterRequestHandler, initializeRuntimeReadiness } from "../src/server";
 
 describe("createAdapterRequestHandler", () => {
 	test("returns health status", async () => {
@@ -33,7 +33,7 @@ describe("createAdapterRequestHandler", () => {
 		expect(response.status).toBe(200);
 		expect(await response.json()).toEqual({
 			object: "list",
-			data: [{ id: "gjc/demo", object: "model", created: 1783468800, owned_by: "gjc" }],
+			data: [{ id: "gjc", object: "model", created: 0, owned_by: "gjc" }],
 		});
 	});
 
@@ -53,7 +53,7 @@ describe("createAdapterRequestHandler", () => {
 					"X-OpenWebUI-User-Message-Parent-Id": "",
 					"X-OpenWebUI-User-Id": "owner-1",
 				},
-				body: JSON.stringify({ model: "gjc/demo", messages: [{ role: "user", content: "hello" }] }),
+				body: JSON.stringify({ model: "gjc", messages: [{ role: "user", content: "hello" }] }),
 			}),
 		);
 
@@ -104,13 +104,105 @@ describe("createAdapterRequestHandler", () => {
 					"X-OpenWebUI-User-Message-Parent-Id": "",
 					"X-OpenWebUI-User-Id": "owner-1",
 				},
-				body: JSON.stringify({ model: "gjc/demo", stream: true, messages: [{ role: "user", content: "hello" }] }),
+				body: JSON.stringify({ model: "gjc", stream: true, messages: [{ role: "user", content: "hello" }] }),
 			}),
 		);
 
 		expect(response.status).toBe(200);
 		expect(response.headers.get("content-type")).toStartWith("text/event-stream");
 		expect(await response.text()).toContain("data: [DONE]");
+	});
+	test("gates provider traffic until startup authentication and prompt hints recover", async () => {
+		const originalFetch = globalThis.fetch;
+		let authAttempts = 0;
+		globalThis.fetch = (async (input: string | Request | URL, init?: RequestInit) => {
+			if (String(input).endsWith("/auths/") && ++authAttempts === 1) return new Response("denied", { status: 401 });
+			if (String(input).endsWith("/auths/")) return Response.json({ id: "owner" });
+			if (String(input).endsWith("/api/config")) return Response.json({ default_prompt_suggestions: [] });
+			if (init?.method === "POST")
+				return Response.json([{ title: ["GJC"], content: "Use the GJC coding agent to work on this project." }]);
+			return new Response("unexpected", { status: 500 });
+		}) as typeof fetch;
+		try {
+			const handler = createAdapterRequestHandler({
+				routes: { projects: [project], owner, runner: fixedRunner("handled") },
+				runtime: {
+					adapterToken: "adapter",
+					readinessToken: "ready",
+					openWebUIBaseUrl: "http://openwebui.test",
+					openWebUIApiToken: "api",
+				},
+			});
+			const response = await handler(
+				new Request("http://adapter.test/v1/models", { headers: { authorization: "Bearer adapter" } }),
+			);
+			expect(response.status).toBe(200);
+			expect(authAttempts).toBe(2);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+	test("retries transient authentication failure and recovers readiness", async () => {
+		const originalFetch = globalThis.fetch;
+		let authAttempts = 0;
+		globalThis.fetch = (async (input: string | Request | URL, init?: RequestInit) => {
+			if (String(input).endsWith("/auths/") && ++authAttempts === 1) return new Response("denied", { status: 401 });
+			if (String(input).endsWith("/auths/")) return Response.json({ id: "owner" });
+			if (String(input).endsWith("/api/config")) return Response.json({ default_prompt_suggestions: [] });
+			if (init?.method === "POST")
+				return Response.json([{ title: ["GJC"], content: "Use the GJC coding agent to work on this project." }]);
+			return new Response("unexpected", { status: 500 });
+		}) as typeof fetch;
+		try {
+			const state = await initializeRuntimeReadiness({
+				adapterToken: "adapter",
+				readinessToken: "ready",
+				openWebUIBaseUrl: "http://openwebui.test",
+				openWebUIApiToken: "api",
+			});
+			expect(state.openWebUIAuthenticated).toBe(true);
+			expect(state.promptHintsSeeded).toBe(true);
+			expect(authAttempts).toBe(2);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+	test("recovers after the bounded startup reconciliation attempts are exhausted", async () => {
+		const originalFetch = globalThis.fetch;
+		let authAttempts = 0;
+		globalThis.fetch = (async (input: string | Request | URL, init?: RequestInit) => {
+			if (String(input).endsWith("/auths/") && ++authAttempts <= 3) return new Response("denied", { status: 503 });
+			if (String(input).endsWith("/auths/")) return Response.json({ id: "owner" });
+			if (String(input).endsWith("/api/config")) return Response.json({ default_prompt_suggestions: [] });
+			if (init?.method === "POST")
+				return Response.json([{ title: ["GJC"], content: "Use the GJC coding agent to work on this project." }]);
+			return new Response("unexpected", { status: 500 });
+		}) as typeof fetch;
+		try {
+			const handler = createAdapterRequestHandler({
+				routes: { projects: [project], owner, runner: fixedRunner("handled") },
+				runtime: {
+					adapterToken: "adapter",
+					readinessToken: "ready",
+					openWebUIBaseUrl: "http://openwebui.test",
+					openWebUIApiToken: "api",
+				},
+			});
+			const initial = await handler(
+				new Request("http://adapter.test/v1/models", { headers: { authorization: "Bearer adapter" } }),
+			);
+			expect(initial.status).toBe(503);
+			expect(authAttempts).toBe(3);
+
+			await new Promise(resolve => setTimeout(resolve, 120));
+			const recovered = await handler(
+				new Request("http://adapter.test/v1/models", { headers: { authorization: "Bearer adapter" } }),
+			);
+			expect(recovered.status).toBe(200);
+			expect(authAttempts).toBe(4);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
 	});
 });
 

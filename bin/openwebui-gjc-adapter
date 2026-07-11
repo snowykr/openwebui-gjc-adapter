@@ -1,0 +1,14 @@
+#!/usr/bin/env bun
+
+import { realpathSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+const launcherPath = realpathSync(fileURLToPath(import.meta.url));
+const packageRoot = dirname(dirname(launcherPath));
+const cliModule = await import(pathToFileURL(join(packageRoot, "src", "cli.ts")).href);
+const exitCode = await cliModule.runCli(process.argv.slice(2));
+
+if (exitCode !== 0) {
+	process.exitCode = exitCode;
+}

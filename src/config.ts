@@ -1,3 +1,14 @@
+import {
+	DEFAULT_EXISTING_PROJECT_ROOT,
+	defaultConfigPath,
+	type InstalledConfig,
+	type InstalledMode,
+	readInstalledConfig,
+} from "./configure/private-config";
+
+export type { InstalledConfig, InstalledMode };
+export { defaultConfigPath, readInstalledConfig };
+
 import { REQUIRED_OPENWEBUI_HEADER_NAMES, type RequiredOpenWebUIHeaderName } from "./contracts";
 
 export interface AdapterConfig {
@@ -5,6 +16,10 @@ export interface AdapterConfig {
 	bindPort: number;
 	openWebUIBaseUrl: string;
 	openWebUIApiToken?: string;
+	adapterToken?: string;
+	readinessToken?: string;
+	mode?: InstalledMode;
+	installationId?: string;
 	openWebUIAdminEmail?: string;
 	openWebUIAdminPassword?: string;
 	ownerUserId?: string;
@@ -145,5 +160,24 @@ export function buildStartupDiagnostics(config: AdapterConfig): StartupDiagnosti
 		missingAllowedProjectRoots,
 		expectedHeaderNames: [...REQUIRED_OPENWEBUI_HEADER_NAMES],
 		messages,
+	};
+}
+export function loadInstalledAdapterConfig(path?: string): AdapterConfig {
+	const installed = readInstalledConfig(path);
+	const managed = installed.mode === "managed";
+	const projectRoot = managed ? "/workspace" : (installed.projectRoot ?? DEFAULT_EXISTING_PROJECT_ROOT);
+	return {
+		bindHost: installed.bindHost,
+		bindPort: installed.bindPort,
+		openWebUIBaseUrl: managed ? "http://openwebui:8080" : installed.openWebUIApiUrl,
+		openWebUIApiToken: installed.openWebUIApiToken,
+		adapterToken: installed.adapterToken,
+		readinessToken: installed.readinessToken,
+		mode: installed.mode,
+		installationId: installed.installationId,
+		statePath: managed ? "/var/lib/gjc" : ".gjc/openwebui-adapter",
+		gjcCommand: managed ? "/opt/openwebui-gjc-adapter/node_modules/.bin/gjc" : "gjc",
+		sessionRoot: managed ? "/run/gjc-session" : `${projectRoot}/.gjc/sessions`,
+		allowedProjectRoots: [projectRoot],
 	};
 }
