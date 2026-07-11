@@ -1,19 +1,21 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli } from "../src/cli";
 import { openSecretFile } from "../src/configure/credentials";
 import {
 	acquireConfigLock,
+	acquireRouteLock,
 	canonicalizeUrl,
+	defaultConfigPath,
 	type InstalledConfig,
 	readInstalledConfig,
 	writeInstalledConfig,
 } from "../src/configure/private-config";
 
 function setup(): { directory: string; config: string; cleanup: () => void } {
-	const directory = mkdtempSync(join(tmpdir(), "gjc-configure-urls-"));
+	const directory = realpathSync(mkdtempSync(join(tmpdir(), "gjc-configure-urls-")));
 	return {
 		directory,
 		config: join(directory, "nested", "config.json"),
@@ -116,6 +118,46 @@ describe("configure URL and persistence contracts", () => {
 				release();
 			}
 			expect(() => statSync(`${t.config}.lock`)).toThrow();
+		} finally {
+			t.cleanup();
+		}
+	});
+
+	test("recovers a configuration lock left by a dead owner", () => {
+		const t = setup();
+		try {
+			mkdirSync(join(t.directory, "nested"), { recursive: true });
+			writeFileSync(`${t.config}.lock`, "999999999\n", { mode: 0o600 });
+			const release = acquireConfigLock(t.config);
+			release();
+		} finally {
+			t.cleanup();
+		}
+	});
+
+	test("rejects a symbolic-link configuration lock before reading its owner", () => {
+		const t = setup();
+		try {
+			mkdirSync(join(t.directory, "nested"), { recursive: true });
+			symlinkSync(join(t.directory, "missing-lock-owner"), `${t.config}.lock`);
+			expect(() => acquireConfigLock(t.config)).toThrow("config lock must not traverse a symbolic link");
+		} finally {
+			t.cleanup();
+		}
+	});
+
+	test("serializes configuration routes through one per-user lock", () => {
+		const t = setup();
+		try {
+			const lockPath = `${defaultConfigPath(t.directory)}.route.lock`;
+			const release = acquireRouteLock(t.directory);
+			try {
+				expect(statSync(lockPath).mode & 0o777).toBe(0o600);
+				expect(() => acquireRouteLock(t.directory)).toThrow("already being modified");
+			} finally {
+				release();
+			}
+			expect(() => statSync(lockPath)).toThrow();
 		} finally {
 			t.cleanup();
 		}

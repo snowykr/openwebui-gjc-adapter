@@ -229,18 +229,36 @@ export function writeInstalledConfig(config: InstalledConfig, path = defaultConf
 export function acquireConfigLock(path = defaultConfigPath()): () => void {
 	rejectSymlink(path, "config path");
 	const lockPath = `${path}.lock`;
+	rejectSymlink(lockPath, "config lock");
 	mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
 	let fd: number;
 	try {
 		fd = openSync(lockPath, "wx", 0o600);
 	} catch {
-		throw new ConfigFileError("configuration is already being modified");
+		if (lockOwnerIsAlive(lockPath)) throw new ConfigFileError("configuration is already being modified");
+		rmSync(lockPath, { force: true });
+		try {
+			fd = openSync(lockPath, "wx", 0o600);
+		} catch {
+			throw new ConfigFileError("configuration is already being modified");
+		}
 	}
+	writeFileSync(fd, `${process.pid}\n`);
 	return () => {
 		closeSync(fd);
 		rmSync(lockPath, { force: true });
 	};
 }
-export function acquireRouteLock(path = defaultConfigPath()): () => void {
-	return acquireConfigLock(`${path}.route`);
+function lockOwnerIsAlive(lockPath: string): boolean {
+	try {
+		const pid = Number(readFileSync(lockPath, "utf8").trim());
+		if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+export function acquireRouteLock(home = process.env.HOME): () => void {
+	return acquireConfigLock(`${defaultConfigPath(home)}.route`);
 }

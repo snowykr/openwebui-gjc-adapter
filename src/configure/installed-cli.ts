@@ -997,7 +997,7 @@ export async function runInstalledCli(
 		const path = optionValue(options, "config") ?? defaultConfigPath();
 		if (command.kind === "configure") {
 			const unlock = acquireConfigLock(path);
-			const unlockRoute = acquireRouteLock(path);
+			const unlockRoute = acquireRouteLock();
 			try {
 				await configure(
 					command.mode,
