@@ -1,0 +1,3 @@
+foo@1.0.0
+  postinstall: node install.js
+These dependencies had their lifecycle scripts blocked during install.
