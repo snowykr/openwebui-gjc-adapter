@@ -73,6 +73,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
@@ -93,7 +94,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           git worktree add --detach "$RUNNER_TEMP/base" "$BASE_SHA"
-          BASE_ROOT="$RUNNER_TEMP/base" HEAD_ROOT="$GITHUB_WORKSPACE" BASE_SHA="$BASE_SHA" HEAD_SHA="$HEAD_SHA" bun scripts/ci-dependency-diff-policy.ts
+          BASE_ROOT="$RUNNER_TEMP/base" HEAD_ROOT="$GITHUB_WORKSPACE" BASE_SHA="$BASE_SHA" HEAD_SHA="$HEAD_SHA" bun --cwd "$RUNNER_TEMP/base" ./scripts/ci-dependency-diff-policy.ts
   package-consumer:
     name: Package consumer (probationary)
     runs-on: ubuntu-24.04
