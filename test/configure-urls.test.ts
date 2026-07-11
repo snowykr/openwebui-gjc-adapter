@@ -135,6 +135,29 @@ describe("configure URL and persistence contracts", () => {
 		}
 	});
 
+	test("does not reclaim an incomplete lock while its owner may still be initializing", () => {
+		const t = setup();
+		try {
+			mkdirSync(join(t.directory, "nested"), { recursive: true });
+			writeFileSync(`${t.config}.lock`, "", { mode: 0o600 });
+			expect(() => acquireConfigLock(t.config)).toThrow("already being modified");
+		} finally {
+			t.cleanup();
+		}
+	});
+
+	test("recovers a stale lock-recovery marker", () => {
+		const t = setup();
+		try {
+			mkdirSync(join(t.directory, "nested"), { recursive: true });
+			writeFileSync(`${t.config}.lock.recovery`, "999999999\n", { mode: 0o600 });
+			const release = acquireConfigLock(t.config);
+			release();
+		} finally {
+			t.cleanup();
+		}
+	});
+
 	test("rejects a symbolic-link configuration lock before reading its owner", () => {
 		const t = setup();
 		try {
@@ -159,6 +182,35 @@ describe("configure URL and persistence contracts", () => {
 			}
 			expect(() => statSync(lockPath)).toThrow();
 		} finally {
+			t.cleanup();
+		}
+	});
+
+	test("releases the config lock when route-lock acquisition fails", async () => {
+		const t = setup();
+		const home = process.env.HOME;
+		process.env.HOME = t.directory;
+		const releaseRoute = acquireRouteLock(t.directory);
+		try {
+			const result = await runCli(
+				[
+					"configure",
+					"existing",
+					"--config",
+					t.config,
+					`--openwebui-api-token-fd=${fd(t.directory, "route-lock-token", "api-token")}`,
+					"--adapter-ingress-url=http://gateway.test/v1",
+					"--openwebui-url=http://openwebui.test",
+				],
+				successfulExistingDependencies(),
+			);
+			expect(result).toBe(1);
+			const releaseConfig = acquireConfigLock(t.config);
+			releaseConfig();
+		} finally {
+			releaseRoute();
+			if (home === undefined) delete process.env.HOME;
+			else process.env.HOME = home;
 			t.cleanup();
 		}
 	});

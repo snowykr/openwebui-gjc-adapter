@@ -1,7 +1,10 @@
 import { randomBytes } from "node:crypto";
 import {
 	closeSync,
+	constants,
+	fstatSync,
 	fsyncSync,
+	linkSync,
 	lstatSync,
 	mkdirSync,
 	openSync,
@@ -229,35 +232,100 @@ export function writeInstalledConfig(config: InstalledConfig, path = defaultConf
 export function acquireConfigLock(path = defaultConfigPath()): () => void {
 	rejectSymlink(path, "config path");
 	const lockPath = `${path}.lock`;
+	const recoveryPath = `${lockPath}.recovery`;
 	rejectSymlink(lockPath, "config lock");
+	rejectSymlink(recoveryPath, "config lock recovery");
 	mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
+	if (lockExists(recoveryPath)) {
+		if (!lockOwnerIsDead(recoveryPath)) throw new ConfigFileError("configuration is already being modified");
+		rmSync(recoveryPath);
+	}
+	const fd = tryAcquireLock(lockPath) ?? recoverDeadLock(lockPath, recoveryPath);
+	return () => releaseLock(lockPath, fd);
+}
+
+function tryAcquireLock(lockPath: string): number | undefined {
+	const temporary = `${lockPath}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+	const fd = openSync(temporary, "wx", 0o600);
+	let linked = false;
+	try {
+		writeFileSync(fd, `${process.pid}\n`);
+		fsyncSync(fd);
+		try {
+			linkSync(temporary, lockPath);
+			linked = true;
+			return fd;
+		} catch (error) {
+			if (isErrno(error, "EEXIST")) return undefined;
+			throw error;
+		}
+	} finally {
+		rmSync(temporary, { force: true });
+		if (!linked) closeSync(fd);
+	}
+}
+
+function recoverDeadLock(lockPath: string, recoveryPath: string): number {
+	const recoveryFd = tryAcquireLock(recoveryPath);
+	if (recoveryFd === undefined) throw new ConfigFileError("configuration is already being modified");
+	try {
+		if (!lockOwnerIsDead(lockPath)) throw new ConfigFileError("configuration is already being modified");
+		rmSync(lockPath);
+		const fd = tryAcquireLock(lockPath);
+		if (fd === undefined) throw new ConfigFileError("configuration is already being modified");
+		return fd;
+	} finally {
+		releaseLock(recoveryPath, recoveryFd);
+	}
+}
+
+function lockOwnerIsDead(lockPath: string): boolean {
+	rejectSymlink(lockPath, "config lock");
 	let fd: number;
 	try {
-		fd = openSync(lockPath, "wx", 0o600);
-	} catch {
-		if (lockOwnerIsAlive(lockPath)) throw new ConfigFileError("configuration is already being modified");
-		rmSync(lockPath, { force: true });
-		try {
-			fd = openSync(lockPath, "wx", 0o600);
-		} catch {
-			throw new ConfigFileError("configuration is already being modified");
-		}
-	}
-	writeFileSync(fd, `${process.pid}\n`);
-	return () => {
-		closeSync(fd);
-		rmSync(lockPath, { force: true });
-	};
-}
-function lockOwnerIsAlive(lockPath: string): boolean {
-	try {
-		const pid = Number(readFileSync(lockPath, "utf8").trim());
-		if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-		process.kill(pid, 0);
-		return true;
+		fd = openSync(lockPath, constants.O_RDONLY | constants.O_NOFOLLOW);
 	} catch {
 		return false;
 	}
+	try {
+		if (!fstatSync(fd).isFile()) return false;
+		const pid = Number(readFileSync(fd, "utf8").trim());
+		if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+		try {
+			process.kill(pid, 0);
+			return false;
+		} catch (error) {
+			return isErrno(error, "ESRCH");
+		}
+	} finally {
+		closeSync(fd);
+	}
+}
+
+function lockExists(path: string): boolean {
+	try {
+		lstatSync(path);
+		return true;
+	} catch (error) {
+		if (isErrno(error, "ENOENT")) return false;
+		throw error;
+	}
+}
+
+function releaseLock(lockPath: string, fd: number): void {
+	try {
+		const held = fstatSync(fd);
+		const current = lstatSync(lockPath);
+		if (current.dev === held.dev && current.ino === held.ino) rmSync(lockPath);
+	} catch (error) {
+		if (!isErrno(error, "ENOENT")) throw error;
+	} finally {
+		closeSync(fd);
+	}
+}
+
+function isErrno(error: unknown, code: string): boolean {
+	return error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === code;
 }
 export function acquireRouteLock(home = process.env.HOME): () => void {
 	return acquireConfigLock(`${defaultConfigPath(home)}.route`);
