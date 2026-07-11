@@ -705,6 +705,25 @@ describe("configure CLI grammar and acknowledgements", () => {
 			expect(existsSync(t.config)).toBe(false);
 			expect(existsSync(`${t.config}.bootstrap.json`)).toBe(false);
 			expect(existsSync(`${t.config}.recovery.json`)).toBe(false);
+			const deniedExistingRoot = join(t.directory, "denied-existing-reset-root");
+			const deniedExisting = await runCli(
+				[
+					"configure",
+					"existing",
+					"--config",
+					t.config,
+					"--reset",
+					"--reset-proof=denied-existing-reset",
+					"--project-root",
+					deniedExistingRoot,
+					"--openwebui-url=http://existing.test",
+					"--adapter-ingress-url=http://gateway.test",
+					`--openwebui-api-token-fd=${secretFd(t.directory, "existing-rejected", "token")}`,
+				],
+				{ ...dependencies, confirmReset: () => false },
+			);
+			expect(deniedExisting).toBe(1);
+			expect(existsSync(deniedExistingRoot)).toBe(false);
 			const result = await runCli(
 				[
 					"configure",
@@ -1617,6 +1636,13 @@ describe("configure CLI grammar and acknowledgements", () => {
 				controllerRecoveryRequired: true,
 				controllerQuiesced: true,
 			});
+			const interruptedRecovery = JSON.parse(capturedBootstrap!);
+			interruptedRecovery.pendingRecovery.controllerQuiesced = false;
+			interruptedRecovery.pendingRecovery.linkage = interruptedRecovery.pendingRecovery.linkage.replace(
+				":controller-quiesced",
+				":controller-live",
+			);
+			capturedBootstrap = JSON.stringify(interruptedRecovery);
 
 			// Preserve the durable artifacts written before the interruption as a process-boundary retry would.
 			writeFileSync(`${t.config}.bootstrap.json`, capturedBootstrap!);
@@ -1652,10 +1678,10 @@ describe("configure CLI grammar and acknowledgements", () => {
 					},
 				),
 			).toBe(1);
-			expect(systemctlCalls).not.toEqual(
+			expect(systemctlCalls).not.toContain("systemctl --user is-enabled openwebui-gjc-adapter-existing.service");
+			expect(systemctlCalls).not.toContain("systemctl --user is-active openwebui-gjc-adapter-existing.service");
+			expect(systemctlCalls).toEqual(
 				expect.arrayContaining([
-					"systemctl --user is-enabled openwebui-gjc-adapter-existing.service",
-					"systemctl --user is-active openwebui-gjc-adapter-existing.service",
 					"systemctl --user stop openwebui-gjc-adapter-existing.service",
 					"systemctl --user disable openwebui-gjc-adapter-existing.service",
 				]),

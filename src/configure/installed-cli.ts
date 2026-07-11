@@ -812,8 +812,13 @@ function productionDeployment(
 		if (tx.controllers.enabled) attempt(() => run(["systemctl", "--user", "enable", unit]));
 		if (tx.controllers.active) attempt(() => run(["systemctl", "--user", "start", unit]));
 		if (errors.length === 0 && tx.previous) {
-			clearPendingRecoveryJournal(path);
-			clearDurableDeploymentSnapshot(path);
+			attempt(() => {
+				const pending = readPendingRecoveryJournal(path);
+				if (pending === undefined) throw new Error("rollback recovery journal is missing");
+				markDurableDeploymentSnapshotComplete(path, pending.transactionId);
+				clearPendingRecoveryJournal(path);
+				clearDurableDeploymentSnapshot(path);
+			});
 		}
 		return errors;
 	};
@@ -912,7 +917,7 @@ function productionDeployment(
 			const evidence = input.proof.evidence;
 			if (!evidence.trim()) throw new Error("reset requires proof for the persisted failed phase");
 			const pending = readPendingRecoveryJournal(path);
-			const resumedRecovery = pending?.controllerRecoveryRequired === true && pending.controllerQuiesced === true;
+			const resumedRecovery = pending?.controllerRecoveryRequired === true;
 			const tx = resumedRecovery
 				? transactionFromDisk()
 				: (() => {
@@ -1389,7 +1394,6 @@ async function configure(
 		bindPort,
 		projectRoot,
 	};
-	if (mode === "existing") prepareExistingProjectRoot(projectRoot!);
 	const pendingRecovery: PendingRecoveryRecord = pending ?? {
 		version: 1,
 		mode,
@@ -1431,6 +1435,7 @@ async function configure(
 					? "route"
 					: undefined);
 	}
+	if (mode === "existing") prepareExistingProjectRoot(projectRoot!);
 	if (!existsSync(recoverySnapshotPath(path))) {
 		const userUnitDirectory = join(
 			process.env.XDG_CONFIG_HOME ?? join(process.env.HOME ?? "", ".config"),
