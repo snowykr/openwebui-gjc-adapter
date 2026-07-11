@@ -1,11 +1,12 @@
+import { createHash } from "node:crypto";
 import * as path from "node:path";
 import { type AllowedRoot, assertPathInsideAllowedRoots } from "../security/paths";
 
 export interface RegisteredProject {
 	readonly id: string;
 	readonly name: string;
+	readonly openWebUIFolderName?: string;
 	readonly cwd: string;
-	readonly modelId: `gjc/${string}`;
 	readonly openWebUIFolderId?: string;
 	readonly allowedRoot: string;
 	readonly sessionRoot?: string;
@@ -19,19 +20,10 @@ export interface RegisterProjectDirectoryInput {
 	readonly sessionRoot?: string;
 }
 
-export interface OpenAIModelListEntry {
-	readonly id: string;
-	readonly object: "model";
-	readonly created: number;
-	readonly owned_by: "gjc";
-}
-
 export interface ProjectFolderMetadata {
 	readonly gjc_adapter: {
 		readonly projectId: string;
-		readonly cwd: string;
-		readonly modelId: string;
-		readonly sessionRoot?: string;
+		readonly projectName: string;
 	};
 }
 
@@ -47,22 +39,55 @@ export function createProjectId(nameOrCwd: string): string {
 	return slug.length > 0 ? slug : "project";
 }
 
+export function disambiguateRegisteredProjects(projects: readonly RegisteredProject[]): readonly RegisteredProject[] {
+	const idCounts = new Map<string, number>();
+	const nameCounts = new Map<string, number>();
+	for (const project of projects) {
+		idCounts.set(project.id, (idCounts.get(project.id) ?? 0) + 1);
+		nameCounts.set(project.name, (nameCounts.get(project.name) ?? 0) + 1);
+	}
+	const withDisambiguatedNames = projects.map(project => {
+		if ((nameCounts.get(project.name) ?? 0) <= 1) return project;
+		return { ...project, openWebUIFolderName: disambiguatedFolderName(project) };
+	});
+	const folderNameCounts = new Map<string, number>();
+	for (const project of withDisambiguatedNames) {
+		const folderName = project.openWebUIFolderName ?? project.name;
+		folderNameCounts.set(folderName, (folderNameCounts.get(folderName) ?? 0) + 1);
+	}
+
+	return withDisambiguatedNames.map(project => {
+		const id =
+			(idCounts.get(project.id) ?? 0) <= 1 ? project.id : `${project.id}-${projectPathFingerprint(project.cwd)}`;
+		const folderName = project.openWebUIFolderName ?? project.name;
+		const openWebUIFolderName =
+			(folderNameCounts.get(folderName) ?? 0) <= 1
+				? folderName
+				: `${folderName} ${projectPathFingerprint(project.cwd)}`;
+		return { ...project, id, openWebUIFolderName };
+	});
+}
+
 export async function registerProjectDirectory(
 	input: RegisterProjectDirectoryInput,
 	allowedRoots: readonly AllowedRoot[],
 	now: Date = new Date(),
 ): Promise<RegisteredProject> {
 	const cwd = await assertPathInsideAllowedRoots(input.cwd, allowedRoots);
+	const sessionRoot = await assertPathInsideAllowedRoots(
+		input.sessionRoot ?? path.join(cwd, ".gjc", "sessions"),
+		allowedRoots,
+	);
 	const id = createProjectId(input.name ?? cwd);
 	const allowedRoot = findAllowedRoot(cwd, allowedRoots);
 
 	return {
 		id,
 		name: input.name ?? path.basename(cwd),
+		openWebUIFolderName: input.name ?? path.basename(cwd),
 		cwd,
-		modelId: `gjc/${id}`,
 		openWebUIFolderId: input.openWebUIFolderId,
-		sessionRoot: input.sessionRoot,
+		sessionRoot,
 		allowedRoot,
 		createdAt: new Date(now),
 	};
@@ -72,20 +97,9 @@ export function buildProjectFolderMetadata(project: RegisteredProject): ProjectF
 	return {
 		gjc_adapter: {
 			projectId: project.id,
-			cwd: project.cwd,
-			modelId: project.modelId,
-			sessionRoot: project.sessionRoot,
+			projectName: project.name,
 		},
 	};
-}
-
-export function listProjectModels(projects: readonly RegisteredProject[]): OpenAIModelListEntry[] {
-	return projects.map(project => ({
-		id: project.modelId,
-		object: "model",
-		created: Math.floor(project.createdAt.getTime() / 1000),
-		owned_by: "gjc",
-	}));
 }
 
 function findAllowedRoot(cwd: string, allowedRoots: readonly AllowedRoot[]): string {
@@ -99,4 +113,20 @@ function findAllowedRoot(cwd: string, allowedRoots: readonly AllowedRoot[]): str
 function isPathInsideRoot(targetPath: string, rootPath: string): boolean {
 	const relativePath = path.relative(rootPath, targetPath);
 	return relativePath === "" || (!relativePath.startsWith("..") && !path.isAbsolute(relativePath));
+}
+
+function projectPathFingerprint(cwd: string): string {
+	return createHash("sha256").update(cwd).digest("hex").slice(0, 8);
+}
+
+function disambiguatedFolderName(project: RegisteredProject): string {
+	return `${project.name} (${projectFolderLabel(project)})`;
+}
+
+function projectFolderLabel(project: RegisteredProject): string {
+	const relativePath = path.relative(project.allowedRoot, project.cwd);
+	if (relativePath !== "" && !relativePath.startsWith("..") && !path.isAbsolute(relativePath)) {
+		return relativePath;
+	}
+	return projectPathFingerprint(project.cwd);
 }

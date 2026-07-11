@@ -19,16 +19,18 @@
 		"openwebui-gjc-adapter": "./bin/openwebui-gjc-adapter"
 	},
 	"scripts": {
+		"start": "bun run src/cli.ts",
 		"check": "biome check . && bun run check:types",
 		"check:types": "tsgo -p tsconfig.json --noEmit",
 		"lint": "biome lint .",
 		"test": "bun test",
+		"e2e:real-openwebui": "bun run scripts/e2e-real-openwebui.ts",
 		"fix": "biome check --write --unsafe .",
 		"fmt": "biome format --write ."
 	},
 	"dependencies": {
-		"@gajae-code/ai": "0.9.0",
-		"@gajae-code/coding-agent": "0.9.0"
+		"@gajae-code/ai": "0.9.4",
+		"@gajae-code/coding-agent": "0.9.4"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.4.14",
@@ -51,6 +53,10 @@
 		".": {
 			"types": "./src/index.ts",
 			"import": "./src/index.ts"
+		},
+		"./cli": {
+			"types": "./src/cli.ts",
+			"import": "./src/cli.ts"
 		},
 		"./*": {
 			"types": "./src/*.ts",

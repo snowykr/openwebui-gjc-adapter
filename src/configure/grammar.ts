@@ -14,7 +14,7 @@ export class CliUsageError extends Error {
 const optionNames = new Set([
 	"config",
 	"admin-email-fd",
-	"admin-password-fd",
+	"admin-password-fd", // ggignore: CLI option name; credential values only arrive through an inherited FD.
 	"openwebui-api-token-fd",
 	"adapter-ingress-url",
 	"bind-host",
@@ -25,7 +25,7 @@ const optionNames = new Set([
 	"reset",
 	"reset-proof",
 ]);
-const fdNames = ["admin-email-fd", "admin-password-fd", "openwebui-api-token-fd"];
+const fdNames = ["admin-email-fd", "admin-password-fd", "openwebui-api-token-fd"]; // ggignore: CLI option names, not credential values.
 function option(options: Record<string, string | boolean>, name: string): string | undefined {
 	const value = options[name];
 	return typeof value === "string" ? value : undefined;

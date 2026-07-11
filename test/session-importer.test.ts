@@ -8,7 +8,6 @@ const project = {
 	name: "Project One",
 	metadata: { color: "blue" },
 };
-
 const projectedChat = {
 	id: "session-1",
 	title: "GJC Session",
@@ -28,7 +27,6 @@ describe("importProjectedSession", () => {
 			project,
 			projectedChat,
 		});
-
 		const chat = await repository.getChat("owner-1", result.chatId);
 
 		expect(result).toEqual({
@@ -209,5 +207,44 @@ describe("importProjectedSession", () => {
 			operation_id: "upsert-chat-message-1",
 		});
 		expect(chat?.history.messages["gjc-session-session-tree-message-a1"]).toBeUndefined();
+	});
+
+	test("drops stale OpenWebUI status history fields during historical reimport", async () => {
+		const repository = new InMemoryOpenWebUIProjectionRepository();
+		const contaminatedMessage = {
+			id: "m1",
+			role: "assistant",
+			content: "Clean content",
+			statusHistory: [
+				{
+					gjc_adapter: {
+						metadata: {
+							text: "/home/snowy/coding/private prompt",
+						},
+					},
+				},
+			],
+		};
+		const historicalChat = {
+			id: "session-cleanup",
+			title: "Cleanup",
+			history: {
+				currentId: "m1",
+				messages: {
+					m1: contaminatedMessage,
+				},
+			},
+		};
+
+		await importProjectedSession({
+			repository,
+			ownerUserId: "owner-1",
+			project,
+			projectedChat: historicalChat,
+		});
+		const chat = await repository.getChat("owner-1", "gjc-session-session-cleanup");
+
+		expect(JSON.stringify(chat?.history.messages)).not.toContain("statusHistory");
+		expect(JSON.stringify(chat?.history.messages)).not.toContain("/home/snowy/coding/private prompt");
 	});
 });

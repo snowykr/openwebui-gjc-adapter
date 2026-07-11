@@ -57,7 +57,7 @@ describe("projectGjcSessionToOpenWebUIChat", () => {
 			content: "hi",
 		});
 		expect(chat.metadata.gjc_adapter).toMatchObject({
-			sessionFile: "/tmp/session.jsonl",
+			sessionFileName: "session.jsonl",
 			gjcEntryId: "a1",
 			entryCount: 2,
 			messageEntryCount: 2,

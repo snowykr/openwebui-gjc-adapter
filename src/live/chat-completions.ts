@@ -1,73 +1,27 @@
-import { type OpenWebUIOwnerContext, validateForwardedOwnerUserId } from "../openwebui/auth";
-import type { OpenWebUIMessageEvent } from "../openwebui/events";
-import type { OpenWebUIHeaderInput } from "../openwebui/headers";
+import { validateForwardedOwnerUserId } from "../openwebui/auth";
 import { parseOpenWebUIHeaders } from "../openwebui/headers";
-import type { RegisteredProject } from "../projects/registry";
-import { findProjectByModelId } from "./models";
-import type {
-	OpenAIChatCompletionChunk,
-	OpenAIChatCompletionRequest,
-	OpenAIChatCompletionResponse,
-	OpenAIChatContentPart,
-	OpenAIChatMessage,
-} from "./openai-types";
+import {
+	type HandleChatCompletionsInput,
+	type LiveChatCompletionsResult,
+	type LiveGatewayRunnerResult,
+	LiveGatewayUnavailableError,
+	WorkflowGateReplyError,
+} from "./chat-completions-types";
+import { latestUserText } from "./chat-content";
+import { deliverContentAfterChunks, deliverFinalAssistantContent, deliverRunnerEvents } from "./chat-delivery";
+import { buildCompletion, buildOpenAIErrorResponse, encodeChatCompletionSse } from "./chat-response-format";
+import { appendResolvedFileContexts } from "./file-contexts";
+import { isGjcOpenWebUIModelId, resolveLiveProjectContext } from "./project-context";
 
-export interface LiveGatewayRunnerInput {
-	readonly project: RegisteredProject;
-	readonly prompt: string;
-	readonly chatId: string;
-	readonly messageId: string;
-	readonly userMessageId: string;
-	readonly userMessageParentId: string | null;
-	readonly continued: boolean;
-}
-
-export type LiveGatewayRunnerResult =
-	| { readonly content: string; readonly chunks?: undefined; readonly events?: readonly OpenWebUIMessageEvent[] }
-	| {
-			readonly content?: undefined;
-			readonly chunks: AsyncIterable<string> | Iterable<string>;
-			readonly events?: readonly OpenWebUIMessageEvent[];
-	  };
-
-export interface LiveGatewayRunner {
-	run(input: LiveGatewayRunnerInput): Promise<LiveGatewayRunnerResult> | LiveGatewayRunnerResult;
-}
-
-export interface LiveGatewayEventDeliveryInput {
-	readonly chatId: string;
-	readonly messageId: string;
-	readonly ownerUserId: string;
-	readonly projectId: string;
-	readonly events: readonly OpenWebUIMessageEvent[];
-}
-
-export type LiveGatewayEventSink = (input: LiveGatewayEventDeliveryInput) => Promise<void> | void;
-
-export type LiveChatCompletionsResult =
-	| { readonly ok: true; readonly status: 200; readonly body: OpenAIChatCompletionResponse }
-	| { readonly ok: true; readonly status: 200; readonly stream: AsyncIterable<string> }
-	| { readonly ok: false; readonly status: 400 | 401 | 404; readonly body: OpenAIErrorResponse };
-
-export interface OpenAIErrorResponse {
-	readonly error: {
-		readonly message: string;
-		readonly type: string;
-		readonly code: string;
-	};
-}
-
-export interface HandleChatCompletionsInput {
-	readonly request: OpenAIChatCompletionRequest;
-	readonly headers: OpenWebUIHeaderInput;
-	readonly projects: readonly RegisteredProject[];
-	readonly owner: OpenWebUIOwnerContext;
-	readonly runner: LiveGatewayRunner;
-	readonly now?: Date;
-	readonly idFactory?: () => string;
-	readonly outbox?: unknown;
-	readonly eventSink?: LiveGatewayEventSink;
-}
+export type {
+	HandleChatCompletionsInput,
+	LiveChatCompletionsResult,
+	LiveGatewayRunner,
+	LiveGatewayRunnerInput,
+	LiveGatewayRunnerResult,
+} from "./chat-completions-types";
+export type { LiveGatewayEventDeliveryInput, LiveGatewayEventSink, LiveGatewayMessageSink } from "./chat-delivery";
+export { LiveGatewayUnavailableError, WorkflowGateReplyError };
 
 export async function handleChatCompletions(input: HandleChatCompletionsInput): Promise<LiveChatCompletionsResult> {
 	const headers = parseOpenWebUIHeaders(input.headers);
@@ -90,13 +44,12 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 		);
 	}
 
-	const project = findProjectByModelId(input.projects, input.request.model);
-	if (project === null) {
-		return errorResult(404, "invalid_request_error", "model_not_found", `Unknown GJC model: ${input.request.model}`);
+	const created = Math.floor((input.now ?? new Date()).getTime() / 1000);
+	const id = input.idFactory?.() ?? `chatcmpl-${created}`;
+	if (!isGjcOpenWebUIModelId(input.request.model)) {
+		return unknownModelResult(input.request.model);
 	}
 
-	const created = toUnixSeconds(input.now ?? new Date());
-	const id = input.idFactory?.() ?? `chatcmpl-${created}`;
 	if (headers.isBackgroundTask) {
 		return {
 			ok: true,
@@ -111,8 +64,17 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 		};
 	}
 
-	const prompt = latestUserText(input.request.messages);
-	if (prompt === null) {
+	if (!Array.isArray(input.request.messages)) {
+		return errorResult(
+			400,
+			"invalid_request_error",
+			"invalid_request_body",
+			"Request body must include a messages array.",
+		);
+	}
+
+	const latestPrompt = latestUserText(input.request.messages, input.request.files);
+	if (latestPrompt === null) {
 		return errorResult(
 			400,
 			"invalid_request_error",
@@ -120,16 +82,59 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 			"A chat completion requires a user message with text content.",
 		);
 	}
-
-	const runnerResult = await input.runner.run({
-		project,
-		prompt,
+	const projectContext = await resolveLiveProjectContext({
+		projects: input.projects,
+		modelId: input.request.model,
+		ownerUserId: input.owner.ownerUserId,
 		chatId: headers.chatId,
-		messageId: headers.messageId,
-		userMessageId: headers.userMessageId,
-		userMessageParentId: headers.userMessageParentId,
-		continued: headers.userMessageParentId !== null,
+		repository: input.projectContextRepository,
+		neutralWorkspace: input.neutralWorkspace,
+		now: input.now,
 	});
+	if (!projectContext.ok) {
+		return errorResult(503, "server_error", projectContext.code, projectContext.message);
+	}
+	const project = projectContext.project;
+	let prompt: string;
+	try {
+		prompt = await appendResolvedFileContexts({
+			prompt: latestPrompt,
+			messages: input.request.messages,
+			files: input.request.files,
+			project,
+			chatId: headers.chatId,
+			userMessageId: headers.userMessageId,
+			resolver: input.fileContextResolver,
+		});
+	} catch {
+		return errorResult(
+			503,
+			"server_error",
+			"attachment_resolution_failed",
+			"OpenWebUI attachment files could not be resolved.",
+		);
+	}
+
+	let runnerResult: LiveGatewayRunnerResult;
+	try {
+		runnerResult = await input.runner.run({
+			project,
+			prompt,
+			chatId: headers.chatId,
+			messageId: headers.messageId,
+			userMessageId: headers.userMessageId,
+			userMessageParentId: headers.userMessageParentId,
+			continued: headers.userMessageParentId !== null,
+		});
+	} catch (error) {
+		if (error instanceof LiveGatewayUnavailableError) {
+			return errorResult(503, "server_error", error.code, error.message);
+		}
+		if (error instanceof WorkflowGateReplyError) {
+			return errorResult(400, "invalid_request_error", error.code, error.message);
+		}
+		throw error;
+	}
 
 	await deliverRunnerEvents({
 		eventSink: input.eventSink,
@@ -145,11 +150,31 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 		return {
 			ok: true,
 			status: 200,
-			stream: encodeChatCompletionSse({ id, created, model: input.request.model, chunks }),
+			stream: encodeChatCompletionSse({
+				id,
+				created,
+				model: input.request.model,
+				chunks: deliverContentAfterChunks({
+					chunks,
+					messageSink: input.messageSink,
+					chatId: headers.chatId,
+					messageId: headers.messageId,
+					ownerUserId: input.owner.ownerUserId,
+					projectId: project.id,
+				}),
+			}),
 		};
 	}
 
 	if (runnerResult.content !== undefined) {
+		await deliverFinalAssistantContent({
+			messageSink: input.messageSink,
+			chatId: headers.chatId,
+			messageId: headers.messageId,
+			ownerUserId: input.owner.ownerUserId,
+			projectId: project.id,
+			content: runnerResult.content,
+		});
 		return {
 			ok: true,
 			status: 200,
@@ -161,6 +186,14 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 	for await (const chunk of runnerResult.chunks) {
 		content += chunk;
 	}
+	await deliverFinalAssistantContent({
+		messageSink: input.messageSink,
+		chatId: headers.chatId,
+		messageId: headers.messageId,
+		ownerUserId: input.owner.ownerUserId,
+		projectId: project.id,
+		content,
+	});
 	return {
 		ok: true,
 		status: 200,
@@ -168,90 +201,19 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 	};
 }
 
-export async function* encodeChatCompletionSse(input: {
-	readonly id: string;
-	readonly created: number;
-	readonly model: string;
-	readonly chunks: AsyncIterable<string> | Iterable<string>;
-}): AsyncIterable<string> {
-	for await (const content of input.chunks) {
-		const chunk: OpenAIChatCompletionChunk = {
-			id: input.id,
-			object: "chat.completion.chunk",
-			created: input.created,
-			model: input.model,
-			choices: [{ index: 0, delta: { role: "assistant", content }, finish_reason: null }],
-		};
-		yield `data: ${JSON.stringify(chunk)}\n\n`;
-	}
-	yield "data: [DONE]\n\n";
+function unknownModelResult(modelId: string): LiveChatCompletionsResult {
+	return errorResult(404, "invalid_request_error", "model_not_found", `Unknown GJC model: ${modelId}`);
 }
 
-function latestUserText(messages: readonly OpenAIChatMessage[]): string | null {
-	for (let index = messages.length - 1; index >= 0; index -= 1) {
-		const message = messages[index];
-		if (message?.role !== "user") continue;
-		return messageContentText(message.content);
-	}
-	return null;
-}
-
-function messageContentText(content: OpenAIChatMessage["content"]): string | null {
-	if (typeof content === "string") return content;
-	if (content === null) return null;
-	const text = content.map(partText).join("").trim();
-	return text.length > 0 ? text : null;
-}
-
-function partText(part: OpenAIChatContentPart): string {
-	return part.text;
-}
-
-function buildCompletion(input: {
-	readonly id: string;
-	readonly created: number;
-	readonly model: string;
-	readonly content: string;
-	readonly metadata?: Record<string, unknown>;
-}): OpenAIChatCompletionResponse {
-	return {
-		id: input.id,
-		object: "chat.completion",
-		created: input.created,
-		model: input.model,
-		choices: [{ index: 0, message: { role: "assistant", content: input.content }, finish_reason: "stop" }],
-		metadata: input.metadata,
-	};
-}
-
-function errorResult(status: 400 | 401 | 404, type: string, code: string, message: string): LiveChatCompletionsResult {
+function errorResult(
+	status: 400 | 401 | 404 | 503,
+	type: string,
+	code: string,
+	message: string,
+): LiveChatCompletionsResult {
 	return {
 		ok: false,
 		status,
-		body: {
-			error: { message, type, code },
-		},
+		body: buildOpenAIErrorResponse({ message, type, code }),
 	};
-}
-
-async function deliverRunnerEvents(input: {
-	readonly eventSink?: LiveGatewayEventSink;
-	readonly events?: readonly OpenWebUIMessageEvent[];
-	readonly chatId: string;
-	readonly messageId: string;
-	readonly ownerUserId: string;
-	readonly projectId: string;
-}): Promise<void> {
-	if (input.eventSink === undefined || input.events === undefined || input.events.length === 0) return;
-	await input.eventSink({
-		chatId: input.chatId,
-		messageId: input.messageId,
-		ownerUserId: input.ownerUserId,
-		projectId: input.projectId,
-		events: input.events,
-	});
-}
-
-function toUnixSeconds(date: Date): number {
-	return Math.floor(date.getTime() / 1000);
 }

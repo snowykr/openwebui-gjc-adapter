@@ -4,19 +4,36 @@ import {
 	buildHealthReport,
 	buildReadinessReport,
 } from "./health";
-import { handleChatCompletions, type LiveGatewayEventSink, type LiveGatewayRunner } from "./live/chat-completions";
-import { buildModelList } from "./live/models";
-import type { OpenAIChatCompletionRequest } from "./live/openai-types";
+import {
+	handleChatCompletions,
+	type LiveChatCompletionsResult,
+	type LiveGatewayEventSink,
+	type LiveGatewayMessageSink,
+	type LiveGatewayRunner,
+} from "./live/chat-completions";
+import { parseChatCompletionRequest } from "./live/chat-request-parser";
+import type { LiveGatewayFileContextResolver } from "./live/file-contexts";
 import type { OpenWebUIOwnerContext } from "./openwebui/auth";
-import type { OpenWebUIHeaderInput } from "./openwebui/headers";
+import type { OpenWebUIProjectionRepository } from "./openwebui/client";
 import {
 	mergePromptHints,
 	OPENWEBUI_CONFIG_ENDPOINT,
 	OPENWEBUI_PROMPT_HINTS_ENDPOINT,
 	promptHintsFromConfig,
 } from "./openwebui/prompt-hints";
+import {
+	buildProjectModelList,
+	handleProjectAdminChatCompletion,
+	handleProjectLinkRequest,
+	handleProjectListRequest,
+	handleProjectUnlinkRequest,
+	isProjectAdminChatCompletionRequest,
+	isProjectUnlinkPath,
+	parseProjectAdminJsonRequest,
+	projectIdFromUnlinkPath,
+} from "./projects/admin-routes";
+import type { ProjectLinkService } from "./projects/link-service";
 import type { RegisteredProject } from "./projects/registry";
-
 export interface AdapterServerOptions {
 	host: string;
 	port: number;
@@ -40,34 +57,28 @@ export interface AdapterRuntimeConfig {
 
 export interface AdapterRouteDependencies {
 	readonly projects: readonly RegisteredProject[];
+	readonly projectProvider?: ProjectProvider;
 	readonly owner: OpenWebUIOwnerContext;
 	readonly runner: LiveGatewayRunner;
+	readonly projectLinkService?: ProjectLinkService;
+	readonly projectContextRepository?: OpenWebUIProjectionRepository;
 	readonly eventSink?: LiveGatewayEventSink;
+	readonly messageSink?: LiveGatewayMessageSink;
+	readonly fileContextResolver?: LiveGatewayFileContextResolver;
+	readonly adapterApiToken?: string;
+	readonly requireAdapterApiToken?: boolean;
 }
 
 type AdapterRequestHandlerOptions = {
 	readonly checks?: readonly AdapterHealthCheck[];
-	readonly readiness?: AdapterReadinessOptions;
 	readonly routes?: AdapterRouteDependencies;
+	readonly readiness?: AdapterReadinessOptions;
 	readonly runtime?: AdapterRuntimeConfig;
 };
-type RuntimeReadinessState = AdapterReadinessOptions;
-function bearerToken(request: Request): string | undefined {
-	const value = request.headers.get("authorization");
-	if (value === null) return undefined;
-	const match = /^Bearer[ \t]+([^ \t]+)[ \t]*$/i.exec(value);
-	return match?.[1];
-}
 
-function authorized(request: Request, token: string | undefined): boolean {
-	if (token === undefined) return true;
-	const presented = bearerToken(request);
-	return presented !== undefined && presented === token;
-}
-
-function unauthorized(): Response {
-	return jsonResponse({ error: "unauthorized" }, { status: 401, headers: { "www-authenticate": "Bearer" } });
-}
+type ProjectProvider =
+	| readonly RegisteredProject[]
+	| (() => readonly RegisteredProject[] | Promise<readonly RegisteredProject[]>);
 
 export interface AdapterServerHandle {
 	url: string;
@@ -83,35 +94,41 @@ function jsonResponse(value: unknown, init?: ResponseInit): Response {
 		},
 	});
 }
+function bearerToken(request: Request): string | undefined {
+	const value = request.headers.get("authorization");
+	const match = value === null ? undefined : /^Bearer[ \t]+([^ \t]+)[ \t]*$/i.exec(value);
+	return match?.[1];
+}
 
-/** Validate the persisted token and reconcile adapter-owned prompt hints without ever returning or logging the token.
- * OpenWebUI v0.10 exposes GET /api/config for authenticated prompt-hint readback and POST /api/v1/configs/suggestions for writes. */
+function unauthorized(): Response {
+	return jsonResponse({ error: "unauthorized" }, { status: 401, headers: { "www-authenticate": "Bearer" } });
+}
+
+/** Validates the persisted token and reconciles config-suggestion hints without exposing credentials. */
 export async function initializeRuntimeReadiness(runtime: AdapterRuntimeConfig): Promise<AdapterReadinessOptions> {
-	if (!runtime.openWebUIApiToken?.trim()) {
+	if (!runtime.openWebUIApiToken?.trim())
 		return {
 			...(runtime.readiness ?? {}),
 			openWebUIAuthenticated: false,
 			promptHintsSeeded: false,
 			reason: "OpenWebUI API token is missing",
 		};
-	}
-	if (!runtime.openWebUIBaseUrl?.trim()) {
+	if (!runtime.openWebUIBaseUrl?.trim())
 		return {
 			...(runtime.readiness ?? {}),
 			openWebUIAuthenticated: false,
 			promptHintsSeeded: false,
 			reason: "OpenWebUI runtime URL is not configured",
 		};
-	}
+
 	const baseUrl = runtime.openWebUIBaseUrl.trim().replace(/\/+$/, "");
-	const token = runtime.openWebUIApiToken;
 	let result: AdapterReadinessOptions = {
 		...(runtime.readiness ?? {}),
 		openWebUIAuthenticated: false,
 		promptHintsSeeded: false,
 	};
-	for (let attempt = 0; attempt < 3; attempt++) {
-		result = await initializeRuntimeReadinessAttempt(baseUrl, token, result);
+	for (let attempt = 0; attempt < 3; attempt += 1) {
+		result = await initializeRuntimeReadinessAttempt(baseUrl, runtime.openWebUIApiToken, result);
 		if (result.openWebUIAuthenticated && result.promptHintsSeeded) return result;
 		if (attempt < 2) await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 100 : 250));
 	}
@@ -126,26 +143,26 @@ async function initializeRuntimeReadinessAttempt(
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), 2_000);
 	try {
-		const response = await fetch(`${baseUrl}/api/v1/auths/`, {
+		const authResponse = await fetch(`${baseUrl}/api/v1/auths/`, {
 			headers: { authorization: `Bearer ${token}` },
 			signal: controller.signal,
 		});
-		if (!response.ok)
+		if (!authResponse.ok)
 			return {
 				...fallback,
 				openWebUIAuthenticated: false,
 				promptHintsSeeded: false,
 				reason: "OpenWebUI API token was rejected",
 			};
-		const authUser = (await response.json()) as { id?: string } | Array<{ id?: string }>;
-		const id = (Array.isArray(authUser) ? authUser[0]?.id : authUser?.id)?.trim();
-		if (!id)
+		const authUser = (await authResponse.json()) as { id?: string } | Array<{ id?: string }>;
+		if (!(Array.isArray(authUser) ? authUser[0]?.id : authUser.id)?.trim())
 			return {
 				...fallback,
 				openWebUIAuthenticated: false,
 				promptHintsSeeded: false,
 				reason: "OpenWebUI authentication response was invalid",
 			};
+
 		const configResponse = await fetch(`${baseUrl}${OPENWEBUI_CONFIG_ENDPOINT}`, {
 			headers: { authorization: `Bearer ${token}` },
 			signal: controller.signal,
@@ -163,18 +180,19 @@ async function initializeRuntimeReadinessAttempt(
 		} catch {
 			config = undefined;
 		}
-		const mergedPayload = mergePromptHints(promptHintsFromConfig(config));
-		if (mergedPayload === undefined)
+		const payload = mergePromptHints(promptHintsFromConfig(config));
+		if (payload === undefined)
 			return {
 				...fallback,
 				openWebUIAuthenticated: true,
 				promptHintsSeeded: false,
 				reason: "OpenWebUI prompt-hint read was invalid",
 			};
+
 		const seedResponse = await fetch(`${baseUrl}${OPENWEBUI_PROMPT_HINTS_ENDPOINT}`, {
 			method: "POST",
 			headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-			body: JSON.stringify(mergedPayload),
+			body: JSON.stringify(payload),
 			signal: controller.signal,
 		});
 		if (!seedResponse.ok)
@@ -190,7 +208,7 @@ async function initializeRuntimeReadinessAttempt(
 		} catch {
 			readback = undefined;
 		}
-		const seeded = JSON.stringify(readback) === JSON.stringify(mergedPayload.suggestions);
+		const seeded = JSON.stringify(readback) === JSON.stringify(payload.suggestions);
 		return {
 			...fallback,
 			openWebUIAuthenticated: true,
@@ -208,62 +226,55 @@ async function initializeRuntimeReadinessAttempt(
 		clearTimeout(timeout);
 	}
 }
-const RUNTIME_RETRY_BASE_DELAY_MS = 100;
-const RUNTIME_RETRY_MAX_DELAY_MS = 2_000;
 
 function createRuntimeReadinessReconciler(
 	runtime: AdapterRuntimeConfig,
-	runtimeReadiness: RuntimeReadinessState,
+	state: AdapterReadinessOptions,
 ): () => Promise<void> {
 	let inFlight: Promise<void> | undefined;
 	let retryCount = 0;
 	let retryAt = 0;
-
-	const isReady = (): boolean =>
-		runtimeReadiness.openWebUIAuthenticated === true && runtimeReadiness.promptHintsSeeded === true;
-	const reconcile = (): Promise<void> => {
-		if (isReady() || inFlight !== undefined || Date.now() < retryAt) return inFlight ?? Promise.resolve();
-
+	const ready = (): boolean => state.openWebUIAuthenticated === true && state.promptHintsSeeded === true;
+	return () => {
+		if (ready() || inFlight !== undefined || Date.now() < retryAt) return inFlight ?? Promise.resolve();
 		inFlight = initializeRuntimeReadiness(runtime)
-			.then(state => {
-				Object.assign(runtimeReadiness, state);
-				if (isReady()) {
-					retryCount = 0;
-					retryAt = 0;
-				} else {
-					const delay = Math.min(RUNTIME_RETRY_MAX_DELAY_MS, RUNTIME_RETRY_BASE_DELAY_MS * 2 ** retryCount);
-					retryCount++;
-					retryAt = Date.now() + delay;
-				}
-			})
-			.catch(() => {
-				Object.assign(runtimeReadiness, {
+			.then(next => Object.assign(state, next))
+			.catch(() =>
+				Object.assign(state, {
 					openWebUIAuthenticated: false,
 					promptHintsSeeded: false,
 					reason: "OpenWebUI runtime reconciliation failed",
-				});
-				const delay = Math.min(RUNTIME_RETRY_MAX_DELAY_MS, RUNTIME_RETRY_BASE_DELAY_MS * 2 ** retryCount);
-				retryCount++;
-				retryAt = Date.now() + delay;
+				}),
+			)
+			.then(() => {
+				if (ready()) {
+					retryCount = 0;
+					retryAt = 0;
+				} else {
+					retryAt = Date.now() + Math.min(2_000, 100 * 2 ** retryCount);
+					retryCount += 1;
+				}
 			})
 			.finally(() => {
 				inFlight = undefined;
 			});
 		return inFlight;
 	};
-
-	return reconcile;
 }
+
 export function createAdapterRequestHandler(
 	options: readonly AdapterHealthCheck[] | AdapterRequestHandlerOptions = [],
 ): (request: Request) => Response | Promise<Response> {
 	const routeOptions: AdapterRequestHandlerOptions | undefined = isHealthCheckList(options) ? undefined : options;
 	const checks = routeOptions?.checks ?? (isHealthCheckList(options) ? options : []);
-	const readiness = routeOptions?.readiness;
 	const routes = routeOptions?.routes;
 	const runtime = routeOptions?.runtime;
-	const runtimeReadiness: RuntimeReadinessState = {
-		...(runtime?.readiness ?? readiness ?? { openWebUIAuthenticated: false, promptHintsSeeded: false }),
+	const runtimeReadiness: AdapterReadinessOptions = {
+		...(runtime?.readiness ??
+			routeOptions?.readiness ?? {
+				openWebUIAuthenticated: false,
+				promptHintsSeeded: false,
+			}),
 	};
 	const reconcileRuntimeReadiness =
 		runtime === undefined ? () => Promise.resolve() : createRuntimeReadinessReconciler(runtime, runtimeReadiness);
@@ -271,16 +282,17 @@ export function createAdapterRequestHandler(
 
 	return async (request: Request): Promise<Response> => {
 		const url = new URL(request.url);
-		if ((url.pathname === "/v1" || url.pathname.startsWith("/v1/")) && !authorized(request, runtime?.adapterToken)) {
-			return unauthorized();
-		}
-		if (runtime !== undefined && (url.pathname === "/v1" || url.pathname.startsWith("/v1/"))) {
-			await reconcileRuntimeReadiness();
-			if (!runtimeReadiness.openWebUIAuthenticated || !runtimeReadiness.promptHintsSeeded) {
-				return jsonResponse(
-					{ error: "service_unavailable", message: "adapter runtime initialization is incomplete" },
-					{ status: 503 },
-				);
+		if (url.pathname === "/v1" || url.pathname.startsWith("/v1/")) {
+			const authError = authenticateProviderRequest(request, routes, runtime);
+			if (authError !== undefined) return authError;
+			if (runtime !== undefined) {
+				await reconcileRuntimeReadiness();
+				if (!runtimeReadiness.openWebUIAuthenticated || !runtimeReadiness.promptHintsSeeded) {
+					return jsonResponse(
+						{ error: "service_unavailable", message: "adapter runtime initialization is incomplete" },
+						{ status: 503 },
+					);
+				}
 			}
 		}
 		if (request.method === "GET" && url.pathname === "/healthz") {
@@ -288,20 +300,46 @@ export function createAdapterRequestHandler(
 			return jsonResponse(report, { status: report.status === "ok" ? 200 : 503 });
 		}
 		if (request.method === "GET" && url.pathname === "/readyz") {
-			if (runtime !== undefined && !authorized(request, runtime.readinessToken)) {
-				return unauthorized();
-			}
+			if (runtime !== undefined && bearerToken(request) !== runtime.readinessToken) return unauthorized();
 			await reconcileRuntimeReadiness();
 			const report = buildReadinessReport(runtimeReadiness);
 			return jsonResponse(report, { status: report.status === "ready" ? 200 : 503 });
 		}
 		if (routes !== undefined && request.method === "GET" && url.pathname === "/v1/models") {
-			return jsonResponse(buildModelList());
+			return jsonResponse(
+				buildProjectModelList(await resolveRouteProjects(routes), routes.projectLinkService !== undefined),
+			);
+		}
+		if (routes?.projectLinkService !== undefined && request.method === "GET" && url.pathname === "/admin/projects") {
+			const authError = authenticateAdapterRequest(request, routes.adapterApiToken, routes.requireAdapterApiToken);
+			if (authError !== undefined) return authError;
+			const result = await handleProjectListRequest(routes.projectLinkService);
+			return jsonResponse(result.body, { status: result.status });
+		}
+		if (
+			routes?.projectLinkService !== undefined &&
+			request.method === "POST" &&
+			url.pathname === "/admin/projects/link"
+		) {
+			const authError = authenticateAdapterRequest(request, routes.adapterApiToken, routes.requireAdapterApiToken);
+			if (authError !== undefined) return authError;
+			const body = await parseProjectAdminJsonRequest(request);
+			if (!body.ok) return jsonResponse(body.result.body, { status: body.result.status });
+			const result = await handleProjectLinkRequest(routes.projectLinkService, body.value);
+			return jsonResponse(result.body, { status: result.status });
+		}
+		if (routes?.projectLinkService !== undefined && request.method === "POST" && isProjectUnlinkPath(url.pathname)) {
+			const authError = authenticateAdapterRequest(request, routes.adapterApiToken, routes.requireAdapterApiToken);
+			if (authError !== undefined) return authError;
+			const projectId = projectIdFromUnlinkPath(url.pathname);
+			if (!projectId.ok) return jsonResponse(projectId.result.body, { status: projectId.result.status });
+			const result = await handleProjectUnlinkRequest(routes.projectLinkService, projectId.value);
+			return jsonResponse(result.body, { status: result.status });
 		}
 		if (routes !== undefined && request.method === "POST" && url.pathname === "/v1/chat/completions") {
-			let body: OpenAIChatCompletionRequest;
+			let body: unknown;
 			try {
-				body = (await request.json()) as OpenAIChatCompletionRequest;
+				body = await request.json();
 			} catch {
 				return jsonResponse(
 					{
@@ -314,14 +352,54 @@ export function createAdapterRequestHandler(
 					{ status: 400 },
 				);
 			}
-			const result = await handleChatCompletions({
-				request: body,
-				headers: headersFromRequest(request),
-				projects: routes.projects,
-				owner: routes.owner,
-				runner: routes.runner,
-				eventSink: routes.eventSink,
-			});
+			const parsed = parseChatCompletionRequest(body);
+			if (!parsed.ok) {
+				return jsonResponse(
+					{
+						error: {
+							message: parsed.message,
+							type: "invalid_request_error",
+							code: "invalid_request_body",
+						},
+					},
+					{ status: 400 },
+				);
+			}
+			if (routes.projectLinkService !== undefined && isProjectAdminChatCompletionRequest(parsed.request)) {
+				const result = await handleProjectAdminChatCompletion(
+					routes.projectLinkService,
+					parsed.request,
+					request.headers,
+					routes.owner,
+				);
+				return jsonResponse(result.body, { status: result.status });
+			}
+			let result: LiveChatCompletionsResult;
+			try {
+				result = await handleChatCompletions({
+					request: parsed.request,
+					headers: request.headers,
+					projects: await resolveRouteProjects(routes),
+					owner: routes.owner,
+					runner: routes.runner,
+					eventSink: routes.eventSink,
+					messageSink: routes.messageSink,
+					fileContextResolver: routes.fileContextResolver,
+					projectContextRepository: routes.projectContextRepository,
+				});
+			} catch (error) {
+				const message = error instanceof Error ? error.message : "GJC live runner failed.";
+				return jsonResponse(
+					{
+						error: {
+							message,
+							type: "server_error",
+							code: "live_runner_error",
+						},
+					},
+					{ status: 503 },
+				);
+			}
 			if (!result.ok) return jsonResponse(result.body, { status: result.status });
 			if ("stream" in result) {
 				return new Response(result.stream, {
@@ -335,8 +413,53 @@ export function createAdapterRequestHandler(
 	};
 }
 
-function headersFromRequest(request: Request): OpenWebUIHeaderInput {
-	return request.headers;
+async function resolveProjects(provider: ProjectProvider): Promise<readonly RegisteredProject[]> {
+	return typeof provider === "function" ? await provider() : provider;
+}
+
+async function resolveRouteProjects(routes: AdapterRouteDependencies): Promise<readonly RegisteredProject[]> {
+	return routes.projectProvider === undefined ? routes.projects : await resolveProjects(routes.projectProvider);
+}
+
+function authenticateProviderRequest(
+	request: Request,
+	routes: AdapterRouteDependencies | undefined,
+	runtime: AdapterRuntimeConfig | undefined,
+): Response | undefined {
+	if (runtime !== undefined) return bearerToken(request) === runtime.adapterToken ? undefined : unauthorized();
+	return authenticateAdapterRequest(request, routes?.adapterApiToken, routes?.requireAdapterApiToken);
+}
+
+function authenticateAdapterRequest(
+	request: Request,
+	adapterApiToken: string | undefined,
+	required = false,
+): Response | undefined {
+	if (adapterApiToken === undefined && required) {
+		return jsonResponse(
+			{
+				error: {
+					message: "Adapter API token is not configured.",
+					type: "server_error",
+					code: "adapter_api_token_unconfigured",
+				},
+			},
+			{ status: 503 },
+		);
+	}
+	if (adapterApiToken === undefined) return undefined;
+	const expected = `Bearer ${adapterApiToken}`;
+	if (request.headers.get("authorization") === expected) return undefined;
+	return jsonResponse(
+		{
+			error: {
+				message: "Adapter API token is missing or invalid.",
+				type: "authentication_error",
+				code: "invalid_api_key",
+			},
+		},
+		{ status: 401 },
+	);
 }
 
 function isHealthCheckList(

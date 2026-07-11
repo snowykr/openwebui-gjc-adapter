@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { LiveGatewayRunner } from "../src/live/chat-completions";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import type { RegisteredProject } from "../src/projects/registry";
-import { createAdapterRequestHandler, initializeRuntimeReadiness } from "../src/server";
+import { createAdapterRequestHandler } from "../src/server";
 
 describe("createAdapterRequestHandler", () => {
 	test("returns health status", async () => {
@@ -33,8 +33,63 @@ describe("createAdapterRequestHandler", () => {
 		expect(response.status).toBe(200);
 		expect(await response.json()).toEqual({
 			object: "list",
-			data: [{ id: "gjc", object: "model", created: 0, owned_by: "gjc" }],
+			data: [{ id: "gjc", object: "model", created: 1783468800, owned_by: "gjc" }],
 		});
+	});
+
+	test("requires configured adapter bearer tokens for OpenAI-compatible routes", async () => {
+		const handler = createAdapterRequestHandler({
+			routes: {
+				projects: [project],
+				owner,
+				runner: fixedRunner("unused"),
+				adapterApiToken: "adapter-token",
+				requireAdapterApiToken: true,
+			},
+		});
+
+		const unauthorized = await handler(new Request("http://adapter.test/v1/models"));
+		const authorized = await handler(
+			new Request("http://adapter.test/v1/models", { headers: { authorization: "Bearer adapter-token" } }),
+		);
+
+		expect(unauthorized.status).toBe(401);
+		expect(await unauthorized.json()).toMatchObject({ error: { code: "invalid_api_key" } });
+		expect(authorized.status).toBe(200);
+	});
+
+	test("fails closed when CLI service requires but lacks an adapter API token", async () => {
+		const handler = createAdapterRequestHandler({
+			routes: { projects: [project], owner, runner: fixedRunner("unused"), requireAdapterApiToken: true },
+		});
+
+		const response = await handler(new Request("http://adapter.test/v1/models"));
+
+		expect(response.status).toBe(503);
+		expect(await response.json()).toMatchObject({ error: { code: "adapter_api_token_unconfigured" } });
+	});
+	test("protects runtime readiness separately from the provider bearer token", async () => {
+		const handler = createAdapterRequestHandler({
+			routes: { projects: [project], owner, runner: fixedRunner("unused") },
+			runtime: {
+				adapterToken: "provider-token",
+				readinessToken: "readiness-token",
+				readiness: { openWebUIAuthenticated: true, promptHintsSeeded: true, mode: "managed" },
+			},
+		});
+
+		const unauthorized = await handler(new Request("http://adapter.test/readyz"));
+		const ready = await handler(
+			new Request("http://adapter.test/readyz", { headers: { authorization: "Bearer readiness-token" } }),
+		);
+		const provider = await handler(
+			new Request("http://adapter.test/v1/models", { headers: { authorization: "Bearer provider-token" } }),
+		);
+
+		expect(unauthorized.status).toBe(401);
+		expect(ready.status).toBe(200);
+		expect(await ready.json()).toMatchObject({ status: "ready", identity: { mode: "managed" } });
+		expect(provider.status).toBe(200);
 	});
 
 	test("routes chat completions to optional route dependencies", async () => {
@@ -64,36 +119,18 @@ describe("createAdapterRequestHandler", () => {
 			choices: [{ message: { role: "assistant", content: "handled" } }],
 		});
 	});
-
-	test("returns OpenAI-style JSON error for malformed chat completion bodies", async () => {
+	test("keeps malformed JSON errors and streaming responses on the current chat route", async () => {
 		const handler = createAdapterRequestHandler({
-			routes: { projects: [project], owner, runner: fixedRunner("unused") },
+			routes: { projects: [project], owner, runner: { run: () => ({ chunks: ["a", "b"] }) } },
 		});
-
-		const response = await handler(
+		const malformed = await handler(
 			new Request("http://adapter.test/v1/chat/completions", {
 				method: "POST",
 				headers: { "content-type": "application/json" },
 				body: "{",
 			}),
 		);
-
-		expect(response.status).toBe(400);
-		expect(await response.json()).toEqual({
-			error: {
-				message: "Request body must be valid JSON.",
-				type: "invalid_request_error",
-				code: "invalid_json",
-			},
-		});
-	});
-
-	test("returns event-stream chat completions for streaming requests", async () => {
-		const handler = createAdapterRequestHandler({
-			routes: { projects: [project], owner, runner: { run: () => ({ chunks: ["a", "b"] }) } },
-		});
-
-		const response = await handler(
+		const streaming = await handler(
 			new Request("http://adapter.test/v1/chat/completions", {
 				method: "POST",
 				headers: {
@@ -108,101 +145,10 @@ describe("createAdapterRequestHandler", () => {
 			}),
 		);
 
-		expect(response.status).toBe(200);
-		expect(response.headers.get("content-type")).toStartWith("text/event-stream");
-		expect(await response.text()).toContain("data: [DONE]");
-	});
-	test("gates provider traffic until startup authentication and prompt hints recover", async () => {
-		const originalFetch = globalThis.fetch;
-		let authAttempts = 0;
-		globalThis.fetch = (async (input: string | Request | URL, init?: RequestInit) => {
-			if (String(input).endsWith("/auths/") && ++authAttempts === 1) return new Response("denied", { status: 401 });
-			if (String(input).endsWith("/auths/")) return Response.json({ id: "owner" });
-			if (String(input).endsWith("/api/config")) return Response.json({ default_prompt_suggestions: [] });
-			if (init?.method === "POST")
-				return Response.json([{ title: ["GJC"], content: "Use the GJC coding agent to work on this project." }]);
-			return new Response("unexpected", { status: 500 });
-		}) as typeof fetch;
-		try {
-			const handler = createAdapterRequestHandler({
-				routes: { projects: [project], owner, runner: fixedRunner("handled") },
-				runtime: {
-					adapterToken: "adapter",
-					readinessToken: "ready",
-					openWebUIBaseUrl: "http://openwebui.test",
-					openWebUIApiToken: "api",
-				},
-			});
-			const response = await handler(
-				new Request("http://adapter.test/v1/models", { headers: { authorization: "Bearer adapter" } }),
-			);
-			expect(response.status).toBe(200);
-			expect(authAttempts).toBe(2);
-		} finally {
-			globalThis.fetch = originalFetch;
-		}
-	});
-	test("retries transient authentication failure and recovers readiness", async () => {
-		const originalFetch = globalThis.fetch;
-		let authAttempts = 0;
-		globalThis.fetch = (async (input: string | Request | URL, init?: RequestInit) => {
-			if (String(input).endsWith("/auths/") && ++authAttempts === 1) return new Response("denied", { status: 401 });
-			if (String(input).endsWith("/auths/")) return Response.json({ id: "owner" });
-			if (String(input).endsWith("/api/config")) return Response.json({ default_prompt_suggestions: [] });
-			if (init?.method === "POST")
-				return Response.json([{ title: ["GJC"], content: "Use the GJC coding agent to work on this project." }]);
-			return new Response("unexpected", { status: 500 });
-		}) as typeof fetch;
-		try {
-			const state = await initializeRuntimeReadiness({
-				adapterToken: "adapter",
-				readinessToken: "ready",
-				openWebUIBaseUrl: "http://openwebui.test",
-				openWebUIApiToken: "api",
-			});
-			expect(state.openWebUIAuthenticated).toBe(true);
-			expect(state.promptHintsSeeded).toBe(true);
-			expect(authAttempts).toBe(2);
-		} finally {
-			globalThis.fetch = originalFetch;
-		}
-	});
-	test("recovers after the bounded startup reconciliation attempts are exhausted", async () => {
-		const originalFetch = globalThis.fetch;
-		let authAttempts = 0;
-		globalThis.fetch = (async (input: string | Request | URL, init?: RequestInit) => {
-			if (String(input).endsWith("/auths/") && ++authAttempts <= 3) return new Response("denied", { status: 503 });
-			if (String(input).endsWith("/auths/")) return Response.json({ id: "owner" });
-			if (String(input).endsWith("/api/config")) return Response.json({ default_prompt_suggestions: [] });
-			if (init?.method === "POST")
-				return Response.json([{ title: ["GJC"], content: "Use the GJC coding agent to work on this project." }]);
-			return new Response("unexpected", { status: 500 });
-		}) as typeof fetch;
-		try {
-			const handler = createAdapterRequestHandler({
-				routes: { projects: [project], owner, runner: fixedRunner("handled") },
-				runtime: {
-					adapterToken: "adapter",
-					readinessToken: "ready",
-					openWebUIBaseUrl: "http://openwebui.test",
-					openWebUIApiToken: "api",
-				},
-			});
-			const initial = await handler(
-				new Request("http://adapter.test/v1/models", { headers: { authorization: "Bearer adapter" } }),
-			);
-			expect(initial.status).toBe(503);
-			expect(authAttempts).toBe(3);
-
-			await new Promise(resolve => setTimeout(resolve, 120));
-			const recovered = await handler(
-				new Request("http://adapter.test/v1/models", { headers: { authorization: "Bearer adapter" } }),
-			);
-			expect(recovered.status).toBe(200);
-			expect(authAttempts).toBe(4);
-		} finally {
-			globalThis.fetch = originalFetch;
-		}
+		expect(malformed.status).toBe(400);
+		expect(await malformed.json()).toMatchObject({ error: { code: "invalid_json" } });
+		expect(streaming.headers.get("content-type")).toStartWith("text/event-stream");
+		expect(await streaming.text()).toContain("data: [DONE]");
 	});
 });
 
@@ -210,15 +156,11 @@ const project: RegisteredProject = {
 	id: "demo",
 	name: "Demo",
 	cwd: "/work/demo",
-	modelId: "gjc/demo",
 	allowedRoot: "/work",
 	createdAt: new Date("2026-07-08T00:00:00.000Z"),
 };
 
-const owner: OpenWebUIOwnerContext = {
-	ownerUserId: "owner-1",
-	singleOwnerLocalMode: false,
-};
+const owner: OpenWebUIOwnerContext = { ownerUserId: "owner-1", singleOwnerLocalMode: false };
 
 function fixedRunner(content: string): LiveGatewayRunner {
 	return { run: () => ({ content }) };

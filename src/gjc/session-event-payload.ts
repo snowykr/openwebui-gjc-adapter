@@ -104,14 +104,17 @@ function toolExecutionPayload(event: GjcRpcRunnerTransportEvent): Readonly<Recor
 		payload.argsPresent === undefined &&
 		payload.partialResultPresent === undefined &&
 		payload.resultPresent === undefined
-	)
+	) {
 		return undefined;
+	}
 	return payload;
 }
 
 function compactRecord(input: Readonly<Record<string, unknown>>): Readonly<Record<string, unknown>> {
 	const output: Record<string, unknown> = {};
-	for (const [key, value] of Object.entries(input)) if (value !== undefined) output[key] = value;
+	for (const [key, value] of Object.entries(input)) {
+		if (value !== undefined) output[key] = value;
+	}
 	return output;
 }
 
@@ -158,15 +161,19 @@ function goalObjective(value: unknown): string | undefined {
 function textValue(value: unknown): string | undefined {
 	return typeof value === "string" ? value : undefined;
 }
+
 function stringValue(value: unknown): string | undefined {
 	return typeof value === "string" && value.length > 0 ? value : undefined;
 }
+
 function numberValue(value: unknown): number | undefined {
 	return typeof value === "number" ? value : undefined;
 }
+
 function recordValue(value: unknown): Record<string, unknown> | undefined {
 	return isRecord(value) ? value : undefined;
 }
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }

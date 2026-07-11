@@ -31,18 +31,22 @@ describe("adapter config contracts", () => {
 		const config = loadAdapterConfig({});
 		expect(config.bindHost).toBe("127.0.0.1");
 		expect(config.bindPort).toBe(8765);
+		expect(config.adapterApiToken).toBeUndefined();
 		expect(config.openWebUIBaseUrl).toBe("http://localhost:8080");
 		expect(config.openWebUIApiToken).toBeUndefined();
 		expect(config.statePath).toBe(".gjc/openwebui-adapter");
 		expect(config.gjcCommand).toBe("gjc");
+		expect(config.turnTimeoutMs).toBe(180_000);
 		expect(config.sessionRoot).toBe(process.cwd());
 		expect(config.allowedProjectRoots).toEqual([process.cwd()]);
+		expect(config.projects).toEqual([]);
 	});
 
 	test("parses configured env values and colon-separated roots", () => {
 		const config = loadAdapterConfig({
 			GJC_OPENWEBUI_BIND_HOST: "0.0.0.0",
 			GJC_OPENWEBUI_BIND_PORT: "4321",
+			GJC_OPENWEBUI_ADAPTER_API_TOKEN: "adapter-token",
 			GJC_OPENWEBUI_BASE_URL: "https://openwebui.example.test",
 			GJC_OPENWEBUI_API_TOKEN: "token",
 			GJC_OPENWEBUI_ADMIN_EMAIL: "admin@example.test",
@@ -50,13 +54,16 @@ describe("adapter config contracts", () => {
 			GJC_OPENWEBUI_OWNER_USER_ID: "owner-1",
 			GJC_OPENWEBUI_STATE_PATH: "/tmp/state",
 			GJC_OPENWEBUI_GJC_COMMAND: "/usr/local/bin/gjc",
+			GJC_OPENWEBUI_TURN_TIMEOUT_MS: "240000",
 			GJC_OPENWEBUI_SESSION_ROOT: "/tmp/sessions",
 			GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS: "/repo/a:/repo/b:",
 			GJC_OPENWEBUI_ARTIFACT_BASE_URL: "https://artifacts.example.test/base",
+			GJC_OPENWEBUI_PROJECTS: "/repo/a|Project A|folder-a|/sessions/a;/repo/b|Project B",
 		});
 		expect(config).toEqual({
 			bindHost: "0.0.0.0",
 			bindPort: 4321,
+			adapterApiToken: "adapter-token",
 			openWebUIBaseUrl: "https://openwebui.example.test",
 			openWebUIApiToken: "token",
 			openWebUIAdminEmail: "admin@example.test",
@@ -64,10 +71,24 @@ describe("adapter config contracts", () => {
 			ownerUserId: "owner-1",
 			statePath: "/tmp/state",
 			gjcCommand: "/usr/local/bin/gjc",
+			turnTimeoutMs: 240_000,
 			sessionRoot: "/tmp/sessions",
 			allowedProjectRoots: ["/repo/a", "/repo/b"],
 			artifactBaseUrl: "https://artifacts.example.test/base",
+			projects: [
+				{ cwd: "/repo/a", name: "Project A", openWebUIFolderId: "folder-a", sessionRoot: "/sessions/a" },
+				{ cwd: "/repo/b", name: "Project B" },
+			],
 		});
+	});
+
+	test("rejects malformed configured project entries", () => {
+		expect(() => loadAdapterConfig({ GJC_OPENWEBUI_PROJECTS: "|" })).toThrow(
+			"GJC_OPENWEBUI_PROJECTS entry 1 must include a non-empty cwd",
+		);
+		expect(() => loadAdapterConfig({ GJC_OPENWEBUI_PROJECTS: "/repo|Name|folder|session|extra" })).toThrow(
+			"GJC_OPENWEBUI_PROJECTS entry 1 has too many fields",
+		);
 	});
 
 	test("rejects invalid ports", () => {
@@ -76,14 +97,27 @@ describe("adapter config contracts", () => {
 		expect(() => loadAdapterConfig({ GJC_OPENWEBUI_BIND_PORT: "12.5" })).toThrow();
 	});
 
+	test("rejects invalid GJC turn timeouts", () => {
+		expect(() => loadAdapterConfig({ GJC_OPENWEBUI_TURN_TIMEOUT_MS: "0" })).toThrow(
+			"GJC_OPENWEBUI_TURN_TIMEOUT_MS must be a positive integer",
+		);
+		expect(() => loadAdapterConfig({ GJC_OPENWEBUI_TURN_TIMEOUT_MS: "12.5" })).toThrow(
+			"GJC_OPENWEBUI_TURN_TIMEOUT_MS must be a positive integer",
+		);
+	});
+
 	test("builds startup diagnostics without throwing for missing auth", () => {
 		const diagnostic = buildStartupDiagnostics(loadAdapterConfig({}));
 		expect(diagnostic.status).toBe("degraded");
 		expect(diagnostic.missingAuth).toBe(true);
+		expect(diagnostic.missingAdapterApiToken).toBe(true);
 		expect(diagnostic.missingAllowedProjectRoots).toBe(false);
 		expect(diagnostic.expectedHeaderNames).toEqual([...REQUIRED_OPENWEBUI_HEADER_NAMES]);
 		expect(diagnostic.messages).toContain(
 			"GJC_OPENWEBUI_API_TOKEN is not set; OpenWebUI API calls are not authenticated.",
+		);
+		expect(diagnostic.messages).toContain(
+			"GJC_OPENWEBUI_ADAPTER_API_TOKEN is not set; inbound OpenAI-compatible calls are not authenticated.",
 		);
 	});
 	test("uses container runtime paths only for managed installed configurations", () => {
@@ -106,7 +140,8 @@ describe("adapter config contracts", () => {
 				statePath: "/var/lib/gjc",
 				sessionRoot: "/run/gjc-session",
 				allowedProjectRoots: ["/workspace"],
-				gjcCommand: "/opt/openwebui-gjc-adapter/node_modules/.bin/gjc",
+				adapterApiToken: "adapter",
+				gjcCommand: "gjc",
 			});
 			writeInstalledConfig({ ...base, mode: "existing", bindHost: "127.0.0.1" }, file);
 			const existing = loadInstalledAdapterConfig(file);

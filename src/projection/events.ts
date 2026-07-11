@@ -22,7 +22,7 @@ export interface AssistantTextFrame {
 }
 
 export interface ProgressFrame {
-	readonly kind: "tool_progress" | "mcp_progress" | "skill_progress";
+	readonly kind: "tool_progress" | "mcp_progress" | "skill_progress" | "subagent_progress";
 	readonly label: string;
 	readonly phase: "start" | "progress" | "end";
 	readonly hidden?: boolean;
@@ -68,6 +68,7 @@ export function projectAgentFrame(frame: ProjectableAgentFrame, sse: OpenAISsePr
 		case "tool_progress":
 		case "mcp_progress":
 		case "skill_progress":
+		case "subagent_progress":
 			return {
 				sseChunks: [],
 				events: [
@@ -75,7 +76,7 @@ export function projectAgentFrame(frame: ProjectableAgentFrame, sse: OpenAISsePr
 						description: frame.label,
 						done: frame.phase === "end",
 						hidden: frame.hidden,
-						gjc_adapter: { frameKind: frame.kind, phase: frame.phase, metadata: frame.metadata ?? {} },
+						gjc_adapter: progressGjcAdapterMetadata(frame),
 					}),
 				],
 			};
@@ -102,6 +103,21 @@ export function projectAgentFrame(frame: ProjectableAgentFrame, sse: OpenAISsePr
 				],
 			};
 	}
+}
+
+function progressGjcAdapterMetadata(frame: ProgressFrame): Record<string, unknown> {
+	const metadata = frame.metadata ?? {};
+	const workflowGate = metadata.workflow_gate;
+	return {
+		frameKind: frame.kind,
+		phase: frame.phase,
+		metadata,
+		...(isRecord(workflowGate) ? { workflow_gate: workflowGate } : {}),
+	};
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export function encodeOpenAISseTextChunk(content: string, input: OpenAISseProjectionInput): string {

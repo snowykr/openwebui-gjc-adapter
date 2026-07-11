@@ -1,111 +1,126 @@
 # OpenWebUI GJC Adapter
 
-The adapter is a Bun CLI and an OpenAI-compatible gateway for GJC-backed OpenWebUI deployments.
+Experimental TS/Bun adapter that treats GJC session JSONL/artifacts as the source of truth and projects them into OpenWebUI folders, chat history trees, message events, and an OpenAI-compatible live gateway.
 
-## Install and run
+## OpenWebUI setup
 
-Install the package globally, then use the `openwebui-gjc-adapter` command:
+Start the adapter service with Bun:
 
 ```sh
-bun add --global openwebui-gjc-adapter
-openwebui-gjc-adapter serve --config /etc/openwebui-gjc-adapter/config.json
+GJC_OPENWEBUI_BIND_HOST=127.0.0.1 \
+GJC_OPENWEBUI_BIND_PORT=8765 \
+GJC_OPENWEBUI_ADAPTER_API_TOKEN=<adapter-openai-key> \
+GJC_OPENWEBUI_API_TOKEN=<openwebui-api-token> \
+GJC_OPENWEBUI_OWNER_USER_ID=<openwebui-user-id> \
+GJC_OPENWEBUI_PROJECTS="/home/me/src/my-repo|my-repo" \
+GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS="/home/me/src" \
+bun run start
 ```
 
-The launcher resolves its own real path before loading the package, so the global-install symlink is safe to invoke from any working directory.
+Configure OpenWebUI to use the adapter as an OpenAI-compatible backend:
 
-## Choose a deployment route
+```env
+OPENAI_API_BASE_URL=http://127.0.0.1:8765/v1
+OPENAI_API_KEY=<adapter-openai-key>
+ENABLE_OPENAI_API=True
+```
 
-### Managed route: private adapter and loopback UI
+Add the required custom headers on the OpenAI connection:
 
-Run the adapter and OpenWebUI together in Compose. The adapter listens on
-`0.0.0.0:8765` only on the Compose network, while OpenWebUI reaches it at:
+```json
+{
+  "X-OpenWebUI-Chat-Id": "{{CHAT_ID}}",
+  "X-OpenWebUI-Message-Id": "{{MESSAGE_ID}}",
+  "X-OpenWebUI-User-Message-Id": "{{USER_MESSAGE_ID}}",
+  "X-OpenWebUI-User-Message-Parent-Id": "{{USER_MESSAGE_PARENT_ID}}",
+  "X-OpenWebUI-User-Id": "{{USER_ID}}",
+  "X-OpenWebUI-Task": "{{TASK}}"
+}
+```
+
+Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. Use `@gajae-code/coding-agent` 0.9.4 or newer so the adapter can consume `RpcClient.onSessionEvent` and project full GJC TUI/session progress into OpenWebUI. Background task calls such as title generation are no-ops and must not create GJC sessions.
+
+## CLI first-install configuration
+
+The CLI supports two first-install paths. These commands configure a deployment; this README does not claim to run or verify a real Docker deployment.
+
+### Managed default path
+
+Use `configure managed` for a new, CLI-managed installation. It targets Docker with OpenWebUI v0.10.0, binds the OpenWebUI UI to loopback only, and places the adapter on a private Docker network. Credentials are passed by file descriptor rather than written into generated configuration. The command verifies that the configured OpenWebUI provider is strictly owned by the installation before accepting it.
+
+The managed path intentionally does not automate Tailscale, tunnels, public ingress, or other exposure outside the loopback-safe boundary. Publish the UI separately only after reviewing the network and authentication model.
+
+### Existing path
+
+Use `configure existing` for an existing OpenWebUI deployment. It validates the supplied OpenWebUI admin token, but does not mutate externally managed provider or ingress configuration. Configure the OpenAI-compatible provider manually with:
+
+```env
+OPENAI_API_BASE_URL=http://127.0.0.1:8765/v1
+OPENAI_API_KEY=<adapter-openai-key>
+ENABLE_OPENAI_API=True
+```
+
+Use the `gjc` model id and add the custom headers shown in [OpenWebUI setup](#openwebui-setup). The placeholders in those headers are required for the adapter to associate requests with the OpenWebUI chat, messages, user, and task.
+
+### Safety and recovery
+
+The CLI uses a readiness probe before reporting configuration as ready. It may reset or disclose an admin token only when it has a controlling TTY, so a token is not accidentally written to redirected output or unattended logs. If readiness or verification fails, correct the reported local configuration or credentials and rerun the relevant command; do not treat a partially configured deployment as ready.
+
+Both paths preserve the loopback-safe boundary: the UI is not exposed by the CLI, and the adapter remains on its private network where applicable.
+
+## Registering projects
+
+Register one project per working directory. The adapter validates the real path against an allowed root before exposing the project as an OpenWebUI folder/projection.
+
+For the service entrypoint, set `GJC_OPENWEBUI_PROJECTS` to a semicolon-separated list of `cwd|name|folderId|sessionRoot` entries. Only `cwd` is required; configured paths must resolve under `GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS`.
+
+```ts
+import { registerProjectDirectory, resolveAllowedRoots } from "openwebui-gjc-adapter";
+
+const allowedRoots = await resolveAllowedRoots(["/home/me/src"]);
+const project = await registerProjectDirectory(
+  {
+    cwd: "/home/me/src/my-repo",
+    name: "my-repo",
+  },
+  allowedRoots,
+);
+```
+
+OpenWebUI should use the stable `gjc` model id. Project folders are not advertised as models; the adapter resolves the GJC working directory from the OpenWebUI chat folder. Historical imports place projected sessions under folder id `gjc-project-<project-id>` and chat id `gjc-project-<project-id>-session-<session-id>` unless OpenWebUI assigns runtime ids.
+
+Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. The adapter uses full session events when the installed GJC RPC client exposes `onSessionEvent`; otherwise it falls back to the standard agent-event stream. Background task calls such as title generation are no-ops and must not create GJC sessions.
+Inside OpenWebUI, send these slash-style commands in a normal `gjc` chat for project administration:
 
 ```text
-http://adapter:8765/v1
+/gjc project link /home/me/src/my-repo
+/gjc project list
+/gjc project unlink my-repo
 ```
 
-Only the OpenWebUI UI is published, on `127.0.0.1:8080` by default. Do not
-publish the adapter port to the host. The adapter configuration file is mounted
-read-only at `/run/openwebui-gjc-adapter/config.json`; adapter state, session
-data, and the neutral workspace use separate persistent mounts.
-
-Managed installation requires a rootful Docker daemon with user-namespace remapping disabled. The preflight checks `docker info` before writing managed Compose artifacts or changing the managed controller; rootless Docker and `userns-remap` are unsupported.
-Configure a dedicated managed instance. The CLI uses the supplied administrator
-credentials only for the initial OpenWebUI signup session; they are read from
-inherited file descriptors and are not persisted:
-```sh
-openwebui-gjc-adapter configure managed \
-  --admin-email-fd=3 --admin-password-fd=4
-```
-OpenWebUI returns a temporary session token during signup. The installer records
-that token in bootstrap state and uses it to exchange for a durable API key;
-the durable key is retained in the private configuration for managed operation.
-After successful configure, the bootstrap journal remains mode `0600` and retains the duplicate API key for recovery/audit purposes.
-
-### Existing route: provider-neutral and manual
-
-Keep an existing deployment when its ingress and OpenAI provider connection are
-managed by the operator. The CLI validates the supplied OpenWebUI API token,
-starts a loopback-only adapter, and leaves provider and ingress configuration
-manual. Supply the existing OpenWebUI URL, its token FD, and the operator's
-external adapter URL ending in `/v1`:
-
-```sh
-openwebui-gjc-adapter configure existing \
-  --openwebui-url=https://openwebui.example \
-  --openwebui-api-token-fd=3 \
-  --adapter-ingress-url=https://adapter.example/v1
-```
-In the existing Open WebUI Admin provider form, configure the operator-owned
-connection with the ingress URL, the adapter token revealed below, and the sole
-model ID `gjc`. Add these request headers using Open WebUI templates:
+The adapter also seeds OpenWebUI Workspace Prompt hints for those project commands and for canonical GJC workflows:
 
 ```text
-X-OpenWebUI-Chat-Id: {{CHAT_ID}}
-X-OpenWebUI-Message-Id: {{MESSAGE_ID}}
-X-OpenWebUI-User-Message-Id: {{USER_MESSAGE_ID}}
-X-OpenWebUI-User-Message-Parent-Id: {{USER_MESSAGE_PARENT_ID}}
-X-OpenWebUI-User-Id: {{USER_ID}}
-X-OpenWebUI-Task: {{TASK}}
+/skill:deep-interview {{REQUEST}}
+/skill:ralplan {{TASK}}
+/skill:ultragoal {{GOAL}}
+/skill:team {{TASK}}
 ```
 
-The operator owns TLS, ingress reachability, provider verification, and a final
-chat test. The CLI never configures that provider or ingress. The adapter's
-provider-neutral runtime may still reconcile its own prompt suggestion on
-`/readyz`: this applies to both managed and existing routes, preserves foreign
-suggestions, and reports readiness only after the OpenWebUI readback matches the
-merged suggestions. A readiness probe may therefore trigger this pending
-adapter-owned reconciliation.
-Use `openwebui-gjc-adapter probe-ready --config /path/to/config.json` to verify the adapter readiness endpoint after deployment.
+Deleting an adapter-created project folder in the OpenWebUI sidebar is treated as an unlink of the OpenWebUI projection only. Local folders, `.gjc` sessions, and GJC history are not deleted. If the same project path is linked again later, the adapter imports the existing session history again.
 
-## Adapter token handling
+## Runtime contract
 
-The generated adapter token is retained in the installer-owned `0600` configuration file and a separate private `0600` `adapter-token` copy used by deployment consumers. It is never displayed during configure. Reveal it only after confirming on the same controlling terminal (the CLI opens `/dev/tty` and writes only there):
+- GJC JSONL and artifacts remain authoritative.
+- OpenWebUI chat rows and chat messages are projection/cache records.
+- Adapter metadata is stored under `gjc_adapter`; user-visible OpenWebUI fields such as title/rating are preserved on reprojection.
+- The live gateway uses `/v1/models` and `/v1/chat/completions`.
+- The package entrypoint wires chat completions through the GJC RPC turn runner and stores OpenWebUI chat-to-GJC session mappings in a file-backed store under `GJC_OPENWEBUI_SESSION_ROOT`.
+- The adapter uses full session events when the installed GJC RPC client exposes `RpcClient.onSessionEvent`; otherwise it safely falls back to the standard agent-event stream. Delivered session events are bounded OpenWebUI message events covering available lifecycle, tool/MCP, subagent, todo, goal, notice, retry, compaction, and workflow progress.
+- Raw tool arguments/results and secret-looking text are not emitted directly; the adapter preserves bounded labels, counts, phases, and status descriptions for display.
+- Workflow gates can be rendered as assistant-visible pending-gate text and validated with the exported gate primitives; wire those primitives into the deployment's event sink/continuation policy before claiming automatic gate approval handling.
+- Regenerate/branch only proceeds when owner, project, session, and message lineage metadata match; otherwise the adapter forks safely.
 
-```sh
-openwebui-gjc-adapter credentials show adapter-token --config /path/to/config.json
-```
+## Operator notes
 
-Keep the configuration file and any mounted state on persistent, operator-controlled storage. Existing mode stores its default project root under `$XDG_STATE_HOME` (falling back to `$XDG_DATA_HOME`, then `$HOME/.local/state`) at `openwebui-gjc-adapter/workspace`; explicit project roots remain supported. Restrict project roots to directories intended for GJC operation.
-The installer may create these private copies:
-
-- `config.json` contains the adapter token, readiness token, and (after managed
-  bootstrap) the Open WebUI API token; it is mode `0600`.
-- `adapter-token` is a private mode-`0600` deployment copy. In managed mode it
-  is supplied as Compose-secret input; existing mode also creates the copy for
-  deployment use. It is not mounted into Open WebUI.
-- Managed bootstrap checkpoints retain the temporary OpenWebUI signup session
-  token in the private `config.json.bootstrap.json` journal (mode `0600`).
-  The session token is exchanged for a durable API key, and retries reuse the
-  same installation identity without creating another account or token.
-  The bootstrap journal is paired with `config.json.recovery.json`; after
-  successful configure both recovery records are cleared. A failed fresh install
-  retains the pending recovery/bootstrap and recovery snapshot bundle, including
-  its installation identity and API-key checkpoint, so retrying the same
-  configure invocation resumes that installation rather than creating another
-  account.
-
-For a failed installation, retry with the same `configure managed` or `configure existing` invocation and persisted options. To intentionally recover or change a route, use `--reset --reset-proof=...`; reset confirmation and token display require the controlling `/dev/tty`, not redirected stdout.
-`probe-ready` verifies readiness and may reconcile the adapter-owned prompt suggestion; it is not a provider or ingress configuration operation.
-
-Managed mode configures its dedicated provider connection. Existing-mode provider and ingress settings, external tunnels, and OCI registry/manifest research remain operator-owned.
+Keep the adapter session/project store on persistent storage. Do not give the adapter an allowed root broader than the directories intended for GJC operation. Artifact links are resolved with realpath containment and symlink escapes are rejected.

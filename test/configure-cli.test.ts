@@ -15,6 +15,7 @@ import {
 	readInstalledConfig,
 	writeInstalledConfig,
 } from "../src/configure/private-config";
+import { renderExistingSystemdUnit } from "../src/configure/systemd";
 
 function tempPath(): { directory: string; config: string; cleanup: () => void } {
 	const directory = mkdtempSync(join(tmpdir(), "gjc-configure-cli-"));
@@ -92,6 +93,50 @@ describe("configure CLI grammar and acknowledgements", () => {
 			kind: "probe-ready",
 			options: { config: "/tmp/custom-config.json" },
 		});
+	});
+	test("routes serve --config through the installed lifecycle and escapes each systemd argument", async () => {
+		const t = tempPath();
+		try {
+			writeInstalledConfig(
+				{
+					version: 1,
+					mode: "existing",
+					installationId: "install",
+					adapterToken: "adapter",
+					readinessToken: "ready",
+					openWebUIApiUrl: "http://localhost:8080",
+					adapterProviderUrl: "http://adapter:8765/v1",
+					bindHost: "127.0.0.1",
+					bindPort: 8765,
+				},
+				t.config,
+			);
+			const output = sink();
+			const result = await runCli(["serve", "--config", t.config], {
+				stdout: output,
+				startServer: config => {
+					expect(config.adapterApiToken).toBe("adapter");
+					expect(config.gjcCommand).toBe("gjc");
+					return { url: "http://127.0.0.1:8765", stop: async () => {} };
+				},
+			});
+			expect(result).toBe(0);
+			expect(output.values).toEqual(["http://127.0.0.1:8765\n"]);
+			expect(
+				renderExistingSystemdUnit({
+					workingDirectory: "/srv/adapter files",
+					adapterCommand: [
+						"/usr/bin/bun",
+						"/srv/adapter files/src/cli.ts",
+						"serve",
+						"--config",
+						"/tmp/config file.json",
+					],
+				}),
+			).toContain('ExecStart=/usr/bin/bun "/srv/adapter files/src/cli.ts" serve --config "/tmp/config file.json"');
+		} finally {
+			t.cleanup();
+		}
 	});
 
 	test("configures managed route and preserves token on same-mode rerun", async () => {

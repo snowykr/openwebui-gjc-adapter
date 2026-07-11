@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import type { TextContent } from "@gajae-code/ai";
 import type { SessionEntry, SessionHeader, SessionMessageEntry } from "@gajae-code/coding-agent";
 import { ADAPTER_PROJECTION_VERSION, buildLineageHash } from "../state/metadata";
@@ -33,7 +34,7 @@ export interface OpenWebUIProjectedMessage {
 	metadata: {
 		gjc_adapter: {
 			projectionVersion: number;
-			sessionFile: string;
+			sessionFileName: string;
 			gjcSessionId: string;
 			gjcEntryId: string;
 			lineageHash: string;
@@ -51,7 +52,7 @@ export interface OpenWebUIProjectedChat {
 	metadata: {
 		gjc_adapter: {
 			projectionVersion: number;
-			sessionFile: string;
+			sessionFileName: string;
 			gjcSessionId: string;
 			gjcEntryId: string | null;
 			lineageHash: string;
@@ -137,6 +138,7 @@ export function projectGjcSessionToOpenWebUIChat(input: GjcSessionProjectionInpu
 
 	const currentId = findProjectedCurrentId(validation.currentId, input.entries, messages);
 	const lineageHash = buildLineageHash([input.sessionFile, input.header.id, currentId ?? ""]);
+	const sessionFileName = path.basename(input.sessionFile);
 
 	return {
 		id: input.header.id,
@@ -148,7 +150,7 @@ export function projectGjcSessionToOpenWebUIChat(input: GjcSessionProjectionInpu
 		metadata: {
 			gjc_adapter: {
 				projectionVersion: ADAPTER_PROJECTION_VERSION,
-				sessionFile: input.sessionFile,
+				sessionFileName,
 				gjcSessionId: input.header.id,
 				gjcEntryId: currentId,
 				lineageHash,
@@ -218,7 +220,7 @@ function projectMessageEntry(
 		metadata: {
 			gjc_adapter: {
 				projectionVersion: ADAPTER_PROJECTION_VERSION,
-				sessionFile: input.sessionFile,
+				sessionFileName: path.basename(input.sessionFile),
 				gjcSessionId: input.header.id,
 				gjcEntryId: entry.id,
 				lineageHash: buildLineageHash([input.sessionFile, input.header.id, entry.id, parentId ?? ""]),

@@ -1,25 +1,23 @@
-import type { RegisteredProject } from "../projects/registry";
-import type { OpenAIModelListResponse } from "./openai-types";
+import type { OpenAIModelEntry, OpenAIModelListResponse } from "./openai-types";
+import { GJC_OPENWEBUI_MODEL_ID } from "./project-context";
 
-export const GJC_MODEL_ID = "gjc";
+export type LiveGatewayModelEntry = OpenAIModelEntry;
 
-export function buildModelList(): OpenAIModelListResponse {
+export function buildModelList(
+	input: readonly unknown[] | readonly LiveGatewayModelEntry[] = [],
+): OpenAIModelListResponse {
+	void input;
 	return {
 		object: "list",
-		data: [
-			{
-				id: GJC_MODEL_ID,
-				object: "model",
-				created: 0,
-				owned_by: "gjc",
-			},
-		],
+		data: [defaultGjcModelEntry()],
 	};
 }
 
-export function findProjectByModelId(
-	projects: readonly RegisteredProject[],
-	modelId: string,
-): RegisteredProject | null {
-	return modelId === GJC_MODEL_ID ? (projects[0] ?? null) : null;
+function defaultGjcModelEntry(): OpenAIModelEntry {
+	return {
+		id: GJC_OPENWEBUI_MODEL_ID,
+		object: "model",
+		created: 1783468800,
+		owned_by: "gjc",
+	};
 }

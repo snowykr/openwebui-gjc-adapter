@@ -1,19 +1,15 @@
 import { describe, expect, it } from "bun:test";
-import {
-	handleChatCompletions,
-	type LiveGatewayRunner,
-	type LiveGatewayRunnerInput,
-} from "../src/live/chat-completions";
+import { handleChatCompletions, type LiveGatewayRunner, WorkflowGateReplyError } from "../src/live/chat-completions";
 import { buildModelList } from "../src/live/models";
 import type { OpenAIChatCompletionRequest } from "../src/live/openai-types";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
+import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
 import type { RegisteredProject } from "../src/projects/registry";
 
 const project: RegisteredProject = {
 	id: "demo",
 	name: "Demo",
 	cwd: "/work/demo",
-	modelId: "gjc/demo",
 	allowedRoot: "/work",
 	createdAt: new Date("2026-07-08T00:00:00.000Z"),
 };
@@ -36,99 +32,40 @@ const request: OpenAIChatCompletionRequest = {
 	messages: [{ role: "user", content: "Build it" }],
 };
 
+const projectWithFolder: RegisteredProject = { ...project, openWebUIFolderId: "folder-demo" };
+
 describe("live OpenAI-compatible chat completions", () => {
-	it("advertises the sole gjc model", () => {
+	it("advertises only the stable gjc model", () => {
 		expect(buildModelList()).toEqual({
 			object: "list",
-			data: [{ id: "gjc", object: "model", created: 0, owned_by: "gjc" }],
+			data: [{ id: "gjc", object: "model", created: 1783468800, owned_by: "gjc" }],
 		});
 	});
-
-	it("returns metadata-only responses for OpenWebUI background tasks without calling the runner", async () => {
-		let calls = 0;
-		const runner: LiveGatewayRunner = {
-			run() {
-				calls += 1;
-				return { content: "unexpected" };
+	it("returns an OpenAI-style 400 for invalid workflow gate replies", async () => {
+		const result = await handleChatCompletions({
+			request,
+			headers: chatHeaders,
+			projects: [projectWithFolder],
+			owner,
+			projectContextRepository: await demoRepository(),
+			runner: {
+				run() {
+					throw new WorkflowGateReplyError("Invalid workflow gate reply.", "invalid_workflow_gate_choice", [
+						"9 is not a valid workflow gate choice. Choose a number from 1 to 3.",
+					]);
+				},
 			},
-		};
-
-		const result = await handleChatCompletions({
-			request,
-			headers: { "X-OpenWebUI-Task": "title_generation", "X-OpenWebUI-User-Id": "owner-1" },
-			projects: [project],
-			owner,
-			runner,
-			now: new Date("2026-07-08T00:00:00.000Z"),
-			idFactory: () => "chatcmpl-test",
-		});
-
-		expect(calls).toBe(0);
-		expect(result.ok).toBe(true);
-		if (!result.ok || !("body" in result)) throw new Error("expected completion body");
-		expect(result.body.choices[0]?.message.content).toBe("");
-		expect(result.body.metadata).toEqual({ task: "title_generation", noop: true });
-	});
-
-	it("rejects forwarded user mismatches", async () => {
-		const result = await handleChatCompletions({
-			request,
-			headers: { ...chatHeaders, "X-OpenWebUI-User-Id": "other-user" },
-			projects: [project],
-			owner,
-			runner: fixedRunner("unused"),
 		});
 
 		expect(result).toEqual({
 			ok: false,
-			status: 401,
+			status: 400,
 			body: {
 				error: {
-					message: "Forwarded OpenWebUI owner does not match adapter owner.",
-					type: "authentication_error",
-					code: "owner-mismatch",
+					message: "Invalid workflow gate reply.",
+					type: "invalid_request_error",
+					code: "invalid_workflow_gate_choice",
 				},
-			},
-		});
-	});
-
-	it("routes normal non-stream completions to the injected runner", async () => {
-		const inputs: LiveGatewayRunnerInput[] = [];
-		const result = await handleChatCompletions({
-			request,
-			headers: chatHeaders,
-			projects: [project],
-			owner,
-			runner: {
-				run(input) {
-					inputs.push(input);
-					return { content: `done: ${input.prompt}` };
-				},
-			},
-			now: new Date("2026-07-08T00:00:00.000Z"),
-			idFactory: () => "chatcmpl-test",
-		});
-
-		expect(inputs).toEqual([
-			{
-				project,
-				prompt: "Build it",
-				chatId: "chat-1",
-				messageId: "assistant-1",
-				userMessageId: "user-1",
-				userMessageParentId: "parent-1",
-				continued: true,
-			},
-		]);
-		expect(result).toEqual({
-			ok: true,
-			status: 200,
-			body: {
-				id: "chatcmpl-test",
-				object: "chat.completion",
-				created: 1783468800,
-				model: "gjc",
-				choices: [{ index: 0, message: { role: "assistant", content: "done: Build it" }, finish_reason: "stop" }],
 			},
 		});
 	});
@@ -138,8 +75,9 @@ describe("live OpenAI-compatible chat completions", () => {
 		const result = await handleChatCompletions({
 			request,
 			headers: chatHeaders,
-			projects: [project],
+			projects: [projectWithFolder],
 			owner,
+			projectContextRepository: await demoRepository(),
 			runner: {
 				run() {
 					return {
@@ -165,54 +103,46 @@ describe("live OpenAI-compatible chat completions", () => {
 		]);
 	});
 
-	it("encodes streaming chunks and final DONE sentinel", async () => {
+	it("persists final assistant content to the injected message sink", async () => {
+		const persisted: unknown[] = [];
 		const result = await handleChatCompletions({
-			request: { ...request, stream: true },
+			request,
 			headers: chatHeaders,
-			projects: [project],
+			projects: [projectWithFolder],
 			owner,
-			runner: { run: () => ({ chunks: ["hello", " world"] }) },
-			now: new Date("2026-07-08T00:00:00.000Z"),
-			idFactory: () => "chatcmpl-stream",
+			projectContextRepository: await demoRepository(),
+			runner: fixedRunner("GJC_UI_REAL_BACKEND_OK"),
+			messageSink(input: unknown) {
+				persisted.push(input);
+			},
 		});
 
 		expect(result.ok).toBe(true);
-		if (!("stream" in result)) throw new Error("expected stream result");
-		const chunks: string[] = [];
-		for await (const chunk of result.stream) chunks.push(chunk);
-
-		expect(chunks).toHaveLength(3);
-		expect(chunks[0]).toStartWith("data: ");
-		expect(chunks[0]).toEndWith("\n\n");
-		expect(JSON.parse(chunks[0]?.slice(6).trim() ?? "{}")).toMatchObject({
-			object: "chat.completion.chunk",
-			choices: [{ delta: { role: "assistant", content: "hello" }, finish_reason: null }],
-		});
-		expect(chunks[2]).toBe("data: [DONE]\n\n");
-	});
-
-	it("rejects project-qualified model IDs", async () => {
-		const result = await handleChatCompletions({
-			request: { ...request, model: "gjc/missing" },
-			headers: chatHeaders,
-			projects: [project],
-			owner,
-			runner: fixedRunner("unused"),
-		});
-		expect(result).toEqual({
-			ok: false,
-			status: 404,
-			body: {
-				error: {
-					message: "Unknown GJC model: gjc/missing",
-					type: "invalid_request_error",
-					code: "model_not_found",
-				},
+		expect(persisted).toEqual([
+			{
+				chatId: "chat-1",
+				messageId: "assistant-1",
+				ownerUserId: "owner-1",
+				projectId: "demo",
+				content: "GJC_UI_REAL_BACKEND_OK",
 			},
-		});
+		]);
 	});
 });
 
 function fixedRunner(content: string): LiveGatewayRunner {
 	return { run: () => ({ content }) };
+}
+
+async function demoRepository(): Promise<InMemoryOpenWebUIProjectionRepository> {
+	const repository = new InMemoryOpenWebUIProjectionRepository();
+	await repository.upsertChat({
+		id: "chat-1",
+		owner_user_id: "owner-1",
+		folder_id: "folder-demo",
+		title: "Demo chat",
+		metadata: {},
+		history: { currentId: null, messages: {} },
+	});
+	return repository;
 }

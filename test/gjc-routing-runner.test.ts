@@ -2,72 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type {
-	GjcContinueSessionInput,
-	GjcSessionAddress,
-	GjcSessionState,
-	GjcSessionStateInput,
-	GjcStartNewSessionInput,
-	GjcSwitchSessionInput,
-	GjcTurnResult,
-	GjcTurnRunner,
-} from "../src/gjc/rpc-runner";
 import { FileBackedSessionMappingStore, SessionMappingStore } from "../src/gjc/session-router";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
-import type { RegisteredProject } from "../src/projects/registry";
 import { InMemoryOutboxStore } from "../src/state/outbox";
-
-class FakeGjcTurnRunner implements GjcTurnRunner {
-	readonly starts: GjcStartNewSessionInput[] = [];
-	readonly continues: GjcContinueSessionInput[] = [];
-	readonly switches: GjcSwitchSessionInput[] = [];
-	readonly states: GjcSessionStateInput[] = [];
-
-	state: GjcSessionState = {
-		sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
-		activeLeaf: "leaf-1",
-		rawFrameCursor: 7,
-		eventCursor: 3,
-	};
-
-	async startNewSession(input: GjcStartNewSessionInput): Promise<GjcSessionAddress & GjcTurnResult> {
-		this.starts.push(input);
-		return {
-			cwd: input.cwd,
-			sessionRoot: input.sessionRoot,
-			projectId: input.projectId,
-			chatId: input.chatId,
-			sessionId: "session-1",
-			text: `new:${input.text}`,
-			events: [{ type: "assistant", text: `new:${input.text}` }],
-			sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
-			activeLeaf: "leaf-1",
-			rawFrameCursor: 7,
-			eventCursor: 3,
-		};
-	}
-
-	async continueSession(input: GjcContinueSessionInput): Promise<GjcTurnResult> {
-		this.continues.push(input);
-		return {
-			text: `continued:${input.text}`,
-			events: [{ type: "assistant", text: `continued:${input.text}` }],
-			sessionFile: input.sessionFile,
-			activeLeaf: "leaf-2",
-			rawFrameCursor: input.rawFrameCursor + 5,
-			eventCursor: input.eventCursor + 2,
-		};
-	}
-
-	async switchSession(input: GjcSwitchSessionInput): Promise<void> {
-		this.switches.push(input);
-	}
-
-	async getState(input: GjcSessionStateInput): Promise<GjcSessionState> {
-		this.states.push(input);
-		return this.state;
-	}
-}
+import { FakeGjcTurnRunner, project } from "./gjc-routing-runner-fixtures";
 
 describe("createGjcRoutingLiveGatewayRunner", () => {
 	test("continues mapped HTTP-style turns through switchSession and getState", async () => {
@@ -200,12 +138,3 @@ describe("createGjcRoutingLiveGatewayRunner", () => {
 		expect(operations[0]?.payloadHash).toBe(enqueued.payloadHash);
 	});
 });
-
-const project: RegisteredProject = {
-	id: "project",
-	name: "Project",
-	cwd: "/workspace/project",
-	modelId: "gjc/project",
-	allowedRoot: "/workspace",
-	createdAt: new Date("2026-07-08T00:00:00.000Z"),
-};

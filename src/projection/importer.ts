@@ -9,9 +9,9 @@ import { OPENWEBUI_METADATA_NAMESPACE } from "../openwebui/persistence-contract"
 export interface ProjectedProjectReference {
 	id: string;
 	name: string;
+	folderId?: string;
 	metadata?: OpenWebUIMetadata;
 }
-
 export interface ProjectedChatMessage {
 	id: string;
 	role: string;
@@ -22,14 +22,13 @@ export interface ProjectedChatMessage {
 	childrenIds?: readonly string[];
 	metadata?: OpenWebUIMetadata;
 }
-
 export interface ProjectedChatHistory {
 	messages: Record<string, ProjectedChatMessage>;
 	currentId: string | null;
 }
-
 export interface ProjectedChat {
 	id: string;
+	openWebUIChatId?: string;
 	title?: string;
 	created_at?: string;
 	updated_at?: string;
@@ -37,14 +36,12 @@ export interface ProjectedChat {
 	messages?: readonly ProjectedChatMessage[];
 	history?: ProjectedChatHistory;
 }
-
 export interface ImportProjectedSessionInput {
 	repository: OpenWebUIProjectionRepository;
 	ownerUserId: string;
 	project: ProjectedProjectReference;
 	projectedChat: ProjectedChat;
 }
-
 export interface ImportProjectedSessionResult {
 	folderId: string;
 	chatId: string;
@@ -55,7 +52,6 @@ const folderIdForProject = (projectId: string): string => `gjc-project-${project
 const chatIdForSession = (sessionId: string): string => `gjc-session-${sessionId}`;
 const messageIdForProjectedMessage = (sessionId: string, messageId: string): string =>
 	`gjc-session-${sessionId}-message-${messageId}`;
-
 const mergeProjectedMetadata = (
 	metadata: OpenWebUIMetadata | undefined,
 	operationId: string,
@@ -78,15 +74,19 @@ const projectedMessages = (projectedChat: ProjectedChat): readonly ProjectedChat
 	if (projectedChat.history !== undefined) return Object.values(projectedChat.history.messages);
 	return [];
 };
-
 const createdAtForMessage = (message: ProjectedChatMessage): string | undefined => {
 	if (message.created_at !== undefined) return message.created_at;
 	if (message.timestamp !== undefined) return new Date(message.timestamp).toISOString();
 	return undefined;
 };
-
 const projectedMessageKey = (projectedChat: ProjectedChat, messageId: string): string =>
 	messageIdForProjectedMessage(projectedChat.id, messageId);
+
+const openWebUIFolderIdForProject = (project: ProjectedProjectReference): string =>
+	project.folderId ?? folderIdForProject(project.id);
+
+const openWebUIChatIdForProjectedChat = (projectedChat: ProjectedChat): string =>
+	projectedChat.openWebUIChatId ?? chatIdForSession(projectedChat.id);
 
 const chatHistoryForProjectedChat = (projectedChat: ProjectedChat, messages: readonly OpenWebUIChatMessageRecord[]) => {
 	if (projectedChat.history === undefined) {
@@ -108,9 +108,8 @@ const chatHistoryForProjectedChat = (projectedChat: ProjectedChat, messages: rea
 				return [
 					id,
 					{
-						...mirrored,
 						id,
-						chat_id: chatIdForSession(projectedChat.id),
+						chat_id: openWebUIChatIdForProjectedChat(projectedChat),
 						owner_user_id: mirrored?.owner_user_id ?? "",
 						role: message.role,
 						content: message.content,
@@ -136,15 +135,16 @@ export const importProjectedSession = async ({
 	project,
 	projectedChat,
 }: ImportProjectedSessionInput): Promise<ImportProjectedSessionResult> => {
-	const folderId = folderIdForProject(project.id);
-	const chatId = chatIdForSession(projectedChat.id);
+	const folderId = openWebUIFolderIdForProject(project);
+	const chatId = openWebUIChatIdForProjectedChat(projectedChat);
 
-	await repository.upsertFolder({
+	const storedFolder = await repository.upsertFolder({
 		id: folderId,
 		owner_user_id: ownerUserId,
 		name: project.name,
 		metadata: mergeProjectedMetadata(project.metadata, "upsert-folder", ownerUserId, project.id, projectedChat.id),
 	});
+	const storedFolderId = storedFolder.id;
 
 	const messages = projectedMessages(projectedChat).map<OpenWebUIChatMessageRecord>((message, index) => {
 		const openwebuiMessageId = messageIdForProjectedMessage(projectedChat.id, message.id);
@@ -179,7 +179,7 @@ export const importProjectedSession = async ({
 	const chat: OpenWebUIChatRecord = {
 		id: chatId,
 		owner_user_id: ownerUserId,
-		folder_id: folderId,
+		folder_id: storedFolderId,
 		title: projectedChat.title ?? projectedChat.id,
 		created_at: projectedChat.created_at,
 		updated_at: projectedChat.updated_at,
@@ -193,12 +193,56 @@ export const importProjectedSession = async ({
 		history: chatHistoryForProjectedChat(projectedChat, messages),
 	};
 
-	await repository.upsertChat(chat);
-	const storedMessages = await repository.replaceChatMessages(ownerUserId, chatId, messages);
+	let storedChat = await repository.upsertChat(chat);
+	if (historyReferencesDifferentChat(storedChat)) {
+		storedChat = await repository.upsertChat({
+			...storedChat,
+			history: chatHistoryWithStoredChatId(storedChat),
+		});
+	}
+	const storedMessages = await repository.replaceChatMessages(
+		ownerUserId,
+		storedChat.id,
+		messages.map(message => ({ ...message, chat_id: storedChat.id })),
+	);
 
 	return {
-		folderId,
-		chatId,
+		folderId: storedFolderId,
+		chatId: storedChat.id,
 		messageIds: storedMessages.map(message => message.id),
 	};
 };
+
+export const upsertProjectedProjectFolder = async ({
+	repository,
+	ownerUserId,
+	project,
+}: {
+	repository: OpenWebUIProjectionRepository;
+	ownerUserId: string;
+	project: ProjectedProjectReference;
+}): Promise<string> => {
+	const folder = await repository.upsertFolder({
+		id: openWebUIFolderIdForProject(project),
+		owner_user_id: ownerUserId,
+		name: project.name,
+		metadata: mergeProjectedMetadata(project.metadata, "upsert-folder", ownerUserId, project.id, ""),
+	});
+	return folder.id;
+};
+
+function historyReferencesDifferentChat(chat: OpenWebUIChatRecord): boolean {
+	return Object.values(chat.history.messages).some(message => message.chat_id !== chat.id);
+}
+
+function chatHistoryWithStoredChatId(chat: OpenWebUIChatRecord): OpenWebUIChatRecord["history"] {
+	return {
+		currentId: chat.history.currentId,
+		messages: Object.fromEntries(
+			Object.entries(chat.history.messages).map(([id, message]) => [
+				id,
+				{ ...message, chat_id: chat.id, owner_user_id: chat.owner_user_id },
+			]),
+		),
+	};
+}

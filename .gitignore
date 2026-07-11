@@ -1,8 +1,20 @@
+# Dependencies
 node_modules/
+
+# Build and test output
 dist/
 coverage/
-.gjc/
+
+# Environment files
 .env
 .env.*
+
+# Local agent/tool state
+.codegraph
+.gjc/
+.omo/
+openwebui-session-mappings.json
+
+# Logs and OS files
 *.log
 .DS_Store
