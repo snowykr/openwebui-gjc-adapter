@@ -1540,10 +1540,12 @@ describe("configure CLI grammar and acknowledgements", () => {
 			}
 		}
 	});
-	test("journals actual controller state through reset quiescence before a production interruption", async () => {
+	test("restores the original controller after a reset recovery retry fails forward deployment", async () => {
 		const t = tempPath();
 		const projectRoot = join(t.directory, "workspace");
-		let capturedPending: Record<string, unknown> | undefined;
+		let capturedBootstrap: string | undefined;
+		let capturedRecovery: string | undefined;
+		let invocation = 1;
 		const systemctlCalls: string[] = [];
 		try {
 			mkdirSync(projectRoot);
@@ -1573,7 +1575,7 @@ describe("configure CLI grammar and acknowledgements", () => {
 					"--adapter-ingress-url=http://gateway.test",
 					"--reset",
 					"--reset-proof=route-change",
-					`--openwebui-api-token-fd=${secretFd(t.directory, "reset-api-token", "api-token")}`,
+					`--openwebui-api-token-fd=${secretFd(t.directory, "reset-api-token-1", "api-token")}`,
 				],
 				{
 					confirmReset: () => true,
@@ -1584,22 +1586,64 @@ describe("configure CLI grammar and acknowledgements", () => {
 						return "";
 					},
 					configureOpenWebUI: async () => {
-						capturedPending = JSON.parse(readFileSync(`${t.config}.bootstrap.json`, "utf8")).pendingRecovery;
+						capturedBootstrap = readFileSync(`${t.config}.bootstrap.json`, "utf8");
+						capturedRecovery = readFileSync(`${t.config}.recovery.json`, "utf8");
 						throw new Error("simulated interruption after reset quiescence");
 					},
 				},
 			);
 			expect(result).toBe(1);
-			expect(capturedPending).toMatchObject({
+			expect(JSON.parse(capturedBootstrap!).pendingRecovery).toMatchObject({
 				priorControllerEnabled: true,
 				priorControllerActive: true,
 				controllerRecoveryRequired: true,
 				controllerQuiesced: true,
 			});
-			expect(systemctlCalls).toEqual(
+
+			// Preserve the durable artifacts written before the interruption as a process-boundary retry would.
+			writeFileSync(`${t.config}.bootstrap.json`, capturedBootstrap!);
+			writeFileSync(`${t.config}.recovery.json`, capturedRecovery!);
+			systemctlCalls.length = 0;
+			invocation = 2;
+
+			expect(
+				await runCli(
+					[
+						"configure",
+						"existing",
+						"--config",
+						t.config,
+						"--openwebui-url=http://two.test",
+						"--adapter-ingress-url=http://gateway.test",
+						"--reset",
+						"--reset-proof=route-change",
+						`--openwebui-api-token-fd=${secretFd(t.directory, "reset-api-token-2", "api-token")}`,
+					],
+					{
+						confirmReset: () => true,
+						systemctl: args => {
+							systemctlCalls.push(args.join(" "));
+							if (args[2] === "is-enabled") return "disabled";
+							if (args[2] === "is-active") return "inactive";
+							return "";
+						},
+						configureOpenWebUI: async () => {
+							if (invocation === 2) throw new Error("forward deployment failed");
+							throw new Error("unexpected invocation");
+						},
+					},
+				),
+			).toBe(1);
+			expect(systemctlCalls).not.toEqual(
 				expect.arrayContaining([
+					"systemctl --user is-enabled openwebui-gjc-adapter-existing.service",
+					"systemctl --user is-active openwebui-gjc-adapter-existing.service",
 					"systemctl --user stop openwebui-gjc-adapter-existing.service",
 					"systemctl --user disable openwebui-gjc-adapter-existing.service",
+				]),
+			);
+			expect(systemctlCalls).toEqual(
+				expect.arrayContaining([
 					"systemctl --user enable openwebui-gjc-adapter-existing.service",
 					"systemctl --user start openwebui-gjc-adapter-existing.service",
 				]),

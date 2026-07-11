@@ -877,20 +877,30 @@ function productionDeployment(
 		reset: async input => {
 			const evidence = input.proof.evidence;
 			if (!evidence.trim()) throw new Error("reset requires proof for the persisted failed phase");
-			const previous = existsSync(path) ? readInstalledConfig(path) : undefined;
-			const controllers = controllerState(input.priorMode);
-			transaction = {
-				snapshots: deploymentSnapshot(path, userUnitDirectory),
-				previous,
-				priorMode: input.priorMode,
-				controllers,
-			};
-			updatePendingRecoveryJournal(path, {
-				controllerRecoveryRequired: true,
-				controllerQuiesced: false,
-				priorControllerEnabled: controllers.enabled,
-				priorControllerActive: controllers.active,
-			});
+			const pending = readPendingRecoveryJournal(path);
+			const resumedRecovery = pending?.controllerRecoveryRequired === true && pending.controllerQuiesced === true;
+			const tx = resumedRecovery
+				? transactionFromDisk()
+				: (() => {
+						const previous = existsSync(path) ? readInstalledConfig(path) : undefined;
+						const controllers = controllerState(input.priorMode);
+						return {
+							snapshots: deploymentSnapshot(path, userUnitDirectory),
+							...(previous === undefined ? {} : { previous }),
+							priorMode: input.priorMode,
+							controllers,
+						};
+					})();
+			if (!tx) throw new Error("reset recovery requires a durable deployment snapshot");
+			transaction = tx;
+			if (!resumedRecovery) {
+				updatePendingRecoveryJournal(path, {
+					controllerRecoveryRequired: true,
+					controllerQuiesced: false,
+					priorControllerEnabled: tx.controllers.enabled,
+					priorControllerActive: tx.controllers.active,
+				});
+			}
 			try {
 				if (input.priorMode === "managed") {
 					const current = await state.read();
@@ -912,14 +922,16 @@ function productionDeployment(
 						throw new Error("reset requires proof for the persisted failed phase");
 					await state.write(resetBootstrapState(current, failedPhase, { failedPhase, evidence }));
 				}
-				const unit = routeControllerUnitName(input.priorMode);
-				run(["systemctl", "--user", "stop", unit]);
-				run(["systemctl", "--user", "disable", unit]);
+				if (!pending?.controllerQuiesced) {
+					const unit = routeControllerUnitName(input.priorMode);
+					run(["systemctl", "--user", "stop", unit]);
+					run(["systemctl", "--user", "disable", unit]);
+				}
 				updatePendingRecoveryJournal(path, {
 					controllerRecoveryRequired: true,
 					controllerQuiesced: true,
-					priorControllerEnabled: controllers.enabled,
-					priorControllerActive: controllers.active,
+					priorControllerEnabled: tx.controllers.enabled,
+					priorControllerActive: tx.controllers.active,
 				});
 				return { completed: true, mode: "reset" };
 			} catch (error) {
@@ -1157,10 +1169,12 @@ function updatePendingRecoveryJournal(
 ): void {
 	const pending = readPendingRecoveryJournal(path);
 	if (pending === undefined) return;
+	const controllerQuiesced = pending.controllerQuiesced || patch.controllerQuiesced === true;
 	writePendingRecoveryJournal(path, {
 		...pending,
 		...patch,
-		linkage: `${pending.mode}:${pending.installationId}:${pending.targetUrl}:${pending.providerUrl}:${pending.uiPort}${pending.projectRoot === undefined ? "" : `:${pending.projectRoot}`}${pending.bindPort === undefined ? "" : `:${pending.bindPort}`}:${pending.priorMode}:${(patch.priorControllerEnabled ?? pending.priorControllerEnabled) ? "enabled" : "disabled"}:${(patch.priorControllerActive ?? pending.priorControllerActive) ? "active" : "inactive"}:${(patch.controllerRecoveryRequired ?? pending.controllerRecoveryRequired) ? "recovery-required" : "controller-live"}:${(patch.controllerQuiesced ?? pending.controllerQuiesced) ? "controller-quiesced" : "controller-live"}`,
+		controllerQuiesced,
+		linkage: `${pending.mode}:${pending.installationId}:${pending.targetUrl}:${pending.providerUrl}:${pending.uiPort}${pending.projectRoot === undefined ? "" : `:${pending.projectRoot}`}${pending.bindPort === undefined ? "" : `:${pending.bindPort}`}:${pending.priorMode}:${(patch.priorControllerEnabled ?? pending.priorControllerEnabled) ? "enabled" : "disabled"}:${(patch.priorControllerActive ?? pending.priorControllerActive) ? "active" : "inactive"}:${(patch.controllerRecoveryRequired ?? pending.controllerRecoveryRequired) ? "recovery-required" : "controller-live"}:${controllerQuiesced ? "controller-quiesced" : "controller-live"}`,
 	});
 }
 function clearPendingRecoveryJournal(path: string): void {
