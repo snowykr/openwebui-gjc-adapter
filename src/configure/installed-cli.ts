@@ -529,10 +529,18 @@ function productionDeployment(
 			}
 		},
 	};
+	const managedOpenWebUIStartupAttempts = 60;
+	const managedOpenWebUIStartupDelayMs = managedReadinessDelayMs ?? 1_000;
 	const http = (config: InstalledConfig) => ({
 		request: async <T>(method: string, endpoint: string, body?: unknown, authorization?: string): Promise<T> => {
 			const token = authorization ?? config.openWebUIApiToken;
-			const attempts = endpoint === "/api/version" ? 10 : 1;
+			const isManagedVersionProbe = config.mode === "managed" && endpoint === "/api/version";
+			const attempts = isManagedVersionProbe
+				? managedOpenWebUIStartupAttempts
+				: endpoint === "/api/version"
+					? 10
+					: 1;
+			const delayMs = isManagedVersionProbe ? managedOpenWebUIStartupDelayMs : 500;
 			let failure: unknown;
 			for (let attempt = 0; attempt < attempts; attempt++) {
 				try {
@@ -548,7 +556,7 @@ function productionDeployment(
 					return (await response.json()) as T;
 				} catch (error) {
 					failure = error;
-					if (attempt + 1 < attempts) await new Promise(resolve => setTimeout(resolve, 500));
+					if (attempt + 1 < attempts) await new Promise(resolve => setTimeout(resolve, delayMs));
 				}
 			}
 			throw failure;

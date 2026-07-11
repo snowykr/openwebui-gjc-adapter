@@ -6,6 +6,7 @@ import {
 	mkdtempSync,
 	openSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
 	symlinkSync,
 	writeFileSync,
@@ -371,6 +372,67 @@ describe("configure CLI grammar and acknowledgements", () => {
 				packageRoot,
 			]);
 		} finally {
+			t.cleanup();
+		}
+	});
+	test("waits for a managed OpenWebUI cold start before configuring its API key", async () => {
+		const t = tempPath();
+		const config = join(realpathSync(t.directory), "config.json");
+		const originalFetch = globalThis.fetch;
+		let versionRequests = 0;
+		let providerConfig = JSON.stringify({
+			ENABLE_OPENAI_API: true,
+			OPENAI_API_BASE_URLS: ["https://api.openai.com/v1"],
+			OPENAI_API_KEYS: [""],
+			OPENAI_API_CONFIGS: {},
+		});
+		const systemctl = (args: readonly string[]) =>
+			args[2] === "is-enabled" ? "disabled" : args[2] === "is-active" ? "inactive" : undefined;
+		const managedFetch = Object.assign(
+			async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+				const path = new URL(input instanceof Request ? input.url : input).pathname;
+				if (path === "/api/version") {
+					versionRequests++;
+					if (versionRequests <= 20) return new Response(null, { status: 503 });
+					return Response.json({ version: "0.10.0" });
+				}
+				if (path === "/api/v1/auths/signup") return Response.json({ token: "session-token" });
+				if (path === "/api/v1/auths/api_key") return Response.json({ api_key: "api-key" });
+				if (path === "/api/v1/auths/") return Response.json({ id: "owner", role: "admin" });
+				if (path === "/openai/config")
+					return new Response(providerConfig, { headers: { "content-type": "application/json" } });
+				if (path === "/openai/config/update") {
+					if (typeof init?.body !== "string") throw new Error("provider update body must be JSON text");
+					providerConfig = init.body;
+					return Response.json({});
+				}
+				throw new Error(`unexpected OpenWebUI request ${path}`);
+			},
+			{ preconnect: originalFetch.preconnect },
+		);
+		try {
+			globalThis.fetch = managedFetch;
+			expect(
+				await runCli(
+					[
+						"configure",
+						"managed",
+						"--config",
+						config,
+						`--admin-email-fd=${secretFd(t.directory, "cold-start-email", "admin@example.test")}`,
+						`--admin-password-fd=${secretFd(t.directory, "cold-start-password", "password")}`,
+					],
+					{
+						systemctl,
+						managedReadinessDelayMs: 0,
+						managedDocker: { run: async () => ({ exitCode: 0, stdout: '[] "/var/lib/docker"', stderr: "" }) },
+						probeManagedAdapter: () => {},
+					},
+				),
+			).toBe(0);
+			expect(versionRequests).toBe(23);
+		} finally {
+			globalThis.fetch = originalFetch;
 			t.cleanup();
 		}
 	});
