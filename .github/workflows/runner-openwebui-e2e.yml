@@ -1,0 +1,96 @@
+name: Runner OpenWebUI E2E
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runner-openwebui-e2e-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  runner-openwebui-e2e:
+    name: Runner OpenWebUI E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - name: Provision runner OpenWebUI E2E
+        env:
+          E2E_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          E2E_ROOT: ${{ runner.temp }}/runner-openwebui-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          umask 077
+          IMAGE='ghcr.io/open-webui/open-webui:v0.10.2@sha256:9fcea9c6e32ab60b0498f3986c6cdf651ddbe61db48d2213a3d28048ddd673d4'
+          CONTAINER="runner-openwebui-e2e-${E2E_RUN_ID}"
+          NETWORK="runner-openwebui-e2e-${E2E_RUN_ID}"
+          ADAPTER_PID=''
+          mkdir -p "$E2E_ROOT/raw" "$E2E_ROOT/diagnostics" "$E2E_ROOT/state" "$E2E_ROOT/sessions" "$E2E_ROOT/allowed" "$E2E_ROOT/output"
+          ADAPTER_TOKEN="$(openssl rand -hex 32)"
+          ADMIN_PASSWORD="$(openssl rand -base64 36)"
+          WEBUI_SECRET="$(openssl rand -hex 32)"
+          for secret in "$ADAPTER_TOKEN" "$ADMIN_PASSWORD" "$WEBUI_SECRET"; do echo "::add-mask::$secret"; done
+          cleanup() {
+            status=$?
+            cleanup_failed=0
+            set +e
+            cleanup_error() {
+              echo "$1"
+              cleanup_failed=1
+            }
+            if [ -n "$ADAPTER_PID" ]; then
+              kill "$ADAPTER_PID" || cleanup_error E2E_ADAPTER_CLEANUP_FAILED
+              wait "$ADAPTER_PID" || cleanup_error E2E_ADAPTER_CLEANUP_FAILED
+            fi
+            CONTAINER_SUMMARY="$(docker inspect "$CONTAINER" --format 'status={{.State.Status}} exit_code={{.State.ExitCode}} started_at={{.State.StartedAt}} finished_at={{.State.FinishedAt}}' 2>&1)" || CONTAINER_SUMMARY=unavailable
+            {
+              printf 'run_status=%s\n' "$status"
+              printf 'container_%s\n' "${CONTAINER_SUMMARY:-unavailable}"
+            } >"$E2E_ROOT/raw/summary.txt"
+            SECRETS="$ADAPTER_TOKEN|$ADMIN_PASSWORD|$WEBUI_SECRET|${OPENWEBUI_JWT:-}" E2E_ROOT="$E2E_ROOT" bun -e 'import { readFile, writeFile } from "node:fs/promises"; import { containsSecretLiteral, redactLiterals } from "./scripts/e2e-runner-openwebui-support"; const secrets=(process.env.SECRETS??"").split("|").filter(Boolean); const source=`${process.env.E2E_ROOT}/raw/summary.txt`; const redacted=redactLiterals(await readFile(source,"utf8"),secrets); if (containsSecretLiteral(redacted,secrets)) { console.log("E2E_DIAGNOSTIC_REDACTION_FAILED"); process.exit(2); } await writeFile(`${process.env.E2E_ROOT}/diagnostics/summary.txt`,redacted);' || { rm -rf "$E2E_ROOT/diagnostics"; mkdir -p "$E2E_ROOT/diagnostics"; echo E2E_DIAGNOSTIC_REDACTION_FAILED; cleanup_failed=1; }
+            docker rm -f "$CONTAINER" >/dev/null 2>&1 || cleanup_error E2E_CONTAINER_CLEANUP_FAILED
+            docker network rm "$NETWORK" >/dev/null 2>&1 || cleanup_error E2E_NETWORK_CLEANUP_FAILED
+            docker network inspect "$NETWORK" >/dev/null 2>&1 && cleanup_error E2E_NETWORK_CLEANUP_FAILED
+            rm -rf "$E2E_ROOT/raw" "$E2E_ROOT/state" "$E2E_ROOT/sessions" "$E2E_ROOT/allowed" || cleanup_error E2E_WORKSPACE_CLEANUP_FAILED
+            [ "$status" -ne 0 ] || [ "$cleanup_failed" -eq 0 ] || exit 1
+            exit "$status"
+          }
+          trap cleanup EXIT
+          docker pull "$IMAGE"
+          [ "$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')" = '0.10.2' ] || { echo E2E_IMAGE_VERSION_MISMATCH; exit 1; }
+          docker network create --driver bridge "$NETWORK" >/dev/null
+          GATEWAY_LINES="$(docker network inspect "$NETWORK" --format '{{range .IPAM.Config}}{{println .Gateway}}{{end}}')" || { echo E2E_NETWORK_GATEWAY_INVALID; exit 1; }
+          readarray -t GATEWAYS <<<"$GATEWAY_LINES"
+          [ "${#GATEWAYS[@]}" -eq 1 ] && [[ "${GATEWAYS[0]}" =~ ^(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$ ]] || { echo E2E_NETWORK_GATEWAY_INVALID; exit 1; }
+          GATEWAY="${GATEWAYS[0]}"
+          OPENAI_CONFIGS='{"0":{"enable":true,"urlIdx":0,"name":"GJC","prefix_id":"","headers":{"X-OpenWebUI-Chat-Id":"{{CHAT_ID}}","X-OpenWebUI-Message-Id":"{{MESSAGE_ID}}","X-OpenWebUI-User-Message-Id":"{{USER_MESSAGE_ID}}","X-OpenWebUI-User-Message-Parent-Id":"{{USER_MESSAGE_PARENT_ID}}","X-OpenWebUI-Task":"{{TASK}}"}}}'
+          docker run -d --name "$CONTAINER" --network "$NETWORK" -p 127.0.0.1:3000:8080 -v "$E2E_ROOT/state:/app/backend/data" -e WEBUI_ADMIN_EMAIL=e2e@example.invalid -e WEBUI_ADMIN_PASSWORD="$ADMIN_PASSWORD" -e WEBUI_ADMIN_NAME='Runner E2E' -e WEBUI_SECRET_KEY="$WEBUI_SECRET" -e ENABLE_OPENAI_API=True -e OPENAI_API_BASE_URLS="[\"http://$GATEWAY:8765/v1\"]" -e OPENAI_API_KEYS="[\"$ADAPTER_TOKEN\"]" -e OPENAI_API_CONFIGS="$OPENAI_CONFIGS" -e ENABLE_FORWARD_USER_INFO_HEADERS=True -e ENABLE_OLLAMA_API=False -e ENABLE_PERSISTENT_CONFIG=False "$IMAGE" >/dev/null
+          deadline=$((SECONDS + 120)); until curl --fail --silent --show-error http://127.0.0.1:3000/api/version >/dev/null; do [ "$SECONDS" -lt "$deadline" ] || { echo E2E_OPENWEBUI_READINESS_TIMEOUT; exit 1; }; sleep 2; done
+          SIGNIN="$(curl --fail --silent --show-error -H 'content-type: application/json' --data "{\"email\":\"e2e@example.invalid\",\"password\":\"$ADMIN_PASSWORD\"}" http://127.0.0.1:3000/api/v1/auths/signin)"
+          OPENWEBUI_JWT="$(SIGNIN="$SIGNIN" bun -e 'const x=JSON.parse(process.env.SIGNIN); if(typeof x.token!=="string"||!x.token||typeof x.id!=="string"||!x.id) process.exit(1); process.stdout.write(x.token)')"
+          echo "::add-mask::$OPENWEBUI_JWT"
+          [ -n "$OPENWEBUI_JWT" ] || { echo E2E_SIGNIN_INVALID; exit 1; }
+          GJC_OPENWEBUI_BIND_HOST="$GATEWAY" GJC_OPENWEBUI_BIND_PORT=8765 GJC_OPENWEBUI_ADAPTER_API_TOKEN="$ADAPTER_TOKEN" GJC_OPENWEBUI_BASE_URL=http://127.0.0.1:3000 GJC_OPENWEBUI_API_TOKEN="$OPENWEBUI_JWT" GJC_OPENWEBUI_OWNER_USER_ID="$(SIGNIN="$SIGNIN" bun -e 'process.stdout.write(JSON.parse(process.env.SIGNIN).id)')" GJC_OPENWEBUI_STATE_PATH="$E2E_ROOT/state/adapter" GJC_OPENWEBUI_SESSION_ROOT="$E2E_ROOT/sessions" GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS="$E2E_ROOT/allowed" bun run start >"$E2E_ROOT/raw/adapter.log" 2>&1 & ADAPTER_PID=$!
+          deadline=$((SECONDS + 60)); until curl --fail --silent --show-error -H "authorization: Bearer $ADAPTER_TOKEN" "http://$GATEWAY:8765/healthz" >"$E2E_ROOT/raw/health.json"; do kill -0 "$ADAPTER_PID" || { echo E2E_ADAPTER_EXITED; exit 1; }; [ "$SECONDS" -lt "$deadline" ] || { echo E2E_ADAPTER_READINESS_TIMEOUT; exit 1; }; sleep 2; done
+          E2E_RUNNER_OPENWEBUI_BASE_URL=http://127.0.0.1:3000 E2E_OPENWEBUI_API_TOKEN="$OPENWEBUI_JWT" E2E_OUTPUT_ROOT="$E2E_ROOT/output" E2E_RUN_ID="$E2E_RUN_ID" timeout 300 bun run e2e:runner-openwebui
+      - name: Upload redacted failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: runner-openwebui-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/runner-openwebui-e2e-${{ github.run_id }}-${{ github.run_attempt }}/diagnostics
+          if-no-files-found: warn
+          retention-days: 14

@@ -6,6 +6,7 @@ import { SessionMappingStore } from "../src/gjc/session-router";
 import {
 	InMemoryOpenWebUIProjectionRepository,
 	type OpenWebUIChatMessageRecord,
+	type OpenWebUIChatOwnerResolution,
 	type OpenWebUIChatRecord,
 	type OpenWebUIFolderRecord,
 	type OpenWebUIProjectionRepository,
@@ -227,6 +228,12 @@ class FolderIdRemappingRepository implements OpenWebUIProjectionRepository {
 
 	async getChat(ownerUserId: string, chatId: string): Promise<OpenWebUIChatRecord | undefined> {
 		return await this.#inner.getChat(ownerUserId, chatId);
+	}
+	async resolveChatOwner(
+		_ownerUserId: string,
+		_chatId: string,
+	): Promise<OpenWebUIChatOwnerResolution> {
+		return { kind: "missing" };
 	}
 
 	async getFolder(ownerUserId: string, folderId: string): Promise<OpenWebUIFolderRecord | undefined> {
