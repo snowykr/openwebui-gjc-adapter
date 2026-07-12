@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { resolveGjcRuntimeLocations } from "../src/configure/runtime-locations";
 import { SessionMappingStore } from "../src/gjc/session-router";
 import {
 	InMemoryOpenWebUIProjectionRepository,
@@ -67,6 +68,7 @@ describe("project link registration", () => {
 			repository,
 			mappings: new SessionMappingStore(),
 			ownerUserId: "owner-1",
+			protectedPaths: protectedPathsFor(workspace),
 		});
 
 		const linked = await service.linkProject({ cwd: projectDirectory, name: "Demo Project" });
@@ -111,6 +113,7 @@ describe("project link registration", () => {
 			repository,
 			mappings: new SessionMappingStore(),
 			ownerUserId: "owner-1",
+			protectedPaths: protectedPathsFor(workspace),
 		});
 		await service.linkProject({ cwd: projectDirectory, name: "Deleted In UI" });
 
@@ -147,6 +150,7 @@ describe("project link registration", () => {
 			store: new SqliteProjectRegistrationStore(":memory:"),
 			repository,
 			ownerUserId: "owner-1",
+			protectedPaths: protectedPathsFor(workspace),
 		});
 
 		await service.linkProject({ cwd: projectDirectory, name: "HTTP Project" });
@@ -172,6 +176,7 @@ describe("project link registration", () => {
 			store,
 			repository,
 			ownerUserId: "owner-1",
+			protectedPaths: protectedPathsFor(workspace),
 		});
 		await service.linkProject({ cwd: projectDirectory, name: "Env Runtime Folder" });
 		const envProject = await registerProjectDirectory(
@@ -179,7 +184,7 @@ describe("project link registration", () => {
 			allowedRoots,
 		);
 
-		service.seedConfiguredProjects([envProject]);
+		await service.seedConfiguredProjects([envProject]);
 
 		expect(service.listProjects()).toMatchObject([
 			{ id: "env-runtime-folder", openWebUIFolderId: "openwebui-runtime-folder" },
@@ -194,11 +199,16 @@ describe("project link registration", () => {
 			allowedRoots: await resolveAllowedRoots([workspace]),
 			store: new SqliteProjectRegistrationStore(":memory:"),
 			ownerUserId: "owner-1",
+			protectedPaths: protectedPathsFor(workspace),
 		});
 
 		await expect(service.linkProject({ cwd: outside, name: "Outside" })).rejects.toThrow("outside allowed");
 	});
 });
+
+function protectedPathsFor(workspace: string) {
+	return resolveGjcRuntimeLocations({ mode: "existing", serviceHome: workspace }).protectedProjectPaths;
+}
 
 class FolderIdRemappingRepository implements OpenWebUIProjectionRepository {
 	readonly deletedFolders: string[] = [];

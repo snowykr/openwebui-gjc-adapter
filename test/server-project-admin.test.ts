@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { resolveGjcRuntimeLocations } from "../src/configure/runtime-locations";
 import { SessionMappingStore } from "../src/gjc/session-router";
 import type { LiveGatewayRunner } from "../src/live/chat-completions";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
@@ -39,6 +40,7 @@ describe("project admin routes", () => {
 			repository,
 			mappings: new SessionMappingStore(),
 			ownerUserId: "owner-1",
+			protectedPaths: protectedPathsFor(workspace),
 		});
 		const handler = createAdapterRequestHandler({
 			routes: {
@@ -63,7 +65,7 @@ describe("project admin routes", () => {
 			project: { id: "admin-project", status: "linked" },
 			sync: { imported: [{ sessionId: "session-one" }] },
 		});
-		expect(await modelIds(handler)).toEqual(["gjc"]);
+		expect(await modelIds(handler)).toEqual([]);
 
 		const unlinked = await handler(
 			new Request("http://adapter.test/admin/projects/admin-project/unlink", {
@@ -73,7 +75,7 @@ describe("project admin routes", () => {
 		);
 		expect(unlinked.status).toBe(200);
 		expect(await unlinked.json()).toMatchObject({ project: { id: "admin-project", status: "unlinked" } });
-		expect(await modelIds(handler)).toEqual(["gjc"]);
+		expect(await modelIds(handler)).toEqual([]);
 		expect(await fs.stat(sessionFile)).toBeTruthy();
 		expect(await repository.getChat("owner-1", "gjc-project-admin-project-session-session-one")).toBeUndefined();
 
@@ -84,7 +86,7 @@ describe("project admin routes", () => {
 			}),
 		);
 		expect(relinked.status).toBe(200);
-		expect(await modelIds(handler)).toEqual(["gjc"]);
+		expect(await modelIds(handler)).toEqual([]);
 		expect(await repository.getChat("owner-1", "gjc-project-admin-project-session-session-one")).toMatchObject({
 			title: "Admin Session",
 		});
@@ -99,6 +101,7 @@ describe("project admin routes", () => {
 			allowedRoots: await resolveAllowedRoots([workspace]),
 			store: new SqliteProjectRegistrationStore(":memory:"),
 			ownerUserId: "owner-1",
+			protectedPaths: protectedPathsFor(workspace),
 		});
 		const handler = createAdapterRequestHandler({
 			routes: {
@@ -121,7 +124,7 @@ describe("project admin routes", () => {
 		expect(linked.status).toBe(200);
 		const linkedBody = (await linked.json()) as ChatCompletionBody;
 		expect(linkedBody.choices[0].message.content).toContain("Linked slash-project");
-		expect(await modelIds(handler)).toEqual(["gjc"]);
+		expect(await modelIds(handler)).toEqual([]);
 
 		const unlinked = await handler(
 			chatCommandRequest({
@@ -132,7 +135,7 @@ describe("project admin routes", () => {
 		expect(unlinked.status).toBe(200);
 		const unlinkedBody = (await unlinked.json()) as ChatCompletionBody;
 		expect(unlinkedBody.choices[0].message.content).toContain("Unlinked slash-project");
-		expect(await modelIds(handler)).toEqual(["gjc"]);
+		expect(await modelIds(handler)).toEqual([]);
 	});
 
 	test("rejects admin link requests outside allowed roots", async () => {
@@ -143,6 +146,7 @@ describe("project admin routes", () => {
 			allowedRoots: await resolveAllowedRoots([workspace]),
 			store: new SqliteProjectRegistrationStore(":memory:"),
 			ownerUserId: "owner-1",
+			protectedPaths: protectedPathsFor(workspace),
 		});
 		const handler = createAdapterRequestHandler({
 			routes: {
@@ -171,6 +175,7 @@ describe("project admin routes", () => {
 			allowedRoots: await resolveAllowedRoots([workspace]),
 			store: new SqliteProjectRegistrationStore(":memory:"),
 			ownerUserId: "owner-1",
+			protectedPaths: protectedPathsFor(workspace),
 		});
 		const handler = createAdapterRequestHandler({
 			routes: {
@@ -196,6 +201,10 @@ describe("project admin routes", () => {
 });
 
 const owner: OpenWebUIOwnerContext = { ownerUserId: "owner-1", singleOwnerLocalMode: false };
+
+function protectedPathsFor(workspace: string) {
+	return resolveGjcRuntimeLocations({ mode: "existing", serviceHome: workspace }).protectedProjectPaths;
+}
 
 function fixedRunner(content: string): LiveGatewayRunner {
 	return { run: () => ({ content }) };

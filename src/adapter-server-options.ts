@@ -13,7 +13,7 @@ import { OpenWebUIHttpClient, type OpenWebUIProjectionRepository } from "./openw
 import { createOpenWebUIFileContextResolver } from "./openwebui/file-context-resolver";
 import { OpenWebUIPromptHintClient } from "./openwebui/prompt-hints";
 import { ProjectLinkService } from "./projects/link-service";
-import { SqliteProjectRegistrationStore } from "./projects/registration-store";
+import { auditProjectRegistrations, SqliteProjectRegistrationStore } from "./projects/registration-store";
 import { disambiguateRegisteredProjects, type RegisteredProject, registerProjectDirectory } from "./projects/registry";
 import { type AllowedRoot, resolveAllowedRoots } from "./security/paths";
 import { type AdapterServerHandle, type AdapterServerOptions, startAdapterServer } from "./server";
@@ -54,9 +54,26 @@ export async function buildResolvedAdapterServerOptions(
 	behavior: BuildAdapterServerOptionsBehavior = {},
 ): Promise<AdapterServerOptions> {
 	assertResolvedAdapterConfig(config);
+	const projectStore =
+		dependencies.projectRegistrationStore ??
+		new SqliteProjectRegistrationStore(buildProjectRegistrationStorePath(config));
+	await auditProjectRegistrations(projectStore, config.runtimeLocations.protectedProjectPaths);
 	const allowedRoots = await resolveAllowedRoots(config.allowedProjectRoots);
 	const projects = await loadConfiguredProjects(config, allowedRoots);
 	const owner = buildOwnerContext(config);
+	const mappings = dependencies.mappings ?? new FileBackedSessionMappingStore(buildSessionMappingStorePath(config));
+	const openWebUIClient = buildOpenWebUIClient(config);
+	const projectionRepository = dependencies.projectionRepository ?? openWebUIClient;
+	const projectLinkService = new ProjectLinkService({
+		allowedRoots,
+		store: projectStore,
+		ownerUserId: owner.ownerUserId,
+		repository: projectionRepository,
+		mappings,
+		protectedPaths: config.runtimeLocations.protectedProjectPaths,
+	});
+	const previouslyLinkedProjectIds = new Set(projectLinkService.listLinkedProjects().map(project => project.id));
+	await projectLinkService.seedConfiguredProjects(projects);
 	const turnRunner =
 		dependencies.turnRunner ??
 		createResolvedGjcRpcTurnRunner({
@@ -64,25 +81,10 @@ export async function buildResolvedAdapterServerOptions(
 			turnTimeoutMs: config.turnTimeoutMs,
 			runtimeLocations: config.runtimeLocations,
 		});
-	const mappings = dependencies.mappings ?? new FileBackedSessionMappingStore(buildSessionMappingStorePath(config));
-	const openWebUIClient = buildOpenWebUIClient(config);
 	const promptHintClient = buildOpenWebUIPromptHintClient(config);
 	if (promptHintClient !== undefined && !behavior.deferOpenWebUIInitialization) {
 		await promptHintClient.seedGjcPromptHints();
 	}
-	const projectionRepository = dependencies.projectionRepository ?? openWebUIClient;
-	const projectStore =
-		dependencies.projectRegistrationStore ??
-		new SqliteProjectRegistrationStore(buildProjectRegistrationStorePath(config));
-	const projectLinkService = new ProjectLinkService({
-		allowedRoots,
-		store: projectStore,
-		ownerUserId: owner.ownerUserId,
-		repository: projectionRepository,
-		mappings,
-	});
-	const previouslyLinkedProjectIds = new Set(projectLinkService.listLinkedProjects().map(project => project.id));
-	projectLinkService.seedConfiguredProjects(projects);
 	if (projectionRepository !== undefined && !behavior.deferOpenWebUIInitialization) {
 		await projectLinkService.reconcileOpenWebUIFolderLinks({ projectIds: previouslyLinkedProjectIds });
 		await projectLinkService.syncLinkedProjects();

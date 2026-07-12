@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { resolveGjcRuntimeLocations } from "../src/configure/runtime-locations";
 import type { LiveGatewayRunner } from "../src/live/chat-completions";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
@@ -124,6 +125,7 @@ async function buildHandler(workspace: string, repository?: InMemoryOpenWebUIPro
 		store: new SqliteProjectRegistrationStore(":memory:"),
 		...(repository === undefined ? {} : { repository }),
 		ownerUserId: "owner-1",
+		protectedPaths: resolveGjcRuntimeLocations({ mode: "existing", serviceHome: workspace }).protectedProjectPaths,
 	});
 	const handler = createAdapterRequestHandler({
 		routes: {

@@ -3,8 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import * as path from "node:path";
 import type { GjcRuntimeLocations } from "../contracts";
-import { pathsOverlap, resolveExistingOrProspectivePath } from "../security/paths";
-import { ProjectLinkError } from "./link-service";
+import { assertProjectsAdmitted } from "./link-service";
 import type { RegisteredProject } from "./registry";
 
 export type ProjectRegistrationSource = "env" | "admin";
@@ -224,19 +223,7 @@ export async function auditProjectRegistrations(
 	store: SqliteProjectRegistrationStore,
 	protectedPaths: GjcRuntimeLocations["protectedProjectPaths"],
 ): Promise<void> {
-	const canonicalProtectedPaths = await Promise.all(protectedPaths.map(resolveExistingOrProspectivePath));
-	for (const project of store.listProjects()) {
-		const candidatePaths = project.sessionRoot === undefined ? [project.cwd] : [project.cwd, project.sessionRoot];
-		for (const candidatePath of candidatePaths) {
-			const canonicalCandidatePath = await resolveExistingOrProspectivePath(candidatePath);
-			if (canonicalProtectedPaths.some(protectedPath => pathsOverlap(canonicalCandidatePath, protectedPath))) {
-				throw new ProjectLinkError(
-					"Project paths must not overlap protected GJC runtime paths.",
-					"invalid_project_link",
-				);
-			}
-		}
-	}
+	await assertProjectsAdmitted(store.listProjects(), protectedPaths);
 }
 
 function projectRegistrationSchema(): string {

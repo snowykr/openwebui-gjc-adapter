@@ -1,8 +1,10 @@
 import * as path from "node:path";
+import type { GjcRuntimeLocations } from "../contracts";
 import type { SessionMappingStore } from "../gjc/session-router";
 import type { OpenWebUIProjectionRepository } from "../openwebui/client";
 import { type SyncProjectSessionsResult, syncProjectSessionsToOpenWebUI } from "../projection/session-sync";
 import type { AllowedRoot } from "../security/paths";
+import { pathsOverlap, resolveExistingOrProspectivePath } from "../security/paths";
 import type {
 	ProjectRegistration,
 	ProjectRegistrationSource,
@@ -17,6 +19,7 @@ export interface ProjectLinkServiceOptions {
 	readonly ownerUserId: string;
 	readonly repository?: OpenWebUIProjectionRepository;
 	readonly mappings?: SessionMappingStore;
+	readonly protectedPaths: GjcRuntimeLocations["protectedProjectPaths"];
 }
 
 export interface ProjectLinkResult {
@@ -46,6 +49,7 @@ export class ProjectLinkService {
 	readonly #ownerUserId: string;
 	readonly #repository?: OpenWebUIProjectionRepository;
 	readonly #mappings?: SessionMappingStore;
+	readonly #protectedPaths: GjcRuntimeLocations["protectedProjectPaths"];
 
 	constructor(options: ProjectLinkServiceOptions) {
 		this.#allowedRoots = options.allowedRoots;
@@ -53,9 +57,11 @@ export class ProjectLinkService {
 		this.#ownerUserId = options.ownerUserId;
 		this.#repository = options.repository;
 		this.#mappings = options.mappings;
+		this.#protectedPaths = options.protectedPaths;
 	}
 
-	seedConfiguredProjects(projects: readonly RegisteredProject[]): void {
+	async seedConfiguredProjects(projects: readonly RegisteredProject[]): Promise<void> {
+		await assertProjectsAdmitted(projects, this.#protectedPaths);
 		this.#store.seedConfiguredProjects(projects);
 	}
 
@@ -72,6 +78,7 @@ export class ProjectLinkService {
 			}
 			throw error;
 		}
+		await assertProjectsAdmitted([registered], this.#protectedPaths);
 		const previous = this.#store.getProject(registered.cwd);
 		let project = this.#store.linkProject(registered, source);
 		try {
@@ -172,6 +179,25 @@ export class ProjectLinkService {
 			return;
 		}
 		this.#store.unlinkProject(previous?.id ?? projectId);
+	}
+}
+
+export async function assertProjectsAdmitted(
+	projects: readonly RegisteredProject[],
+	protectedPaths: GjcRuntimeLocations["protectedProjectPaths"],
+): Promise<void> {
+	const canonicalProtectedPaths = await Promise.all(protectedPaths.map(resolveExistingOrProspectivePath));
+	for (const project of projects) {
+		const candidatePaths = project.sessionRoot === undefined ? [project.cwd] : [project.cwd, project.sessionRoot];
+		for (const candidatePath of candidatePaths) {
+			const canonicalCandidatePath = await resolveExistingOrProspectivePath(candidatePath);
+			if (canonicalProtectedPaths.some(protectedPath => pathsOverlap(canonicalCandidatePath, protectedPath))) {
+				throw new ProjectLinkError(
+					"Project paths must not overlap protected GJC runtime paths.",
+					"invalid_project_link",
+				);
+			}
+		}
 	}
 }
 
