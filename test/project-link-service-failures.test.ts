@@ -10,6 +10,7 @@ import type {
 } from "../src/openwebui/client";
 import { ProjectLinkService } from "../src/projects/link-service";
 import { SqliteProjectRegistrationStore } from "../src/projects/registration-store";
+import * as pathsModule from "../src/security/paths";
 import { resolveAllowedRoots } from "../src/security/paths";
 
 const tempDirs: string[] = [];
@@ -21,6 +22,48 @@ afterEach(async () => {
 });
 
 describe("project link registration failure handling", () => {
+	test("detects overlap symmetrically while allowing a sibling", () => {
+		// Given: equal, ancestor, descendant, and sibling path pairs.
+		const root = path.join(os.tmpdir(), "gjc-overlap-root");
+		const descendant = path.join(root, "child");
+		const sibling = path.join(path.dirname(root), "gjc-overlap-sibling");
+
+		// When: the public overlap predicate compares both directions.
+		const overlap = pathOverlapExport();
+		expect(overlap).not.toBeUndefined();
+		if (overlap === undefined) return;
+		const relations = [
+			overlap(root, root),
+			overlap(root, descendant),
+			overlap(descendant, root),
+			overlap(root, sibling),
+		];
+
+		// Then: only equality and ancestry in either direction overlap.
+		expect(relations).toEqual([true, true, true, false]);
+	});
+
+	test("resolves an existing symlink and a prospective descendant through its real parent", async () => {
+		// Given: a real directory exposed through a symlink alias.
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-canonical-path-"));
+		tempDirs.push(workspace);
+		const realRoot = path.join(workspace, "real-root");
+		const alias = path.join(workspace, "alias");
+		await fs.mkdir(realRoot);
+		await fs.symlink(realRoot, alias);
+
+		// When: existing and not-yet-created paths are canonicalized.
+		const canonicalize = pathCanonicalizerExport();
+		expect(canonicalize).not.toBeUndefined();
+		if (canonicalize === undefined) return;
+		const existing = await canonicalize(alias);
+		const prospective = await canonicalize(path.join(alias, "future", "project"));
+
+		// Then: both paths are expressed below the canonical real root.
+		expect(existing).toBe(realRoot);
+		expect(prospective).toBe(path.join(realRoot, "future", "project"));
+	});
+
 	test("preserves linked state when projection deletion fails", async () => {
 		const { service, projectDirectory } = await serviceForTempProject(
 			"Delete Failure",
@@ -79,6 +122,29 @@ describe("project link registration failure handling", () => {
 		expect(service.listLinkedProjects()).toMatchObject([{ id: "equivalent-path", status: "linked" }]);
 	});
 });
+
+type PathOverlap = (leftPath: string, rightPath: string) => boolean;
+type PathCanonicalizer = (targetPath: string) => Promise<string>;
+
+function pathOverlapExport(): PathOverlap | undefined {
+	const candidate: unknown = Reflect.get(pathsModule, "pathsOverlap");
+	if (typeof candidate !== "function") return undefined;
+	return (leftPath, rightPath) => {
+		const result: unknown = Reflect.apply(candidate, pathsModule, [leftPath, rightPath]);
+		if (typeof result !== "boolean") throw new Error("Path overlap export returned an invalid result.");
+		return result;
+	};
+}
+
+function pathCanonicalizerExport(): PathCanonicalizer | undefined {
+	const candidate: unknown = Reflect.get(pathsModule, "resolveExistingOrProspectivePath");
+	if (typeof candidate !== "function") return undefined;
+	return async targetPath => {
+		const result: unknown = await Reflect.apply(candidate, pathsModule, [targetPath]);
+		if (typeof result !== "string") throw new Error("Path canonicalizer export returned an invalid result.");
+		return result;
+	};
+}
 
 async function serviceForTempProject(name: string, repository: OpenWebUIProjectionRepository) {
 	const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-link-service-"));

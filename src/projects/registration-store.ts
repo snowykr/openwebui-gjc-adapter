@@ -2,6 +2,9 @@ import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import * as path from "node:path";
+import type { GjcRuntimeLocations } from "../contracts";
+import { pathsOverlap, resolveExistingOrProspectivePath } from "../security/paths";
+import { ProjectLinkError } from "./link-service";
 import type { RegisteredProject } from "./registry";
 
 export type ProjectRegistrationSource = "env" | "admin";
@@ -36,7 +39,8 @@ export class SqliteProjectRegistrationStore {
 		}
 		this.#db = new Database(databasePath);
 		this.#db.exec("PRAGMA journal_mode = WAL");
-		this.#ensureSchema();
+		this.#db.exec(projectRegistrationSchema());
+		this.#migrateLegacyModelIdColumn();
 	}
 
 	seedConfiguredProjects(projects: readonly RegisteredProject[]): void {
@@ -105,11 +109,6 @@ export class SqliteProjectRegistrationStore {
 
 	close(): void {
 		this.#db.close();
-	}
-
-	#ensureSchema(): void {
-		this.#db.exec(projectRegistrationSchema());
-		this.#migrateLegacyModelIdColumn();
 	}
 
 	#migrateLegacyModelIdColumn(): void {
@@ -185,7 +184,8 @@ export class SqliteProjectRegistrationStore {
 	#assignProjectIdentity(project: RegisteredProject): RegisteredProject {
 		const sameId = this.#getById(project.id);
 		if (sameId === undefined || sameId.cwd === project.cwd) return project;
-		const fingerprintedId = `${project.id}-${projectPathFingerprint(project.cwd)}`;
+		const fingerprint = createHash("sha256").update(project.cwd).digest("hex").slice(0, 8);
+		const fingerprintedId = `${project.id}-${fingerprint}`;
 		return { ...project, id: fingerprintedId };
 	}
 
@@ -220,8 +220,23 @@ export class SqliteProjectRegistrationStore {
 	}
 }
 
-function projectPathFingerprint(cwd: string): string {
-	return createHash("sha256").update(cwd).digest("hex").slice(0, 8);
+export async function auditProjectRegistrations(
+	store: SqliteProjectRegistrationStore,
+	protectedPaths: GjcRuntimeLocations["protectedProjectPaths"],
+): Promise<void> {
+	const canonicalProtectedPaths = await Promise.all(protectedPaths.map(resolveExistingOrProspectivePath));
+	for (const project of store.listProjects()) {
+		const candidatePaths = project.sessionRoot === undefined ? [project.cwd] : [project.cwd, project.sessionRoot];
+		for (const candidatePath of candidatePaths) {
+			const canonicalCandidatePath = await resolveExistingOrProspectivePath(candidatePath);
+			if (canonicalProtectedPaths.some(protectedPath => pathsOverlap(canonicalCandidatePath, protectedPath))) {
+				throw new ProjectLinkError(
+					"Project paths must not overlap protected GJC runtime paths.",
+					"invalid_project_link",
+				);
+			}
+		}
+	}
 }
 
 function projectRegistrationSchema(): string {
