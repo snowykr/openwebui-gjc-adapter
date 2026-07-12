@@ -1,4 +1,4 @@
-import { RpcClient } from "@gajae-code/coding-agent/modes/rpc/rpc-client";
+import { RpcClient } from "@gajae-code/coding-agent";
 import type {
 	GjcRpcRunnerClientOptions,
 	GjcRpcRunnerTransport,
@@ -25,8 +25,14 @@ interface FullSessionEventRpcClient {
 }
 
 export function createDefaultRpcTransport(options: GjcRpcRunnerClientOptions): GjcRpcRunnerTransport {
+	if (options.runtimeLocations === undefined) throw new TypeError("resolved runtime locations are required");
 	return createRpcTransportFromClient(
-		new RpcClient({ cwd: options.cwd, sessionDir: options.sessionRoot, cliPath: options.cliPath }),
+		new RpcClient({
+			cwd: options.cwd,
+			sessionDir: options.sessionRoot,
+			cliPath: options.cliPath,
+			env: { ...options.runtimeLocations.childEnvironment, PI_CONFIG_DIR: undefined },
+		}),
 	);
 }
 

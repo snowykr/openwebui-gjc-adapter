@@ -1,3 +1,146 @@
+diff --git a/dist/types/config/settings.d.ts b/dist/types/config/settings.d.ts
+index 959fadb88688f1d300142ee62b682443cf64b2bc..b98dc195d56e8fc24b5faca3041e0cd6f184e623 100644
+--- a/dist/types/config/settings.d.ts
++++ b/dist/types/config/settings.d.ts
+@@ -115,6 +115,8 @@ export declare class Settings {
+      * Set a model role (helper for modelRoles record).
+      */
+     setModelRole(role: ModelRole | string, modelId: string): void;
++    setGlobalModelRole(role: ModelRole | string, modelId: string | undefined): void;
++    setGlobalModelRoleAndFlush(role: ModelRole | string, modelId: string | undefined): Promise<void>;
+     /**
+      * Set an agent model override while keeping any live runtime override aligned.
+      *
+diff --git a/dist/types/modes/index.d.ts b/dist/types/modes/index.d.ts
+index 9943a0ea2ce04231d2b5aa06f7084e0d78ef4f01..ac3eed3cb4653e06cf99b89bd625c86dc084be00 100644
+--- a/dist/types/modes/index.d.ts
++++ b/dist/types/modes/index.d.ts
+@@ -5,6 +5,6 @@ export { runAcpMode } from "./acp";
+ export { runBridgeMode } from "./bridge/bridge-mode";
+ export { InteractiveMode, type InteractiveModeOptions } from "./interactive-mode";
+ export { type PrintModeOptions, runPrintMode } from "./print-mode";
+-export { defineRpcClientTool, type ModelInfo, RpcClient, type RpcClientCustomTool, type RpcClientOptions, type RpcClientToolContext, type RpcClientToolResult, type RpcEventListener, } from "./rpc/rpc-client";
++export { defineRpcClientTool, type ModelInfo, RpcClient, type RpcClientCustomTool, type RpcClientOptions, type RpcClientToolContext, type RpcClientToolResult, type RpcDefaultModelSelection, type RpcEventListener, } from "./rpc/rpc-client";
+ export { runRpcMode } from "./rpc/rpc-mode";
+ export type { RpcCommand, RpcHostToolCallRequest, RpcHostToolCancelRequest, RpcHostToolDefinition, RpcHostToolResult, RpcHostToolUpdate, RpcResponse, RpcSessionState, } from "./rpc/rpc-types";
+diff --git a/dist/types/modes/rpc/rpc-client.d.ts b/dist/types/modes/rpc/rpc-client.d.ts
+index 25db9cf86ff1a66257d8d08ef9ac50ea8be671dd..35020cf70ed564a1ba5b01ea963ed9f2eaa33cd8 100644
+--- a/dist/types/modes/rpc/rpc-client.d.ts
++++ b/dist/types/modes/rpc/rpc-client.d.ts
+@@ -3,7 +3,7 @@
+  *
+  * Spawns the agent in RPC mode and provides a typed API for all operations.
+  */
+-import type { AgentEvent, AgentMessage, AgentToolResult, ThinkingLevel } from "@gajae-code/agent-core";
++import { type AgentEvent, type AgentMessage, type AgentToolResult, type ResolvedThinkingLevel, ThinkingLevel } from "@gajae-code/agent-core";
+ import type { CompactionResult } from "@gajae-code/agent-core/compaction";
+ import type { ImageContent, Model } from "@gajae-code/ai";
+ import type { BashResult } from "../../exec/bash-executor";
+@@ -23,7 +23,7 @@ export interface RpcClientOptions {
+     /** Working directory for the agent */
+     cwd?: string;
+     /** Environment variables */
+-    env?: Record<string, string>;
++    env?: Readonly<Record<string, string | undefined>>;
+     /** Provider to use */
+     provider?: string;
+     /** Model ID to use */
+@@ -36,6 +36,11 @@ export interface RpcClientOptions {
+     customTools?: RpcClientCustomTool[];
+ }
+ export type ModelInfo = Pick<Model, "provider" | "id" | "contextWindow" | "reasoning" | "thinking">;
++export type RpcDefaultModelSelection = {
++    readonly provider: string;
++    readonly modelId: string;
++    readonly thinkingLevel: ResolvedThinkingLevel;
++};
+ export type RpcEventListener = (event: AgentEvent) => void;
+ export type RpcSessionEventListener = (event: AgentSessionEvent) => void;
+ export interface RpcClientToolContext<TDetails = unknown> {
+@@ -149,6 +154,7 @@ export declare class RpcClient {
+         provider: string;
+         id: string;
+     }>;
++    setDefaultModelSelection(provider: string, modelId: string, thinkingLevel: ResolvedThinkingLevel): Promise<RpcDefaultModelSelection>;
+     /**
+      * Cycle to next model.
+      */
+diff --git a/dist/types/modes/rpc/rpc-types.d.ts b/dist/types/modes/rpc/rpc-types.d.ts
+index 0f117b7179c7ac0f2b392d0d079c621d5aee7349..7f9e6e7a995dea8be4f213577be952b85366376c 100644
+--- a/dist/types/modes/rpc/rpc-types.d.ts
++++ b/dist/types/modes/rpc/rpc-types.d.ts
+@@ -4,7 +4,7 @@
+  * Commands are sent as JSON lines on stdin.
+  * Responses and events are emitted as JSON lines on stdout.
+  */
+-import type { AgentMessage, AgentToolResult, ThinkingLevel } from "@gajae-code/agent-core";
++import type { AgentMessage, AgentToolResult, ResolvedThinkingLevel, ThinkingLevel } from "@gajae-code/agent-core";
+ import type { CompactionResult } from "@gajae-code/agent-core/compaction";
+ import type { Effort, ImageContent, Model } from "@gajae-code/ai";
+ import type { BashResult } from "../../exec/bash-executor";
+@@ -69,6 +69,12 @@ export type RpcCommand = {
+     type: "set_model";
+     provider: string;
+     modelId: string;
++} | {
++    id?: string;
++    type: "set_default_model_selection";
++    provider: string;
++    modelId: string;
++    thinkingLevel?: ResolvedThinkingLevel;
+ } | {
+     id?: string;
+     type: "cycle_model";
+@@ -278,6 +284,16 @@ export type RpcResponse = {
+     command: "set_model";
+     success: true;
+     data: Model;
++} | {
++    id?: string;
++    type: "response";
++    command: "set_default_model_selection";
++    success: true;
++    data: {
++        provider: string;
++        modelId: string;
++        thinkingLevel: ResolvedThinkingLevel;
++    };
+ } | {
+     id?: string;
+     type: "response";
+diff --git a/dist/types/session/agent-session.d.ts b/dist/types/session/agent-session.d.ts
+index 02053ca9a688d990a025239debad0514ff11a691..7a4552b0a24b0277c3bb875f455a97bdb75ae641 100644
+--- a/dist/types/session/agent-session.d.ts
++++ b/dist/types/session/agent-session.d.ts
+@@ -12,7 +12,7 @@
+  *
+  * Modes use this class and add their own I/O layer on top.
+  */
+-import { type Agent, type AgentEvent, type AgentMessage, type AgentState, type AgentTool, type StablePrefixSnapshot, ThinkingLevel } from "@gajae-code/agent-core";
++import { type Agent, type AgentEvent, type AgentMessage, type AgentState, type AgentTool, type ResolvedThinkingLevel, type StablePrefixSnapshot, ThinkingLevel } from "@gajae-code/agent-core";
+ import { type CompactionResult, type EmergencyCompactionSample } from "@gajae-code/agent-core/compaction";
+ import type { AssistantMessage, Effort, ImageContent, Message, MessageAttribution, Model, ProviderSessionState, ServiceTier, SimpleStreamOptions, TextContent, ToolCall, ToolChoice, Usage, UsageReport } from "@gajae-code/ai";
+ export interface ForkContextSeedMetadata {
+@@ -309,6 +309,11 @@ export interface RoleModelCycleResult {
+     thinkingLevel: ThinkingLevel | undefined;
+     role: string;
+ }
++export interface DefaultModelSelectionResult {
++    readonly provider: string;
++    readonly modelId: string;
++    readonly thinkingLevel: ResolvedThinkingLevel;
++}
+ /** Session statistics for /session command */
+ export interface SessionStats {
+     sessionFile: string | undefined;
+@@ -854,6 +859,7 @@ export declare class AgentSession {
+     setModelTemporary(model: Model, thinkingLevel?: ThinkingLevel, options?: {
+         persistAsSessionDefault?: boolean;
+     }): Promise<void>;
++    setDefaultModelSelection(model: Model, thinkingLevel: ThinkingLevel | undefined): Promise<DefaultModelSelectionResult>;
+     /**
+      * Cycle to next/previous model.
+      * Uses scoped models (from --models flag) if available, otherwise all available models.
 diff --git a/src/config/settings.ts b/src/config/settings.ts
 index a9ef2c34762aa0189e24de55ab778d989190b8dc..f1dbfe5268160dd8caf6bcafd033407dfa105b71 100644
 --- a/src/config/settings.ts
@@ -247,8 +390,20 @@ index aa95bdf863ee87beca36119e882de3d5cbde1fc2..0cb3a0c3970908362dc8181e20292a95
  	"rulebook-matching-pipeline.md": "# Rulebook Matching Pipeline\n\nThis document describes how coding-agent discovers rules from supported config formats, normalizes them into a single `Rule` shape, resolves precedence conflicts, and splits the result into:\n\n- **Rulebook rules** (available to the model via system prompt + `rule://` URLs)\n- **TTSR rules** (time-travel stream interruption rules)\n\nIt reflects the current implementation, including partial semantics and metadata that is parsed but not enforced.\n\n## Implementation files\n\n- [`../src/capability/rule.ts`](../packages/coding-agent/src/capability/rule.ts)\n- [`../src/capability/index.ts`](../packages/coding-agent/src/capability/index.ts)\n- [`../src/discovery/index.ts`](../packages/coding-agent/src/discovery/index.ts)\n- [`../src/discovery/helpers.ts`](../packages/coding-agent/src/discovery/helpers.ts)\n- [`../src/discovery/builtin.ts`](../packages/coding-agent/src/discovery/builtin.ts)\n- [`../src/discovery/cursor.ts`](../packages/coding-agent/src/discovery/cursor.ts)\n- [`../src/discovery/windsurf.ts`](../packages/coding-agent/src/discovery/windsurf.ts)\n- [`../src/discovery/cline.ts`](../packages/coding-agent/src/discovery/cline.ts)\n- [`../src/sdk.ts`](../packages/coding-agent/src/sdk.ts)\n- [`../src/system-prompt.ts`](../packages/coding-agent/src/system-prompt.ts)\n- [`../src/internal-urls/rule-protocol.ts`](../packages/coding-agent/src/internal-urls/rule-protocol.ts)\n- [`../src/utils/frontmatter.ts`](../packages/coding-agent/src/utils/frontmatter.ts)\n\n## 1. Canonical rule shape\n\nAll providers normalize source files into `Rule`:\n\n```ts\ninterface Rule {\n  name: string;\n  path: string;\n  content: string;\n  globs?: string[];\n  alwaysApply?: boolean;\n  description?: string;\n  condition?: string[];\n  scope?: string[];\n  interruptMode?: \"never\" | \"prose-only\" | \"tool-only\" | \"always\";\n  _source: SourceMeta;\n}\n```\n\nCapability identity is `rule.name` (`ruleCapability.key = rule => rule.name`).\n\nConsequence: precedence and deduplication are **name-based only**. Two different files with the same `name` are considered the same logical rule.\n\n## 2. Discovery sources and normalization\n\n`src/discovery/index.ts` auto-registers providers. For `rules`, current providers are:\n\n- `native` (priority `100`)\n- `cursor` (priority `50`)\n- `windsurf` (priority `50`)\n- `cline` (priority `40`)\n\n### Native provider (`builtin.ts`)\n\nLoads `.gjc` rules from:\n\n- project: `<cwd>/.gjc/rules/*.{md,mdc}`\n- user: `~/.gjc/agent/rules/*.{md,mdc}`\n\nNormalization:\n\n- `name` = filename without `.md`/`.mdc`\n- frontmatter parsed via `parseFrontmatter`\n- `content` = body (frontmatter stripped)\n- `globs`, `alwaysApply`, `description`, `condition`/legacy `ttsr_trigger`, `scope`, and `interruptMode` are parsed by `buildRuleFromMarkdown`\n\nImportant caveat: `condition` values that look like file globs are converted into `tool:edit(...)` / `tool:write(...)` scope shorthands with catch-all condition `.*`.\n\n### Cursor provider (`cursor.ts`)\n\nLoads from:\n\n- user: `~/.cursor/rules/*.{mdc,md}`\n- project: `<cwd>/.cursor/rules/*.{mdc,md}`\n\nNormalization (`transformMDCRule`):\n\n- `description`: kept only if string\n- `alwaysApply`: only `true` is preserved (`false` becomes `undefined`)\n- `globs`: accepts array (string elements only) or single string\n- `condition`/legacy `ttsr_trigger`, `scope`, and `interruptMode` are parsed by shared rule helpers\n- `name` from filename without extension\n\n### Windsurf provider (`windsurf.ts`)\n\nLoads from:\n\n- user: `~/.codeium/windsurf/memories/global_rules.md` (fixed rule name `global_rules`)\n- project: `<cwd>/.windsurf/rules/*.md`\n\nNormalization:\n\n- `globs`: array-of-string or single string\n- `alwaysApply`, `description`, `condition`/legacy `ttsr_trigger`, `scope`, and `interruptMode` parsed by shared rule helpers\n- `name` is fixed to `global_rules` for the user global file and derived from filename for project rules\n\n### Cline provider (`cline.ts`)\n\nSearches upward from `cwd` for nearest `.clinerules`:\n\n- if directory: loads `*.md` inside it\n- if file: loads single file as rule named `clinerules`\n\nNormalization:\n\n- `globs`: array-of-string or single string\n- `alwaysApply`, `description`, `condition`/legacy `ttsr_trigger`, `scope`, and `interruptMode` parsed by shared rule helpers\n- `name` is fixed to `clinerules` for a `.clinerules` file and derived from filename for `.clinerules/*.md`\n\n## 3. Frontmatter parsing behavior and ambiguity\n\nAll providers use `parseFrontmatter` (`utils/frontmatter.ts`) with these semantics:\n\n1. Frontmatter is parsed only when content starts with `---` and has a closing `\\n---`.\n2. Body is trimmed after frontmatter extraction.\n3. If YAML parse fails:\n   - warning is logged,\n   - parser falls back to simple `key: value` line parsing (`^(\\w+):\\s*(.*)$`).\n\nAmbiguity consequences:\n\n- Fallback parser does not support arrays, nested objects, quoting rules, or hyphenated keys.\n- Fallback values become strings (for example `alwaysApply: true` becomes string `\"true\"`), so providers requiring boolean/string types may drop metadata.\n- `ttsr_trigger` works in fallback (underscore key); keys like `thinking-level` would not.\n- Files without valid frontmatter still load as rules with empty metadata and full content body.\n\n## 4. Provider precedence and deduplication\n\n`loadCapability(\"rules\")` (`capability/index.ts`) merges provider outputs and then deduplicates by `rule.name`.\n\n### Precedence model\n\n- Providers are ordered by priority descending.\n- Equal priority keeps registration order (`cursor` before `windsurf` from `discovery/index.ts`).\n- Dedup is first-wins: first encountered rule name is kept; later same-name items are marked `_shadowed` in `all` and excluded from `items`.\n\nEffective rule provider order is currently:\n\n1. `native` (100)\n2. `cursor` (50)\n3. `windsurf` (50)\n4. `cline` (40)\n\n### Intra-provider ordering caveat\n\nWithin a provider, item order comes from `loadFilesFromDir` glob result ordering plus explicit push order. This is deterministic enough for normal use but not explicitly sorted in code.\n\nNotable source-order differences:\n\n- `native` appends project then user config dirs.\n- `cursor` appends user then project results.\n- `windsurf` appends user `global_rules` first, then project rules.\n- `cline` loads only nearest `.clinerules` source.\n\n## 5. Split into Rulebook, Always-Apply, and TTSR buckets\n\nAfter rule discovery in `createAgentSession` (`sdk.ts`):\n\n1. All discovered rules are scanned.\n2. Rules with `condition` entries are registered into `TtsrManager`; legacy `ttsr_trigger` / `ttsrTrigger` are accepted during rule parsing as condition fallbacks.\n3. A separate `rulebookRules` list is built with this predicate:\n\n```ts\n!isTtsrRule && rule.alwaysApply !== true && !!rule.description;\n```\n\n4. An `alwaysApplyRules` list is built:\n\n```ts\n!isTtsrRule && rule.alwaysApply === true;\n```\n\n### Bucket behavior\n\n- **TTSR bucket**: any rule with a non-empty parsed `condition` that `TtsrManager.addRule(...)` accepts. Takes priority over other buckets.\n- **Always-apply bucket**: `alwaysApply === true`, not TTSR. Full content injected into system prompt. Resolvable via `rule://`.\n- **Rulebook bucket**: must have description, must not be TTSR, must not be `alwaysApply`. Listed in system prompt by name+description; content read on demand via `rule://`.\n- A rule with both `condition` and `alwaysApply` goes to TTSR only (TTSR takes priority).\n- A rule with both `alwaysApply` and `description` goes to always-apply only (not rulebook).\n\n## 6. How metadata affects runtime surfaces\n\n### `description`\n\n- Required for inclusion in rulebook.\n- Rendered in system prompt `<rules>` block.\n- Missing description means rule is not available via `rule://` and not listed in system prompt rules.\n\n### `globs`\n\n- Carried through on `Rule`.\n- Rendered as `<glob>...</glob>` entries in the system prompt rules block.\n- Exposed in rules UI state (`extensions` mode list).\n- **Not enforced for automatic matching in this pipeline.** There is no runtime glob matcher selecting rules by current file/tool target.\n\n### `alwaysApply`\n\n- Parsed and preserved by providers.\n- Used in UI display (`\"always\"` trigger label in extensions state manager).\n- Used as an exclusion condition from `rulebookRules`.\n- **Full rule content is auto-injected into the system prompt** (before the rulebook rules section).\n- Rule is also addressable via `rule://<name>` for re-reading.\n\n### `condition`, `scope`, and `interruptMode`\n\n- `condition` is the current TTSR trigger field; legacy `ttsr_trigger` / `ttsrTrigger` are accepted as fallback inputs during parsing.\n- `scope` narrows TTSR matching scope. A condition token that looks like a file glob becomes `tool:edit(<glob>)` and `tool:write(<glob>)` scope entries plus catch-all condition `.*`.\n- `interruptMode` can override the global TTSR interrupt mode for the rule.\n\n## 7. System prompt inclusion path\n\n`buildSystemPromptInternal` receives both `rules` (rulebook) and `alwaysApplyRules`.\n\nAlways-apply rules are rendered first, injecting their raw content directly into the prompt.\n\nRulebook rules are rendered in a `# Rules` section with:\n\n- `Read rule://<name> when working in matching domain`\n- Each rule's `name`, `description`, and optional `<glob>` list\n\nThis is advisory/contextual: prompt text asks the model to read applicable rules, but code does not enforce glob applicability.\n\n## 8. `rule://` internal URL behavior\n\n`RuleProtocolHandler` is registered with:\n\n```ts\nnew RuleProtocolHandler({\n  getRules: () => [...rulebookRules, ...alwaysApplyRules],\n});\n```\n\nImplications:\n\n- `rule://<name>` resolves against both **rulebookRules** and **alwaysApplyRules**.\n- TTSR-only rules and rules with no description and no `alwaysApply` are not addressable via `rule://`.\n- Resolution is exact name match.\n- Unknown names return error listing available rule names.\n- Returned content is raw `rule.content` (frontmatter stripped), content type `text/markdown`.\n\n## 9. Known partial / non-enforced semantics\n\n1. Provider descriptions mention legacy files (`.cursorrules`, `.windsurfrules`), but current loader code paths do not actually read those files.\n2. `globs` metadata is surfaced to prompt/UI but not enforced by rule selection logic.\n3. Rule selection for `rule://` includes rulebook and always-apply rules, but not TTSR-only rules.\n4. Discovery warnings (`loadCapability(\"rules\").warnings`) are produced but `createAgentSession` does not currently surface/log them in this path.\n",
  	"sdk.md": "# SDK\n\nThe SDK is the in-process integration surface for `@gajae-code/coding-agent`.\nUse it when you want direct access to agent state, event streaming, tool wiring, and session control from your own Bun/Node process.\n\nIf you need cross-language/process isolation, use RPC mode instead.\n\n## Installation\n\n```bash\nbun add @gajae-code/coding-agent\n```\n\n## Entry points\n\n`@gajae-code/coding-agent` exports the SDK APIs from the package root (and also via `@gajae-code/coding-agent/sdk`).\n\nCore exports for embedders:\n\n- `createAgentSession`\n- `SessionManager`\n- `Settings`\n- `AuthStorage`\n- `ModelRegistry`\n- `discoverAuthStorage`\n- Discovery helpers for retained context/prompt surfaces (`discoverContextFiles`, `discoverPromptTemplates`)\n- Tool factory surface (`createTools`, `BUILTIN_TOOLS`, tool classes)\n\n## Quick start (auto-discovery defaults)\n\n```ts\nimport { createAgentSession } from \"@gajae-code/coding-agent\";\n\nconst { session, modelFallbackMessage } = await createAgentSession();\n\nif (modelFallbackMessage) {\n  process.stderr.write(`${modelFallbackMessage}\\n`);\n}\n\nconst unsubscribe = session.subscribe((event) => {\n  if (\n    event.type === \"message_update\" &&\n    event.assistantMessageEvent.type === \"text_delta\"\n  ) {\n    process.stdout.write(event.assistantMessageEvent.delta);\n  }\n});\n\nawait session.prompt(\"Summarize this repository in 3 bullets.\");\nunsubscribe();\nawait session.dispose();\n```\n\n## What `createAgentSession()` discovers by default\n\n`createAgentSession()` follows “provide to override, omit to discover”.\n\nIf omitted, it resolves:\n\n- `cwd`: `getProjectDir()`\n- `agentDir`: `~/.gjc/agent` (via `getAgentDir()`)\n- `authStorage`: `discoverAuthStorage(agentDir)`\n- `modelRegistry`: `new ModelRegistry(authStorage)` + background `refreshInBackground()` when the registry is not provided\n- `settings`: `await Settings.init({ cwd, agentDir })`\n- `sessionManager`: `SessionManager.create(cwd)` (file-backed)\n- context files and prompt templates\n- built-in tools via `createTools(...)`\n- LSP integration (enabled by default)\n- `eventBus`: new `EventBus()` unless supplied\n\n### Required vs optional inputs\n\nTypically you must provide only what you want to control:\n\n- **Must provide**: nothing for a minimal session\n- **Usually provide explicitly** in embedders:\n  - `sessionManager` (if you need in-memory or custom location)\n  - `authStorage` + `modelRegistry` (if you own credential/model lifecycle)\n  - `model` or `modelPattern` (if deterministic model selection matters)\n  - `settings` (if you need isolated/test config)\n\n## Session manager behavior (persistent vs in-memory)\n\n`AgentSession` always uses a `SessionManager`; behavior depends on which factory you use.\n\n### File-backed (default)\n\n```ts\nimport { createAgentSession, SessionManager } from \"@gajae-code/coding-agent\";\n\nconst { session } = await createAgentSession({\n  sessionManager: SessionManager.create(process.cwd()),\n});\n\nconsole.log(session.sessionFile); // absolute .jsonl path\n```\n\n- Persists conversation/messages/state deltas to session files.\n- Supports resume/open/list/fork workflows.\n- `session.sessionFile` is defined.\n\n### In-memory\n\n```ts\nimport { createAgentSession, SessionManager } from \"@gajae-code/coding-agent\";\n\nconst { session } = await createAgentSession({\n  sessionManager: SessionManager.inMemory(),\n});\n\nconsole.log(session.sessionFile); // undefined\n```\n\n- No filesystem persistence.\n- Useful for tests, ephemeral workers, request-scoped agents.\n- Session methods still work, but persistence-specific behaviors (file resume/fork paths) are naturally limited.\n\n### Resume/open/list helpers\n\n```ts\nimport { SessionManager } from \"@gajae-code/coding-agent\";\n\nconst recent = await SessionManager.continueRecent(process.cwd());\nconst listed = await SessionManager.list(process.cwd());\nconst opened = listed[0] ? await SessionManager.open(listed[0].path) : null;\n```\n\n## Model and auth wiring\n\n`createAgentSession()` uses `ModelRegistry` + `AuthStorage` for model selection and API key resolution.\n\n### Explicit wiring\n\n```ts\nimport {\n  createAgentSession,\n  discoverAuthStorage,\n  ModelRegistry,\n  SessionManager,\n} from \"@gajae-code/coding-agent\";\n\nconst authStorage = await discoverAuthStorage();\nconst modelRegistry = new ModelRegistry(authStorage);\nawait modelRegistry.refresh();\n\nconst available = modelRegistry.getAvailable();\nif (available.length === 0)\n  throw new Error(\"No authenticated models available\");\n\nconst { session } = await createAgentSession({\n  authStorage,\n  modelRegistry,\n  model: available[0],\n  thinkingLevel: \"medium\",\n  sessionManager: SessionManager.inMemory(),\n});\n```\n\n### Selection order when `model` is omitted\n\nWhen no explicit `model`/`modelPattern` is provided:\n\n1. restore model from existing session (if restorable + key available)\n2. settings default model role (`default`)\n3. first available model with valid auth\n\nIf restore fails, `modelFallbackMessage` explains fallback.\n\n### Auth priority\n\n`AuthStorage.getApiKey(...)` resolves in this order:\n\n1. runtime override (`setRuntimeApiKey`)\n2. stored credentials in `agent.db`\n3. provider environment variables\n4. custom-provider resolver fallback (if configured)\n\n## Event subscription model\n\nSubscribe with `session.subscribe(listener)`; it returns an unsubscribe function.\n\n```ts\nconst unsubscribe = session.subscribe((event) => {\n  switch (event.type) {\n    case \"agent_start\":\n    case \"turn_start\":\n    case \"tool_execution_start\":\n      break;\n    case \"message_update\":\n      if (event.assistantMessageEvent.type === \"text_delta\") {\n        process.stdout.write(event.assistantMessageEvent.delta);\n      }\n      break;\n  }\n});\n```\n\n`AgentSessionEvent` includes core `AgentEvent` plus session-level events:\n\n- `auto_compaction_start` / `auto_compaction_end`\n- `auto_retry_start` / `auto_retry_end`\n- `retry_fallback_applied` / `retry_fallback_succeeded`\n- `ttsr_triggered`\n- `todo_reminder` / `todo_auto_clear`\n- `irc_message`\n\n## Prompt lifecycle\n\n`session.prompt(text, options?)` is the primary entry point.\n\nBehavior:\n\n1. optional command/template expansion (`/` commands, custom commands, file slash commands, prompt templates)\n2. if currently streaming:\n   - requires `streamingBehavior: \"steer\" | \"followUp\"`\n   - queues instead of throwing work away\n3. if idle:\n   - validates model + API key\n   - appends user message\n   - starts agent turn\n\nRelated APIs:\n\n- `sendUserMessage(content, { deliverAs? })`\n- `steer(text, images?)`\n- `followUp(text, images?)`\n- `sendCustomMessage({ customType, content, ... }, { deliverAs?, triggerTurn? })`\n- `abort()`\n\n## Tools integration\n\n### Built-ins and filtering\n\n- Built-ins come from `createTools(...)` and `BUILTIN_TOOLS`.\n- `toolNames` acts as an allowlist for built-ins.\n- Hidden tools (for example `yield`) are opt-in unless required by options.\n\n```ts\nconst { session } = await createAgentSession({\n  toolNames: [\"read\", \"grep\", \"find\", \"write\"],\n  requireYieldTool: true,\n});\n```\n\n### Runtime tool set changes\n\n`AgentSession` supports runtime activation updates:\n\n- `getActiveToolNames()`\n- `getAllToolNames()`\n- `setActiveToolsByName(names)`\n\nSystem prompt is rebuilt to reflect active tool changes.\n\n## Discovery helpers\n\nUse these when you want partial control without recreating internal discovery logic:\n\n- `discoverAuthStorage(agentDir?)`\n- `discoverContextFiles(cwd?, _agentDir?)`\n- `discoverPromptTemplates(cwd?, agentDir?)`\n- `buildSystemPrompt(options?)`\n\n## Subagent-oriented options\n\nFor SDK consumers building orchestrators (similar to task executor flow):\n\n- `outputSchema`: passes structured output expectation into tool context\n- `requireYieldTool`: forces `yield` tool inclusion\n- `taskDepth`: recursion-depth context for nested task sessions\n- `parentTaskPrefix`: artifact naming prefix for nested task outputs\n\nThese are optional for normal single-agent embedding.\n\n## `createAgentSession()` return value\n\n```ts\ntype CreateAgentSessionResult = {\n  session: AgentSession;\n  setToolUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void;\n  modelFallbackMessage?: string;\n  lspServers?: Array<{\n    name: string;\n    status: \"ready\" | \"error\";\n    fileTypes: string[];\n    error?: string;\n  }>;\n  eventBus: EventBus;\n};\n```\n\nUse `setToolUIContext(...)` only if your embedder provides UI capabilities that tools should call into.\n\n## Startup performance\n\n`createAgentSession()` runs two background optimizations to overlap I/O with the rest of session setup:\n\n- **Model-host preconnect.** As soon as the model is resolved, the SDK fires a best-effort `fetch.preconnect(model.baseUrl)` so DNS + TCP + TLS + HTTP/2 to the provider's host happens in parallel with tool registry build, and system-prompt assembly. The first real `fetch(...)` then reuses the warm connection, saving 100–300 ms on transcontinental hops (e.g. residential IP → `api.anthropic.com`). Implementation lives in `preconnectModelHost()` in `packages/coding-agent/src/sdk.ts`. If `fetch.preconnect` is unavailable (non-Bun runtime) or the call throws, the optimization is silently skipped — never a hard dependency. Applies to every mode (interactive, print, RPC, ACP).\n- **Conditional LSP warmup.** Startup LSP servers (those returned by `discoverStartupLspServers(cwd)`) are only warmed when **all** of these hold:\n  - `enableLsp !== false` on the session options, **and**\n  - `options.hasUI === true` (interactive TUI), **and**\n  - the `lsp.diagnosticsOnWrite` setting is enabled.\n\n  Print / script / RPC / ACP invocations (`hasUI=false`) skip the warmup entirely: they don't render the warmup status indicator and typically finish before the language servers would stabilize, so warming them just spends CPU parsing big `initialize` responses concurrently with the LLM stream consumer and jitters perceived latency. Tools that actually need an LSP server still spin one up on demand through `getOrCreateClient()` — only the *startup* warmup is skipped. The returned `lspServers` field in `CreateAgentSessionResult` is therefore `undefined` (not an empty array) whenever the warmup branch was bypassed.\n\n## Minimal controlled embed example\n\n```ts\nimport {\n  createAgentSession,\n  discoverAuthStorage,\n  ModelRegistry,\n  SessionManager,\n  Settings,\n} from \"@gajae-code/coding-agent\";\n\nconst authStorage = await discoverAuthStorage();\nconst modelRegistry = new ModelRegistry(authStorage);\nawait modelRegistry.refresh();\n\nconst settings = Settings.isolated({\n  \"compaction.enabled\": true,\n  \"retry.enabled\": true,\n});\n\nconst { session } = await createAgentSession({\n  authStorage,\n  modelRegistry,\n  settings,\n  sessionManager: SessionManager.inMemory(),\n  toolNames: [\"read\", \"grep\", \"find\", \"edit\", \"write\"],\n  enableLsp: true,\n});\n\nsession.subscribe((event) => {\n  if (\n    event.type === \"message_update\" &&\n    event.assistantMessageEvent.type === \"text_delta\"\n  ) {\n    process.stdout.write(event.assistantMessageEvent.delta);\n  }\n});\n\nawait session.prompt(\"Find all TODO comments in this repo and propose fixes.\");\nawait session.dispose();\n```\n",
  	"secrets.md": "# Secret Obfuscation\n\nPrevents sensitive values (API keys, tokens, passwords) from being sent to LLM providers. When enabled, secrets are replaced with deterministic placeholders before leaving the process, and restored in tool call arguments returned by the model.\n\n## Enabling\n\nDisabled by default. Toggle via `/settings` UI or directly in `config.yml`:\n\n```yaml\nsecrets:\n  enabled: true\n```\n\n## How it works\n\n1. On session startup, secrets are collected from two sources:\n   - **Environment variables** whose names match common secret patterns (`KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `PASS`, `AUTH`, `CREDENTIAL`, `PRIVATE`, `OAUTH`) with values >= 8 characters\n   - **`secrets.yml` files** (see below)\n\n2. Outbound text messages to the LLM have secret values replaced with deterministic placeholders like `#AB12#`.\n\n3. Session context/tool arguments returned from the model are deep-walked and obfuscation placeholders are restored to original values before display or execution.\n\nTwo modes control what happens to each secret:\n\n| Mode                  | Behavior                                                | Reversible                                      |\n| --------------------- | ------------------------------------------------------- | ----------------------------------------------- |\n| `obfuscate` (default) | Replaced with deterministic placeholder `#[A-Z0-9]{4}#` | Yes (deobfuscated in tool args/session context) |\n| `replace`             | Replaced with deterministic same-length string          | No (one-way)                                    |\n\n## secrets.yml\n\nDefine custom secret entries in YAML. Two locations are checked:\n\n| Level   | Path                       | Purpose                     |\n| ------- | -------------------------- | --------------------------- |\n| Global  | `~/.gjc/agent/secrets.yml` | Secrets across all projects |\n| Project | `<cwd>/.gjc/secrets.yml`   | Project-specific secrets    |\n\nProject entries override global entries with matching `content`.\n\n### Schema\n\nEach entry in the array has these fields:\n\n| Field         | Type                         | Required | Description                                       |\n| ------------- | ---------------------------- | -------- | ------------------------------------------------- |\n| `type`        | `\"plain\"` or `\"regex\"`       | Yes      | Match strategy                                    |\n| `content`     | string                       | Yes      | The secret value (plain) or regex pattern (regex) |\n| `mode`        | `\"obfuscate\"` or `\"replace\"` | No       | Default: `\"obfuscate\"`                            |\n| `replacement` | string                       | No       | Custom replacement (replace mode only)            |\n| `flags`       | string                       | No       | Regex flags (regex type only)                     |\n\n### Examples\n\n#### Plain secrets\n\n```yaml\n# Obfuscate a specific API key (default mode)\n- type: plain\n  content: sk-proj-abc123def456\n\n# Replace a database password with a fixed string\n- type: plain\n  content: hunter2\n  mode: replace\n  replacement: \"********\"\n```\n\n#### Regex secrets\n\n```yaml\n# Obfuscate any AWS-style key\n- type: regex\n  content: \"AKIA[0-9A-Z]{16}\"\n\n# Case-insensitive match with explicit flags\n- type: regex\n  content: \"api[_-]?key\\\\s*=\\\\s*\\\\w+\"\n  flags: \"i\"\n\n# Regex literal syntax (pattern and flags in one string)\n- type: regex\n  content: \"/bearer\\\\s+[a-zA-Z0-9._~+\\\\/=-]+/i\"\n```\n\nRegex entries always scan globally (the `g` flag is enforced automatically). The regex literal syntax `/pattern/flags` is supported as an alternative to separate `content` + `flags` fields. Escaped slashes within the pattern (`\\\\/`) are handled correctly.\n\n#### Replace mode with regex\n\n```yaml\n# One-way replace connection strings (not reversible)\n- type: regex\n  content: \"postgres://[^\\\\s]+\"\n  mode: replace\n  replacement: \"postgres://***\"\n```\n\n## Interaction with env var detection\n\nEnvironment variables are collected first, then file-defined entries are appended. File entries can cover secrets that don't live in env vars (config files, hardcoded values, etc.). If the same plain value appears in both env and file entries, the env entry's obfuscate-mode mapping is used first.\n\n## Key files\n\n- `packages/coding-agent/src/secrets/index.ts` -- loading, merging, env var collection\n- `packages/coding-agent/src/secrets/obfuscator.ts` -- `SecretObfuscator` class, placeholder generation, message obfuscation\n- `packages/coding-agent/src/secrets/regex.ts` -- regex literal parsing and compilation\n- `packages/coding-agent/src/config/settings-schema.ts` -- `secrets.enabled` setting definition\n\n## See also\n\n- [`auth-broker-gateway.md`](./auth-broker-gateway.md) -- remote credential vault and forward-proxy that keep provider OAuth refresh tokens and access tokens off developer hosts entirely (complementary to in-process obfuscation).\n",
+diff --git a/src/modes/index.ts b/src/modes/index.ts
+index 1343d082575792f8cf480944ed8f1e5539e1e6e7..1c144de728ccceb238dce47e8dfa8cf4f61860ce 100644
+--- a/src/modes/index.ts
++++ b/src/modes/index.ts
+@@ -16,6 +16,7 @@ export {
+ 	type RpcClientOptions,
+ 	type RpcClientToolContext,
+ 	type RpcClientToolResult,
++	type RpcDefaultModelSelection,
+ 	type RpcEventListener,
+ } from "./rpc/rpc-client";
+ export { runRpcMode } from "./rpc/rpc-mode";
 diff --git a/src/modes/rpc/rpc-client.ts b/src/modes/rpc/rpc-client.ts
-index fd4d0e6eebce72c28e2efc972594bbeccceadd0b..8f1c3effbbeb7db25d1dae73ba0e07168addc749 100644
+index fd4d0e6eebce72c28e2efc972594bbeccceadd0b..e7877540a1d7a0e781270078ae2bed390210fc46 100644
 --- a/src/modes/rpc/rpc-client.ts
 +++ b/src/modes/rpc/rpc-client.ts
 @@ -3,7 +3,13 @@
@@ -266,6 +421,15 @@ index fd4d0e6eebce72c28e2efc972594bbeccceadd0b..8f1c3effbbeb7db25d1dae73ba0e0716
  import type { CompactionResult } from "@gajae-code/agent-core/compaction";
  import type { ImageContent, Model } from "@gajae-code/ai";
  import { isRecord, ptree, readJsonl } from "@gajae-code/utils";
+@@ -49,7 +55,7 @@ export interface RpcClientOptions {
+ 	/** Working directory for the agent */
+ 	cwd?: string;
+ 	/** Environment variables */
+-	env?: Record<string, string>;
++	env?: Readonly<Record<string, string | undefined>>;
+ 	/** Provider to use */
+ 	provider?: string;
+ 	/** Model ID to use */
 @@ -64,6 +70,12 @@ export interface RpcClientOptions {
  
  export type ModelInfo = Pick<Model, "provider" | "id" | "contextWindow" | "reasoning" | "thinking">;

@@ -1,3 +1,4 @@
+import type { GjcRuntimeLocations } from "../contracts";
 import type { WorkflowGateAnswer } from "../projection/workflow-gates";
 import type { RegisteredProject } from "../projects/registry";
 
@@ -92,6 +93,7 @@ export interface GjcRpcRunnerClientOptions {
 	readonly cwd: string;
 	readonly sessionRoot: string;
 	readonly cliPath?: string;
+	readonly runtimeLocations: GjcRuntimeLocations;
 }
 
 export interface GjcRpcTransportState {
@@ -172,6 +174,11 @@ export interface CreateGjcRpcTurnRunnerInput {
 	readonly clientFactory?: GjcRpcRunnerClientFactory;
 	readonly cliPath?: string;
 	readonly turnTimeoutMs?: number;
+	readonly runtimeLocations?: GjcRuntimeLocations;
 }
 
-export { createGjcRpcTurnRunner, GjcRpcRunnerError } from "./rpc-client-runner";
+export interface CreateResolvedGjcRpcTurnRunnerInput extends CreateGjcRpcTurnRunnerInput {
+	readonly runtimeLocations: GjcRuntimeLocations;
+}
+
+export { createGjcRpcTurnRunner, createResolvedGjcRpcTurnRunner, GjcRpcRunnerError } from "./rpc-client-runner";

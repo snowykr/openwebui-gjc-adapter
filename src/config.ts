@@ -5,6 +5,8 @@ import {
 	type InstalledMode,
 	readInstalledConfig,
 } from "./configure/private-config";
+import { resolveGjcRuntimeLocations } from "./configure/runtime-locations";
+import type { GjcRuntimeLocations } from "./contracts";
 
 export {
 	GjcRuntimeLocationError,
@@ -31,11 +33,20 @@ export interface AdapterConfig {
 	ownerUserId?: string;
 	statePath: string;
 	gjcCommand: string;
+	readonly gjcConfigDirName?: string;
+	readonly gjcCodingAgentDir?: string;
+	readonly runtimeLocations?: GjcRuntimeLocations;
 	turnTimeoutMs: number;
 	sessionRoot: string;
 	allowedProjectRoots: string[];
 	artifactBaseUrl?: string;
 	projects: AdapterProjectConfig[];
+}
+
+export interface ResolvedAdapterConfig extends AdapterConfig {
+	readonly gjcConfigDirName: string;
+	readonly gjcCodingAgentDir: string;
+	readonly runtimeLocations: GjcRuntimeLocations;
 }
 
 export interface AdapterProjectConfig {
@@ -70,10 +81,6 @@ function requireNonEmptyString(value: string | undefined, fallback: string, name
 	return trimmed;
 }
 
-function optionalNonEmptyString(value: string | undefined): string | undefined {
-	return value?.trim() || undefined;
-}
-
 function parsePort(value: string | undefined): number {
 	if (value === undefined || value.trim().length === 0) {
 		return DEFAULT_BIND_PORT;
@@ -103,10 +110,6 @@ function parseUrl(value: string | undefined, fallback: string, name: string): st
 	}
 }
 
-function optionalEnv(env: Record<string, string | undefined>, name: string): string | undefined {
-	return env[name];
-}
-
 function parseAllowedProjectRoots(value: string | undefined, fallbackRoot: string): string[] {
 	if (value === undefined || value.trim().length === 0) {
 		return [fallbackRoot];
@@ -133,10 +136,13 @@ function parseProjectEntry(entry: string, entryNumber: number): AdapterProjectCo
 	if (fields.length > 4) {
 		throw new Error(`GJC_OPENWEBUI_PROJECTS entry ${entryNumber} has too many fields`);
 	}
-	const cwd = requiredProjectField(fields[0], entryNumber, "cwd");
-	const name = optionalProjectField(fields[1]);
-	const openWebUIFolderId = optionalProjectField(fields[2]);
-	const sessionRoot = optionalProjectField(fields[3]);
+	const cwd = fields[0]?.trim() || undefined;
+	if (cwd === undefined) {
+		throw new Error(`GJC_OPENWEBUI_PROJECTS entry ${entryNumber} must include a non-empty cwd`);
+	}
+	const name = fields[1]?.trim() || undefined;
+	const openWebUIFolderId = fields[2]?.trim() || undefined;
+	const sessionRoot = fields[3]?.trim() || undefined;
 	return {
 		cwd,
 		...(name === undefined ? {} : { name }),
@@ -145,72 +151,49 @@ function parseProjectEntry(entry: string, entryNumber: number): AdapterProjectCo
 	};
 }
 
-function requiredProjectField(value: string | undefined, entryNumber: number, fieldName: string): string {
-	const field = optionalProjectField(value);
-	if (field === undefined) {
-		throw new Error(`GJC_OPENWEBUI_PROJECTS entry ${entryNumber} must include a non-empty ${fieldName}`);
-	}
-	return field;
-}
-
-function optionalProjectField(value: string | undefined): string | undefined {
-	return value?.trim() || undefined;
-}
-
-export function loadAdapterConfig(env: Record<string, string | undefined> = process.env): AdapterConfig {
-	const currentWorkingDirectory = process.cwd();
-	const config: AdapterConfig = {
-		bindHost: requireNonEmptyString(
-			optionalEnv(env, "GJC_OPENWEBUI_BIND_HOST"),
-			DEFAULT_BIND_HOST,
-			"GJC_OPENWEBUI_BIND_HOST",
-		),
-		bindPort: parsePort(optionalEnv(env, "GJC_OPENWEBUI_BIND_PORT")),
-		adapterApiToken: optionalNonEmptyString(optionalEnv(env, "GJC_OPENWEBUI_ADAPTER_API_TOKEN")),
-		openWebUIBaseUrl: parseUrl(
-			optionalEnv(env, "GJC_OPENWEBUI_BASE_URL"),
-			DEFAULT_OPENWEBUI_BASE_URL,
-			"GJC_OPENWEBUI_BASE_URL",
-		),
-		openWebUIApiToken: optionalNonEmptyString(optionalEnv(env, "GJC_OPENWEBUI_API_TOKEN")),
-		openWebUIAdminEmail: optionalNonEmptyString(optionalEnv(env, "GJC_OPENWEBUI_ADMIN_EMAIL")),
-		openWebUIAdminPassword: optionalNonEmptyString(optionalEnv(env, "GJC_OPENWEBUI_ADMIN_PASSWORD")),
-		ownerUserId: optionalNonEmptyString(optionalEnv(env, "GJC_OPENWEBUI_OWNER_USER_ID")),
-		statePath: requireNonEmptyString(
-			optionalEnv(env, "GJC_OPENWEBUI_STATE_PATH"),
-			DEFAULT_STATE_PATH,
-			"GJC_OPENWEBUI_STATE_PATH",
-		),
+export function loadAdapterConfig(env: Record<string, string | undefined> = process.env): ResolvedAdapterConfig {
+	const artifactBaseUrl = env.GJC_OPENWEBUI_ARTIFACT_BASE_URL?.trim() || undefined;
+	const adapterApiToken = env.GJC_OPENWEBUI_ADAPTER_API_TOKEN?.trim() || undefined;
+	const openWebUIApiToken = env.GJC_OPENWEBUI_API_TOKEN?.trim() || undefined;
+	const openWebUIAdminEmail = env.GJC_OPENWEBUI_ADMIN_EMAIL?.trim() || undefined;
+	const openWebUIAdminPassword = env.GJC_OPENWEBUI_ADMIN_PASSWORD?.trim() || undefined;
+	const ownerUserId = env.GJC_OPENWEBUI_OWNER_USER_ID?.trim() || undefined;
+	const serviceHome = env.HOME ?? process.env.HOME;
+	const runtimeLocations = resolveGjcRuntimeLocations({
+		mode: "existing",
+		...(serviceHome === undefined ? {} : { serviceHome }),
+		environment: env,
+	});
+	return Object.freeze({
+		bindHost: requireNonEmptyString(env.GJC_OPENWEBUI_BIND_HOST, DEFAULT_BIND_HOST, "GJC_OPENWEBUI_BIND_HOST"),
+		bindPort: parsePort(env.GJC_OPENWEBUI_BIND_PORT),
+		...(adapterApiToken === undefined ? {} : { adapterApiToken }),
+		openWebUIBaseUrl: parseUrl(env.GJC_OPENWEBUI_BASE_URL, DEFAULT_OPENWEBUI_BASE_URL, "GJC_OPENWEBUI_BASE_URL"),
+		...(openWebUIApiToken === undefined ? {} : { openWebUIApiToken }),
+		...(openWebUIAdminEmail === undefined ? {} : { openWebUIAdminEmail }),
+		...(openWebUIAdminPassword === undefined ? {} : { openWebUIAdminPassword }),
+		...(ownerUserId === undefined ? {} : { ownerUserId }),
+		statePath: requireNonEmptyString(env.GJC_OPENWEBUI_STATE_PATH, DEFAULT_STATE_PATH, "GJC_OPENWEBUI_STATE_PATH"),
 		gjcCommand: requireNonEmptyString(
-			optionalEnv(env, "GJC_OPENWEBUI_GJC_COMMAND"),
+			env.GJC_OPENWEBUI_GJC_COMMAND,
 			DEFAULT_GJC_COMMAND,
 			"GJC_OPENWEBUI_GJC_COMMAND",
 		),
+		gjcConfigDirName: runtimeLocations.childEnvironment.GJC_CONFIG_DIR,
+		gjcCodingAgentDir: runtimeLocations.agentDir,
+		runtimeLocations,
 		turnTimeoutMs: parsePositiveInteger(
-			optionalEnv(env, "GJC_OPENWEBUI_TURN_TIMEOUT_MS"),
+			env.GJC_OPENWEBUI_TURN_TIMEOUT_MS,
 			DEFAULT_TURN_TIMEOUT_MS,
 			"GJC_OPENWEBUI_TURN_TIMEOUT_MS",
 		),
-		sessionRoot: requireNonEmptyString(
-			optionalEnv(env, "GJC_OPENWEBUI_SESSION_ROOT"),
-			currentWorkingDirectory,
-			"GJC_OPENWEBUI_SESSION_ROOT",
-		),
-		allowedProjectRoots: parseAllowedProjectRoots(
-			optionalEnv(env, "GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS"),
-			currentWorkingDirectory,
-		),
-		artifactBaseUrl: optionalNonEmptyString(optionalEnv(env, "GJC_OPENWEBUI_ARTIFACT_BASE_URL")),
-		projects: parseConfiguredProjects(optionalEnv(env, "GJC_OPENWEBUI_PROJECTS")),
-	};
-	if (config.artifactBaseUrl !== undefined) {
-		config.artifactBaseUrl = parseUrl(
-			config.artifactBaseUrl,
-			config.artifactBaseUrl,
-			"GJC_OPENWEBUI_ARTIFACT_BASE_URL",
-		);
-	}
-	return config;
+		sessionRoot: requireNonEmptyString(env.GJC_OPENWEBUI_SESSION_ROOT, process.cwd(), "GJC_OPENWEBUI_SESSION_ROOT"),
+		allowedProjectRoots: parseAllowedProjectRoots(env.GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS, process.cwd()),
+		...(artifactBaseUrl === undefined
+			? {}
+			: { artifactBaseUrl: parseUrl(artifactBaseUrl, artifactBaseUrl, "GJC_OPENWEBUI_ARTIFACT_BASE_URL") }),
+		projects: parseConfiguredProjects(env.GJC_OPENWEBUI_PROJECTS),
+	});
 }
 
 export function buildStartupDiagnostics(config: AdapterConfig): StartupDiagnostic {
@@ -238,11 +221,14 @@ export function buildStartupDiagnostics(config: AdapterConfig): StartupDiagnosti
 		messages,
 	};
 }
-export function loadInstalledAdapterConfig(path?: string): AdapterConfig {
+export function loadInstalledAdapterConfig(path?: string): ResolvedAdapterConfig {
 	const installed = readInstalledConfig(path);
 	const managed = installed.mode === "managed";
 	const projectRoot = managed ? "/workspace" : (installed.projectRoot ?? DEFAULT_EXISTING_PROJECT_ROOT);
-	return {
+	const runtimeLocations = resolveGjcRuntimeLocations(
+		managed ? { mode: "managed" } : { mode: "existing", installedConfig: installed },
+	);
+	return Object.freeze({
 		bindHost: installed.bindHost,
 		bindPort: installed.bindPort,
 		openWebUIBaseUrl: managed ? "http://openwebui:8080" : installed.openWebUIApiUrl,
@@ -255,6 +241,9 @@ export function loadInstalledAdapterConfig(path?: string): AdapterConfig {
 		ownerUserId: installed.ownerUserId,
 		statePath: managed ? "/var/lib/gjc" : ".gjc/openwebui-adapter",
 		gjcCommand: "gjc",
+		gjcConfigDirName: runtimeLocations.childEnvironment.GJC_CONFIG_DIR,
+		gjcCodingAgentDir: runtimeLocations.agentDir,
+		runtimeLocations,
 		turnTimeoutMs: DEFAULT_TURN_TIMEOUT_MS,
 		sessionRoot: managed ? "/run/gjc-session" : `${projectRoot}/.gjc/sessions`,
 		allowedProjectRoots: managed ? [projectRoot, "/run/gjc-session"] : [projectRoot],
@@ -265,5 +254,5 @@ export function loadInstalledAdapterConfig(path?: string): AdapterConfig {
 				sessionRoot: managed ? "/run/gjc-session" : `${projectRoot}/.gjc/sessions`,
 			},
 		],
-	};
+	});
 }

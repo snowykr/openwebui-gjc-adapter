@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resolveAdapterConfig } from "../src/adapter-server-options";
 import { buildStartupDiagnostics, loadAdapterConfig, loadInstalledAdapterConfig } from "../src/config";
 import {
 	DEFAULT_EXISTING_PROJECT_ROOT,
@@ -42,6 +43,33 @@ describe("adapter config contracts", () => {
 		expect(config.projects).toEqual([]);
 	});
 
+	test("retains resolved runtime fields as frozen enumerable configuration", () => {
+		const config = loadAdapterConfig({});
+		const spread = { ...config };
+		const json = JSON.parse(JSON.stringify(config)) as Record<string, unknown>;
+
+		expect(Object.isFrozen(config)).toBe(true);
+		expect(Object.getOwnPropertyDescriptor(config, "gjcConfigDirName")).toMatchObject({
+			enumerable: true,
+			writable: false,
+		});
+		expect(Object.getOwnPropertyDescriptor(config, "gjcCodingAgentDir")).toMatchObject({
+			enumerable: true,
+			writable: false,
+		});
+		expect(Object.getOwnPropertyDescriptor(config, "runtimeLocations")).toMatchObject({
+			enumerable: true,
+			writable: false,
+		});
+		expect(spread.runtimeLocations).toBe(config.runtimeLocations);
+		expect(resolveAdapterConfig(config)).toBe(config);
+		expect(spread.gjcConfigDirName).toBe(config.gjcConfigDirName);
+		expect(spread.gjcCodingAgentDir).toBe(config.gjcCodingAgentDir);
+		expect(json.gjcConfigDirName).toBe(config.gjcConfigDirName);
+		expect(json.gjcCodingAgentDir).toBe(config.gjcCodingAgentDir);
+		expect(json.runtimeLocations).toEqual(config.runtimeLocations);
+	});
+
 	test("parses configured env values and colon-separated roots", () => {
 		const config = loadAdapterConfig({
 			GJC_OPENWEBUI_BIND_HOST: "0.0.0.0",
@@ -71,6 +99,9 @@ describe("adapter config contracts", () => {
 			ownerUserId: "owner-1",
 			statePath: "/tmp/state",
 			gjcCommand: "/usr/local/bin/gjc",
+			gjcConfigDirName: ".gjc",
+			gjcCodingAgentDir: config.runtimeLocations.agentDir,
+			runtimeLocations: config.runtimeLocations,
 			turnTimeoutMs: 240_000,
 			sessionRoot: "/tmp/sessions",
 			allowedProjectRoots: ["/repo/a", "/repo/b"],
@@ -136,13 +167,19 @@ describe("adapter config contracts", () => {
 		};
 		try {
 			writeInstalledConfig({ ...base, mode: "managed" }, file);
-			expect(loadInstalledAdapterConfig(file)).toMatchObject({
+			const managed = loadInstalledAdapterConfig(file);
+			expect(managed).toMatchObject({
 				statePath: "/var/lib/gjc",
 				sessionRoot: "/run/gjc-session",
 				allowedProjectRoots: ["/workspace", "/run/gjc-session"],
 				adapterApiToken: "adapter",
 				gjcCommand: "gjc",
 			});
+			expect(Object.isFrozen(managed)).toBe(true);
+			expect(Object.keys(managed)).toEqual(
+				expect.arrayContaining(["gjcConfigDirName", "gjcCodingAgentDir", "runtimeLocations"]),
+			);
+			expect({ ...managed }.runtimeLocations).toBe(managed.runtimeLocations);
 			writeInstalledConfig({ ...base, mode: "existing", bindHost: "127.0.0.1", ownerUserId: "owner-test" }, file);
 			const existing = loadInstalledAdapterConfig(file);
 			expect(existing.statePath).toBe(".gjc/openwebui-adapter");

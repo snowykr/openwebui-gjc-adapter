@@ -1,7 +1,10 @@
+import { resolveGjcRuntimeLocations } from "../configure/runtime-locations";
+import type { GjcRuntimeLocations } from "../contracts";
 import { createDefaultRpcTransport } from "./rpc-client-transport";
 import { GjcRpcRunnerError } from "./rpc-errors";
 import type {
 	CreateGjcRpcTurnRunnerInput,
+	CreateResolvedGjcRpcTurnRunnerInput,
 	GjcContinueSessionInput,
 	GjcRespondWorkflowGateInput,
 	GjcRpcRunnerClientOptions,
@@ -30,10 +33,17 @@ interface StartedClient {
 export { GjcRpcRunnerError };
 
 export function createGjcRpcTurnRunner(input: CreateGjcRpcTurnRunnerInput = {}): GjcTurnRunner {
+	const runtimeLocations = input.runtimeLocations ?? resolveGjcRuntimeLocations({ mode: "existing" });
+	return createResolvedGjcRpcTurnRunner({ ...input, runtimeLocations });
+}
+
+export function createResolvedGjcRpcTurnRunner(input: CreateResolvedGjcRpcTurnRunnerInput): GjcTurnRunner {
+	if (input.runtimeLocations === undefined) throw new TypeError("resolved runtime locations are required");
 	return new RpcBackedGjcTurnRunner(
 		input.clientFactory ?? createDefaultRpcTransport,
 		input.cliPath,
 		input.turnTimeoutMs ?? 60_000,
+		input.runtimeLocations,
 	);
 }
 
@@ -44,6 +54,7 @@ class RpcBackedGjcTurnRunner implements GjcTurnRunner {
 		private readonly clientFactory: (options: GjcRpcRunnerClientOptions) => GjcRpcRunnerTransport,
 		private readonly cliPath: string | undefined,
 		private readonly turnTimeoutMs: number,
+		private readonly runtimeLocations: GjcRuntimeLocations,
 	) {}
 
 	async startNewSession(input: GjcStartNewSessionInput): Promise<GjcSessionAddress & GjcTurnResult> {
@@ -111,13 +122,17 @@ class RpcBackedGjcTurnRunner implements GjcTurnRunner {
 		for (const event of result.events) yield event;
 	}
 
-	private async getOrStartClient(key: string, options: GjcRpcRunnerClientOptions): Promise<GjcRpcRunnerTransport> {
+	private async getOrStartClient(
+		key: string,
+		options: Pick<GjcRpcRunnerClientOptions, "cwd" | "sessionRoot">,
+	): Promise<GjcRpcRunnerTransport> {
 		const existing = this.#clients.get(key);
 		if (existing !== undefined) return existing.client;
 		const client = this.clientFactory({
 			cwd: options.cwd,
 			sessionRoot: options.sessionRoot,
 			...(this.cliPath === undefined ? {} : { cliPath: this.cliPath }),
+			runtimeLocations: this.runtimeLocations,
 		});
 		await runRpcCommand("start", () => client.start());
 		this.#clients.set(key, { client });

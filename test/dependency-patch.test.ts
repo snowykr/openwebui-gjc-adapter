@@ -1,11 +1,18 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
+import type { RpcClientOptions, RpcDefaultModelSelection } from "@gajae-code/coding-agent";
 
 const PATCH_PATH = join(import.meta.dir, "..", "patches", "@gajae-code%2Fcoding-agent@0.10.0.patch");
-const EXPECTED_PATCH_SHA256 = "4fd8caed7b11852cdb3782c4fa6ddcd9d79235cfd379254110f1d521f16eb11d";
+const EXPECTED_PATCH_SHA256 = "3200948e7617b93d54df1431dfd368af60c1549f05e894e39ed7893e3f6f3328";
 const EXPECTED_PATCH_FILES = [
+	"dist/types/config/settings.d.ts",
+	"dist/types/modes/index.d.ts",
+	"dist/types/modes/rpc/rpc-client.d.ts",
+	"dist/types/modes/rpc/rpc-types.d.ts",
+	"dist/types/session/agent-session.d.ts",
 	"src/config/settings.ts",
 	"src/internal-urls/docs-index.generated.ts",
+	"src/modes/index.ts",
 	"src/modes/rpc/rpc-client.ts",
 	"src/modes/rpc/rpc-types.ts",
 	"src/modes/shared/agent-wire/command-dispatch.ts",
@@ -13,6 +20,13 @@ const EXPECTED_PATCH_FILES = [
 	"src/modes/shared/agent-wire/scopes.ts",
 	"src/session/agent-session.ts",
 ] as const;
+const EXPECTED_PATCH_BYTES = 277_547;
+const EXPECTED_PATCH_LINES = 736;
+const UNDEFINED_ENV_OPTIONS = { env: { PI_CONFIG_DIR: undefined } } satisfies RpcClientOptions;
+
+function retainSelectionType(selection: RpcDefaultModelSelection): RpcDefaultModelSelection {
+	return selection;
+}
 
 describe("approved canonical setter dependency", () => {
 	test("pins exact npm 0.10.0 packages and the approved patch when the manifest is read", async () => {
@@ -47,8 +61,12 @@ describe("approved canonical setter dependency", () => {
 
 		// Then
 		expect(digest).toBe(EXPECTED_PATCH_SHA256);
+		expect(patchFile.size).toBe(EXPECTED_PATCH_BYTES);
+		expect(patch.match(/\n/gu)?.length).toBe(EXPECTED_PATCH_LINES);
 		expect(headers.map(match => match[1])).toEqual([...EXPECTED_PATCH_FILES]);
 		expect(headers.every(match => match[1] === match[2])).toBe(true);
+		expect(patch).toContain("env?: Readonly<Record<string, string | undefined>>;");
+		expect(patch).toContain("type RpcDefaultModelSelection,");
 	});
 
 	test("exports the positional canonical setter when the installed package is loaded", async () => {
@@ -61,5 +79,11 @@ describe("approved canonical setter dependency", () => {
 		// Then
 		expect(setter).toBeFunction();
 		expect(setter.length).toBe(3);
+		expect(UNDEFINED_ENV_OPTIONS.env.PI_CONFIG_DIR).toBeUndefined();
+		expect(retainSelectionType({ provider: "provider", modelId: "model", thinkingLevel: "off" })).toEqual({
+			provider: "provider",
+			modelId: "model",
+			thinkingLevel: "off",
+		});
 	});
 });
