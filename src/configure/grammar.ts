@@ -22,6 +22,8 @@ const optionNames = new Set([
 	"ui-port",
 	"openwebui-url",
 	"project-root",
+	"gjc-config-dir-name",
+	"gjc-coding-agent-dir",
 	"reset",
 	"reset-proof",
 ]);
@@ -94,6 +96,11 @@ export function parseCliArguments(argv: readonly string[]): CliCommand {
 		throw new CliUsageError("managed configuration does not accept openwebui-url");
 	if (mode === "managed" && options["bind-port"] !== undefined)
 		throw new CliUsageError("managed configuration does not accept bind-port customization");
+	if (
+		mode === "managed" &&
+		(options["gjc-config-dir-name"] !== undefined || options["gjc-coding-agent-dir"] !== undefined)
+	)
+		throw new CliUsageError("managed configuration does not accept GJC runtime location overrides");
 	if (mode === "existing" && (options["admin-email-fd"] !== undefined || options["admin-password-fd"] !== undefined))
 		throw new CliUsageError("existing configuration does not accept managed admin credentials");
 	if (mode === "existing" && options["ui-port"] !== undefined)

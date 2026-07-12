@@ -6,6 +6,11 @@ import {
 	readInstalledConfig,
 } from "./configure/private-config";
 
+export {
+	GjcRuntimeLocationError,
+	type ResolveGjcRuntimeLocationsInput,
+	resolveGjcRuntimeLocations,
+} from "./configure/runtime-locations";
 export type { InstalledConfig, InstalledMode };
 export { defaultConfigPath, readInstalledConfig };
 
@@ -66,11 +71,7 @@ function requireNonEmptyString(value: string | undefined, fallback: string, name
 }
 
 function optionalNonEmptyString(value: string | undefined): string | undefined {
-	if (value === undefined) {
-		return undefined;
-	}
-	const trimmed = value.trim();
-	return trimmed.length === 0 ? undefined : trimmed;
+	return value?.trim() || undefined;
 }
 
 function parsePort(value: string | undefined): number {
@@ -153,11 +154,7 @@ function requiredProjectField(value: string | undefined, entryNumber: number, fi
 }
 
 function optionalProjectField(value: string | undefined): string | undefined {
-	if (value === undefined) {
-		return undefined;
-	}
-	const trimmed = value.trim();
-	return trimmed.length === 0 ? undefined : trimmed;
+	return value?.trim() || undefined;
 }
 
 export function loadAdapterConfig(env: Record<string, string | undefined> = process.env): AdapterConfig {
