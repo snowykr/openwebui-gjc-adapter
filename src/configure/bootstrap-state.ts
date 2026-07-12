@@ -38,6 +38,8 @@ export interface PendingRecoveryRecord {
 	readonly uiPort: number;
 	readonly bindPort?: number;
 	readonly projectRoot?: string;
+	readonly gjcConfigDirName?: string;
+	readonly gjcCodingAgentDir?: string;
 	readonly priorControllerEnabled: boolean;
 	readonly priorControllerActive: boolean;
 	readonly controllerRecoveryRequired: boolean;

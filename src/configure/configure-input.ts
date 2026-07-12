@@ -3,7 +3,7 @@ import { existsSync, lstatSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { generateAdapterToken, readSecretRecordFromFd } from "./credentials";
 import type { CliDependencies, DeploymentLifecycle, ResetRequest } from "./installed-cli-contracts";
-import { buildPendingRecoveryLinkage } from "./pending-recovery";
+import { buildPendingRecoveryLinkage, validatePendingRecoveryRetry } from "./pending-recovery";
 import type { PendingRecoveryStore } from "./pending-recovery-store";
 import {
 	canonicalizeUrl,
@@ -61,38 +61,6 @@ function assertRegularOrAbsent(path: string): void {
 	}
 }
 
-function validatePendingInput(input: ConfigureRequest, pending: ReturnType<PendingRecoveryStore["read"]>): void {
-	if (pending === undefined) return;
-	if (pending.mode !== input.mode) throw new Error("pending recovery belongs to a different deployment mode");
-	if (input.mode === "managed" && optionValue(input.options, "adapter-ingress-url") !== undefined)
-		throw new Error("managed recovery does not accept an ingress URL");
-	const requestedTarget = optionValue(input.options, "openwebui-url");
-	if (requestedTarget !== undefined && canonicalizeUrl(requestedTarget, "openwebui-url") !== pending.targetUrl)
-		throw new Error("pending recovery OpenWebUI URL does not match retry input");
-	const requestedProvider = optionValue(input.options, "adapter-ingress-url");
-	if (requestedProvider !== undefined) {
-		let canonicalProvider = canonicalizeUrl(requestedProvider, "adapter-ingress-url");
-		if (!canonicalProvider.endsWith("/v1")) canonicalProvider += "/v1";
-		if (canonicalProvider !== pending.providerUrl)
-			throw new Error("pending recovery provider URL does not match retry input");
-	}
-	if (pending.linkage !== buildPendingRecoveryLinkage(pending)) throw new Error("pending recovery linkage is invalid");
-	const previous = existsSync(input.path) ? readInstalledConfig(input.path) : undefined;
-	if (
-		previous?.mode === pending.mode &&
-		(previous.installationId !== pending.installationId ||
-			previous.adapterToken !== pending.adapterToken ||
-			previous.readinessToken !== pending.readinessToken)
-	)
-		throw new Error("pending recovery identity does not match installed configuration");
-	if (
-		pending.mode === "existing" &&
-		optionValue(input.options, "bind-port") !== undefined &&
-		Number(optionValue(input.options, "bind-port")) !== pending.bindPort
-	)
-		throw new Error("pending recovery bind port does not match retry input");
-}
-
 export async function parseConfigureInput(input: ConfigureRequest): Promise<ConfigureInput> {
 	const userUnitDirectory = join(
 		process.env.XDG_CONFIG_HOME ?? join(process.env.HOME ?? "", ".config"),
@@ -111,10 +79,15 @@ export async function parseConfigureInput(input: ConfigureRequest): Promise<Conf
 	])
 		assertRegularOrAbsent(artifact);
 	const pending = input.pendingStore.read();
-	validatePendingInput(input, pending);
+	const previous = existsSync(input.path) ? readInstalledConfig(input.path) : undefined;
+	const runtimeLocationIdentity = validatePendingRecoveryRetry({
+		mode: input.mode,
+		options: input.options,
+		pending,
+		previous,
+	});
 	if (existsSync(input.path) && (lstatSync(input.path).isSymbolicLink() || lstatSync(input.path).isDirectory()))
 		throw new Error("config artifact must be a regular file or absent");
-	const previous = existsSync(input.path) ? readInstalledConfig(input.path) : undefined;
 	if (previous && previous.mode !== input.mode && input.options.reset !== true)
 		throw new Error("changing the deployment route requires --reset");
 	const bindHost = input.mode === "managed" ? "0.0.0.0" : "127.0.0.1";
@@ -192,6 +165,7 @@ export async function parseConfigureInput(input: ConfigureRequest): Promise<Conf
 		bindHost,
 		bindPort,
 		projectRoot,
+		...runtimeLocationIdentity,
 	};
 	const pendingRecovery = pending ?? {
 		version: 1,
@@ -206,6 +180,7 @@ export async function parseConfigureInput(input: ConfigureRequest): Promise<Conf
 		uiPort,
 		...(input.mode === "existing" ? { bindPort } : {}),
 		...(projectRoot === undefined ? {} : { projectRoot }),
+		...runtimeLocationIdentity,
 		priorControllerEnabled: false,
 		priorControllerActive: false,
 		controllerRecoveryRequired:
