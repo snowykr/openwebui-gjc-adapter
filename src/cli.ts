@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { type AdapterConfig, buildStartupDiagnostics, loadAdapterConfig } from "./config";
+import { type CliDependencies, runInstalledCli } from "./configure/installed-cli";
 import { createGjcRpcTurnRunner, type GjcTurnRunner } from "./gjc/rpc-runner";
 import { FileBackedSessionMappingStore, type SessionMappingStore } from "./gjc/session-router";
 import type { AdapterHealthCheck } from "./health";
@@ -18,6 +19,17 @@ import { type AllowedRoot, resolveAllowedRoots } from "./security/paths";
 import { type AdapterServerHandle, type AdapterServerOptions, startAdapterServer } from "./server";
 
 const SESSION_MAPPING_STORE_FILE = "openwebui-session-mappings.json";
+const TOP_LEVEL_USAGE = `Usage: openwebui-gjc-adapter [command]
+
+Without a command, starts the adapter service from environment configuration.
+
+Commands:
+  configure managed   Configure a managed local OpenWebUI installation
+  configure existing  Configure an adapter for an existing OpenWebUI installation
+  serve --config PATH Start an installed adapter service
+  probe-ready         Check an installed adapter service readiness
+  credentials show adapter-token  Display an installed adapter token
+`;
 
 export interface BuildAdapterServerOptionsDependencies {
 	readonly turnRunner?: GjcTurnRunner;
@@ -27,12 +39,22 @@ export interface BuildAdapterServerOptionsDependencies {
 	readonly projectionRepository?: OpenWebUIProjectionRepository;
 	readonly projectRegistrationStore?: SqliteProjectRegistrationStore;
 }
+interface BuildAdapterServerOptionsBehavior {
+	readonly deferOpenWebUIInitialization?: boolean;
+}
 
 export async function buildAdapterServerOptionsFromEnv(
 	env: Record<string, string | undefined> = process.env,
 	dependencies: BuildAdapterServerOptionsDependencies = {},
 ): Promise<AdapterServerOptions> {
-	const config = loadAdapterConfig(env);
+	return buildAdapterServerOptions(loadAdapterConfig(env), dependencies);
+}
+
+export async function buildAdapterServerOptions(
+	config: AdapterConfig,
+	dependencies: BuildAdapterServerOptionsDependencies = {},
+	behavior: BuildAdapterServerOptionsBehavior = {},
+): Promise<AdapterServerOptions> {
 	const allowedRoots = await resolveAllowedRoots(config.allowedProjectRoots);
 	const projects = await loadConfiguredProjects(config, allowedRoots);
 	const owner = buildOwnerContext(config);
@@ -45,7 +67,7 @@ export async function buildAdapterServerOptionsFromEnv(
 	const mappings = dependencies.mappings ?? new FileBackedSessionMappingStore(buildSessionMappingStorePath(config));
 	const openWebUIClient = buildOpenWebUIClient(config);
 	const promptHintClient = buildOpenWebUIPromptHintClient(config);
-	if (promptHintClient !== undefined) {
+	if (promptHintClient !== undefined && !behavior.deferOpenWebUIInitialization) {
 		await promptHintClient.seedGjcPromptHints();
 	}
 	const projectionRepository = dependencies.projectionRepository ?? openWebUIClient;
@@ -61,7 +83,7 @@ export async function buildAdapterServerOptionsFromEnv(
 	});
 	const previouslyLinkedProjectIds = new Set(projectLinkService.listLinkedProjects().map(project => project.id));
 	projectLinkService.seedConfiguredProjects(projects);
-	if (projectionRepository !== undefined) {
+	if (projectionRepository !== undefined && !behavior.deferOpenWebUIInitialization) {
 		await projectLinkService.reconcileOpenWebUIFolderLinks({ projectIds: previouslyLinkedProjectIds });
 		await projectLinkService.syncLinkedProjects();
 	}
@@ -87,6 +109,41 @@ export async function buildAdapterServerOptionsFromEnv(
 			...(eventSink === undefined ? {} : { eventSink }),
 			...(messageSink === undefined ? {} : { messageSink }),
 			...(fileContextResolver === undefined ? {} : { fileContextResolver }),
+		},
+	};
+}
+
+export async function buildInstalledAdapterServerOptions(config: AdapterConfig): Promise<AdapterServerOptions> {
+	const options = await buildAdapterServerOptions(config, {}, { deferOpenWebUIInitialization: true });
+	if (config.adapterToken === undefined || config.readinessToken === undefined || config.mode === undefined) {
+		throw new Error("installed adapter configuration is missing runtime credentials or mode");
+	}
+	const promptHintClient = buildOpenWebUIPromptHintClient(config);
+	const projectLinkService = options.routes?.projectLinkService;
+	return {
+		...options,
+		runtime: {
+			adapterToken: config.adapterToken,
+			readinessToken: config.readinessToken,
+			readiness: {
+				openWebUIAuthenticated: false,
+				promptHintsSeeded: false,
+				mode: config.mode,
+				generation: config.installationId,
+				reason: "OpenWebUI runtime initialization is pending",
+			},
+			openWebUIBaseUrl: config.openWebUIBaseUrl,
+			openWebUIApiToken: config.openWebUIApiToken,
+			initialize: async () => {
+				if (promptHintClient !== undefined) await promptHintClient.seedGjcPromptHints();
+				if (projectLinkService !== undefined) {
+					const previouslyLinkedProjectIds = new Set(
+						projectLinkService.listLinkedProjects().map(project => project.id),
+					);
+					await projectLinkService.reconcileOpenWebUIFolderLinks({ projectIds: previouslyLinkedProjectIds });
+					await projectLinkService.syncLinkedProjects();
+				}
+			},
 		},
 	};
 }
@@ -198,19 +255,52 @@ function buildOwnerContext(config: AdapterConfig): OpenWebUIOwnerContext {
 		singleOwnerLocalMode: false,
 	};
 }
+export interface RunCliDependencies extends CliDependencies {
+	/** Test seam for observing the fully composed installed server options. */
+	readonly startConfiguredServer?: (
+		options: AdapterServerOptions,
+	) => AdapterServerHandle | Promise<AdapterServerHandle>;
+}
 
-async function main(): Promise<void> {
+export async function runCli(
+	argv: readonly string[] = process.argv.slice(2),
+	dependencies: RunCliDependencies = {},
+): Promise<number> {
+	if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h")) {
+		(dependencies.stdout ?? process.stdout).write(TOP_LEVEL_USAGE);
+		return 0;
+	}
+	if (isInstalledCommand(argv)) {
+		return runInstalledCli(argv, {
+			...dependencies,
+			startServer:
+				dependencies.startServer ??
+				(dependencies.startConfiguredServer
+					? async config => dependencies.startConfiguredServer!(await buildInstalledAdapterServerOptions(config))
+					: async config => startAdapterServer(await buildInstalledAdapterServerOptions(config))),
+		});
+	}
 	try {
 		const handle = await startAdapterServiceFromEnv();
 		console.log(`openwebui-gjc-adapter listening on ${handle.url}`);
 		installShutdownHandler(handle);
+		return 0;
 	} catch (error) {
 		if (error instanceof Error) {
 			console.error(error.message);
-			process.exit(1);
+			return 1;
 		}
 		throw error;
 	}
+}
+
+function isInstalledCommand(argv: readonly string[]): boolean {
+	return (
+		argv[0] === "configure" ||
+		argv[0] === "probe-ready" ||
+		argv[0] === "serve" ||
+		(argv[0] === "credentials" && argv[1] === "show" && argv[2] === "adapter-token")
+	);
 }
 
 function installShutdownHandler(handle: AdapterServerHandle): void {
@@ -230,5 +320,5 @@ function installShutdownHandler(handle: AdapterServerHandle): void {
 }
 
 if (import.meta.main) {
-	await main();
+	process.exitCode = await runCli();
 }

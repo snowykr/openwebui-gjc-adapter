@@ -15,6 +15,9 @@
 	"packageManager": "bun@1.3.14",
 	"main": "./src/index.ts",
 	"types": "./src/index.ts",
+	"bin": {
+		"openwebui-gjc-adapter": "./bin/openwebui-gjc-adapter"
+	},
 	"scripts": {
 		"start": "bun run src/cli.ts",
 		"check": "biome check . && bun run check:types",
@@ -40,7 +43,10 @@
 	"files": [
 		"src",
 		"README.md",
-		"CHANGELOG.md"
+		"CHANGELOG.md",
+		"bin",
+		"Dockerfile.adapter",
+		"bun.lock"
 	],
 	"exports": {
 		".": {

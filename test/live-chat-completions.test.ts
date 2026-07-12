@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { handleChatCompletions, type LiveGatewayRunner, WorkflowGateReplyError } from "../src/live/chat-completions";
+import { buildModelList } from "../src/live/models";
 import type { OpenAIChatCompletionRequest } from "../src/live/openai-types";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
@@ -34,6 +35,12 @@ const request: OpenAIChatCompletionRequest = {
 const projectWithFolder: RegisteredProject = { ...project, openWebUIFolderId: "folder-demo" };
 
 describe("live OpenAI-compatible chat completions", () => {
+	it("advertises only the stable gjc model", () => {
+		expect(buildModelList()).toEqual({
+			object: "list",
+			data: [{ id: "gjc", object: "model", created: 1783468800, owned_by: "gjc" }],
+		});
+	});
 	it("returns an OpenAI-style 400 for invalid workflow gate replies", async () => {
 		const result = await handleChatCompletions({
 			request,

@@ -1,6 +1,10 @@
 export * from "./branches/regenerate";
 export * from "./cli";
 export * from "./config";
+export * from "./configure/credentials";
+export * from "./configure/grammar";
+export * from "./configure/private-config";
+export type { OpenWebUIHeaderName } from "./contracts";
 export * from "./contracts";
 export * from "./gjc/rpc-frames";
 export * from "./gjc/rpc-runner";
@@ -23,6 +27,7 @@ export * from "./projection/importer";
 export * from "./projection/workflow-gates";
 export * from "./projects/registry";
 export * from "./security/paths";
+export type { AdapterRuntimeConfig, AdapterServerHandle, AdapterServerOptions } from "./server";
 export * from "./server";
 export * from "./state/metadata";
 export * from "./state/outbox";

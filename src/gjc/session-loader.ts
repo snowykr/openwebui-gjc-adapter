@@ -1,5 +1,5 @@
 import type { SessionEntry, SessionHeader } from "@gajae-code/coding-agent";
-import { loadEntriesFromFile } from "@gajae-code/coding-agent/session/session-manager";
+import { loadEntriesFromFile } from "@gajae-code/coding-agent";
 
 export type GjcSessionLoadDiagnosticCode = "missing_session_header" | "empty_session_file" | "corrupt_session_file";
 

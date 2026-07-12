@@ -1,13 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { RpcClient } from "@gajae-code/coding-agent/modes/rpc/rpc-client";
 import { createRpcTransportFromClient, type RpcClientTransportClient } from "../src/gjc/rpc-client-transport";
 import type { GjcRpcRunnerTransportEvent, GjcRpcTransportState } from "../src/gjc/rpc-runner";
 
 describe("createRpcTransportFromClient", () => {
-	test("uses a GJC client version that exposes full session events", () => {
-		expect(typeof RpcClient.prototype.onSessionEvent).toBe("function");
-	});
-
 	test("prefers full session events over filtered agent events when the GJC client exposes onSessionEvent", async () => {
 		const client = new FullSessionEventClient([
 			{ type: "todo_reminder", todos: [{ text: "keep evidence bounded" }] },

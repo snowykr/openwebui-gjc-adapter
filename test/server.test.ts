@@ -68,6 +68,33 @@ describe("createAdapterRequestHandler", () => {
 		expect(response.status).toBe(503);
 		expect(await response.json()).toMatchObject({ error: { code: "adapter_api_token_unconfigured" } });
 	});
+	test("protects runtime readiness separately from the provider bearer token", async () => {
+		const handler = createAdapterRequestHandler({
+			routes: { projects: [project], owner, runner: fixedRunner("unused") },
+			runtime: {
+				adapterToken: "provider-token",
+				readinessToken: "readiness-token",
+				readiness: { openWebUIAuthenticated: true, promptHintsSeeded: true, mode: "managed" },
+			},
+		});
+
+		const unauthorized = await handler(new Request("http://adapter.test/readyz"));
+		const ready = await handler(
+			new Request("http://adapter.test/readyz", { headers: { authorization: "Bearer readiness-token" } }),
+		);
+		const providerOnReadiness = await handler(
+			new Request("http://adapter.test/readyz", { headers: { authorization: "Bearer provider-token" } }),
+		);
+		const provider = await handler(
+			new Request("http://adapter.test/v1/models", { headers: { authorization: "Bearer provider-token" } }),
+		);
+
+		expect(unauthorized.status).toBe(401);
+		expect(ready.status).toBe(200);
+		expect(providerOnReadiness.status).toBe(401);
+		expect(await ready.json()).toMatchObject({ status: "ready", identity: { mode: "managed" } });
+		expect(provider.status).toBe(200);
+	});
 
 	test("routes chat completions to optional route dependencies", async () => {
 		const handler = createAdapterRequestHandler({
@@ -95,6 +122,37 @@ describe("createAdapterRequestHandler", () => {
 			object: "chat.completion",
 			choices: [{ message: { role: "assistant", content: "handled" } }],
 		});
+	});
+	test("keeps malformed JSON errors and streaming responses on the current chat route", async () => {
+		const handler = createAdapterRequestHandler({
+			routes: { projects: [project], owner, runner: { run: () => ({ chunks: ["a", "b"] }) } },
+		});
+		const malformed = await handler(
+			new Request("http://adapter.test/v1/chat/completions", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: "{",
+			}),
+		);
+		const streaming = await handler(
+			new Request("http://adapter.test/v1/chat/completions", {
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					"X-OpenWebUI-Chat-Id": "chat-1",
+					"X-OpenWebUI-Message-Id": "assistant-1",
+					"X-OpenWebUI-User-Message-Id": "user-1",
+					"X-OpenWebUI-User-Message-Parent-Id": "",
+					"X-OpenWebUI-User-Id": "owner-1",
+				},
+				body: JSON.stringify({ model: "gjc", stream: true, messages: [{ role: "user", content: "hello" }] }),
+			}),
+		);
+
+		expect(malformed.status).toBe(400);
+		expect(await malformed.json()).toMatchObject({ error: { code: "invalid_json" } });
+		expect(streaming.headers.get("content-type")).toStartWith("text/event-stream");
+		expect(await streaming.text()).toContain("data: [DONE]");
 	});
 });
 
