@@ -114,14 +114,34 @@ export function latestPendingWorkflowGate(events: readonly GjcTurnEvent[]): Pend
 	return null;
 }
 
-export function projectTurnEvents(events: readonly GjcTurnEvent[]): readonly OpenWebUIMessageEvent[] {
+export function projectTurnEvents(
+	events: readonly GjcTurnEvent[],
+	canonicalModel?: string,
+): readonly OpenWebUIMessageEvent[] {
+	if (canonicalModel === undefined) return [];
 	const projected: OpenWebUIMessageEvent[] = [];
 	for (const [index, event] of events.entries()) {
 		const frame = turnEventToProjectableFrame(event);
 		if (frame === null) continue;
-		projected.push(...projectAgentFrame(frame, { id: `gjc-event-${index}`, created: 0, model: "gjc" }).events);
+		const frameEvents = projectAgentFrame(frame, {
+			id: `gjc-event-${index}`,
+			created: 0,
+			model: canonicalModel,
+		}).events;
+		projected.push(...frameEvents.map(event => bindEventModel(event, canonicalModel)));
 	}
 	return projected;
+}
+
+function bindEventModel(event: OpenWebUIMessageEvent, canonicalModel: string | undefined): OpenWebUIMessageEvent {
+	if (canonicalModel === undefined || event.type !== "status") return event;
+	return {
+		...event,
+		data: {
+			...event.data,
+			gjc_adapter: { ...(event.data.gjc_adapter ?? {}), model: canonicalModel },
+		},
+	};
 }
 
 export function buildSessionMappingPayloadHash(mapping: SessionMapping): string {

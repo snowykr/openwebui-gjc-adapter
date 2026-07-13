@@ -9,6 +9,7 @@ import { registerProjectDirectory } from "../src/projects/registry";
 import { resolveAllowedRoots } from "../src/security/paths";
 import { createAdapterRequestHandler } from "../src/server";
 import { chatRequest, FakeGjcTurnRunner } from "./cli-fixtures";
+import { staticModelReaderFactory } from "./model-selection-fixtures";
 import { messageEntry, writeSessionFile } from "./session-sync-fixtures";
 
 describe("adapter CLI project reconciliation", () => {
@@ -79,6 +80,7 @@ describe("adapter CLI project reconciliation", () => {
 			turnRunner: new FakeGjcTurnRunner(),
 			projectionRepository: repository,
 			projectRegistrationStore: store,
+			modelReaderFactory: staticModelReaderFactory(),
 		});
 		const routes = options.routes;
 		if (routes === undefined) throw new Error("expected route dependencies");

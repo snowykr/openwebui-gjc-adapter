@@ -1,10 +1,12 @@
-import { buildModelList } from "../live/models";
+import type { ModelReaderFactory } from "../live/model-reader";
+import { ModelSelectionError, modelSelectionError } from "../live/model-selection-errors";
+import { createModelSelectionPolicy } from "../live/model-selection-policy";
+import { buildModelList, classifyGjcModelId, formatCanonicalModelId } from "../live/models";
 import type {
 	OpenAIChatCompletionRequest,
 	OpenAIChatCompletionResponse,
 	OpenAIModelListResponse,
 } from "../live/openai-types";
-import { GJC_OPENWEBUI_MODEL_ID } from "../live/project-context";
 import { type OpenWebUIOwnerContext, validateForwardedOwnerUserId } from "../openwebui/auth";
 import type { OpenWebUIHeaderInput } from "../openwebui/headers";
 import { parseOpenWebUIHeaders } from "../openwebui/headers";
@@ -90,6 +92,7 @@ export async function handleProjectAdminChatCompletion(
 	request: OpenAIChatCompletionRequest,
 	headers: OpenWebUIHeaderInput,
 	ownerContext: OpenWebUIOwnerContext,
+	modelReaderFactory?: ModelReaderFactory,
 ): Promise<ProjectAdminRouteResult> {
 	const parsedHeaders = parseOpenWebUIHeaders(headers);
 	if (!parsedHeaders.ok) {
@@ -100,24 +103,29 @@ export async function handleProjectAdminChatCompletion(
 		return errorResult("Forwarded OpenWebUI owner does not match adapter owner.", owner.reason, 401);
 	}
 	if (parsedHeaders.isBackgroundTask) {
-		return { status: 200, body: chatResponse("") };
+		try {
+			return await canonicalAdminResponse("", request.model, modelReaderFactory);
+		} catch (error) {
+			if (error instanceof ModelSelectionError) return modelSelectionErrorResult(error);
+			return infrastructureErrorResult(error, "project_command_failed");
+		}
 	}
 	const command = latestUserText(request);
 	if (command === undefined) return errorResult("A project command is required.", "invalid_project_command", 400);
 	try {
-		return {
-			status: 200,
-			body: chatResponse(await executeProjectCommand(service, command)),
-		};
+		const content = await executeProjectCommand(service, command);
+		return await canonicalAdminResponse(content, request.model, modelReaderFactory);
 	} catch (error) {
 		if (error instanceof ProjectLinkError) return projectLinkErrorResult(error);
+		if (error instanceof ModelSelectionError) return modelSelectionErrorResult(error);
 		return infrastructureErrorResult(error, "project_command_failed");
 	}
 }
 
 export function isProjectAdminChatCompletionRequest(request: OpenAIChatCompletionRequest): boolean {
 	const command = latestUserText(request);
-	return request.model === GJC_OPENWEBUI_MODEL_ID && (command?.startsWith("/gjc project ") ?? false);
+	const model = classifyGjcModelId(request.model);
+	return (model.kind === "alias" || model.kind === "canonical") && (command?.startsWith("/gjc project ") ?? false);
 }
 
 function parseProjectLinkBody(body: unknown):
@@ -201,14 +209,34 @@ function latestUserText(request: OpenAIChatCompletionRequest): string | undefine
 	return undefined;
 }
 
-function chatResponse(content: string): OpenAIChatCompletionResponse {
+async function canonicalAdminResponse(
+	content: string,
+	requestedModelId: string,
+	modelReaderFactory?: ModelReaderFactory,
+): Promise<ProjectAdminRouteResult> {
+	if (modelReaderFactory === undefined) {
+		throw modelSelectionError(
+			classifyGjcModelId(requestedModelId).kind === "canonical"
+				? "model_selection_not_available"
+				: "model_selection_default_read_failed",
+		);
+	}
+	const model = formatCanonicalModelId(await createModelSelectionPolicy(modelReaderFactory).resolve(requestedModelId));
+	return { status: 200, body: chatResponse(content, model) };
+}
+
+function chatResponse(content: string, model: string): OpenAIChatCompletionResponse {
 	return {
 		id: `chatcmpl-${Date.now()}`,
 		object: "chat.completion",
 		created: Math.floor(Date.now() / 1000),
-		model: GJC_OPENWEBUI_MODEL_ID,
+		model,
 		choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
 	};
+}
+
+function modelSelectionErrorResult(error: ModelSelectionError): ProjectAdminRouteResult {
+	return { status: error.status, body: { error: { message: error.message, type: error.type, code: error.code } } };
 }
 
 function projectLinkErrorResult(error: ProjectLinkError): ProjectAdminRouteResult {
@@ -216,10 +244,10 @@ function projectLinkErrorResult(error: ProjectLinkError): ProjectAdminRouteResul
 }
 
 function infrastructureErrorResult(error: unknown, code: string): ProjectAdminRouteResult {
-	const message = error instanceof Error ? error.message : "Project link operation failed.";
+	void error;
 	return {
 		status: 503,
-		body: { error: { message, type: "server_error", code } },
+		body: { error: { message: "Project administration operation failed.", type: "server_error", code } },
 	};
 }
 

@@ -1,5 +1,4 @@
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { type AdapterConfig, buildStartupDiagnostics, loadAdapterConfig, type ResolvedAdapterConfig } from "./config";
 import { resolveGjcRuntimeLocations } from "./configure/runtime-locations";
 import { createResolvedGjcRpcTurnRunner, type GjcTurnRunner } from "./gjc/rpc-runner";
@@ -8,6 +7,7 @@ import type { AdapterHealthCheck } from "./health";
 import type { LiveGatewayEventSink, LiveGatewayMessageSink } from "./live/chat-completions";
 import type { LiveGatewayFileContextResolver } from "./live/file-contexts";
 import { createGjcRoutingLiveGatewayRunner } from "./live/gjc-routing-runner";
+import { createModelReaderFactory, type ModelReaderFactory, resolveGjcCliPath } from "./live/model-reader";
 import { buildOpenWebUIAuthStartupDiagnostic, type OpenWebUIOwnerContext } from "./openwebui/auth";
 import { OpenWebUIHttpClient, type OpenWebUIProjectionRepository } from "./openwebui/client";
 import { createOpenWebUIFileContextResolver } from "./openwebui/file-context-resolver";
@@ -17,8 +17,10 @@ import { auditProjectRegistrations, SqliteProjectRegistrationStore } from "./pro
 import { disambiguateRegisteredProjects, type RegisteredProject, registerProjectDirectory } from "./projects/registry";
 import { type AllowedRoot, resolveAllowedRoots } from "./security/paths";
 import { type AdapterServerHandle, type AdapterServerOptions, startAdapterServer } from "./server";
+import { FileBackedOutboxStore, type OutboxStore } from "./state/outbox";
 
 const SESSION_MAPPING_STORE_FILE = "openwebui-session-mappings.json";
+const PROJECTION_OUTBOX_STORE_FILE = "openwebui-projection-outbox.json";
 
 export interface BuildAdapterServerOptionsDependencies {
 	readonly turnRunner?: GjcTurnRunner;
@@ -27,6 +29,8 @@ export interface BuildAdapterServerOptionsDependencies {
 	readonly messageSink?: LiveGatewayMessageSink;
 	readonly projectionRepository?: OpenWebUIProjectionRepository;
 	readonly projectRegistrationStore?: SqliteProjectRegistrationStore;
+	readonly modelReaderFactory?: ModelReaderFactory;
+	readonly outbox?: OutboxStore;
 }
 
 interface BuildAdapterServerOptionsBehavior {
@@ -62,6 +66,11 @@ export async function buildResolvedAdapterServerOptions(
 	const projects = await loadConfiguredProjects(config, allowedRoots);
 	const owner = buildOwnerContext(config);
 	const mappings = dependencies.mappings ?? new FileBackedSessionMappingStore(buildSessionMappingStorePath(config));
+	const outbox = dependencies.outbox ?? new FileBackedOutboxStore(buildProjectionOutboxStorePath(config));
+	const cliPath = resolveGjcCliPath(config.gjcCommand);
+	const modelReaderFactory =
+		dependencies.modelReaderFactory ??
+		createModelReaderFactory({ cliPath, runtimeLocations: config.runtimeLocations });
 	const openWebUIClient = buildOpenWebUIClient(config);
 	const projectionRepository = dependencies.projectionRepository ?? openWebUIClient;
 	const projectLinkService = new ProjectLinkService({
@@ -77,7 +86,7 @@ export async function buildResolvedAdapterServerOptions(
 	const turnRunner =
 		dependencies.turnRunner ??
 		createResolvedGjcRpcTurnRunner({
-			cliPath: resolveGjcCliPath(config.gjcCommand),
+			cliPath,
 			turnTimeoutMs: config.turnTimeoutMs,
 			runtimeLocations: config.runtimeLocations,
 		});
@@ -105,7 +114,15 @@ export async function buildResolvedAdapterServerOptions(
 			projectLinkService,
 			...(projectionRepository === undefined ? {} : { projectContextRepository: projectionRepository }),
 			owner,
-			runner: createGjcRoutingLiveGatewayRunner({ turnRunner, mappings, ownerUserId: owner.ownerUserId }),
+			runner: createGjcRoutingLiveGatewayRunner({
+				turnRunner,
+				mappings,
+				ownerUserId: owner.ownerUserId,
+				modelReaderFactory,
+				outbox,
+			}),
+			modelReaderFactory,
+			neutralWorkspace: config.runtimeLocations.readerWorkspace,
 			requireAdapterApiToken: true,
 			...(config.adapterApiToken === undefined ? {} : { adapterApiToken: config.adapterApiToken }),
 			...(eventSink === undefined ? {} : { eventSink }),
@@ -197,6 +214,10 @@ function buildProjectRegistrationStorePath(config: AdapterConfig): string {
 	return path.join(config.statePath, "adapter-state.sqlite");
 }
 
+function buildProjectionOutboxStorePath(config: AdapterConfig): string {
+	return path.join(config.statePath, PROJECTION_OUTBOX_STORE_FILE);
+}
+
 function buildOpenWebUIClient(config: AdapterConfig): OpenWebUIHttpClient | undefined {
 	if (config.openWebUIApiToken === undefined) return undefined;
 	return new OpenWebUIHttpClient({ baseUrl: config.openWebUIBaseUrl, apiToken: config.openWebUIApiToken });
@@ -232,13 +253,6 @@ function buildOpenWebUIFileContextResolver(
 ): LiveGatewayFileContextResolver | undefined {
 	if (client === undefined) return undefined;
 	return createOpenWebUIFileContextResolver(client);
-}
-
-function resolveGjcCliPath(gjcCommand: string): string {
-	if (gjcCommand === "gjc") {
-		return fileURLToPath(import.meta.resolve("@gajae-code/coding-agent/cli"));
-	}
-	return gjcCommand;
 }
 
 function buildOwnerContext(config: AdapterConfig): OpenWebUIOwnerContext {

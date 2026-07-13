@@ -12,6 +12,7 @@ import type {
 import { SessionMappingStore } from "../src/gjc/session-router";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
 import type { RegisteredProject } from "../src/projects/registry";
+import { staticModelReaderFactory } from "./model-selection-fixtures";
 
 class FakeGjcTurnRunner implements GjcTurnRunner {
 	events: GjcTurnResult["events"] = [{ type: "assistant", text: "assistant from gjc" }];
@@ -35,6 +36,7 @@ class FakeGjcTurnRunner implements GjcTurnRunner {
 			activeLeaf: "leaf-1",
 			rawFrameCursor: 7,
 			eventCursor: 3,
+			...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
 		};
 	}
 
@@ -46,6 +48,7 @@ class FakeGjcTurnRunner implements GjcTurnRunner {
 			activeLeaf: "leaf-2",
 			rawFrameCursor: input.rawFrameCursor + 5,
 			eventCursor: input.eventCursor + 2,
+			...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
 		};
 	}
 
@@ -64,7 +67,11 @@ describe("createGjcRoutingLiveGatewayRunner event projection", () => {
 			{ type: "agent_end", id: "agent-1", text: "Subagent done" },
 			{ type: "assistant", text: "done" },
 		];
-		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings: new SessionMappingStore() });
+		const runner = createGjcRoutingLiveGatewayRunner({
+			turnRunner,
+			mappings: new SessionMappingStore(),
+			modelReaderFactory: staticModelReaderFactory(),
+		});
 
 		const result = await runner.run({
 			project,
@@ -74,6 +81,7 @@ describe("createGjcRoutingLiveGatewayRunner event projection", () => {
 			userMessageId: "user-1",
 			userMessageParentId: null,
 			continued: false,
+			requestedModelId: "gjc",
 		});
 
 		expect(result).toMatchObject({
@@ -87,6 +95,7 @@ describe("createGjcRoutingLiveGatewayRunner event projection", () => {
 						gjc_adapter: {
 							frameKind: "subagent_progress",
 							phase: "progress",
+							model: "gjc/anthropic/claude-sonnet-4:low",
 							metadata: { eventType: "agent_start", id: "agent-1" },
 						},
 					},
@@ -115,7 +124,11 @@ describe("createGjcRoutingLiveGatewayRunner event projection", () => {
 			{ type: "message_start", id: "message-1", text: "SECRET_PROMPT_TEXT_SHOULD_NOT_BE_STORED" },
 			{ type: "assistant", text: "done" },
 		];
-		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings: new SessionMappingStore() });
+		const runner = createGjcRoutingLiveGatewayRunner({
+			turnRunner,
+			mappings: new SessionMappingStore(),
+			modelReaderFactory: staticModelReaderFactory(),
+		});
 
 		const result = await runner.run({
 			project,
@@ -125,6 +138,7 @@ describe("createGjcRoutingLiveGatewayRunner event projection", () => {
 			userMessageId: "user-1",
 			userMessageParentId: null,
 			continued: false,
+			requestedModelId: "gjc",
 		});
 
 		expect(JSON.stringify(result.events)).not.toContain("SECRET_PROMPT_TEXT_SHOULD_NOT_BE_STORED");
@@ -164,7 +178,11 @@ describe("createGjcRoutingLiveGatewayRunner event projection", () => {
 				},
 			},
 		];
-		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings: new SessionMappingStore() });
+		const runner = createGjcRoutingLiveGatewayRunner({
+			turnRunner,
+			mappings: new SessionMappingStore(),
+			modelReaderFactory: staticModelReaderFactory(),
+		});
 
 		const result = await runner.run({
 			project,
@@ -174,6 +192,7 @@ describe("createGjcRoutingLiveGatewayRunner event projection", () => {
 			userMessageId: "user-1",
 			userMessageParentId: null,
 			continued: false,
+			requestedModelId: "gjc",
 		});
 
 		expect(result.events).toEqual([

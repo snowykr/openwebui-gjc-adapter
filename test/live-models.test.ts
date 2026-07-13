@@ -11,6 +11,14 @@ function exportedFunction(name: string): (...args: readonly unknown[]) => unknow
 }
 
 describe("canonical GJC model codec", () => {
+	test("classifies alias canonical malformed and foreign ids", () => {
+		const classify = exportedFunction("classifyGjcModelId");
+		expect(classify("gjc")).toEqual({ kind: "alias" });
+		expect(classify("gjc/openai/gpt-5:off")).toMatchObject({ kind: "canonical" });
+		expect(classify("gjc/noncanonical")).toEqual({ kind: "malformed" });
+		expect(classify("openai/gpt-5")).toEqual({ kind: "foreign" });
+	});
+
 	test("round-trips strict RFC3986 bytes when provider and model contain delimiters", () => {
 		// Given
 		const format = exportedFunction("formatCanonicalModelId");
@@ -52,6 +60,12 @@ describe("canonical GJC model codec", () => {
 });
 
 describe("atomic GJC catalog decoder", () => {
+	test("strict decoding distinguishes a valid empty catalog from malformed descriptors", () => {
+		const decode = exportedFunction("decodeStrictModelCatalog");
+		expect(decode([])).toEqual([]);
+		expect(decode([{ provider: "broken" }])).toBeNull();
+	});
+
 	test("emits off for a non-reasoning descriptor and concrete levels for a complete reasoning descriptor", () => {
 		// Given
 		const decode = exportedFunction("decodeModelCatalog");

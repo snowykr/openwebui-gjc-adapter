@@ -33,9 +33,37 @@ export async function waitForStartedServer(proc: Bun.Subprocess, url: string): P
 	return await Promise.race([response, exited]);
 }
 
+export const SERVER_START_DEADLINE_MS = 5_000;
+
+export interface FailedStartCleanupReceipt {
+	readonly deadlineMs: number;
+	readonly pid: number;
+	readonly port: number;
+	readonly processExited: boolean;
+	readonly root: string;
+}
+
+export interface RealSelectionStartOptions {
+	readonly failStartup?: boolean;
+	readonly invalidRunnerModel?: string;
+	readonly onFailedCleanup?: (receipt: FailedStartCleanupReceipt) => void;
+}
+
 export async function stopProcess(proc: Bun.Subprocess): Promise<void> {
 	proc.kill();
-	await proc.exited;
+	let timeout: ReturnType<typeof setTimeout> | undefined;
+	try {
+		await Promise.race([
+			proc.exited,
+			new Promise<void>(resolve => {
+				timeout = setTimeout(resolve, 500);
+			}),
+		]);
+		if (proc.exitCode === null) proc.kill("SIGKILL");
+		await proc.exited;
+	} finally {
+		if (timeout !== undefined) clearTimeout(timeout);
+	}
 }
 
 export class FakeGjcTurnRunner implements GjcTurnRunner {
@@ -56,6 +84,7 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 			activeLeaf: "leaf-1",
 			rawFrameCursor: 1,
 			eventCursor: 1,
+			...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
 		};
 	}
 
@@ -67,6 +96,7 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 			activeLeaf: input.activeLeaf,
 			rawFrameCursor: input.rawFrameCursor + 1,
 			eventCursor: input.eventCursor + 1,
+			...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
 		};
 	}
 
@@ -106,7 +136,7 @@ export function chatRequest(
 async function waitForHttpResponse(url: string): Promise<Response> {
 	const startedAt = Date.now();
 	let lastError: Error | null = null;
-	while (Date.now() - startedAt < 5_000) {
+	while (Date.now() - startedAt < SERVER_START_DEADLINE_MS) {
 		try {
 			return await fetch(url);
 		} catch (error) {

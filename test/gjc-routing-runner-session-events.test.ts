@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { SessionMappingStore } from "../src/gjc/session-router";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
 import { FakeGjcTurnRunner, project } from "./gjc-routing-runner-fixtures";
+import { staticModelReaderFactory } from "./model-selection-fixtures";
 
 describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 	test("projects full GJC session events into bounded OpenWebUI status families", async () => {
@@ -33,7 +34,11 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 			{ type: "auto_retry_end", payload: { success: false, attempt: 2, finalError: "failed [redacted]" } },
 			{ type: "assistant", text: "done" },
 		];
-		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings: new SessionMappingStore() });
+		const runner = createGjcRoutingLiveGatewayRunner({
+			turnRunner,
+			mappings: new SessionMappingStore(),
+			modelReaderFactory: staticModelReaderFactory(),
+		});
 
 		const result = await runner.run({
 			project,
@@ -43,6 +48,7 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 			userMessageId: "user-1",
 			userMessageParentId: null,
 			continued: false,
+			requestedModelId: "gjc",
 		});
 
 		expect(result.events).toEqual([

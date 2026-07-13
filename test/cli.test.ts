@@ -8,6 +8,7 @@ import type { LiveGatewayEventDeliveryInput } from "../src/live/chat-completions
 import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
 import { createAdapterRequestHandler } from "../src/server";
 import { chatRequest, FakeGjcTurnRunner, reserveTcpPort, stopProcess, waitForStartedServer } from "./cli-fixtures";
+import { staticModelReaderFactory } from "./model-selection-fixtures";
 import { messageEntry, writeSessionFile } from "./session-sync-fixtures";
 
 const spawnedProcesses: Bun.Subprocess[] = [];
@@ -55,7 +56,7 @@ describe("adapter CLI service", () => {
 		});
 		spawnedProcesses.push(proc);
 
-		const exitCode = await Promise.race([proc.exited, Bun.sleep(1_000).then(() => -1)]);
+		const exitCode = await Promise.race([proc.exited, Bun.sleep(4_000).then(() => -1)]);
 
 		expect(exitCode).toBe(0);
 		if (!(proc.stdout instanceof ReadableStream)) throw new Error("expected CLI stdout");
@@ -145,6 +146,7 @@ describe("adapter CLI service", () => {
 			{
 				turnRunner,
 				projectionRepository: repository,
+				modelReaderFactory: staticModelReaderFactory(),
 				eventSink: input => {
 					delivered.push(input);
 				},

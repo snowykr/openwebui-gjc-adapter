@@ -40,6 +40,7 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 			activeLeaf: "leaf-1",
 			rawFrameCursor: 7,
 			eventCursor: 3,
+			...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
 		};
 	}
 
@@ -52,6 +53,7 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 			activeLeaf: "leaf-2",
 			rawFrameCursor: input.rawFrameCursor + 5,
 			eventCursor: input.eventCursor + 2,
+			...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
 		};
 	}
 

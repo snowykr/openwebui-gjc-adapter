@@ -6,7 +6,11 @@ import { createAdapterRequestHandler } from "../src/server";
 describe("createAdapterRequestHandler streaming", () => {
 	test("returns event-stream chat completions for streaming requests", async () => {
 		const handler = createAdapterRequestHandler({
-			routes: { projects: [project], owner, runner: { run: () => ({ chunks: ["a", "b"] }) } },
+			routes: {
+				projects: [project],
+				owner,
+				runner: { run: () => ({ chunks: ["a", "b"], model: "gjc/anthropic/claude-sonnet-4:low" }) },
+			},
 		});
 
 		const response = await handler(

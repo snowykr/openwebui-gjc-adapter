@@ -2,6 +2,11 @@ import { GJC_THINKING_LEVELS, type GjcThinkingLevel, type NormalizedModelSelecti
 import type { OpenAIModelEntry, OpenAIModelListResponse } from "./openai-types";
 
 export type LiveGatewayModelEntry = OpenAIModelEntry;
+export type GjcModelIdClassification =
+	| { readonly kind: "alias" }
+	| { readonly kind: "canonical"; readonly selection: NormalizedModelSelection }
+	| { readonly kind: "malformed" }
+	| { readonly kind: "foreign" };
 
 const THINKING_MODES = ["effort", "budget", "google-level", "anthropic-adaptive", "anthropic-budget-effort"] as const;
 const RFC3986_EXTRA = /[!'()*]/g;
@@ -63,49 +68,66 @@ export function parseCanonicalModelId(value: unknown): NormalizedModelSelection 
 	return { provider, modelId, thinkingLevel };
 }
 
+export function classifyGjcModelId(value: string): GjcModelIdClassification {
+	if (value === "gjc") return { kind: "alias" };
+	const selection = parseCanonicalModelId(value);
+	if (selection !== null) return { kind: "canonical", selection };
+	return value.startsWith("gjc") ? { kind: "malformed" } : { kind: "foreign" };
+}
+
 export function decodeModelCatalog(input: unknown): readonly NormalizedModelSelection[] {
-	if (!Array.isArray(input)) return [];
-	const selections = input.flatMap(decodeDescriptor);
+	return decodeStrictModelCatalog(input) ?? [];
+}
+
+export function decodeStrictModelCatalog(input: unknown): readonly NormalizedModelSelection[] | null {
+	if (!Array.isArray(input)) return null;
+	const selections: NormalizedModelSelection[] = [];
+	for (const descriptor of input) {
+		const decoded = decodeDescriptor(descriptor);
+		if (decoded === null) return null;
+		selections.push(...decoded);
+	}
 	const unique = new Map<string, NormalizedModelSelection>();
 	for (const selection of selections) unique.set(formatCanonicalModelId(selection), selection);
 	return [...unique.values()].sort(compareSelections);
 }
 
-function decodeDescriptor(input: unknown): readonly NormalizedModelSelection[] {
-	if (!isRecord(input)) return [];
+function decodeDescriptor(input: unknown): readonly NormalizedModelSelection[] | null {
+	if (!isRecord(input)) return null;
 	const provider = Reflect.get(input, "provider");
 	const modelId = Reflect.get(input, "id");
 	const reasoning = Reflect.get(input, "reasoning");
-	if (typeof provider !== "string" || typeof modelId !== "string" || typeof reasoning !== "boolean") return [];
-	if (!isSafeComponent(provider) || !isSafeComponent(modelId)) return [];
+	if (typeof provider !== "string" || typeof modelId !== "string" || typeof reasoning !== "boolean") return null;
+	if (!isSafeComponent(provider) || !isSafeComponent(modelId)) return null;
 	const hasThinking = Reflect.has(input, "thinking") && Reflect.get(input, "thinking") !== undefined;
-	if (!reasoning) return hasThinking ? [] : [{ provider, modelId, thinkingLevel: "off" }];
+	if (!reasoning) return hasThinking ? null : [{ provider, modelId, thinkingLevel: "off" }];
 	const thinking = Reflect.get(input, "thinking");
-	if (!isRecord(thinking)) return [];
+	if (!isRecord(thinking)) return null;
 	const levels = decodeThinkingDescriptor(thinking);
+	if (levels === null) return null;
 	return levels.map(thinkingLevel => ({ provider, modelId, thinkingLevel }));
 }
 
-function decodeThinkingDescriptor(input: Readonly<Record<PropertyKey, unknown>>): readonly GjcThinkingLevel[] {
+function decodeThinkingDescriptor(input: Readonly<Record<PropertyKey, unknown>>): readonly GjcThinkingLevel[] | null {
 	const minLevel = Reflect.get(input, "minLevel");
 	const maxLevel = Reflect.get(input, "maxLevel");
 	const mode = Reflect.get(input, "mode");
-	if (!isReasoningLevel(minLevel) || !isReasoningLevel(maxLevel) || !isThinkingMode(mode)) return [];
+	if (!isReasoningLevel(minLevel) || !isReasoningLevel(maxLevel) || !isThinkingMode(mode)) return null;
 	const minRank = GJC_THINKING_LEVELS.indexOf(minLevel);
 	const maxRank = GJC_THINKING_LEVELS.indexOf(maxLevel);
-	if (minRank > maxRank) return [];
+	if (minRank > maxRank) return null;
 	const explicit = Reflect.get(input, "levels");
 	let levels: readonly GjcThinkingLevel[];
 	if (explicit === undefined) {
 		levels = GJC_THINKING_LEVELS.slice(minRank, maxRank + 1);
 	} else {
-		if (!Array.isArray(explicit) || explicit.length === 0 || !explicit.every(isReasoningLevel)) return [];
-		if (new Set(explicit).size !== explicit.length) return [];
+		if (!Array.isArray(explicit) || explicit.length === 0 || !explicit.every(isReasoningLevel)) return null;
+		if (new Set(explicit).size !== explicit.length) return null;
 		levels = [...explicit].sort((left, right) => thinkingRank(left) - thinkingRank(right));
-		if (levels.some(level => thinkingRank(level) < minRank || thinkingRank(level) > maxRank)) return [];
+		if (levels.some(level => thinkingRank(level) < minRank || thinkingRank(level) > maxRank)) return null;
 	}
 	const defaultLevel = Reflect.get(input, "defaultLevel");
-	if (defaultLevel !== undefined && (!isReasoningLevel(defaultLevel) || !levels.includes(defaultLevel))) return [];
+	if (defaultLevel !== undefined && (!isReasoningLevel(defaultLevel) || !levels.includes(defaultLevel))) return null;
 	return levels;
 }
 

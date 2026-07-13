@@ -3,6 +3,7 @@ import type { LiveGatewayRunner } from "../src/live/chat-completions";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import type { RegisteredProject } from "../src/projects/registry";
 import { createAdapterRequestHandler } from "../src/server";
+import { CANONICAL_MODEL_IDS, staticModelReaderFactory } from "./model-selection-fixtures";
 
 describe("createAdapterRequestHandler", () => {
 	test("returns health status", async () => {
@@ -25,7 +26,7 @@ describe("createAdapterRequestHandler", () => {
 
 	test("returns model list from optional route dependencies", async () => {
 		const handler = createAdapterRequestHandler({
-			routes: { projects: [project], owner, runner: fixedRunner("unused") },
+			routes: { projects: [project], owner, runner: fixedRunner("unused"), modelReaderFactory },
 		});
 
 		const response = await handler(new Request("http://adapter.test/v1/models"));
@@ -33,7 +34,7 @@ describe("createAdapterRequestHandler", () => {
 		expect(response.status).toBe(200);
 		expect(await response.json()).toEqual({
 			object: "list",
-			data: [{ id: "gjc", object: "model", created: 1783468800, owned_by: "gjc" }],
+			data: CANONICAL_MODEL_IDS.map(id => ({ id, object: "model", created: 1783468800, owned_by: "gjc" })),
 		});
 	});
 
@@ -43,6 +44,7 @@ describe("createAdapterRequestHandler", () => {
 				projects: [project],
 				owner,
 				runner: fixedRunner("unused"),
+				modelReaderFactory,
 				adapterApiToken: "adapter-token",
 				requireAdapterApiToken: true,
 			},
@@ -60,7 +62,13 @@ describe("createAdapterRequestHandler", () => {
 
 	test("fails closed when CLI service requires but lacks an adapter API token", async () => {
 		const handler = createAdapterRequestHandler({
-			routes: { projects: [project], owner, runner: fixedRunner("unused"), requireAdapterApiToken: true },
+			routes: {
+				projects: [project],
+				owner,
+				runner: fixedRunner("unused"),
+				modelReaderFactory,
+				requireAdapterApiToken: true,
+			},
 		});
 
 		const response = await handler(new Request("http://adapter.test/v1/models"));
@@ -70,7 +78,7 @@ describe("createAdapterRequestHandler", () => {
 	});
 	test("protects runtime readiness separately from the provider bearer token", async () => {
 		const handler = createAdapterRequestHandler({
-			routes: { projects: [project], owner, runner: fixedRunner("unused") },
+			routes: { projects: [project], owner, runner: fixedRunner("unused"), modelReaderFactory },
 			runtime: {
 				adapterToken: "provider-token",
 				readinessToken: "readiness-token",
@@ -98,7 +106,7 @@ describe("createAdapterRequestHandler", () => {
 
 	test("routes chat completions to optional route dependencies", async () => {
 		const handler = createAdapterRequestHandler({
-			routes: { projects: [project], owner, runner: fixedRunner("handled") },
+			routes: { projects: [project], owner, runner: fixedRunner("handled"), modelReaderFactory },
 		});
 
 		const response = await handler(
@@ -125,7 +133,12 @@ describe("createAdapterRequestHandler", () => {
 	});
 	test("keeps malformed JSON errors and streaming responses on the current chat route", async () => {
 		const handler = createAdapterRequestHandler({
-			routes: { projects: [project], owner, runner: { run: () => ({ chunks: ["a", "b"] }) } },
+			routes: {
+				projects: [project],
+				owner,
+				runner: { run: () => ({ chunks: ["a", "b"], model: CANONICAL_MODEL_IDS[0] }) },
+				modelReaderFactory,
+			},
 		});
 		const malformed = await handler(
 			new Request("http://adapter.test/v1/chat/completions", {
@@ -167,5 +180,7 @@ const project: RegisteredProject = {
 const owner: OpenWebUIOwnerContext = { ownerUserId: "owner-1", singleOwnerLocalMode: false };
 
 function fixedRunner(content: string): LiveGatewayRunner {
-	return { run: () => ({ content }) };
+	return { run: () => ({ content, model: CANONICAL_MODEL_IDS[0] }) };
 }
+
+const modelReaderFactory = staticModelReaderFactory();

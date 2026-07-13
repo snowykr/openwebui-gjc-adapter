@@ -192,11 +192,14 @@ describe("createGjcRoutingLiveGatewayRunner", () => {
 		const runner = createGjcRoutingLiveGatewayRunner({
 			turnRunner,
 			mappings,
-			requestedModelId: () => "gjc",
+			requestedModelId: () => "foreign-callback-must-not-win",
 			createNeutralModelReader: () => neutralReader(transcript),
 		});
 
-		const result = await runner.run(turn(continued ? "chat-1" : "chat-neutral", "user-2", continued));
+		const result = await runner.run({
+			...turn(continued ? "chat-1" : "chat-neutral", "user-2", continued),
+			requestedModelId: "gjc",
+		});
 		const selectedInput = continued ? turnRunner.continues[0] : turnRunner.starts[0];
 		expect(transcript).toEqual(["catalog", "state", "stop"]);
 		expect(selectedInput?.modelSelection).toEqual(lowSelection);

@@ -48,7 +48,7 @@ describe("live direct OpenWebUI attachments", () => {
 			runner: {
 				run(input) {
 					inputs.push(input);
-					return { content: "done" };
+					return { content: "done", model: "gjc/anthropic/claude-sonnet-4:low" };
 				},
 			},
 			fileContextResolver(input) {
@@ -82,7 +82,7 @@ describe("live direct OpenWebUI attachments", () => {
 			runner: {
 				run(input) {
 					inputs.push(input);
-					return { content: "done" };
+					return { content: "done", model: "gjc/anthropic/claude-sonnet-4:low" };
 				},
 			},
 			fileContextResolver(input) {
@@ -136,7 +136,7 @@ describe("live direct OpenWebUI attachments", () => {
 			runner: {
 				run(input) {
 					inputs.push(input);
-					return { content: "done" };
+					return { content: "done", model: "gjc/anthropic/claude-sonnet-4:low" };
 				},
 			},
 			fileContextResolver(input) {

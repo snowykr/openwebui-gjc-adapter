@@ -1,7 +1,9 @@
 import type { NormalizedModelSelection } from "../contracts";
 import type { GjcTurnRunner } from "../gjc/rpc-runner";
+import { GjcRpcRunnerError } from "../gjc/rpc-runner";
 import {
 	normalizeModelSelection,
+	type RouteGjcTurnResult,
 	routeGjcTurn,
 	type SessionMapping,
 	type SessionMappingStore,
@@ -9,8 +11,10 @@ import {
 import { projectPendingWorkflowGateMessage } from "../projection/workflow-gates";
 import type { OutboxStore } from "../state/outbox";
 import type { LiveGatewayRunner, LiveGatewayRunnerInput, LiveGatewayRunnerResult } from "./chat-completions";
-import { WorkflowGateReplyError } from "./chat-completions";
-import { decodeModelCatalog, formatCanonicalModelId, parseCanonicalModelId } from "./models";
+import type { ModelReader, ModelReaderFactory } from "./model-reader";
+import { modelSelectionError } from "./model-selection-errors";
+import { createModelSelectionPolicy } from "./model-selection-policy";
+import { formatCanonicalModelId, parseCanonicalModelId } from "./models";
 import {
 	buildEventPayloadHash,
 	buildSessionMappingPayloadHash,
@@ -28,13 +32,11 @@ export interface CreateGjcRoutingLiveGatewayRunnerInput {
 	readonly createNeutralModelReader?: (
 		turn: LiveGatewayRunnerInput,
 	) => NeutralModelReader | Promise<NeutralModelReader>;
+	readonly modelReaderFactory?: ModelReaderFactory;
 }
 
-export interface NeutralModelReader {
-	getAvailableModels(): Promise<readonly unknown[]>;
-	getState(): Promise<unknown>;
-	stop(): void;
-}
+export type NeutralModelReader = ModelReader;
+export type { ModelReader, ModelReaderFactory } from "./model-reader";
 
 export type GjcRoutingLiveGatewayRunnerResult = LiveGatewayRunnerResult & { readonly model?: string };
 
@@ -47,7 +49,7 @@ export function createGjcRoutingLiveGatewayRunner(
 ): GjcRoutingLiveGatewayRunner {
 	return {
 		async run(turn: LiveGatewayRunnerInput): Promise<GjcRoutingLiveGatewayRunnerResult> {
-			const requestedModelId = input.requestedModelId?.(turn);
+			const requestedModelId = turn.requestedModelId ?? input.requestedModelId?.(turn);
 			const existing = input.mappings.get(turn.chatId);
 			if (
 				requestedModelId !== undefined &&
@@ -55,7 +57,7 @@ export function createGjcRoutingLiveGatewayRunner(
 				existing.operationId === turn.userMessageId
 			) {
 				const selection = assertBoundRequest(existing, requestedModelId, "duplicate");
-				const events = projectTurnEvents(existing.events ?? []);
+				const events = projectTurnEvents(existing.events ?? [], formatCanonicalModelId(selection));
 				const result =
 					events.length === 0
 						? { content: existing.assistantText ?? "" }
@@ -77,16 +79,24 @@ export function createGjcRoutingLiveGatewayRunner(
 			const modelSelection =
 				requestedModelId === undefined ? undefined : await resolveNormalSelection(input, turn, requestedModelId);
 
-			const result = await routeGjcTurn({
-				project: turn.project,
-				chatId: turn.chatId,
-				userMessageId: turn.userMessageId,
-				parentId: turn.userMessageParentId ?? undefined,
-				text: turn.prompt,
-				runner: input.turnRunner,
-				mappings: input.mappings,
-				...(modelSelection === undefined ? {} : { modelSelection }),
-			});
+			let result: RouteGjcTurnResult;
+			try {
+				result = await routeGjcTurn({
+					project: turn.project,
+					chatId: turn.chatId,
+					userMessageId: turn.userMessageId,
+					parentId: turn.userMessageParentId ?? undefined,
+					text: turn.prompt,
+					runner: input.turnRunner,
+					mappings: input.mappings,
+					...(modelSelection === undefined ? {} : { modelSelection }),
+				});
+			} catch (error) {
+				if (error instanceof GjcRpcRunnerError && error.command === "set_default_model_selection") {
+					throw modelSelectionError("model_selection_apply_failed");
+				}
+				throw error;
+			}
 
 			input.outbox?.enqueue({
 				operationId: result.mapping.operationId,
@@ -97,7 +107,11 @@ export function createGjcRoutingLiveGatewayRunner(
 				payloadHash: buildSessionMappingPayloadHash(result.mapping),
 			});
 
-			const projectedEvents = projectTurnEvents(result.events);
+			const canonicalModel =
+				result.mapping.modelSelection === undefined
+					? undefined
+					: formatCanonicalModelId(result.mapping.modelSelection);
+			const projectedEvents = projectTurnEvents(result.events, canonicalModel);
 			if (projectedEvents.length > 0) {
 				input.outbox?.enqueue({
 					operationId: `${result.mapping.operationId}:events`,
@@ -151,32 +165,17 @@ function assertBoundRequest(
 ): NormalizedModelSelection {
 	const selection = normalizeModelSelection(mapping.modelSelection);
 	if (selection === undefined) {
-		throw selectionError(
+		throw modelSelectionError(
 			branch === "duplicate" ? "model_selection_idempotency_conflict" : "model_selection_gate_binding_missing",
 		);
 	}
 	const requested = requestedModelId === "gjc" ? selection : parseCanonicalModelId(requestedModelId);
 	if (requested === null || !sameSelection(selection, requested)) {
-		throw selectionError(
+		throw modelSelectionError(
 			branch === "duplicate" ? "model_selection_idempotency_conflict" : "model_selection_gate_mismatch",
 		);
 	}
 	return selection;
-}
-
-function selectionError(
-	code:
-		| "model_selection_idempotency_conflict"
-		| "model_selection_gate_binding_missing"
-		| "model_selection_gate_mismatch",
-): WorkflowGateReplyError {
-	const message = {
-		model_selection_idempotency_conflict: "The prior GJC model selection cannot be replayed.",
-		model_selection_gate_binding_missing: "The pending workflow gate has no valid GJC model selection binding.",
-		model_selection_gate_mismatch:
-			"The pending workflow gate must be answered with its original GJC model selection.",
-	}[code];
-	return new WorkflowGateReplyError(message, code, []);
 }
 
 async function resolveNormalSelection(
@@ -184,34 +183,15 @@ async function resolveNormalSelection(
 	turn: LiveGatewayRunnerInput,
 	requestedModelId: string,
 ): Promise<NormalizedModelSelection> {
-	const createReader = input.createNeutralModelReader;
+	const createReader =
+		input.modelReaderFactory ??
+		(input.createNeutralModelReader === undefined ? undefined : () => input.createNeutralModelReader?.(turn));
 	if (createReader === undefined) throw new TypeError("GJC model selection reader is unavailable");
-	const reader = await createReader(turn);
-	try {
-		const catalog = decodeModelCatalog(await reader.getAvailableModels());
-		const requested =
-			requestedModelId === "gjc"
-				? selectionFromState(await reader.getState())
-				: parseCanonicalModelId(requestedModelId);
-		if (requested === null || !catalog.some(selection => sameSelection(selection, requested))) {
-			throw new TypeError("GJC model selection is unavailable");
-		}
-		return requested;
-	} finally {
-		reader.stop();
-	}
-}
-
-function selectionFromState(state: unknown): NormalizedModelSelection | null {
-	if (typeof state !== "object" || state === null) return null;
-	const model = Reflect.get(state, "model");
-	if (typeof model !== "object" || model === null) return null;
-	const selection = {
-		provider: Reflect.get(model, "provider"),
-		modelId: Reflect.get(model, "id"),
-		thinkingLevel: Reflect.get(state, "thinkingLevel"),
-	};
-	return normalizeModelSelection(selection) ?? null;
+	return createModelSelectionPolicy(async () => {
+		const reader = await createReader();
+		if (reader === undefined) throw new TypeError("GJC model selection reader is unavailable");
+		return reader;
+	}).resolve(requestedModelId);
 }
 
 function sameSelection(left: NormalizedModelSelection, right: NormalizedModelSelection): boolean {

@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { buildAdapterServerOptionsFromEnv } from "../src/cli";
 import { createAdapterRequestHandler } from "../src/server";
 import { chatRequest, FakeGjcTurnRunner, reserveTcpPort, stopProcess, waitForStartedServer } from "./cli-fixtures";
+import { CANONICAL_MODEL_IDS } from "./model-selection-fixtures";
 
 const spawnedProcesses: Bun.Subprocess[] = [];
 
@@ -43,6 +44,8 @@ describe("adapter CLI auth and start", () => {
 		const projectDirectory = path.join(workspace, "Demo Project");
 		await fs.mkdir(projectDirectory);
 		const port = await reserveTcpPort();
+		const fixturePath = path.join(process.cwd(), "test/fixtures/gjc-rpc-selection-scenario.ts");
+		await fs.chmod(fixturePath, 0o755);
 		const proc = Bun.spawn(["bun", "run", "start"], {
 			cwd: process.cwd(),
 			env: {
@@ -54,6 +57,7 @@ describe("adapter CLI auth and start", () => {
 				GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS: workspace,
 				GJC_OPENWEBUI_STATE_PATH: path.join(workspace, "adapter-state"),
 				GJC_OPENWEBUI_PROJECTS: `${projectDirectory}|Demo Project`,
+				GJC_OPENWEBUI_GJC_COMMAND: fixturePath,
 			},
 			stdout: "pipe",
 			stderr: "pipe",
@@ -67,6 +71,6 @@ describe("adapter CLI auth and start", () => {
 		expect(modelsResponse.status).toBe(200);
 		const body = (await modelsResponse.json()) as { object: string; data: { id: string }[] };
 		expect(body.object).toBe("list");
-		expect(body.data.map(model => model.id)).toEqual([]);
+		expect(body.data.map(model => model.id)).toEqual([...CANONICAL_MODEL_IDS]);
 	});
 });

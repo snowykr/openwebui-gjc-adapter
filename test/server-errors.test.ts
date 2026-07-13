@@ -3,8 +3,71 @@ import type { LiveGatewayRunner } from "../src/live/chat-completions";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import type { RegisteredProject } from "../src/projects/registry";
 import { createAdapterRequestHandler } from "../src/server";
+import { staticModelReaderFactory } from "./model-selection-fixtures";
 
 describe("createAdapterRequestHandler chat completion errors", () => {
+	test("maps model catalog lifecycle failures while preserving valid empty catalogs", async () => {
+		const unavailable = createAdapterRequestHandler({
+			routes: {
+				projects: [project],
+				owner,
+				runner: fixedRunner("unused"),
+				modelReaderFactory: async () => {
+					throw new Error("private upstream path");
+				},
+			},
+		});
+		const failed = await unavailable(new Request("http://adapter.test/v1/models"));
+		expect(failed.status).toBe(503);
+		expect(await failed.json()).toEqual({
+			error: {
+				message: "The current GJC model catalog could not be resolved.",
+				type: "server_error",
+				code: "model_catalog_unavailable",
+			},
+		});
+
+		const empty = createAdapterRequestHandler({
+			routes: {
+				projects: [project],
+				owner,
+				runner: fixedRunner("unused"),
+				modelReaderFactory: async () => ({
+					async getAvailableModels() {
+						return [];
+					},
+					async getState() {
+						return {};
+					},
+					stop() {},
+				}),
+			},
+		});
+		const succeeded = await empty(new Request("http://adapter.test/v1/models"));
+		expect(succeeded.status).toBe(200);
+		expect(await succeeded.json()).toEqual({ object: "list", data: [] });
+	});
+
+	test("rejects provider authentication before model reader access", async () => {
+		let readerCalls = 0;
+		const handler = createAdapterRequestHandler({
+			routes: {
+				projects: [project],
+				owner,
+				runner: fixedRunner("unused"),
+				adapterApiToken: "adapter-token",
+				requireAdapterApiToken: true,
+				modelReaderFactory: async () => {
+					readerCalls += 1;
+					throw new Error("must not be reached");
+				},
+			},
+		});
+
+		const response = await handler(new Request("http://adapter.test/v1/models"));
+		expect([response.status, readerCalls]).toEqual([401, 0]);
+	});
+
 	test("returns OpenAI-style JSON error for malformed chat completion bodies", async () => {
 		const handler = createAdapterRequestHandler({
 			routes: { projects: [project], owner, runner: fixedRunner("unused") },
@@ -75,7 +138,7 @@ describe("createAdapterRequestHandler chat completion errors", () => {
 		expect(response.headers.get("content-type")).toStartWith("application/json");
 		expect(await response.json()).toEqual({
 			error: {
-				message: "GJC RPC start failed: configured CLI is unavailable",
+				message: "GJC live runner failed.",
 				type: "server_error",
 				code: "live_runner_error",
 			},
@@ -147,6 +210,32 @@ describe("createAdapterRequestHandler chat completion errors", () => {
 		expect(await invalidStream.json()).toMatchObject({
 			error: { code: "invalid_request_body", message: "Request stream must be a boolean when provided." },
 		});
+	});
+
+	test("rejects malformed foreign and background requests before resolving projects", async () => {
+		let providerCalls = 0;
+		const handler = createAdapterRequestHandler({
+			routes: {
+				projects: [project],
+				projectProvider: () => {
+					providerCalls += 1;
+					return [project];
+				},
+				owner,
+				runner: fixedRunner("unused"),
+				modelReaderFactory: staticModelReaderFactory(),
+			},
+		});
+		const malformed = await handler(
+			chatRequest({ model: "gjc/noncanonical", messages: [{ role: "user", content: "hello" }] }),
+		);
+		const foreign = await handler(chatRequest({ model: "foreign", messages: [{ role: "user", content: "hello" }] }));
+		const backgroundRequest = chatRequest({ model: "gjc", messages: [] });
+		backgroundRequest.headers.set("X-OpenWebUI-Task", "title");
+		const background = await handler(backgroundRequest);
+
+		expect([malformed.status, foreign.status, background.status]).toEqual([400, 404, 200]);
+		expect(providerCalls).toBe(0);
 	});
 });
 

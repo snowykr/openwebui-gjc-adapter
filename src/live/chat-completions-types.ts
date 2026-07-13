@@ -16,14 +16,21 @@ export interface LiveGatewayRunnerInput {
 	readonly userMessageId: string;
 	readonly userMessageParentId: string | null;
 	readonly continued: boolean;
+	readonly requestedModelId?: string;
 }
 
 export type LiveGatewayRunnerResult =
-	| { readonly content: string; readonly chunks?: undefined; readonly events?: readonly OpenWebUIMessageEvent[] }
+	| {
+			readonly content: string;
+			readonly chunks?: undefined;
+			readonly events?: readonly OpenWebUIMessageEvent[];
+			readonly model?: string;
+	  }
 	| {
 			readonly content?: undefined;
 			readonly chunks: AsyncIterable<string> | Iterable<string>;
 			readonly events?: readonly OpenWebUIMessageEvent[];
+			readonly model?: string;
 	  };
 
 export interface LiveGatewayRunner {
@@ -48,12 +55,13 @@ export class WorkflowGateReplyError extends Error {
 export type LiveChatCompletionsResult =
 	| { readonly ok: true; readonly status: 200; readonly body: OpenAIChatCompletionResponse }
 	| { readonly ok: true; readonly status: 200; readonly stream: AsyncIterable<string> }
-	| { readonly ok: false; readonly status: 400 | 401 | 404 | 503; readonly body: OpenAIErrorResponse };
+	| { readonly ok: false; readonly status: 400 | 401 | 404 | 409 | 503; readonly body: OpenAIErrorResponse };
 
 export interface HandleChatCompletionsInput {
 	readonly request: OpenAIChatCompletionRequest;
 	readonly headers: OpenWebUIHeaderInput;
 	readonly projects: readonly RegisteredProject[];
+	readonly projectProvider?: () => readonly RegisteredProject[] | Promise<readonly RegisteredProject[]>;
 	readonly owner: OpenWebUIOwnerContext;
 	readonly runner: LiveGatewayRunner;
 	readonly now?: Date;
@@ -64,4 +72,5 @@ export interface HandleChatCompletionsInput {
 	readonly fileContextResolver?: LiveGatewayFileContextResolver;
 	readonly projectContextRepository?: OpenWebUIProjectionRepository;
 	readonly neutralWorkspace?: string;
+	readonly modelReaderFactory?: import("./model-reader").ModelReaderFactory;
 }

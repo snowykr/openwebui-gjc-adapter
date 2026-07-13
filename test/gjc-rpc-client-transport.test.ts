@@ -81,6 +81,7 @@ describe("createRpcTransportFromClient", () => {
 		const protocolTranscript = join(root, "protocol.jsonl");
 		const lifecycleTranscript = join(root, "lifecycle.jsonl");
 		const locations = resolveGjcRuntimeLocations({ mode: "managed" });
+		const adapterKeys = ["GJC_OPENWEBUI_ADAPTER_API_TOKEN", "GJC_OPENWEBUI_ADMIN_PASSWORD"] as const;
 		const keys = [
 			"GJC_CONFIG_DIR",
 			"GJC_CODING_AGENT_DIR",
@@ -91,6 +92,7 @@ describe("createRpcTransportFromClient", () => {
 			"GJC_RPC_FIXTURE_ENV_TRANSCRIPT",
 			"GJC_RPC_FIXTURE_PROTOCOL_TRANSCRIPT",
 			"GJC_RPC_FIXTURE_LIFECYCLE_TRANSCRIPT",
+			...adapterKeys,
 		] as const;
 		const previous = Object.fromEntries(keys.map(key => [key, process.env[key]]));
 		Object.assign(process.env, {
@@ -103,6 +105,7 @@ describe("createRpcTransportFromClient", () => {
 			GJC_RPC_FIXTURE_ENV_TRANSCRIPT: transcript,
 			GJC_RPC_FIXTURE_PROTOCOL_TRANSCRIPT: protocolTranscript,
 			GJC_RPC_FIXTURE_LIFECYCLE_TRANSCRIPT: lifecycleTranscript,
+			...Object.fromEntries(adapterKeys.map(key => [key, `secret:${key}`])),
 		});
 		const transport = createDefaultRpcTransport({
 			cwd: root,
@@ -119,6 +122,10 @@ describe("createRpcTransportFromClient", () => {
 
 			// Then: protocol state is valid and environment evidence stays separate from stdout.
 			expect(state).toMatchObject({ sessionId: "fixture-session", messageCount: 0 });
+			const childKeys = readFileSync(`/proc/${childPid}/environ`, "utf8")
+				.split("\0")
+				.map(entry => entry.split("=", 1)[0]);
+			expect(childKeys.filter(key => key.startsWith("GJC_OPENWEBUI_"))).toEqual([]);
 			const environment: unknown = JSON.parse(readFileSync(transcript, "utf8"));
 			expect(environment).toEqual({
 				HOME: locations.home,

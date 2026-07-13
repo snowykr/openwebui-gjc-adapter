@@ -10,6 +10,7 @@ import { ProjectLinkService } from "../src/projects/link-service";
 import { SqliteProjectRegistrationStore } from "../src/projects/registration-store";
 import { resolveAllowedRoots } from "../src/security/paths";
 import { createAdapterRequestHandler } from "../src/server";
+import { CANONICAL_MODEL_IDS, staticModelReaderFactory } from "./model-selection-fixtures";
 
 const tempDirs: string[] = [];
 
@@ -52,6 +53,40 @@ describe("project admin route security boundaries", () => {
 
 		expect(response.status).toBe(200);
 		expect(service.listLinkedProjects()).toEqual([]);
+	});
+
+	test("fails closed without alias output when a background admin reader is missing", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-admin-"));
+		tempDirs.push(workspace);
+		const { handler } = await buildHandler(workspace, undefined, false);
+		const response = await handler(
+			chatCommandRequest(
+				{ model: "gjc", messages: [{ role: "user", content: "/gjc project list" }] },
+				{ task: "title" },
+			),
+		);
+		expect(response.status).toBe(409);
+		const body = await response.text();
+		expect(body).toContain('"code":"model_selection_default_read_failed"');
+		expect(body).not.toContain('"model":"gjc"');
+	});
+
+	test.each([
+		["canonical admin", {}],
+		["canonical background admin", { task: "title" }],
+	] as const)("maps a missing reader for %s to canonical unavailability", async (_label, options) => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-admin-"));
+		tempDirs.push(workspace);
+		const { handler } = await buildHandler(workspace, undefined, false);
+		const response = await handler(
+			chatCommandRequest(
+				{ model: CANONICAL_MODEL_IDS[0], messages: [{ role: "user", content: "/gjc project list" }] },
+				options,
+			),
+		);
+
+		expect(response.status).toBe(404);
+		expect(await response.json()).toMatchObject({ error: { code: "model_selection_not_available" } });
 	});
 
 	test("rejects malformed unlink path encoding with a client error", async () => {
@@ -119,7 +154,11 @@ async function adminHandlerForTempProject(name: string) {
 	return { ...(await buildHandler(workspace)), projectDirectory };
 }
 
-async function buildHandler(workspace: string, repository?: InMemoryOpenWebUIProjectionRepository) {
+async function buildHandler(
+	workspace: string,
+	repository?: InMemoryOpenWebUIProjectionRepository,
+	includeModelReader = true,
+) {
 	const service = new ProjectLinkService({
 		allowedRoots: await resolveAllowedRoots([workspace]),
 		store: new SqliteProjectRegistrationStore(":memory:"),
@@ -134,6 +173,7 @@ async function buildHandler(workspace: string, repository?: InMemoryOpenWebUIPro
 			projectLinkService: service,
 			owner,
 			runner: fixedRunner("unused"),
+			...(includeModelReader ? { modelReaderFactory: staticModelReaderFactory() } : {}),
 			adapterApiToken: "adapter-token",
 			requireAdapterApiToken: true,
 		},

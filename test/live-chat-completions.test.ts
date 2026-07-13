@@ -38,7 +38,7 @@ describe("live OpenAI-compatible chat completions", () => {
 	it("advertises only the stable gjc model", () => {
 		expect(buildModelList()).toEqual({
 			object: "list",
-			data: [{ id: "gjc", object: "model", created: 1783468800, owned_by: "gjc" }],
+			data: [],
 		});
 	});
 	it("returns an OpenAI-style 400 for invalid workflow gate replies", async () => {
@@ -82,6 +82,7 @@ describe("live OpenAI-compatible chat completions", () => {
 				run() {
 					return {
 						content: "done",
+						model: "gjc/anthropic/claude-sonnet-4:low",
 						events: [{ type: "status", data: { description: "Tool ran", done: true } }],
 					};
 				},
@@ -131,7 +132,7 @@ describe("live OpenAI-compatible chat completions", () => {
 });
 
 function fixedRunner(content: string): LiveGatewayRunner {
-	return { run: () => ({ content }) };
+	return { run: () => ({ content, model: "gjc/anthropic/claude-sonnet-4:low" }) };
 }
 
 async function demoRepository(): Promise<InMemoryOpenWebUIProjectionRepository> {

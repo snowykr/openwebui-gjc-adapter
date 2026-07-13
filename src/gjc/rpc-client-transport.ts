@@ -33,12 +33,19 @@ interface FullSessionEventRpcClient {
 
 export function createDefaultRpcTransport(options: GjcRpcRunnerClientOptions): GjcRpcSelectionTransport {
 	if (options.runtimeLocations === undefined) throw new TypeError("resolved runtime locations are required");
+	const childEnvironment: Record<string, string | undefined> = {
+		...options.runtimeLocations.childEnvironment,
+		PI_CONFIG_DIR: undefined,
+	};
+	for (const name of Object.keys(process.env)) {
+		if (name.startsWith("GJC_OPENWEBUI_")) childEnvironment[name] = undefined;
+	}
 	return createRpcTransportFromClient(
 		new RpcClient({
 			cwd: options.cwd,
 			sessionDir: options.sessionRoot,
 			cliPath: options.cliPath,
-			env: { ...options.runtimeLocations.childEnvironment, PI_CONFIG_DIR: undefined },
+			env: childEnvironment,
 		}),
 	);
 }
