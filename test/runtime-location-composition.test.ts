@@ -149,6 +149,22 @@ describe("runtime location composition", () => {
 		expect(compose).not.toContain("PI_CONFIG_DIR");
 	});
 
+	test("stages the managed neutral reader workspace before catalog requests", () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-managed-reader-workspace-")));
+		try {
+			stage(artifacts(root));
+
+			for (const path of [
+				"state/home/.gjc/agent",
+				"state/home/.gjc/openwebui/default-reader",
+				"state/home/.gjc/openwebui/default-reader/.gjc/sessions",
+			])
+				expect(lstatSync(join(root, path)).isDirectory()).toBe(true);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	test("preserves literal dollars and spaces in systemd Environment values", () => {
 		// Given: resolved locations containing systemd-significant whitespace and dollars.
 		const base = resolveGjcRuntimeLocations({ mode: "managed" });

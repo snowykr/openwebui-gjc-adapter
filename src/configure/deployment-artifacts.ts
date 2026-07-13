@@ -12,7 +12,7 @@ import {
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import type { DeploymentRuntime } from "./deployment-runtime";
 import type { FileSnapshot } from "./file-snapshots";
 import type { CliDependencies } from "./installed-cli-contracts";
@@ -65,6 +65,15 @@ export function stageDeploymentArtifacts(input: StageInput): void {
 			throw new Error("Docker executable is not available on PATH");
 		for (const runtimePath of ["state", "session", "workspace"])
 			mkdirSync(join(artifacts.directory, runtimePath), { recursive: true, mode: 0o700 });
+		for (const runtimePath of [
+			runtimeLocations.agentDir,
+			runtimeLocations.readerWorkspace,
+			runtimeLocations.readerSessionRoot,
+		])
+			mkdirSync(join(artifacts.directory, "state", relative("/var/lib/gjc", runtimePath)), {
+				recursive: true,
+				mode: 0o700,
+			});
 		const selectedOwnership =
 			ownership ??
 			validatedOwnership(
