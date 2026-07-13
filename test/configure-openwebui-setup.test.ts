@@ -51,7 +51,7 @@ function setup(
 }
 
 describe("OpenWebUI v0.10 setup contract", () => {
-	test("uses session authentication only for key creation, then verifies the durable key and provider readback", async () => {
+	test("uses session authentication only for key creation, then leaves provider model discovery dynamic", async () => {
 		const t = setup();
 		const result = await configureOpenWebUI(t.input);
 		expect(result.apiKey).toBe("key");
@@ -68,7 +68,6 @@ describe("OpenWebUI v0.10 setup contract", () => {
 			OPENAI_API_CONFIGS: {
 				"0": {
 					enable: true,
-					model_ids: ["gjc"],
 					headers: {
 						"X-OpenWebUI-Chat-Id": "{{CHAT_ID}}",
 						"X-OpenWebUI-Message-Id": "{{MESSAGE_ID}}",
@@ -81,6 +80,7 @@ describe("OpenWebUI v0.10 setup contract", () => {
 				},
 			},
 		});
+		expect(JSON.stringify(t.calls.find(call => call[1] === "/openai/config/update")?.[2])).not.toContain("model_ids");
 		expect(JSON.stringify(t.calls.find(call => call[1] === "/openai/config/update")?.[2])).not.toContain("prefix_id");
 	});
 	test("persists bootstrap completion across the managed api-key and provider invocations", async () => {
@@ -165,6 +165,33 @@ describe("OpenWebUI v0.10 setup contract", () => {
 			OPENAI_API_CONFIGS: { "0": { prefix_id: "other" } },
 		});
 		await expect(configureOpenWebUI(t.input)).rejects.toThrow("foreign");
+	});
+	test("migrates a legacy owned model pin to dynamic discovery", async () => {
+		const t = setup("managed", {
+			ENABLE_OPENAI_API: true,
+			OPENAI_API_BASE_URLS: ["http://adapter:8765/v1"],
+			OPENAI_API_KEYS: ["adapter-token"],
+			OPENAI_API_CONFIGS: {
+				"0": {
+					enable: true,
+					model_ids: ["gjc"],
+					headers: {
+						"X-OpenWebUI-Chat-Id": "{{CHAT_ID}}",
+						"X-OpenWebUI-Message-Id": "{{MESSAGE_ID}}",
+						"X-OpenWebUI-User-Message-Id": "{{USER_MESSAGE_ID}}",
+						"X-OpenWebUI-User-Message-Parent-Id": "{{USER_MESSAGE_PARENT_ID}}",
+						"X-OpenWebUI-Task": "{{TASK}}",
+						"X-OpenWebUI-User-Id": "{{USER_ID}}",
+					},
+					openwebui_gjc_adapter: { schema: 1, installationId: "install-1" },
+				},
+			},
+		});
+
+		await configureOpenWebUI(t.input);
+
+		expect(t.calls.filter(call => call[1] === "/openai/config/update")).toHaveLength(1);
+		expect(JSON.stringify(t.calls.find(call => call[1] === "/openai/config/update")?.[2])).not.toContain("model_ids");
 	});
 	test("rejects signup without a session token", async () => {
 		const t = setup();

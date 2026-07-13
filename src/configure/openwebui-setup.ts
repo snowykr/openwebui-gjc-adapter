@@ -89,7 +89,6 @@ export interface OpenWebUISetupResult {
 	readonly openAIConnections: readonly ProviderConnection[];
 	readonly ownerUserId: string;
 }
-export const GJC_MODEL_ID = "gjc";
 export function buildManagedAdapterUrl(): string {
 	return "http://adapter:8765/v1";
 }
@@ -182,7 +181,6 @@ export async function configureOpenWebUI(input: OpenWebUISetupInput): Promise<Op
 		const marker: OwnershipMarker = { schema: 1, installationId: input.installationId };
 		const ownedConfig: OpenAIConnectionConfig = {
 			enable: true,
-			model_ids: [GJC_MODEL_ID],
 			headers: buildHeaders(),
 			openwebui_gjc_adapter: marker,
 		};
@@ -268,11 +266,18 @@ function isPristineDefault(current: OpenAIConfigResponse): boolean {
 function isOwnedConfig(config: OpenAIConnectionConfig, installationId: string): boolean {
 	const expected = {
 		enable: true,
-		model_ids: [GJC_MODEL_ID],
 		headers: buildHeaders(),
 		openwebui_gjc_adapter: { schema: 1, installationId },
 	};
-	return JSON.stringify(config) === JSON.stringify(expected);
+	const legacyExpected = {
+		enable: true,
+		model_ids: ["gjc"],
+		headers: buildHeaders(),
+		openwebui_gjc_adapter: { schema: 1, installationId },
+	};
+	return (
+		JSON.stringify(config) === JSON.stringify(expected) || JSON.stringify(config) === JSON.stringify(legacyExpected)
+	);
 }
 async function writeProviderConfig(
 	http: OpenWebUIHttpClient,
