@@ -208,7 +208,12 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 		});
 		expect(continued.ok).toBe(true);
 		expect(turnRunner.switches).toHaveLength(1);
-		expect(turnRunner.states).toHaveLength(0);
+		expect(turnRunner.states).toHaveLength(1);
+		expect(turnRunner.continues[0]).toMatchObject({
+			activeLeaf: "assistant-1",
+			rawFrameCursor: 1,
+			eventCursor: 1,
+		});
 		expect(deliveredEvents.some(event => event.events.some(item => item.type === "status"))).toBe(true);
 
 		const background = await handleChatCompletions({
