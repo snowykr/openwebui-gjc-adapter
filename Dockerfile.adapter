@@ -3,6 +3,7 @@ FROM oven/bun:1.3.14
 WORKDIR /opt/openwebui-gjc-adapter
 
 COPY package.json bun.lock ./
+COPY patches ./patches
 RUN bun install --frozen-lockfile --production
 RUN test -x /opt/openwebui-gjc-adapter/node_modules/.bin/gjc
 COPY src ./src
@@ -16,7 +17,7 @@ ENV GJC_OPENWEBUI_BIND_HOST=0.0.0.0 \
     GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS=/workspace
 EXPOSE 8765
 
-RUN addgroup --system adapter && adduser --system --ingroup adapter adapter
+RUN groupadd --system adapter && useradd --system --gid adapter --no-create-home --shell /usr/sbin/nologin adapter
 USER adapter:adapter
 
 ENTRYPOINT ["bun", "/opt/openwebui-gjc-adapter/bin/openwebui-gjc-adapter"]
