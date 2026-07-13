@@ -46,6 +46,7 @@ COPY --from=gjc-builder /opt/gajae-code /opt/gajae-code
 RUN printf '%s\n' \
     '#!/usr/bin/env bash' \
     'set -euo pipefail' \
+    'export BUN_OPTIONS="--env-file=/dev/null --config=/dev/null"' \
     'exec bun --no-env-file --config=/dev/null /opt/gajae-code/packages/coding-agent/src/cli.ts "$@"' \
     > /usr/local/bin/gjc \
     && chmod +x /usr/local/bin/gjc \

@@ -56,7 +56,7 @@ describe("SDK v3 lifecycle CLI boundary", () => {
 				fixture.environment.GJC_SDK_FIXTURE_RAW_BUN_CHILD_ENTRYPOINT = rawBunChildEntrypoint;
 				writeFileSync(
 					rawBunChildEntrypoint,
-					"process.stdout.write(JSON.stringify({ bunOptions: process.env.BUN_OPTIONS }));\n",
+					"process.stdout.write(JSON.stringify({ bunOptions: process.env.BUN_OPTIONS, agentDotenvType: typeof process.env.GJC_SDK_AGENT_DOTENV }));\n",
 				);
 				writeFileSync(
 					join(fixture.cwd, "preload.ts"),
@@ -86,7 +86,10 @@ describe("SDK v3 lifecycle CLI boundary", () => {
 				expect(await Bun.file(agentPreloadMarker).exists()).toBe(false);
 				expect(invocation.rawBunChild).toEqual({
 					exitCode: 0,
-					stdout: JSON.stringify({ bunOptions: "--no-env-file --config=/dev/null" }),
+					stdout: JSON.stringify({
+						bunOptions: "--env-file=/dev/null --config=/dev/null",
+						agentDotenvType: "undefined",
+					}),
 					stderr: "",
 				});
 				const launcher = readFileSync(useWrapper ? fixture.cliPath : expectedSessionCommand, "utf8");

@@ -87,6 +87,7 @@ describe("GJC SDK runtime provenance", () => {
 
 		// Then
 		expect(dockerfile).toContain(runtimeCommand);
+		expect(dockerfile).toContain('export BUN_OPTIONS="--env-file=/dev/null --config=/dev/null"');
 		expect(dockerfile).toContain("GJC_OPENWEBUI_GJC_COMMAND=/usr/local/bin/gjc");
 		expect(dockerfile).not.toContain("node_modules/.bin/gjc");
 		expect(dockerfile).not.toContain("COPY patches ./patches");
@@ -97,7 +98,7 @@ describe("GJC SDK runtime provenance", () => {
 		const source = await Bun.file(join(ROOT, "src/gjc/sdk-v3-cli.ts")).text();
 
 		// Then
-		expect(source).toContain('const ISOLATED_BUN_OPTIONS = "--no-env-file --config=/dev/null";');
+		expect(source).toContain('const ISOLATED_BUN_OPTIONS = "--env-file=/dev/null --config=/dev/null";');
 		expect(source).toContain("BUN_OPTIONS: ISOLATED_BUN_OPTIONS");
 	});
 

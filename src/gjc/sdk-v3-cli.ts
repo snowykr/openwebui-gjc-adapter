@@ -22,7 +22,7 @@ interface SdkCliOptions {
 	readonly timeoutMs?: number;
 }
 
-const ISOLATED_BUN_OPTIONS = "--no-env-file --config=/dev/null";
+const ISOLATED_BUN_OPTIONS = "--env-file=/dev/null --config=/dev/null";
 
 export class SdkV3Cli {
 	readonly #options: SdkCliOptions;
