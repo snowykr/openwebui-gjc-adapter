@@ -1,8 +1,9 @@
 import { RpcClient } from "@gajae-code/coding-agent";
+import type { NormalizedModelSelection } from "../contracts";
 import type {
 	GjcRpcRunnerClientOptions,
-	GjcRpcRunnerTransport,
 	GjcRpcRunnerTransportEvent,
+	GjcRpcSelectionTransport,
 	GjcRpcTransportState,
 } from "./rpc-runner";
 
@@ -12,6 +13,12 @@ export interface RpcClientTransportClient {
 	newSession(): Promise<{ readonly cancelled: boolean }>;
 	switchSession(sessionPath: string): Promise<{ readonly cancelled: boolean }>;
 	getState(): Promise<GjcRpcTransportState>;
+	getAvailableModels?(): Promise<readonly unknown[]>;
+	setDefaultModelSelection?(
+		provider: string,
+		modelId: string,
+		thinkingLevel: NormalizedModelSelection["thinkingLevel"],
+	): Promise<NormalizedModelSelection>;
 	prompt(message: string): Promise<void>;
 	onEvent(listener: (event: GjcRpcRunnerTransportEvent) => void): () => void;
 	onWorkflowGate(listener: (gate: GjcRpcRunnerTransportEvent) => void): () => void;
@@ -24,7 +31,7 @@ interface FullSessionEventRpcClient {
 	onSessionEvent(listener: (event: GjcRpcRunnerTransportEvent) => void): () => void;
 }
 
-export function createDefaultRpcTransport(options: GjcRpcRunnerClientOptions): GjcRpcRunnerTransport {
+export function createDefaultRpcTransport(options: GjcRpcRunnerClientOptions): GjcRpcSelectionTransport {
 	if (options.runtimeLocations === undefined) throw new TypeError("resolved runtime locations are required");
 	return createRpcTransportFromClient(
 		new RpcClient({
@@ -36,11 +43,11 @@ export function createDefaultRpcTransport(options: GjcRpcRunnerClientOptions): G
 	);
 }
 
-export function createRpcTransportFromClient(client: RpcClientTransportClient): GjcRpcRunnerTransport {
+export function createRpcTransportFromClient(client: RpcClientTransportClient): GjcRpcSelectionTransport {
 	return new RpcClientTransport(client);
 }
 
-class RpcClientTransport implements GjcRpcRunnerTransport {
+class RpcClientTransport implements GjcRpcSelectionTransport {
 	readonly #client: RpcClientTransportClient;
 
 	constructor(client: RpcClientTransportClient) {
@@ -65,6 +72,22 @@ class RpcClientTransport implements GjcRpcRunnerTransport {
 
 	async getState() {
 		return this.#client.getState();
+	}
+
+	async getAvailableModels(): Promise<readonly unknown[]> {
+		const getAvailableModels = this.#client.getAvailableModels;
+		if (getAvailableModels === undefined) throw new TypeError("RPC client does not support model catalogs");
+		return getAvailableModels.call(this.#client);
+	}
+
+	async setDefaultModelSelection(
+		provider: string,
+		modelId: string,
+		thinkingLevel: NormalizedModelSelection["thinkingLevel"],
+	): Promise<NormalizedModelSelection> {
+		const setDefaultModelSelection = this.#client.setDefaultModelSelection;
+		if (setDefaultModelSelection === undefined) throw new TypeError("RPC client does not support model selection");
+		return setDefaultModelSelection.call(this.#client, provider, modelId, thinkingLevel);
 	}
 
 	async promptAndWait(message: string, timeoutMs?: number): Promise<readonly GjcRpcRunnerTransportEvent[]> {

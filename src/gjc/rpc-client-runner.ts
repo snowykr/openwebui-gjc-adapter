@@ -1,5 +1,5 @@
 import { resolveGjcRuntimeLocations } from "../configure/runtime-locations";
-import type { GjcRuntimeLocations } from "../contracts";
+import type { GjcRuntimeLocations, NormalizedModelSelection } from "../contracts";
 import { createDefaultRpcTransport } from "./rpc-client-transport";
 import { GjcRpcRunnerError } from "./rpc-errors";
 import type {
@@ -28,6 +28,8 @@ import {
 
 interface StartedClient {
 	readonly client: GjcRpcRunnerTransport;
+	readonly ready: Promise<void>;
+	tail: Promise<void>;
 }
 
 export { GjcRpcRunnerError };
@@ -59,10 +61,12 @@ class RpcBackedGjcTurnRunner implements GjcTurnRunner {
 
 	async startNewSession(input: GjcStartNewSessionInput): Promise<GjcSessionAddress & GjcTurnResult> {
 		const clientKey = newSessionClientKey(input.projectId, input.chatId);
-		const client = await this.getOrStartClient(clientKey, input);
-		const session = await runRpcCommand("new_session", () => client.newSession());
-		if (isCancelled(session)) throw new GjcRpcRunnerError("new_session", "session creation was cancelled");
-		const result = await this.runPrompt(client, input.text, 0, 0);
+		const started = await this.getOrStartClient(clientKey, input);
+		const result = await enqueue(started, async () => {
+			const session = await runRpcCommand("new_session", () => started.client.newSession());
+			if (isCancelled(session)) throw new GjcRpcRunnerError("new_session", "session creation was cancelled");
+			return this.runPrompt(started.client, input.text, 0, 0, input.modelSelection);
+		});
 		const address = {
 			cwd: input.cwd,
 			sessionRoot: input.sessionRoot,
@@ -70,46 +74,75 @@ class RpcBackedGjcTurnRunner implements GjcTurnRunner {
 			sessionId: result.sessionId,
 			chatId: input.chatId,
 		};
-		this.#clients.set(sessionClientKey(address), { client });
+		this.#clients.set(sessionClientKey(address), started);
+		if (this.#clients.get(clientKey) === started) this.#clients.delete(clientKey);
 		return { ...address, ...stripSessionId(result) };
 	}
 
 	async continueSession(input: GjcContinueSessionInput): Promise<GjcTurnResult> {
-		const client = await this.getOrStartClient(sessionClientKey(input), input);
-		return stripSessionId(await this.runPrompt(client, input.text, input.rawFrameCursor, input.eventCursor));
+		const started = await this.getOrStartClient(sessionClientKey(input), input);
+		return enqueue(started, async () =>
+			stripSessionId(
+				await this.runPrompt(
+					started.client,
+					input.text,
+					input.rawFrameCursor,
+					input.eventCursor,
+					input.modelSelection,
+				),
+			),
+		);
 	}
 
 	async switchSession(input: GjcSwitchSessionInput): Promise<void> {
 		if (input.sessionFile === undefined) {
 			throw new GjcRpcRunnerError("switch_session", "sessionFile is required for continuation");
 		}
-		const client = await this.getOrStartClient(sessionClientKey(input), input);
-		const result = await runRpcCommand("switch_session", () => client.switchSession(input.sessionFile ?? ""));
-		if (isCancelled(result)) throw new GjcRpcRunnerError("switch_session", "session switch was cancelled");
+		const started = await this.getOrStartClient(sessionClientKey(input), input);
+		await enqueue(started, async () => {
+			const result = await runRpcCommand("switch_session", () =>
+				started.client.switchSession(input.sessionFile ?? ""),
+			);
+			if (isCancelled(result)) throw new GjcRpcRunnerError("switch_session", "session switch was cancelled");
+		});
 	}
 
 	async getState(input: GjcSessionStateInput): Promise<GjcSessionState> {
-		const client = await this.getOrStartClient(sessionClientKey(input), input);
-		const state = await runRpcCommand("get_state", () => client.getState());
-		return mapSessionState(state, 0, 0);
+		const started = await this.getOrStartClient(sessionClientKey(input), input);
+		return enqueue(started, async () => {
+			const state = await runRpcCommand("get_state", () => started.client.getState());
+			return mapSessionState(state, 0, 0);
+		});
+	}
+
+	async getAvailableModels(input: GjcSessionStateInput): Promise<readonly unknown[]> {
+		const started = await this.getOrStartClient(sessionClientKey(input), input);
+		const getAvailableModels = started.client.getAvailableModels;
+		if (getAvailableModels === undefined)
+			throw new GjcRpcRunnerError("get_available_models", "RPC transport does not support model catalogs");
+		return enqueue(started, () => runRpcCommand("get_available_models", getAvailableModels.bind(started.client)));
 	}
 
 	async respondWorkflowGate(input: GjcRespondWorkflowGateInput): Promise<GjcTurnResult> {
-		const client = await this.getOrStartClient(sessionClientKey(input), input);
-		if (client.respondGate === undefined) {
+		const started = await this.getOrStartClient(sessionClientKey(input), input);
+		if (started.client.respondGate === undefined) {
 			throw new GjcRpcRunnerError("workflow_gate_response", "RPC transport does not support workflow gates");
 		}
-		const resolution = await runRpcCommand("workflow_gate_response", () =>
-			callRespondGate(client, input.gateId, input.answer, input.idempotencyKey),
-		);
-		assertAcceptedWorkflowGateResolution(resolution);
-		const state = await runRpcCommand("get_state", () => client.getState());
-		const assistantText = await runRpcCommand("get_last_assistant_text", () => client.getLastAssistantText());
-		return {
-			...mapSessionState(state, input.rawFrameCursor, input.eventCursor),
-			text: assistantText ?? "",
-			events: assistantText === null ? [] : [{ type: "assistant", text: assistantText }],
-		};
+		return enqueue(started, async () => {
+			const state = await runRpcCommand("get_state", () => started.client.getState());
+			const resolution = await runRpcCommand("workflow_gate_response", () =>
+				callRespondGate(started.client, input.gateId, input.answer, input.idempotencyKey),
+			);
+			assertAcceptedWorkflowGateResolution(resolution);
+			const assistantText = await runRpcCommand("get_last_assistant_text", () =>
+				started.client.getLastAssistantText(),
+			);
+			return {
+				...mapSessionState(state, input.rawFrameCursor, input.eventCursor),
+				text: assistantText ?? "",
+				events: assistantText === null ? [] : [{ type: "assistant", text: assistantText }],
+			};
+		});
 	}
 
 	async runTurn(input: GjcStartNewSessionInput | GjcContinueSessionInput): Promise<GjcTurnResult> {
@@ -125,18 +158,29 @@ class RpcBackedGjcTurnRunner implements GjcTurnRunner {
 	private async getOrStartClient(
 		key: string,
 		options: Pick<GjcRpcRunnerClientOptions, "cwd" | "sessionRoot">,
-	): Promise<GjcRpcRunnerTransport> {
+	): Promise<StartedClient> {
 		const existing = this.#clients.get(key);
-		if (existing !== undefined) return existing.client;
+		if (existing !== undefined) return existing.ready.then(() => existing);
 		const client = this.clientFactory({
 			cwd: options.cwd,
 			sessionRoot: options.sessionRoot,
 			...(this.cliPath === undefined ? {} : { cliPath: this.cliPath }),
 			runtimeLocations: this.runtimeLocations,
 		});
-		await runRpcCommand("start", () => client.start());
-		this.#clients.set(key, { client });
-		return client;
+		const readiness = Promise.withResolvers<void>();
+		const started: StartedClient = { client, ready: readiness.promise, tail: Promise.resolve() };
+		this.#clients.set(key, started);
+		void runRpcCommand("start", () => client.start()).then(readiness.resolve, readiness.reject);
+		try {
+			await started.ready;
+			return started;
+		} catch (error) {
+			if (this.#clients.get(key) === started) {
+				this.#clients.delete(key);
+				client.stop();
+			}
+			throw error;
+		}
 	}
 
 	private async runPrompt(
@@ -144,7 +188,22 @@ class RpcBackedGjcTurnRunner implements GjcTurnRunner {
 		text: string,
 		baseRawFrameCursor: number,
 		baseEventCursor: number,
+		selection?: NormalizedModelSelection,
 	): Promise<GjcTurnResult & { readonly sessionId: string }> {
+		let modelSelection: NormalizedModelSelection | undefined;
+		if (selection !== undefined) {
+			await runRpcCommand("get_state", () => client.getState());
+			const setter = client.setDefaultModelSelection;
+			if (setter === undefined) {
+				throw new GjcRpcRunnerError(
+					"set_default_model_selection",
+					"RPC transport does not support default model selection",
+				);
+			}
+			modelSelection = await runRpcCommand("set_default_model_selection", () =>
+				setter.call(client, selection.provider, selection.modelId, selection.thinkingLevel),
+			);
+		}
 		const rawEvents = await runRpcCommand("prompt", () =>
 			promptAndCollectWorkflowGates(client, text, this.turnTimeoutMs),
 		);
@@ -156,9 +215,18 @@ class RpcBackedGjcTurnRunner implements GjcTurnRunner {
 			sessionId: state.sessionId,
 			text: assistantText ?? lastEventText(events) ?? "",
 			events,
+			...(modelSelection === undefined ? {} : { modelSelection }),
 		};
 	}
 }
+
+async function enqueue<T>(started: StartedClient, operation: () => Promise<T>): Promise<T> {
+	const result = started.tail.then(() => started.ready).then(operation);
+	started.tail = result.then(releaseQueue, releaseQueue);
+	return result;
+}
+
+const releaseQueue = (): void => undefined;
 
 async function runRpcCommand<T>(command: string, operation: () => Promise<T>): Promise<T> {
 	try {
@@ -194,14 +262,8 @@ function lastEventText(events: readonly GjcTurnEvent[]): string | undefined {
 }
 
 function stripSessionId(result: GjcTurnResult & { readonly sessionId: string }): GjcTurnResult {
-	return {
-		text: result.text,
-		events: result.events,
-		...(result.sessionFile === undefined ? {} : { sessionFile: result.sessionFile }),
-		...(result.activeLeaf === undefined ? {} : { activeLeaf: result.activeLeaf }),
-		rawFrameCursor: result.rawFrameCursor,
-		eventCursor: result.eventCursor,
-	};
+	const { sessionId: _sessionId, ...turn } = result;
+	return turn;
 }
 
 function sessionClientKey(input: Pick<GjcSessionAddress, "projectId" | "sessionId">): string {

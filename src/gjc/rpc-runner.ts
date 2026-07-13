@@ -1,4 +1,4 @@
-import type { GjcRuntimeLocations } from "../contracts";
+import type { GjcRuntimeLocations, NormalizedModelSelection } from "../contracts";
 import type { WorkflowGateAnswer } from "../projection/workflow-gates";
 import type { RegisteredProject } from "../projects/registry";
 
@@ -18,6 +18,7 @@ export interface GjcStartNewSessionInput {
 	readonly userMessageId: string;
 	readonly parentId?: string;
 	readonly text: string;
+	readonly modelSelection?: NormalizedModelSelection;
 }
 
 export interface GjcContinueSessionInput extends GjcSessionAddress {
@@ -29,6 +30,7 @@ export interface GjcContinueSessionInput extends GjcSessionAddress {
 	readonly rawFrameCursor: number;
 	readonly eventCursor: number;
 	readonly operationId: string;
+	readonly modelSelection?: NormalizedModelSelection;
 }
 
 export interface GjcSwitchSessionInput extends GjcSessionAddress {
@@ -73,6 +75,7 @@ export interface GjcTurnResult {
 	readonly activeLeaf?: string;
 	readonly rawFrameCursor: number;
 	readonly eventCursor: number;
+	readonly modelSelection?: NormalizedModelSelection;
 }
 
 export interface GjcTurnRunner {
@@ -80,6 +83,7 @@ export interface GjcTurnRunner {
 	continueSession(input: GjcContinueSessionInput): Promise<GjcTurnResult>;
 	switchSession(input: GjcSwitchSessionInput): Promise<void>;
 	getState(input: GjcSessionStateInput): Promise<GjcSessionState>;
+	getAvailableModels?(input: GjcSessionStateInput): Promise<readonly unknown[]>;
 	respondWorkflowGate?(input: GjcRespondWorkflowGateInput): Promise<GjcTurnResult>;
 	streamTurn?(input: GjcStartNewSessionInput | GjcContinueSessionInput): AsyncIterable<GjcTurnEvent>;
 	runTurn?(input: GjcStartNewSessionInput | GjcContinueSessionInput): Promise<GjcTurnResult>;
@@ -162,10 +166,25 @@ export interface GjcRpcRunnerTransport {
 	newSession(): Promise<undefined | { readonly cancelled: boolean }>;
 	switchSession(sessionPath: string): Promise<undefined | { readonly cancelled: boolean }>;
 	getState(): Promise<GjcRpcTransportState>;
+	getAvailableModels?(): Promise<readonly unknown[]>;
+	setDefaultModelSelection?(
+		provider: string,
+		modelId: string,
+		thinkingLevel: NormalizedModelSelection["thinkingLevel"],
+	): Promise<NormalizedModelSelection>;
 	promptAndWait(message: string, timeoutMs?: number): Promise<readonly GjcRpcRunnerTransportEvent[]>;
 	onWorkflowGate?(listener: (gate: GjcRpcRunnerTransportEvent) => void): () => void;
 	respondGate?(gateId: string, answer: WorkflowGateAnswer, idempotencyKey?: string): Promise<unknown>;
 	getLastAssistantText(): Promise<string | null>;
+}
+
+export interface GjcRpcSelectionTransport extends GjcRpcRunnerTransport {
+	getAvailableModels(): Promise<readonly unknown[]>;
+	setDefaultModelSelection(
+		provider: string,
+		modelId: string,
+		thinkingLevel: NormalizedModelSelection["thinkingLevel"],
+	): Promise<NormalizedModelSelection>;
 }
 
 export type GjcRpcRunnerClientFactory = (options: GjcRpcRunnerClientOptions) => GjcRpcRunnerTransport;
