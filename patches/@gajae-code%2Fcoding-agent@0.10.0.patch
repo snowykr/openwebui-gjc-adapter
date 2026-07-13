@@ -1,13 +1,14 @@
 diff --git a/dist/types/config/settings.d.ts b/dist/types/config/settings.d.ts
-index 959fadb88688f1d300142ee62b682443cf64b2bc..b98dc195d56e8fc24b5faca3041e0cd6f184e623 100644
+index 959fadb88688f1d300142ee62b682443cf64b2bc..41da042e53a6974b85ff0d001e78d3eb81865abd 100644
 --- a/dist/types/config/settings.d.ts
 +++ b/dist/types/config/settings.d.ts
-@@ -115,6 +115,8 @@ export declare class Settings {
+@@ -115,6 +115,9 @@ export declare class Settings {
       * Set a model role (helper for modelRoles record).
       */
      setModelRole(role: ModelRole | string, modelId: string): void;
 +    setGlobalModelRole(role: ModelRole | string, modelId: string | undefined): void;
 +    setGlobalModelRoleAndFlush(role: ModelRole | string, modelId: string | undefined): Promise<void>;
++    setGlobalModelRoleIfCurrentAndFlush(role: ModelRole | string, expectedModelId: string | undefined, modelId: string | undefined): Promise<boolean>;
      /**
       * Set an agent model override while keeping any live runtime override aligned.
       *
@@ -142,7 +143,7 @@ index 02053ca9a688d990a025239debad0514ff11a691..7a4552b0a24b0277c3bb875f455a97bd
       * Cycle to next/previous model.
       * Uses scoped models (from --models flag) if available, otherwise all available models.
 diff --git a/src/config/settings.ts b/src/config/settings.ts
-index a9ef2c34762aa0189e24de55ab778d989190b8dc..f1dbfe5268160dd8caf6bcafd033407dfa105b71 100644
+index a9ef2c34762aa0189e24de55ab778d989190b8dc..025170251cf7c2f2ddee76383c7fe5600edd356d 100644
 --- a/src/config/settings.ts
 +++ b/src/config/settings.ts
 @@ -55,6 +55,12 @@ export interface RawSettings {
@@ -231,7 +232,7 @@ index a9ef2c34762aa0189e24de55ab778d989190b8dc..f1dbfe5268160dd8caf6bcafd033407d
  		const runtimeOverrides = getByPath(this.#overrides, ["modelRoles"]);
  		const updateRuntimeOverride =
  			!!runtimeOverrides &&
-@@ -488,12 +491,55 @@ export class Settings {
+@@ -488,12 +491,106 @@ export class Settings {
  			!Array.isArray(runtimeOverrides) &&
  			Object.hasOwn(runtimeOverrides, role);
  
@@ -285,10 +286,61 @@ index a9ef2c34762aa0189e24de55ab778d989190b8dc..f1dbfe5268160dd8caf6bcafd033407d
 +		);
 +		return transaction;
 +	}
++
++	setGlobalModelRoleIfCurrentAndFlush(
++		role: ModelRole | string,
++		expectedModelId: string | undefined,
++		modelId: string | undefined,
++	): Promise<boolean> {
++		const transaction = this.#globalModelRoleTail.then(async () => {
++			if (!this.#persist || !this.#configPath) {
++				if (shallowStringRecord(getByPath(this.#global, ["modelRoles"]))[role] !== expectedModelId) return false;
++				this.setGlobalModelRole(role, modelId);
++				await this.flushOrThrow();
++				return true;
++			}
++
++			await this.flushOrThrow();
++			const configPath = this.#configPath;
++			let updated = false;
++			const save = this.#saveTail.then(() =>
++				withFileLock(configPath, async () => {
++					const current = await this.#loadYaml(configPath);
++					const currentModelRoles = shallowStringRecord(getByPath(current, ["modelRoles"]));
++					if (currentModelRoles[role] === expectedModelId) {
++						if (modelId === undefined) {
++							const { [role]: _removed, ...remaining } = currentModelRoles;
++							setByPath(current, ["modelRoles"], remaining);
++						} else {
++							setByPath(current, ["modelRoles"], { ...currentModelRoles, [role]: modelId });
++						}
++						await Bun.write(configPath, YAML.stringify(current, null, 2));
++						updated = true;
++					}
++					this.#global = current;
++					for (const patch of this.#modified.values()) {
++						setByPath(this.#global, patch.path.split("."), structuredClone(patch.value));
++					}
++				}),
++			);
++			this.#saveTail = save.then(
++				() => undefined,
++				() => undefined,
++			);
++			await save;
++			this.#rebuildMerged();
++			return updated;
++		});
++		this.#globalModelRoleTail = transaction.then(
++			() => undefined,
++			() => undefined,
++		);
++		return transaction;
++	}
  	/**
  	 * Set an agent model override while keeping any live runtime override aligned.
  	 *
-@@ -824,15 +870,10 @@ export class Settings {
+@@ -824,15 +921,10 @@ export class Settings {
  	#queueSave(): void {
  		if (!this.#persist || !this.#configPath) return;
  
@@ -306,7 +358,7 @@ index a9ef2c34762aa0189e24de55ab778d989190b8dc..f1dbfe5268160dd8caf6bcafd033407d
  		}, 100);
  	}
  
-@@ -840,30 +881,40 @@ export class Settings {
+@@ -840,30 +932,40 @@ export class Settings {
  		if (!this.#persist || !this.#configPath || this.#modified.size === 0) return;
  
  		const configPath = this.#configPath;
@@ -647,7 +699,7 @@ index 91213d2b7d325cdb00b306399d4c2505ff26d088..2600e2105d60e6c3427e1610821ea02e
  	get_available_models: "model",
  	set_thinking_level: "model",
 diff --git a/src/session/agent-session.ts b/src/session/agent-session.ts
-index 5379f0e987bfbfb21ebd5406bd6c27bc58b74924..32e2251855b6fe9fbdb49f76be563f02a34077b1 100644
+index 5379f0e987bfbfb21ebd5406bd6c27bc58b74924..cb8436bfbbf421593c2e898d349bcdc8774d1b8e 100644
 --- a/src/session/agent-session.ts
 +++ b/src/session/agent-session.ts
 @@ -28,6 +28,7 @@ import {
@@ -706,10 +758,8 @@ index 5379f0e987bfbfb21ebd5406bd6c27bc58b74924..32e2251855b6fe9fbdb49f76be563f02
 +				ThinkingLevel.Off;
 +			await this.waitForIdle();
 +			const previousDefaultModelRole = this.settings.getGlobal("modelRoles")?.default;
-+			await this.settings.setGlobalModelRoleAndFlush(
-+				"default",
-+				formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel),
-+			);
++			const selectedDefaultModelRole = formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel);
++			await this.settings.setGlobalModelRoleAndFlush("default", selectedDefaultModelRole);
 +			try {
 +				const previousThinkingLevel = this.thinkingLevel;
 +				await this.setModelTemporary(model, effectiveLevel);
@@ -718,11 +768,13 @@ index 5379f0e987bfbfb21ebd5406bd6c27bc58b74924..32e2251855b6fe9fbdb49f76be563f02
 +				}
 +				this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, "default");
 +			} catch (error) {
-+				await this.settings.setGlobalModelRoleAndFlush("default", previousDefaultModelRole).catch(rollbackError => {
-+					logger.warn("Failed to restore durable default model selection after live apply failure", {
-+						error: String(rollbackError),
++				await this.settings
++					.setGlobalModelRoleIfCurrentAndFlush("default", selectedDefaultModelRole, previousDefaultModelRole)
++					.catch(rollbackError => {
++						logger.warn("Failed to restore durable default model selection after live apply failure", {
++							error: String(rollbackError),
++						});
 +					});
-+				});
 +				throw error;
 +			}
 +			return { provider: model.provider, modelId: model.id, thinkingLevel: effectiveLevel };

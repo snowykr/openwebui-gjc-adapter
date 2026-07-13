@@ -1,9 +1,13 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import { join } from "node:path";
 import type { RpcClientOptions, RpcDefaultModelSelection } from "@gajae-code/coding-agent";
+import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
+import { YAML } from "bun";
 
 const PATCH_PATH = join(import.meta.dir, "..", "patches", "@gajae-code%2Fcoding-agent@0.10.0.patch");
-const EXPECTED_PATCH_SHA256 = "3200948e7617b93d54df1431dfd368af60c1549f05e894e39ed7893e3f6f3328";
+const EXPECTED_PATCH_SHA256 = "73d29f9fc3575f46dd0e5e8bca8a4aff575a4a62531cdb4069458553ce6ecd8a";
 const EXPECTED_PATCH_FILES = [
 	"dist/types/config/settings.d.ts",
 	"dist/types/modes/index.d.ts",
@@ -20,8 +24,8 @@ const EXPECTED_PATCH_FILES = [
 	"src/modes/shared/agent-wire/scopes.ts",
 	"src/session/agent-session.ts",
 ] as const;
-const EXPECTED_PATCH_BYTES = 277_547;
-const EXPECTED_PATCH_LINES = 736;
+const EXPECTED_PATCH_BYTES = 279_523;
+const EXPECTED_PATCH_LINES = 788;
 const UNDEFINED_ENV_OPTIONS = { env: { PI_CONFIG_DIR: undefined } } satisfies RpcClientOptions;
 
 function retainSelectionType(selection: RpcDefaultModelSelection): RpcDefaultModelSelection {
@@ -67,6 +71,10 @@ describe("approved canonical setter dependency", () => {
 		expect(headers.every(match => match[1] === match[2])).toBe(true);
 		expect(patch).toContain("env?: Readonly<Record<string, string | undefined>>;");
 		expect(patch).toContain("type RpcDefaultModelSelection,");
+		expect(patch).toContain("setGlobalModelRoleIfCurrentAndFlush(");
+		expect(patch).toContain(
+			'setGlobalModelRoleIfCurrentAndFlush("default", selectedDefaultModelRole, previousDefaultModelRole)',
+		);
 	});
 
 	test("exports the positional canonical setter when the installed package is loaded", async () => {
@@ -85,5 +93,38 @@ describe("approved canonical setter dependency", () => {
 			modelId: "model",
 			thinkingLevel: "off",
 		});
+	});
+
+	test("does not restore a stale default over a newer external selection", async () => {
+		// Given: this process has durably selected a model, then another RPC process has persisted a newer default.
+		const testDir = await fs.mkdtemp(join(os.tmpdir(), "openwebui-gjc-adapter-default-model-race-"));
+		const agentDir = join(testDir, "agent");
+		const projectDir = join(testDir, "project");
+		const configPath = join(agentDir, "config.yml");
+		try {
+			await fs.mkdir(agentDir, { recursive: true });
+			await fs.mkdir(projectDir, { recursive: true });
+			await Bun.write(configPath, YAML.stringify({ modelRoles: { default: "provider/original:low" } }));
+			const settings = await Settings.init({ agentDir, cwd: projectDir });
+			await settings.setGlobalModelRoleAndFlush("default", "provider/failing:medium");
+			await Bun.write(configPath, YAML.stringify({ modelRoles: { default: "provider/newer:high" } }));
+
+			// When: the failed selection attempts its durable rollback.
+			const restored = await settings.setGlobalModelRoleIfCurrentAndFlush(
+				"default",
+				"provider/failing:medium",
+				"provider/original:low",
+			);
+
+			// Then: the newer shared-file value survives.
+			expect(restored).toBe(false);
+			expect(YAML.parse(await Bun.file(configPath).text())).toEqual({
+				modelRoles: { default: "provider/newer:high" },
+			});
+			expect(settings.getGlobal("modelRoles")).toEqual({ default: "provider/newer:high" });
+		} finally {
+			resetSettingsForTest();
+			await fs.rm(testDir, { recursive: true, force: true });
+		}
 	});
 });
