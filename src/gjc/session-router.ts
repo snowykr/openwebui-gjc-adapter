@@ -128,10 +128,7 @@ export async function routeGjcTurn(input: RouteGjcTurnInput): Promise<RouteGjcTu
 		...address,
 		sessionFile: existingSessionFile,
 	});
-	const state =
-		input.modelSelection === undefined
-			? await input.runner.getState({ ...address, sessionFile: existingSessionFile })
-			: existing;
+	const state = await input.runner.getState({ ...address, sessionFile: existingSessionFile });
 	const result = await input.runner.continueSession({
 		...address,
 		userMessageId: input.userMessageId,

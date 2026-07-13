@@ -161,6 +161,14 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		const selectedInput = continued ? turnRunner.continues[0] : turnRunner.starts[0];
 		expect(transcript).toEqual(["catalog", "state", "stop"]);
 		expect(selectedInput?.modelSelection).toEqual(lowSelection);
+		if (continued) {
+			expect(turnRunner.states).toHaveLength(1);
+			expect(selectedInput).toMatchObject({
+				activeLeaf: "leaf-1",
+				rawFrameCursor: 7,
+				eventCursor: 3,
+			});
+		}
 		expect(mappings.get(continued ? "chat-1" : "chat-neutral")?.modelSelection).toEqual(mediumSelection);
 		expect(result.model).toBe("gjc/anthropic/claude-sonnet-4:medium");
 	});
