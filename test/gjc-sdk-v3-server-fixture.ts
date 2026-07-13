@@ -20,7 +20,13 @@ export function startSdkFixtureServer(scenario: SdkFixtureScenario): SdkFixtureS
 		websocket: {
 			open(socket) {
 				connections += 1;
-				socket.send(JSON.stringify({ type: "server_hello", protocolVersion: 3, connectionId: `c-${connections}` }));
+				socket.send(
+					JSON.stringify({
+						type: "server_hello",
+						protocolVersion: scenario === "hello_failure" ? 2 : 3,
+						connectionId: `c-${connections}`,
+					}),
+				);
 			},
 			message(socket, message) {
 				const frame = parseFrame(message);

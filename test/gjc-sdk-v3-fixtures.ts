@@ -11,7 +11,10 @@ import { startSdkFixtureServer } from "./gjc-sdk-v3-server-fixture";
 export type { SdkFixtureScenario, SdkFixtureServer, SdkFrame } from "./gjc-sdk-v3-fixture-types";
 export { expectSdkRequest, startSdkFixtureServer } from "./gjc-sdk-v3-server-fixture";
 
-export function createSdkTransportFixture(scenario: SdkFixtureScenario) {
+export function createSdkTransportFixture(
+	scenario: SdkFixtureScenario,
+	options: { readonly closeFailure?: boolean } = {},
+) {
 	const root = mkdtempSync(join(tmpdir(), "gjc-sdk-v3-contract-"));
 	const home = join(root, "home");
 	const agentDir = join(home, ".gjc", "agent");
@@ -37,6 +40,7 @@ export function createSdkTransportFixture(scenario: SdkFixtureScenario) {
 		GJC_SDK_FIXTURE_ENDPOINT_TOKEN: server.token,
 		GJC_SDK_FIXTURE_EXPECTED_CWD: cwd,
 		GJC_SDK_FIXTURE_SAVED_PATH: savedSessionPath,
+		GJC_SDK_FIXTURE_CLOSE_FAILURE: options.closeFailure ? "1" : undefined,
 		PATH: `${dirname(process.execPath)}:${process.env.PATH ?? ""}`,
 	};
 	const previousFixtureEnvironment = Object.fromEntries(

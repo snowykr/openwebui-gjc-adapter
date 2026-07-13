@@ -40,7 +40,11 @@ async function startReader(transport: GjcRpcSelectionTransport): Promise<ModelRe
 		await transport.newEphemeralSession?.();
 		return transport;
 	} catch (error) {
-		await transport.stop();
+		try {
+			await transport.stop();
+		} catch (cleanupError) {
+			throw new AggregateError([error, cleanupError], "GJC model reader startup and cleanup failed");
+		}
 		throw error;
 	}
 }

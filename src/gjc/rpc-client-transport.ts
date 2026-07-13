@@ -49,7 +49,7 @@ class SdkV3Transport implements GjcRpcSelectionTransport {
 	readonly #gateListeners = new Set<(gate: GjcRpcRunnerTransportEvent) => void>();
 	#authority: SdkSessionAuthority | undefined;
 	#client: SdkV3Client | undefined;
-	#ephemeral = false;
+	#ephemeralSessionId: string | undefined;
 	#lastFinalizedAssistantText: string | undefined;
 	readonly #pendingGateTurns = new Map<string, SdkTurnCorrelation>();
 
@@ -61,16 +61,14 @@ class SdkV3Transport implements GjcRpcSelectionTransport {
 
 	async stop(): Promise<void> {
 		const client = this.#client;
-		const authority = this.#authority;
-		const ephemeral = this.#ephemeral;
+		const ephemeralSessionId = this.#ephemeralSessionId;
 		this.#client = undefined;
 		this.#authority = undefined;
-		this.#ephemeral = false;
+		this.#ephemeralSessionId = undefined;
 		this.#pendingGateTurns.clear();
 		client?.close();
-		if (ephemeral && authority !== undefined) {
-			await this.#cli.closeSession(authority.sessionId, randomUUID()).catch(() => undefined);
-		}
+		if (ephemeralSessionId === undefined) return;
+		await this.#cli.closeSession(ephemeralSessionId, randomUUID());
 	}
 
 	async newSession(): Promise<{ readonly cancelled: boolean }> {
@@ -79,8 +77,9 @@ class SdkV3Transport implements GjcRpcSelectionTransport {
 	}
 
 	async newEphemeralSession(): Promise<void> {
-		await this.newSession();
-		this.#ephemeral = true;
+		const authority = await this.#cli.createSession(randomUUID());
+		this.#ephemeralSessionId = authority.sessionId;
+		await this.connect(authority);
 	}
 
 	async switchSession(sessionPath?: string, sessionId?: string): Promise<{ readonly cancelled: boolean }> {
@@ -217,7 +216,12 @@ class SdkV3Transport implements GjcRpcSelectionTransport {
 		this.#lastFinalizedAssistantText = undefined;
 		this.#pendingGateTurns.clear();
 		const client = new SdkV3Client(authority.endpoint);
-		await client.connect();
+		try {
+			await client.connect();
+		} catch (error) {
+			client.close();
+			throw error;
+		}
 		this.#client = client;
 		this.#authority = authority;
 	}

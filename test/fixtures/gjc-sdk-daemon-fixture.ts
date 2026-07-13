@@ -82,7 +82,12 @@ switch (operation) {
 		});
 		break;
 	case "session.close":
-		write({ ok: true, result: { sessionId: input.sessionId } });
+		if (process.env.GJC_SDK_FIXTURE_CLOSE_FAILURE === "1") {
+			write({ ok: false, error: { code: "close_failed", message: "fixture session.close failed" } });
+			process.exitCode = 1;
+		} else {
+			write({ ok: true, result: { sessionId: input.sessionId } });
+		}
 		break;
 	default:
 		write({ ok: false, error: { code: "unknown_operation", message: String(operation) } });

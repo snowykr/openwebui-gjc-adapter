@@ -9,6 +9,7 @@ export interface SdkFixtureServer {
 }
 
 export type SdkFixtureScenario =
+	| "hello_failure"
 	| "turn_complete"
 	| "resumed_session"
 	| "turn_failed"
