@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -36,38 +36,66 @@ describe("SDK v3 lifecycle CLI boundary", () => {
 		}
 	});
 
-	test("Given a hostile project bunfig and dotenv When creating a session Then trusted CLI isolation wins", async () => {
-		const fixture = createCliFixture();
-		try {
-			const preloadMarker = join(fixture.root, "preload-ran");
-			const agentPreloadMarker = join(fixture.root, "agent-preload-ran");
-			writeFileSync(join(fixture.cwd, "preload.ts"), `await Bun.write(${JSON.stringify(preloadMarker)}, "ran");\n`);
-			writeFileSync(join(fixture.cwd, "bunfig.toml"), '[run]\npreload = ["./preload.ts"]\n');
-			writeFileSync(join(fixture.cwd, ".env"), "GJC_SDK_HOSTILE_DOTENV=loaded\n");
-			writeFileSync(
-				join(fixture.agentDir, "preload.ts"),
-				`await Bun.write(${JSON.stringify(agentPreloadMarker)}, "ran");\n`,
+	for (const [cliKind, useWrapper] of [
+		["source CLI", false],
+		["extensionless wrapper", true],
+	] as const) {
+		test(`Given hostile bunfig and dotenv with ${cliKind} When creating a session Then trusted isolation wins`, async () => {
+			const fixture = createCliFixture(
+				{
+					BUN_OPTIONS: "--smol",
+					GJC_SDK_FIXTURE_SPAWN_RAW_BUN: "1",
+				},
+				1_000,
+				useWrapper,
 			);
-			writeFileSync(join(fixture.agentDir, "bunfig.toml"), '[run]\npreload = ["./preload.ts"]\n');
-			writeFileSync(join(fixture.agentDir, ".env"), "GJC_SDK_AGENT_DOTENV=loaded\n");
+			try {
+				const preloadMarker = join(fixture.root, "preload-ran");
+				const agentPreloadMarker = join(fixture.root, "agent-preload-ran");
+				const rawBunChildEntrypoint = join(fixture.root, "raw-bun-child.ts");
+				fixture.environment.GJC_SDK_FIXTURE_RAW_BUN_CHILD_ENTRYPOINT = rawBunChildEntrypoint;
+				writeFileSync(
+					rawBunChildEntrypoint,
+					"process.stdout.write(JSON.stringify({ bunOptions: process.env.BUN_OPTIONS }));\n",
+				);
+				writeFileSync(
+					join(fixture.cwd, "preload.ts"),
+					`await Bun.write(${JSON.stringify(preloadMarker)}, "ran");\n`,
+				);
+				writeFileSync(join(fixture.cwd, "bunfig.toml"), 'preload = ["./preload.ts"]\n');
+				writeFileSync(join(fixture.cwd, ".env"), "GJC_SDK_HOSTILE_DOTENV=loaded\n");
+				writeFileSync(
+					join(fixture.agentDir, "preload.ts"),
+					`await Bun.write(${JSON.stringify(agentPreloadMarker)}, "ran");\n`,
+				);
+				writeFileSync(join(fixture.agentDir, "bunfig.toml"), 'preload = ["./preload.ts"]\n');
+				writeFileSync(join(fixture.agentDir, ".env"), "GJC_SDK_AGENT_DOTENV=loaded\nBUN_OPTIONS=\n");
 
-			const authority = await fixture.cli.createSession("create-key");
-			const invocation = firstTranscriptRecord(fixture.transcript);
+				const authority = await fixture.cli.createSession("create-key");
+				const invocation = firstTranscriptRecord(fixture.transcript);
 
-			expect(authority.cwd).toBe(fixture.cwd);
-			expect(invocation.cwd).toBe(fixture.agentDir);
-			expect(invocation.hostileDotenv).toBeUndefined();
-			expect(invocation.agentDotenv).toBeUndefined();
-			expect(invocation.sessionCommand).toBe(join(fixture.agentDir, "sdk-session-host"));
-			const launcher = readFileSync(String(invocation.sessionCommand), "utf8");
-			expect(launcher).toContain("--no-env-file --config=/dev/null");
-			expect(launcher).toContain("sdk session-host-internal");
-			expect(await Bun.file(preloadMarker).exists()).toBe(false);
-			expect(await Bun.file(agentPreloadMarker).exists()).toBe(false);
-		} finally {
-			fixture.dispose();
-		}
-	});
+				expect(authority.cwd).toBe(fixture.cwd);
+				expect(invocation.cwd).toBe(fixture.agentDir);
+				expect(invocation.hostileDotenv).toBeUndefined();
+				expect(invocation.agentDotenv).toBeUndefined();
+				const expectedSessionCommand = useWrapper
+					? `${fixture.cliPath} sdk session-host-internal`
+					: join(fixture.agentDir, "sdk-session-host");
+				expect(invocation.sessionCommand).toBe(expectedSessionCommand);
+				expect(await Bun.file(preloadMarker).exists()).toBe(false);
+				expect(await Bun.file(agentPreloadMarker).exists()).toBe(false);
+				expect(invocation.rawBunChild).toEqual({
+					exitCode: 0,
+					stdout: JSON.stringify({ bunOptions: "--no-env-file --config=/dev/null" }),
+					stderr: "",
+				});
+				const launcher = readFileSync(useWrapper ? fixture.cliPath : expectedSessionCommand, "utf8");
+				expect(launcher).toContain("--no-env-file --config=/dev/null");
+			} finally {
+				fixture.dispose();
+			}
+		});
+	}
 
 	test("Given a lifecycle subprocess exceeds its deadline When creating Then it is killed with a typed timeout", async () => {
 		const fixture = createCliFixture({ GJC_SDK_FIXTURE_DELAY_MS: "500" }, 30);
@@ -97,12 +125,14 @@ describe("SDK v3 lifecycle CLI boundary", () => {
 function createCliFixture(
 	extraEnvironment: Readonly<Record<string, string>> = {},
 	timeoutMs = 1_000,
+	useWrapper = false,
 ): {
 	readonly root: string;
 	readonly cwd: string;
 	readonly agentDir: string;
 	readonly sessionRoot: string;
 	readonly transcript: string;
+	readonly cliPath: string;
 	readonly environment: Record<string, string | undefined>;
 	readonly cli: SdkV3Cli;
 	dispose(): void;
@@ -113,6 +143,14 @@ function createCliFixture(
 	const sessionRoot = join(agentDir, "sessions", "project");
 	const transcript = join(root, "cli.jsonl");
 	for (const path of [cwd, agentDir, sessionRoot]) mkdirSync(path, { recursive: true });
+	const cliPath = useWrapper ? join(root, "gjc") : fixtureCli;
+	if (useWrapper) {
+		writeFileSync(
+			cliPath,
+			`#!/bin/sh\nexec ${JSON.stringify(process.execPath)} --no-env-file --config=/dev/null ${JSON.stringify(fixtureCli)} "$@"\n`,
+		);
+		chmodSync(cliPath, 0o700);
+	}
 	writeFileSync(transcript, "");
 	const environment: Record<string, string | undefined> = {
 		...process.env,
@@ -122,13 +160,14 @@ function createCliFixture(
 		GJC_SDK_FIXTURE_SAVED_PATH: join(sessionRoot, "expected-session.jsonl"),
 		...extraEnvironment,
 	};
-	const cli = new SdkV3Cli({ cliPath: fixtureCli, cwd, agentDir, sessionRoot, environment, timeoutMs });
+	const cli = new SdkV3Cli({ cliPath, cwd, agentDir, sessionRoot, environment, timeoutMs });
 	return {
 		root,
 		cwd,
 		agentDir,
 		sessionRoot,
 		transcript,
+		cliPath,
 		environment,
 		cli,
 		dispose: () => rmSync(root, { recursive: true }),

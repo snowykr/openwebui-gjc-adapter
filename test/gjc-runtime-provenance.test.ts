@@ -92,6 +92,15 @@ describe("GJC SDK runtime provenance", () => {
 		expect(dockerfile).not.toContain("COPY patches ./patches");
 	});
 
+	test("pins recursive Bun isolation at the SDK lifecycle environment boundary", async () => {
+		// Given
+		const source = await Bun.file(join(ROOT, "src/gjc/sdk-v3-cli.ts")).text();
+
+		// Then
+		expect(source).toContain('const ISOLATED_BUN_OPTIONS = "--no-env-file --config=/dev/null";');
+		expect(source).toContain("BUN_OPTIONS: ISOLATED_BUN_OPTIONS");
+	});
+
 	test("uses absolute system paths when creating the unprivileged adapter user", async () => {
 		// Given
 		const dockerfile = await Bun.file(join(ROOT, "Dockerfile.adapter")).text();
