@@ -130,8 +130,8 @@ describe("createGjcRpcTurnRunner workflow gates", () => {
 
 		expect(client.calls).toEqual([
 			{ type: "start" },
-			{ type: "respond_gate", gateId: "gate-deep-1", answer: { selected: ["JWT"] }, idempotencyKey: "idem-deep-1" },
 			{ type: "get_state" },
+			{ type: "respond_gate", gateId: "gate-deep-1", answer: { selected: ["JWT"] }, idempotencyKey: "idem-deep-1" },
 			{ type: "get_last_assistant_text" },
 		]);
 		expect(result).toMatchObject({ text: "accepted", rawFrameCursor: 11, eventCursor: 5 });
@@ -173,6 +173,7 @@ describe("createGjcRpcTurnRunner workflow gates", () => {
 		).rejects.toThrow("GJC RPC workflow_gate_response failed: invalid_workflow_gate_answer");
 		expect(client.calls).toEqual([
 			{ type: "start" },
+			{ type: "get_state" },
 			{ type: "respond_gate", gateId: "gate-deep-1", answer: { selected: ["BAD"] }, idempotencyKey: "idem-deep-1" },
 		]);
 	});

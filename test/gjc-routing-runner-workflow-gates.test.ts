@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { SessionMappingStore } from "../src/gjc/session-router";
+import { createHash } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { FileBackedSessionMappingStore, SessionMappingStore } from "../src/gjc/session-router";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
+import { InMemoryOutboxStore } from "../src/state/outbox";
 import {
 	decisionWorkflowGateEvent,
 	deepInterviewWorkflowGateEvent,
@@ -82,6 +87,122 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 			},
 		]);
 	});
+
+	test("classifies duplicate replay before catalog or transport and keeps its immutable binding", async () => {
+		const turnRunner = new FakeGjcTurnRunner();
+		const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent);
+		mappings.upsert({ ...requiredMapping(mappings), operationId: "user-2", assistantText: "cached" });
+		let readerCount = 0;
+		const runner = createGjcRoutingLiveGatewayRunner({
+			turnRunner,
+			mappings,
+			requestedModelId: () => "gjc",
+			createNeutralModelReader: () => {
+				readerCount += 1;
+				throw new Error("must not read");
+			},
+		});
+
+		expect(await runner.run(replyInput("1"))).toMatchObject({
+			content: "cached",
+			model: "gjc/anthropic/claude-sonnet-4:medium",
+		});
+		expect(readerCount).toBe(0);
+		expect(turnRunner.gateResponses).toHaveLength(0);
+		expect(turnRunner.starts).toHaveLength(0);
+	});
+
+	test("rejects pending missing or mismatched bindings without mutable reads or writes", async () => {
+		for (const modelSelection of [
+			undefined,
+			{ provider: "openai", modelId: "gpt-5", thinkingLevel: "high" },
+		] as const) {
+			const turnRunner = new FakeGjcTurnRunner();
+			const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent);
+			const before = requiredMapping(mappings);
+			mappings.set({ ...before, modelSelection });
+			let readerCount = 0;
+			const runner = createGjcRoutingLiveGatewayRunner({
+				turnRunner,
+				mappings,
+				requestedModelId: () => "gjc/anthropic/claude-sonnet-4:medium",
+				createNeutralModelReader: () => {
+					readerCount += 1;
+					throw new Error("must not read");
+				},
+			});
+
+			await expect(runner.run(replyInput("1"))).rejects.toThrow(
+				modelSelection === undefined ? "no valid GJC model selection binding" : "original GJC model selection",
+			);
+			expect(readerCount).toBe(0);
+			expect(turnRunner.gateResponses).toHaveLength(0);
+			expect(mappings.get("chat-1")).toEqual({ ...before, modelSelection });
+		}
+	});
+
+	test("answers a matching pending gate from its bound tuple despite mutable catalog drift", async () => {
+		const turnRunner = new FakeGjcTurnRunner();
+		const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent);
+		let readerCount = 0;
+		const runner = createGjcRoutingLiveGatewayRunner({
+			turnRunner,
+			mappings,
+			requestedModelId: () => "gjc",
+			createNeutralModelReader: () => {
+				readerCount += 1;
+				throw new Error("drifted catalog must not be read");
+			},
+		});
+
+		expect(await runner.run(replyInput("1"))).toEqual({
+			content: "workflow gate accepted",
+			model: "gjc/anthropic/claude-sonnet-4:medium",
+		});
+		expect(readerCount).toBe(0);
+		expect(turnRunner.gateResponses).toHaveLength(1);
+		expect(mappings.get("chat-1")?.modelSelection).toEqual({
+			provider: "anthropic",
+			modelId: "claude-sonnet-4",
+			thinkingLevel: "medium",
+		});
+	});
+
+	for (const failure of ["setter", "prompt"] as const) {
+		test(`keeps file-backed bytes and outbox unchanged after selected ${failure} failure`, async () => {
+			const root = mkdtempSync(join(tmpdir(), `gjc-${failure}-failure-`));
+			try {
+				const filePath = join(root, "mappings.json");
+				const mappings = new FileBackedSessionMappingStore(filePath);
+				mappings.set({ ...baseMapping("seed-chat"), operationId: "seed-user" });
+				const before = readFileSync(filePath, "utf8");
+				const turnRunner = new FakeGjcTurnRunner();
+				const start = turnRunner.startNewSession.bind(turnRunner);
+				turnRunner.startNewSession = async input => {
+					if (failure === "prompt") await start(input);
+					throw new Error(`${failure} failed`);
+				};
+				const outbox = new InMemoryOutboxStore();
+				const runner = createGjcRoutingLiveGatewayRunner({
+					turnRunner,
+					mappings,
+					outbox,
+					requestedModelId: () => "gjc/anthropic/claude-sonnet-4:low",
+					createNeutralModelReader: selectedReader,
+				});
+
+				await expect(runner.run({ ...replyInput("hello"), chatId: "failed-chat" })).rejects.toThrow(
+					`${failure} failed`,
+				);
+				expect(mappings.get("failed-chat")).toBeUndefined();
+				expect(readFileSync(filePath, "utf8")).toBe(before);
+				expect(hashText(readFileSync(filePath, "utf8"))).toBe(hashText(before));
+				expect(outbox.listPending()).toHaveLength(0);
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		});
+	}
 });
 
 function pendingGateMappings(event: unknown, sessionFile = "/workspace/project/.gjc/sessions/session-1.jsonl") {
@@ -96,9 +217,16 @@ function pendingGateMappings(event: unknown, sessionFile = "/workspace/project/.
 		eventCursor: 3,
 		operationId: "user-1",
 		assistantText: "pending",
+		modelSelection: { provider: "anthropic", modelId: "claude-sonnet-4", thinkingLevel: "medium" },
 		events: [event as never],
 	});
 	return mappings;
+}
+
+function requiredMapping(mappings: SessionMappingStore) {
+	const mapping = mappings.get("chat-1");
+	if (mapping === undefined) throw new Error("expected mapping");
+	return mapping;
 }
 
 function replyInput(prompt: string) {
@@ -111,4 +239,38 @@ function replyInput(prompt: string) {
 		userMessageParentId: "user-1",
 		continued: true,
 	};
+}
+
+function baseMapping(chatId: string) {
+	return {
+		chatId,
+		projectId: project.id,
+		sessionId: "session-1",
+		rawFrameCursor: 0,
+		eventCursor: 0,
+		operationId: "user-1",
+	};
+}
+
+function selectedReader() {
+	return {
+		async getAvailableModels() {
+			return [
+				{
+					provider: "anthropic",
+					id: "claude-sonnet-4",
+					reasoning: true,
+					thinking: { minLevel: "low", maxLevel: "low", mode: "effort" },
+				},
+			];
+		},
+		async getState() {
+			return {};
+		},
+		stop() {},
+	};
+}
+
+function hashText(value: string): string {
+	return createHash("sha256").update(value).digest("hex");
 }

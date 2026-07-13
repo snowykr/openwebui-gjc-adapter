@@ -1,7 +1,7 @@
 import { classifyRpcFrame } from "../gjc/rpc-frames";
 import type { GjcTurnEvent, GjcTurnRunner } from "../gjc/rpc-runner";
 import type { SessionMapping, SessionMappingStore } from "../gjc/session-router";
-import { validateSessionFile } from "../gjc/session-router";
+import { normalizeModelSelection, validateSessionFile } from "../gjc/session-router";
 import type { OpenWebUIMessageEvent } from "../openwebui/events";
 import { type ProjectableAgentFrame, projectAgentFrame } from "../projection/events";
 import {
@@ -26,8 +26,9 @@ export interface WorkflowGateTurnDependencies {
 export async function handleWorkflowGateReply(
 	input: WorkflowGateTurnDependencies,
 	turn: LiveGatewayRunnerInput,
+	preflightMapping?: SessionMapping,
 ): Promise<LiveGatewayRunnerResult | null> {
-	const mapping = input.mappings.get(turn.chatId);
+	const mapping = preflightMapping ?? input.mappings.get(turn.chatId);
 	if (mapping === undefined || mapping.projectId !== turn.project.id) return null;
 	const pendingGate = latestPendingWorkflowGate(mapping.events ?? []);
 	if (pendingGate === null) return null;
@@ -134,6 +135,7 @@ export function buildSessionMappingPayloadHash(mapping: SessionMapping): string 
 		eventCursor: mapping.eventCursor,
 		operationId: mapping.operationId,
 		assistantText: mapping.assistantText ?? null,
+		modelSelection: normalizeModelSelection(mapping.modelSelection) ?? null,
 		events: (mapping.events ?? []).map(event => ({
 			type: event.type,
 			text: event.text ?? null,

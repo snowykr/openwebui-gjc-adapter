@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FileBackedSessionMappingStore, SessionMappingStore } from "../src/gjc/session-router";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
+import { buildSessionMappingPayloadHash } from "../src/live/workflow-gate-turns";
 import { InMemoryOutboxStore } from "../src/state/outbox";
 import { FakeGjcTurnRunner, project } from "./gjc-routing-runner-fixtures";
 
@@ -68,6 +69,44 @@ describe("createGjcRoutingLiveGatewayRunner", () => {
 
 		const second = new FileBackedSessionMappingStore(filePath);
 		expect(second.get("chat-1")).toEqual(first.get("chat-1"));
+	});
+
+	test("serializes only exact normalized tuple keys", () => {
+		withFileStore((store, filePath) => {
+			const modelSelection = { ...mediumSelection };
+			Reflect.set(modelSelection, "canonicalId", "gjc/anthropic/claude-sonnet-4:medium");
+			store.set(mappingInput(modelSelection));
+			const persisted = JSON.parse(readFileSync(filePath, "utf8"));
+			expect(persisted.mappings[0].modelSelection).toEqual(mediumSelection);
+			expect(JSON.stringify(persisted)).not.toContain("gjc/anthropic");
+		});
+	});
+
+	test("round-trips a normalized tuple through a file-backed reload", () => {
+		withFileStore((store, filePath) => {
+			store.set(mappingInput(mediumSelection));
+			expect(new FileBackedSessionMappingStore(filePath).get("chat-1")?.modelSelection).toEqual(mediumSelection);
+		});
+	});
+
+	test("includes the normalized tuple in the mapping payload hash", () => {
+		withFileStore(store => {
+			const mapping = store.set(mappingInput(mediumSelection));
+			expect(buildSessionMappingPayloadHash(mapping)).not.toBe(
+				buildSessionMappingPayloadHash({ ...mapping, modelSelection: undefined }),
+			);
+		});
+	});
+
+	test("strips corrupted tuples when loading a file-backed mapping", () => {
+		withFileStore((store, filePath) => {
+			const mapping = store.set(mappingInput(mediumSelection));
+			writeFileSync(
+				filePath,
+				JSON.stringify({ mappings: [{ ...mapping, modelSelection: { ...mediumSelection, provider: "a%2Fb" } }] }),
+			);
+			expect(new FileBackedSessionMappingStore(filePath).get("chat-1")?.modelSelection).toBeUndefined();
+		});
 	});
 
 	test("returns cached duplicate content after store reload without rerunning", async () => {
@@ -137,4 +176,92 @@ describe("createGjcRoutingLiveGatewayRunner", () => {
 		if (enqueued === undefined) throw new Error("expected enqueued operation");
 		expect(operations[0]?.payloadHash).toBe(enqueued.payloadHash);
 	});
+
+	test.each([
+		["start", false],
+		["continuation", true],
+	] as const)("reports the returned %s selection instead of its requested alias", async (_label, continued) => {
+		const turnRunner = new FakeGjcTurnRunner();
+		const start = turnRunner.startNewSession.bind(turnRunner);
+		turnRunner.startNewSession = async input => ({ ...(await start(input)), modelSelection: mediumSelection });
+		const resume = turnRunner.continueSession.bind(turnRunner);
+		turnRunner.continueSession = async input => ({ ...(await resume(input)), modelSelection: mediumSelection });
+		const mappings = new SessionMappingStore();
+		if (continued) mappings.set(mappingInput(mediumSelection));
+		const transcript: string[] = [];
+		const runner = createGjcRoutingLiveGatewayRunner({
+			turnRunner,
+			mappings,
+			requestedModelId: () => "gjc",
+			createNeutralModelReader: () => neutralReader(transcript),
+		});
+
+		const result = await runner.run(turn(continued ? "chat-1" : "chat-neutral", "user-2", continued));
+		const selectedInput = continued ? turnRunner.continues[0] : turnRunner.starts[0];
+		expect(transcript).toEqual(["catalog", "state", "stop"]);
+		expect(selectedInput?.modelSelection).toEqual(lowSelection);
+		expect(mappings.get(continued ? "chat-1" : "chat-neutral")?.modelSelection).toEqual(mediumSelection);
+		expect(result.model).toBe("gjc/anthropic/claude-sonnet-4:medium");
+	});
 });
+
+const lowSelection = { provider: "anthropic", modelId: "claude-sonnet-4", thinkingLevel: "low" } as const;
+const mediumSelection = { ...lowSelection, thinkingLevel: "medium" } as const;
+
+function mappingInput(modelSelection: typeof mediumSelection) {
+	return {
+		chatId: "chat-1",
+		projectId: project.id,
+		sessionId: "session-1",
+		sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
+		rawFrameCursor: 0,
+		eventCursor: 0,
+		operationId: "user-1",
+		modelSelection,
+	};
+}
+
+function withFileStore(run: (store: FileBackedSessionMappingStore, filePath: string) => void): void {
+	const root = mkdtempSync(join(tmpdir(), "gjc-selection-mapping-"));
+	const filePath = join(root, "mappings.json");
+	try {
+		run(new FileBackedSessionMappingStore(filePath), filePath);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+}
+
+function neutralReader(transcript: string[]) {
+	return {
+		async getAvailableModels() {
+			transcript.push("catalog");
+			return [
+				{
+					provider: "anthropic",
+					id: "claude-sonnet-4",
+					reasoning: true,
+					thinking: { minLevel: "low", maxLevel: "medium", mode: "effort" },
+				},
+			];
+		},
+		async getState() {
+			transcript.push("state");
+			return { model: { provider: "anthropic", id: "claude-sonnet-4" }, thinkingLevel: "low" };
+		},
+		stop() {
+			transcript.push("stop");
+		},
+	};
+}
+
+function turn(chatId: string, userMessageId: string, continued = false) {
+	return {
+		project,
+		prompt: "hello",
+		chatId,
+		messageId: `assistant-${userMessageId}`,
+		userMessageId,
+		userMessageParentId: null,
+		continued,
+	};
+}

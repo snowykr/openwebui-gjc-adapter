@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import type { NormalizedModelSelection } from "../src/contracts";
 import type {
 	GjcContinueSessionInput,
 	GjcSessionAddress,
@@ -9,7 +10,7 @@ import type {
 	GjcTurnResult,
 	GjcTurnRunner,
 } from "../src/gjc/rpc-runner";
-import { routeGjcTurn, SessionMappingStore } from "../src/gjc/session-router";
+import { type RouteGjcTurnInput, routeGjcTurn, SessionMappingStore } from "../src/gjc/session-router";
 import type { RegisteredProject } from "../src/projects/registry";
 
 class FakeGjcTurnRunner implements GjcTurnRunner {
@@ -24,9 +25,12 @@ class FakeGjcTurnRunner implements GjcTurnRunner {
 		rawFrameCursor: 7,
 		eventCursor: 3,
 	};
+	returnedSelection: NormalizedModelSelection | undefined;
+	failPrompt = false;
 
 	async startNewSession(input: GjcStartNewSessionInput): Promise<GjcSessionAddress & GjcTurnResult> {
 		this.starts.push(input);
+		if (this.failPrompt) throw new Error("prompt failed");
 		return {
 			cwd: input.cwd,
 			sessionRoot: input.sessionRoot,
@@ -39,11 +43,13 @@ class FakeGjcTurnRunner implements GjcTurnRunner {
 			activeLeaf: "leaf-1",
 			rawFrameCursor: 7,
 			eventCursor: 3,
+			...(this.returnedSelection === undefined ? {} : { modelSelection: this.returnedSelection }),
 		};
 	}
 
 	async continueSession(input: GjcContinueSessionInput): Promise<GjcTurnResult> {
 		this.continues.push(input);
+		if (this.failPrompt) throw new Error("prompt failed");
 		return {
 			text: `continued:${input.text}`,
 			events: [{ type: "assistant", text: `continued:${input.text}` }],
@@ -51,6 +57,7 @@ class FakeGjcTurnRunner implements GjcTurnRunner {
 			activeLeaf: "leaf-2",
 			rawFrameCursor: input.rawFrameCursor + 5,
 			eventCursor: input.eventCursor + 2,
+			...(this.returnedSelection === undefined ? {} : { modelSelection: this.returnedSelection }),
 		};
 	}
 
@@ -70,14 +77,7 @@ describe("routeGjcTurn", () => {
 		const mappings = new SessionMappingStore();
 		const project = createProject();
 
-		const result = await routeGjcTurn({
-			project,
-			chatId: "chat-1",
-			userMessageId: "message-1",
-			text: "hello",
-			runner,
-			mappings,
-		});
+		const result = await routeGjcTurn(routeInput(runner, mappings, { project }));
 
 		expect(runner.starts).toHaveLength(1);
 		expect(runner.starts[0]).toMatchObject({
@@ -120,15 +120,13 @@ describe("routeGjcTurn", () => {
 			operationId: "message-1",
 		});
 
-		const result = await routeGjcTurn({
-			project,
-			chatId: "chat-1",
-			userMessageId: "message-2",
-			parentId: "message-1",
-			text: "again",
-			runner,
-			mappings,
-		});
+		const result = await routeGjcTurn(
+			routeInput(runner, mappings, {
+				userMessageId: "message-2",
+				parentId: "message-1",
+				text: "again",
+			}),
+		);
 
 		expect(runner.starts).toHaveLength(0);
 		expect(runner.switches).toHaveLength(1);
@@ -170,14 +168,12 @@ describe("routeGjcTurn", () => {
 		});
 
 		await expect(
-			routeGjcTurn({
-				project,
-				chatId: "chat-1",
-				userMessageId: "message-2",
-				text: "again",
-				runner,
-				mappings,
-			}),
+			routeGjcTurn(
+				routeInput(runner, mappings, {
+					userMessageId: "message-2",
+					text: "again",
+				}),
+			),
 		).rejects.toThrow("outside project session root");
 		expect(runner.switches).toHaveLength(0);
 	});
@@ -185,24 +181,9 @@ describe("routeGjcTurn", () => {
 	test("keeps one mapping and does not rerun duplicate operations", async () => {
 		const runner = new FakeGjcTurnRunner();
 		const mappings = new SessionMappingStore();
-		const project = createProject();
 
-		const first = await routeGjcTurn({
-			project,
-			chatId: "chat-1",
-			userMessageId: "message-1",
-			text: "hello",
-			runner,
-			mappings,
-		});
-		const duplicate = await routeGjcTurn({
-			project,
-			chatId: "chat-1",
-			userMessageId: "message-1",
-			text: "hello",
-			runner,
-			mappings,
-		});
+		const first = await routeGjcTurn(routeInput(runner, mappings));
+		const duplicate = await routeGjcTurn(routeInput(runner, mappings));
 
 		expect(runner.starts).toHaveLength(1);
 		expect(runner.continues).toHaveLength(0);
@@ -211,7 +192,77 @@ describe("routeGjcTurn", () => {
 		expect(duplicate.assistantText).toBe("new:hello");
 		expect(duplicate.events).toEqual([{ type: "assistant", text: "new:hello" }]);
 	});
+
+	test("persists only the normalized selection returned by a successful selected operation", async () => {
+		const runner = new FakeGjcTurnRunner();
+		const mappings = new SessionMappingStore();
+		const requested = selection("anthropic", "requested", "low");
+		runner.returnedSelection = selection("anthropic", "normalized", "medium");
+
+		const result = await routeGjcTurn(
+			routeInput(runner, mappings, {
+				chatId: "chat-selected",
+				userMessageId: "message-selected",
+				modelSelection: requested,
+			}),
+		);
+
+		expect(runner.starts[0]?.modelSelection).toEqual(requested);
+		expect(result.mapping.modelSelection).toEqual(runner.returnedSelection);
+		expect(mappings.get("chat-selected")?.modelSelection).toEqual(runner.returnedSelection);
+	});
+
+	test("leaves an existing mapping unchanged when the selected prompt fails", async () => {
+		const runner = new FakeGjcTurnRunner();
+		const mappings = new SessionMappingStore();
+		const originalSelection = selection("anthropic", "bound", "medium");
+		mappings.set({
+			chatId: "chat-1",
+			projectId: "project",
+			sessionId: "session-1",
+			rawFrameCursor: 2,
+			eventCursor: 1,
+			operationId: "message-1",
+			modelSelection: originalSelection,
+		});
+		runner.failPrompt = true;
+
+		await expect(
+			routeGjcTurn(
+				routeInput(runner, mappings, {
+					userMessageId: "message-2",
+					text: "again",
+					modelSelection: selection("openai", "new", "high"),
+				}),
+			),
+		).rejects.toThrow("prompt failed");
+		expect(mappings.get("chat-1")).toMatchObject({ operationId: "message-1", modelSelection: originalSelection });
+	});
 });
+
+function selection(
+	provider: string,
+	modelId: string,
+	thinkingLevel: NormalizedModelSelection["thinkingLevel"],
+): NormalizedModelSelection {
+	return { provider, modelId, thinkingLevel };
+}
+
+function routeInput(
+	runner: GjcTurnRunner,
+	mappings: SessionMappingStore,
+	overrides: Partial<RouteGjcTurnInput> = {},
+): RouteGjcTurnInput {
+	return {
+		project: createProject(),
+		chatId: "chat-1",
+		userMessageId: "message-1",
+		text: "hello",
+		runner,
+		mappings,
+		...overrides,
+	};
+}
 
 function createProject(): RegisteredProject {
 	return {

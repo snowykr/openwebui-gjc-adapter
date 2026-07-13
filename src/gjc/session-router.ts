@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, parse, relative, resolve, sep } from "node:path";
+import { GJC_THINKING_LEVELS, type NormalizedModelSelection } from "../contracts";
 import type { RegisteredProject } from "../projects/registry";
 import { type GjcTurnEvent, type GjcTurnRunner, getProjectSessionRoot } from "./rpc-runner";
 
@@ -14,6 +15,7 @@ export interface SessionMapping {
 	readonly operationId: string;
 	readonly assistantText?: string;
 	readonly events?: readonly GjcTurnEvent[];
+	readonly modelSelection?: NormalizedModelSelection;
 }
 
 export class SessionMappingStore {
@@ -64,9 +66,7 @@ export class FileBackedSessionMappingStore extends SessionMappingStore {
 		const parsed = JSON.parse(readFileSync(this.filePath, "utf8")) as {
 			readonly mappings?: readonly SessionMapping[];
 		};
-		for (const mapping of parsed.mappings ?? []) {
-			super.set(mapping);
-		}
+		for (const mapping of parsed.mappings ?? []) super.set(mapping);
 	}
 
 	private persist(): void {
@@ -83,6 +83,7 @@ export interface RouteGjcTurnInput {
 	readonly text: string;
 	readonly runner: GjcTurnRunner;
 	readonly mappings: SessionMappingStore;
+	readonly modelSelection?: NormalizedModelSelection;
 }
 
 export interface RouteGjcTurnResult {
@@ -119,10 +120,10 @@ export async function routeGjcTurn(input: RouteGjcTurnInput): Promise<RouteGjcTu
 		...address,
 		sessionFile: existingSessionFile,
 	});
-	const state = await input.runner.getState({
-		...address,
-		sessionFile: existingSessionFile,
-	});
+	const state =
+		input.modelSelection === undefined
+			? await input.runner.getState({ ...address, sessionFile: existingSessionFile })
+			: existing;
 	const result = await input.runner.continueSession({
 		...address,
 		userMessageId: input.userMessageId,
@@ -132,23 +133,27 @@ export async function routeGjcTurn(input: RouteGjcTurnInput): Promise<RouteGjcTu
 		rawFrameCursor: state.rawFrameCursor,
 		eventCursor: state.eventCursor,
 		operationId: input.userMessageId,
+		...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
 	});
+	const completedSelection =
+		input.modelSelection === undefined ? undefined : normalizeModelSelection(result.modelSelection);
+	if (input.modelSelection !== undefined && completedSelection === undefined)
+		throw new TypeError("Missing selected GJC outcome");
+	const sessionFile = [result.sessionFile, state.sessionFile, existingSessionFile].find(
+		candidate => candidate !== undefined,
+	);
 	const mapping = input.mappings.upsert({
 		chatId: input.chatId,
 		projectId: input.project.id,
 		sessionId: existing.sessionId,
-		sessionFile: firstDefinedValidSessionFile(
-			input.project,
-			result.sessionFile,
-			state.sessionFile,
-			existingSessionFile,
-		),
+		sessionFile: sessionFile === undefined ? undefined : validateSessionFile(input.project, sessionFile),
 		activeLeaf: result.activeLeaf ?? state.activeLeaf,
 		rawFrameCursor: result.rawFrameCursor,
 		eventCursor: result.eventCursor,
 		operationId: input.userMessageId,
 		assistantText: result.text,
 		events: result.events,
+		...(completedSelection === undefined ? {} : { modelSelection: completedSelection }),
 	});
 
 	return {
@@ -167,7 +172,12 @@ async function startNewMappedSession(input: RouteGjcTurnInput): Promise<RouteGjc
 		userMessageId: input.userMessageId,
 		parentId: input.parentId,
 		text: input.text,
+		...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
 	});
+	const completedSelection =
+		input.modelSelection === undefined ? undefined : normalizeModelSelection(result.modelSelection);
+	if (input.modelSelection !== undefined && completedSelection === undefined)
+		throw new TypeError("Missing selected GJC outcome");
 	const mapping = input.mappings.upsert({
 		chatId: input.chatId,
 		projectId: input.project.id,
@@ -179,6 +189,7 @@ async function startNewMappedSession(input: RouteGjcTurnInput): Promise<RouteGjc
 		operationId: input.userMessageId,
 		assistantText: result.text,
 		events: result.events,
+		...(completedSelection === undefined ? {} : { modelSelection: completedSelection }),
 	});
 
 	return {
@@ -188,22 +199,13 @@ async function startNewMappedSession(input: RouteGjcTurnInput): Promise<RouteGjc
 	};
 }
 
-function firstDefinedValidSessionFile(
-	project: RegisteredProject,
-	...sessionFiles: readonly (string | undefined)[]
-): string | undefined {
-	for (const sessionFile of sessionFiles) {
-		if (sessionFile !== undefined) return validateSessionFile(project, sessionFile);
-	}
-	return undefined;
-}
-
 export function validateSessionFile(project: RegisteredProject, sessionFile: string | undefined): string | undefined {
 	if (sessionFile === undefined) return undefined;
 	const sessionRoot = getProjectSessionRoot(project);
 	const resolvedSessionRoot = resolveExistingOrProspectivePath(sessionRoot);
 	const resolvedSessionFile = resolveExistingOrProspectivePath(sessionFile);
-	if (!isPathInsideRoot(resolvedSessionFile, resolvedSessionRoot)) {
+	const relativeSessionFile = relative(resolvedSessionRoot, resolvedSessionFile);
+	if (relativeSessionFile.startsWith("..") || isAbsolute(relativeSessionFile)) {
 		throw new Error(`Stored GJC session file is outside project session root: ${sessionFile}`);
 	}
 	return resolvedSessionFile;
@@ -217,7 +219,13 @@ function resolveExistingOrProspectivePath(targetPath: string): string {
 		if (!isNotFoundError(error)) throw error;
 	}
 
-	const segments = splitAbsolutePath(absoluteTargetPath);
+	const parsedPath = parse(absoluteTargetPath);
+	const segments = [
+		parsedPath.root,
+		...relative(parsedPath.root, absoluteTargetPath)
+			.split(sep)
+			.filter(segment => segment.length > 0),
+	];
 	for (let index = segments.length - 1; index >= 0; index -= 1) {
 		const parentCandidate = resolve(...segments.slice(0, index + 1));
 		try {
@@ -230,17 +238,6 @@ function resolveExistingOrProspectivePath(targetPath: string): string {
 	throw new Error(`No existing parent found for path: ${targetPath}`);
 }
 
-function splitAbsolutePath(absolutePath: string): string[] {
-	const parsedPath = parse(absolutePath);
-	const relativePath = relative(parsedPath.root, absolutePath);
-	return [parsedPath.root, ...relativePath.split(sep).filter(segment => segment.length > 0)];
-}
-
-function isPathInsideRoot(targetPath: string, rootPath: string): boolean {
-	const relativePath = relative(rootPath, targetPath);
-	return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
-}
-
 function isNotFoundError(error: unknown): boolean {
 	return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
@@ -249,5 +246,29 @@ function copySessionMapping(mapping: SessionMapping): SessionMapping {
 	return {
 		...mapping,
 		events: mapping.events === undefined ? undefined : [...mapping.events],
+		modelSelection: normalizeModelSelection(mapping.modelSelection),
 	};
+}
+
+const UNSAFE_MODEL_COMPONENT = /[\p{Cc}\p{White_Space}]|%[0-9a-f]{2}/iu;
+
+export function normalizeModelSelection(value: unknown): NormalizedModelSelection | undefined {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+	const provider = Reflect.get(value, "provider");
+	const modelId = Reflect.get(value, "modelId");
+	const thinkingLevel = Reflect.get(value, "thinkingLevel");
+	if (!isSafeModelComponent(provider) || !isSafeModelComponent(modelId)) return undefined;
+	const normalizedThinkingLevel = GJC_THINKING_LEVELS.find(level => level === thinkingLevel);
+	return normalizedThinkingLevel === undefined
+		? undefined
+		: { provider, modelId, thinkingLevel: normalizedThinkingLevel };
+}
+
+function isSafeModelComponent(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		value.length > 0 &&
+		!UNSAFE_MODEL_COMPONENT.test(value) &&
+		!value.split("/").some(segment => segment === "." || segment === "..")
+	);
 }
