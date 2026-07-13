@@ -13,6 +13,7 @@ import { OpenWebUIHttpClient, type OpenWebUIProjectionRepository } from "./openw
 import { createOpenWebUIFileContextResolver } from "./openwebui/file-context-resolver";
 import { OpenWebUIPromptHintClient } from "./openwebui/prompt-hints";
 import { ProjectLinkService } from "./projects/link-service";
+import { preflightProjectRegistrationDatabase } from "./projects/registration-preflight";
 import { auditProjectRegistrations, SqliteProjectRegistrationStore } from "./projects/registration-store";
 import { disambiguateRegisteredProjects, type RegisteredProject, registerProjectDirectory } from "./projects/registry";
 import { type AllowedRoot, resolveAllowedRoots } from "./security/paths";
@@ -58,78 +59,95 @@ export async function buildResolvedAdapterServerOptions(
 	behavior: BuildAdapterServerOptionsBehavior = {},
 ): Promise<AdapterServerOptions> {
 	assertResolvedAdapterConfig(config);
-	const projectStore =
-		dependencies.projectRegistrationStore ??
-		new SqliteProjectRegistrationStore(buildProjectRegistrationStorePath(config));
-	await auditProjectRegistrations(projectStore, config.runtimeLocations.protectedProjectPaths);
-	const allowedRoots = await resolveAllowedRoots(config.allowedProjectRoots);
-	const projects = await loadConfiguredProjects(config, allowedRoots);
-	const owner = buildOwnerContext(config);
-	const mappings = dependencies.mappings ?? new FileBackedSessionMappingStore(buildSessionMappingStorePath(config));
-	const outbox = dependencies.outbox ?? new FileBackedOutboxStore(buildProjectionOutboxStorePath(config));
-	const cliPath = resolveGjcCliPath(config.gjcCommand);
-	const modelReaderFactory =
-		dependencies.modelReaderFactory ??
-		createModelReaderFactory({ cliPath, runtimeLocations: config.runtimeLocations });
-	const openWebUIClient = buildOpenWebUIClient(config);
-	const projectionRepository = dependencies.projectionRepository ?? openWebUIClient;
-	const projectLinkService = new ProjectLinkService({
-		allowedRoots,
-		store: projectStore,
-		ownerUserId: owner.ownerUserId,
-		repository: projectionRepository,
-		mappings,
-		protectedPaths: config.runtimeLocations.protectedProjectPaths,
-	});
-	const previouslyLinkedProjectIds = new Set(projectLinkService.listLinkedProjects().map(project => project.id));
-	await projectLinkService.seedConfiguredProjects(projects);
-	const turnRunner =
-		dependencies.turnRunner ??
-		createResolvedGjcRpcTurnRunner({
-			cliPath,
-			turnTimeoutMs: config.turnTimeoutMs,
-			runtimeLocations: config.runtimeLocations,
+	const internalStore = dependencies.projectRegistrationStore === undefined;
+	const databasePath = path.join(config.statePath, "adapter-state.sqlite");
+	if (internalStore)
+		await preflightProjectRegistrationDatabase(databasePath, config.runtimeLocations.protectedProjectPaths);
+	const projectStore = dependencies.projectRegistrationStore ?? new SqliteProjectRegistrationStore(databasePath);
+	try {
+		// This second audit catches pathname replacement after the immutable snapshot; it cannot make reopen atomic.
+		await auditProjectRegistrations(projectStore, config.runtimeLocations.protectedProjectPaths);
+		const allowedRoots = await resolveAllowedRoots(config.allowedProjectRoots);
+		const projects = await loadConfiguredProjects(config, allowedRoots);
+		const owner = buildOwnerContext(config);
+		const mappings =
+			dependencies.mappings ??
+			new FileBackedSessionMappingStore(path.join(config.sessionRoot, SESSION_MAPPING_STORE_FILE));
+		const outbox =
+			dependencies.outbox ?? new FileBackedOutboxStore(path.join(config.statePath, PROJECTION_OUTBOX_STORE_FILE));
+		const cliPath = resolveGjcCliPath(config.gjcCommand);
+		const modelReaderFactory =
+			dependencies.modelReaderFactory ??
+			createModelReaderFactory({ cliPath, runtimeLocations: config.runtimeLocations });
+		const openWebUIClient = buildOpenWebUIClient(config);
+		const projectionRepository = dependencies.projectionRepository ?? openWebUIClient;
+		const projectLinkService = new ProjectLinkService({
+			allowedRoots,
+			store: projectStore,
+			ownerUserId: owner.ownerUserId,
+			repository: projectionRepository,
+			mappings,
+			protectedPaths: config.runtimeLocations.protectedProjectPaths,
 		});
-	const promptHintClient = buildOpenWebUIPromptHintClient(config);
-	if (promptHintClient !== undefined && !behavior.deferOpenWebUIInitialization) {
-		await promptHintClient.seedGjcPromptHints();
-	}
-	if (projectionRepository !== undefined && !behavior.deferOpenWebUIInitialization) {
-		await projectLinkService.reconcileOpenWebUIFolderLinks({ projectIds: previouslyLinkedProjectIds });
-		await projectLinkService.syncLinkedProjects();
-	}
-	const eventSink = dependencies.eventSink ?? buildOpenWebUIEventSink(openWebUIClient);
-	const messageSink = dependencies.messageSink ?? buildOpenWebUIMessageSink(openWebUIClient);
-	const fileContextResolver = buildOpenWebUIFileContextResolver(openWebUIClient);
-	return {
-		host: config.bindHost,
-		port: config.bindPort,
-		checks: buildRuntimeHealthChecks(config),
-		routes: {
-			projects: [...projectLinkService.listLinkedProjects()],
-			projectProvider: async () => {
-				await projectLinkService.reconcileOpenWebUIFolderLinks();
-				return projectLinkService.listLinkedProjects();
-			},
-			projectLinkService,
-			...(projectionRepository === undefined ? {} : { projectContextRepository: projectionRepository }),
-			owner,
-			runner: createGjcRoutingLiveGatewayRunner({
-				turnRunner,
-				mappings,
-				ownerUserId: owner.ownerUserId,
+		const previouslyLinkedProjectIds = new Set(projectLinkService.listLinkedProjects().map(project => project.id));
+		await projectLinkService.seedConfiguredProjects(projects);
+		const turnRunner =
+			dependencies.turnRunner ??
+			createResolvedGjcRpcTurnRunner({
+				cliPath,
+				turnTimeoutMs: config.turnTimeoutMs,
+				runtimeLocations: config.runtimeLocations,
+			});
+		const promptHintClient = buildOpenWebUIPromptHintClient(config);
+		if (promptHintClient !== undefined && !behavior.deferOpenWebUIInitialization) {
+			await promptHintClient.seedGjcPromptHints();
+		}
+		if (projectionRepository !== undefined && !behavior.deferOpenWebUIInitialization) {
+			await projectLinkService.reconcileOpenWebUIFolderLinks({ projectIds: previouslyLinkedProjectIds });
+			await projectLinkService.syncLinkedProjects();
+		}
+		const eventSink = dependencies.eventSink ?? buildOpenWebUIEventSink(openWebUIClient);
+		const messageSink = dependencies.messageSink ?? buildOpenWebUIMessageSink(openWebUIClient);
+		const fileContextResolver = buildOpenWebUIFileContextResolver(openWebUIClient);
+		return {
+			host: config.bindHost,
+			port: config.bindPort,
+			checks: buildRuntimeHealthChecks(config),
+			routes: {
+				projects: [...projectLinkService.listLinkedProjects()],
+				projectProvider: async () => {
+					await projectLinkService.reconcileOpenWebUIFolderLinks();
+					return projectLinkService.listLinkedProjects();
+				},
+				projectLinkService,
+				...(projectionRepository === undefined ? {} : { projectContextRepository: projectionRepository }),
+				owner,
+				runner: createGjcRoutingLiveGatewayRunner({
+					turnRunner,
+					mappings,
+					ownerUserId: owner.ownerUserId,
+					modelReaderFactory,
+					outbox,
+				}),
 				modelReaderFactory,
-				outbox,
-			}),
-			modelReaderFactory,
-			neutralWorkspace: config.runtimeLocations.readerWorkspace,
-			requireAdapterApiToken: true,
-			...(config.adapterApiToken === undefined ? {} : { adapterApiToken: config.adapterApiToken }),
-			...(eventSink === undefined ? {} : { eventSink }),
-			...(messageSink === undefined ? {} : { messageSink }),
-			...(fileContextResolver === undefined ? {} : { fileContextResolver }),
-		},
-	};
+				neutralWorkspace: config.runtimeLocations.readerWorkspace,
+				requireAdapterApiToken: true,
+				...(config.adapterApiToken === undefined ? {} : { adapterApiToken: config.adapterApiToken }),
+				...(eventSink === undefined ? {} : { eventSink }),
+				...(messageSink === undefined ? {} : { messageSink }),
+				...(fileContextResolver === undefined ? {} : { fileContextResolver }),
+			},
+		};
+	} catch (error) {
+		if (!internalStore) throw error;
+		try {
+			projectStore.close();
+		} catch (closeError) {
+			if (error instanceof Error && error.cause === undefined)
+				Reflect.defineProperty(error, "cause", { value: closeError });
+		}
+		throw error;
+	}
 }
 
 export function resolveAdapterConfig(config: AdapterConfig): ResolvedAdapterConfig {
@@ -204,18 +222,6 @@ function buildRuntimeHealthChecks(config: AdapterConfig): AdapterHealthCheck[] {
 			detail: "GJC live runner is wired to the RPC turn runner.",
 		},
 	];
-}
-
-function buildSessionMappingStorePath(config: AdapterConfig): string {
-	return path.join(config.sessionRoot, SESSION_MAPPING_STORE_FILE);
-}
-
-function buildProjectRegistrationStorePath(config: AdapterConfig): string {
-	return path.join(config.statePath, "adapter-state.sqlite");
-}
-
-function buildProjectionOutboxStorePath(config: AdapterConfig): string {
-	return path.join(config.statePath, PROJECTION_OUTBOX_STORE_FILE);
 }
 
 function buildOpenWebUIClient(config: AdapterConfig): OpenWebUIHttpClient | undefined {
