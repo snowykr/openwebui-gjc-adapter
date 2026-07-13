@@ -4,7 +4,7 @@ import type { GjcRpcRunnerClientOptions, GjcRpcSelectionTransport } from "../gjc
 export interface ModelReader {
 	getAvailableModels(): Promise<readonly unknown[]>;
 	getState(): Promise<unknown>;
-	stop(): void;
+	stop(): void | Promise<void>;
 }
 
 export type ModelReaderFactory = () => Promise<ModelReader>;
@@ -31,17 +31,16 @@ export function createModelReaderFactory(input: CreateModelReaderFactoryInput): 
 }
 
 export function resolveGjcCliPath(gjcCommand: string): string {
-	return gjcCommand === "gjc" ? fileURLToPath(import.meta.resolve("@gajae-code/coding-agent/cli")) : gjcCommand;
+	return gjcCommand;
 }
 
 async function startReader(transport: GjcRpcSelectionTransport): Promise<ModelReader> {
 	try {
 		await transport.start();
+		await transport.newEphemeralSession?.();
 		return transport;
 	} catch (error) {
-		transport.stop();
+		await transport.stop();
 		throw error;
 	}
 }
-
-import { fileURLToPath } from "node:url";

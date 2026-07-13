@@ -233,7 +233,9 @@ describe("CLI module boundaries", () => {
 				installedSource.includes("buildResolvedAdapterServerOptions(config") &&
 				baseSource.includes("createResolvedGjcRpcTurnRunner({") &&
 				runnerSource.includes("input.clientFactory ?? createDefaultRpcTransport") &&
-				transportSource.includes("new RpcClient({"),
+				transportSource.includes("new SdkV3Transport(") &&
+				transportSource.includes("new SdkV3Cli({") &&
+				transportSource.includes("new SdkV3Client(authority.endpoint)"),
 			resolvedDeploymentChain:
 				deploymentSource.includes("renderResolvedManagedCompose({") &&
 				deploymentSource.includes("renderResolvedSystemdComposeUnit({") &&

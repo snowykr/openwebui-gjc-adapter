@@ -46,6 +46,7 @@ export interface FailedStartCleanupReceipt {
 export interface RealSelectionStartOptions {
 	readonly failStartup?: boolean;
 	readonly invalidRunnerModel?: string;
+	readonly catalogMode?: "capabilities" | "current-only";
 	readonly onFailedCleanup?: (receipt: FailedStartCleanupReceipt) => void;
 }
 

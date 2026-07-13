@@ -40,6 +40,30 @@ describe("real canonical model selection surfaces", () => {
 		await rebound.stop();
 	}, 15_000);
 
+	test("exposes only the authoritative current tuple when current-dev omits capabilities", async () => {
+		const harness = await RealSelectionHarness.start({ catalogMode: "current-only" });
+		try {
+			const models = await harness.models();
+			expect(models).toMatchObject({ status: 200 });
+			expect(models.body.data.map(model => model.id)).toEqual([CANONICAL_MODEL_IDS[0]]);
+			expect(await harness.chat("gjc", { id: "current-alias" })).toMatchObject({
+				status: 200,
+				body: { model: CANONICAL_MODEL_IDS[0] },
+			});
+			const beforeGuess = harness.coordinator.snapshot();
+			await expectSelectionError(
+				harness.chat(CANONICAL_MODEL_IDS[1], { id: "unsupported-guess" }),
+				503,
+				"model_catalog_unavailable",
+			);
+			const afterGuess = harness.coordinator.snapshot();
+			expect(afterGuess.setterAttempts).toBe(beforeGuess.setterAttempts);
+			expect(afterGuess.promptCount).toBe(beforeGuess.promptCount);
+		} finally {
+			await harness.stop();
+		}
+	}, 15_000);
+
 	test("drives catalog JSON SSE background normalization admin and setter failure", async () => {
 		const harness = await RealSelectionHarness.start();
 		try {

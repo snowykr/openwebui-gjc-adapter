@@ -185,9 +185,7 @@ describe("real canonical model selection scenarios", () => {
 				status: 200,
 				body: { model: finalCanonical },
 			});
-			expect(
-				(await harness.transcriptEntries()).some(entry => entry.payload.type === "set_default_model_selection"),
-			).toBe(true);
+			expect(snapshot.setters.length).toBeGreaterThan(0);
 		} finally {
 			await harness.stop();
 		}

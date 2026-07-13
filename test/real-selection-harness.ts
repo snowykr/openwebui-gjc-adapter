@@ -10,7 +10,6 @@ import {
 	parseMappingDocument,
 	parseModelList,
 	parseSseModels,
-	parseTranscriptEntry,
 } from "./real-selection-schemas";
 
 export class RealSelectionHarness {
@@ -18,7 +17,6 @@ export class RealSelectionHarness {
 	readonly token = "selection-harness-token";
 	readonly root: string;
 	readonly baseUrl: string;
-	readonly transcriptPath: string;
 	readonly observationPath: string;
 	readonly #port: number;
 	#process: Bun.Subprocess;
@@ -26,7 +24,6 @@ export class RealSelectionHarness {
 	private constructor(root: string, port: number, process: Bun.Subprocess, coordinator: RealSelectionCoordinator) {
 		this.root = root;
 		this.baseUrl = `http://127.0.0.1:${port}`;
-		this.transcriptPath = path.join(root, "selection-transcript.jsonl");
 		this.observationPath = path.join(root, "selection-observations.jsonl");
 		this.#port = port;
 		this.#process = process;
@@ -40,8 +37,8 @@ export class RealSelectionHarness {
 		let port: number | undefined;
 		try {
 			port = await cli.reserveTcpPort();
-			coordinator = new RealSelectionCoordinator();
-			child = spawnServer(root, port, coordinator.url, options);
+			coordinator = new RealSelectionCoordinator({ catalogMode: options.catalogMode ?? "capabilities" });
+			child = spawnServer(root, port, coordinator, options);
 			const harness = new RealSelectionHarness(root, port, child, coordinator);
 			await cli.waitForStartedServer(child, `${harness.baseUrl}/healthz`);
 			return harness;
@@ -162,16 +159,8 @@ export class RealSelectionHarness {
 	async restartAfterRemovingModelBinding(chatId: string): Promise<void> {
 		await cli.stopProcess(this.#process);
 		await this.removeModelBinding(chatId);
-		this.#process = spawnServer(this.root, this.#port, this.coordinator.url, {});
+		this.#process = spawnServer(this.root, this.#port, this.coordinator, {});
 		await cli.waitForStartedServer(this.#process, `${this.baseUrl}/healthz`);
-	}
-
-	async transcriptEntries(): Promise<readonly ReturnType<typeof parseTranscriptEntry>[]> {
-		const bytes = await readFile(this.transcriptPath, "utf8");
-		return bytes
-			.split("\n")
-			.filter(line => line.length > 0)
-			.map(line => parseTranscriptEntry(JSON.parse(line)));
 	}
 
 	async stop(): Promise<void> {
@@ -205,7 +194,7 @@ export class RealSelectionHarness {
 }
 
 function selectionFixturePath(): string {
-	return path.join(process.cwd(), "test/fixtures/gjc-rpc-selection-scenario.ts");
+	return path.join(process.cwd(), "test/fixtures/gjc-sdk-daemon-fixture.ts");
 }
 
 function serverFixturePath(): string {
@@ -215,7 +204,7 @@ function serverFixturePath(): string {
 function spawnServer(
 	root: string,
 	port: number,
-	coordinatorUrl: string,
+	coordinator: RealSelectionCoordinator,
 	options: cli.RealSelectionStartOptions,
 ): Bun.Subprocess {
 	return Bun.spawn([process.execPath, serverFixturePath()], {
@@ -238,8 +227,11 @@ function spawnServer(
 			GJC_OPENWEBUI_STATE_PATH: path.join(root, "state"),
 			GJC_OPENWEBUI_SESSION_ROOT: path.join(root, "sessions"),
 			GJC_OPENWEBUI_GJC_COMMAND: selectionFixturePath(),
-			GJC_SELECTION_COORDINATOR_URL: coordinatorUrl,
-			GJC_SELECTION_TRANSCRIPT: path.join(root, "selection-transcript.jsonl"),
+			GJC_SDK_FIXTURE_CLI_TRANSCRIPT: path.join(root, "sdk-cli-transcript.jsonl"),
+			GJC_SDK_FIXTURE_ENDPOINT_URL: coordinator.sdkUrl,
+			GJC_SDK_FIXTURE_ENDPOINT_TOKEN: coordinator.sdkToken,
+			GJC_SDK_FIXTURE_SESSION_ID: "selection-session",
+			GJC_SDK_FIXTURE_DYNAMIC_AUTHORITY: "1",
 			GJC_SELECTION_OBSERVATIONS: path.join(root, "selection-observations.jsonl"),
 			GJC_SELECTION_RUNTIME_RECEIPT: path.join(root, "selection-runtime-receipt.json"),
 			...(options.failStartup ? { GJC_SELECTION_FAIL_STARTUP: "1" } : {}),

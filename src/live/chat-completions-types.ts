@@ -34,6 +34,7 @@ export type LiveGatewayRunnerResult =
 	  };
 
 export interface LiveGatewayRunner {
+	stop?(): void | Promise<void>;
 	run(input: LiveGatewayRunnerInput): Promise<LiveGatewayRunnerResult> | LiveGatewayRunnerResult;
 }
 

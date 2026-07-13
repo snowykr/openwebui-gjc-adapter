@@ -1,6 +1,7 @@
 import type { NormalizedModelSelection } from "../src/contracts";
 import { formatCanonicalModelId } from "../src/live/models";
 import { LOW_SELECTION, MEDIUM_SELECTION, MODEL_DESCRIPTORS } from "./model-selection-fixtures";
+import { type RealSelectionSdkServer, startRealSelectionSdkServer } from "./real-selection-sdk-coordinator";
 
 export type SelectionCoordinatorSnapshot = {
 	readonly selection: NormalizedModelSelection;
@@ -15,7 +16,11 @@ export type SelectionCoordinatorSnapshot = {
 
 export class RealSelectionCoordinator {
 	readonly url: string;
+	readonly sdkUrl: string;
+	readonly sdkToken: string;
 	readonly #server: ReturnType<typeof Bun.serve>;
+	readonly #sdkServer: RealSelectionSdkServer;
+	readonly #catalogMode: "capabilities" | "current-only";
 	#selection: NormalizedModelSelection = LOW_SELECTION;
 	#normalizeNext = false;
 	#failNextSetter = false;
@@ -37,9 +42,13 @@ export class RealSelectionCoordinator {
 	#barrierRelease: (() => void) | undefined;
 	#barrierPromise: Promise<void> | undefined;
 
-	constructor() {
+	constructor(options: { readonly catalogMode: "capabilities" | "current-only" } = { catalogMode: "capabilities" }) {
+		this.#catalogMode = options.catalogMode;
 		this.#server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: request => this.#fetch(request) });
 		this.url = this.#server.url.toString().replace(/\/$/, "");
+		this.#sdkServer = startRealSelectionSdkServer(this.url);
+		this.sdkUrl = this.#sdkServer.url;
+		this.sdkToken = this.#sdkServer.token;
 	}
 
 	normalizeNextToMedium(): void {
@@ -111,7 +120,7 @@ export class RealSelectionCoordinator {
 	}
 
 	async stop(): Promise<void> {
-		await this.#server.stop();
+		await Promise.all([this.#server.stop(), this.#sdkServer.stop()]);
 	}
 
 	async #fetch(request: Request): Promise<Response> {
@@ -122,7 +131,7 @@ export class RealSelectionCoordinator {
 				this.#malformedCatalogOnce = false;
 				return Response.json({ models: [{ provider: "broken" }] });
 			}
-			return Response.json({ models: MODEL_DESCRIPTORS });
+			return Response.json({ models: this.#catalog() });
 		}
 		if (request.method === "GET" && pathname === "/state") {
 			this.#stateReads += 1;
@@ -180,6 +189,18 @@ export class RealSelectionCoordinator {
 		}
 		return new Response("not found", { status: 404 });
 	}
+
+	#catalog(): readonly unknown[] {
+		if (this.#catalogMode === "capabilities") return MODEL_DESCRIPTORS;
+		return MODEL_DESCRIPTORS.map(model => {
+			if (!isRecord(model)) throw new TypeError("invalid fixture model");
+			return { provider: model.provider, id: model.id, name: model.id };
+		});
+	}
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 async function readSelection(request: Request): Promise<NormalizedModelSelection> {

@@ -22,6 +22,9 @@ describe("createGjcRpcTurnRunner workflow gates", () => {
 						options: [{ label: "JWT", value: "JWT" }],
 						context: { prompt: "Choose authentication method" },
 						required: true,
+						commandId: "command-1",
+						turnId: "turn-1",
+						sessionId: "session-1",
 					},
 				],
 			],
@@ -49,6 +52,9 @@ describe("createGjcRpcTurnRunner workflow gates", () => {
 					schemaHash: "sha256:deep",
 					options: [{ label: "JWT", value: "JWT" }],
 					context: { prompt: "Choose authentication method" },
+					commandId: "command-1",
+					turnId: "turn-1",
+					sessionId: "session-1",
 				},
 			},
 		]);
@@ -119,6 +125,15 @@ describe("createGjcRpcTurnRunner workflow gates", () => {
 			advanceStateAfterRespondGate: true,
 		});
 		const runner = createGjcRpcTurnRunner({ clientFactory: recordFactory([], client) });
+		client.workflowGateOnRespond = {
+			type: "workflow_gate",
+			gateId: "gate-deep-2",
+			schemaHash: "sha256:next",
+			schema: { type: "boolean" },
+			commandId: "command-1",
+			turnId: "turn-1",
+			sessionId: "session-1",
+		};
 		const result = await runner.respondWorkflowGate?.({
 			cwd: "/workspace/project",
 			sessionRoot: "/workspace/project/.gjc/sessions",
@@ -134,11 +149,25 @@ describe("createGjcRpcTurnRunner workflow gates", () => {
 			rawFrameCursor: 10,
 			eventCursor: 4,
 			operationId: "message-2",
+			gateCorrelation: { commandId: "command-1", turnId: "turn-1", sessionId: "session-1" },
 		});
 
 		expect(client.calls).toEqual([
 			{ type: "start" },
-			{ type: "respond_gate", gateId: "gate-deep-1", answer: { selected: ["JWT"] }, idempotencyKey: "idem-deep-1" },
+			{
+				type: "switch_session",
+				sessionPath: "/workspace/project/.gjc/sessions/session-1.jsonl",
+			},
+			{
+				type: "on_workflow_gate",
+			},
+			{
+				type: "respond_gate",
+				gateId: "gate-deep-1",
+				answer: { selected: ["JWT"] },
+				idempotencyKey: "idem-deep-1",
+				correlation: { commandId: "command-1", turnId: "turn-1", sessionId: "session-1" },
+			},
 			{ type: "get_state" },
 			{ type: "get_last_assistant_text" },
 		]);
@@ -148,6 +177,18 @@ describe("createGjcRpcTurnRunner workflow gates", () => {
 			activeLeaf: "leaf-2",
 			rawFrameCursor: 12,
 			eventCursor: 6,
+			events: [
+				{ type: "assistant", text: "accepted" },
+				{
+					type: "workflow_gate",
+					id: "gate-deep-2",
+					payload: {
+						commandId: "command-1",
+						turnId: "turn-1",
+						sessionId: "session-1",
+					},
+				},
+			],
 		});
 	});
 
@@ -187,6 +228,8 @@ describe("createGjcRpcTurnRunner workflow gates", () => {
 		).rejects.toThrow("GJC RPC workflow_gate_response failed: invalid_workflow_gate_answer");
 		expect(client.calls).toEqual([
 			{ type: "start" },
+			{ type: "switch_session", sessionPath: undefined },
+			{ type: "on_workflow_gate" },
 			{ type: "respond_gate", gateId: "gate-deep-1", answer: { selected: ["BAD"] }, idempotencyKey: "idem-deep-1" },
 		]);
 	});

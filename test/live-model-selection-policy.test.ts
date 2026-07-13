@@ -96,6 +96,33 @@ describe("createModelSelectionPolicy", () => {
 		expect(canonicalTranscript).toEqual(["catalog", "stop"]);
 	});
 
+	test("exposes only the authoritative current tuple when current-dev Q10 omits capabilities", async () => {
+		const policy = createModelSelectionPolicy(
+			readerFactory([{ provider: "anthropic", id: "claude-sonnet-4", name: "Claude Sonnet 4" }], {
+				model: { provider: "anthropic", id: "claude-sonnet-4" },
+				thinkingLevel: "low",
+			}),
+		);
+
+		expect((await policy.listModels()).data.map(model => model.id)).toEqual(["gjc/anthropic/claude-sonnet-4:low"]);
+		expect(await policy.resolve("gjc")).toEqual(LOW_SELECTION);
+		expect(await policy.resolve("gjc/anthropic/claude-sonnet-4:low")).toEqual(LOW_SELECTION);
+	});
+
+	test("rejects guessed tuples with 503 when current-dev Q10 omits capabilities", async () => {
+		const policy = createModelSelectionPolicy(
+			readerFactory([{ provider: "anthropic", id: "claude-sonnet-4", name: "Claude Sonnet 4" }], {
+				model: { provider: "anthropic", id: "claude-sonnet-4" },
+				thinkingLevel: "low",
+			}),
+		);
+
+		await expect(policy.resolve("gjc/anthropic/claude-sonnet-4:medium")).rejects.toMatchObject({
+			code: "model_catalog_unavailable",
+			status: 503,
+		});
+	});
+
 	test.each([
 		["model_selection_invalid_id", "gjc/noncanonical"],
 		["model_not_found", "foreign"],

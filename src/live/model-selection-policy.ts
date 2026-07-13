@@ -16,14 +16,17 @@ export function createModelSelectionPolicy(createReader: ModelReaderFactory): Mo
 			let reader: ModelReader | undefined;
 			try {
 				reader = await createReader();
-				const catalog = decodeStrictModelCatalog(await reader.getAvailableModels());
-				if (catalog === null) throw modelSelectionError("model_catalog_unavailable");
-				return buildModelList(catalog);
+				const rawCatalog = await reader.getAvailableModels();
+				const catalog = decodeStrictModelCatalog(rawCatalog);
+				if (catalog !== null) return buildModelList(catalog);
+				const current = currentSelection(rawCatalog, await reader.getState());
+				if (current === undefined) throw modelSelectionError("model_catalog_unavailable");
+				return buildModelList([current]);
 			} catch (error) {
 				if (isCatalogError(error)) throw error;
 				throw modelSelectionError("model_catalog_unavailable");
 			} finally {
-				reader?.stop();
+				await reader?.stop();
 			}
 		},
 
@@ -51,10 +54,15 @@ async function resolveAlias(createReader: ModelReaderFactory): Promise<Normalize
 	let reader: ModelReader | undefined;
 	try {
 		reader = await createReader();
-		const catalog = decodeStrictModelCatalog(await reader.getAvailableModels());
-		if (catalog === null) throw new Error("invalid catalog");
+		const rawCatalog = await reader.getAvailableModels();
+		const catalog = decodeStrictModelCatalog(rawCatalog);
 		const selection = selectionFromState(await reader.getState());
-		if (selection === undefined || !catalog.some(candidate => sameSelection(candidate, selection))) {
+		const usable =
+			selection !== undefined &&
+			(catalog === null
+				? isAuthoritativeCurrent(rawCatalog, selection)
+				: catalog.some(candidate => sameSelection(candidate, selection)));
+		if (!usable || selection === undefined) {
 			throw modelSelectionError("model_selection_default_unusable");
 		}
 		return selection;
@@ -62,7 +70,7 @@ async function resolveAlias(createReader: ModelReaderFactory): Promise<Normalize
 		if (isDefaultUnusableError(error)) throw error;
 		throw modelSelectionError("model_selection_default_read_failed");
 	} finally {
-		reader?.stop();
+		await reader?.stop();
 	}
 }
 
@@ -73,16 +81,22 @@ async function resolveCanonical(
 	let reader: ModelReader | undefined;
 	try {
 		reader = await createReader();
-		const catalog = decodeStrictModelCatalog(await reader.getAvailableModels());
-		if (catalog === null || !catalog.some(candidate => sameSelection(candidate, selection))) {
+		const rawCatalog = await reader.getAvailableModels();
+		const catalog = decodeStrictModelCatalog(rawCatalog);
+		if (catalog === null) {
+			const current = currentSelection(rawCatalog, await reader.getState());
+			if (current !== undefined && sameSelection(current, selection)) return selection;
+			throw modelSelectionError("model_catalog_unavailable");
+		}
+		if (!catalog.some(candidate => sameSelection(candidate, selection))) {
 			throw modelSelectionError("model_selection_not_available");
 		}
 		return selection;
 	} catch (error) {
-		if (isNotAvailableError(error)) throw error;
+		if (isCanonicalResolutionError(error)) throw error;
 		throw modelSelectionError("model_selection_not_available");
 	} finally {
-		reader?.stop();
+		await reader?.stop();
 	}
 }
 
@@ -97,6 +111,39 @@ function selectionFromState(state: unknown): NormalizedModelSelection | undefine
 	});
 }
 
+function currentSelection(rawCatalog: readonly unknown[], state: unknown): NormalizedModelSelection | undefined {
+	const selection = selectionFromState(state);
+	return selection !== undefined && isAuthoritativeCurrent(rawCatalog, selection) ? selection : undefined;
+}
+
+function isAuthoritativeCurrent(rawCatalog: readonly unknown[], selection: NormalizedModelSelection): boolean {
+	return isCurrentOnlyCatalog(rawCatalog) && rawCatalog.some(model => hasModelIdentity(model, selection));
+}
+
+function isCurrentOnlyCatalog(catalog: readonly unknown[]): boolean {
+	return (
+		catalog.length > 0 &&
+		catalog.every(
+			model =>
+				typeof model === "object" &&
+				model !== null &&
+				!Array.isArray(model) &&
+				!Reflect.has(model, "reasoning") &&
+				!Reflect.has(model, "thinking"),
+		)
+	);
+}
+
+function hasModelIdentity(model: unknown, selection: NormalizedModelSelection): boolean {
+	return (
+		typeof model === "object" &&
+		model !== null &&
+		!Array.isArray(model) &&
+		Reflect.get(model, "provider") === selection.provider &&
+		Reflect.get(model, "id") === selection.modelId
+	);
+}
+
 function sameSelection(left: NormalizedModelSelection, right: NormalizedModelSelection): boolean {
 	return (
 		left.provider === right.provider && left.modelId === right.modelId && left.thinkingLevel === right.thinkingLevel
@@ -107,5 +154,6 @@ const isCatalogError = (error: unknown): boolean =>
 	error instanceof ModelSelectionError && error.code === "model_catalog_unavailable";
 const isDefaultUnusableError = (error: unknown): boolean =>
 	error instanceof ModelSelectionError && error.code === "model_selection_default_unusable";
-const isNotAvailableError = (error: unknown): boolean =>
-	error instanceof ModelSelectionError && error.code === "model_selection_not_available";
+const isCanonicalResolutionError = (error: unknown): boolean =>
+	error instanceof ModelSelectionError &&
+	(error.code === "model_selection_not_available" || error.code === "model_catalog_unavailable");

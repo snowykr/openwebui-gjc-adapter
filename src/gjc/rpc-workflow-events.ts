@@ -39,13 +39,29 @@ export function callRespondGate(
 	gateId: string,
 	answer: Parameters<NonNullable<GjcRpcRunnerTransport["respondGate"]>>[1],
 	idempotencyKey: string | undefined,
+	correlation: Parameters<NonNullable<GjcRpcRunnerTransport["respondGate"]>>[3],
 ): Promise<unknown> {
 	if (client.respondGate === undefined) {
 		return Promise.reject(
 			new GjcRpcRunnerError("workflow_gate_response", "RPC transport does not support workflow gates"),
 		);
 	}
-	return client.respondGate(gateId, answer, idempotencyKey);
+	return client.respondGate(gateId, answer, idempotencyKey, correlation);
+}
+
+export async function respondAndCollectWorkflowGates(
+	client: GjcRpcRunnerTransport,
+	respond: () => Promise<unknown>,
+): Promise<{ readonly resolution: unknown; readonly workflowGates: readonly GjcRpcRunnerTransportEvent[] }> {
+	const workflowGates: GjcRpcRunnerTransportEvent[] = [];
+	const unsubscribe = client.onWorkflowGate?.(gate => workflowGates.push(gate));
+	try {
+		const resolution = await respond();
+		await Promise.resolve();
+		return { resolution, workflowGates: dedupeWorkflowGateEvents(workflowGates) };
+	} finally {
+		unsubscribe?.();
+	}
 }
 
 export function assertAcceptedWorkflowGateResolution(resolution: unknown): void {
@@ -111,6 +127,9 @@ function workflowGatePayload(event: GjcRpcRunnerTransportEvent): Readonly<Record
 		"gateId",
 		event.gateId ?? event.gate_id ?? nestedPayload?.gateId ?? nestedPayload?.gate_id,
 	);
+	copyPayloadField(payload, "commandId", event.commandId ?? nestedPayload?.commandId);
+	copyPayloadField(payload, "turnId", event.turnId ?? nestedPayload?.turnId);
+	copyPayloadField(payload, "sessionId", event.sessionId ?? nestedPayload?.sessionId);
 	copyPayloadField(payload, "stage", event.stage ?? nestedPayload?.stage);
 	copyPayloadField(payload, "kind", event.kind ?? nestedPayload?.kind);
 	copyPayloadField(payload, "schema", event.schema ?? nestedPayload?.schema);

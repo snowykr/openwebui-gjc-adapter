@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import type { GjcRuntimeLocations } from "../contracts";
+import type { GjcSessionStorageLocations } from "../gjc/session-root";
 import type { SessionMappingStore } from "../gjc/session-router";
 import type { OpenWebUIProjectionRepository } from "../openwebui/client";
 import { type SyncProjectSessionsResult, syncProjectSessionsToOpenWebUI } from "../projection/session-sync";
@@ -20,6 +21,7 @@ export interface ProjectLinkServiceOptions {
 	readonly repository?: OpenWebUIProjectionRepository;
 	readonly mappings?: SessionMappingStore;
 	readonly protectedPaths: GjcRuntimeLocations["protectedProjectPaths"];
+	readonly runtimeLocations?: GjcSessionStorageLocations;
 }
 
 export interface ProjectLinkResult {
@@ -50,6 +52,7 @@ export class ProjectLinkService {
 	readonly #repository?: OpenWebUIProjectionRepository;
 	readonly #mappings?: SessionMappingStore;
 	readonly #protectedPaths: GjcRuntimeLocations["protectedProjectPaths"];
+	readonly #runtimeLocations?: GjcSessionStorageLocations;
 
 	constructor(options: ProjectLinkServiceOptions) {
 		this.#allowedRoots = options.allowedRoots;
@@ -58,6 +61,7 @@ export class ProjectLinkService {
 		this.#repository = options.repository;
 		this.#mappings = options.mappings;
 		this.#protectedPaths = options.protectedPaths;
+		this.#runtimeLocations = options.runtimeLocations;
 	}
 
 	async seedConfiguredProjects(projects: readonly RegisteredProject[]): Promise<void> {
@@ -120,6 +124,7 @@ export class ProjectLinkService {
 			ownerUserId: this.#ownerUserId,
 			projects: this.listLinkedProjects(),
 			mappings: this.#mappings,
+			runtimeLocations: this.#runtimeLocations,
 		});
 		for (const folder of sync.folders) {
 			const project = this.#store.getProject(folder.projectId);
@@ -155,6 +160,7 @@ export class ProjectLinkService {
 			ownerUserId: this.#ownerUserId,
 			projects: [project],
 			mappings: this.#mappings,
+			runtimeLocations: this.#runtimeLocations,
 		});
 	}
 

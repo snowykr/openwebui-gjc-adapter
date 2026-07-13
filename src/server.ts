@@ -195,7 +195,13 @@ export function startAdapterServer(options: AdapterServerOptions): AdapterServer
 	return {
 		url: server.url.toString(),
 		async stop(): Promise<void> {
-			await server.stop();
+			const results = await Promise.allSettled([server.stop(), options.routes?.runner.stop?.()]);
+			const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+			if (failures.length > 0)
+				throw new AggregateError(
+					failures.map(result => result.reason),
+					"Server cleanup failed",
+				);
 		},
 	};
 }

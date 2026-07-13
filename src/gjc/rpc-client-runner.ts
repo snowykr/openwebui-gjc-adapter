@@ -9,7 +9,6 @@ import type {
 	GjcRespondWorkflowGateInput,
 	GjcRpcRunnerClientOptions,
 	GjcRpcRunnerTransport,
-	GjcRpcTransportState,
 	GjcSessionAddress,
 	GjcSessionState,
 	GjcSessionStateInput,
@@ -19,12 +18,15 @@ import type {
 	GjcTurnResult,
 	GjcTurnRunner,
 } from "./rpc-runner";
+import { lastEventText, mapSessionState, stripSessionId } from "./rpc-runner-result";
 import {
 	assertAcceptedWorkflowGateResolution,
 	callRespondGate,
 	promptAndCollectWorkflowGates,
+	respondAndCollectWorkflowGates,
 	toTurnEvent,
 } from "./rpc-workflow-events";
+import { resolveGjcSdkSessionRoot } from "./session-root";
 
 interface StartedClient {
 	readonly client: GjcRpcRunnerTransport;
@@ -59,9 +61,24 @@ class RpcBackedGjcTurnRunner implements GjcTurnRunner {
 		private readonly runtimeLocations: GjcRuntimeLocations,
 	) {}
 
+	async stop(): Promise<void> {
+		const clients = [...new Set(this.#clients.values())].map(started => started.client);
+		this.#clients.clear();
+		const results = await Promise.allSettled(clients.map(client => client.stop()));
+		const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+		if (failures.length > 0)
+			throw new AggregateError(
+				failures.map(result => result.reason),
+				"GJC cleanup failed",
+			);
+	}
+
+	resolveSessionRoot = (cwd: string): string => resolveGjcSdkSessionRoot(cwd, this.runtimeLocations);
+
 	async startNewSession(input: GjcStartNewSessionInput): Promise<GjcSessionAddress & GjcTurnResult> {
+		const sessionRoot = this.resolveSessionRoot(input.cwd);
 		const clientKey = newSessionClientKey(input.projectId, input.chatId);
-		const started = await this.getOrStartClient(clientKey, input);
+		const started = await this.getOrStartClient(clientKey, { ...input, sessionRoot });
 		const result = await enqueue(started, async () => {
 			const session = await runRpcCommand("new_session", () => started.client.newSession());
 			if (isCancelled(session)) throw new GjcRpcRunnerError("new_session", "session creation was cancelled");
@@ -69,7 +86,7 @@ class RpcBackedGjcTurnRunner implements GjcTurnRunner {
 		});
 		const address = {
 			cwd: input.cwd,
-			sessionRoot: input.sessionRoot,
+			sessionRoot,
 			projectId: input.projectId,
 			sessionId: result.sessionId,
 			chatId: input.chatId,
@@ -95,13 +112,10 @@ class RpcBackedGjcTurnRunner implements GjcTurnRunner {
 	}
 
 	async switchSession(input: GjcSwitchSessionInput): Promise<void> {
-		if (input.sessionFile === undefined) {
-			throw new GjcRpcRunnerError("switch_session", "sessionFile is required for continuation");
-		}
 		const started = await this.getOrStartClient(sessionClientKey(input), input);
 		await enqueue(started, async () => {
 			const result = await runRpcCommand("switch_session", () =>
-				started.client.switchSession(input.sessionFile ?? ""),
+				started.client.switchSession(input.sessionFile, input.sessionId),
 			);
 			if (isCancelled(result)) throw new GjcRpcRunnerError("switch_session", "session switch was cancelled");
 		});
@@ -129,8 +143,14 @@ class RpcBackedGjcTurnRunner implements GjcTurnRunner {
 			throw new GjcRpcRunnerError("workflow_gate_response", "RPC transport does not support workflow gates");
 		}
 		return enqueue(started, async () => {
-			const resolution = await runRpcCommand("workflow_gate_response", () =>
-				callRespondGate(started.client, input.gateId, input.answer, input.idempotencyKey),
+			const switched = await runRpcCommand("switch_session", () =>
+				started.client.switchSession(input.sessionFile, input.sessionId),
+			);
+			if (isCancelled(switched)) throw new GjcRpcRunnerError("switch_session", "session switch was cancelled");
+			const { resolution, workflowGates } = await runRpcCommand("workflow_gate_response", () =>
+				respondAndCollectWorkflowGates(started.client, () =>
+					callRespondGate(started.client, input.gateId, input.answer, input.idempotencyKey, input.gateCorrelation),
+				),
 			);
 			assertAcceptedWorkflowGateResolution(resolution);
 			const state = await runRpcCommand("get_state", () => started.client.getState());
@@ -140,7 +160,10 @@ class RpcBackedGjcTurnRunner implements GjcTurnRunner {
 			return {
 				...mapSessionState(state, input.rawFrameCursor, input.eventCursor),
 				text: assistantText ?? "",
-				events: assistantText === null ? [] : [{ type: "assistant", text: assistantText }],
+				events: [
+					...(assistantText === null ? [] : [{ type: "assistant", text: assistantText }]),
+					...workflowGates.map(toTurnEvent),
+				],
 			};
 		});
 	}
@@ -163,7 +186,7 @@ class RpcBackedGjcTurnRunner implements GjcTurnRunner {
 		if (existing !== undefined) return existing.ready.then(() => existing);
 		const client = this.clientFactory({
 			cwd: options.cwd,
-			sessionRoot: options.sessionRoot,
+			sessionRoot: this.resolveSessionRoot(options.cwd),
 			...(this.cliPath === undefined ? {} : { cliPath: this.cliPath }),
 			runtimeLocations: this.runtimeLocations,
 		});
@@ -177,7 +200,7 @@ class RpcBackedGjcTurnRunner implements GjcTurnRunner {
 		} catch (error) {
 			if (this.#clients.get(key) === started) {
 				this.#clients.delete(key);
-				client.stop();
+				await client.stop();
 			}
 			throw error;
 		}
@@ -240,30 +263,6 @@ async function runRpcCommand<T>(command: string, operation: () => Promise<T>): P
 
 function isCancelled(value: undefined | { readonly cancelled: boolean }): boolean {
 	return value?.cancelled ?? false;
-}
-
-function mapSessionState(state: GjcRpcTransportState, rawFrameCursor: number, eventCursor: number): GjcSessionState {
-	const rawCursor = state.rawFrameCursor ?? rawFrameCursor;
-	const projectedEventCursor = state.eventCursor ?? state.messageCount ?? eventCursor;
-	return {
-		...(state.sessionFile === undefined ? {} : { sessionFile: state.sessionFile }),
-		...(state.activeLeaf === undefined ? {} : { activeLeaf: state.activeLeaf }),
-		rawFrameCursor: rawCursor,
-		eventCursor: projectedEventCursor,
-	};
-}
-
-function lastEventText(events: readonly GjcTurnEvent[]): string | undefined {
-	for (let index = events.length - 1; index >= 0; index -= 1) {
-		const text = events[index]?.text;
-		if (text !== undefined) return text;
-	}
-	return undefined;
-}
-
-function stripSessionId(result: GjcTurnResult & { readonly sessionId: string }): GjcTurnResult {
-	const { sessionId: _sessionId, ...turn } = result;
-	return turn;
 }
 
 function sessionClientKey(input: Pick<GjcSessionAddress, "projectId" | "sessionId">): string {

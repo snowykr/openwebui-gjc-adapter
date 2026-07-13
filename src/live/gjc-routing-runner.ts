@@ -48,6 +48,9 @@ export function createGjcRoutingLiveGatewayRunner(
 	input: CreateGjcRoutingLiveGatewayRunnerInput,
 ): GjcRoutingLiveGatewayRunner {
 	return {
+		async stop(): Promise<void> {
+			await input.turnRunner.stop?.();
+		},
 		async run(turn: LiveGatewayRunnerInput): Promise<GjcRoutingLiveGatewayRunnerResult> {
 			const requestedModelId = turn.requestedModelId ?? input.requestedModelId?.(turn);
 			const existing = input.mappings.get(turn.chatId);

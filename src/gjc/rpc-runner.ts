@@ -52,6 +52,13 @@ export interface GjcRespondWorkflowGateInput extends GjcSessionAddress {
 	readonly rawFrameCursor: number;
 	readonly eventCursor: number;
 	readonly operationId: string;
+	readonly gateCorrelation?: GjcWorkflowGateCorrelation;
+}
+
+export interface GjcWorkflowGateCorrelation {
+	readonly commandId: string;
+	readonly turnId: string;
+	readonly sessionId: string;
 }
 
 export interface GjcSessionState {
@@ -79,6 +86,8 @@ export interface GjcTurnResult {
 }
 
 export interface GjcTurnRunner {
+	stop?(): void;
+	resolveSessionRoot?(cwd: string): string;
 	startNewSession(input: GjcStartNewSessionInput): Promise<GjcSessionAddress & GjcTurnResult>;
 	continueSession(input: GjcContinueSessionInput): Promise<GjcTurnResult>;
 	switchSession(input: GjcSwitchSessionInput): Promise<void>;
@@ -103,6 +112,11 @@ export interface GjcRpcRunnerClientOptions {
 export interface GjcRpcTransportState {
 	readonly sessionId: string;
 	readonly sessionFile?: string;
+	readonly model?: {
+		readonly provider: string;
+		readonly id: string;
+	};
+	readonly thinkingLevel?: unknown;
 	readonly activeLeaf?: string;
 	readonly rawFrameCursor?: number;
 	readonly eventCursor?: number;
@@ -158,13 +172,17 @@ export interface GjcRpcRunnerTransportEvent {
 	readonly thinkingLevel?: string;
 	readonly message?: unknown;
 	readonly payload?: unknown;
+	readonly commandId?: string;
+	readonly turnId?: string;
+	readonly sessionId?: string;
 }
 
 export interface GjcRpcRunnerTransport {
 	start(): Promise<void>;
-	stop(): void;
+	stop(): void | Promise<void>;
+	newEphemeralSession?(): Promise<void>;
 	newSession(): Promise<undefined | { readonly cancelled: boolean }>;
-	switchSession(sessionPath: string): Promise<undefined | { readonly cancelled: boolean }>;
+	switchSession(sessionPath?: string, sessionId?: string): Promise<undefined | { readonly cancelled: boolean }>;
 	getState(): Promise<GjcRpcTransportState>;
 	getAvailableModels?(): Promise<readonly unknown[]>;
 	setDefaultModelSelection?(
@@ -174,7 +192,12 @@ export interface GjcRpcRunnerTransport {
 	): Promise<NormalizedModelSelection>;
 	promptAndWait(message: string, timeoutMs?: number): Promise<readonly GjcRpcRunnerTransportEvent[]>;
 	onWorkflowGate?(listener: (gate: GjcRpcRunnerTransportEvent) => void): () => void;
-	respondGate?(gateId: string, answer: WorkflowGateAnswer, idempotencyKey?: string): Promise<unknown>;
+	respondGate?(
+		gateId: string,
+		answer: WorkflowGateAnswer,
+		idempotencyKey?: string,
+		correlation?: GjcWorkflowGateCorrelation,
+	): Promise<unknown>;
 	getLastAssistantText(): Promise<string | null>;
 }
 

@@ -88,6 +88,7 @@ export async function buildResolvedAdapterServerOptions(
 			repository: projectionRepository,
 			mappings,
 			protectedPaths: config.runtimeLocations.protectedProjectPaths,
+			runtimeLocations: config.runtimeLocations,
 		});
 		const previouslyLinkedProjectIds = new Set(projectLinkService.listLinkedProjects().map(project => project.id));
 		await projectLinkService.seedConfiguredProjects(projects);
@@ -219,7 +220,7 @@ function buildRuntimeHealthChecks(config: AdapterConfig): AdapterHealthCheck[] {
 		{
 			name: "gjc-live-runner",
 			status: "ok",
-			detail: "GJC live runner is wired to the RPC turn runner.",
+			detail: "GJC live runner is wired to the authenticated SDK v3 turn runner.",
 		},
 	];
 }
@@ -262,8 +263,5 @@ function buildOpenWebUIFileContextResolver(
 }
 
 function buildOwnerContext(config: AdapterConfig): OpenWebUIOwnerContext {
-	return {
-		ownerUserId: config.ownerUserId ?? "",
-		singleOwnerLocalMode: false,
-	};
+	return { ownerUserId: config.ownerUserId ?? "", singleOwnerLocalMode: false };
 }

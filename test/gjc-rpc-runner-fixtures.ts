@@ -14,7 +14,7 @@ export interface RecordedClient {
 type FakeCall =
 	| { readonly type: "start" }
 	| { readonly type: "new_session" }
-	| { readonly type: "switch_session"; readonly sessionPath: string }
+	| { readonly type: "switch_session"; readonly sessionPath?: string }
 	| { readonly type: "get_state" }
 	| { readonly type: "prompt"; readonly message: string }
 	| {
@@ -22,6 +22,11 @@ type FakeCall =
 			readonly gateId: string;
 			readonly answer: unknown;
 			readonly idempotencyKey?: string;
+			readonly correlation?: {
+				readonly commandId: string;
+				readonly turnId: string;
+				readonly sessionId: string;
+			};
 	  }
 	| { readonly type: "on_workflow_gate" }
 	| { readonly type: "get_last_assistant_text" }
@@ -41,6 +46,7 @@ export class FakeRpcTransport implements GjcRpcRunnerTransport {
 	};
 	failCommand: FakeCall["type"] | undefined;
 	workflowGateOnPrompt: GjcRpcRunnerTransportEvent | undefined;
+	workflowGateOnRespond: GjcRpcRunnerTransportEvent | undefined;
 
 	#stateIndex = 0;
 	#promptIndex = 0;
@@ -71,7 +77,7 @@ export class FakeRpcTransport implements GjcRpcRunnerTransport {
 		return { cancelled: false };
 	}
 
-	async switchSession(sessionPath: string): Promise<{ readonly cancelled: boolean }> {
+	async switchSession(sessionPath?: string): Promise<{ readonly cancelled: boolean }> {
 		this.record({ type: "switch_session", sessionPath });
 		return { cancelled: false };
 	}
@@ -103,13 +109,21 @@ export class FakeRpcTransport implements GjcRpcRunnerTransport {
 		};
 	}
 
-	async respondGate(gateId: string, answer: unknown, idempotencyKey?: string): Promise<unknown> {
+	async respondGate(
+		gateId: string,
+		answer: unknown,
+		idempotencyKey?: string,
+		correlation?: { readonly commandId: string; readonly turnId: string; readonly sessionId: string },
+	): Promise<unknown> {
 		this.record({
 			type: "respond_gate",
 			gateId,
 			answer,
 			...(idempotencyKey === undefined ? {} : { idempotencyKey }),
+			...(correlation === undefined ? {} : { correlation }),
 		});
+		const workflowGate = this.workflowGateOnRespond;
+		if (workflowGate !== undefined) queueMicrotask(() => this.#workflowGateListener?.(workflowGate));
 		if (this.advanceStateAfterRespondGate) this.#stateIndex += 1;
 		return this.respondGateResult;
 	}

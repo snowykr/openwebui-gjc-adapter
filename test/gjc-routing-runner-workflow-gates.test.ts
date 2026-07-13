@@ -49,6 +49,7 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 				answer: { selected: ["JWT"] },
 				idempotencyKey: "chat-1:user-2",
 				userMessageId: "user-2",
+				gateCorrelation: { commandId: "command-1", turnId: "turn-1", sessionId: "session-1" },
 			},
 		]);
 	});

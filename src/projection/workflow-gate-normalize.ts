@@ -16,6 +16,10 @@ export function pendingWorkflowGateFromEvent(event: {
 	const context = jsonObjectFromUnknown(payload.context);
 	const createdAt = stringField(payload, "createdAt") ?? stringField(payload, "created_at");
 	const required = booleanField(payload, "required");
+	const commandId = stringField(payload, "commandId");
+	const turnId = stringField(payload, "turnId");
+	const sessionId = stringField(payload, "sessionId");
+	const hasCompleteCorrelation = commandId !== undefined && turnId !== undefined && sessionId !== undefined;
 	return {
 		gateId,
 		...(stage === undefined ? {} : { stage }),
@@ -30,6 +34,7 @@ export function pendingWorkflowGateFromEvent(event: {
 		...(context === undefined ? {} : { context }),
 		...(createdAt === undefined ? {} : { createdAt }),
 		...(required === undefined ? {} : { required }),
+		...(hasCompleteCorrelation ? { commandId, turnId, sessionId } : {}),
 	};
 }
 

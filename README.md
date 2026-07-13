@@ -38,7 +38,7 @@ Add the required custom headers on the OpenAI connection:
 }
 ```
 
-Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. Use `@gajae-code/coding-agent` 0.9.4 or newer so the adapter can consume `RpcClient.onSessionEvent` and project full GJC TUI/session progress into OpenWebUI. Background task calls such as title generation are no-ops and must not create GJC sessions.
+Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. The adapter package pins the published GJC 0.10.1 metadata packages, while the managed image builds and runs the exact reviewed current-`dev` source commit declared in `Dockerfile.adapter`. Session control uses the authenticated localhost SDK v3 WebSocket contract; the removed legacy JSONL RPC mode is not supported. Background task calls such as title generation are no-ops and must not create GJC sessions.
 
 ## CLI first-install configuration
 
@@ -72,7 +72,7 @@ Both paths preserve the loopback-safe boundary: the UI is not exposed by the CLI
 
 Existing installations accept exactly two direct runtime-location flags: `--gjc-config-dir-name NAME` and `--gjc-coding-agent-dir PATH`. Direct values are persisted. Runtime resolution uses persisted installed values, then adapter-namespaced environment values, then derived defaults. The namespaced selectors are `GJC_OPENWEBUI_GJC_CONFIG_DIR_NAME` and `GJC_OPENWEBUI_GJC_CODING_AGENT_DIR`. Managed configuration rejects both runtime-location flags because its runtime locations are fixed below `/var/lib/gjc/home`.
 
-Ambient `GJC_CONFIG_DIR`, `PI_CONFIG_DIR`, and `GJC_CODING_AGENT_DIR` do not select shipped RPC runtime locations. Each child receives the resolved `HOME`, `GJC_CONFIG_DIR`, and `GJC_CODING_AGENT_DIR`; inherited `PI_CONFIG_DIR` is removed. XDG variables remain inherited but do not select or relocate these paths.
+Ambient `GJC_CONFIG_DIR`, `PI_CONFIG_DIR`, and `GJC_CODING_AGENT_DIR` do not select shipped SDK runtime locations. Each child receives the resolved `HOME`, `GJC_CONFIG_DIR`, and `GJC_CODING_AGENT_DIR`; inherited `PI_CONFIG_DIR` is removed. XDG variables remain inherited but do not select or relocate these paths.
 
 Recovery preserves the legacy vector when neither location field is present and records config-name only, agent-directory only, and both fields together when locations are explicit. A pending recovery journal is authoritative: a retry may omit both flags to resume the recorded values, while a differing retry is rejected before configuration, journal, reset, or deployment writes.
 
@@ -99,7 +99,7 @@ Project folders are not advertised as models; the adapter resolves the GJC worki
 
 The project guard protects exactly four resolved GJC paths: `configDomain`, `agentDir`, `readerWorkspace`, and `readerSessionRoot`. A project `cwd` or explicit `sessionRoot` is rejected when it is equal to, an ancestor of, or a descendant of any one of them. The guard does not cover adapter state, mappings, session stores, or SQLite.
 
-Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. The adapter uses full session events when the installed GJC RPC client exposes `onSessionEvent`; otherwise it falls back to the standard agent-event stream. Background task calls such as title generation are no-ops and must not create GJC sessions.
+Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. The adapter authenticates to each SDK v3 session endpoint before consuming its correlated lifecycle, turn, gate, and stream events. Background task calls such as title generation are no-ops and must not create GJC sessions.
 Inside OpenWebUI, send these slash-style commands in a normal `gjc` chat for project administration:
 
 ```text
@@ -125,14 +125,14 @@ Canonical model ids use `gjc/<encoded-provider>/<encoded-model>:<thinking>`. Pro
 
 Selection updates the machine-global last-successful-writer-wins default. Operations are serialized per stable client, but the adapter does not provide global request ordering or a distributed ordering guarantee. The adapter invokes the setter once and does not retry, compensate, or roll it back. It also does not roll back an already committed project link or unlink if the later model-selection read needed for the response fails.
 
-- GJC JSONL and artifacts remain authoritative.
+- GJC session history and artifacts remain authoritative.
 - OpenWebUI chat rows and chat messages are projection/cache records.
 - Adapter metadata is stored under `gjc_adapter`; user-visible OpenWebUI fields such as title/rating are preserved on reprojection.
 - The live gateway uses `/v1/models` and `/v1/chat/completions`.
-- The package entrypoint wires chat completions through the GJC RPC turn runner and stores OpenWebUI chat-to-GJC session mappings in a file-backed store under `GJC_OPENWEBUI_SESSION_ROOT`.
-- The adapter uses full session events when the installed GJC RPC client exposes `RpcClient.onSessionEvent`; otherwise it safely falls back to the standard agent-event stream. Delivered session events are bounded OpenWebUI message events covering available lifecycle, tool/MCP, subagent, todo, goal, notice, retry, compaction, and workflow progress.
+- The package entrypoint wires chat completions through the GJC SDK v3 turn runner and stores OpenWebUI chat-to-GJC session mappings in a file-backed store under `GJC_OPENWEBUI_SESSION_ROOT`.
+- The adapter consumes authenticated SDK v3 session events and correlates prompt completion by command and turn identity. Delivered session events are bounded OpenWebUI message events covering available lifecycle, tool/MCP, subagent, todo, goal, notice, retry, compaction, and workflow progress.
 - Raw tool arguments/results and secret-looking text are not emitted directly; the adapter preserves bounded labels, counts, phases, and status descriptions for display.
-- Workflow gates can be rendered as assistant-visible pending-gate text and validated with the exported gate primitives; wire those primitives into the deployment's event sink/continuation policy before claiming automatic gate approval handling.
+- Workflow gates are rendered as assistant-visible pending-gate text. A matching user reply is validated against the persisted gate schema and resumed through the authenticated SDK session; replies that do not match the stored project, session, message lineage, or gate correlation fail closed.
 - Regenerate/branch only proceeds when owner, project, session, and message lineage metadata match; otherwise the adapter forks safely.
 
 ## Operator notes

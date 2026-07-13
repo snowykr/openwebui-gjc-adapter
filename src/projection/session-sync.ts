@@ -2,6 +2,7 @@ import type { Dirent } from "node:fs";
 import { readdir } from "node:fs/promises";
 import * as path from "node:path";
 import { GjcSessionLoadError, loadGjcSessionFile } from "../gjc/session-loader";
+import { type GjcSessionStorageLocations, resolveGjcSdkSessionRoot } from "../gjc/session-root";
 import type { SessionMappingStore } from "../gjc/session-router";
 import type { OpenWebUIProjectionRepository } from "../openwebui/client";
 import { buildProjectFolderMetadata, type RegisteredProject } from "../projects/registry";
@@ -13,6 +14,7 @@ export interface SyncProjectSessionsInput {
 	readonly ownerUserId: string;
 	readonly projects: readonly RegisteredProject[];
 	readonly mappings?: SessionMappingStore;
+	readonly runtimeLocations?: GjcSessionStorageLocations;
 }
 
 export interface ImportedProjectSession {
@@ -59,7 +61,7 @@ export async function syncProjectSessionsToOpenWebUI(
 		});
 		folders.push({ projectId: project.id, folderId });
 
-		for (const filePath of await listSessionFiles(project)) {
+		for (const filePath of await listSessionFiles(project, input.runtimeLocations)) {
 			try {
 				const loaded = await loadGjcSessionFile(filePath);
 				if (importedSessionIds.has(loaded.header.id)) {
@@ -128,8 +130,21 @@ function historicalChatId(projectId: string, sessionId: string): string {
 	return `gjc-project-${projectId}-session-${sessionId}`;
 }
 
-async function listSessionFiles(project: RegisteredProject): Promise<readonly string[]> {
-	const sessionRoot = project.sessionRoot ?? path.join(project.cwd, ".gjc", "sessions");
+async function listSessionFiles(
+	project: RegisteredProject,
+	runtimeLocations: GjcSessionStorageLocations | undefined,
+): Promise<readonly string[]> {
+	const configuredRoot = project.sessionRoot ?? path.join(project.cwd, ".gjc", "sessions");
+	const sessionRoots = [
+		...(runtimeLocations === undefined ? [] : [resolveGjcSdkSessionRoot(project.cwd, runtimeLocations)]),
+		configuredRoot,
+	].filter((root, index, roots) => roots.indexOf(root) === index);
+	const files: string[] = [];
+	for (const sessionRoot of sessionRoots) files.push(...(await listRootSessionFiles(sessionRoot)));
+	return files;
+}
+
+async function listRootSessionFiles(sessionRoot: string): Promise<readonly string[]> {
 	let entries: Dirent[];
 	try {
 		entries = await readdir(sessionRoot, { withFileTypes: true });

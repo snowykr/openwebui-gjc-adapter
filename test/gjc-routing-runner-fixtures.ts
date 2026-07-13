@@ -25,6 +25,7 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 		eventCursor: 3,
 	};
 	events: GjcTurnResult["events"] = [{ type: "assistant", text: "assistant from gjc" }];
+	gateResponseEvents: GjcTurnResult["events"] = [{ type: "assistant", text: "workflow gate accepted" }];
 
 	async startNewSession(input: GjcStartNewSessionInput): Promise<GjcSessionAddress & GjcTurnResult> {
 		this.starts.push(input);
@@ -70,7 +71,7 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 		this.gateResponses.push(input);
 		return {
 			text: "workflow gate accepted",
-			events: [{ type: "assistant", text: "workflow gate accepted" }],
+			events: this.gateResponseEvents,
 			sessionFile: input.sessionFile,
 			activeLeaf: "leaf-gate",
 			rawFrameCursor: input.rawFrameCursor,
@@ -96,6 +97,9 @@ export const deepInterviewWorkflowGateEvent = {
 		kind: "question",
 		schemaHash: "sha256:deep",
 		idempotencyKey: "idem-deep-1",
+		commandId: "command-1",
+		turnId: "turn-1",
+		sessionId: "session-1",
 		context: { prompt: "Choose authentication method" },
 		options: [
 			{ label: "JWT", value: "JWT" },

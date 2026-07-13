@@ -1,8 +1,12 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, parse, relative, resolve, sep } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { GJC_THINKING_LEVELS, type NormalizedModelSelection } from "../contracts";
 import type { RegisteredProject } from "../projects/registry";
 import { type GjcTurnEvent, type GjcTurnRunner, getProjectSessionRoot } from "./rpc-runner";
+import { ensureSdkSessionFile, validateSessionFile } from "./session-file";
+import { resolveEffectiveGjcSessionRoot } from "./session-root";
+
+export { validateSessionFile } from "./session-file";
 
 export interface SessionMapping {
 	readonly chatId: string;
@@ -106,8 +110,12 @@ export async function routeGjcTurn(input: RouteGjcTurnInput): Promise<RouteGjcTu
 		return startNewMappedSession(input);
 	}
 
-	const sessionRoot = getProjectSessionRoot(input.project);
-	const existingSessionFile = validateSessionFile(input.project, existing.sessionFile);
+	const sessionRoot = resolveEffectiveGjcSessionRoot(
+		input.project.cwd,
+		getProjectSessionRoot(input.project),
+		input.runner.resolveSessionRoot,
+	);
+	const existingSessionFile = await ensureSdkSessionFile(input.project, existing.sessionFile, sessionRoot);
 	const address = {
 		cwd: input.project.cwd,
 		sessionRoot,
@@ -146,7 +154,7 @@ export async function routeGjcTurn(input: RouteGjcTurnInput): Promise<RouteGjcTu
 		chatId: input.chatId,
 		projectId: input.project.id,
 		sessionId: existing.sessionId,
-		sessionFile: sessionFile === undefined ? undefined : validateSessionFile(input.project, sessionFile),
+		sessionFile: sessionFile === undefined ? undefined : validateSessionFile(input.project, sessionFile, sessionRoot),
 		activeLeaf: result.activeLeaf ?? state.activeLeaf,
 		rawFrameCursor: result.rawFrameCursor,
 		eventCursor: result.eventCursor,
@@ -164,9 +172,14 @@ export async function routeGjcTurn(input: RouteGjcTurnInput): Promise<RouteGjcTu
 }
 
 async function startNewMappedSession(input: RouteGjcTurnInput): Promise<RouteGjcTurnResult> {
+	const sessionRoot = resolveEffectiveGjcSessionRoot(
+		input.project.cwd,
+		getProjectSessionRoot(input.project),
+		input.runner.resolveSessionRoot,
+	);
 	const result = await input.runner.startNewSession({
 		cwd: input.project.cwd,
-		sessionRoot: getProjectSessionRoot(input.project),
+		sessionRoot,
 		projectId: input.project.id,
 		chatId: input.chatId,
 		userMessageId: input.userMessageId,
@@ -182,7 +195,7 @@ async function startNewMappedSession(input: RouteGjcTurnInput): Promise<RouteGjc
 		chatId: input.chatId,
 		projectId: input.project.id,
 		sessionId: result.sessionId,
-		sessionFile: validateSessionFile(input.project, result.sessionFile),
+		sessionFile: validateSessionFile(input.project, result.sessionFile, sessionRoot),
 		activeLeaf: result.activeLeaf,
 		rawFrameCursor: result.rawFrameCursor,
 		eventCursor: result.eventCursor,
@@ -197,49 +210,6 @@ async function startNewMappedSession(input: RouteGjcTurnInput): Promise<RouteGjc
 		events: result.events,
 		mapping,
 	};
-}
-
-export function validateSessionFile(project: RegisteredProject, sessionFile: string | undefined): string | undefined {
-	if (sessionFile === undefined) return undefined;
-	const sessionRoot = getProjectSessionRoot(project);
-	const resolvedSessionRoot = resolveExistingOrProspectivePath(sessionRoot);
-	const resolvedSessionFile = resolveExistingOrProspectivePath(sessionFile);
-	const relativeSessionFile = relative(resolvedSessionRoot, resolvedSessionFile);
-	if (relativeSessionFile.startsWith("..") || isAbsolute(relativeSessionFile)) {
-		throw new Error(`Stored GJC session file is outside project session root: ${sessionFile}`);
-	}
-	return resolvedSessionFile;
-}
-
-function resolveExistingOrProspectivePath(targetPath: string): string {
-	const absoluteTargetPath = resolve(targetPath);
-	try {
-		return realpathSync(absoluteTargetPath);
-	} catch (error) {
-		if (!isNotFoundError(error)) throw error;
-	}
-
-	const parsedPath = parse(absoluteTargetPath);
-	const segments = [
-		parsedPath.root,
-		...relative(parsedPath.root, absoluteTargetPath)
-			.split(sep)
-			.filter(segment => segment.length > 0),
-	];
-	for (let index = segments.length - 1; index >= 0; index -= 1) {
-		const parentCandidate = resolve(...segments.slice(0, index + 1));
-		try {
-			const realParent = realpathSync(parentCandidate);
-			return resolve(realParent, ...segments.slice(index + 1));
-		} catch (error) {
-			if (!isNotFoundError(error)) throw error;
-		}
-	}
-	throw new Error(`No existing parent found for path: ${targetPath}`);
-}
-
-function isNotFoundError(error: unknown): boolean {
-	return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
 
 function copySessionMapping(mapping: SessionMapping): SessionMapping {

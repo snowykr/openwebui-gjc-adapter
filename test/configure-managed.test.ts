@@ -10,7 +10,8 @@ import { renderSystemdComposeUnit } from "../src/configure/systemd";
 describe("managed installation rendering and preflight", () => {
 	test("ships every Docker build input in the packed package whitelist", () => {
 		const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { files?: string[] };
-		expect(pkg.files).toEqual(expect.arrayContaining(["src", "bin", "Dockerfile.adapter", "patches", "bun.lock"]));
+		expect(pkg.files).toEqual(expect.arrayContaining(["src", "bin", "Dockerfile.adapter", "bun.lock"]));
+		expect(pkg.files).not.toContain("patches");
 	});
 	test("keeps the adapter private and loopback-only UI publishing", () => {
 		const compose = renderManagedCompose({
@@ -51,7 +52,8 @@ describe("managed installation rendering and preflight", () => {
 	test("Dockerfile uses the package root as its build context", () => {
 		const dockerfile = readFileSync(new URL("../Dockerfile.adapter", import.meta.url), "utf8");
 		expect(dockerfile).toContain("COPY package.json bun.lock ./");
-		expect(dockerfile).toContain("COPY patches ./patches");
+		expect(dockerfile).not.toContain("COPY patches ./patches");
+		expect(dockerfile).toContain("COPY --from=gjc-builder /opt/gajae-code /opt/gajae-code");
 		expect(dockerfile).toContain("COPY src ./src");
 		expect(dockerfile).toContain("COPY bin ./bin");
 		expect(dockerfile).toContain("USER adapter:adapter");

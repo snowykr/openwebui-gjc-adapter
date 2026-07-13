@@ -1,15 +1,15 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveGjcRuntimeLocations } from "../src/configure/runtime-locations";
 import {
 	createDefaultRpcTransport,
 	createRpcTransportFromClient,
 	type RpcClientTransportClient,
 } from "../src/gjc/rpc-client-transport";
 import type { GjcRpcRunnerTransportEvent, GjcRpcTransportState } from "../src/gjc/rpc-runner";
+import { startSdkFixtureServer } from "./gjc-sdk-v3-fixtures";
 
 describe("createRpcTransportFromClient", () => {
 	test("default transport rejects omitted resolved locations before client construction", () => {
@@ -75,12 +75,25 @@ describe("createRpcTransportFromClient", () => {
 	});
 
 	test("overwrites GJC child locations while inheriting unrelated XDG values", async () => {
-		// Given: hostile ambient GJC/PI values, inherited XDG values, and the real stdio client.
+		// Given: hostile ambient GJC/PI values, inherited XDG values, and the SDK daemon CLI.
 		const root = mkdtempSync(join(tmpdir(), "gjc-rpc-environment-"));
-		const transcript = join(root, "environment.jsonl");
-		const protocolTranscript = join(root, "protocol.jsonl");
-		const lifecycleTranscript = join(root, "lifecycle.jsonl");
-		const locations = resolveGjcRuntimeLocations({ mode: "managed" });
+		const transcript = join(root, "sdk-cli.jsonl");
+		const server = startSdkFixtureServer("turn_complete");
+		const home = join(root, "home");
+		const configDomain = join(home, ".gjc");
+		const agentDir = join(configDomain, "agent");
+		const readerWorkspace = join(configDomain, "openwebui", "default-reader");
+		const readerSessionRoot = join(readerWorkspace, ".gjc", "sessions");
+		for (const path of [agentDir, readerSessionRoot]) mkdirSync(path, { recursive: true });
+		const locations = {
+			home,
+			configDomain,
+			agentDir,
+			readerWorkspace,
+			readerSessionRoot,
+			protectedProjectPaths: [configDomain, agentDir, readerWorkspace, readerSessionRoot] as const,
+			childEnvironment: { HOME: home, GJC_CONFIG_DIR: ".gjc", GJC_CODING_AGENT_DIR: agentDir },
+		};
 		const adapterKeys = ["GJC_OPENWEBUI_ADAPTER_API_TOKEN", "GJC_OPENWEBUI_ADMIN_PASSWORD"] as const;
 		const keys = [
 			"GJC_CONFIG_DIR",
@@ -89,9 +102,9 @@ describe("createRpcTransportFromClient", () => {
 			"XDG_DATA_HOME",
 			"XDG_STATE_HOME",
 			"XDG_CACHE_HOME",
-			"GJC_RPC_FIXTURE_ENV_TRANSCRIPT",
-			"GJC_RPC_FIXTURE_PROTOCOL_TRANSCRIPT",
-			"GJC_RPC_FIXTURE_LIFECYCLE_TRANSCRIPT",
+			"GJC_SDK_FIXTURE_CLI_TRANSCRIPT",
+			"GJC_SDK_FIXTURE_ENDPOINT_URL",
+			"GJC_SDK_FIXTURE_ENDPOINT_TOKEN",
 			...adapterKeys,
 		] as const;
 		const previous = Object.fromEntries(keys.map(key => [key, process.env[key]]));
@@ -102,31 +115,26 @@ describe("createRpcTransportFromClient", () => {
 			XDG_DATA_HOME: "/hostile/xdg-data",
 			XDG_STATE_HOME: "/hostile/xdg-state",
 			XDG_CACHE_HOME: "/hostile/xdg-cache",
-			GJC_RPC_FIXTURE_ENV_TRANSCRIPT: transcript,
-			GJC_RPC_FIXTURE_PROTOCOL_TRANSCRIPT: protocolTranscript,
-			GJC_RPC_FIXTURE_LIFECYCLE_TRANSCRIPT: lifecycleTranscript,
+			GJC_SDK_FIXTURE_CLI_TRANSCRIPT: transcript,
+			GJC_SDK_FIXTURE_ENDPOINT_URL: server.url,
+			GJC_SDK_FIXTURE_ENDPOINT_TOKEN: server.token,
 			...Object.fromEntries(adapterKeys.map(key => [key, `secret:${key}`])),
 		});
 		const transport = createDefaultRpcTransport({
 			cwd: root,
 			sessionRoot: locations.readerSessionRoot,
-			cliPath: fileURLToPath(new URL("fixtures/gjc-rpc-stdio-fixture.ts", import.meta.url)),
+			cliPath: fileURLToPath(new URL("fixtures/gjc-sdk-daemon-fixture.ts", import.meta.url)),
 			runtimeLocations: locations,
 		});
-		let childPid: number | undefined;
 		try {
-			// When: the actual upstream RpcClient starts and performs get_state.
+			// When: the SDK lifecycle command creates and authenticates a session.
 			await transport.start();
-			const state = await transport.getState();
-			childPid = processRecordPid(readJsonl(lifecycleTranscript)[0]);
+			await transport.newSession();
 
-			// Then: protocol state is valid and environment evidence stays separate from stdout.
-			expect(state).toMatchObject({ sessionId: "fixture-session", messageCount: 0 });
-			const childKeys = readFileSync(`/proc/${childPid}/environ`, "utf8")
-				.split("\0")
-				.map(entry => entry.split("=", 1)[0]);
-			expect(childKeys.filter(key => key.startsWith("GJC_OPENWEBUI_"))).toEqual([]);
-			const environment: unknown = JSON.parse(readFileSync(transcript, "utf8"));
+			// Then: managed locations win, unrelated XDG values survive, and adapter secrets do not cross the boundary.
+			const first = readJsonl(transcript)[0];
+			if (first === null || typeof first !== "object") throw new TypeError("missing SDK CLI transcript");
+			const environment = Reflect.get(first, "environment");
 			expect(environment).toEqual({
 				HOME: locations.home,
 				GJC_CONFIG_DIR: ".gjc",
@@ -135,23 +143,14 @@ describe("createRpcTransportFromClient", () => {
 				XDG_DATA_HOME: "/hostile/xdg-data",
 				XDG_STATE_HOME: "/hostile/xdg-state",
 				XDG_CACHE_HOME: "/hostile/xdg-cache",
+				adapterKeys: [],
 			});
 			expect(JSON.stringify(environment)).not.toContain("/hostile/config");
 			expect(JSON.stringify(environment)).not.toContain("/hostile/agent");
 			expect(JSON.stringify(environment)).not.toContain("/hostile/pi");
-			const protocol = readJsonl(protocolTranscript);
-			expect(protocol).toEqual([
-				{
-					type: "process",
-					argv: ["--mode", "rpc", "--session-dir", locations.readerSessionRoot],
-					cwd: root,
-				},
-				{ type: "request", payload: { id: "req_1", type: "get_state" } },
-				{ type: "response", payload: fixtureResponse("req_1") },
-			]);
 		} finally {
 			transport.stop();
-			if (childPid !== undefined) await waitForExit(childPid);
+			server.stop();
 			for (const key of keys) {
 				const value = previous[key];
 				if (value === undefined) delete process.env[key];
@@ -162,54 +161,11 @@ describe("createRpcTransportFromClient", () => {
 	});
 });
 
-function fixtureResponse(id: string) {
-	return {
-		id,
-		type: "response",
-		command: "get_state",
-		success: true,
-		data: {
-			thinkingLevel: "off",
-			isStreaming: false,
-			isCompacting: false,
-			steeringMode: "one-at-a-time",
-			followUpMode: "one-at-a-time",
-			interruptMode: "immediate",
-			sessionId: "fixture-session",
-			autoCompactionEnabled: true,
-			messageCount: 0,
-			queuedMessageCount: 0,
-			todoPhases: [],
-		},
-	};
-}
-
 function readJsonl(path: string): readonly unknown[] {
 	return readFileSync(path, "utf8")
 		.trim()
 		.split("\n")
 		.map(line => JSON.parse(line));
-}
-
-function processRecordPid(value: unknown): number {
-	if (value === null || typeof value !== "object") throw new Error("fixture process transcript is missing");
-	const pid = Reflect.get(value, "pid");
-	if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0)
-		throw new Error("fixture process transcript has an invalid pid");
-	return pid;
-}
-
-async function waitForExit(pid: number): Promise<void> {
-	for (let attempt = 0; attempt < 100; attempt += 1) {
-		try {
-			process.kill(pid, 0);
-		} catch (error) {
-			if (error instanceof Error && "code" in error && error.code === "ESRCH") return;
-			throw error;
-		}
-		await Bun.sleep(10);
-	}
-	throw new Error(`fixture process ${pid} did not exit`);
 }
 
 class FullSessionEventClient implements RpcClientTransportClient {

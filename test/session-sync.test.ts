@@ -18,6 +18,41 @@ afterEach(async () => {
 });
 
 describe("syncProjectSessionsToOpenWebUI", () => {
+	test("imports transcripts from the current-dev SDK cwd-scoped session directory", async () => {
+		// Given: a project whose transcript was written under agentDir, not its configured sessionRoot.
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-sync-sdk-root-"));
+		tempDirs.push(workspace);
+		const home = path.join(workspace, "home");
+		const agentDir = path.join(home, ".gjc", "agent");
+		const projectDirectory = path.join(workspace, "Project SDK");
+		const sdkSessionRoot = path.join(agentDir, "sessions", `-tmp-${path.basename(workspace)}-Project SDK`);
+		await fs.mkdir(sdkSessionRoot, { recursive: true });
+		await writeSessionFile(path.join(sdkSessionRoot, "sdk-session.jsonl"), {
+			header: { id: "sdk-session", title: "SDK Session", cwd: projectDirectory },
+			entries: [messageEntry("sdk-user", null, "user", "new SDK transcript")],
+		});
+		await fs.mkdir(projectDirectory, { recursive: true });
+		const allowedRoots = await resolveAllowedRoots([workspace]);
+		const project = await registerProjectDirectory(
+			{ cwd: projectDirectory, name: "Project SDK", sessionRoot: path.join(workspace, "adapter-session-root") },
+			allowedRoots,
+		);
+		const repository = new InMemoryOpenWebUIProjectionRepository();
+
+		// When: historical synchronization runs with the same runtime locations as the SDK broker.
+		const result = await syncProjectSessionsToOpenWebUI({
+			repository,
+			ownerUserId: "owner-1",
+			projects: [project],
+			runtimeLocations: { home, agentDir },
+		});
+
+		// Then: the newly written SDK transcript is imported despite the configured mapping root.
+		expect(result.imported).toMatchObject([
+			{ sessionId: "sdk-session", sessionFile: path.join(sdkSessionRoot, "sdk-session.jsonl") },
+		]);
+	});
+
 	test("imports existing project session files into owner-scoped OpenWebUI folders and mappings", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-sync-"));
 		tempDirs.push(workspace);

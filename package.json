@@ -28,8 +28,8 @@
 		"fmt": "biome format --write ."
 	},
 	"dependencies": {
-		"@gajae-code/ai": "0.10.0",
-		"@gajae-code/coding-agent": "0.10.0"
+		"@gajae-code/ai": "0.10.1",
+		"@gajae-code/coding-agent": "0.10.1"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.4.14",
@@ -46,7 +46,6 @@
 		"CHANGELOG.md",
 		"bin",
 		"Dockerfile.adapter",
-		"patches",
 		"bun.lock"
 	],
 	"exports": {
@@ -94,8 +93,5 @@
 			"types": "./src/projects/*.ts",
 			"import": "./src/projects/*.ts"
 		}
-	},
-	"patchedDependencies": {
-		"@gajae-code/coding-agent@0.10.0": "patches/@gajae-code%2Fcoding-agent@0.10.0.patch"
 	}
 }

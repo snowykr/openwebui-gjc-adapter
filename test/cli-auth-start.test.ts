@@ -5,14 +5,18 @@ import * as path from "node:path";
 import { buildAdapterServerOptionsFromEnv } from "../src/cli";
 import { createAdapterRequestHandler } from "../src/server";
 import { chatRequest, FakeGjcTurnRunner, reserveTcpPort, stopProcess, waitForStartedServer } from "./cli-fixtures";
+import { type SdkFixtureServer, startSdkFixtureServer } from "./gjc-sdk-v3-fixtures";
 import { CANONICAL_MODEL_IDS } from "./model-selection-fixtures";
 
 const spawnedProcesses: Bun.Subprocess[] = [];
+const sdkServers: SdkFixtureServer[] = [];
 
 describe("adapter CLI auth and start", () => {
 	afterEach(async () => {
 		await Promise.all(spawnedProcesses.map(stopProcess));
 		spawnedProcesses.length = 0;
+		for (const server of sdkServers) server.stop();
+		sdkServers.length = 0;
 	});
 
 	test("rejects OpenAI-compatible requests when the adapter API token is not configured", async () => {
@@ -44,7 +48,10 @@ describe("adapter CLI auth and start", () => {
 		const projectDirectory = path.join(workspace, "Demo Project");
 		await fs.mkdir(projectDirectory);
 		const port = await reserveTcpPort();
-		const fixturePath = path.join(process.cwd(), "test/fixtures/gjc-rpc-selection-scenario.ts");
+		const fixturePath = path.join(process.cwd(), "test/fixtures/gjc-sdk-daemon-fixture.ts");
+		const fixtureTranscript = path.join(workspace, "sdk-cli.jsonl");
+		const sdkServer = startSdkFixtureServer("model_catalog");
+		sdkServers.push(sdkServer);
 		await fs.chmod(fixturePath, 0o755);
 		const proc = Bun.spawn(["bun", "run", "start"], {
 			cwd: process.cwd(),
@@ -58,6 +65,9 @@ describe("adapter CLI auth and start", () => {
 				GJC_OPENWEBUI_STATE_PATH: path.join(workspace, "adapter-state"),
 				GJC_OPENWEBUI_PROJECTS: `${projectDirectory}|Demo Project`,
 				GJC_OPENWEBUI_GJC_COMMAND: fixturePath,
+				GJC_SDK_FIXTURE_CLI_TRANSCRIPT: fixtureTranscript,
+				GJC_SDK_FIXTURE_ENDPOINT_URL: sdkServer.url,
+				GJC_SDK_FIXTURE_ENDPOINT_TOKEN: sdkServer.token,
 			},
 			stdout: "pipe",
 			stderr: "pipe",
