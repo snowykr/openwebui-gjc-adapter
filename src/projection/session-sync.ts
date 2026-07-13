@@ -3,7 +3,7 @@ import { readdir } from "node:fs/promises";
 import * as path from "node:path";
 import { GjcSessionLoadError, loadGjcSessionFile } from "../gjc/session-loader";
 import { type GjcSessionStorageLocations, resolveGjcSdkSessionRoot } from "../gjc/session-root";
-import type { SessionMappingStore } from "../gjc/session-router";
+import type { SessionMapping, SessionMappingStore } from "../gjc/session-router";
 import type { OpenWebUIProjectionRepository } from "../openwebui/client";
 import { buildProjectFolderMetadata, type RegisteredProject } from "../projects/registry";
 import { projectGjcSessionToOpenWebUIChat } from "./chat-tree";
@@ -74,7 +74,7 @@ export async function syncProjectSessionsToOpenWebUI(
 					continue;
 				}
 				importedSessionIds.add(loaded.header.id);
-				const existingChatId = findMappedChatId(input.mappings, project.id, loaded.header.id);
+				const existingMapping = findMappedMapping(input.mappings, project.id, loaded.header.id);
 				const projectedChat = projectGjcSessionToOpenWebUIChat({
 					sessionFile: loaded.filePath,
 					header: loaded.header,
@@ -86,18 +86,20 @@ export async function syncProjectSessionsToOpenWebUI(
 					project: projectReference,
 					projectedChat: {
 						...projectedChat,
-						openWebUIChatId: existingChatId ?? historicalChatId(project.id, loaded.header.id),
+						openWebUIChatId: existingMapping?.chatId ?? historicalChatId(project.id, loaded.header.id),
 					},
 				});
-				input.mappings?.upsert({
-					chatId: result.chatId,
-					projectId: project.id,
-					sessionId: loaded.header.id,
-					sessionFile: loaded.filePath,
-					rawFrameCursor: 0,
-					eventCursor: 0,
-					operationId: "historical-import",
-				});
+				if (existingMapping === undefined || existingMapping.operationId === "historical-import") {
+					input.mappings?.upsert({
+						chatId: result.chatId,
+						projectId: project.id,
+						sessionId: loaded.header.id,
+						sessionFile: loaded.filePath,
+						rawFrameCursor: 0,
+						eventCursor: 0,
+						operationId: "historical-import",
+					});
+				}
 				imported.push({
 					projectId: project.id,
 					sessionId: loaded.header.id,
@@ -158,20 +160,20 @@ async function listRootSessionFiles(sessionRoot: string): Promise<readonly strin
 		.sort();
 }
 
-function findMappedChatId(
+function findMappedMapping(
 	mappings: SessionMappingStore | undefined,
 	projectId: string,
 	sessionId: string,
-): string | undefined {
+): SessionMapping | undefined {
 	const entries = mappings
 		?.entries()
 		.filter(mapping => mapping.projectId === projectId && mapping.sessionId === sessionId);
 	if (entries === undefined || entries.length === 0) return undefined;
 	for (let index = entries.length - 1; index >= 0; index -= 1) {
 		const mapping = entries[index];
-		if (mapping?.operationId === "historical-import") return mapping.chatId;
+		if (mapping?.operationId === "historical-import") return mapping;
 	}
-	return entries[entries.length - 1]?.chatId;
+	return entries[entries.length - 1];
 }
 
 function skippedSession(projectId: string, filePath: string, error: unknown): SkippedProjectSession {
