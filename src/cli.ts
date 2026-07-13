@@ -21,6 +21,23 @@ Commands:
   serve --config PATH Start an installed adapter service
   probe-ready         Check an installed adapter service readiness
   credentials show adapter-token  Display an installed adapter token
+
+Models:
+  gjc/<encoded-provider>/<encoded-model>:<thinking>  Canonical GJC model id
+  gjc  Input-only alias for the current machine-global default
+`;
+const EXISTING_CONFIGURE_USAGE = `Usage: openwebui-gjc-adapter configure existing [options]
+
+GJC runtime location options:
+  --gjc-config-dir-name NAME   Set the persisted GJC config directory name
+  --gjc-coding-agent-dir PATH  Set the persisted canonical coding-agent directory
+
+Precedence: persisted CLI values, adapter-namespaced environment values, then derived defaults.
+Pending recovery values are authoritative for retries.
+`;
+const MANAGED_CONFIGURE_USAGE = `Usage: openwebui-gjc-adapter configure managed [options]
+
+Managed GJC runtime locations are fixed; runtime location overrides are rejected.
 `;
 
 export interface RunCliDependencies extends CliDependencies {
@@ -36,6 +53,16 @@ export async function runCli(
 ): Promise<number> {
 	if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h")) {
 		(dependencies.stdout ?? process.stdout).write(TOP_LEVEL_USAGE);
+		return 0;
+	}
+	if (
+		argv.length === 3 &&
+		argv[0] === "configure" &&
+		(argv[1] === "existing" || argv[1] === "managed") &&
+		argv[2] === "--help"
+	) {
+		const usage = argv[1] === "existing" ? EXISTING_CONFIGURE_USAGE : MANAGED_CONFIGURE_USAGE;
+		(dependencies.stdout ?? process.stdout).write(usage);
 		return 0;
 	}
 	if (isInstalledCommand(argv)) {

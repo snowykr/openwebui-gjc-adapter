@@ -60,13 +60,21 @@ OPENAI_API_KEY=<adapter-openai-key>
 ENABLE_OPENAI_API=True
 ```
 
-Use the `gjc` model id and add the custom headers shown in [OpenWebUI setup](#openwebui-setup). The placeholders in those headers are required for the adapter to associate requests with the OpenWebUI chat, messages, user, and task.
+OpenWebUI requests may use the input-only `gjc` alias or a canonical model id from `/v1/models`. Add the custom headers shown in [OpenWebUI setup](#openwebui-setup). The placeholders in those headers are required for the adapter to associate requests with the OpenWebUI chat, messages, user, and task.
 
 ### Safety and recovery
 
 The CLI uses a readiness probe before reporting configuration as ready. It may reset or disclose an admin token only when it has a controlling TTY, so a token is not accidentally written to redirected output or unattended logs. If readiness or verification fails, correct the reported local configuration or credentials and rerun the relevant command; do not treat a partially configured deployment as ready.
 
 Both paths preserve the loopback-safe boundary: the UI is not exposed by the CLI, and the adapter remains on its private network where applicable.
+
+### GJC runtime locations and recovery
+
+Existing installations accept exactly two direct runtime-location flags: `--gjc-config-dir-name NAME` and `--gjc-coding-agent-dir PATH`. Direct values are persisted. Runtime resolution uses persisted installed values, then adapter-namespaced environment values, then derived defaults. The namespaced selectors are `GJC_OPENWEBUI_GJC_CONFIG_DIR_NAME` and `GJC_OPENWEBUI_GJC_CODING_AGENT_DIR`. Managed configuration rejects both runtime-location flags because its runtime locations are fixed below `/var/lib/gjc/home`.
+
+Ambient `GJC_CONFIG_DIR`, `PI_CONFIG_DIR`, and `GJC_CODING_AGENT_DIR` do not select shipped RPC runtime locations. Each child receives the resolved `HOME`, `GJC_CONFIG_DIR`, and `GJC_CODING_AGENT_DIR`; inherited `PI_CONFIG_DIR` is removed. XDG variables remain inherited but do not select or relocate these paths.
+
+Recovery preserves the legacy vector when neither location field is present and records config-name only, agent-directory only, and both fields together when locations are explicit. A pending recovery journal is authoritative: a retry may omit both flags to resume the recorded values, while a differing retry is rejected before configuration, journal, reset, or deployment writes.
 
 ## Registering projects
 
@@ -87,7 +95,9 @@ const project = await registerProjectDirectory(
 );
 ```
 
-OpenWebUI should use the stable `gjc` model id. Project folders are not advertised as models; the adapter resolves the GJC working directory from the OpenWebUI chat folder. Historical imports place projected sessions under folder id `gjc-project-<project-id>` and chat id `gjc-project-<project-id>-session-<session-id>` unless OpenWebUI assigns runtime ids.
+Project folders are not advertised as models; the adapter resolves the GJC working directory from the OpenWebUI chat folder. Historical imports place projected sessions under folder id `gjc-project-<project-id>` and chat id `gjc-project-<project-id>-session-<session-id>` unless OpenWebUI assigns runtime ids.
+
+The project guard protects exactly four resolved GJC paths: `configDomain`, `agentDir`, `readerWorkspace`, and `readerSessionRoot`. A project `cwd` or explicit `sessionRoot` is rejected when it is equal to, an ancestor of, or a descendant of any one of them. The guard does not cover adapter state, mappings, session stores, or SQLite.
 
 Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. The adapter uses full session events when the installed GJC RPC client exposes `onSessionEvent`; otherwise it falls back to the standard agent-event stream. Background task calls such as title generation are no-ops and must not create GJC sessions.
 Inside OpenWebUI, send these slash-style commands in a normal `gjc` chat for project administration:
@@ -110,6 +120,10 @@ The adapter also seeds OpenWebUI Workspace Prompt hints for those project comman
 Deleting an adapter-created project folder in the OpenWebUI sidebar is treated as an unlink of the OpenWebUI projection only. Local folders, `.gjc` sessions, and GJC history are not deleted. If the same project path is linked again later, the adapter imports the existing session history again.
 
 ## Runtime contract
+
+Canonical model ids use `gjc/<encoded-provider>/<encoded-model>:<thinking>`. Provider and model components use uppercase RFC 3986 percent-encoding; each component must decode exactly once and re-encode to the same bytes. The bare `gjc` alias is accepted only as input and is never emitted. Catalog, JSON, SSE, workflow, event, and persisted mapping output use the normalized tuple returned by GJC.
+
+Selection updates the machine-global last-successful-writer-wins default. Operations are serialized per stable client, but the adapter does not provide global request ordering or a distributed ordering guarantee. The adapter invokes the setter once and does not retry, compensate, or roll it back. It also does not roll back an already committed project link or unlink if the later model-selection read needed for the response fails.
 
 - GJC JSONL and artifacts remain authoritative.
 - OpenWebUI chat rows and chat messages are projection/cache records.

@@ -61,6 +61,7 @@ export class GoldenTurnRunner implements GjcTurnRunner {
 			activeLeaf: "assistant-1",
 			rawFrameCursor: 1,
 			eventCursor: 1,
+			...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
 		};
 	}
 
@@ -73,6 +74,7 @@ export class GoldenTurnRunner implements GjcTurnRunner {
 			activeLeaf: "assistant-2",
 			rawFrameCursor: input.rawFrameCursor + 1,
 			eventCursor: input.eventCursor + 1,
+			...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
 		};
 	}
 

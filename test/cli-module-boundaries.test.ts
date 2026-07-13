@@ -24,6 +24,23 @@ Commands:
   serve --config PATH Start an installed adapter service
   probe-ready         Check an installed adapter service readiness
   credentials show adapter-token  Display an installed adapter token
+
+Models:
+  gjc/<encoded-provider>/<encoded-model>:<thinking>  Canonical GJC model id
+  gjc  Input-only alias for the current machine-global default
+`;
+const EXISTING_HELP = `Usage: openwebui-gjc-adapter configure existing [options]
+
+GJC runtime location options:
+  --gjc-config-dir-name NAME   Set the persisted GJC config directory name
+  --gjc-coding-agent-dir PATH  Set the persisted canonical coding-agent directory
+
+Precedence: persisted CLI values, adapter-namespaced environment values, then derived defaults.
+Pending recovery values are authoritative for retries.
+`;
+const MANAGED_HELP = `Usage: openwebui-gjc-adapter configure managed [options]
+
+Managed GJC runtime locations are fixed; runtime location overrides are rejected.
 `;
 
 type Capture = { value: string };
@@ -102,9 +119,11 @@ describe("CLI module boundaries", () => {
 		// Then: output bytes and exits remain pinned.
 		expect(results).toEqual([
 			{ code: 0, stdout: TOP_LEVEL_HELP, stderr: "" },
-			{ code: 2, stdout: "", stderr: "unknown option: --help\n" },
-			{ code: 2, stdout: "", stderr: "unknown option: --help\n" },
+			{ code: 0, stdout: EXISTING_HELP, stderr: "" },
+			{ code: 0, stdout: MANAGED_HELP, stderr: "" },
 		]);
+		expect(results[1]?.stdout.match(/--gjc-[a-z-]+/g)).toEqual(["--gjc-config-dir-name", "--gjc-coding-agent-dir"]);
+		expect(results[2]?.stdout).not.toContain("--gjc-");
 	});
 
 	test("pins config outputs diagnostics and validation message order", () => {
