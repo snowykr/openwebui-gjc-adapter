@@ -49,7 +49,7 @@ describe("latest dev SDK v3 transport contract", () => {
 			);
 			expect(prompts).toHaveLength(1);
 		} finally {
-			fixture.dispose();
+			await fixture.dispose();
 		}
 	});
 
@@ -89,7 +89,7 @@ describe("latest dev SDK v3 transport contract", () => {
 			);
 			expect(selection).toEqual({ provider: "future", modelId: "capable", thinkingLevel: "high" });
 		} finally {
-			fixture.dispose();
+			await fixture.dispose();
 		}
 	});
 

@@ -59,15 +59,18 @@ export function createSdkTransportFixture(
 		cliTranscript,
 		savedSessionPath,
 		runtimeLocations,
-		dispose() {
-			transport.stop();
-			server.stop();
-			for (const name of Object.keys(fixtureEnvironment)) {
-				const previous = previousFixtureEnvironment[name];
-				if (previous === undefined) delete process.env[name];
-				else process.env[name] = previous;
+		async dispose() {
+			try {
+				await transport.stop();
+			} finally {
+				server.stop();
+				for (const name of Object.keys(fixtureEnvironment)) {
+					const previous = previousFixtureEnvironment[name];
+					if (previous === undefined) delete process.env[name];
+					else process.env[name] = previous;
+				}
+				rmSync(root, { recursive: true, force: true });
 			}
-			rmSync(root, { recursive: true, force: true });
 		},
 	};
 }

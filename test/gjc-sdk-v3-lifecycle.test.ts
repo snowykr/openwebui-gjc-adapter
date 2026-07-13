@@ -10,7 +10,7 @@ describe("latest dev SDK v3 lifecycle contract", () => {
 
 			await fixture.transport.switchSession(fixture.savedSessionPath, "sdk-session-resumed");
 			const state = await fixture.transport.getState();
-			fixture.transport.stop();
+			await fixture.transport.stop();
 
 			expect(state).toEqual({
 				sessionId: "sdk-session-resumed",
@@ -19,7 +19,7 @@ describe("latest dev SDK v3 lifecycle contract", () => {
 			});
 			expect(readCliOperations(fixture.cliTranscript)).toEqual(["session.list", "session.resume"]);
 		} finally {
-			fixture.dispose();
+			await fixture.dispose();
 		}
 	});
 
@@ -29,11 +29,11 @@ describe("latest dev SDK v3 lifecycle contract", () => {
 			await fixture.transport.start();
 			await fixture.transport.newSession();
 
-			fixture.transport.stop();
+			await fixture.transport.stop();
 
 			expect(readCliOperations(fixture.cliTranscript)).toEqual(["session.create"]);
 		} finally {
-			fixture.dispose();
+			await fixture.dispose();
 		}
 	});
 
@@ -51,7 +51,7 @@ describe("latest dev SDK v3 lifecycle contract", () => {
 				turnId: "turn-right",
 			});
 		} finally {
-			fixture.dispose();
+			await fixture.dispose();
 		}
 	});
 
@@ -70,7 +70,7 @@ describe("latest dev SDK v3 lifecycle contract", () => {
 
 			expect(readCliOperations(fixture.cliTranscript)).toEqual(["session.create", "session.close"]);
 		} finally {
-			fixture.dispose();
+			await fixture.dispose();
 		}
 	});
 
@@ -86,7 +86,7 @@ describe("latest dev SDK v3 lifecycle contract", () => {
 
 			expect(readCliOperations(fixture.cliTranscript)).toEqual(["session.create", "session.close"]);
 		} finally {
-			fixture.dispose();
+			await fixture.dispose();
 		}
 	});
 
@@ -102,7 +102,7 @@ describe("latest dev SDK v3 lifecycle contract", () => {
 
 			await expect(reader.stop()).rejects.toThrow("fixture session.close failed");
 		} finally {
-			fixture.dispose();
+			await fixture.dispose();
 		}
 	});
 
@@ -127,7 +127,7 @@ describe("latest dev SDK v3 lifecycle contract", () => {
 			).toEqual(["GJC SDK v3 hello: expected protocolVersion 3 after open", "fixture session.close failed"]);
 			expect(readCliOperations(fixture.cliTranscript)).toEqual(["session.create", "session.close"]);
 		} finally {
-			fixture.dispose();
+			await fixture.dispose();
 		}
 	});
 });

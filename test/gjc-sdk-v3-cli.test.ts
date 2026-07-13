@@ -15,7 +15,7 @@ describe("SDK v3 lifecycle CLI boundary", () => {
 				"session id does not match the requested session",
 			);
 		} finally {
-			fixture.dispose();
+			await fixture.dispose();
 		}
 	});
 
@@ -32,7 +32,7 @@ describe("SDK v3 lifecycle CLI boundary", () => {
 				"saved session path is outside the SDK session root",
 			);
 		} finally {
-			fixture.dispose();
+			await fixture.dispose();
 		}
 	});
 
@@ -92,7 +92,7 @@ describe("SDK v3 lifecycle CLI boundary", () => {
 				const launcher = readFileSync(useWrapper ? fixture.cliPath : expectedSessionCommand, "utf8");
 				expect(launcher).toContain("--no-env-file --config=/dev/null");
 			} finally {
-				fixture.dispose();
+				await fixture.dispose();
 			}
 		});
 	}
@@ -105,7 +105,7 @@ describe("SDK v3 lifecycle CLI boundary", () => {
 				code: "cli_timeout",
 			});
 		} finally {
-			fixture.dispose();
+			await fixture.dispose();
 		}
 	});
 
@@ -117,7 +117,7 @@ describe("SDK v3 lifecycle CLI boundary", () => {
 			const records = transcriptRecords(fixture.transcript);
 			expect(records.at(-1)?.operation).toBe("session.close");
 		} finally {
-			fixture.dispose();
+			await fixture.dispose();
 		}
 	});
 });

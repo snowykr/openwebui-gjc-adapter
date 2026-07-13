@@ -13,21 +13,18 @@ export interface ModelSelectionPolicy {
 export function createModelSelectionPolicy(createReader: ModelReaderFactory): ModelSelectionPolicy {
 	return {
 		async listModels(): Promise<OpenAIModelListResponse> {
-			let reader: ModelReader | undefined;
-			try {
-				reader = await createReader();
-				const rawCatalog = await reader.getAvailableModels();
-				const catalog = decodeStrictModelCatalog(rawCatalog);
-				if (catalog !== null) return buildModelList(catalog);
-				const current = currentSelection(rawCatalog, await reader.getState());
-				if (current === undefined) throw modelSelectionError("model_catalog_unavailable");
-				return buildModelList([current]);
-			} catch (error) {
-				if (isCatalogError(error)) throw error;
-				throw modelSelectionError("model_catalog_unavailable");
-			} finally {
-				await reader?.stop();
-			}
+			return withReader(
+				createReader,
+				async reader => {
+					const rawCatalog = await reader.getAvailableModels();
+					const catalog = decodeStrictModelCatalog(rawCatalog);
+					if (catalog !== null) return buildModelList(catalog);
+					const current = currentSelection(rawCatalog, await reader.getState());
+					if (current === undefined) throw modelSelectionError("model_catalog_unavailable");
+					return buildModelList([current]);
+				},
+				error => (isCatalogError(error) ? error : modelSelectionError("model_catalog_unavailable")),
+			);
 		},
 
 		async resolve(modelId: string): Promise<NormalizedModelSelection> {
@@ -51,52 +48,81 @@ function assertSelectableSyntax(
 }
 
 async function resolveAlias(createReader: ModelReaderFactory): Promise<NormalizedModelSelection> {
-	let reader: ModelReader | undefined;
-	try {
-		reader = await createReader();
-		const rawCatalog = await reader.getAvailableModels();
-		const catalog = decodeStrictModelCatalog(rawCatalog);
-		const selection = selectionFromState(await reader.getState());
-		const usable =
-			selection !== undefined &&
-			(catalog === null
-				? isAuthoritativeCurrent(rawCatalog, selection)
-				: catalog.some(candidate => sameSelection(candidate, selection)));
-		if (!usable || selection === undefined) {
-			throw modelSelectionError("model_selection_default_unusable");
-		}
-		return selection;
-	} catch (error) {
-		if (isDefaultUnusableError(error)) throw error;
-		throw modelSelectionError("model_selection_default_read_failed");
-	} finally {
-		await reader?.stop();
-	}
+	return withReader(
+		createReader,
+		async reader => {
+			const rawCatalog = await reader.getAvailableModels();
+			const catalog = decodeStrictModelCatalog(rawCatalog);
+			const selection = selectionFromState(await reader.getState());
+			const usable =
+				selection !== undefined &&
+				(catalog === null
+					? isAuthoritativeCurrent(rawCatalog, selection)
+					: catalog.some(candidate => sameSelection(candidate, selection)));
+			if (!usable || selection === undefined) {
+				throw modelSelectionError("model_selection_default_unusable");
+			}
+			return selection;
+		},
+		error => (isDefaultUnusableError(error) ? error : modelSelectionError("model_selection_default_read_failed")),
+	);
 }
 
 async function resolveCanonical(
 	createReader: ModelReaderFactory,
 	selection: NormalizedModelSelection,
 ): Promise<NormalizedModelSelection> {
+	return withReader(
+		createReader,
+		async reader => {
+			const rawCatalog = await reader.getAvailableModels();
+			const catalog = decodeStrictModelCatalog(rawCatalog);
+			if (catalog === null) {
+				const current = currentSelection(rawCatalog, await reader.getState());
+				if (current !== undefined && sameSelection(current, selection)) return selection;
+				throw modelSelectionError("model_catalog_unavailable");
+			}
+			if (!catalog.some(candidate => sameSelection(candidate, selection))) {
+				throw modelSelectionError("model_selection_not_available");
+			}
+			return selection;
+		},
+		error => (isCanonicalResolutionError(error) ? error : modelSelectionError("model_selection_not_available")),
+	);
+}
+
+async function withReader<T>(
+	createReader: ModelReaderFactory,
+	operation: (reader: ModelReader) => Promise<T>,
+	mapError: (error: unknown) => ModelSelectionError,
+): Promise<T> {
 	let reader: ModelReader | undefined;
+	let result: T;
 	try {
 		reader = await createReader();
-		const rawCatalog = await reader.getAvailableModels();
-		const catalog = decodeStrictModelCatalog(rawCatalog);
-		if (catalog === null) {
-			const current = currentSelection(rawCatalog, await reader.getState());
-			if (current !== undefined && sameSelection(current, selection)) return selection;
-			throw modelSelectionError("model_catalog_unavailable");
-		}
-		if (!catalog.some(candidate => sameSelection(candidate, selection))) {
-			throw modelSelectionError("model_selection_not_available");
-		}
-		return selection;
+		result = await operation(reader);
 	} catch (error) {
-		if (isCanonicalResolutionError(error)) throw error;
-		throw modelSelectionError("model_selection_not_available");
-	} finally {
+		return throwAfterCleanup(reader, mapError(error));
+	}
+	await reader.stop();
+	return result;
+}
+
+async function throwAfterCleanup(reader: ModelReader | undefined, primary: ModelSelectionError): Promise<never> {
+	try {
 		await reader?.stop();
+	} catch (cleanup) {
+		throw new ModelSelectionCleanupError(primary, cleanup);
+	}
+	throw primary;
+}
+
+class ModelSelectionCleanupError extends ModelSelectionError {
+	override readonly cause: AggregateError;
+
+	constructor(primary: ModelSelectionError, cleanup: unknown) {
+		super(primary.code, primary.status, primary.type, primary.message);
+		this.cause = new AggregateError([primary, cleanup], "GJC model selection and cleanup failed");
 	}
 }
 
@@ -150,10 +176,10 @@ function sameSelection(left: NormalizedModelSelection, right: NormalizedModelSel
 	);
 }
 
-const isCatalogError = (error: unknown): boolean =>
+const isCatalogError = (error: unknown): error is ModelSelectionError =>
 	error instanceof ModelSelectionError && error.code === "model_catalog_unavailable";
-const isDefaultUnusableError = (error: unknown): boolean =>
+const isDefaultUnusableError = (error: unknown): error is ModelSelectionError =>
 	error instanceof ModelSelectionError && error.code === "model_selection_default_unusable";
-const isCanonicalResolutionError = (error: unknown): boolean =>
+const isCanonicalResolutionError = (error: unknown): error is ModelSelectionError =>
 	error instanceof ModelSelectionError &&
 	(error.code === "model_selection_not_available" || error.code === "model_catalog_unavailable");

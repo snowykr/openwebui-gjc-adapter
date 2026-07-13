@@ -144,6 +144,48 @@ describe("createModelSelectionPolicy", () => {
 	});
 
 	test.each([
+		[
+			"catalog",
+			() => createModelSelectionPolicy(failingStopReaderFactory([{ provider: "broken" }])).listModels(),
+			"model_catalog_unavailable",
+		],
+		[
+			"alias state",
+			() =>
+				createModelSelectionPolicy(failingStopReaderFactory(MODEL_DESCRIPTORS, new Error("state"))).resolve("gjc"),
+			"model_selection_default_read_failed",
+		],
+		[
+			"canonical catalog",
+			() => createModelSelectionPolicy(failingStopReaderFactory([])).resolve(CANONICAL_MODEL_IDS[0]),
+			"model_selection_not_available",
+		],
+	] as const)("preserves the mapped %s failure together with cleanup failure", async (_path, operation, code) => {
+		const failure: unknown = await operation().then(
+			() => undefined,
+			error => error,
+		);
+		if (!(failure instanceof ModelSelectionError)) {
+			throw new TypeError("selection failures must retain their public error type");
+		}
+		if (!(failure.cause instanceof AggregateError)) {
+			throw new TypeError("selection cleanup failures must preserve both causes");
+		}
+
+		expect(failure.code).toBe(code);
+		expect(failure.cause.errors).toEqual([
+			expect.objectContaining({ code }),
+			expect.objectContaining({ message: "reader cleanup failed" }),
+		]);
+	});
+
+	test("exposes cleanup failure when catalog listing otherwise succeeds", async () => {
+		await expect(
+			createModelSelectionPolicy(failingStopReaderFactory(MODEL_DESCRIPTORS)).listModels(),
+		).rejects.toThrow("reader cleanup failed");
+	});
+
+	test.each([
 		["gjc", "model_selection_default_read_failed", readerFactory(MODEL_DESCRIPTORS, new Error("state"))],
 		["gjc", "model_selection_default_unusable", readerFactory(MODEL_DESCRIPTORS, {})],
 		[CANONICAL_MODEL_IDS[0], "model_selection_not_available", readerFactory([])],
@@ -169,5 +211,20 @@ function readerFactory(catalog: readonly unknown[], state: unknown = {}): ModelR
 			return state;
 		},
 		stop() {},
+	});
+}
+
+function failingStopReaderFactory(catalog: readonly unknown[], state: unknown = {}): ModelReaderFactory {
+	return async () => ({
+		async getAvailableModels() {
+			return catalog;
+		},
+		async getState() {
+			if (state instanceof Error) throw state;
+			return state;
+		},
+		stop() {
+			throw new Error("reader cleanup failed");
+		},
 	});
 }

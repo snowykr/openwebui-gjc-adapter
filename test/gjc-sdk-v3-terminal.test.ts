@@ -22,7 +22,7 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 			expect(state.sessionFile).toBeUndefined();
 			expect(readCliOperations(fixture.cliTranscript)).toEqual(["session.create"]);
 		} finally {
-			fixture.dispose();
+			await fixture.dispose();
 		}
 	});
 
@@ -37,7 +37,7 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 				message: expect.stringContaining("fixture model failed"),
 			});
 		} finally {
-			fixture.dispose();
+			await fixture.dispose();
 		}
 	});
 
@@ -52,7 +52,7 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 			expect(events.at(-1)).toMatchObject({ gateId: "durable-gate", gate_id: "durable-gate" });
 			expectSdkRequest(fixture.server.frames, "query_request", "workflow.gates.list");
 		} finally {
-			fixture.dispose();
+			await fixture.dispose();
 		}
 	});
 
@@ -65,7 +65,7 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 
 			expect(events.at(-1)).toMatchObject({ gateId: "durable-gate", gate_id: "durable-gate" });
 		} finally {
-			fixture.dispose();
+			await fixture.dispose();
 		}
 	});
 
@@ -78,7 +78,7 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 				code: "invalid_result",
 			});
 		} finally {
-			fixture.dispose();
+			await fixture.dispose();
 		}
 	});
 
@@ -96,7 +96,7 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 			expect(assistant).toBe("continued assistant");
 			expect(answer.idempotencyKey).toBe("same-answer");
 		} finally {
-			fixture.dispose();
+			await fixture.dispose();
 		}
 	});
 
@@ -122,7 +122,7 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 				),
 			).toHaveLength(2);
 		} finally {
-			fixture.dispose();
+			await fixture.dispose();
 		}
 	});
 
@@ -135,7 +135,7 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 
 			expect(events.at(-1)).toMatchObject({ type: "agent_end", turnId: "turn-right" });
 		} finally {
-			fixture.dispose();
+			await fixture.dispose();
 		}
 	});
 
@@ -148,7 +148,7 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 
 			expect(events.at(-1)).toMatchObject({ type: "agent_end", turnId: "turn-right" });
 		} finally {
-			fixture.dispose();
+			await fixture.dispose();
 		}
 	});
 
@@ -164,7 +164,7 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 			);
 			expect(gateQueries).toHaveLength(1);
 		} finally {
-			fixture.dispose();
+			await fixture.dispose();
 		}
 	});
 
@@ -182,7 +182,7 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 			);
 			expect(assistant).toBe("current dev assistant");
 		} finally {
-			fixture.dispose();
+			await fixture.dispose();
 		}
 	});
 
@@ -193,7 +193,7 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 
 			await expect(fixture.transport.promptAndWait("new turn", 80)).rejects.toMatchObject({ code: "timeout" });
 		} finally {
-			fixture.dispose();
+			await fixture.dispose();
 		}
 	});
 });
