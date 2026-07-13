@@ -32,6 +32,7 @@ export class FakeRpcTransport implements GjcRpcRunnerTransport {
 	readonly states: GjcRpcTransportState[];
 	readonly promptEvents: readonly GjcRpcRunnerTransportEvent[][];
 	readonly assistantTexts: readonly string[];
+	readonly advanceStateAfterRespondGate: boolean;
 	respondGateResult: unknown = {
 		gate_id: "gate",
 		status: "accepted",
@@ -49,10 +50,12 @@ export class FakeRpcTransport implements GjcRpcRunnerTransport {
 		readonly states: readonly GjcRpcTransportState[];
 		readonly promptEvents?: readonly (readonly GjcRpcRunnerTransportEvent[])[];
 		readonly assistantTexts?: readonly string[];
+		readonly advanceStateAfterRespondGate?: boolean;
 	}) {
 		this.states = [...input.states];
 		this.promptEvents = input.promptEvents?.map(events => [...events]) ?? [[]];
 		this.assistantTexts = input.assistantTexts ?? [""];
+		this.advanceStateAfterRespondGate = input.advanceStateAfterRespondGate ?? false;
 	}
 
 	async start(): Promise<void> {
@@ -107,6 +110,7 @@ export class FakeRpcTransport implements GjcRpcRunnerTransport {
 			answer,
 			...(idempotencyKey === undefined ? {} : { idempotencyKey }),
 		});
+		if (this.advanceStateAfterRespondGate) this.#stateIndex += 1;
 		return this.respondGateResult;
 	}
 

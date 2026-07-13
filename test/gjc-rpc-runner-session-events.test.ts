@@ -139,7 +139,7 @@ describe("createGjcRpcTurnRunner session events", () => {
 		]);
 	});
 
-	test("queues gate state before response without applying a model selection", async () => {
+	test("reads refreshed gate state after response without applying a model selection", async () => {
 		const client = new SelectionTransport({});
 		const runner = createGjcRpcTurnRunner({ clientFactory: () => client });
 		expect([await runner.getAvailableModels?.(turnAddress), ...client.calls]).toEqual([[], "start", "models"]);
@@ -153,7 +153,7 @@ describe("createGjcRpcTurnRunner session events", () => {
 			eventCursor: 0,
 			operationId: "message-gate",
 		});
-		expect(client.calls).toEqual(["start", "models", "state", "gate:wg_fixture_ralplan_000001", "text"]);
+		expect(client.calls).toEqual(["start", "models", "gate:wg_fixture_ralplan_000001", "state", "text"]);
 	});
 });
 

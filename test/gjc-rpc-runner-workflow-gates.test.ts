@@ -97,7 +97,7 @@ describe("createGjcRpcTurnRunner workflow gates", () => {
 		]);
 	});
 
-	test("answers workflow gates through the RPC transport", async () => {
+	test("answers workflow gates and persists the refreshed RPC state", async () => {
 		const client = new FakeRpcTransport({
 			states: [
 				{
@@ -107,8 +107,16 @@ describe("createGjcRpcTurnRunner workflow gates", () => {
 					rawFrameCursor: 11,
 					eventCursor: 5,
 				},
+				{
+					sessionId: "session-1",
+					sessionFile: "/workspace/project/.gjc/sessions/session-2.jsonl",
+					activeLeaf: "leaf-2",
+					rawFrameCursor: 12,
+					eventCursor: 6,
+				},
 			],
 			assistantTexts: ["accepted"],
+			advanceStateAfterRespondGate: true,
 		});
 		const runner = createGjcRpcTurnRunner({ clientFactory: recordFactory([], client) });
 		const result = await runner.respondWorkflowGate?.({
@@ -130,11 +138,17 @@ describe("createGjcRpcTurnRunner workflow gates", () => {
 
 		expect(client.calls).toEqual([
 			{ type: "start" },
-			{ type: "get_state" },
 			{ type: "respond_gate", gateId: "gate-deep-1", answer: { selected: ["JWT"] }, idempotencyKey: "idem-deep-1" },
+			{ type: "get_state" },
 			{ type: "get_last_assistant_text" },
 		]);
-		expect(result).toMatchObject({ text: "accepted", rawFrameCursor: 11, eventCursor: 5 });
+		expect(result).toMatchObject({
+			text: "accepted",
+			sessionFile: "/workspace/project/.gjc/sessions/session-2.jsonl",
+			activeLeaf: "leaf-2",
+			rawFrameCursor: 12,
+			eventCursor: 6,
+		});
 	});
 
 	test("surfaces rejected workflow gate resolutions from the RPC transport", async () => {
@@ -173,7 +187,6 @@ describe("createGjcRpcTurnRunner workflow gates", () => {
 		).rejects.toThrow("GJC RPC workflow_gate_response failed: invalid_workflow_gate_answer");
 		expect(client.calls).toEqual([
 			{ type: "start" },
-			{ type: "get_state" },
 			{ type: "respond_gate", gateId: "gate-deep-1", answer: { selected: ["BAD"] }, idempotencyKey: "idem-deep-1" },
 		]);
 	});

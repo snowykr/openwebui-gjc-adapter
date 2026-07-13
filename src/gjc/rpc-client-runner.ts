@@ -129,11 +129,11 @@ class RpcBackedGjcTurnRunner implements GjcTurnRunner {
 			throw new GjcRpcRunnerError("workflow_gate_response", "RPC transport does not support workflow gates");
 		}
 		return enqueue(started, async () => {
-			const state = await runRpcCommand("get_state", () => started.client.getState());
 			const resolution = await runRpcCommand("workflow_gate_response", () =>
 				callRespondGate(started.client, input.gateId, input.answer, input.idempotencyKey),
 			);
 			assertAcceptedWorkflowGateResolution(resolution);
+			const state = await runRpcCommand("get_state", () => started.client.getState());
 			const assistantText = await runRpcCommand("get_last_assistant_text", () =>
 				started.client.getLastAssistantText(),
 			);
