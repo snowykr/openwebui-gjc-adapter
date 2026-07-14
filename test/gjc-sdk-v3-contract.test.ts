@@ -58,7 +58,17 @@ describe("latest dev SDK v3 transport contract", () => {
 		const transport = createRpcTransportFromClient(client);
 
 		await expect(transport.getAvailableModels()).resolves.toEqual([
-			{ provider: "openai", id: "gpt-current", name: "Current only" },
+			{
+				provider: "openai",
+				id: "gpt-current",
+				name: "Current only",
+				contextWindow: 128_000,
+				maxTokens: 32_000,
+				reasoning: true,
+				thinking: { validLevels: ["off", "low", "xhigh", "max"] },
+				current: true,
+				currentThinkingLevel: "inherit",
+			},
 		]);
 	});
 
@@ -84,7 +94,7 @@ describe("latest dev SDK v3 transport contract", () => {
 					provider: "future",
 					id: "capable",
 					reasoning: true,
-					thinking: expect.objectContaining({ levels: ["off", "high"] }),
+					thinking: expect.objectContaining({ validLevels: ["off", "high"], levels: ["high"] }),
 				}),
 			);
 			expect(selection).toEqual({ provider: "future", modelId: "capable", thinkingLevel: "high" });
@@ -122,7 +132,19 @@ class CurrentOnlyCatalogClient implements RpcClientTransportClient {
 		return { sessionId: "current-only" };
 	}
 	async getAvailableModels(): Promise<readonly unknown[]> {
-		return [{ provider: "openai", id: "gpt-current", name: "Current only" }];
+		return [
+			{
+				provider: "openai",
+				id: "gpt-current",
+				name: "Current only",
+				contextWindow: 128_000,
+				maxTokens: 32_000,
+				reasoning: true,
+				thinking: { validLevels: ["off", "low", "xhigh", "max"] },
+				current: true,
+				currentThinkingLevel: "inherit",
+			},
+		];
 	}
 	async prompt(): Promise<void> {}
 	onEvent(_listener: (event: GjcRpcRunnerTransportEvent) => void): () => void {

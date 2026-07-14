@@ -53,14 +53,19 @@ export function handleQuery(
 								provider: "future",
 								id: "capable",
 								name: "Capable",
+								contextWindow: 128_000,
+								maxTokens: 32_000,
 								reasoning: true,
 								thinking: {
-									minLevel: "off",
+									validLevels: ["off", "high"],
+									minLevel: "high",
 									maxLevel: "high",
 									mode: "effort",
-									levels: ["off", "high"],
-									defaultLevel: "off",
+									levels: ["high"],
+									defaultLevel: "high",
 								},
+								current: true,
+								currentThinkingLevel: "high",
 							},
 						]
 				: query === "session.last_assistant"

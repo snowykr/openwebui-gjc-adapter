@@ -261,7 +261,7 @@ function selectedReader() {
 					provider: "anthropic",
 					id: "claude-sonnet-4",
 					reasoning: true,
-					thinking: { minLevel: "low", maxLevel: "low", mode: "effort" },
+					thinking: { validLevels: ["off", "low"] },
 				},
 			];
 		},

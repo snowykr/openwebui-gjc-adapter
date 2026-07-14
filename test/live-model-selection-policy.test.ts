@@ -8,7 +8,9 @@ import {
 import { createModelSelectionPolicy } from "../src/live/model-selection-policy";
 import {
 	CANONICAL_MODEL_IDS,
+	LOW_MODEL_ID,
 	LOW_SELECTION,
+	MEDIUM_MODEL_ID,
 	MODEL_DESCRIPTORS,
 	staticModelReaderFactory,
 } from "./model-selection-fixtures";
@@ -89,37 +91,67 @@ describe("createModelSelectionPolicy", () => {
 
 		const canonicalTranscript: string[] = [];
 		expect(
-			await createModelSelectionPolicy(staticModelReaderFactory(canonicalTranscript)).resolve(
-				CANONICAL_MODEL_IDS[1],
-			),
+			await createModelSelectionPolicy(staticModelReaderFactory(canonicalTranscript)).resolve(MEDIUM_MODEL_ID),
 		).toEqual({ ...LOW_SELECTION, thinkingLevel: "medium" });
 		expect(canonicalTranscript).toEqual(["catalog", "stop"]);
 	});
 
-	test("exposes only the authoritative current tuple when current-dev Q10 omits capabilities", async () => {
+	test("exposes Q10 validLevels without advertising inherit readback", async () => {
 		const policy = createModelSelectionPolicy(
-			readerFactory([{ provider: "anthropic", id: "claude-sonnet-4", name: "Claude Sonnet 4" }], {
-				model: { provider: "anthropic", id: "claude-sonnet-4" },
-				thinkingLevel: "low",
-			}),
+			readerFactory(
+				[
+					{
+						provider: "anthropic",
+						id: "claude-sonnet-4",
+						name: "Claude Sonnet 4",
+						reasoning: true,
+						thinking: { validLevels: ["off", "low", "xhigh", "max"] },
+						current: true,
+						currentThinkingLevel: "inherit",
+					},
+				],
+				{
+					model: { provider: "anthropic", id: "claude-sonnet-4" },
+					thinkingLevel: "low",
+				},
+			),
 		);
 
-		expect((await policy.listModels()).data.map(model => model.id)).toEqual(["gjc/anthropic/claude-sonnet-4:low"]);
+		expect((await policy.listModels()).data.map(model => model.id)).toEqual([
+			"gjc/anthropic/claude-sonnet-4:off",
+			"gjc/anthropic/claude-sonnet-4:low",
+			"gjc/anthropic/claude-sonnet-4:xhigh",
+			"gjc/anthropic/claude-sonnet-4:max",
+		]);
 		expect(await policy.resolve("gjc")).toEqual(LOW_SELECTION);
-		expect(await policy.resolve("gjc/anthropic/claude-sonnet-4:low")).toEqual(LOW_SELECTION);
+		expect(await policy.resolve("gjc/anthropic/claude-sonnet-4:max")).toEqual({
+			...LOW_SELECTION,
+			thinkingLevel: "max",
+		});
 	});
 
-	test("rejects guessed tuples with 503 when current-dev Q10 omits capabilities", async () => {
+	test("rejects an unavailable tuple against Q10 validLevels", async () => {
 		const policy = createModelSelectionPolicy(
-			readerFactory([{ provider: "anthropic", id: "claude-sonnet-4", name: "Claude Sonnet 4" }], {
-				model: { provider: "anthropic", id: "claude-sonnet-4" },
-				thinkingLevel: "low",
-			}),
+			readerFactory(
+				[
+					{
+						provider: "anthropic",
+						id: "claude-sonnet-4",
+						name: "Claude Sonnet 4",
+						reasoning: true,
+						thinking: { validLevels: ["off", "low"] },
+					},
+				],
+				{
+					model: { provider: "anthropic", id: "claude-sonnet-4" },
+					thinkingLevel: "low",
+				},
+			),
 		);
 
 		await expect(policy.resolve("gjc/anthropic/claude-sonnet-4:medium")).rejects.toMatchObject({
-			code: "model_catalog_unavailable",
-			status: 503,
+			code: "model_selection_not_available",
+			status: 404,
 		});
 	});
 
@@ -157,7 +189,7 @@ describe("createModelSelectionPolicy", () => {
 		],
 		[
 			"canonical catalog",
-			() => createModelSelectionPolicy(failingStopReaderFactory([])).resolve(CANONICAL_MODEL_IDS[0]),
+			() => createModelSelectionPolicy(failingStopReaderFactory([])).resolve(LOW_MODEL_ID),
 			"model_selection_not_available",
 		],
 	] as const)("preserves the mapped %s failure together with cleanup failure", async (_path, operation, code) => {
@@ -188,8 +220,8 @@ describe("createModelSelectionPolicy", () => {
 	test.each([
 		["gjc", "model_selection_default_read_failed", readerFactory(MODEL_DESCRIPTORS, new Error("state"))],
 		["gjc", "model_selection_default_unusable", readerFactory(MODEL_DESCRIPTORS, {})],
-		[CANONICAL_MODEL_IDS[0], "model_selection_not_available", readerFactory([])],
-		[CANONICAL_MODEL_IDS[0], "model_selection_not_available", () => Promise.reject(new Error("reader unavailable"))],
+		[LOW_MODEL_ID, "model_selection_not_available", readerFactory([])],
+		[LOW_MODEL_ID, "model_selection_not_available", () => Promise.reject(new Error("reader unavailable"))],
 	] as const)("maps %s to %s and always stops", async (modelId, code, factory) => {
 		try {
 			await createModelSelectionPolicy(factory).resolve(modelId);

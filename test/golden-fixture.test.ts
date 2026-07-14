@@ -62,6 +62,7 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 		const project = await registerProjectDirectory({ cwd, name: "Golden" }, allowedRoots, createdAt);
 		expect(
 			buildModelList([
+				selectionFixture.REASONING_OFF_SELECTION,
 				selectionFixture.LOW_SELECTION,
 				selectionFixture.MEDIUM_SELECTION,
 				selectionFixture.OFF_SELECTION,

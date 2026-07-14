@@ -209,7 +209,7 @@ function neutralReader(transcript: string[]) {
 					provider: "anthropic",
 					id: "claude-sonnet-4",
 					reasoning: true,
-					thinking: { minLevel: "low", maxLevel: "medium", mode: "effort" },
+					thinking: { validLevels: ["off", "low", "medium"] },
 				},
 			];
 		},

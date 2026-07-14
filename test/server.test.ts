@@ -3,7 +3,7 @@ import type { LiveGatewayRunner } from "../src/live/chat-completions";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import type { RegisteredProject } from "../src/projects/registry";
 import { createAdapterRequestHandler } from "../src/server";
-import { CANONICAL_MODEL_IDS, staticModelReaderFactory } from "./model-selection-fixtures";
+import { CANONICAL_MODEL_IDS, LOW_MODEL_ID, staticModelReaderFactory } from "./model-selection-fixtures";
 
 describe("createAdapterRequestHandler", () => {
 	test("returns health status", async () => {
@@ -136,7 +136,7 @@ describe("createAdapterRequestHandler", () => {
 			routes: {
 				projects: [project],
 				owner,
-				runner: { run: () => ({ chunks: ["a", "b"], model: CANONICAL_MODEL_IDS[0] }) },
+				runner: { run: () => ({ chunks: ["a", "b"], model: LOW_MODEL_ID }) },
 				modelReaderFactory,
 			},
 		});
@@ -180,7 +180,7 @@ const project: RegisteredProject = {
 const owner: OpenWebUIOwnerContext = { ownerUserId: "owner-1", singleOwnerLocalMode: false };
 
 function fixedRunner(content: string): LiveGatewayRunner {
-	return { run: () => ({ content, model: CANONICAL_MODEL_IDS[0] }) };
+	return { run: () => ({ content, model: LOW_MODEL_ID }) };
 }
 
 const modelReaderFactory = staticModelReaderFactory();

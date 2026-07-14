@@ -11,7 +11,7 @@ import { ProjectLinkService } from "../src/projects/link-service";
 import { SqliteProjectRegistrationStore } from "../src/projects/registration-store";
 import { resolveAllowedRoots } from "../src/security/paths";
 import { createAdapterRequestHandler } from "../src/server";
-import { CANONICAL_MODEL_IDS, staticModelReaderFactory } from "./model-selection-fixtures";
+import { CANONICAL_MODEL_IDS, LOW_MODEL_ID, staticModelReaderFactory } from "./model-selection-fixtures";
 import { messageEntry, writeSessionFile } from "./session-sync-fixtures";
 
 const tempDirs: string[] = [];
@@ -226,7 +226,7 @@ async function createProjectService(workspace: string): Promise<ProjectLinkServi
 }
 
 function fixedRunner(content: string): LiveGatewayRunner {
-	return { run: () => ({ content, model: CANONICAL_MODEL_IDS[0] }) };
+	return { run: () => ({ content, model: LOW_MODEL_ID }) };
 }
 
 const modelReaderFactory = staticModelReaderFactory();

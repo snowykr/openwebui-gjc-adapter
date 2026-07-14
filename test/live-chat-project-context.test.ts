@@ -12,7 +12,7 @@ import type { OpenAIChatCompletionRequest } from "../src/live/openai-types";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
 import type { RegisteredProject } from "../src/projects/registry";
-import { CANONICAL_MODEL_IDS, staticModelReaderFactory } from "./model-selection-fixtures";
+import { LOW_MODEL_ID, staticModelReaderFactory } from "./model-selection-fixtures";
 
 const project: RegisteredProject = {
 	id: "demo",
@@ -99,7 +99,7 @@ describe("live chat project context", () => {
 
 	it("maps a missing background reader by requested model ownership", async () => {
 		const results = await Promise.all(
-			["gjc", CANONICAL_MODEL_IDS[0]].map(model =>
+			["gjc", LOW_MODEL_ID].map(model =>
 				handleChatCompletions({
 					request: { ...request, model },
 					headers: { "X-OpenWebUI-Task": "title_generation", "X-OpenWebUI-User-Id": "owner-1" },

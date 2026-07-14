@@ -8,7 +8,6 @@ export type GjcModelIdClassification =
 	| { readonly kind: "malformed" }
 	| { readonly kind: "foreign" };
 
-const THINKING_MODES = ["effort", "budget", "google-level", "anthropic-adaptive", "anthropic-budget-effort"] as const;
 const RFC3986_EXTRA = /[!'()*]/g;
 const HEX_ESCAPE = /%[0-9a-fA-F]{2}/;
 const CONTROL_OR_WHITESPACE = /[\p{Cc}\p{White_Space}]/u;
@@ -35,7 +34,7 @@ function decodeNormalizedSelection(input: unknown): readonly NormalizedModelSele
 	if (
 		typeof provider !== "string" ||
 		typeof modelId !== "string" ||
-		!isSafeComponent(provider) ||
+		!isSafeProvider(provider) ||
 		!isSafeComponent(modelId) ||
 		!isThinkingLevel(thinkingLevel)
 	) {
@@ -45,6 +44,7 @@ function decodeNormalizedSelection(input: unknown): readonly NormalizedModelSele
 }
 
 export function formatCanonicalModelId(selection: NormalizedModelSelection): string {
+	if (!isSafeProvider(selection.provider)) throw new TypeError("Invalid GJC model provider");
 	const provider = encodeComponent(selection.provider);
 	const modelId = encodeComponent(selection.modelId);
 	return `gjc/${provider}/${modelId}:${selection.thinkingLevel}`;
@@ -64,7 +64,7 @@ export function parseCanonicalModelId(value: unknown): NormalizedModelSelection 
 	if (!isThinkingLevel(thinkingLevel)) return null;
 	const provider = decodeCanonicalComponent(encodedProvider);
 	const modelId = decodeCanonicalComponent(encodedModel);
-	if (provider === null || modelId === null) return null;
+	if (provider === null || !isSafeProvider(provider) || modelId === null) return null;
 	return { provider, modelId, thinkingLevel };
 }
 
@@ -98,37 +98,24 @@ function decodeDescriptor(input: unknown): readonly NormalizedModelSelection[] |
 	const modelId = Reflect.get(input, "id");
 	const reasoning = Reflect.get(input, "reasoning");
 	if (typeof provider !== "string" || typeof modelId !== "string" || typeof reasoning !== "boolean") return null;
-	if (!isSafeComponent(provider) || !isSafeComponent(modelId)) return null;
-	const hasThinking = Reflect.has(input, "thinking") && Reflect.get(input, "thinking") !== undefined;
-	if (!reasoning) return hasThinking ? null : [{ provider, modelId, thinkingLevel: "off" }];
+	if (!isSafeProvider(provider) || !isSafeComponent(modelId)) return null;
 	const thinking = Reflect.get(input, "thinking");
 	if (!isRecord(thinking)) return null;
-	const levels = decodeThinkingDescriptor(thinking);
+	const levels = decodeThinkingDescriptor(thinking, reasoning);
 	if (levels === null) return null;
 	return levels.map(thinkingLevel => ({ provider, modelId, thinkingLevel }));
 }
 
-function decodeThinkingDescriptor(input: Readonly<Record<PropertyKey, unknown>>): readonly GjcThinkingLevel[] | null {
-	const minLevel = Reflect.get(input, "minLevel");
-	const maxLevel = Reflect.get(input, "maxLevel");
-	const mode = Reflect.get(input, "mode");
-	if (!isReasoningLevel(minLevel) || !isReasoningLevel(maxLevel) || !isThinkingMode(mode)) return null;
-	const minRank = GJC_THINKING_LEVELS.indexOf(minLevel);
-	const maxRank = GJC_THINKING_LEVELS.indexOf(maxLevel);
-	if (minRank > maxRank) return null;
-	const explicit = Reflect.get(input, "levels");
-	let levels: readonly GjcThinkingLevel[];
-	if (explicit === undefined) {
-		levels = GJC_THINKING_LEVELS.slice(minRank, maxRank + 1);
-	} else {
-		if (!Array.isArray(explicit) || explicit.length === 0 || !explicit.every(isReasoningLevel)) return null;
-		if (new Set(explicit).size !== explicit.length) return null;
-		levels = [...explicit].sort((left, right) => thinkingRank(left) - thinkingRank(right));
-		if (levels.some(level => thinkingRank(level) < minRank || thinkingRank(level) > maxRank)) return null;
-	}
-	const defaultLevel = Reflect.get(input, "defaultLevel");
-	if (defaultLevel !== undefined && (!isReasoningLevel(defaultLevel) || !levels.includes(defaultLevel))) return null;
-	return levels;
+function decodeThinkingDescriptor(
+	input: Readonly<Record<PropertyKey, unknown>>,
+	reasoning: boolean,
+): readonly GjcThinkingLevel[] | null {
+	const levels = Reflect.get(input, "validLevels");
+	if (!Array.isArray(levels) || levels.length === 0 || !levels.every(isThinkingLevel)) return null;
+	const canonical = GJC_THINKING_LEVELS.filter(level => levels.includes(level));
+	if (canonical.length !== levels.length || canonical.some((level, index) => level !== levels[index])) return null;
+	if (reasoning) return levels.length > 1 && levels[0] === "off" ? levels : null;
+	return levels.length === 1 && levels[0] === "off" ? levels : null;
 }
 
 function encodeComponent(value: string): string {
@@ -159,20 +146,16 @@ function isSafeComponent(value: string): boolean {
 	);
 }
 
+function isSafeProvider(value: string): boolean {
+	return isSafeComponent(value) && !value.includes("/");
+}
+
 function isRecord(value: unknown): value is Readonly<Record<PropertyKey, unknown>> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isThinkingLevel(value: unknown): value is GjcThinkingLevel {
 	return typeof value === "string" && GJC_THINKING_LEVELS.some(level => level === value);
-}
-
-function isReasoningLevel(value: unknown): value is Exclude<GjcThinkingLevel, "off"> {
-	return isThinkingLevel(value) && value !== "off";
-}
-
-function isThinkingMode(value: unknown): value is (typeof THINKING_MODES)[number] {
-	return typeof value === "string" && THINKING_MODES.some(mode => mode === value);
 }
 
 function compareSelections(left: NormalizedModelSelection, right: NormalizedModelSelection): number {

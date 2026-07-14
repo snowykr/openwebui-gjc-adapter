@@ -20,7 +20,7 @@ export class RealSelectionCoordinator {
 	readonly sdkToken: string;
 	readonly #server: ReturnType<typeof Bun.serve>;
 	readonly #sdkServer: RealSelectionSdkServer;
-	readonly #catalogMode: "capabilities" | "current-only";
+	readonly #catalogMode: "capabilities" | "current-inherit";
 	#selection: NormalizedModelSelection = LOW_SELECTION;
 	#normalizeNext = false;
 	#failNextSetter = false;
@@ -42,7 +42,9 @@ export class RealSelectionCoordinator {
 	#barrierRelease: (() => void) | undefined;
 	#barrierPromise: Promise<void> | undefined;
 
-	constructor(options: { readonly catalogMode: "capabilities" | "current-only" } = { catalogMode: "capabilities" }) {
+	constructor(
+		options: { readonly catalogMode: "capabilities" | "current-inherit" } = { catalogMode: "capabilities" },
+	) {
 		this.#catalogMode = options.catalogMode;
 		this.#server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: request => this.#fetch(request) });
 		this.url = this.#server.url.toString().replace(/\/$/, "");
@@ -194,7 +196,12 @@ export class RealSelectionCoordinator {
 		if (this.#catalogMode === "capabilities") return MODEL_DESCRIPTORS;
 		return MODEL_DESCRIPTORS.map(model => {
 			if (!isRecord(model)) throw new TypeError("invalid fixture model");
-			return { provider: model.provider, id: model.id, name: model.id };
+			const current = model.provider === LOW_SELECTION.provider && model.id === LOW_SELECTION.modelId;
+			return {
+				...model,
+				current,
+				...(current ? { currentThinkingLevel: "inherit" } : {}),
+			};
 		});
 	}
 }

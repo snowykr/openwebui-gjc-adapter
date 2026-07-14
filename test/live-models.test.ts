@@ -19,19 +19,32 @@ describe("canonical GJC model codec", () => {
 		expect(classify("openai/gpt-5")).toEqual({ kind: "foreign" });
 	});
 
-	test("round-trips strict RFC3986 bytes when provider and model contain delimiters", () => {
+	test("round-trips strict RFC3986 bytes when a model id contains delimiters and Unicode", () => {
 		// Given
 		const format = exportedFunction("formatCanonicalModelId");
 		const parse = exportedFunction("parseCanonicalModelId");
-		const selection = { provider: "p/100%", modelId: "m:n/雪", thinkingLevel: "high" };
+		const selection = { provider: "p-100%", modelId: "m:n/雪", thinkingLevel: "high" };
 
 		// When
 		const canonical = format(selection);
 		const decoded = parse(canonical);
 
 		// Then
-		expect(canonical).toBe("gjc/p%2F100%25/m%3An%2F%E9%9B%AA:high");
+		expect(canonical).toBe("gjc/p-100%25/m%3An%2F%E9%9B%AA:high");
 		expect(decoded).toEqual(selection);
+	});
+
+	test("rejects a provider containing slash at normalized and canonical codec admission", () => {
+		// Given
+		const format = exportedFunction("formatCanonicalModelId");
+		const parse = exportedFunction("parseCanonicalModelId");
+		const build = exportedFunction("buildModelList");
+		const selection = { provider: "proxy/openai", modelId: "model:雪/preview", thinkingLevel: "off" };
+
+		// When / Then
+		expect(() => format(selection)).toThrow();
+		expect(parse("gjc/proxy%2Fopenai/model%3A%E9%9B%AA%2Fpreview:off")).toBeNull();
+		expect(build([selection])).toEqual({ object: "list", data: [] });
 	});
 
 	test("rejects non-canonical and unsafe spellings when parsing", () => {
@@ -66,17 +79,29 @@ describe("atomic GJC catalog decoder", () => {
 		expect(decode([{ provider: "broken" }])).toBeNull();
 	});
 
-	test("emits off for a non-reasoning descriptor and concrete levels for a complete reasoning descriptor", () => {
+	test("uses Q10 thinking.validLevels as the authoritative settable menu for every row", () => {
 		// Given
 		const decode = exportedFunction("decodeModelCatalog");
 		const catalog = [
-			{ provider: "plain", id: "chat", contextWindow: 1000, reasoning: false },
+			{
+				provider: "plain",
+				id: "chat:雪/preview",
+				contextWindow: 1000,
+				reasoning: false,
+				thinking: { validLevels: ["off"] },
+			},
 			{
 				provider: "reasoning",
 				id: "deep",
 				contextWindow: 2000,
 				reasoning: true,
-				thinking: { minLevel: "minimal", maxLevel: "high", mode: "effort" },
+				thinking: {
+					validLevels: ["off", "minimal", "medium", "xhigh", "max"],
+					minLevel: "minimal",
+					maxLevel: "max",
+					mode: "effort",
+					levels: ["max", "minimal", "max"],
+				},
 			},
 		];
 
@@ -85,39 +110,53 @@ describe("atomic GJC catalog decoder", () => {
 
 		// Then
 		expect(tuples).toEqual([
-			{ provider: "plain", modelId: "chat", thinkingLevel: "off" },
+			{ provider: "plain", modelId: "chat:雪/preview", thinkingLevel: "off" },
+			{ provider: "reasoning", modelId: "deep", thinkingLevel: "off" },
 			{ provider: "reasoning", modelId: "deep", thinkingLevel: "minimal" },
-			{ provider: "reasoning", modelId: "deep", thinkingLevel: "low" },
 			{ provider: "reasoning", modelId: "deep", thinkingLevel: "medium" },
-			{ provider: "reasoning", modelId: "deep", thinkingLevel: "high" },
+			{ provider: "reasoning", modelId: "deep", thinkingLevel: "xhigh" },
+			{ provider: "reasoning", modelId: "deep", thinkingLevel: "max" },
 		]);
 	});
 
-	test("rejects each malformed descriptor atomically without recovering partial tuples", () => {
+	test.each([
+		["missing thinking", { provider: "reasoning", id: "missing", reasoning: true }],
+		["missing validLevels", { provider: "reasoning", id: "missing-levels", reasoning: true, thinking: {} }],
+		["empty validLevels", { provider: "reasoning", id: "empty", reasoning: true, thinking: { validLevels: [] } }],
+		[
+			"inherit readback",
+			{ provider: "reasoning", id: "inherit", reasoning: true, thinking: { validLevels: ["off", "inherit"] } },
+		],
+		[
+			"unknown level",
+			{ provider: "reasoning", id: "unknown", reasoning: true, thinking: { validLevels: ["off", "ultra"] } },
+		],
+		[
+			"duplicate level",
+			{ provider: "reasoning", id: "duplicate", reasoning: true, thinking: { validLevels: ["off", "low", "low"] } },
+		],
+		[
+			"noncanonical order",
+			{ provider: "reasoning", id: "order", reasoning: true, thinking: { validLevels: ["low", "off"] } },
+		],
+		[
+			"nonreasoning level",
+			{ provider: "plain", id: "chat", reasoning: false, thinking: { validLevels: ["off", "low"] } },
+		],
+		[
+			"provider slash",
+			{ provider: "provider/sub", id: "model", reasoning: false, thinking: { validLevels: ["off"] } },
+		],
+	] as const)("rejects %s atomically after a valid Q10 row", (_name, invalid) => {
 		// Given
-		const decode = exportedFunction("decodeModelCatalog");
-		const malformed = [
-			{ provider: "plain", id: "chat", reasoning: false, thinking: { minLevel: "off" } },
-			{ provider: "reasoning", id: "empty", reasoning: true },
-			{
-				provider: "reasoning",
-				id: "partial",
-				reasoning: true,
-				thinking: { minLevel: "low", maxLevel: "high", mode: "effort", levels: ["low", "inherit"] },
-			},
-			{
-				provider: "reasoning",
-				id: "bounds",
-				reasoning: true,
-				thinking: { minLevel: "high", maxLevel: "low", mode: "effort" },
-			},
-		];
+		const decode = exportedFunction("decodeStrictModelCatalog");
+		const valid = { provider: "plain", id: "chat", reasoning: false, thinking: { validLevels: ["off"] } };
 
 		// When
-		const tuples = decode(malformed);
+		const tuples = decode([valid, invalid]);
 
 		// Then
-		expect(tuples).toEqual([]);
+		expect(tuples).toBeNull();
 	});
 
 	test("deduplicates tuples and sorts provider/model UTF-8 bytes before thinking rank", () => {
@@ -128,14 +167,14 @@ describe("atomic GJC catalog decoder", () => {
 				provider: "z",
 				id: "m",
 				reasoning: true,
-				thinking: { minLevel: "minimal", maxLevel: "max", mode: "budget", levels: ["max", "low", "minimal"] },
+				thinking: { validLevels: ["off", "minimal", "low", "max"] },
 			},
-			{ provider: "ä", id: "m", reasoning: false },
+			{ provider: "ä", id: "m", reasoning: false, thinking: { validLevels: ["off"] } },
 			{
 				provider: "z",
 				id: "m",
 				reasoning: true,
-				thinking: { minLevel: "minimal", maxLevel: "max", mode: "budget", levels: ["minimal", "low", "max"] },
+				thinking: { validLevels: ["off", "minimal", "low", "max"] },
 			},
 		];
 
@@ -144,6 +183,7 @@ describe("atomic GJC catalog decoder", () => {
 
 		// Then
 		expect(tuples).toEqual([
+			{ provider: "z", modelId: "m", thinkingLevel: "off" },
 			{ provider: "z", modelId: "m", thinkingLevel: "minimal" },
 			{ provider: "z", modelId: "m", thinkingLevel: "low" },
 			{ provider: "z", modelId: "m", thinkingLevel: "max" },

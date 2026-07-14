@@ -10,7 +10,7 @@ import { ProjectLinkService } from "../src/projects/link-service";
 import { SqliteProjectRegistrationStore } from "../src/projects/registration-store";
 import { resolveAllowedRoots } from "../src/security/paths";
 import { createAdapterRequestHandler } from "../src/server";
-import { CANONICAL_MODEL_IDS, staticModelReaderFactory } from "./model-selection-fixtures";
+import { LOW_MODEL_ID, staticModelReaderFactory } from "./model-selection-fixtures";
 
 const tempDirs: string[] = [];
 
@@ -80,7 +80,7 @@ describe("project admin route security boundaries", () => {
 		const { handler } = await buildHandler(workspace, undefined, false);
 		const response = await handler(
 			chatCommandRequest(
-				{ model: CANONICAL_MODEL_IDS[0], messages: [{ role: "user", content: "/gjc project list" }] },
+				{ model: LOW_MODEL_ID, messages: [{ role: "user", content: "/gjc project list" }] },
 				options,
 			),
 		);

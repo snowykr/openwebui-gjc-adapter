@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { access } from "node:fs/promises";
 import type { FailedStartCleanupReceipt } from "./cli-fixtures";
-import { CANONICAL_MODEL_IDS } from "./model-selection-fixtures";
+import { CANONICAL_MODEL_IDS, LOW_MODEL_ID, MEDIUM_MODEL_ID } from "./model-selection-fixtures";
 import { expectNoDeliveryMutation, expectSelectionError } from "./real-selection-expectations";
 import { RealSelectionHarness } from "./real-selection-harness";
 
@@ -10,8 +10,8 @@ describe("real canonical model selection surfaces", () => {
 		const harness = await RealSelectionHarness.start({ invalidRunnerModel: "gjc" });
 		try {
 			const before = await harness.effects();
-			const json = await harness.chat(CANONICAL_MODEL_IDS[0], { id: "invalid-json" });
-			const stream = await harness.chat(CANONICAL_MODEL_IDS[0], { id: "invalid-stream", stream: true });
+			const json = await harness.chat(LOW_MODEL_ID, { id: "invalid-json" });
+			const stream = await harness.chat(LOW_MODEL_ID, { id: "invalid-stream", stream: true });
 			for (const result of [json, stream]) {
 				expect(result).toMatchObject({
 					status: 503,
@@ -40,25 +40,17 @@ describe("real canonical model selection surfaces", () => {
 		await rebound.stop();
 	}, 15_000);
 
-	test("exposes only the authoritative current tuple when current-dev omits capabilities", async () => {
-		const harness = await RealSelectionHarness.start({ catalogMode: "current-only" });
+	test("exposes Q10 capabilities without advertising current inherit readback", async () => {
+		const harness = await RealSelectionHarness.start({ catalogMode: "current-inherit" });
 		try {
 			const models = await harness.models();
 			expect(models).toMatchObject({ status: 200 });
-			expect(models.body.data.map(model => model.id)).toEqual([CANONICAL_MODEL_IDS[0]]);
+			expect(models.body.data.map(model => model.id)).toEqual([...CANONICAL_MODEL_IDS]);
+			expect(models.body.data.map(model => model.id)).not.toContain("gjc/anthropic/claude-sonnet-4:inherit");
 			expect(await harness.chat("gjc", { id: "current-alias" })).toMatchObject({
 				status: 200,
-				body: { model: CANONICAL_MODEL_IDS[0] },
+				body: { model: LOW_MODEL_ID },
 			});
-			const beforeGuess = harness.coordinator.snapshot();
-			await expectSelectionError(
-				harness.chat(CANONICAL_MODEL_IDS[1], { id: "unsupported-guess" }),
-				503,
-				"model_catalog_unavailable",
-			);
-			const afterGuess = harness.coordinator.snapshot();
-			expect(afterGuess.setterAttempts).toBe(beforeGuess.setterAttempts);
-			expect(afterGuess.promptCount).toBe(beforeGuess.promptCount);
 		} finally {
 			await harness.stop();
 		}
@@ -72,17 +64,17 @@ describe("real canonical model selection surfaces", () => {
 			expect(models.body.data.map(model => model.id)).toEqual([...CANONICAL_MODEL_IDS]);
 			expect(await harness.chat("gjc", { id: "alias" })).toMatchObject({
 				status: 200,
-				body: { model: CANONICAL_MODEL_IDS[0] },
+				body: { model: LOW_MODEL_ID },
 			});
 			harness.coordinator.normalizeNextToMedium();
-			expect(await harness.chat(CANONICAL_MODEL_IDS[0], { id: "normalized" })).toMatchObject({
+			expect(await harness.chat(LOW_MODEL_ID, { id: "normalized" })).toMatchObject({
 				status: 200,
-				body: { model: CANONICAL_MODEL_IDS[1] },
+				body: { model: MEDIUM_MODEL_ID },
 			});
 			const mapping = await harness.mappingBytes();
 			expect(mapping).toContain('"thinkingLevel": "medium"');
-			expect(mapping).not.toContain(CANONICAL_MODEL_IDS[0]);
-			expect(await harness.eventModels("chat-normalized")).toEqual([CANONICAL_MODEL_IDS[1]]);
+			expect(mapping).not.toContain(LOW_MODEL_ID);
+			expect(await harness.eventModels("chat-normalized")).toEqual([MEDIUM_MODEL_ID]);
 			const normalizedEffects = await harness.effects();
 			expect(normalizedEffects.outbox.filter(row => row.chatId === "chat-normalized").map(row => row.kind)).toEqual([
 				"session_mapping",
@@ -90,29 +82,25 @@ describe("real canonical model selection surfaces", () => {
 			]);
 			expect(await harness.chat("gjc", { id: "alias-admin", content: "/gjc project list" })).toMatchObject({
 				status: 200,
-				body: { model: CANONICAL_MODEL_IDS[1] },
+				body: { model: MEDIUM_MODEL_ID },
 			});
 			harness.coordinator.normalizeNextToMedium();
-			expect(await harness.chat(CANONICAL_MODEL_IDS[0], { id: "stream", stream: true })).toMatchObject({
+			expect(await harness.chat(LOW_MODEL_ID, { id: "stream", stream: true })).toMatchObject({
 				status: 200,
-				sseModels: [CANONICAL_MODEL_IDS[1]],
+				sseModels: [MEDIUM_MODEL_ID],
 			});
 			const beforeBackground = await harness.effects();
 			expect(await harness.chat("gjc", { id: "background", task: "title" })).toMatchObject({
 				status: 200,
-				body: { model: CANONICAL_MODEL_IDS[1] },
+				body: { model: MEDIUM_MODEL_ID },
 			});
-			expect(
-				await harness.chat(CANONICAL_MODEL_IDS[0], { id: "canonical-background", task: "title" }),
-			).toMatchObject({
+			expect(await harness.chat(LOW_MODEL_ID, { id: "canonical-background", task: "title" })).toMatchObject({
 				status: 200,
-				body: { model: CANONICAL_MODEL_IDS[0] },
+				body: { model: LOW_MODEL_ID },
 			});
-			expect(
-				await harness.chat(CANONICAL_MODEL_IDS[0], { id: "admin", content: "/gjc project list" }),
-			).toMatchObject({
+			expect(await harness.chat(LOW_MODEL_ID, { id: "admin", content: "/gjc project list" })).toMatchObject({
 				status: 200,
-				body: { model: CANONICAL_MODEL_IDS[0] },
+				body: { model: LOW_MODEL_ID },
 			});
 			const afterBackground = await harness.effects();
 			expect(afterBackground.coordinator).toMatchObject({
@@ -125,7 +113,7 @@ describe("real canonical model selection surfaces", () => {
 			const beforeFailure = await harness.effects();
 			harness.coordinator.failNextSetter();
 			await expectSelectionError(
-				harness.chat(CANONICAL_MODEL_IDS[0], { id: "setter-failure" }),
+				harness.chat(LOW_MODEL_ID, { id: "setter-failure" }),
 				409,
 				"model_selection_apply_failed",
 			);

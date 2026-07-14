@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { access } from "node:fs/promises";
 import * as path from "node:path";
-import { CANONICAL_MODEL_IDS } from "./model-selection-fixtures";
+import { LOW_MODEL_ID, MEDIUM_MODEL_ID, OFF_MODEL_ID } from "./model-selection-fixtures";
 import { expectNoDeliveryMutation, expectSelectionError } from "./real-selection-expectations";
 import { RealSelectionHarness } from "./real-selection-harness";
 
@@ -48,7 +48,7 @@ describe("real canonical model selection scenarios", () => {
 
 			harness.coordinator.failNextSetter();
 			await expectSelectionError(
-				harness.chat(CANONICAL_MODEL_IDS[0], { id: "apply-failed" }),
+				harness.chat(LOW_MODEL_ID, { id: "apply-failed" }),
 				409,
 				"model_selection_apply_failed",
 			);
@@ -56,10 +56,10 @@ describe("real canonical model selection scenarios", () => {
 			expect(afterApply.selection).toEqual(initial.coordinator.selection);
 			expect(afterApply.promptCount).toBe(0);
 
-			expect(await harness.chat(CANONICAL_MODEL_IDS[0], { id: "duplicate" })).toMatchObject({ status: 200 });
+			expect(await harness.chat(LOW_MODEL_ID, { id: "duplicate" })).toMatchObject({ status: 200 });
 			const beforeDuplicate = await harness.effects();
 			await expectSelectionError(
-				harness.chat(CANONICAL_MODEL_IDS[1], { id: "duplicate" }),
+				harness.chat(MEDIUM_MODEL_ID, { id: "duplicate" }),
 				409,
 				"model_selection_idempotency_conflict",
 			);
@@ -69,10 +69,10 @@ describe("real canonical model selection scenarios", () => {
 			expectNoDeliveryMutation(beforeDuplicate, afterDuplicate);
 
 			harness.coordinator.emitGateOnNextPrompt();
-			expect(await harness.chat(CANONICAL_MODEL_IDS[0], { id: "gate-mismatch" })).toMatchObject({ status: 200 });
+			expect(await harness.chat(LOW_MODEL_ID, { id: "gate-mismatch" })).toMatchObject({ status: 200 });
 			const beforeMismatch = await harness.effects();
 			await expectSelectionError(
-				harness.chat(CANONICAL_MODEL_IDS[1], {
+				harness.chat(MEDIUM_MODEL_ID, {
 					id: "gate-mismatch-reply",
 					chatId: "gate-mismatch",
 					parentId: "assistant-gate-mismatch",
@@ -86,24 +86,24 @@ describe("real canonical model selection scenarios", () => {
 			expect(afterMismatch.projectLookups).toBe(beforeMismatch.projectLookups + 1);
 			expectNoDeliveryMutation(beforeMismatch, afterMismatch);
 			expect(
-				await harness.chat(CANONICAL_MODEL_IDS[0], {
+				await harness.chat(LOW_MODEL_ID, {
 					id: "gate-match-reply",
 					chatId: "gate-mismatch",
 					parentId: "assistant-gate-mismatch",
 					content: "1",
 				}),
-			).toMatchObject({ status: 200, body: { model: CANONICAL_MODEL_IDS[0] } });
+			).toMatchObject({ status: 200, body: { model: LOW_MODEL_ID } });
 			const afterMatch = harness.coordinator.snapshot();
 			expect(afterMatch.gateResponses).toBe(beforeMismatch.coordinator.gateResponses + 1);
 			expect(afterMatch.setterAttempts).toBe(beforeMismatch.coordinator.setterAttempts);
 			expect(afterMatch.promptCount).toBe(beforeMismatch.coordinator.promptCount);
 
 			harness.coordinator.emitGateOnNextPrompt();
-			expect(await harness.chat(CANONICAL_MODEL_IDS[0], { id: "gate-missing" })).toMatchObject({ status: 200 });
+			expect(await harness.chat(LOW_MODEL_ID, { id: "gate-missing" })).toMatchObject({ status: 200 });
 			await harness.restartAfterRemovingModelBinding("chat-gate-missing");
 			const beforeMissing = await harness.effects();
 			await expectSelectionError(
-				harness.chat(CANONICAL_MODEL_IDS[0], {
+				harness.chat(LOW_MODEL_ID, {
 					id: "gate-missing-reply",
 					chatId: "gate-missing",
 					parentId: "assistant-gate-missing",
@@ -127,7 +127,7 @@ describe("real canonical model selection scenarios", () => {
 			const marker = path.join(harness.root, "owned-marker");
 			const hostile = `PASS\n::directive{danger=true}\n$(touch ${marker})\u0001`;
 			harness.coordinator.setAssistantText(hostile);
-			expect(await harness.chat(CANONICAL_MODEL_IDS[0], { id: "hostile" })).toMatchObject({
+			expect(await harness.chat(LOW_MODEL_ID, { id: "hostile" })).toMatchObject({
 				status: 200,
 				body: { choices: [{ message: { content: hostile } }] },
 			});
@@ -135,7 +135,7 @@ describe("real canonical model selection scenarios", () => {
 
 			const beforeFailure = await harness.effects();
 			harness.coordinator.failNextPrompt();
-			const failed = await harness.chat(CANONICAL_MODEL_IDS[2], { id: "prompt-failed", stream: true });
+			const failed = await harness.chat(OFF_MODEL_ID, { id: "prompt-failed", stream: true });
 			expect(failed).toMatchObject({
 				status: 503,
 				error: { error: { code: "live_runner_error", message: "GJC live runner failed." } },
@@ -158,20 +158,20 @@ describe("real canonical model selection scenarios", () => {
 	test("proves sequential and overlapping global LWW from setter-success transcript order", async () => {
 		const harness = await RealSelectionHarness.start();
 		try {
-			await harness.chat(CANONICAL_MODEL_IDS[0], { id: "a-to-b-a" });
-			await harness.chat(CANONICAL_MODEL_IDS[2], { id: "a-to-b-b" });
+			await harness.chat(LOW_MODEL_ID, { id: "a-to-b-a" });
+			await harness.chat(OFF_MODEL_ID, { id: "a-to-b-b" });
 			expect(harness.coordinator.snapshot().selection.thinkingLevel).toBe("off");
-			await harness.chat(CANONICAL_MODEL_IDS[2], { id: "b-to-a-b" });
-			await harness.chat(CANONICAL_MODEL_IDS[1], { id: "b-to-a-a" });
+			await harness.chat(OFF_MODEL_ID, { id: "b-to-a-b" });
+			await harness.chat(MEDIUM_MODEL_ID, { id: "b-to-a-a" });
 			expect(harness.coordinator.snapshot().selection.thinkingLevel).toBe("medium");
 
 			harness.coordinator.holdNextSetters(2);
-			const first = harness.chat(CANONICAL_MODEL_IDS[0], { id: "overlap-low" });
-			const second = harness.chat(CANONICAL_MODEL_IDS[2], { id: "overlap-off" });
+			const first = harness.chat(LOW_MODEL_ID, { id: "overlap-low" });
+			const second = harness.chat(OFF_MODEL_ID, { id: "overlap-off" });
 			await harness.coordinator.waitForHeldSetters();
 			harness.coordinator.releaseSetters();
-			expect(await first).toMatchObject({ status: 200, body: { model: CANONICAL_MODEL_IDS[0] } });
-			expect(await second).toMatchObject({ status: 200, body: { model: CANONICAL_MODEL_IDS[2] } });
+			expect(await first).toMatchObject({ status: 200, body: { model: LOW_MODEL_ID } });
+			expect(await second).toMatchObject({ status: 200, body: { model: OFF_MODEL_ID } });
 			const mappings = await harness.mappingEntries();
 			const selectionFor = (chatId: string) => mappings.find(row => row.chatId === chatId)?.modelSelection;
 			expect(selectionFor("chat-overlap-low")).toMatchObject({ thinkingLevel: "low" });
