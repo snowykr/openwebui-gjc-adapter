@@ -6,6 +6,7 @@ import { type GjcSessionStorageLocations, resolveGjcSdkSessionRoot } from "../gj
 import type { SessionMapping, SessionMappingStore } from "../gjc/session-router";
 import type { OpenWebUIProjectionRepository } from "../openwebui/client";
 import { buildProjectFolderMetadata, type RegisteredProject } from "../projects/registry";
+import { resolveExistingOrProspectivePath } from "../security/paths";
 import { projectGjcSessionToOpenWebUIChat } from "./chat-tree";
 import { importProjectedSession, type ProjectedProjectReference, upsertProjectedProjectFolder } from "./importer";
 
@@ -64,6 +65,17 @@ export async function syncProjectSessionsToOpenWebUI(
 		for (const filePath of await listSessionFiles(project, input.runtimeLocations)) {
 			try {
 				const loaded = await loadGjcSessionFile(filePath);
+				const sessionCwd = await resolveExistingOrProspectivePath(loaded.header.cwd);
+				const projectCwd = await resolveExistingOrProspectivePath(project.cwd);
+				if (sessionCwd !== projectCwd) {
+					skipped.push({
+						projectId: project.id,
+						filePath,
+						code: "session_cwd_mismatch",
+						message: `GJC session cwd ${loaded.header.cwd} does not match project cwd ${project.cwd}`,
+					});
+					continue;
+				}
 				if (importedSessionIds.has(loaded.header.id)) {
 					skipped.push({
 						projectId: project.id,
