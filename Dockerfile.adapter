@@ -6,7 +6,7 @@ FROM rust:1.86-slim-bookworm@sha256:57d415bbd61ce11e2d5f73de068103c7bd9f3188dc13
 
 ENV BUN_INSTALL=/opt/bun \
     GJC_UPSTREAM_REPOSITORY=https://github.com/Yeachan-Heo/gajae-code.git \
-    GJC_UPSTREAM_COMMIT=d13c09c40446a33a33bc25c2e17ba525f1aa27d7 \
+    GJC_UPSTREAM_COMMIT=6fae7cc5475ba85b075608f1e87e6c0cb9e8693d \
     PATH=/opt/bun/bin:/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin
 
 RUN apt-get update \
@@ -19,7 +19,7 @@ RUN git init /opt/gajae-code \
     && git fetch --depth=1 "$GJC_UPSTREAM_REPOSITORY" "$GJC_UPSTREAM_COMMIT" \
     && git checkout --detach FETCH_HEAD \
     && test "$(git rev-parse HEAD)" = "$GJC_UPSTREAM_COMMIT"
-COPY patches/gajae-code-d13c09c-sdk-broker-safe-bun.patch /tmp/gajae-code-sdk-broker.patch
+COPY patches/gajae-code-6fae7cc-sdk-broker-safe-bun.patch /tmp/gajae-code-sdk-broker.patch
 RUN cd /opt/gajae-code \
     && git apply --check /tmp/gajae-code-sdk-broker.patch \
     && git apply /tmp/gajae-code-sdk-broker.patch
@@ -38,7 +38,7 @@ RUN bun --cwd=packages/coding-agent run generate-docs-index \
 FROM python:3.12-slim-bookworm@sha256:8a7e7cc04fd3e2bd787f7f24e22d5d119aa590d429b50c95dfe12b3abe52f48b
 
 ENV BUN_INSTALL=/opt/bun \
-    GJC_UPSTREAM_COMMIT=d13c09c40446a33a33bc25c2e17ba525f1aa27d7 \
+    GJC_UPSTREAM_COMMIT=6fae7cc5475ba85b075608f1e87e6c0cb9e8693d \
     PATH=/opt/bun/bin:/usr/local/bin:/usr/bin:/bin
 LABEL org.opencontainers.image.revision=$GJC_UPSTREAM_COMMIT
 
