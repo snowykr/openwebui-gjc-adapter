@@ -1,7 +1,7 @@
 diff --git a/packages/coding-agent/src/sdk/broker/runtime.ts b/packages/coding-agent/src/sdk/broker/runtime.ts
 --- a/packages/coding-agent/src/sdk/broker/runtime.ts
 +++ b/packages/coding-agent/src/sdk/broker/runtime.ts
-@@ -24,2 +24,5 @@ export function resolveSdkInternalSpawnCommand(
+@@ -21,2 +21,5 @@ export function resolveSdkInternalSpawnCommand(
 -	return { file: runtime.execPath, args: [entrypoint, "sdk", action] };
 +	return {
 +		file: runtime.execPath,
