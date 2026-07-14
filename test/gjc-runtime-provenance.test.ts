@@ -6,15 +6,16 @@ import { join } from "node:path";
 
 const ROOT = join(import.meta.dir, "..");
 const UPSTREAM_REPOSITORY = "https://github.com/Yeachan-Heo/gajae-code.git";
-const UPSTREAM_COMMIT = "825ea2de656c44435b7402eaaf34c72b2bfd46c2";
+const UPSTREAM_COMMIT = "15f1691a7820fc4d727322f81c480ae4a0332f4a";
 const BUN_IMAGE_DIGEST = "sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4";
 const RUST_IMAGE_DIGEST = "sha256:57d415bbd61ce11e2d5f73de068103c7bd9f3188dc132c97cef4a8f62989e944";
 const PYTHON_IMAGE_DIGEST = "sha256:8a7e7cc04fd3e2bd787f7f24e22d5d119aa590d429b50c95dfe12b3abe52f48b";
 const BROKER_RUNTIME_PATH = "packages/coding-agent/src/sdk/broker/runtime.ts";
-const BROKER_FIXTURE_PATH = "test/fixtures/gajae-code-825ea2d-sdk-broker-runtime.txt";
+const BROKER_FIXTURE_PATH = "test/fixtures/gajae-code-15f1691-sdk-broker-runtime.txt";
 const BROKER_FIXTURE_SHA256 = "767be871319a7ef50da5aea230bbe32964e563caf8259e7d3eee95fa4b49434a";
-const BROKER_PATCH_PATH = "patches/gajae-code-825ea2d-sdk-broker-safe-bun.patch";
+const BROKER_PATCH_PATH = "patches/gajae-code-15f1691-sdk-broker-safe-bun.patch";
 const STALE_PROVENANCE_PREFIXES = [
+	["825", "ea2d"].join(""),
 	["6fa", "e7cc"].join(""),
 	["d13", "c09c"].join(""),
 	["44a", "8645"].join(""),
@@ -118,7 +119,7 @@ describe("GJC SDK runtime provenance", () => {
 		const patchApplyIndex = dockerfile.indexOf("git apply /tmp/gajae-code-sdk-broker.patch");
 		const installIndex = dockerfile.indexOf("bun install --frozen-lockfile --ignore-scripts");
 		expect(dockerfile).toContain(
-			"COPY patches/gajae-code-825ea2d-sdk-broker-safe-bun.patch /tmp/gajae-code-sdk-broker.patch",
+			"COPY patches/gajae-code-15f1691-sdk-broker-safe-bun.patch /tmp/gajae-code-sdk-broker.patch",
 		);
 		expect(checkoutIndex).toBeGreaterThan(-1);
 		expect(patchCheckIndex).toBeGreaterThan(checkoutIndex);
