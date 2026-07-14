@@ -80,6 +80,17 @@ describe("latest dev SDK v3 transport contract", () => {
 		});
 	});
 
+	test("Given model.set selection components When parsing Then provider delimiters are rejected without restricting model IDs", () => {
+		expect(() => parseSelection({ provider: "openai/family", modelId: "model", thinkingLevel: "high" })).toThrow(
+			"provider must not contain /",
+		);
+		expect(parseSelection({ provider: "openai", modelId: "org/model:v2/한글", thinkingLevel: "high" })).toEqual({
+			provider: "openai",
+			modelId: "org/model:v2/한글",
+			thinkingLevel: "high",
+		});
+	});
+
 	test("Given future capability metadata When enumerating canonical tuples Then supported levels remain usable", async () => {
 		const fixture = createSdkTransportFixture("turn_complete");
 		try {

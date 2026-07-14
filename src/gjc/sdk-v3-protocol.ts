@@ -140,12 +140,14 @@ export function parseQueryPage(
 
 export function parseSelection(value: unknown): NormalizedModelSelection {
 	const result = parseRecord(value, "model.set result");
+	const provider = requiredString(result, "provider", "model.set result");
+	if (provider.includes("/")) throw new SdkV3ProtocolError("model.set result", "provider must not contain /");
 	const thinkingLevel = requiredString(result, "thinkingLevel", "model.set result");
 	if (!isThinkingLevel(thinkingLevel)) {
 		throw new SdkV3ProtocolError("model.set result", "thinkingLevel is unsupported");
 	}
 	return {
-		provider: requiredString(result, "provider", "model.set result"),
+		provider,
 		modelId: requiredString(result, "modelId", "model.set result"),
 		thinkingLevel,
 	};
