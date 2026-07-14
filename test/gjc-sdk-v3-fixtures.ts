@@ -18,9 +18,10 @@ export function createSdkTransportFixture(
 	const root = mkdtempSync(join(tmpdir(), "gjc-sdk-v3-contract-"));
 	const home = join(root, "home");
 	const agentDir = join(home, ".gjc", "agent");
+	const launcherParent = join(home, ".gjc", "openwebui");
 	const cwd = join(root, "workspace");
 	const sessionRoot = join(cwd, ".gjc", "sessions");
-	for (const path of [home, agentDir, cwd, sessionRoot]) mkdirSync(path, { recursive: true });
+	for (const path of [home, agentDir, launcherParent, cwd, sessionRoot]) mkdirSync(path, { recursive: true });
 	const cliTranscript = join(root, "cli.jsonl");
 	appendFileSync(cliTranscript, "");
 	const server = startSdkFixtureServer(scenario);
