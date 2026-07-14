@@ -1,5 +1,6 @@
+import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { mkdir, open, realpath } from "node:fs/promises";
+import { mkdir, open, realpath, rename, unlink } from "node:fs/promises";
 import { dirname, extname, isAbsolute, join, relative } from "node:path";
 import { resolveExistingOrProspectivePath } from "../security/paths";
 import {
@@ -162,31 +163,56 @@ export class SdkV3Cli {
 			}
 			await directoryHandle.chmod(0o700);
 		} catch (error) {
-			throwLauncherFileSystemError(error, "SDK launcher directory must be private");
-		} finally {
 			await directoryHandle?.close();
+			throwLauncherFileSystemError(error, "SDK launcher directory must be private");
 		}
+		if (directoryHandle === undefined) {
+			throw new SdkV3OperationError("invalid_input", "SDK launcher directory must be private");
+		}
+		const temporaryLauncher = join(this.#options.launcherDir, `.sdk-session-host.${randomUUID()}.tmp`);
 		let launcherHandle: Awaited<ReturnType<typeof open>> | undefined;
+		let published = false;
 		try {
 			launcherHandle = await open(
-				launcher,
-				constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+				temporaryLauncher,
+				constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_NONBLOCK,
 				0o600,
 			);
 			const launcherEntry = await launcherHandle.stat();
 			if (!launcherEntry.isFile() || launcherEntry.nlink !== 1) {
 				throw new SdkV3OperationError("invalid_input", "SDK session launcher must be a private regular file");
 			}
-			await launcherHandle.chmod(0o600);
-			await launcherHandle.truncate(0);
 			await launcherHandle.writeFile(
 				`#!/bin/sh\nexec ${shellQuote(process.execPath)} --no-env-file --config=/dev/null ${shellQuote(this.#options.cliPath)} sdk session-host-internal "$@"\n`,
 			);
+			await launcherHandle.sync();
 			await launcherHandle.chmod(0o700);
+			await launcherHandle.sync();
+			await launcherHandle.close();
+			launcherHandle = undefined;
+			await rename(temporaryLauncher, launcher);
+			published = true;
+			await directoryHandle.sync();
 		} catch (error) {
 			throwLauncherFileSystemError(error, "SDK session launcher must be a private regular file");
 		} finally {
-			await launcherHandle?.close();
+			try {
+				await launcherHandle?.close();
+			} finally {
+				try {
+					if (!published) {
+						try {
+							await unlink(temporaryLauncher);
+						} catch (error) {
+							if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) {
+								throwLauncherFileSystemError(error, "SDK session launcher could not be cleaned up");
+							}
+						}
+					}
+				} finally {
+					await directoryHandle.close();
+				}
+			}
 		}
 		return {
 			...this.#options.environment,

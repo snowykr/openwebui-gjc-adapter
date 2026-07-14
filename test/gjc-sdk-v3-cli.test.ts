@@ -1,5 +1,15 @@
 import { describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	linkSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -91,35 +101,70 @@ describe("SDK v3 lifecycle CLI boundary", () => {
 		}
 	});
 
-	test("Given a symlink at the source launcher path When creating Then the target is not overwritten", async () => {
+	test("Given a symlink at the source launcher path When creating Then it is atomically replaced without touching the target", async () => {
 		const fixture = createCliFixture();
 		try {
 			const victim = join(fixture.root, "launcher-victim");
 			writeFileSync(victim, "preserve-victim-bytes");
-			symlinkSync(victim, join(fixture.launcherDir, "sdk-session-host"));
+			const launcher = join(fixture.launcherDir, "sdk-session-host");
+			symlinkSync(victim, launcher);
 
-			await expect(fixture.cli.createSession("create-key")).rejects.toMatchObject({
-				name: "SdkV3OperationError",
-				code: "invalid_input",
-				message: "SDK session launcher must be a private regular file",
-			});
+			await fixture.cli.createSession("create-key");
+
 			expect(readFileSync(victim, "utf8")).toBe("preserve-victim-bytes");
+			expect(readFileSync(launcher, "utf8")).toContain("--no-env-file --config=/dev/null");
 		} finally {
 			await fixture.dispose();
 		}
 	});
 
-	test("Given a generated source launcher When creating another session Then the launcher remains reusable", async () => {
+	test("Given a hard link at the source launcher path When creating Then the linked file is not modified", async () => {
 		const fixture = createCliFixture();
 		try {
-			await fixture.cli.createSession("first-create-key");
+			const victim = join(fixture.root, "hardlink-victim");
+			const launcher = join(fixture.launcherDir, "sdk-session-host");
+			writeFileSync(victim, "preserve-hardlink-bytes");
+			linkSync(victim, launcher);
 
-			await fixture.cli.createSession("second-create-key");
+			await fixture.cli.createSession("create-key");
+
+			expect(readFileSync(victim, "utf8")).toBe("preserve-hardlink-bytes");
+			expect(readFileSync(launcher, "utf8")).toContain("--no-env-file --config=/dev/null");
+		} finally {
+			await fixture.dispose();
+		}
+	});
+
+	test("Given a FIFO at the source launcher path When creating Then publication does not block on the FIFO", async () => {
+		const fixture = createCliFixture();
+		try {
+			const launcher = join(fixture.launcherDir, "sdk-session-host");
+			expect(Bun.spawnSync(["mkfifo", launcher]).exitCode).toBe(0);
+
+			await fixture.cli.createSession("create-key");
+
+			expect(statSync(launcher).isFile()).toBe(true);
+			expect(readFileSync(launcher, "utf8")).toContain("--no-env-file --config=/dev/null");
+		} finally {
+			await fixture.dispose();
+		}
+	});
+
+	test("Given concurrent source lifecycle calls When creating sessions Then every caller observes a complete launcher", async () => {
+		const fixture = createCliFixture();
+		try {
+			const calls = Array.from({ length: 16 }, (_, index) =>
+				fixture.cli.createSession(`concurrent-create-${index}`),
+			);
+
+			await Promise.all(calls);
 
 			expect(
 				transcriptRecords(fixture.transcript).filter(record => record.operation === "session.create"),
-			).toHaveLength(2);
-			expect(statSync(join(fixture.launcherDir, "sdk-session-host")).mode & 0o777).toBe(0o700);
+			).toHaveLength(16);
+			const launcher = join(fixture.launcherDir, "sdk-session-host");
+			expect(readFileSync(launcher, "utf8")).toContain("--no-env-file --config=/dev/null");
+			expect(statSync(launcher).mode & 0o777).toBe(0o700);
 		} finally {
 			await fixture.dispose();
 		}
@@ -130,11 +175,13 @@ describe("SDK v3 lifecycle CLI boundary", () => {
 		try {
 			const launcher = join(fixture.launcherDir, "sdk-session-host");
 			writeFileSync(launcher, "stale-launcher", { mode: 0o644 });
+			const staleInode = statSync(launcher).ino;
 
 			await fixture.cli.createSession("create-key");
 
 			expect(readFileSync(launcher, "utf8")).toContain("--no-env-file --config=/dev/null");
 			expect(statSync(launcher).mode & 0o777).toBe(0o700);
+			expect(statSync(launcher).ino).not.toBe(staleInode);
 		} finally {
 			await fixture.dispose();
 		}
