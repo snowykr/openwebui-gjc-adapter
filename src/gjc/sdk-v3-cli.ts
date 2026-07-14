@@ -22,8 +22,6 @@ interface SdkCliOptions {
 	readonly timeoutMs?: number;
 }
 
-const ISOLATED_BUN_OPTIONS = "--env-file=/dev/null --config=/dev/null";
-
 export class SdkV3Cli {
 	readonly #options: SdkCliOptions;
 	readonly #timeoutMs: number;
@@ -134,7 +132,6 @@ export class SdkV3Cli {
 			}
 			return {
 				...this.#options.environment,
-				BUN_OPTIONS: ISOLATED_BUN_OPTIONS,
 				GJC_SDK_SESSION_COMMAND: `${this.#options.cliPath} sdk session-host-internal`,
 			};
 		}
@@ -150,7 +147,6 @@ export class SdkV3Cli {
 		await chmod(launcher, 0o700);
 		return {
 			...this.#options.environment,
-			BUN_OPTIONS: ISOLATED_BUN_OPTIONS,
 			GJC_SDK_SESSION_COMMAND: launcher,
 		};
 	}

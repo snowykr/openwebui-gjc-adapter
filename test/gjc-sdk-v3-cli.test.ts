@@ -41,23 +41,10 @@ describe("SDK v3 lifecycle CLI boundary", () => {
 		["extensionless wrapper", true],
 	] as const) {
 		test(`Given hostile bunfig and dotenv with ${cliKind} When creating a session Then trusted isolation wins`, async () => {
-			const fixture = createCliFixture(
-				{
-					BUN_OPTIONS: "--smol",
-					GJC_SDK_FIXTURE_SPAWN_RAW_BUN: "1",
-				},
-				1_000,
-				useWrapper,
-			);
+			const fixture = createCliFixture({}, 1_000, useWrapper);
 			try {
 				const preloadMarker = join(fixture.root, "preload-ran");
 				const agentPreloadMarker = join(fixture.root, "agent-preload-ran");
-				const rawBunChildEntrypoint = join(fixture.root, "raw-bun-child.ts");
-				fixture.environment.GJC_SDK_FIXTURE_RAW_BUN_CHILD_ENTRYPOINT = rawBunChildEntrypoint;
-				writeFileSync(
-					rawBunChildEntrypoint,
-					"process.stdout.write(JSON.stringify({ bunOptions: process.env.BUN_OPTIONS, agentDotenvType: typeof process.env.GJC_SDK_AGENT_DOTENV }));\n",
-				);
 				writeFileSync(
 					join(fixture.cwd, "preload.ts"),
 					`await Bun.write(${JSON.stringify(preloadMarker)}, "ran");\n`,
@@ -69,7 +56,7 @@ describe("SDK v3 lifecycle CLI boundary", () => {
 					`await Bun.write(${JSON.stringify(agentPreloadMarker)}, "ran");\n`,
 				);
 				writeFileSync(join(fixture.agentDir, "bunfig.toml"), 'preload = ["./preload.ts"]\n');
-				writeFileSync(join(fixture.agentDir, ".env"), "GJC_SDK_AGENT_DOTENV=loaded\nBUN_OPTIONS=\n");
+				writeFileSync(join(fixture.agentDir, ".env"), "GJC_SDK_AGENT_DOTENV=loaded\n");
 
 				const authority = await fixture.cli.createSession("create-key");
 				const invocation = firstTranscriptRecord(fixture.transcript);
@@ -84,14 +71,6 @@ describe("SDK v3 lifecycle CLI boundary", () => {
 				expect(invocation.sessionCommand).toBe(expectedSessionCommand);
 				expect(await Bun.file(preloadMarker).exists()).toBe(false);
 				expect(await Bun.file(agentPreloadMarker).exists()).toBe(false);
-				expect(invocation.rawBunChild).toEqual({
-					exitCode: 0,
-					stdout: JSON.stringify({
-						bunOptions: "--env-file=/dev/null --config=/dev/null",
-						agentDotenvType: "undefined",
-					}),
-					stderr: "",
-				});
 				const launcher = readFileSync(useWrapper ? fixture.cliPath : expectedSessionCommand, "utf8");
 				expect(launcher).toContain("--no-env-file --config=/dev/null");
 			} finally {

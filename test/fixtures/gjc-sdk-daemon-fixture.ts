@@ -7,13 +7,6 @@ if (Number.isFinite(delayMs) && delayMs > 0) await Bun.sleep(delayMs);
 
 const argv = process.argv.slice(2);
 const transcript = requiredEnvironment("GJC_SDK_FIXTURE_CLI_TRANSCRIPT");
-const rawBunChild =
-	process.env.GJC_SDK_FIXTURE_SPAWN_RAW_BUN === "1"
-		? Bun.spawnSync([process.execPath, requiredEnvironment("GJC_SDK_FIXTURE_RAW_BUN_CHILD_ENTRYPOINT")], {
-				cwd: process.cwd(),
-				env: process.env,
-			})
-		: undefined;
 appendFileSync(
 	transcript,
 	`${JSON.stringify({
@@ -32,14 +25,6 @@ appendFileSync(
 		hostileDotenv: process.env.GJC_SDK_HOSTILE_DOTENV,
 		agentDotenv: process.env.GJC_SDK_AGENT_DOTENV,
 		sessionCommand: process.env.GJC_SDK_SESSION_COMMAND,
-		rawBunChild:
-			rawBunChild === undefined
-				? undefined
-				: {
-						exitCode: rawBunChild.exitCode,
-						stdout: rawBunChild.stdout.toString(),
-						stderr: rawBunChild.stderr.toString(),
-					},
 	})}\n`,
 );
 

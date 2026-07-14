@@ -11,7 +11,7 @@ describe("managed installation rendering and preflight", () => {
 	test("ships every Docker build input in the packed package whitelist", () => {
 		const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { files?: string[] };
 		expect(pkg.files).toEqual(expect.arrayContaining(["src", "bin", "Dockerfile.adapter", "bun.lock"]));
-		expect(pkg.files).not.toContain("patches");
+		expect(pkg.files).toContain("patches");
 	});
 	test("keeps the adapter private and loopback-only UI publishing", () => {
 		const compose = renderManagedCompose({

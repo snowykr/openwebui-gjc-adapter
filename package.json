@@ -46,6 +46,7 @@
 		"CHANGELOG.md",
 		"bin",
 		"Dockerfile.adapter",
+		"patches",
 		"bun.lock"
 	],
 	"exports": {
