@@ -224,7 +224,7 @@ export function normalizeModelSelection(value: unknown): NormalizedModelSelectio
 	const provider = Reflect.get(value, "provider");
 	const modelId = Reflect.get(value, "modelId");
 	const thinkingLevel = Reflect.get(value, "thinkingLevel");
-	if (!isSafeModelComponent(provider) || !isSafeModelComponent(modelId)) return undefined;
+	if (!isSafeModelComponent(provider) || provider.includes("/") || !isSafeModelComponent(modelId)) return undefined;
 	const normalizedThinkingLevel = GJC_THINKING_LEVELS.find(level => level === thinkingLevel);
 	return normalizedThinkingLevel === undefined
 		? undefined

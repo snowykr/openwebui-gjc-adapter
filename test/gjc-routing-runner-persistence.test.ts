@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { NormalizedModelSelection } from "../src/contracts";
 import { FileBackedSessionMappingStore, SessionMappingStore } from "../src/gjc/session-router";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
 import { buildSessionMappingPayloadHash } from "../src/live/workflow-gate-turns";
@@ -64,6 +65,16 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				JSON.stringify({ mappings: [{ ...mapping, modelSelection: { ...mediumSelection, provider: "a%2Fb" } }] }),
 			);
 			expect(new FileBackedSessionMappingStore(filePath).get("chat-1")?.modelSelection).toBeUndefined();
+		});
+	});
+
+	test("strips slash-delimited providers before persisting a session mapping", () => {
+		withFileStore((store, filePath) => {
+			store.set(mappingInput({ ...mediumSelection, provider: "proxy/openai", modelId: "model:雪/preview" }));
+
+			const persisted = JSON.parse(readFileSync(filePath, "utf8"));
+
+			expect(persisted.mappings[0].modelSelection).toBeUndefined();
 		});
 	});
 
@@ -177,7 +188,7 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 const lowSelection = { provider: "anthropic", modelId: "claude-sonnet-4", thinkingLevel: "low" } as const;
 const mediumSelection = { ...lowSelection, thinkingLevel: "medium" } as const;
 
-function mappingInput(modelSelection: typeof mediumSelection) {
+function mappingInput(modelSelection: NormalizedModelSelection) {
 	return {
 		chatId: "chat-1",
 		projectId: project.id,
