@@ -121,7 +121,7 @@ Deleting an adapter-created project folder in the OpenWebUI sidebar is treated a
 
 ## Runtime contract
 
-Canonical model ids use `gjc/<encoded-provider>/<encoded-model>:<thinking>`. Provider and model components use uppercase RFC 3986 percent-encoding; each component must decode exactly once and re-encode to the same bytes. The bare `gjc` alias is accepted only as input and is never emitted. Catalog, JSON, SSE, workflow, event, and persisted mapping output use the normalized tuple returned by GJC.
+Canonical model ids use `gjc/<encoded-provider>/<encoded-model>:<thinking>`. Provider and model components use uppercase RFC 3986 percent-encoding; each component must decode exactly once and re-encode to the same bytes. Providers containing `/` are rejected because upstream `model.set` uses the first slash as its provider/model boundary, while model ids may contain `/`, `:`, and Unicode and are encoded normally. The bare `gjc` alias is accepted only as input and is never emitted. Catalog, JSON, SSE, workflow, event, and persisted mapping output use the normalized tuple returned by GJC.
 
 Selection updates the machine-global last-successful-writer-wins default. Operations are serialized per stable client, but the adapter does not provide global request ordering or a distributed ordering guarantee. The adapter invokes the setter once and does not retry, compensate, or roll it back. It also does not roll back an already committed project link or unlink if the later model-selection read needed for the response fails.
 
