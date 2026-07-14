@@ -61,12 +61,24 @@ export async function syncProjectSessionsToOpenWebUI(
 			project: projectReference,
 		});
 		folders.push({ projectId: project.id, folderId });
+		const projectCwd = await resolveExistingOrProspectivePath(project.cwd);
 
 		for (const filePath of await listSessionFiles(project, input.runtimeLocations)) {
 			try {
 				const loaded = await loadGjcSessionFile(filePath);
-				const sessionCwd = await resolveExistingOrProspectivePath(loaded.header.cwd);
-				const projectCwd = await resolveExistingOrProspectivePath(project.cwd);
+				let sessionCwd: string;
+				try {
+					sessionCwd = await resolveExistingOrProspectivePath(loaded.header.cwd);
+				} catch (error) {
+					if (!(error instanceof Error)) throw error;
+					skipped.push({
+						projectId: project.id,
+						filePath,
+						code: "session_cwd_invalid",
+						message: "GJC session cwd could not be resolved",
+					});
+					continue;
+				}
 				if (sessionCwd !== projectCwd) {
 					skipped.push({
 						projectId: project.id,

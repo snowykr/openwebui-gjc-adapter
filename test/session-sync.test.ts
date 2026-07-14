@@ -129,6 +129,12 @@ describe("syncProjectSessionsToOpenWebUI", () => {
 			entries: [messageEntry("a-user", null, "user", "from A")],
 		});
 		await Bun.write(path.join(sessionRootA, "broken.jsonl"), "{not-json\n");
+		const loopCwd = path.join(workspace, "loop-cwd");
+		await fs.symlink(loopCwd, loopCwd);
+		await writeSessionFile(path.join(sessionRootA, "loop.jsonl"), {
+			header: { id: "session-loop", title: "Session Loop", cwd: loopCwd },
+			entries: [messageEntry("loop-user", null, "user", "must be skipped")],
+		});
 		await writeSessionFile(path.join(sessionRootB, "b.jsonl"), {
 			header: { id: "session-b", title: "Session B", cwd: projectB },
 			entries: [messageEntry("b-user", null, "user", "from B")],
@@ -155,6 +161,12 @@ describe("syncProjectSessionsToOpenWebUI", () => {
 				filePath: path.join(sessionRootA, "broken.jsonl"),
 				code: "empty_session_file",
 			}),
+			{
+				projectId: "project-a",
+				filePath: path.join(sessionRootA, "loop.jsonl"),
+				code: "session_cwd_invalid",
+				message: "GJC session cwd could not be resolved",
+			},
 		]);
 		expect((await repository.getChat("owner-1", "gjc-project-project-a-session-session-a"))?.folder_id).toBe(
 			"gjc-project-project-a",

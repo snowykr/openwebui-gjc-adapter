@@ -1,7 +1,11 @@
 import type { SessionEntry, SessionHeader } from "@gajae-code/coding-agent";
 import { loadEntriesFromFile } from "@gajae-code/coding-agent";
 
-export type GjcSessionLoadDiagnosticCode = "missing_session_header" | "empty_session_file" | "corrupt_session_file";
+export type GjcSessionLoadDiagnosticCode =
+	| "missing_session_header"
+	| "invalid_session_header"
+	| "empty_session_file"
+	| "corrupt_session_file";
 
 export interface GjcSessionLoadDiagnostic {
 	code: GjcSessionLoadDiagnosticCode;
@@ -52,6 +56,15 @@ export async function loadGjcSessionFile(filePath: string): Promise<LoadedGjcSes
 				{
 					code: "missing_session_header",
 					message: `GJC session file ${filePath} does not start with a session header`,
+					filePath,
+				},
+			]);
+		}
+		if (typeof firstEntry.cwd !== "string" || firstEntry.cwd.trim().length === 0) {
+			throw new GjcSessionLoadError(filePath, [
+				{
+					code: "invalid_session_header",
+					message: `GJC session header in ${filePath} must contain a non-empty string cwd`,
 					filePath,
 				},
 			]);

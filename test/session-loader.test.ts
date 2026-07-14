@@ -14,6 +14,42 @@ afterEach(async () => {
 });
 
 describe("loadGjcSessionFile", () => {
+	test.each([
+		["missing", undefined],
+		["non-string", 42],
+		["blank", "  "],
+	] as const)("rejects a session header whose cwd is %s", async (caseName, cwd) => {
+		// Given: an upstream-loadable session header with an invalid project authority cwd.
+		const dirPath = await fs.mkdtemp(path.join(os.tmpdir(), `gjc-session-loader-${caseName}-cwd-`));
+		tempDirs.push(dirPath);
+		const filePath = path.join(dirPath, `${caseName}-cwd.jsonl`);
+		await Bun.write(
+			filePath,
+			`${JSON.stringify({
+				type: "session",
+				version: 3,
+				id: `${caseName}-cwd`,
+				timestamp: "2026-07-08T00:00:00.000Z",
+				cwd,
+			})}\n`,
+		);
+
+		// When: the adapter loads the file through its session boundary.
+		const loading = loadGjcSessionFile(filePath);
+
+		// Then: a deterministic typed header diagnostic rejects it.
+		await expect(loading).rejects.toBeInstanceOf(GjcSessionLoadError);
+		await expect(loading).rejects.toMatchObject({
+			diagnostics: [
+				{
+					code: "invalid_session_header",
+					message: `GJC session header in ${filePath} must contain a non-empty string cwd`,
+					filePath,
+				},
+			],
+		});
+	});
+
 	test("splits header and entries from an existing JSONL session file without overwriting it", async () => {
 		const dirPath = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-loader-"));
 		tempDirs.push(dirPath);
