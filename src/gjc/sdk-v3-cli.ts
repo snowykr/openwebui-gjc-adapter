@@ -1,5 +1,6 @@
-import { chmod, mkdir, writeFile } from "node:fs/promises";
-import { extname, isAbsolute, join, relative } from "node:path";
+import { constants } from "node:fs";
+import { mkdir, open, realpath } from "node:fs/promises";
+import { dirname, extname, isAbsolute, join, relative } from "node:path";
 import { resolveExistingOrProspectivePath } from "../security/paths";
 import {
 	parseJsonRecord,
@@ -17,6 +18,7 @@ interface SdkCliOptions {
 	readonly cliPath: string;
 	readonly cwd: string;
 	readonly agentDir: string;
+	readonly launcherDir: string;
 	readonly sessionRoot: string;
 	readonly environment: Readonly<Record<string, string | undefined>>;
 	readonly timeoutMs?: number;
@@ -135,16 +137,57 @@ export class SdkV3Cli {
 				GJC_SDK_SESSION_COMMAND: `${this.#options.cliPath} sdk session-host-internal`,
 			};
 		}
-		const launcher = join(this.#options.agentDir, "sdk-session-host");
+		const launcher = join(this.#options.launcherDir, "sdk-session-host");
 		if (/\s/.test(launcher)) {
-			throw new SdkV3OperationError("invalid_input", "SDK agent directory cannot contain whitespace");
+			throw new SdkV3OperationError("invalid_input", "SDK launcher directory cannot contain whitespace");
 		}
-		await writeFile(
-			launcher,
-			`#!/bin/sh\nexec ${shellQuote(process.execPath)} --no-env-file --config=/dev/null ${shellQuote(this.#options.cliPath)} sdk session-host-internal "$@"\n`,
-			{ mode: 0o700 },
-		);
-		await chmod(launcher, 0o700);
+		let directoryHandle: Awaited<ReturnType<typeof open>> | undefined;
+		try {
+			const launcherParent = dirname(this.#options.launcherDir);
+			if ((await realpath(launcherParent)) !== launcherParent) {
+				throw new SdkV3OperationError("invalid_input", "SDK launcher directory must be private");
+			}
+			try {
+				await mkdir(this.#options.launcherDir, { mode: 0o700 });
+			} catch (error) {
+				if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+			}
+			directoryHandle = await open(
+				this.#options.launcherDir,
+				constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+			);
+			const directory = await directoryHandle.stat();
+			if (!directory.isDirectory() || (await realpath(this.#options.launcherDir)) !== this.#options.launcherDir) {
+				throw new SdkV3OperationError("invalid_input", "SDK launcher directory must be private");
+			}
+			await directoryHandle.chmod(0o700);
+		} catch (error) {
+			throwLauncherFileSystemError(error, "SDK launcher directory must be private");
+		} finally {
+			await directoryHandle?.close();
+		}
+		let launcherHandle: Awaited<ReturnType<typeof open>> | undefined;
+		try {
+			launcherHandle = await open(
+				launcher,
+				constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+				0o600,
+			);
+			const launcherEntry = await launcherHandle.stat();
+			if (!launcherEntry.isFile() || launcherEntry.nlink !== 1) {
+				throw new SdkV3OperationError("invalid_input", "SDK session launcher must be a private regular file");
+			}
+			await launcherHandle.chmod(0o600);
+			await launcherHandle.truncate(0);
+			await launcherHandle.writeFile(
+				`#!/bin/sh\nexec ${shellQuote(process.execPath)} --no-env-file --config=/dev/null ${shellQuote(this.#options.cliPath)} sdk session-host-internal "$@"\n`,
+			);
+			await launcherHandle.chmod(0o700);
+		} catch (error) {
+			throwLauncherFileSystemError(error, "SDK session launcher must be a private regular file");
+		} finally {
+			await launcherHandle?.close();
+		}
 		return {
 			...this.#options.environment,
 			GJC_SDK_SESSION_COMMAND: launcher,
@@ -158,6 +201,14 @@ export class SdkV3Cli {
 			: [this.#options.cliPath];
 		return [...prefix, ...args];
 	}
+}
+
+function throwLauncherFileSystemError(error: unknown, message: string): never {
+	if (error instanceof SdkV3OperationError) throw error;
+	if (error instanceof Error && "code" in error && typeof error.code === "string") {
+		throw new SdkV3OperationError("invalid_input", message);
+	}
+	throw error;
 }
 
 function shellQuote(value: string): string {

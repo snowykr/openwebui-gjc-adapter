@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -67,7 +67,7 @@ describe("SDK v3 lifecycle CLI boundary", () => {
 				expect(invocation.agentDotenv).toBeUndefined();
 				const expectedSessionCommand = useWrapper
 					? `${fixture.cliPath} sdk session-host-internal`
-					: join(fixture.agentDir, "sdk-session-host");
+					: join(fixture.launcherDir, "sdk-session-host");
 				expect(invocation.sessionCommand).toBe(expectedSessionCommand);
 				expect(await Bun.file(preloadMarker).exists()).toBe(false);
 				expect(await Bun.file(agentPreloadMarker).exists()).toBe(false);
@@ -86,6 +86,55 @@ describe("SDK v3 lifecycle CLI boundary", () => {
 				name: "SdkV3OperationError",
 				code: "cli_timeout",
 			});
+		} finally {
+			await fixture.dispose();
+		}
+	});
+
+	test("Given a symlink at the source launcher path When creating Then the target is not overwritten", async () => {
+		const fixture = createCliFixture();
+		try {
+			const victim = join(fixture.root, "launcher-victim");
+			writeFileSync(victim, "preserve-victim-bytes");
+			symlinkSync(victim, join(fixture.launcherDir, "sdk-session-host"));
+
+			await expect(fixture.cli.createSession("create-key")).rejects.toMatchObject({
+				name: "SdkV3OperationError",
+				code: "invalid_input",
+				message: "SDK session launcher must be a private regular file",
+			});
+			expect(readFileSync(victim, "utf8")).toBe("preserve-victim-bytes");
+		} finally {
+			await fixture.dispose();
+		}
+	});
+
+	test("Given a generated source launcher When creating another session Then the launcher remains reusable", async () => {
+		const fixture = createCliFixture();
+		try {
+			await fixture.cli.createSession("first-create-key");
+
+			await fixture.cli.createSession("second-create-key");
+
+			expect(
+				transcriptRecords(fixture.transcript).filter(record => record.operation === "session.create"),
+			).toHaveLength(2);
+			expect(statSync(join(fixture.launcherDir, "sdk-session-host")).mode & 0o777).toBe(0o700);
+		} finally {
+			await fixture.dispose();
+		}
+	});
+
+	test("Given an existing source launcher When creating Then it is safely replaced with private executable bytes", async () => {
+		const fixture = createCliFixture();
+		try {
+			const launcher = join(fixture.launcherDir, "sdk-session-host");
+			writeFileSync(launcher, "stale-launcher", { mode: 0o644 });
+
+			await fixture.cli.createSession("create-key");
+
+			expect(readFileSync(launcher, "utf8")).toContain("--no-env-file --config=/dev/null");
+			expect(statSync(launcher).mode & 0o777).toBe(0o700);
 		} finally {
 			await fixture.dispose();
 		}
@@ -112,6 +161,7 @@ function createCliFixture(
 	readonly root: string;
 	readonly cwd: string;
 	readonly agentDir: string;
+	readonly launcherDir: string;
 	readonly sessionRoot: string;
 	readonly transcript: string;
 	readonly cliPath: string;
@@ -122,9 +172,10 @@ function createCliFixture(
 	const root = mkdtempSync(join(tmpdir(), "gjc-sdk-cli-"));
 	const cwd = join(root, "project");
 	const agentDir = join(root, "trusted-agent");
+	const launcherDir = join(root, "service-private-runtime");
 	const sessionRoot = join(agentDir, "sessions", "project");
 	const transcript = join(root, "cli.jsonl");
-	for (const path of [cwd, agentDir, sessionRoot]) mkdirSync(path, { recursive: true });
+	for (const path of [cwd, agentDir, launcherDir, sessionRoot]) mkdirSync(path, { recursive: true, mode: 0o700 });
 	const cliPath = useWrapper ? join(root, "gjc") : fixtureCli;
 	if (useWrapper) {
 		writeFileSync(
@@ -142,11 +193,12 @@ function createCliFixture(
 		GJC_SDK_FIXTURE_SAVED_PATH: join(sessionRoot, "expected-session.jsonl"),
 		...extraEnvironment,
 	};
-	const cli = new SdkV3Cli({ cliPath, cwd, agentDir, sessionRoot, environment, timeoutMs });
+	const cli = new SdkV3Cli({ cliPath, cwd, agentDir, launcherDir, sessionRoot, environment, timeoutMs });
 	return {
 		root,
 		cwd,
 		agentDir,
+		launcherDir,
 		sessionRoot,
 		transcript,
 		cliPath,

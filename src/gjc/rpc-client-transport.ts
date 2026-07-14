@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import type { NormalizedModelSelection } from "../contracts";
 import type {
 	GjcRpcRunnerClientOptions,
@@ -38,6 +39,7 @@ export function createDefaultRpcTransport(options: GjcRpcRunnerClientOptions): G
 			cliPath: options.cliPath ?? "gjc",
 			cwd: options.cwd,
 			agentDir: options.runtimeLocations.agentDir,
+			launcherDir: join(options.runtimeLocations.configDomain, "openwebui", "runtime"),
 			sessionRoot: resolveGjcSdkSessionRoot(options.cwd, options.runtimeLocations),
 			environment,
 		}),

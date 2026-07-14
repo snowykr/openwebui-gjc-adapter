@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -148,6 +148,9 @@ describe("createRpcTransportFromClient", () => {
 			expect(JSON.stringify(environment)).not.toContain("/hostile/config");
 			expect(JSON.stringify(environment)).not.toContain("/hostile/agent");
 			expect(JSON.stringify(environment)).not.toContain("/hostile/pi");
+			const launcherDir = join(locations.configDomain, "openwebui", "runtime");
+			expect(Reflect.get(first, "sessionCommand")).toBe(join(launcherDir, "sdk-session-host"));
+			expect(statSync(launcherDir).mode & 0o777).toBe(0o700);
 		} finally {
 			transport.stop();
 			server.stop();
