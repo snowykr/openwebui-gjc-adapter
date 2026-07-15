@@ -38,7 +38,7 @@ Add the required custom headers on the OpenAI connection:
 }
 ```
 
-Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. The adapter package pins the published GJC 0.10.1 metadata packages, while the managed image builds and runs the exact reviewed current-`dev` source commit declared in `Dockerfile.adapter`. Session control uses the authenticated localhost SDK v3 WebSocket contract; the removed legacy JSONL RPC mode is not supported. Background task calls such as title generation are no-ops and must not create GJC sessions.
+Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. The adapter package pins the published GJC 0.10.1 metadata packages, while the managed image builds and runs the exact reviewed current-`dev` source commit declared in `Dockerfile.adapter`. Upstream SDK v3 monitoring was last checked against `Yeachan-Heo/gajae-code` `dev` commit `26bb02e724f971b3c7927637fb68967fea4a6ae0` (2026-07-15); it is an unreleased upstream reference, not a supported runtime pin. Session control uses the authenticated localhost SDK v3 WebSocket contract; the removed legacy JSONL RPC mode is not supported. Background task calls such as title generation are no-ops and must not create GJC sessions.
 
 ## CLI first-install configuration
 

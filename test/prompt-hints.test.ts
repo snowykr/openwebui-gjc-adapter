@@ -35,6 +35,23 @@ describe("mandatory prompt-hint reconciliation", () => {
 			globalThis.fetch = original;
 		}
 	});
+	test("seeds a fresh OpenWebUI installation when config omits prompt suggestions", async () => {
+		const calls: Request[] = [];
+		const original = globalThis.fetch;
+		globalThis.fetch = (async (input, init) => {
+			calls.push(new Request(String(input), init));
+			if (calls.length === 1) return Response.json({ id: "admin" });
+			if (calls.length === 2) return Response.json({ status: true, version: "0.10.0" });
+			return Response.json(GJC_PROMPT_HINTS_PAYLOAD.suggestions);
+		}) as typeof fetch;
+		try {
+			const result = await initializeRuntimeReadiness(runtime);
+			expect(result).toMatchObject({ openWebUIAuthenticated: true, promptHintsSeeded: true });
+			expect(await calls[2]?.json()).toEqual(GJC_PROMPT_HINTS_PAYLOAD);
+		} finally {
+			globalThis.fetch = original;
+		}
+	});
 	test("owned suggestion is replaced and readback mismatch fails closed", async () => {
 		const original = globalThis.fetch;
 		let count = 0;

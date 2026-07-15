@@ -18,48 +18,6 @@ describe("createRpcTransportFromClient", () => {
 		);
 	});
 
-	test("fixture answers committed state, catalog, and positional setter JSONL exchanges byte-for-byte", async () => {
-		// Given: the raw fixture process with separate protocol and lifecycle transcripts.
-		const root = mkdtempSync(join(tmpdir(), "gjc-rpc-raw-jsonl-"));
-		const protocol = join(root, "protocol.jsonl");
-		const lifecycle = join(root, "lifecycle.jsonl");
-		const fixture = fileURLToPath(new URL("fixtures/gjc-rpc-stdio-fixture.ts", import.meta.url));
-		const processHandle = Bun.spawn([process.execPath, fixture, "--mode", "rpc"], {
-			cwd: root,
-			env: {
-				...process.env,
-				GJC_RPC_FIXTURE_PROTOCOL_TRANSCRIPT: protocol,
-				GJC_RPC_FIXTURE_LIFECYCLE_TRANSCRIPT: lifecycle,
-			},
-			stdin: "pipe",
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-
-		// When: the exact committed request is written and stdin closes.
-		processHandle.stdin.write(
-			'{"id":"req_state","type":"get_state"}\n{"id":"req_models","type":"get_available_models"}\n{"id":"req_set","type":"set_default_model_selection","provider":"anthropic","modelId":"claude-sonnet-4","thinkingLevel":"medium"}\n',
-		);
-		processHandle.stdin.end();
-		const stdout = await new Response(processHandle.stdout).text();
-		const stderr = await new Response(processHandle.stderr).text();
-		const exitCode = await processHandle.exited;
-
-		try {
-			// Then: stdout and evidence preserve the exact request identity without conflating RpcClient traffic.
-			expect(exitCode).toBe(0);
-			expect(stderr).toBe("");
-			expect(stdout).toBe(
-				'{"type":"ready"}\n{"id":"req_state","type":"response","command":"get_state","success":true,"data":{"thinkingLevel":"off","isStreaming":false,"isCompacting":false,"steeringMode":"one-at-a-time","followUpMode":"one-at-a-time","interruptMode":"immediate","sessionId":"fixture-session","autoCompactionEnabled":true,"messageCount":0,"queuedMessageCount":0,"todoPhases":[]}}\n{"id":"req_models","type":"response","command":"get_available_models","success":true,"data":{"models":[]}}\n{"id":"req_set","type":"response","command":"set_default_model_selection","success":true,"data":{"provider":"anthropic","modelId":"claude-sonnet-4","thinkingLevel":"medium"}}\n',
-			);
-			expect(readFileSync(protocol, "utf8")).toBe(
-				`${JSON.stringify({ type: "process", argv: ["--mode", "rpc"], cwd: root })}\n{"type":"request","payload":{"id":"req_state","type":"get_state"}}\n{"type":"response","payload":{"id":"req_state","type":"response","command":"get_state","success":true,"data":{"thinkingLevel":"off","isStreaming":false,"isCompacting":false,"steeringMode":"one-at-a-time","followUpMode":"one-at-a-time","interruptMode":"immediate","sessionId":"fixture-session","autoCompactionEnabled":true,"messageCount":0,"queuedMessageCount":0,"todoPhases":[]}}}\n{"type":"request","payload":{"id":"req_models","type":"get_available_models"}}\n{"type":"response","payload":{"id":"req_models","type":"response","command":"get_available_models","success":true,"data":{"models":[]}}}\n{"type":"request","payload":{"id":"req_set","type":"set_default_model_selection","provider":"anthropic","modelId":"claude-sonnet-4","thinkingLevel":"medium"}}\n{"type":"response","payload":{"id":"req_set","type":"response","command":"set_default_model_selection","success":true,"data":{"provider":"anthropic","modelId":"claude-sonnet-4","thinkingLevel":"medium"}}}\n`,
-			);
-			expect(readJsonl(lifecycle)).toEqual([{ type: "started", pid: processHandle.pid }, { type: "eof" }]);
-		} finally {
-			rmSync(root, { recursive: true, force: true });
-		}
-	});
 
 	test("prefers full session events over filtered agent events when the GJC client exposes onSessionEvent", async () => {
 		const client = new FullSessionEventClient([
