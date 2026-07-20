@@ -149,7 +149,7 @@ export function startRealSelectionSdkServer(coordinatorUrl: string): RealSelecti
 				return;
 			}
 			sessionSelections.set(socket.data.sessionId, selectionFromRecord(payload.selection));
-			socket.send(JSON.stringify({ type: "control_response", id, ok: true, result: payload.selection }));
+			socket.send(JSON.stringify({ type: "control_response", id, ok: true, result: { changed: true } }));
 			return;
 		}
 		if (operation === "session.close") {
