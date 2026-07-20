@@ -1,3 +1,4 @@
+import { dirname, resolve } from "node:path";
 import {
 	assertPublishedSdkAttachmentCurrent,
 	withPublicSdkSessionMutationCoordinator,
@@ -6,16 +7,18 @@ import { SdkV3OperationError } from "../gjc/sdk-v3-protocol";
 import type { GjcLifecycleTransaction } from "../gjc/turn-runner";
 import { GjcCloseReceipt } from "../gjc/turn-runner";
 import { ensureAttachment } from "./gjc-public-sdk-session-ops";
-import { attachmentKey } from "./gjc-routing-endpoints";
+import { attachmentKey, readPublishedSdkEndpoint, validatePersistedSessionIdentity } from "./gjc-routing-endpoints";
 import type { LifecycleAddress, LifecycleEffect, PublicSdkRunnerContext } from "./gjc-routing-lifecycle";
 import {
-	runLifecycleTestBarrier,
+	type SessionAttachment,
 	sameActiveAttachmentProof,
+	sameAttachmentProof,
 	sameCloseReceiptSnapshot,
 	sameExactActiveCloseProof,
 	sameLifecycleAddress,
 	samePublishedAttachmentSnapshot,
 } from "./gjc-routing-proof";
+import { runLifecycleTestBarrier } from "./gjc-routing-test-barrier";
 
 export async function withLifecycle<T>(
 	context: PublicSdkRunnerContext,
@@ -70,8 +73,54 @@ export async function withLifecycle<T>(
 	};
 	return withPublicSdkSessionMutationCoordinator(address, owner, async () => {
 		if (ensureActiveAttachment) await ensureAttachment(context, address, lifecycle);
+		else await reattachCloseOnly(context, address);
 		return effect(lifecycle);
 	});
+}
+async function reattachCloseOnly(context: PublicSdkRunnerContext, address: LifecycleAddress): Promise<void> {
+	if (context.attachments.has(attachmentKey(address))) return;
+	const proof = address.recoveryAttachment;
+	if (
+		address.sessionFile === undefined ||
+		proof?.tmuxSocket === undefined ||
+		proof.tmuxPane === undefined ||
+		proof.tmuxPanePid === undefined ||
+		proof.tmuxOwnershipTag === undefined
+	)
+		throw new SdkV3OperationError("endpoint_stale", "Close requires a persisted owned-pane attachment.");
+	const sessionRoot = dirname(resolve(address.sessionFile));
+	await validatePersistedSessionIdentity({ ...address, sessionRoot, sessionFile: address.sessionFile });
+	const published = await readPublishedSdkEndpoint(address.cwd, address.sessionId);
+	if (
+		published === undefined ||
+		!sameAttachmentProof(proof, published) ||
+		published.endpoint.pid !== proof.tmuxPanePid
+	)
+		throw new SdkV3OperationError("endpoint_stale", "Close attachment descriptor or pane PID is not current.");
+	const pane = {
+		socketName: proof.tmuxSocket,
+		target: proof.tmuxPane,
+		panePid: proof.tmuxPanePid,
+		ownershipTag: proof.tmuxOwnershipTag,
+	};
+	const backend = new (await import("../gjc/cli-lifecycle-backend")).CliLifecycleBackend({
+		cliPath: context.input.cliPath,
+		cwd: resolve(address.cwd),
+		tmuxSocket: pane.socketName,
+		childEnvironment: context.input.runtimeLocations.childEnvironment,
+	});
+	const candidate: SessionAttachment = {
+		cwd: resolve(address.cwd),
+		sessionRoot,
+		projectId: address.projectId,
+		sessionId: address.sessionId,
+		sessionPath: address.sessionFile,
+		pane,
+		published,
+	};
+	if (published.endpoint.pid !== pane.panePid || (await backend.readiness({ ...candidate, pane })).status !== "closed")
+		throw new SdkV3OperationError("endpoint_stale", "Close owned tmux pane authority could not be revalidated.");
+	context.attachments.set(attachmentKey(address), candidate);
 }
 
 async function publishClosed<T>(

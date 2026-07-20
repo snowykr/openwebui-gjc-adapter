@@ -72,7 +72,15 @@ export async function runCli(
 			startServer:
 				dependencies.startServer ??
 				(startConfiguredServer
-					? async config => startConfiguredServer(await buildResolvedInstalledAdapterServerOptions(config))
+					? async config => {
+							const options = await buildResolvedInstalledAdapterServerOptions(config);
+							try {
+								return await startConfiguredServer(options);
+							} catch (error) {
+								await options.runtimeLock.release();
+								throw error;
+							}
+						}
 					: async config => startAdapterServer(await buildResolvedInstalledAdapterServerOptions(config))),
 		});
 	}

@@ -127,6 +127,7 @@ export type GjcLifecycleTestBarrierPhase =
 	| "post_cli_pre_bind"
 	| "post_mutation_pre_proof"
 	| "pre_durable_publication"
+	| "post_ack_pre_transcript"
 	| "between_branch_phases"
 	| "post_close_proof_pre_commit";
 

@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { SessionHeader, SessionMessageEntry } from "@gajae-code/coding-agent";
+import { loadHeldGjcSessionFile } from "../src/gjc/session-discovery-reader";
 import {
 	discoverFreshGjcSessionFile,
 	GjcSessionLoadError,
@@ -84,16 +86,65 @@ describe("loadGjcSessionFile", () => {
 		expect(loaded.diagnostics).toEqual([]);
 		expect(afterContent).toBe(originalContent);
 	});
-
-	test("throws typed diagnostics for corrupt or invalid loads", async () => {
+	test.each([
+		["unknown type", { type: "unsupported", id: "entry-2", parentId: null, timestamp: "2026-07-08T00:00:00.000Z" }],
+		[
+			"extra field",
+			{
+				type: "message",
+				id: "entry-2",
+				parentId: null,
+				timestamp: "2026-07-08T00:00:00.000Z",
+				message: { role: "user", content: "hello", timestamp: 1 },
+				untrusted: true,
+			},
+		],
+	] as const)("rejects a malformed later entry with %s", async (_caseName, entry) => {
 		const dirPath = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-loader-"));
 		tempDirs.push(dirPath);
-		const filePath = path.join(dirPath, "invalid.jsonl");
-		await Bun.write(filePath, `${JSON.stringify({ type: "message", id: "entry-1", parentId: null })}\n`);
+		const filePath = path.join(dirPath, "session.jsonl");
+		await writeSessionHeader(filePath, "session-file", dirPath);
+		await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`);
 
-		await expect(loadGjcSessionFile(filePath)).rejects.toBeInstanceOf(GjcSessionLoadError);
 		await expect(loadGjcSessionFile(filePath)).rejects.toMatchObject({
-			diagnostics: [expect.objectContaining({ code: "empty_session_file", filePath })],
+			diagnostics: [expect.objectContaining({ code: "corrupt_session_file", filePath })],
+		});
+	});
+
+	test("rejects unknown fields on the session header", async () => {
+		const dirPath = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-loader-"));
+		tempDirs.push(dirPath);
+		const filePath = path.join(dirPath, "session.jsonl");
+		await Bun.write(
+			filePath,
+			`${JSON.stringify({
+				type: "session",
+				version: 3,
+				id: "session-file",
+				timestamp: "2026-07-08T00:00:00.000Z",
+				cwd: dirPath,
+				untrusted: true,
+			})}\n`,
+		);
+
+		await expect(loadGjcSessionFile(filePath)).rejects.toMatchObject({
+			diagnostics: [expect.objectContaining({ code: "corrupt_session_file", filePath })],
+		});
+	});
+
+	test("classifies empty and malformed nonempty session files distinctly", async () => {
+		const dirPath = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-loader-"));
+		tempDirs.push(dirPath);
+		const emptyFilePath = path.join(dirPath, "empty.jsonl");
+		const malformedFilePath = path.join(dirPath, "invalid.jsonl");
+		await Bun.write(emptyFilePath, "");
+		await Bun.write(malformedFilePath, `${JSON.stringify({ type: "message", id: "entry-1", parentId: null })}\n`);
+
+		await expect(loadGjcSessionFile(emptyFilePath)).rejects.toMatchObject({
+			diagnostics: [expect.objectContaining({ code: "empty_session_file", filePath: emptyFilePath })],
+		});
+		await expect(loadGjcSessionFile(malformedFilePath)).rejects.toMatchObject({
+			diagnostics: [expect.objectContaining({ code: "corrupt_session_file", filePath: malformedFilePath })],
 		});
 	});
 });
@@ -179,6 +230,58 @@ describe("fresh GJC session discovery", () => {
 			prototype.readFile = originalReadFile;
 		}
 	});
+	test("rejects an intermediate-directory swap to an equal-identity external hard link", async () => {
+		const sessionRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-discovery-"));
+		const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-outside-"));
+		tempDirs.push(sessionRoot, outsideRoot);
+		const nested = path.join(sessionRoot, "nested");
+		const moved = path.join(sessionRoot, "nested-held");
+		const candidate = path.join(nested, "successor.jsonl");
+		const outsideTranscript = path.join(outsideRoot, "successor.jsonl");
+		await fs.mkdir(nested);
+		await writeSessionHeader(candidate, "successor", path.join(sessionRoot, "project"));
+		await fs.link(candidate, outsideTranscript);
+		const handle = await fs.open(candidate, "r");
+		const prototype = Object.getPrototypeOf(handle) as { stat: () => Promise<Stats> };
+		await handle.close();
+		const originalStat = prototype.stat;
+		let swapped = false;
+		prototype.stat = async function (this: { stat: () => Promise<Stats> }): Promise<Stats> {
+			const held = await originalStat.call(this);
+			if (!swapped) {
+				swapped = true;
+				await fs.rename(nested, moved);
+				await fs.symlink(outsideRoot, nested);
+			}
+			return held;
+		};
+		try {
+			await expect(loadHeldGjcSessionFile(sessionRoot, candidate)).rejects.toBeInstanceOf(GjcSessionLoadError);
+		} finally {
+			prototype.stat = originalStat;
+		}
+	});
+	test("keeps routing contracts below their facades", async () => {
+		const gjc = path.join(process.cwd(), "src", "gjc");
+		const [router, turnRouter, contract, runner] = await Promise.all([
+			Bun.file(path.join(gjc, "session-router.ts")).text(),
+			Bun.file(path.join(gjc, "session-turn-router.ts")).text(),
+			Bun.file(path.join(gjc, "session-turn-router-contract.ts")).text(),
+			Bun.file(path.join(gjc, "turn-runner.ts")).text(),
+		]);
+
+		expect({
+			routerReexportsLeaf: router.includes('from "./session-turn-router-contract"'),
+			turnRouterAvoidsFacade: !turnRouter.includes('from "./session-router"'),
+			contractAvoidsFacade: !contract.includes('from "./session-router"'),
+			runnerAvoidsFacade: !runner.includes('from "./session-router"'),
+		}).toEqual({
+			routerReexportsLeaf: true,
+			turnRouterAvoidsFacade: true,
+			contractAvoidsFacade: true,
+			runnerAvoidsFacade: true,
+		});
+	});
 
 	test("rejects ambiguous fresh transcripts and transcripts from another cwd", async () => {
 		const sessionRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-discovery-"));
@@ -202,6 +305,21 @@ describe("fresh GJC session discovery", () => {
 		await expect(discoverFreshGjcSessionFile(sessionRoot, baseline, "successor", projectCwd)).rejects.toBeInstanceOf(
 			GjcSessionLoadError,
 		);
+	});
+	test("rejects intermediate-directory symlink escapes before opening a candidate", async () => {
+		const sessionRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-discovery-"));
+		const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-outside-"));
+		tempDirs.push(sessionRoot, outsideRoot);
+		const projectCwd = path.join(sessionRoot, "project");
+		const outsideTranscript = path.join(outsideRoot, "successor.jsonl");
+		await writeSessionHeader(outsideTranscript, "successor", projectCwd);
+		await fs.symlink(outsideRoot, path.join(sessionRoot, "nested"));
+
+		await expect(
+			loadHeldGjcSessionFile(sessionRoot, path.join(sessionRoot, "nested", "successor.jsonl")),
+		).rejects.toMatchObject({
+			diagnostics: [expect.objectContaining({ code: "corrupt_session_file" })],
+		});
 	});
 });
 

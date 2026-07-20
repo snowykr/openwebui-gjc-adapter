@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, normalize, relative, resolve } from "node:path";
+import { RuntimeSingletonLock } from "../src/runtime-singleton-lock";
 import {
 	type AdapterRouteDependencies,
 	type AdapterRuntimeConfig,
@@ -60,9 +61,17 @@ describe("server module boundaries", () => {
 				owner: { ownerUserId: "owner", singleOwnerLocalMode: false },
 				runner: { run: () => ({ content: "unused" }) },
 			};
-			const options: AdapterServerOptions = { host: "127.0.0.1", port: 0, runtimeRoot, runtime, routes };
+			const options: AdapterServerOptions = {
+				host: "127.0.0.1",
+				port: 0,
+				runtimeRoot,
+				runtimeLock: await RuntimeSingletonLock.acquire(runtimeRoot),
+				runtime,
+				routes,
+			};
 			const handle: AdapterServerHandle | undefined = undefined;
 			void options;
+			await options.runtimeLock.release();
 			void handle;
 
 			const facade = await import("../src/server");

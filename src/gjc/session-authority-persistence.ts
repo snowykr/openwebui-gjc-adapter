@@ -15,6 +15,7 @@ import { dirname } from "node:path";
 import { AuthorityMutationLock } from "./session-authority-file";
 import { SessionAuthority } from "./session-authority-store";
 import type {
+	AcknowledgedSuccessor,
 	ProvisionalSessionOperation,
 	SessionAuthorityInput,
 	SessionAuthorityRecord,
@@ -25,22 +26,35 @@ import type {
 import { SESSION_AUTHORITY_VERSION, SessionAuthorityLoadError } from "./session-authority-types";
 import {
 	isAlreadyExists,
+	isAuthorityDocumentRelationallyValid,
 	isLegacyMappingDocument,
 	isProvisionalOperation,
 	isV2Record,
 } from "./session-authority-validation";
 
+export class SessionAuthorityDurabilityError extends Error {
+	constructor(filePath: string, cause: unknown) {
+		super(`Session authority durability is uncertain after replacing ${filePath}.`, { cause });
+		this.name = "SessionAuthorityDurabilityError";
+	}
+}
+
 export class FileSessionAuthority extends SessionAuthority {
 	constructor(private readonly filePath: string) {
 		super();
-		if (!existsSync(filePath)) return;
-		this.load();
-		if (
-			this.entries().some(record => record.journal.some(operation => operation.state === "pending")) ||
-			this.provisionalEntries().some(operation => operation.state === "pending")
-		) {
-			super.reconcileRestart();
-			this.persist();
+		const lock = AuthorityMutationLock.acquire(this.filePath);
+		try {
+			if (!existsSync(this.filePath)) return;
+			this.load();
+			if (
+				this.entries().some(record => record.journal.some(operation => operation.state === "pending")) ||
+				this.provisionalEntries().some(operation => operation.state === "pending")
+			) {
+				super.reconcileRestart();
+				this.persist();
+			}
+		} finally {
+			lock.release();
 		}
 	}
 	override set(input: SessionAuthorityInput): SessionAuthorityRecord {
@@ -48,6 +62,14 @@ export class FileSessionAuthority extends SessionAuthority {
 	}
 	override upsert(input: SessionAuthorityInput): SessionAuthorityRecord {
 		return this.mutate(() => super.upsert(input));
+	}
+	override recordAcknowledgedSuccessor(
+		chatId: string,
+		operationId: string,
+		operationHash: string,
+		successor: AcknowledgedSuccessor,
+	): SessionOperation {
+		return this.mutate(() => super.recordAcknowledgedSuccessor(chatId, operationId, operationHash, successor));
 	}
 	override transitionOperation(
 		chatId: string,
@@ -66,8 +88,8 @@ export class FileSessionAuthority extends SessionAuthority {
 		result: SessionOperationResult,
 	): SessionAuthorityRecord {
 		return this.mutate(() => {
-			super.upsert(mapping);
-			return super.transitionOperation(chatId, operationId, "complete", detail, result);
+			super.transitionOperation(chatId, operationId, "complete", detail, result);
+			return super.upsert(mapping);
 		});
 	}
 	override beginOperation(
@@ -106,9 +128,17 @@ export class FileSessionAuthority extends SessionAuthority {
 		const lock = AuthorityMutationLock.acquire(this.filePath);
 		try {
 			this.load();
-			const result = mutation();
-			this.persist();
-			return result;
+			const records = this.entries();
+			const provisionalOperations = this.provisionalEntries();
+			try {
+				const result = mutation();
+				this.persist();
+				return result;
+			} catch (error) {
+				if (error instanceof SessionAuthorityDurabilityError) throw error;
+				this.replaceAll(records, provisionalOperations);
+				throw error;
+			}
 		} finally {
 			lock.release();
 		}
@@ -126,11 +156,14 @@ export class FileSessionAuthority extends SessionAuthority {
 			this.replaceAll([]);
 			return;
 		}
-		if (!isAuthorityDocument(document))
+		if (
+			!isAuthorityDocument(document) ||
+			!isAuthorityDocumentRelationallyValid(document.mappings, document.provisionalOperations ?? [])
+		)
 			throw new SessionAuthorityLoadError(this.filePath, "authority document is not a valid v2 authority");
 		this.replaceAll(document.mappings, document.provisionalOperations ?? []);
 	}
-	private persist(): void {
+	protected persist(): void {
 		const mappings = this.entries();
 		const provisionalOperations = this.provisionalEntries();
 		if (!mappings.every(isV2Record) || !provisionalOperations.every(isProvisionalOperation))
@@ -149,6 +182,14 @@ export class FileSessionAuthority extends SessionAuthority {
 			closeSync(descriptor);
 		}
 		renameSync(temporary, this.filePath);
+		try {
+			this.syncDirectory();
+		} catch (error) {
+			this.load();
+			throw new SessionAuthorityDurabilityError(this.filePath, error);
+		}
+	}
+	protected syncDirectory(): void {
 		const directory = openSync(dirname(this.filePath), "r");
 		try {
 			fsyncSync(directory);

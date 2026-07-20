@@ -1,6 +1,6 @@
 import type { AdapterHealthCheck, AdapterReadinessOptions } from "./health";
 import type { AdapterRouteDependencies } from "./live/openai-routes";
-import { RuntimeSingletonLock } from "./runtime-singleton-lock";
+import type { RuntimeSingletonLock } from "./runtime-singleton-lock";
 import { createAdapterRequestHandler } from "./server-request-handler";
 import type { AdapterRuntimeConfig } from "./server-runtime-readiness";
 
@@ -11,6 +11,7 @@ export interface AdapterServerOptions {
 	host: string;
 	port: number;
 	runtimeRoot: string;
+	runtimeLock: RuntimeSingletonLock;
 	checks?: readonly AdapterHealthCheck[];
 	readiness?: AdapterReadinessOptions;
 	runtime?: AdapterRuntimeConfig;
@@ -22,7 +23,7 @@ export interface AdapterServerHandle {
 }
 
 export async function startAdapterServer(options: AdapterServerOptions): Promise<AdapterServerHandle> {
-	const lock = await RuntimeSingletonLock.acquire(options.runtimeRoot);
+	const lock = options.runtimeLock;
 	try {
 		const server = Bun.serve({
 			hostname: options.host,

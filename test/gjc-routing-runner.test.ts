@@ -3,8 +3,22 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionMappingStore } from "../src/gjc/session-router";
+import type { GjcControlResult, GjcTurnRunner } from "../src/gjc/turn-runner";
+import type { LiveGatewayRunnerInput } from "../src/live/chat-completions";
+import { controlOperationHash } from "../src/live/gjc-routing-publication";
 import { createGjcRoutingLiveGatewayRunner, createPublicSdkGjcTurnRunner } from "../src/live/gjc-routing-runner";
+import { attachmentProof } from "./gjc-lifecycle-fixtures";
 import { FakeGjcTurnRunner, project } from "./gjc-routing-runner-fixtures";
+
+function legacyTranscriptHeader(id: string, cwd: string): string {
+	return `${JSON.stringify({
+		type: "session",
+		version: 3,
+		id,
+		timestamp: "2026-07-20T00:00:00.000Z",
+		cwd,
+	})}\n`;
+}
 
 describe("createGjcRoutingLiveGatewayRunner", () => {
 	test("awaits asynchronous transport cleanup when stopping", async () => {
@@ -140,7 +154,8 @@ describe("createGjcRoutingLiveGatewayRunner", () => {
 		const legacyFile = join(legacyRoot, "session-legacy.jsonl");
 		const sdkFile = join(sdkRoot, "session-legacy.jsonl");
 		mkdirSync(legacyRoot, { recursive: true });
-		writeFileSync(legacyFile, '{"type":"session"}\n');
+		const legacyTranscript = legacyTranscriptHeader("session-legacy", cwd);
+		writeFileSync(legacyFile, legacyTranscript);
 		const upgradedProject = { ...project, cwd, allowedRoot: root, sessionRoot: legacyRoot };
 		const turnRunner = new SdkSessionRootTurnRunner(sdkRoot, sdkFile);
 		const mappings = new SessionMappingStore();
@@ -165,13 +180,72 @@ describe("createGjcRoutingLiveGatewayRunner", () => {
 				continued: true,
 			});
 
-			expect(readFileSync(sdkFile, "utf8")).toBe('{"type":"session"}\n');
+			expect(readFileSync(sdkFile, "utf8")).toBe(legacyTranscript);
 			expect(turnRunner.switches[0]?.sessionFile).toBe(sdkFile);
 			expect(mappings.get("chat-legacy")?.sessionFile).toBe(sdkFile);
-			expect(readFileSync(legacyFile, "utf8")).toBe('{"type":"session"}\n');
+			expect(readFileSync(legacyFile, "utf8")).toBe(legacyTranscript);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
+	});
+	test("checkpoints only an acknowledged session.new before a failed successor publication", async () => {
+		const mappings = new SessionMappingStore();
+		mappings.set({
+			chatId: "chat-control",
+			projectId: project.id,
+			sessionId: "predecessor",
+			sessionFile: "/workspace/project/.gjc/sessions/predecessor.jsonl",
+			operationId: "prior",
+			rawFrameCursor: 0,
+			eventCursor: 0,
+		});
+		const acknowledgements: Array<{ readonly kind: string; readonly detail: string | undefined }> = [];
+		class AcknowledgingRunner extends FakeGjcTurnRunner {
+			calls = 0;
+
+			async runControl(
+				input: LiveGatewayRunnerInput,
+				_mapping: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[1],
+				_lifecycle: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[2],
+				onAcknowledgedSuccessor?: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[3],
+			): Promise<GjcControlResult> {
+				this.calls++;
+				const operation = mappings.operation(input.chatId, input.userMessageId);
+				acknowledgements.push({ kind: operation?.kind ?? "", detail: operation?.detail });
+				await onAcknowledgedSuccessor?.({
+					sessionId: "successor",
+					attachment: attachmentProof({ cwd: project.cwd, sessionId: "successor" }),
+				});
+				throw new Error("transcript discovery failed");
+			}
+		}
+		const turnRunner = new AcknowledgingRunner();
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings });
+		const turn: LiveGatewayRunnerInput = {
+			project,
+			prompt: "",
+			chatId: "chat-control",
+			messageId: "assistant-control",
+			userMessageId: "control-new",
+			userMessageParentId: "prior",
+			continued: true,
+			control: { operation: "session.new" },
+		};
+
+		await expect(runner.run(turn)).rejects.toThrow("transcript discovery failed");
+
+		const operation = mappings.operation(turn.chatId, turn.userMessageId);
+		expect(acknowledgements).toEqual([{ kind: "create", detail: controlOperationHash(turn) }]);
+		expect(operation).toMatchObject({
+			kind: "create",
+			state: "uncertain",
+			detail: controlOperationHash(turn),
+			acknowledgedSuccessor: { sessionId: "successor" },
+		});
+		expect(mappings.get(turn.chatId)?.sessionId).toBe("predecessor");
+
+		await expect(runner.run(turn)).rejects.toThrow("requires reconciliation");
+		expect(turnRunner.calls).toBe(1);
 	});
 });
 

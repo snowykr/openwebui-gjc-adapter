@@ -185,6 +185,17 @@ export function startRealSelectionSdkServer(coordinatorUrl: string): RealSelecti
 					}),
 				);
 			} else {
+				const text = requiredString(await fetchRecord(`${coordinatorUrl}/assistant`), "text");
+				socket.send(
+					JSON.stringify({
+						type: "turn_stream",
+						sessionId: socket.data.sessionId,
+						phase: "finalized",
+						finalAnswer: true,
+						text,
+						...correlation,
+					}),
+				);
 				socket.send(JSON.stringify({ type: "agent_end", sessionId: socket.data.sessionId, ...correlation }));
 			}
 			return;

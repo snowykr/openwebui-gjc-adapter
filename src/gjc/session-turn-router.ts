@@ -1,8 +1,9 @@
 import type { SessionOperationResult } from "./session-authority";
 import { ensureSdkSessionFile, validateSessionFile } from "./session-file";
+import { recoverInitialMappedSession } from "./session-initial-create-recovery";
 import { copyAttachment, hashTurnIngress, normalizeModelSelection } from "./session-operation-codec";
 import { resolveEffectiveGjcSessionRoot } from "./session-root";
-import type { RouteGjcTurnInput, RouteGjcTurnResult } from "./session-router";
+import type { RouteGjcTurnInput, RouteGjcTurnResult } from "./session-turn-router-contract";
 import { startNewMappedSession } from "./session-turn-router-new";
 import { type GjcTurnRunner, getProjectSessionRoot } from "./turn-runner";
 
@@ -50,6 +51,8 @@ export async function routeGjcTurn(input: RouteGjcTurnInput): Promise<RouteGjcTu
 		throw new Error(`GJC operation ${input.userMessageId} requires reconciliation.`);
 	}
 
+	if (existing === undefined && input.mappings.provisionalOperation(input.chatId, input.userMessageId) !== undefined)
+		return recoverInitialMappedSession(input, operationHash);
 	if (existing === undefined || existing.projectId !== input.project.id) {
 		return startNewMappedSession(input);
 	}
@@ -59,7 +62,12 @@ export async function routeGjcTurn(input: RouteGjcTurnInput): Promise<RouteGjcTu
 		getProjectSessionRoot(input.project),
 		input.runner.resolveSessionRoot,
 	);
-	const existingSessionFile = await ensureSdkSessionFile(input.project, existing.sessionFile, sessionRoot);
+	const existingSessionFile = await ensureSdkSessionFile(
+		input.project,
+		existing.sessionFile,
+		sessionRoot,
+		existing.sessionId,
+	);
 	const address = {
 		cwd: input.project.cwd,
 		sessionRoot,

@@ -130,6 +130,8 @@ export function startSdkFixtureServer(scenario: SdkFixtureScenario, expectedCwd?
 									JSON.stringify({
 										type: "turn_stream",
 										sessionId: "sdk-session-created",
+										commandId: "command-right",
+										turnId: "turn-right",
 										phase: "finalized",
 										finalAnswer: true,
 										text: "continued assistant",

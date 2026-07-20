@@ -1,13 +1,7 @@
 import type { PublicSdkGate, PublicSdkSessionAttachment, PublicSdkTurnOutcome } from "./public-sdk-contract";
 import { createPublicSdkDeadline } from "./public-sdk-deadline";
 import type { SdkV3Client } from "./sdk-v3-client";
-import {
-	parseLastAssistant,
-	parseRecord,
-	requiredString,
-	type SdkRecord,
-	SdkV3OperationError,
-} from "./sdk-v3-protocol";
+import { parseRecord, requiredString, type SdkRecord, SdkV3OperationError } from "./sdk-v3-protocol";
 import { SdkTerminalWindow } from "./sdk-v3-terminal";
 
 export interface PublicSdkTurnContext {
@@ -42,7 +36,7 @@ export async function runTurn(
 			turnId: requiredString(accepted, "turnId", `${operation} result`),
 		};
 		window.accept(correlation);
-		const value = await addAssistantFallback(context, window.wait(correlation, deadline.remaining()), deadline);
+		const value = await window.wait(correlation, deadline.remaining());
 		await context.authority(deadline.remaining(), async () => undefined);
 		return value;
 	} finally {
@@ -75,7 +69,7 @@ export async function runGateTurn(
 			),
 		);
 		window.accept(gate.correlation);
-		const value = await addAssistantFallback(context, window.wait(gate.correlation, deadline.remaining()), deadline);
+		const value = await window.wait(gate.correlation, deadline.remaining());
 		await context.authority(deadline.remaining(), async () => undefined);
 		return value;
 	} finally {
@@ -136,15 +130,4 @@ export function waitForReply(
 	});
 	if (settled) cleanup();
 	return { promise, cancel: () => settle(resolve) };
-}
-
-async function addAssistantFallback(
-	context: PublicSdkTurnContext,
-	outcome: Promise<PublicSdkTurnOutcome>,
-	deadline: ReturnType<typeof createPublicSdkDeadline>,
-): Promise<PublicSdkTurnOutcome> {
-	const value = await outcome;
-	if (value.finalizedAssistantText !== undefined) return value;
-	const text = parseLastAssistant(await context.client.queryAll("session.last_assistant", {}, deadline.remaining()));
-	return text === null ? value : { ...value, finalizedAssistantText: text };
 }

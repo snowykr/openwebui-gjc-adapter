@@ -1,39 +1,15 @@
 import { resolve } from "node:path";
 import type { CliLifecycleAttachment } from "../gjc/cli-lifecycle-backend";
 import type { PublicSdkSessionAttachment } from "../gjc/public-sdk-contract";
-import type {
-	GjcCloseReceipt,
-	GjcLifecyclePublicationAddress,
-	GjcLifecycleTestBarrierEvidence,
-	GjcLifecycleTestBarrierHook,
-	GjcTurnEvent,
-	GjcTurnResult,
-} from "../gjc/turn-runner";
+import type { GjcCloseReceipt, GjcLifecyclePublicationAddress, GjcTurnEvent, GjcTurnResult } from "../gjc/turn-runner";
+
+export { lifecycleBarrierEvidence, runLifecycleTestBarrier } from "./gjc-routing-test-barrier";
 
 export type SessionAttachment = Omit<CliLifecycleAttachment, "pane"> & {
 	readonly pane?: CliLifecycleAttachment["pane"];
 	readonly projectId: string;
 	readonly published?: PublicSdkSessionAttachment;
 };
-
-export function lifecycleBarrierEvidence(attachment: PublicSdkSessionAttachment): GjcLifecycleTestBarrierEvidence {
-	const authority = attachment.authority;
-	return {
-		cwd: attachment.cwd,
-		sessionId: attachment.sessionId,
-		...(authority === undefined
-			? {}
-			: { generation: authority.generation, digestPrefix: authority.payloadDigest.slice(0, 12) }),
-	};
-}
-
-export async function runLifecycleTestBarrier(
-	hook: GjcLifecycleTestBarrierHook | undefined,
-	phase: Parameters<GjcLifecycleTestBarrierHook>[0],
-	attachment: PublicSdkSessionAttachment,
-): Promise<void> {
-	await hook?.(phase, lifecycleBarrierEvidence(attachment));
-}
 
 export function turnResult(
 	outcome: import("../gjc/public-sdk-contract").PublicSdkTurnOutcome,
@@ -73,7 +49,7 @@ export function turnResult(
 
 export function attachmentProof(
 	attachment: PublicSdkSessionAttachment,
-	lifecycle: SessionAttachment,
+	lifecycle: Pick<SessionAttachment, "pane">,
 ): import("../gjc/session-authority").SessionAttachmentProof {
 	if (attachment.authority === undefined) throw new Error("Published GJC endpoint is missing descriptor authority.");
 	if (!isSha256HexDigest(attachment.authority.payloadDigest))

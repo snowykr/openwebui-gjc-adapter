@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { NormalizedModelSelection } from "../src/contracts";
 import { SessionAuthorityLoadError } from "../src/gjc/session-authority";
 import {
 	FileBackedSessionMappingStore,
@@ -160,9 +161,8 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 			{ provider: "openai", modelId: "gpt-5", thinkingLevel: "high" },
 		] as const) {
 			const turnRunner = new FakeGjcTurnRunner();
-			const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent);
+			const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent, undefined, modelSelection ?? null);
 			const before = requiredMapping(mappings);
-			mappings.set({ ...before, modelSelection });
 			let readerCount = 0;
 			const runner = createGjcRoutingLiveGatewayRunner({
 				turnRunner,
@@ -339,7 +339,15 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 	});
 });
 
-function pendingGateMappings(event: unknown, sessionFile = "/workspace/project/.gjc/sessions/session-1.jsonl") {
+function pendingGateMappings(
+	event: unknown,
+	sessionFile = "/workspace/project/.gjc/sessions/session-1.jsonl",
+	modelSelection: NormalizedModelSelection | null = {
+		provider: "anthropic",
+		modelId: "claude-sonnet-4",
+		thinkingLevel: "medium",
+	},
+) {
 	const mappings = new SessionMappingStore();
 	mappings.set({
 		chatId: "chat-1",
@@ -351,7 +359,7 @@ function pendingGateMappings(event: unknown, sessionFile = "/workspace/project/.
 		eventCursor: 3,
 		operationId: "user-1",
 		assistantText: "pending",
-		modelSelection: { provider: "anthropic", modelId: "claude-sonnet-4", thinkingLevel: "medium" },
+		modelSelection: modelSelection ?? undefined,
 		events: [event as never],
 	});
 	return mappings;

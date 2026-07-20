@@ -83,10 +83,23 @@
 			"types": "./src/gjc/public-sdk-contract.ts",
 			"import": "./src/gjc/public-sdk-contract.ts"
 		},
-		"./live/*": {
-			"types": "./src/live/*.ts",
-			"import": "./src/live/*.ts"
+		"./live/chat-completions": {
+			"types": "./src/live/chat-completions.ts",
+			"import": "./src/live/chat-completions.ts"
 		},
+		"./live/gjc-routing-runner": {
+			"types": "./src/live/gjc-routing-runner.ts",
+			"import": "./src/live/gjc-routing-runner.ts"
+		},
+		"./live/models": {
+			"types": "./src/live/models.ts",
+			"import": "./src/live/models.ts"
+		},
+		"./live/openai-types": {
+			"types": "./src/live/openai-types.ts",
+			"import": "./src/live/openai-types.ts"
+		},
+		"./live/*": null,
 		"./projection/*": {
 			"types": "./src/projection/*.ts",
 			"import": "./src/projection/*.ts"

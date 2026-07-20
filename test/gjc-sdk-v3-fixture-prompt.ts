@@ -46,6 +46,25 @@ export function handlePrompt(
 			commandId: "command-wrong",
 			turnId: "turn-wrong",
 		});
+		if (scenario === "turn_complete")
+			sendEvent(socket, {
+				type: "turn_stream",
+				sessionId,
+				phase: "finalized",
+				finalAnswer: true,
+				text: "stale session-only assistant",
+			});
+		sendEvent(socket, { type: "agent_end", sessionId, ...correlation });
+	}
+	if (scenario === "turn_finalized") {
+		sendEvent(socket, {
+			type: "turn_stream",
+			sessionId,
+			phase: "finalized",
+			finalAnswer: true,
+			text: "correlated assistant",
+			...correlation,
+		});
 		sendEvent(socket, { type: "agent_end", sessionId, ...correlation });
 	}
 	if (scenario === "branch_regenerate") {

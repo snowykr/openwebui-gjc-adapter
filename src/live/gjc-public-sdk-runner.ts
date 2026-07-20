@@ -76,17 +76,7 @@ class PublicSdkGjcTurnRunner implements GjcTurnRunner {
 		beforePrompt: Parameters<GjcTurnRunner["startNewSession"]>[2],
 		onFailure?: Parameters<GjcTurnRunner["startNewSession"]>[3],
 	): Promise<T> {
-		return startNewSession(
-			this.#context,
-			input,
-			publish,
-			beforePrompt as (
-				address: GjcSessionAddress,
-				attachment: import("../gjc/session-authority").SessionAttachmentProof,
-				lifecycle: GjcLifecycleTransaction,
-			) => Promise<void>,
-			onFailure,
-		);
+		return startNewSession(this.#context, input, publish, beforePrompt, onFailure);
 	}
 
 	switchSession(input: GjcSwitchSessionInput): Promise<void> {
@@ -112,7 +102,8 @@ class PublicSdkGjcTurnRunner implements GjcTurnRunner {
 		input: LiveGatewayRunnerInput,
 		mapping: SessionMapping,
 		lifecycle: GjcLifecycleTransaction,
+		onAcknowledgedSuccessor?: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[3],
 	): Promise<GjcControlResult> {
-		return runControl(this.#context, input, mapping, lifecycle);
+		return runControl(this.#context, input, mapping, lifecycle, onAcknowledgedSuccessor);
 	}
 }

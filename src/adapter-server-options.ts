@@ -1,3 +1,4 @@
+import { mkdir } from "node:fs/promises";
 import * as path from "node:path";
 import { createAdapterSessionCloser } from "./adapter-close-options";
 import {
@@ -32,6 +33,7 @@ import type { OpenWebUIProjectionRepository } from "./openwebui/client";
 import { ProjectLinkService, type SessionCloseResult } from "./projects/link-service";
 import { preflightProjectRegistrationDatabase } from "./projects/registration-preflight";
 import { auditProjectRegistrations, SqliteProjectRegistrationStore } from "./projects/registration-store";
+import { RuntimeSingletonLock } from "./runtime-singleton-lock";
 import { resolveAllowedRoots } from "./security/paths";
 import { type AdapterServerHandle, type AdapterServerOptions, startAdapterServer } from "./server";
 import { FileBackedOutboxStore, type OutboxStore } from "./state/outbox";
@@ -83,12 +85,16 @@ export async function buildResolvedAdapterServerOptions(
 	behavior: BuildAdapterServerOptionsBehavior = {},
 ): Promise<AdapterServerOptions> {
 	assertResolvedAdapterConfig(config);
+	await mkdir(config.statePath, { recursive: true });
+	const lock = await RuntimeSingletonLock.acquire(config.statePath);
+	let completed = false;
 	const internalStore = dependencies.projectRegistrationStore === undefined;
 	const databasePath = path.join(config.statePath, "adapter-state.sqlite");
-	if (internalStore)
-		await preflightProjectRegistrationDatabase(databasePath, config.runtimeLocations.protectedProjectPaths);
-	const projectStore = dependencies.projectRegistrationStore ?? new SqliteProjectRegistrationStore(databasePath);
+	let projectStore: SqliteProjectRegistrationStore | undefined;
 	try {
+		if (internalStore)
+			await preflightProjectRegistrationDatabase(databasePath, config.runtimeLocations.protectedProjectPaths);
+		projectStore = dependencies.projectRegistrationStore ?? new SqliteProjectRegistrationStore(databasePath);
 		await auditProjectRegistrations(projectStore, config.runtimeLocations.protectedProjectPaths);
 		const allowedRoots = await resolveAllowedRoots(config.allowedProjectRoots);
 		const projects = await loadConfiguredProjects(config, allowedRoots);
@@ -160,10 +166,11 @@ export async function buildResolvedAdapterServerOptions(
 		const eventSink = dependencies.eventSink ?? buildOpenWebUIEventSink(openWebUIClient);
 		const messageSink = dependencies.messageSink ?? buildOpenWebUIMessageSink(openWebUIClient);
 		const fileContextResolver = buildOpenWebUIFileContextResolver(openWebUIClient);
-		return {
+		const options = {
 			host: config.bindHost,
 			port: config.bindPort,
 			runtimeRoot: config.statePath,
+			runtimeLock: lock,
 			checks: buildRuntimeHealthChecks(config),
 			routes: {
 				projects: [...projectLinkService.listLinkedProjects()],
@@ -192,15 +199,24 @@ export async function buildResolvedAdapterServerOptions(
 				...(fileContextResolver === undefined ? {} : { fileContextResolver }),
 			},
 		};
+		completed = true;
+		return options;
 	} catch (error) {
-		if (!internalStore) throw error;
+		if (!internalStore || projectStore === undefined) throw error;
 		try {
 			projectStore.close();
 		} catch (closeError) {
-			if (error instanceof Error && error.cause === undefined)
-				Reflect.defineProperty(error, "cause", { value: closeError });
+			if (error instanceof Error) {
+				const cause =
+					error.cause === undefined
+						? closeError
+						: new AggregateError([error.cause, closeError], "Startup failure cleanup failed");
+				Reflect.defineProperty(error, "cause", { value: cause });
+			}
 		}
 		throw error;
+	} finally {
+		if (!completed) await lock.release();
 	}
 }
 

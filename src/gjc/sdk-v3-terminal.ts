@@ -167,7 +167,7 @@ export class SdkTerminalWindow {
 		for (const frame of [...this.postAcceptEvents()].reverse()) {
 			if (
 				frame.type === "turn_stream" &&
-				matches(frame, correlation) &&
+				matchesTurnStream(frame, correlation) &&
 				frame.phase === "finalized" &&
 				frame.finalAnswer === true &&
 				typeof frame.text === "string"
@@ -219,6 +219,13 @@ function matches(frame: SdkRecord, correlation: SdkTurnCorrelation): boolean {
 		nested.sessionId === correlation.sessionId &&
 		nested.commandId === correlation.commandId &&
 		nested.turnId === correlation.turnId
+	);
+}
+function matchesTurnStream(frame: SdkRecord, correlation: SdkTurnCorrelation): boolean {
+	return (
+		frame.sessionId === correlation.sessionId &&
+		frame.commandId === correlation.commandId &&
+		frame.turnId === correlation.turnId
 	);
 }
 function matchesAction(frame: SdkRecord, correlation: SdkTurnCorrelation): boolean {

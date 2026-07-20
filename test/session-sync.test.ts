@@ -159,7 +159,7 @@ describe("syncProjectSessionsToOpenWebUI", () => {
 			expect.objectContaining({
 				projectId: "project-a",
 				filePath: path.join(sessionRootA, "broken.jsonl"),
-				code: "empty_session_file",
+				code: "corrupt_session_file",
 			}),
 			{
 				projectId: "project-a",

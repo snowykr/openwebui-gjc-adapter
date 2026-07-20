@@ -341,6 +341,7 @@ describe("durable projection reconciliation", () => {
 			modelSelection: { provider: "anthropic", modelId: "claude-sonnet-4", thinkingLevel: "medium" as const },
 			events: [{ type: "tool_start", id: "tool-1" }],
 		};
+		mappings.set({ ...mapping, operationId: "bootstrap" });
 		mappings.beginOperation("chat-1", { id: "op-1", kind: "prompt", detail: "request" });
 		mappings.completeOperationWithMapping("chat-1", "op-1", "request", mapping, "turn");
 		mappings.set({ ...mapping, operationId: "op-2" });
@@ -371,6 +372,7 @@ describe("durable projection reconciliation", () => {
 			eventCursor: 1,
 			operationId: "op-1",
 		};
+		mappings.set({ ...mapping, operationId: "bootstrap" });
 		mappings.beginOperation("chat-1", { id: "op-1", kind: "prompt", detail: "request" });
 		mappings.completeOperationWithMapping("chat-1", "op-1", "request", mapping, "turn");
 		const outbox = new InMemoryOutboxStore();
@@ -404,6 +406,7 @@ describe("durable projection reconciliation", () => {
 				eventCursor: 1,
 				operationId: "op-1",
 			};
+			mappings.set({ ...mapping, operationId: "bootstrap" });
 			mappings.beginOperation("chat-1", { id: "op-1", kind: "prompt", detail: "request" });
 			mappings.completeOperationWithMapping("chat-1", "op-1", "request", mapping, "turn");
 			const repository = new InMemoryOpenWebUIProjectionRepository();

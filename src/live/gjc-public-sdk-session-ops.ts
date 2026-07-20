@@ -29,7 +29,8 @@ import {
 	waitForSdkEndpoint,
 } from "./gjc-routing-endpoints";
 import type { PublicSdkRunnerContext } from "./gjc-routing-lifecycle";
-import { runLifecycleTestBarrier, turnResult } from "./gjc-routing-proof";
+import { turnResult } from "./gjc-routing-proof";
+import { runLifecycleTestBarrier } from "./gjc-routing-test-barrier";
 
 export {
 	currentAttachmentProof,

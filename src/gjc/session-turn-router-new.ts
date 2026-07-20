@@ -2,7 +2,7 @@ import type { ProvisionalSessionOperation } from "./session-authority";
 import { validateSessionFile } from "./session-file";
 import { hashTurnIngress, normalizeModelSelection } from "./session-operation-codec";
 import { resolveEffectiveGjcSessionRoot } from "./session-root";
-import type { RouteGjcTurnInput, RouteGjcTurnResult } from "./session-router";
+import type { RouteGjcTurnInput, RouteGjcTurnResult } from "./session-turn-router-contract";
 import { getProjectSessionRoot } from "./turn-runner";
 
 export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<RouteGjcTurnResult> {
@@ -74,7 +74,6 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 			async (address, attachment) => {
 				input.mappings.attachProvisionalOperation(input.chatId, input.userMessageId, {
 					sessionId: address.sessionId,
-					sessionFile: validateSessionFile(input.project, address.sessionFile, sessionRoot),
 					attachment,
 				});
 			},
@@ -87,7 +86,6 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 		throw error;
 	}
 }
-
 function provisionalOperation(
 	input: RouteGjcTurnInput,
 ): Omit<ProvisionalSessionOperation, "state" | "startedAt" | "completedAt"> {

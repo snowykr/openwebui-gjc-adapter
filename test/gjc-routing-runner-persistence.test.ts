@@ -4,6 +4,9 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, wri
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GjcRuntimeLocations, NormalizedModelSelection } from "../src/contracts";
+import type { PublicSdkSessionPort } from "../src/gjc/public-sdk-contract";
+import { PublicSdkSessionClient } from "../src/gjc/public-sdk-session-port";
+import { FileSessionAuthority, SessionAuthorityDurabilityError } from "../src/gjc/session-authority-persistence";
 import { FileBackedSessionMappingStore, SessionMappingStore } from "../src/gjc/session-router";
 import type {
 	GjcControlResult,
@@ -41,16 +44,197 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		const second = new FileBackedSessionMappingStore(filePath);
 		expect(second.get("chat-1")).toEqual(first.get("chat-1"));
 	});
+	test("isolates nested authority events and observations from insert and read mutations", () => {
+		withFileStore((_store, filePath) => {
+			const input = {
+				...mappingInput(mediumSelection),
+				events: [{ type: "assistant", payload: { nested: { value: "original" } } }],
+				observations: { state: { value: "original" } },
+			};
+			const authority = new FileSessionAuthority(filePath);
+			const stored = authority.set(input);
+			input.events[0].payload.nested.value = "mutated-input";
+			input.observations.state.value = "mutated-input";
 
-	test("serializes only exact normalized tuple keys", () => {
+			const eventPayload = stored.events?.[0]?.payload;
+			const observation = stored.observations?.state;
+			const eventNested = eventPayload === undefined ? undefined : Reflect.get(eventPayload, "nested");
+			if (
+				typeof eventNested !== "object" ||
+				eventNested === null ||
+				typeof observation !== "object" ||
+				observation === null
+			)
+				throw new Error("Expected nested authority values.");
+			Reflect.set(eventNested, "value", "mutated-read");
+			Reflect.set(observation, "value", "mutated-read");
+
+			expect(authority.get("chat-1")).toMatchObject({
+				events: [{ payload: { nested: { value: "original" } } }],
+				observations: { state: { value: "original" } },
+			});
+			expect(new FileSessionAuthority(filePath).get("chat-1")).toMatchObject({
+				events: [{ payload: { nested: { value: "original" } } }],
+				observations: { state: { value: "original" } },
+			});
+		});
+	});
+	test("reloads under the mutation lock so two stores retain both interleaved writes", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-interleave-")), "mappings.json");
+		const first = new FileSessionAuthority(filePath);
+		const second = new FileSessionAuthority(filePath);
+		first.set(mappingInput(mediumSelection));
+		second.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2"]);
+	});
+	test.each(["write", "fsync", "rename"])("restores live authority after an injected %s failure", phase => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-failure-")), "mappings.json");
+		const authority = new FailingFileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.failure = new Error(`injected ${phase} failure`);
+
+		expect(() =>
+			authority.set({
+				...mappingInput(mediumSelection),
+				chatId: `${phase}-chat`,
+				operationId: `${phase}-operation`,
+			}),
+		).toThrow(`injected ${phase} failure`);
+		expect(authority.entries().map(record => record.chatId)).toEqual(["chat-1"]);
+		expect(new FileSessionAuthority(filePath).entries().map(record => record.chatId)).toEqual(["chat-1"]);
+	});
+	test.each(["open", "fsync", "close"])("reloads visible authority after an injected directory %s failure", phase => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-directory-failure-")), "mappings.json");
+		const authority = new FailingFileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.directoryFailure = new Error(`injected directory ${phase} failure`);
+
+		let error: unknown;
+		try {
+			authority.set({
+				...mappingInput(mediumSelection),
+				chatId: `${phase}-chat`,
+				operationId: `${phase}-operation`,
+			});
+		} catch (caught) {
+			error = caught;
+		}
+
+		expect(error).toBeInstanceOf(SessionAuthorityDurabilityError);
+		expect((error as Error & { cause?: unknown }).cause).toBe(authority.directoryFailure);
+		expect(
+			authority
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", `${phase}-chat`]);
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", `${phase}-chat`]);
+	});
+	test("durably records acknowledged create successors without replacing their predecessor", () => {
 		withFileStore((store, filePath) => {
-			const modelSelection = { ...mediumSelection };
-			Reflect.set(modelSelection, "canonicalId", "gjc/anthropic/claude-sonnet-4:medium");
-			store.set(mappingInput(modelSelection));
-			const persisted = JSON.parse(readFileSync(filePath, "utf8"));
-			expect(persisted).toMatchObject({ kind: "openwebui-gjc-session-authority", version: 2 });
-			expect(persisted.mappings[0].modelSelection).toEqual(mediumSelection);
-			expect(JSON.stringify(persisted)).not.toContain("gjc/anthropic");
+			const predecessor = store.set({
+				chatId: "chat-successor",
+				projectId: project.id,
+				sessionId: "predecessor",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "predecessor-operation",
+			});
+			store.beginOperation("chat-successor", {
+				id: "create-operation",
+				ingressId: "create-operation",
+				kind: "create",
+				detail: "create-hash",
+			});
+			const successor = {
+				sessionId: "successor",
+				attachment: {
+					descriptorPath: "/workspace/.gjc/state/sdk/successor.json",
+					descriptorStat: { dev: 1, ino: 2, size: 3, mtimeMs: 4 },
+					payloadDigest: "a".repeat(64),
+					generation: 4,
+					expectedSessionId: "successor",
+					expectedCwd: "/workspace",
+				},
+			};
+			expect(
+				store.recordAcknowledgedSuccessor("chat-successor", "create-operation", "create-hash", successor),
+			).toMatchObject({ state: "pending", acknowledgedSuccessor: successor });
+			expect(
+				store.recordAcknowledgedSuccessor("chat-successor", "create-operation", "create-hash", successor),
+			).toMatchObject({ state: "pending", acknowledgedSuccessor: successor });
+			expect(store.get("chat-successor")).toEqual(predecessor);
+			expect(() =>
+				store.recordAcknowledgedSuccessor("chat-successor", "create-operation", "create-hash", {
+					...successor,
+					sessionId: "different",
+				}),
+			).toThrow("conflicting acknowledged successor");
+			expect(JSON.parse(readFileSync(filePath, "utf8")).mappings[0].sessionId).toBe("predecessor");
+
+			const restarted = new FileBackedSessionMappingStore(filePath);
+			expect(restarted.get("chat-successor")).toEqual(predecessor);
+			expect(restarted.operation("chat-successor", "create-operation")).toMatchObject({
+				state: "uncertain",
+				acknowledgedSuccessor: successor,
+			});
+			expect(
+				restarted.recordAcknowledgedSuccessor("chat-successor", "create-operation", "create-hash", successor),
+			).toMatchObject({ state: "uncertain", acknowledgedSuccessor: successor });
+			restarted.beginOperation("chat-successor", {
+				id: "branch-operation",
+				kind: "branch",
+				detail: "branch-hash",
+			});
+			expect(
+				restarted.recordAcknowledgedSuccessor("chat-successor", "branch-operation", "branch-hash", successor),
+			).toMatchObject({ state: "pending", acknowledgedSuccessor: successor });
+			expect(
+				new FileBackedSessionMappingStore(filePath).operation("chat-successor", "branch-operation"),
+			).toMatchObject({
+				state: "uncertain",
+				acknowledgedSuccessor: successor,
+			});
+
+			restarted.beginOperation("chat-successor", {
+				id: "complete-operation",
+				kind: "create",
+				detail: "complete-hash",
+			});
+			restarted.recordAcknowledgedSuccessor("chat-successor", "complete-operation", "complete-hash", successor);
+			restarted.completeOperationWithMapping(
+				"chat-successor",
+				"complete-operation",
+				"published",
+				{ ...predecessor, sessionId: "successor", operationId: "complete-operation" },
+				"control",
+			);
+			expect(new FileBackedSessionMappingStore(filePath).operation("chat-successor", "complete-operation")).toEqual(
+				expect.not.objectContaining({ acknowledgedSuccessor: expect.anything() }),
+			);
+		});
+	});
+
+	test("rejects authority model selections that runtime normalization drops", () => {
+		withFileStore((store, filePath) => {
+			store.set(mappingInput(mediumSelection));
+			const document = JSON.parse(readFileSync(filePath, "utf8"));
+			document.mappings[0].modelSelection.provider = "a%2Fb";
+
+			writeFileSync(filePath, JSON.stringify(document));
+
+			expect(() => new FileBackedSessionMappingStore(filePath)).toThrow("not a valid v2 authority");
 		});
 	});
 
@@ -81,13 +265,15 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		});
 	});
 
-	test("strips slash-delimited providers before persisting a session mapping", () => {
+	test("rejects authority model selections with fields normalization would drop", () => {
 		withFileStore((store, filePath) => {
-			store.set(mappingInput({ ...mediumSelection, provider: "proxy/openai", modelId: "model:雪/preview" }));
+			store.set(mappingInput(mediumSelection));
+			const document = JSON.parse(readFileSync(filePath, "utf8"));
+			document.mappings[0].modelSelection.canonicalId = "gjc/anthropic/claude-sonnet-4:medium";
 
-			const persisted = JSON.parse(readFileSync(filePath, "utf8"));
+			writeFileSync(filePath, JSON.stringify(document));
 
-			expect(persisted.mappings[0].modelSelection).toBeUndefined();
+			expect(() => new FileBackedSessionMappingStore(filePath)).toThrow("not a valid v2 authority");
 		});
 	});
 	test("fails closed on corrupt v2 authority records", () => {
@@ -169,6 +355,104 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			splitGeneration.mappings[0].attachment = { ...valid.mappings[0].attachment, generation: 5 };
 			writeFileSync(filePath, JSON.stringify(splitGeneration));
 			expect(() => new FileBackedSessionMappingStore(filePath)).toThrow("not a valid v2 authority");
+		});
+	});
+	test.each([
+		[
+			"tmux field",
+			(successor: any): void => {
+				successor.attachment.tmuxPane = "%10";
+			},
+		],
+		[
+			"session file",
+			(successor: any): void => {
+				successor.attachment.sessionFile = "/workspace/session.jsonl";
+			},
+		],
+		[
+			"credential",
+			(successor: any): void => {
+				successor.attachment.token = "secret";
+			},
+		],
+		[
+			"endpoint URL",
+			(successor: any): void => {
+				successor.attachment.url = "http://localhost";
+			},
+		],
+		[
+			"unknown key",
+			(successor: any): void => {
+				successor.extra = true;
+			},
+		],
+		[
+			"session ID mismatch",
+			(successor: any): void => {
+				successor.sessionId = "session-other";
+			},
+		],
+	] as const)("fails closed on an invalid acknowledged successor %s", (_field, corrupt) => {
+		withFileStore((_store, filePath) => {
+			const document = validAuthorityDocument();
+			const operation = document.mappings[0].journal[0];
+			operation.kind = "create";
+			operation.state = "pending";
+			delete operation.completedAt;
+			delete operation.result;
+			operation.acknowledgedSuccessor = acknowledgedSuccessor();
+			corrupt(operation.acknowledgedSuccessor);
+			writeFileSync(filePath, JSON.stringify(document));
+			expect(() => new FileBackedSessionMappingStore(filePath)).toThrow("not a valid v2 authority");
+		});
+	});
+	test.each([
+		[
+			"non-create operation",
+			(operation: any): void => {
+				operation.kind = "prompt";
+			},
+		],
+		[
+			"complete operation",
+			(operation: any): void => {
+				operation.state = "complete";
+				operation.completedAt = "2026-01-01T00:00:00.000Z";
+			},
+		],
+		[
+			"conflict operation",
+			(operation: any): void => {
+				operation.state = "conflict";
+			},
+		],
+	] as const)("fails closed on an acknowledged successor for a %s", (_field, corrupt) => {
+		withFileStore((_store, filePath) => {
+			const document = validAuthorityDocument();
+			const operation = document.mappings[0].journal[0];
+			operation.kind = "create";
+			operation.state = "pending";
+			delete operation.completedAt;
+			delete operation.result;
+			operation.acknowledgedSuccessor = acknowledgedSuccessor();
+			corrupt(operation);
+			writeFileSync(filePath, JSON.stringify(document));
+			expect(() => new FileBackedSessionMappingStore(filePath)).toThrow("not a valid v2 authority");
+		});
+	});
+	test.each(["pending", "uncertain"] as const)("loads a %s create acknowledged successor", state => {
+		withFileStore((_store, filePath) => {
+			const document = validAuthorityDocument();
+			const operation = document.mappings[0].journal[0];
+			operation.kind = "create";
+			operation.state = state;
+			delete operation.completedAt;
+			delete operation.result;
+			operation.acknowledgedSuccessor = acknowledgedSuccessor();
+			writeFileSync(filePath, JSON.stringify(document));
+			expect(() => new FileBackedSessionMappingStore(filePath)).not.toThrow();
 		});
 	});
 	test.each([
@@ -711,24 +995,41 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			fixture.dispose();
 		}
 	});
-	test("does not duplicate a branch after its successor descriptor becomes stale", async () => {
+	test("keeps an acknowledged branch checkpoint uncertain after restart without remote replay", async () => {
 		let barrierHits = 0;
 		const fixture = await setupPublicSdkBranchFixture("branch_regenerate", async (phase, evidence) => {
 			expect(phase).toBe("between_branch_phases");
 			expect(evidence).toMatchObject({ cwd: fixture.project.cwd, sessionId: "sdk-session-successor" });
-			if (barrierHits === 0) {
-				unlinkSync(join(evidence.cwd, ".gjc", "state", "sdk", `${evidence.sessionId}.json`));
-			}
 			barrierHits += 1;
+			throw new Error("post-ack interruption");
 		});
 		try {
-			await expect(fixture.runner.run(fixture.turn)).rejects.toThrow("endpoint descriptor");
+			await expect(fixture.runner.run(fixture.turn)).rejects.toThrow("post-ack interruption");
 			const restartedMappings = new FileBackedSessionMappingStore(fixture.mappingFile);
 			expect(restartedMappings.operation("chat-q16", "branch-q16")).toMatchObject({
 				id: "branch-q16",
 				kind: "branch",
 				state: "uncertain",
+				acknowledgedSuccessor: {
+					sessionId: "sdk-session-successor",
+					attachment: expect.objectContaining({
+						expectedSessionId: "sdk-session-successor",
+						expectedCwd: fixture.project.cwd,
+					}),
+				},
 			});
+			const checkpoint = restartedMappings.operation("chat-q16", "branch-q16")?.acknowledgedSuccessor;
+			expect(Object.keys(checkpoint?.attachment ?? {}).sort()).toEqual([
+				"descriptorPath",
+				"descriptorStat",
+				"expectedCwd",
+				"expectedSessionId",
+				"generation",
+				"payloadDigest",
+			]);
+			expect(
+				new FileBackedSessionMappingStore(fixture.mappingFile).operation("chat-q16", "branch-q16"),
+			).toMatchObject({ acknowledgedSuccessor: checkpoint });
 			expect(restartedMappings.get("chat-q16")).toMatchObject({
 				sessionId: "sdk-session-created",
 				operationId: "predecessor-q16",
@@ -751,10 +1052,14 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 					frame => frame.type === "control_request" && frame.operation === "turn.prompt",
 				),
 			).toHaveLength(0);
+			expect(fixture.server.frames.some(frame => frame.operation === "session.close")).toBe(false);
 			expect(new FileBackedSessionMappingStore(fixture.mappingFile).get("chat-q16")).toMatchObject({
 				sessionId: "sdk-session-created",
 				operationId: "predecessor-q16",
 			});
+			expect(
+				new FileBackedSessionMappingStore(fixture.mappingFile).operation("chat-q16", "branch-q16"),
+			).toMatchObject({ state: "uncertain", acknowledgedSuccessor: checkpoint });
 		} finally {
 			fixture.dispose();
 		}
@@ -1314,6 +1619,7 @@ test("applies released model selection responses across fresh and continuation t
 	const sessionRoot = join(root, ".gjc", "sessions");
 	const mappingFile = join(root, "mappings.json");
 	const server = startSdkFixtureServer("model_catalog", root);
+	let checkedProvisionalPersistence = false;
 	try {
 		writeFileSync(
 			join(root, "gjc-sdk-fixture.json"),
@@ -1335,6 +1641,14 @@ test("applies released model selection responses across fresh and continuation t
 					},
 				} as GjcRuntimeLocations,
 				turnTimeoutMs: 1_000,
+				sessionPortFactory: () =>
+					provisionalPersistenceCheckingPort(
+						mappingFile,
+						() => checkedProvisionalPersistence,
+						() => {
+							checkedProvisionalPersistence = true;
+						},
+					),
 			}),
 			mappings: new FileBackedSessionMappingStore(mappingFile),
 			requestedModelId: () => "gjc/anthropic/claude-sonnet-4:medium",
@@ -1350,6 +1664,7 @@ test("applies released model selection responses across fresh and continuation t
 			continued: false,
 		};
 		await runner.run(firstTurn);
+		expect(checkedProvisionalPersistence).toBe(true);
 		const persisted = new FileBackedSessionMappingStore(mappingFile).get("same-session");
 		expect(persisted?.sessionFile).toMatch(new RegExp(`^${sessionRoot}/[^/]+\\.jsonl$`));
 		expect(persisted?.sessionFile).toBeDefined();
@@ -1444,7 +1759,267 @@ test("cleans up exactly the owned CLI pane when the post-CLI binding barrier fai
 		rmSync(root, { recursive: true, force: true });
 	}
 });
+test("retains an acknowledged session.new successor without transcript proof across restart and replay", async () => {
+	const fixture = setupAcknowledgedSessionNewFixture("absent");
+	try {
+		await expect(fixture.runner.run(fixture.turn)).rejects.toThrow();
+		expect(fixture.barrierHits).toBe(1);
+		const restarted = new FileBackedSessionMappingStore(fixture.mappingFile);
+		expect(restarted.get("chat-session-new")).toMatchObject({ sessionId: "sdk-session-created" });
+		expect(restarted.operation("chat-session-new", "session-new")).toMatchObject({
+			kind: "create",
+			state: "uncertain",
+			acknowledgedSuccessor: { sessionId: "sdk-session-new" },
+		});
+		const replay = createGjcRoutingLiveGatewayRunner({
+			turnRunner: createPublicSdkGjcTurnRunner(fixture.runnerInput),
+			mappings: restarted,
+			testBarrierHook: fixture.barrier,
+		});
+		await expect(replay.run(fixture.turn)).rejects.toThrow("requires reconciliation");
+		await expect(replay.run({ ...fixture.turn, prompt: "conflicting replay" })).rejects.toThrow(
+			"requires reconciliation",
+		);
+		expect(fixture.server.frames.filter(frame => frame.operation === "session.new")).toHaveLength(1);
+		expect(fixture.server.frames.some(frame => frame.operation === "session.close")).toBe(false);
+		expect(await Bun.file(fixture.predecessorPath).exists()).toBe(true);
+	} finally {
+		fixture.dispose();
+	}
+});
+test("promotes a delayed acknowledged session.new successor after restart", async () => {
+	const fixture = setupAcknowledgedSessionNewFixture("absent");
+	try {
+		await expect(fixture.runner.run(fixture.turn)).rejects.toThrow();
+		writeFileSync(
+			fixture.successorPath,
+			`${JSON.stringify({
+				type: "session",
+				version: 3,
+				id: "sdk-session-new",
+				timestamp: "2026-01-01T00:00:00.000Z",
+				cwd: fixture.root,
+			})}\n`,
+		);
+		const replay = createGjcRoutingLiveGatewayRunner({
+			turnRunner: createPublicSdkGjcTurnRunner(fixture.runnerInput),
+			mappings: new FileBackedSessionMappingStore(fixture.mappingFile),
+		});
+		await expect(replay.run(fixture.turn)).resolves.toMatchObject({ content: "" });
+		const restarted = new FileBackedSessionMappingStore(fixture.mappingFile);
+		expect(restarted.get("chat-session-new")).toMatchObject({
+			sessionId: "sdk-session-new",
+			sessionFile: fixture.successorPath,
+			operationId: "session-new",
+		});
+		expect(restarted.operation("chat-session-new", "session-new")).toEqual(
+			expect.not.objectContaining({ acknowledgedSuccessor: expect.anything() }),
+		);
+		expect(fixture.server.frames.filter(frame => frame.operation === "session.new")).toHaveLength(1);
+	} finally {
+		fixture.dispose();
+	}
+});
 
+test.each([
+	"duplicate",
+	"descriptor replacement",
+] as const)("does not promote an acknowledged session.new successor after restart on %s", async failure => {
+	const fixture = setupAcknowledgedSessionNewFixture("absent");
+	try {
+		await expect(fixture.runner.run(fixture.turn)).rejects.toThrow();
+		writeFileSync(
+			fixture.successorPath,
+			`${JSON.stringify({
+				type: "session",
+				version: 3,
+				id: "sdk-session-new",
+				timestamp: "2026-01-01T00:00:00.000Z",
+				cwd: fixture.root,
+			})}\n`,
+		);
+		if (failure === "duplicate")
+			writeFileSync(fixture.successorCopyPath, readFileSync(fixture.successorPath, "utf8"));
+		else
+			writeFileSync(
+				fixture.successorEndpointPath,
+				JSON.stringify({ version: 1, url: fixture.server.url, token: "replaced" }),
+			);
+		const replay = createGjcRoutingLiveGatewayRunner({
+			turnRunner: createPublicSdkGjcTurnRunner(fixture.runnerInput),
+			mappings: new FileBackedSessionMappingStore(fixture.mappingFile),
+		});
+		await expect(replay.run(fixture.turn)).rejects.toThrow("requires reconciliation");
+		expect(
+			new FileBackedSessionMappingStore(fixture.mappingFile).operation("chat-session-new", "session-new"),
+		).toMatchObject({
+			state: "uncertain",
+			acknowledgedSuccessor: { sessionId: "sdk-session-new" },
+		});
+		expect(fixture.server.frames.filter(frame => frame.operation === "session.new")).toHaveLength(1);
+		expect(fixture.server.frames.some(frame => frame.operation === "session.close")).toBe(false);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("promotes an acknowledged session.new successor only after a unique valid transcript", async () => {
+	const fixture = setupAcknowledgedSessionNewFixture("valid");
+	try {
+		await fixture.runner.run(fixture.turn);
+		const restarted = new FileBackedSessionMappingStore(fixture.mappingFile);
+		expect(restarted.get("chat-session-new")).toMatchObject({
+			sessionId: "sdk-session-new",
+			sessionFile: fixture.successorPath,
+			operationId: "session-new",
+		});
+		expect(restarted.operation("chat-session-new", "session-new")).toEqual(
+			expect.not.objectContaining({ acknowledgedSuccessor: expect.anything() }),
+		);
+		expect(fixture.server.frames.some(frame => frame.operation === "session.close")).toBe(false);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test.each([
+	"duplicate",
+	"invalid",
+] as const)("retains an acknowledged session.new successor when its transcript is %s", async transcript => {
+	const fixture = setupAcknowledgedSessionNewFixture(transcript);
+	try {
+		await expect(fixture.runner.run(fixture.turn)).rejects.toThrow();
+		const restarted = new FileBackedSessionMappingStore(fixture.mappingFile);
+		expect(restarted.get("chat-session-new")).toMatchObject({ sessionId: "sdk-session-created" });
+		expect(restarted.operation("chat-session-new", "session-new")).toMatchObject({
+			state: "uncertain",
+			acknowledgedSuccessor: { sessionId: "sdk-session-new" },
+		});
+		expect(
+			Object.keys(
+				restarted.operation("chat-session-new", "session-new")?.acknowledgedSuccessor?.attachment ?? {},
+			).sort(),
+		).toEqual([
+			"descriptorPath",
+			"descriptorStat",
+			"expectedCwd",
+			"expectedSessionId",
+			"generation",
+			"payloadDigest",
+		]);
+		expect(fixture.server.frames.some(frame => frame.operation === "session.close")).toBe(false);
+		expect(await Bun.file(fixture.predecessorPath).exists()).toBe(true);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+function setupAcknowledgedSessionNewFixture(transcript: "absent" | "valid" | "duplicate" | "invalid") {
+	const root = mkdtempSync(join(tmpdir(), "gjc-session-new-ack-"));
+	const sessionRoot = join(root, ".gjc", "sessions");
+	const endpointRoot = join(root, ".gjc", "state", "sdk");
+	const mappingFile = join(root, "mappings.json");
+	const predecessorPath = join(sessionRoot, "sdk-session-created.jsonl");
+	const successorPath = join(sessionRoot, "sdk-session-new.jsonl");
+	const server = startSdkFixtureServer("controls", root);
+	let barrierHits = 0;
+	mkdirSync(endpointRoot, { recursive: true });
+	mkdirSync(sessionRoot, { recursive: true });
+	writeFileSync(
+		predecessorPath,
+		`${JSON.stringify({ type: "session", version: 3, id: "sdk-session-created", timestamp: "2026-01-01T00:00:00.000Z", cwd: root })}\n`,
+	);
+	writeFileSync(
+		join(endpointRoot, "sdk-session-created.json"),
+		JSON.stringify({ version: 1, url: server.url, token: server.token }),
+	);
+	const mappings = new FileBackedSessionMappingStore(mappingFile);
+	mappings.set({
+		...mappingInput(mediumSelection),
+		chatId: "chat-session-new",
+		sessionId: "sdk-session-created",
+		sessionFile: predecessorPath,
+		operationId: "predecessor",
+	});
+	const barrier: GjcLifecycleTestBarrierHook = (phase, evidence) => {
+		if (phase !== "post_ack_pre_transcript") return;
+		barrierHits += 1;
+		expect(evidence).toMatchObject({ cwd: root, sessionId: "sdk-session-new" });
+		const persisted: any = JSON.parse(readFileSync(mappingFile, "utf8"));
+		expect(persisted.mappings[0]).toMatchObject({ sessionId: "sdk-session-created" });
+		expect(persisted.mappings[0].journal).toContainEqual(
+			expect.objectContaining({
+				id: "session-new",
+				kind: "create",
+				state: "pending",
+				acknowledgedSuccessor: expect.objectContaining({
+					sessionId: "sdk-session-new",
+					attachment: {
+						descriptorPath: expect.any(String),
+						descriptorStat: expect.any(Object),
+						expectedCwd: root,
+						expectedSessionId: "sdk-session-new",
+						generation: expect.any(Number),
+						payloadDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+					},
+				}),
+			}),
+		);
+		if (transcript === "absent") return;
+		const header = {
+			type: "session",
+			version: 3,
+			id: transcript === "invalid" ? "wrong-session" : "sdk-session-new",
+			timestamp: "2026-01-01T00:00:00.000Z",
+			cwd: root,
+		};
+		writeFileSync(successorPath, `${JSON.stringify(header)}\n`);
+		if (transcript === "duplicate")
+			writeFileSync(join(sessionRoot, "sdk-session-new-copy.jsonl"), `${JSON.stringify(header)}\n`);
+	};
+	const runnerInput = {
+		cliPath: join(root, "missing-gjc-cli"),
+		runtimeLocations: {
+			childEnvironment: { HOME: root, GJC_CONFIG_DIR: join(root, ".gjc"), GJC_CODING_AGENT_DIR: join(root, ".gjc") },
+		} as GjcRuntimeLocations,
+		turnTimeoutMs: 1_000,
+		testBarrierHook: barrier,
+	};
+	const turn = {
+		project: { ...project, cwd: root, sessionRoot },
+		prompt: "new successor",
+		chatId: "chat-session-new",
+		messageId: "assistant-session-new",
+		userMessageId: "session-new",
+		userMessageParentId: null,
+		continued: true,
+		control: { operation: "session.new" as const },
+	};
+	return {
+		runner: createGjcRoutingLiveGatewayRunner({
+			turnRunner: createPublicSdkGjcTurnRunner(runnerInput),
+			mappings,
+			testBarrierHook: barrier,
+		}),
+		runnerInput,
+		mappingFile,
+		root,
+		successorCopyPath: join(sessionRoot, "sdk-session-new-copy.jsonl"),
+		successorEndpointPath: join(endpointRoot, "sdk-session-new.json"),
+		predecessorPath,
+		successorPath,
+		server,
+		turn,
+		barrier,
+		get barrierHits() {
+			return barrierHits;
+		},
+		dispose() {
+			server.stop();
+			rmSync(root, { recursive: true, force: true });
+		},
+	};
+}
 function tmuxPanesInCwd(cwd: string): string[] {
 	const result = Bun.spawnSync({
 		cmd: ["tmux", "list-panes", "-a", "-F", "#{pane_id}|#{pane_current_path}"],
@@ -1459,6 +2034,19 @@ function tmuxPanesInCwd(cwd: string): string[] {
 			const [pane, paneCwd, ...extra] = line.split("|");
 			return extra.length === 0 && pane !== undefined && paneCwd === cwd ? [pane] : [];
 		});
+}
+class FailingFileSessionAuthority extends FileSessionAuthority {
+	failure: Error | undefined;
+	directoryFailure: Error | undefined;
+
+	protected override persist(): void {
+		if (this.failure !== undefined) throw this.failure;
+		super.persist();
+	}
+	protected override syncDirectory(): void {
+		if (this.directoryFailure !== undefined) throw this.directoryFailure;
+		super.syncDirectory();
+	}
 }
 const lowSelection = { provider: "anthropic", modelId: "claude-sonnet-4", thinkingLevel: "low" } as const;
 const mediumSelection = { ...lowSelection, thinkingLevel: "medium" } as const;
@@ -1481,6 +2069,19 @@ function mappingInput(modelSelection: NormalizedModelSelection) {
 		eventCursor: 0,
 		operationId: "user-1",
 		modelSelection,
+	};
+}
+function acknowledgedSuccessor(): any {
+	return {
+		sessionId: "session-successor",
+		attachment: {
+			descriptorPath: "/workspace/.gjc/endpoints/session-successor.json",
+			descriptorStat: { dev: 1, ino: 2, size: 3, mtimeMs: 4 },
+			payloadDigest: "0000000000000000000000000000000000000000000000000000000000000000",
+			generation: 4,
+			expectedSessionId: "session-successor",
+			expectedCwd: "/workspace",
+		},
 	};
 }
 function validAuthorityDocument(): any {
@@ -1730,6 +2331,41 @@ function setupPublicRunnerBarrierFixture(
 			rmSync(root, { recursive: true, force: true });
 		},
 	};
+}
+function provisionalPersistenceCheckingPort(
+	mappingFile: string,
+	alreadyChecked: () => boolean,
+	observed: () => void,
+): PublicSdkSessionPort {
+	const client = new PublicSdkSessionClient();
+	return new Proxy(client, {
+		get(target, property) {
+			const value = Reflect.get(target, property, target);
+			if (typeof value !== "function") return value;
+			if (property !== "prompt") return value.bind(target);
+			return async (...args: Parameters<PublicSdkSessionPort["prompt"]>) => {
+				if (!alreadyChecked()) {
+					const persisted: unknown = JSON.parse(readFileSync(mappingFile, "utf8"));
+					expect(persisted).toMatchObject({
+						provisionalOperations: [
+							{
+								kind: "create",
+								state: "pending",
+								sessionId: expect.any(String),
+								attachment: expect.objectContaining({
+									expectedSessionId: expect.any(String),
+									expectedCwd: expect.any(String),
+								}),
+							},
+						],
+					});
+					expect(JSON.stringify(persisted)).not.toContain('"sessionFile"');
+					observed();
+				}
+				return value.call(target, ...args);
+			};
+		},
+	}) as PublicSdkSessionPort;
 }
 function restoreEnv(name: string, value: string | undefined): void {
 	if (value === undefined) delete process.env[name];

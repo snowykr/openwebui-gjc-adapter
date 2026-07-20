@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { NormalizedModelSelection } from "../src/contracts";
@@ -28,6 +28,20 @@ import type {
 import { GjcCloseReceipt } from "../src/gjc/turn-runner";
 import type { RegisteredProject } from "../src/projects/registry";
 import { attachmentProof, lifecycleFixture } from "./gjc-lifecycle-fixtures";
+import { messageEntry, writeSessionFile } from "./session-sync-fixtures";
+
+function ownedAttachmentProof<T extends { readonly cwd: string; readonly sessionId: string }>(
+	address: T,
+): ReturnType<typeof attachmentProof> {
+	return {
+		...attachmentProof(address),
+		tmuxSocket: "/tmp/tmux.sock",
+		tmuxPane: "%1",
+		tmuxPanePid: 1,
+		tmuxOwnershipTag: "owner",
+		ownedAt: "2026-07-19T00:00:00.000Z",
+	};
+}
 
 class FakeGjcTurnRunner implements GjcTurnRunner {
 	readonly starts: GjcStartNewSessionInput[] = [];
@@ -48,7 +62,7 @@ class FakeGjcTurnRunner implements GjcTurnRunner {
 		input: GjcStartNewSessionInput,
 		publish: (result: GjcSessionAddress & GjcTurnResult, lifecycle: GjcLifecycleTransaction) => Promise<T>,
 		beforePrompt: (
-			address: GjcSessionAddress & { readonly sessionFile: string },
+			address: GjcSessionAddress,
 			attachment: ReturnType<typeof attachmentProof>,
 			lifecycle: GjcLifecycleTransaction,
 		) => Promise<void>,
@@ -64,11 +78,7 @@ class FakeGjcTurnRunner implements GjcTurnRunner {
 		};
 		const lifecycle = lifecycleFixture(address);
 		if (this.failPrompt) {
-			await beforePrompt(
-				{ ...address, sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl" },
-				attachmentProof(address),
-				lifecycle,
-			);
+			await beforePrompt(address, ownedAttachmentProof(address), lifecycle);
 			const error = new Error("prompt failed");
 			await onFailure?.(lifecycle, error);
 			throw error;
@@ -292,30 +302,187 @@ describe("routeGjcTurn", () => {
 	});
 
 	test("keeps the durable provisional create proof after a prompt failure and rejects replay or conflicting ingress", async () => {
-		const runner = new FakeGjcTurnRunner();
-		const mappings = new SessionMappingStore();
-		runner.failPrompt = true;
+		const directory = mkdtempSync(join(tmpdir(), "gjc-provisional-create-"));
+		try {
+			const cwd = join(directory, "project");
+			mkdirSync(join(cwd, ".gjc", "sessions"), { recursive: true });
+			const runner = new FakeGjcTurnRunner();
+			const mappings = new SessionMappingStore();
+			const project = { ...createProject(), cwd };
+			runner.failPrompt = true;
 
-		await expect(routeGjcTurn(routeInput(runner, mappings))).rejects.toThrow("prompt failed");
-		expect(mappings.provisionalOperation("chat-1", "message-1")).toEqual({
-			id: "message-1",
-			kind: "create",
-			ingressId: "message-1",
-			chatId: "chat-1",
-			projectId: "project",
-			detail: expect.any(String),
-			state: "uncertain",
-			startedAt: expect.any(String),
-			sessionId: "session-1",
-			sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
-			attachment: attachmentProof({
-				cwd: "/workspace/project",
+			await expect(routeGjcTurn(routeInput(runner, mappings, { project }))).rejects.toThrow("prompt failed");
+			expect(mappings.provisionalOperation("chat-1", "message-1")).toEqual({
+				id: "message-1",
+				kind: "create",
+				ingressId: "message-1",
+				chatId: "chat-1",
+				projectId: "project",
+				detail: expect.any(String),
+				state: "uncertain",
+				startedAt: expect.any(String),
 				sessionId: "session-1",
-			}),
-		});
-		await expect(routeGjcTurn(routeInput(runner, mappings))).rejects.toThrow("requires reconciliation");
-		await expect(routeGjcTurn(routeInput(runner, mappings, { text: "different" }))).rejects.toThrow("conflicts");
-		expect(runner.starts).toHaveLength(1);
+				attachment: ownedAttachmentProof({
+					cwd,
+					sessionId: "session-1",
+				}),
+			});
+			await expect(routeGjcTurn(routeInput(runner, mappings, { project }))).rejects.toThrow(
+				"requires reconciliation",
+			);
+			await expect(routeGjcTurn(routeInput(runner, mappings, { project, text: "different" }))).rejects.toThrow(
+				"conflicts",
+			);
+			expect(runner.starts).toHaveLength(1);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+	test("recovers an uncertain initial create after restart only from an exact current transcript", async () => {
+		const cases: readonly {
+			readonly name: string;
+			readonly write: (sessionRoot: string, cwd: string) => Promise<void>;
+			readonly currentAttachmentMismatch?: boolean;
+			readonly modelSelection?: NormalizedModelSelection;
+		}[] = [
+			{ name: "absent", write: async (_sessionRoot: string, _cwd: string) => undefined },
+			{
+				name: "duplicate",
+				write: async (sessionRoot: string, cwd: string) => {
+					await writeRecoveryTranscript(join(sessionRoot, "session-1.jsonl"), cwd);
+					await writeRecoveryTranscript(join(sessionRoot, "session-1-copy.jsonl"), cwd);
+				},
+			},
+			{
+				name: "descriptor mismatch",
+				write: async (sessionRoot: string, cwd: string) =>
+					writeRecoveryTranscript(join(sessionRoot, "session-1.jsonl"), cwd),
+				currentAttachmentMismatch: true,
+			},
+			{
+				name: "user mismatch",
+				write: async (sessionRoot: string, cwd: string) =>
+					writeRecoveryTranscript(join(sessionRoot, "session-1.jsonl"), cwd, "other"),
+			},
+			{
+				name: "assistant absence",
+				write: async (sessionRoot: string, cwd: string) =>
+					writeSessionFile(join(sessionRoot, "session-1.jsonl"), {
+						header: { id: "session-1", title: "Recovery", cwd },
+						entries: [messageEntry("user-1", null, "user", "hello")],
+					}),
+			},
+			{
+				name: "model-selected provisional",
+				write: async (sessionRoot: string, cwd: string) =>
+					writeRecoveryTranscript(join(sessionRoot, "session-1.jsonl"), cwd),
+				modelSelection: selection("anthropic", "selected", "low"),
+			},
+		];
+		for (const scenario of cases) {
+			const directory = mkdtempSync(join(tmpdir(), `gjc-initial-create-${scenario.name}-`));
+			try {
+				const cwd = join(directory, "project");
+				const sessionRoot = join(cwd, ".gjc", "sessions");
+				mkdirSync(sessionRoot, { recursive: true });
+				const project = { ...createProject(), cwd };
+				const authorityPath = join(directory, "authority.json");
+				const failedRunner = new FakeGjcTurnRunner();
+				failedRunner.failPrompt = true;
+				await expect(
+					routeGjcTurn(routeInput(failedRunner, new FileBackedSessionMappingStore(authorityPath), { project })),
+				).rejects.toThrow("prompt failed");
+				await scenario.write(sessionRoot, cwd);
+
+				const restarted = new FileBackedSessionMappingStore(authorityPath);
+				const recoveryRunner = new FakeGjcTurnRunner();
+				if (scenario.currentAttachmentMismatch) {
+					recoveryRunner.getState = async input => ({
+						...(await FakeGjcTurnRunner.prototype.getState.call(recoveryRunner, input)),
+						attachment: attachmentProof({ ...input.lifecycle.address, sessionId: "other-session" }),
+					});
+				}
+				await expect(
+					routeGjcTurn(
+						routeInput(recoveryRunner, restarted, { project, modelSelection: scenario.modelSelection }),
+					),
+				).rejects.toThrow("requires reconciliation");
+				expect(recoveryRunner.starts).toHaveLength(0);
+				expect(recoveryRunner.continues).toHaveLength(0);
+				expect(restarted.provisionalOperation("chat-1", "message-1")?.state).toBe("uncertain");
+			} finally {
+				rmSync(directory, { recursive: true, force: true });
+			}
+		}
+	});
+
+	test("replays an exact uncertain initial create after restart without prompting", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-initial-create-exact-"));
+		try {
+			const cwd = join(directory, "project");
+			const sessionRoot = join(cwd, ".gjc", "sessions");
+			mkdirSync(sessionRoot, { recursive: true });
+			const project = { ...createProject(), cwd };
+			const authorityPath = join(directory, "authority.json");
+			const failedRunner = new FakeGjcTurnRunner();
+			failedRunner.failPrompt = true;
+			await expect(
+				routeGjcTurn(routeInput(failedRunner, new FileBackedSessionMappingStore(authorityPath), { project })),
+			).rejects.toThrow("prompt failed");
+			await writeRecoveryTranscript(join(sessionRoot, "session-1.jsonl"), cwd);
+
+			const restarted = new FileBackedSessionMappingStore(authorityPath);
+			const recoveryRunner = new FakeGjcTurnRunner();
+			const result = await routeGjcTurn(routeInput(recoveryRunner, restarted, { project }));
+
+			expect(recoveryRunner.starts).toHaveLength(0);
+			expect(recoveryRunner.continues).toHaveLength(0);
+			expect(recoveryRunner.states).toHaveLength(1);
+			expect(result.assistantText).toBe("recovered");
+			expect(result.mapping).toMatchObject({
+				sessionId: "session-1",
+				sessionFile: join(sessionRoot, "session-1.jsonl"),
+				activeLeaf: "assistant-1",
+				operationId: "message-1",
+			});
+			expect(restarted.provisionalOperation("chat-1", "message-1")?.state).toBe("complete");
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+	test("preserves a failed initial-create recovery publication as the reconciliation cause", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-initial-create-publication-cause-"));
+		try {
+			const cwd = join(directory, "project");
+			const sessionRoot = join(cwd, ".gjc", "sessions");
+			mkdirSync(sessionRoot, { recursive: true });
+			const project = { ...createProject(), cwd };
+			const authorityPath = join(directory, "authority.json");
+			const failedRunner = new FakeGjcTurnRunner();
+			failedRunner.failPrompt = true;
+			await expect(
+				routeGjcTurn(routeInput(failedRunner, new FileBackedSessionMappingStore(authorityPath), { project })),
+			).rejects.toThrow("prompt failed");
+			await writeRecoveryTranscript(join(sessionRoot, "session-1.jsonl"), cwd);
+
+			const publicationError = new Error("lifecycle publication failed");
+			const recoveryRunner = new FakeGjcTurnRunner();
+			recoveryRunner.withLifecyclePublication = async <T>(
+				_address: GjcLifecyclePublicationAddress,
+				_effect: (lifecycle: GjcLifecycleTransaction) => Promise<T>,
+			): Promise<T> => {
+				throw publicationError;
+			};
+
+			await expect(
+				routeGjcTurn(routeInput(recoveryRunner, new FileBackedSessionMappingStore(authorityPath), { project })),
+			).rejects.toMatchObject({
+				message: "GJC operation message-1 requires reconciliation.",
+				cause: publicationError,
+			});
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
 	});
 	test("keeps a completed create authoritative when projection publication fails and repairs on replay", async () => {
 		const runner = new FakeGjcTurnRunner();
@@ -701,4 +868,13 @@ function createProject(): RegisteredProject {
 		allowedRoot: "/workspace",
 		createdAt: new Date("2026-07-08T00:00:00.000Z"),
 	};
+}
+async function writeRecoveryTranscript(filePath: string, cwd: string, userText = "hello"): Promise<void> {
+	await writeSessionFile(filePath, {
+		header: { id: "session-1", title: "Recovery", cwd },
+		entries: [
+			messageEntry("user-1", null, "user", userText),
+			messageEntry("assistant-1", "user-1", "assistant", "recovered"),
+		],
+	});
 }

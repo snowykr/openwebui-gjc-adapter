@@ -49,6 +49,15 @@ export interface SessionAttachmentProof {
 	readonly tmuxOwnershipTag?: string;
 	readonly ownedAt?: string;
 }
+export type EndpointSessionAttachmentProof = Omit<
+	SessionAttachmentProof,
+	"tmuxSocket" | "tmuxPane" | "tmuxPanePid" | "tmuxOwnershipTag" | "ownedAt"
+>;
+
+export interface AcknowledgedSuccessor {
+	readonly sessionId: string;
+	readonly attachment: EndpointSessionAttachmentProof;
+}
 
 export interface SessionOperationResult {
 	readonly kind: "turn" | "control" | "close";
@@ -78,6 +87,7 @@ export interface SessionOperation {
 	readonly completedAt?: string;
 	readonly detail?: string;
 	readonly result?: SessionOperationResult;
+	readonly acknowledgedSuccessor?: AcknowledgedSuccessor;
 }
 
 export interface ProvisionalSessionOperation extends SessionOperation {

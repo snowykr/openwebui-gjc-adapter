@@ -30,10 +30,10 @@ import {
 	attachmentProof,
 	canRetainColdResumePane,
 	isPositiveSafeInteger,
-	runLifecycleTestBarrier,
 	type SessionAttachment,
 } from "./gjc-routing-proof";
 import { isModelSelectionApplyFailure } from "./gjc-routing-selection";
+import { runLifecycleTestBarrier } from "./gjc-routing-test-barrier";
 import { modelSelectionError } from "./model-selection-errors";
 
 export async function ensureAttachment(

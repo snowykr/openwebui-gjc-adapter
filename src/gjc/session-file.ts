@@ -1,10 +1,21 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, constants, createReadStream, fstatSync, openSync, realpathSync } from "node:fs";
-import { copyFile, link, mkdir, rm } from "node:fs/promises";
-import { basename, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
+import {
+	closeSync,
+	constants,
+	createReadStream,
+	createWriteStream,
+	fstatSync,
+	openSync,
+	readSync,
+	realpathSync,
+} from "node:fs";
+import { link, mkdir, rm } from "node:fs/promises";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
+import { pipeline } from "node:stream/promises";
 import type { RegisteredProject } from "../projects/registry";
+import { resolveExistingOrProspectivePath } from "./session-file-path";
+import { decodeSessionHeader } from "./session-transcript-decoder";
 import { getProjectSessionRoot } from "./turn-runner";
-
 export class SessionFileBoundaryError extends Error {
 	override readonly name = "SessionFileBoundaryError";
 }
@@ -103,15 +114,20 @@ export async function ensureSdkSessionFile(
 	project: RegisteredProject,
 	sessionFile: string | undefined,
 	sdkSessionRoot: string,
+	expectedLegacySessionId?: string,
 ): Promise<string | undefined> {
 	if (sessionFile === undefined) return undefined;
 	try {
 		return validateSessionFile(project, sessionFile, sdkSessionRoot);
 	} catch (error) {
 		if (!(error instanceof SessionFileBoundaryError)) throw error;
-		const legacyFile = validateSessionFile(project, sessionFile);
+		const legacyFile = validateExplicitLegacySessionFile(project, sessionFile, expectedLegacySessionId);
 		if (legacyFile === undefined) throw error;
-		return copyLegacySessionFile(legacyFile, sdkSessionRoot);
+		try {
+			return await copyLegacySessionFile(legacyFile, sdkSessionRoot);
+		} finally {
+			legacyFile.close();
+		}
 	}
 }
 
@@ -127,19 +143,66 @@ function validatePathWithinRoot(sessionFile: string, sessionRoot: string): strin
 	return resolvedSessionFile;
 }
 
-async function copyLegacySessionFile(source: string, sdkSessionRoot: string): Promise<string> {
+function validateExplicitLegacySessionFile(
+	project: RegisteredProject,
+	sessionFile: string,
+	expectedSessionId: string | undefined,
+): OpenedRegularSessionFile | undefined {
+	if (expectedSessionId === undefined || expectedSessionId.trim().length === 0) return undefined;
+	let legacyPath: string;
+	try {
+		legacyPath = validateSessionFile(project, sessionFile) ?? "";
+	} catch (error) {
+		if (error instanceof SessionFileBoundaryError) return undefined;
+		throw error;
+	}
+	if (legacyPath.length === 0) return undefined;
+
+	let opened: OpenedRegularSessionFile;
+	try {
+		opened = openAbsoluteRegularSessionFile(sessionFile);
+	} catch {
+		return undefined;
+	}
+	let accepted = false;
+	try {
+		const headerBytes = Buffer.alloc(1024 * 1024);
+		const bytesRead = readSync(opened.descriptor, headerBytes, 0, headerBytes.length, 0);
+		const headerLine = headerBytes.subarray(0, bytesRead).toString("utf8").split(/\r?\n/, 1)[0];
+		if (headerLine === undefined) return undefined;
+		const header = decodeSessionHeader(JSON.parse(headerLine));
+		if (
+			header?.version !== 3 ||
+			header.id !== expectedSessionId ||
+			realpathSync(header.cwd) !== realpathSync(project.cwd)
+		)
+			return undefined;
+		revalidateOpenedRegularSessionFile(opened);
+		accepted = true;
+		return opened;
+	} catch {
+		return undefined;
+	} finally {
+		if (!accepted) opened.close();
+	}
+}
+async function copyLegacySessionFile(source: OpenedRegularSessionFile, sdkSessionRoot: string): Promise<string> {
 	const canonicalRoot = resolveExistingOrProspectivePath(sdkSessionRoot);
 	await mkdir(canonicalRoot, { recursive: true });
-	const target = resolve(canonicalRoot, basename(source));
-	const temporary = join(canonicalRoot, `.${basename(source)}.${randomUUID()}.migration`);
+	const target = resolve(canonicalRoot, basename(source.canonicalPath));
+	const temporary = join(canonicalRoot, `.${basename(source.canonicalPath)}.${randomUUID()}.migration`);
 	try {
-		await copyFile(source, temporary, constants.COPYFILE_EXCL);
+		revalidateOpenedRegularSessionFile(source);
+		await pipeline(
+			createReadStream("", { fd: source.descriptor, autoClose: false }),
+			createWriteStream(temporary, { flags: "wx" }),
+		);
 		try {
 			await link(temporary, target);
 		} catch (error) {
 			if (!isAlreadyExistsError(error)) throw error;
 			const existingTarget = validatePathWithinRoot(target, canonicalRoot);
-			if ((await hashFile(source)) !== (await hashFile(existingTarget))) {
+			if ((await hashFile(temporary)) !== (await hashFile(existingTarget))) {
 				throw new Error(`SDK session migration target already contains different data: ${target}`);
 			}
 		}
@@ -153,37 +216,6 @@ async function hashFile(path: string): Promise<string> {
 	const hash = createHash("sha256");
 	for await (const chunk of createReadStream(path)) hash.update(chunk);
 	return hash.digest("hex");
-}
-
-function resolveExistingOrProspectivePath(targetPath: string): string {
-	const absoluteTargetPath = resolve(targetPath);
-	try {
-		return realpathSync(absoluteTargetPath);
-	} catch (error) {
-		if (!isNotFoundError(error)) throw error;
-	}
-
-	const parsedPath = parse(absoluteTargetPath);
-	const segments = [
-		parsedPath.root,
-		...relative(parsedPath.root, absoluteTargetPath)
-			.split(sep)
-			.filter(segment => segment.length > 0),
-	];
-	for (let index = segments.length - 1; index >= 0; index -= 1) {
-		const parentCandidate = resolve(...segments.slice(0, index + 1));
-		try {
-			const realParent = realpathSync(parentCandidate);
-			return resolve(realParent, ...segments.slice(index + 1));
-		} catch (error) {
-			if (!isNotFoundError(error)) throw error;
-		}
-	}
-	throw new Error(`No existing parent found for path: ${targetPath}`);
-}
-
-function isNotFoundError(error: unknown): boolean {
-	return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
 
 function isAlreadyExistsError(error: unknown): boolean {

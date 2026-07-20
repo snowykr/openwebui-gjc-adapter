@@ -204,6 +204,64 @@ describe("CLI module boundaries", () => {
 		// Then: the facade remains reviewable without compressed lines.
 		expect(cliLines).toBeLessThanOrEqual(250);
 	});
+	test("pins explicit live package exports and blocks internal live modules", () => {
+		const manifest = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")) as {
+			exports: Record<string, unknown>;
+		};
+		const supportedLivePaths = [
+			"./live/chat-completions",
+			"./live/gjc-routing-runner",
+			"./live/models",
+			"./live/openai-types",
+		] as const;
+
+		expect(
+			Object.keys(manifest.exports)
+				.filter(path => path.startsWith("./live/") && path !== "./live/*")
+				.sort(),
+		).toEqual([...supportedLivePaths].sort());
+		expect(manifest.exports["./live/*"]).toBeNull();
+		for (const path of supportedLivePaths)
+			expect(manifest.exports[path]).toEqual({
+				types: `./src/${path.slice(2)}.ts`,
+				import: `./src/${path.slice(2)}.ts`,
+			});
+	});
+	test("resolves supported live consumer paths but rejects internals", async () => {
+		for (const path of [
+			"openwebui-gjc-adapter/live/chat-completions",
+			"openwebui-gjc-adapter/live/gjc-routing-runner",
+			"openwebui-gjc-adapter/live/models",
+			"openwebui-gjc-adapter/live/openai-types",
+		])
+			await expect(import(path)).resolves.toBeDefined();
+
+		for (const path of [
+			"openwebui-gjc-adapter/live/gjc-routing-control",
+			"openwebui-gjc-adapter/live/gjc-routing-successor-recovery",
+			"openwebui-gjc-adapter/live/gjc-routing-test-barrier",
+		])
+			await expect(import(path)).rejects.toThrow();
+	});
+
+	test("keeps the live routing type graph below the runner facade", () => {
+		const selectionSource = readFileSync(join(ROOT, "src/live/gjc-routing-selection.ts"), "utf8");
+		const gatewaySource = readFileSync(join(ROOT, "src/live/gjc-routing-gateway.ts"), "utf8");
+		const facadeSource = readFileSync(join(ROOT, "src/live/gjc-routing-runner.ts"), "utf8");
+
+		expect({
+			selectionTypeEdgeToLowerRunner:
+				/import\s+type\s+\{\s*GjcTurnRunner\s*\}\s+from\s+["']\.\.\/gjc\/turn-runner["']/.test(selectionSource),
+			selectionToRunnerFacade: relativeImports(selectionSource).includes("./gjc-routing-runner"),
+			gatewayToSelection: relativeImports(gatewaySource).includes("./gjc-routing-selection"),
+			facadeToGateway: relativeImports(facadeSource).includes("./gjc-routing-gateway"),
+		}).toEqual({
+			selectionTypeEdgeToLowerRunner: true,
+			selectionToRunnerFacade: false,
+			gatewayToSelection: true,
+			facadeToGateway: true,
+		});
+	});
 
 	test("enforces the exact acyclic CLI import graph", async () => {
 		// Given: extraction modules that may not yet exist during architecture RED.

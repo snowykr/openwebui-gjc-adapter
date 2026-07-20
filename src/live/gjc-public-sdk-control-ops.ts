@@ -1,21 +1,31 @@
 import { resolve } from "node:path";
-import { authorizeBranchRegenerateCandidate, resolveBranchRegenerateAction } from "../branches/regenerate";
 import { SdkV3OperationError } from "../gjc/sdk-v3-protocol";
-import { discoverFreshGjcSessionFile, snapshotGjcSessionFiles } from "../gjc/session-loader";
+import type { AcknowledgedSuccessor } from "../gjc/session-authority-types";
+import { snapshotGjcSessionFiles } from "../gjc/session-loader";
 import type { SessionMapping } from "../gjc/session-router";
 import type { GjcControlResult, GjcLifecycleTransaction } from "../gjc/turn-runner";
 import type { LiveGatewayRunnerInput } from "./chat-completions";
 import { OpenWebUIControlError } from "./chat-completions-types";
-import { ensureAttachment, freshAttachmentProof, withMutationPort, withPort } from "./gjc-public-sdk-session-ops";
-import { attachmentKey, validatePersistedSessionIdentity, waitForSdkEndpoint } from "./gjc-routing-endpoints";
+import { ensureAttachment, freshAttachmentProof, withMutationPort } from "./gjc-public-sdk-session-ops";
+import {
+	discoverSuccessorSessionFile,
+	endpointSuccessorProof,
+	handoffAcknowledgedNewSessionSuccessor,
+	retainedSuccessorPane,
+	runBranchControl,
+	successorAttachmentProof,
+} from "./gjc-public-sdk-successor-authority";
+import { attachmentKey, validatePersistedSessionIdentity } from "./gjc-routing-endpoints";
 import type { PublicSdkRunnerContext } from "./gjc-routing-lifecycle";
-import { attachmentProof, type SessionAttachment, turnResult } from "./gjc-routing-proof";
+import { type SessionAttachment, turnResult } from "./gjc-routing-proof";
+import { runLifecycleTestBarrier } from "./gjc-routing-test-barrier";
 
 export async function runControl(
 	context: PublicSdkRunnerContext,
 	input: LiveGatewayRunnerInput,
 	mapping: SessionMapping,
 	lifecycle: GjcLifecycleTransaction,
+	onAcknowledgedSuccessor?: (successor: AcknowledgedSuccessor) => Promise<void> | void,
 ): Promise<GjcControlResult> {
 	const control = input.control;
 	if (control === undefined) throw new Error("OpenWebUI control request was not supplied.");
@@ -25,9 +35,10 @@ export async function runControl(
 		control.operation === "session.resume" ||
 		control.operation === "session.switch"
 	) {
-		return runSessionControl(context, input, mapping, lifecycle);
+		return runSessionControl(context, input, mapping, lifecycle, onAcknowledgedSuccessor);
 	}
-	if (control.operation === "branch") return runBranchControl(context, input, mapping, lifecycle);
+	if (control.operation === "branch")
+		return runBranchControl(context, input, mapping, lifecycle, onAcknowledgedSuccessor);
 	const attachment = await ensureAttachment(context, mappedAddress(input, mapping), lifecycle);
 	const idempotencyKey = `${input.chatId}:${input.userMessageId}`;
 	if (control.operation === "abort") {
@@ -76,6 +87,7 @@ async function runSessionControl(
 	input: LiveGatewayRunnerInput,
 	mapping: SessionMapping,
 	lifecycle: GjcLifecycleTransaction,
+	onAcknowledgedSuccessor?: (successor: AcknowledgedSuccessor) => Promise<void> | void,
 ): Promise<GjcControlResult> {
 	const control = input.control;
 	if (
@@ -137,15 +149,28 @@ async function runSessionControl(
 			"endpoint_stale",
 			"Lifecycle operation did not bind to the expected successor in the mapped workspace",
 		);
+	const successorProof = await successorAttachmentProof(context, attachment, successor);
+	if (isNewSession) {
+		await handoffAcknowledgedNewSessionSuccessor(
+			lifecycle,
+			{ cwd: input.project.cwd, sessionRoot, chatId: mapping.chatId },
+			mapping,
+			successor,
+			successorProof,
+		);
+		await onAcknowledgedSuccessor?.({
+			sessionId: successor.sessionId,
+			attachment: endpointSuccessorProof(successorProof),
+		});
+		await runLifecycleTestBarrier(context.input.testBarrierHook, "post_ack_pre_transcript", successor);
+	}
 	const sessionFile = isNewSession
-		? (
-				await discoverFreshGjcSessionFile(
-					sessionRoot,
-					baseline ?? new Set<string>(),
-					successor.sessionId,
-					input.project.cwd,
-				)
-			).filePath
+		? await discoverSuccessorSessionFile(
+				sessionRoot,
+				baseline ?? new Set<string>(),
+				successor.sessionId,
+				input.project.cwd,
+			)
 		: sessionTarget?.sessionFile;
 	if (sessionFile === undefined)
 		throw new SdkV3OperationError(
@@ -160,6 +185,7 @@ async function runSessionControl(
 		sessionId: successor.sessionId,
 		sessionFile,
 	});
+	const retainedPane = retainedSuccessorPane(attachment, successorProof);
 	const successorAttachment: SessionAttachment = {
 		cwd: resolve(input.project.cwd),
 		sessionRoot,
@@ -167,8 +193,9 @@ async function runSessionControl(
 		sessionId: successor.sessionId,
 		sessionPath: sessionFile,
 		published: successor,
+		...(retainedPane === undefined ? {} : { pane: retainedPane }),
 	};
-	const proof = attachmentProof(successor, successorAttachment);
+	const proof = successorProof;
 	const address = {
 		cwd: input.project.cwd,
 		sessionRoot,
@@ -181,62 +208,6 @@ async function runSessionControl(
 	context.attachments.set(attachmentKey(address), successorAttachment);
 	await lifecycle.handoff(address, proof);
 	return { sessionId: successor.sessionId, sessionFile, attachment: proof };
-}
-
-async function runBranchControl(
-	context: PublicSdkRunnerContext,
-	input: LiveGatewayRunnerInput,
-	mapping: SessionMapping,
-	lifecycle: GjcLifecycleTransaction,
-): Promise<GjcControlResult> {
-	const decision = resolveBranchRegenerateAction({
-		ownerUserId: input.ownerUserId,
-		project: input.project,
-		chatId: input.chatId,
-		messageId: input.messageId,
-		mappings: { get: () => mapping },
-		messageMetadata: input.messageMetadata,
-	});
-	if (decision.action === "uncertain") throw new OpenWebUIControlError(`branch_lineage_${decision.reason}`);
-	const sessionRoot = resolve(input.project.sessionRoot ?? `${input.project.cwd}/.gjc/sessions`);
-	const baseline = await snapshotGjcSessionFiles(sessionRoot);
-	const attachment = await ensureAttachment(context, mappedAddress(input, mapping, sessionRoot), lifecycle);
-	const branched = await withPort(context, attachment, lifecycle, async port => {
-		const authorized = authorizeBranchRegenerateCandidate(
-			decision,
-			await port.branchCandidates(context.input.turnTimeoutMs),
-		);
-		if (authorized.action === "uncertain") throw new OpenWebUIControlError(`branch_lineage_${authorized.reason}`);
-		return port.branch(
-			{ entryId: authorized.gjcEntryId },
-			`${input.chatId}:${input.userMessageId}`,
-			context.input.turnTimeoutMs,
-		);
-	});
-	if (branched.sessionId === attachment.sessionId) throw new OpenWebUIControlError("branch_successor_identity");
-	const sessionFile = (await discoverFreshGjcSessionFile(sessionRoot, baseline, branched.sessionId, input.project.cwd))
-		.filePath;
-	const published = await waitForSdkEndpoint(input.project.cwd, branched.sessionId);
-	const successorAttachment: SessionAttachment = {
-		cwd: resolve(input.project.cwd),
-		sessionRoot,
-		projectId: mapping.projectId,
-		sessionId: branched.sessionId,
-		sessionPath: sessionFile,
-		published,
-	};
-	const proof = attachmentProof(published, successorAttachment);
-	context.attachments.set(
-		attachmentKey({
-			cwd: input.project.cwd,
-			sessionRoot,
-			projectId: mapping.projectId,
-			chatId: mapping.chatId,
-			sessionId: branched.sessionId,
-		}),
-		successorAttachment,
-	);
-	return { sessionId: branched.sessionId, sessionFile, attachment: proof };
 }
 
 function mappedAddress(

@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { buildAdapterServerOptionsFromEnv as buildOptions } from "../src/adapter-server-options";
 import { ProjectLinkError as LinkError } from "../src/projects/link-service";
 import { SqliteProjectRegistrationStore as RegistrationStore } from "../src/projects/registration-store";
+import { startAdapterServer } from "../src/server";
 import { reserveTcpPort } from "./cli-fixtures";
 import * as fixture from "./project-registration-startup-preflight-fixtures";
 
@@ -56,17 +57,55 @@ test("lifecycle closes one internal store without replacing the primary error", 
 	// Given: internal creation, a deterministic realpath sentinel, and a secondary close failure.
 	const context = await makeContext("internal");
 	const missing = path.join(context.root, "missing");
-	const primary = Object.freeze(new Error("primary realpath failure"));
+	const primary = new Error("primary realpath failure");
 	const secondary = Object.freeze(new Error("secondary close failure"));
 	const originalRealpath = fs.realpath;
 	const realpath = spyOn(fs, "realpath");
-	for (let index = 0; index < 4; index += 1) realpath.mockImplementationOnce(originalRealpath);
+	for (let index = 0; index < 5; index += 1) realpath.mockImplementationOnce(originalRealpath);
 	realpath.mockRejectedValueOnce(primary);
 	const original = RegistrationStore.prototype.close;
 	const close = spyOn(RegistrationStore.prototype, "close").mockImplementation(closeAfter(original, secondary));
 	// When: allowed-root resolution rejects. Then: one close preserves the sentinel and releases descriptors.
 	await expect(buildOptions(runtimeEnv(context.root, missing))).rejects.toBe(primary);
-	expect([realpath.mock.calls.at(-1), close.mock.calls.length]).toEqual([[missing], 1]);
+	expect([primary.cause, realpath.mock.calls.at(-1), close.mock.calls.length]).toEqual([secondary, [missing], 1]);
+	for (const mock of [realpath, close]) mock.mockRestore();
+	expect(await fixture.openFileDescriptors(context.databasePath)).toEqual([]);
+});
+test("lifecycle aggregates an existing startup cause with an internal store close failure", async () => {
+	// Given: a primary error that already identifies its cause and a secondary close failure.
+	const context = await makeContext("internal-existing-cause");
+	const missing = path.join(context.root, "missing");
+	const existingCause = new Error("existing startup cause");
+	const primary = new Error("primary realpath failure", { cause: existingCause });
+	const secondary = new Error("secondary close failure");
+	const originalRealpath = fs.realpath;
+	const realpath = spyOn(fs, "realpath");
+	for (let index = 0; index < 5; index += 1) realpath.mockImplementationOnce(originalRealpath);
+	realpath.mockRejectedValueOnce(primary);
+	const original = RegistrationStore.prototype.close;
+	const close = spyOn(RegistrationStore.prototype, "close").mockImplementation(closeAfter(original, secondary));
+	// When: allowed-root resolution rejects. Then: the primary remains top-level and both causes remain visible.
+	await expect(buildOptions(runtimeEnv(context.root, missing))).rejects.toBe(primary);
+	expect(primary.cause).toBeInstanceOf(AggregateError);
+	if (!(primary.cause instanceof AggregateError)) throw new TypeError("expected aggregate startup cleanup cause");
+	expect(primary.cause.errors).toEqual([existingCause, secondary]);
+	expect(close).toHaveBeenCalledTimes(1);
+	for (const mock of [realpath, close]) mock.mockRestore();
+	expect(await fixture.openFileDescriptors(context.databasePath)).toEqual([]);
+});
+test("lifecycle preserves the startup error when the internal store closes successfully", async () => {
+	// Given: a deterministic startup failure and a normal internal store close.
+	const context = await makeContext("internal-successful-close");
+	const missing = path.join(context.root, "missing");
+	const primary = new Error("primary realpath failure");
+	const originalRealpath = fs.realpath;
+	const realpath = spyOn(fs, "realpath");
+	for (let index = 0; index < 5; index += 1) realpath.mockImplementationOnce(originalRealpath);
+	realpath.mockRejectedValueOnce(primary);
+	const close = spyOn(RegistrationStore.prototype, "close");
+	// When: allowed-root resolution rejects. Then: successful cleanup leaves its error unchanged.
+	await expect(buildOptions(runtimeEnv(context.root, missing))).rejects.toBe(primary);
+	expect([primary.cause, close.mock.calls.length]).toEqual([undefined, 1]);
 	for (const mock of [realpath, close]) mock.mockRestore();
 	expect(await fixture.openFileDescriptors(context.databasePath)).toEqual([]);
 });
@@ -91,6 +130,86 @@ test("lifecycle closes constructor-local handles while preserving initialization
 		expect(await fixture.existingSourceArtifacts(databasePath)).toEqual(expect.arrayContaining(artifacts));
 		expect(await fixture.openFileDescriptors(databasePath)).toEqual([]);
 	}
+});
+test("a concurrent startup loser has no effects beyond observing the held singleton lease", async () => {
+	const context = await makeContext("singleton-concurrent");
+	const originalRealpath = fs.realpath;
+	let allowWinnerToFinish!: () => void;
+	let authorityReached!: () => void;
+	const winnerBlocked = new Promise<void>(resolve => {
+		allowWinnerToFinish = resolve;
+	});
+	const authorityObserved = new Promise<void>(resolve => {
+		authorityReached = resolve;
+	});
+	const blockingRealpath = (async (target: Parameters<typeof fs.realpath>[0]) => {
+		if (target === context.root) {
+			authorityReached();
+			await winnerBlocked;
+		}
+		return originalRealpath(target);
+	}) as typeof fs.realpath;
+	const realpath = spyOn(fs, "realpath").mockImplementation(blockingRealpath);
+	const exec = spyOn(Database.prototype, "exec");
+	const serve = spyOn(Bun, "serve");
+	let winner: Awaited<ReturnType<typeof buildOptions>> | undefined;
+	try {
+		const winnerStartup = buildOptions(runtimeEnv(context.root));
+		await authorityObserved;
+		for (const mock of [exec, realpath, serve]) mock.mockClear();
+		await expect(buildOptions(runtimeEnv(context.root))).rejects.toThrow(
+			`Adapter runtime root is already owned by PID ${process.pid}`,
+		);
+		expect({
+			sqlite: exec.mock.calls.length,
+			authorityPaths: realpath.mock.calls.map(([target]) => target),
+			outbox: await Bun.file(path.join(context.root, "state", "openwebui-projection-outbox.json")).exists(),
+			server: serve.mock.calls.length,
+		}).toEqual({
+			sqlite: 0,
+			authorityPaths: [path.join(context.root, "state")],
+			outbox: false,
+			server: 0,
+		});
+		allowWinnerToFinish();
+		winner = await winnerStartup;
+	} finally {
+		allowWinnerToFinish();
+		for (const mock of [exec, realpath, serve]) mock.mockRestore();
+		await winner?.runtimeLock.release();
+	}
+	const successor = await buildOptions(runtimeEnv(context.root));
+	await successor.runtimeLock.release();
+});
+
+test("build, preflight, and serve failures each release the singleton lease", async () => {
+	const buildContext = await makeContext("singleton-build-release");
+	const missing = path.join(buildContext.root, "missing");
+	await expect(buildOptions(runtimeEnv(buildContext.root, missing))).rejects.toHaveProperty("code", "ENOENT");
+	const afterBuild = await buildOptions(runtimeEnv(buildContext.root));
+	expect(afterBuild.runtimeRoot).toBe(path.join(buildContext.root, "state"));
+	await afterBuild.runtimeLock.release();
+
+	const preflightContext = await makeContext("singleton-preflight-release");
+	await fs.mkdir(path.dirname(preflightContext.databasePath), { recursive: true });
+	await fs.writeFile(preflightContext.databasePath, "not sqlite");
+	await expect(buildOptions(runtimeEnv(preflightContext.root))).rejects.toThrow(
+		"Project registration database is incompatible.",
+	);
+	await fs.rm(preflightContext.databasePath);
+	const afterPreflight = await buildOptions(runtimeEnv(preflightContext.root));
+	await afterPreflight.runtimeLock.release();
+
+	const serveContext = await makeContext("singleton-serve-release");
+	const options = await buildOptions(runtimeEnv(serveContext.root));
+	const failure = Object.freeze(new Error("serve failure"));
+	const serve = spyOn(Bun, "serve").mockImplementation(() => {
+		throw failure;
+	});
+	await expect(startAdapterServer(options)).rejects.toBe(failure);
+	serve.mockRestore();
+	const afterServe = await buildOptions(runtimeEnv(serveContext.root));
+	await afterServe.runtimeLock.release();
 });
 async function compatibleCase(kind: string) {
 	const context = await makeContext(`compatible-${kind}`);

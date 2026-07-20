@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { LiveGatewayRunner } from "../src/live/chat-completions";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import type { RegisteredProject } from "../src/projects/registry";
+import { RuntimeSingletonLock } from "../src/runtime-singleton-lock";
 import { createAdapterRequestHandler, startAdapterServer } from "../src/server";
 import { CANONICAL_MODEL_IDS, LOW_MODEL_ID, staticModelReaderFactory } from "./model-selection-fixtures";
 
@@ -215,7 +216,12 @@ describe("Bun transport configuration", () => {
 		let handle: Awaited<ReturnType<typeof startAdapterServer>> | undefined;
 
 		try {
-			handle = await startAdapterServer({ host: "127.0.0.1", port: 0, runtimeRoot });
+			handle = await startAdapterServer({
+				host: "127.0.0.1",
+				port: 0,
+				runtimeRoot,
+				runtimeLock: await RuntimeSingletonLock.acquire(runtimeRoot),
+			});
 			const serverOptions = serve.mock.calls[0]?.[0];
 
 			expect(serverOptions).toMatchObject({ idleTimeout: 180 });

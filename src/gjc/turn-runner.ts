@@ -9,7 +9,8 @@ import type {
 	GjcSessionAddress,
 } from "./lifecycle-transaction";
 import type { SessionAttachmentProof } from "./session-authority";
-import type { SessionMapping } from "./session-router";
+import type { AcknowledgedSuccessor } from "./session-authority-types";
+import type { SessionMapping } from "./session-mapping-store";
 
 export type {
 	GjcLifecycleOwner,
@@ -127,7 +128,7 @@ export interface GjcTurnRunner {
 		input: GjcStartNewSessionInput,
 		publish: (result: GjcSessionAddress & GjcTurnResult, lifecycle: GjcLifecycleTransaction) => Promise<T>,
 		beforePrompt: (
-			address: GjcSessionAddress & { readonly sessionFile: string },
+			address: GjcSessionAddress,
 			attachment: SessionAttachmentProof,
 			lifecycle: GjcLifecycleTransaction,
 		) => Promise<void>,
@@ -144,6 +145,7 @@ export interface GjcTurnRunner {
 		input: LiveGatewayRunnerInput,
 		mapping: SessionMapping,
 		lifecycle: GjcLifecycleTransaction,
+		onAcknowledgedSuccessor?: (successor: AcknowledgedSuccessor) => Promise<void> | void,
 	): Promise<GjcControlResult>;
 }
 

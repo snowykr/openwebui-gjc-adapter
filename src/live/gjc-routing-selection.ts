@@ -1,8 +1,8 @@
 import type { NormalizedModelSelection } from "../contracts";
 import { SdkV3OperationError } from "../gjc/sdk-v3-protocol";
 import { normalizeModelSelection, type SessionMapping } from "../gjc/session-router";
+import type { GjcTurnRunner } from "../gjc/turn-runner";
 import type { LiveGatewayRunnerInput, LiveGatewayRunnerResult } from "./chat-completions";
-import type { GjcSessionTurnRunner } from "./gjc-routing-runner";
 import type { ModelReader, ModelReaderFactory } from "./model-reader";
 import { modelSelectionError } from "./model-selection-errors";
 import { createModelSelectionPolicy } from "./model-selection-policy";
@@ -10,7 +10,7 @@ import { formatCanonicalModelId, parseCanonicalModelId } from "./models";
 
 export function assertBoundRequest(
 	mapping: SessionMapping,
-	requestedModelId: string,
+	requestedModelId: string | undefined,
 	branch: "duplicate" | "pending",
 ): NormalizedModelSelection {
 	const selection = normalizeModelSelection(mapping.modelSelection);
@@ -18,7 +18,10 @@ export function assertBoundRequest(
 		throw modelSelectionError(
 			branch === "duplicate" ? "model_selection_idempotency_conflict" : "model_selection_gate_binding_missing",
 		);
-	const requested = requestedModelId === "gjc" ? selection : parseCanonicalModelId(requestedModelId);
+	const requested =
+		requestedModelId === undefined || requestedModelId === "gjc"
+			? selection
+			: parseCanonicalModelId(requestedModelId);
 	if (requested === null || !sameSelection(selection, requested))
 		throw modelSelectionError(
 			branch === "duplicate" ? "model_selection_idempotency_conflict" : "model_selection_gate_mismatch",
@@ -46,7 +49,7 @@ export async function resolveNormalSelection(
 }
 
 export async function replayWithLifecyclePublication<T>(
-	runner: GjcSessionTurnRunner,
+	runner: GjcTurnRunner,
 	turn: LiveGatewayRunnerInput,
 	mapping: SessionMapping,
 	effect: () => Promise<T>,

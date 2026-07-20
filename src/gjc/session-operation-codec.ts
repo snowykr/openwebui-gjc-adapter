@@ -8,6 +8,7 @@ import type {
 	SessionOperation,
 	SessionOperationResult,
 } from "./session-authority-types";
+import { isRecord } from "./session-authority-validation-primitives";
 import type { GjcTurnEvent } from "./turn-runner";
 
 export interface SessionOperationMapping {
@@ -76,18 +77,27 @@ export function operationResult(
 export function copyAttachment(attachment: SessionAttachmentProof): SessionAttachmentProof {
 	return { ...attachment, descriptorStat: { ...attachment.descriptorStat } };
 }
+export function operationIdentifiers(operation: Pick<SessionOperation, "id" | "ingressId">): readonly string[] {
+	return operation.ingressId === undefined || operation.ingressId === operation.id
+		? [operation.id]
+		: [operation.id, operation.ingressId];
+}
+
 export function appendJournal(
 	existing: readonly SessionOperation[],
 	incoming: readonly SessionOperation[],
 ): SessionOperation[] {
 	const journal = [...existing];
 	for (const operation of incoming) {
-		const duplicate = journal.find(
-			candidate =>
-				candidate.id === operation.id ||
-				(operation.ingressId !== undefined && candidate.ingressId === operation.ingressId),
+		const duplicate = journal.find(candidate =>
+			operationIdentifiers(candidate).some(identifier => operationIdentifiers(operation).includes(identifier)),
 		);
-		if (duplicate === undefined) journal.push(operation);
+		if (duplicate === undefined) {
+			journal.push(operation);
+			continue;
+		}
+		if (duplicate.id === operation.id && duplicate.ingressId === operation.ingressId) continue;
+		throw new Error(`Session operation ${operation.id} conflicts with an existing operation.`);
 	}
 	return journal;
 }
@@ -108,7 +118,7 @@ export function provisionalKey(chatId: string, ingressId: string): string {
 }
 export function createAuthorityIdentity(input: SessionAuthorityInput): SessionAuthorityRecord {
 	const createdAt = input.createdAt ?? new Date().toISOString();
-	const journal = input.journal ?? [];
+	const journal = appendJournal([], input.journal ?? []);
 	const operation = journal.find(
 		candidate => candidate.id === input.operationId || candidate.ingressId === input.operationId,
 	);
@@ -163,10 +173,9 @@ export function replayCloseOperation(
 export const UNSAFE_MODEL_COMPONENT = /[\p{Cc}\p{White_Space}]|%[0-9a-f]{2}/iu;
 
 export function normalizeModelSelection(value: unknown): NormalizedModelSelection | undefined {
-	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
-	const provider = Reflect.get(value, "provider");
-	const modelId = Reflect.get(value, "modelId");
-	const thinkingLevel = Reflect.get(value, "thinkingLevel");
+	if (!isRecord(value) || !Object.keys(value).every(key => ["provider", "modelId", "thinkingLevel"].includes(key)))
+		return undefined;
+	const { provider, modelId, thinkingLevel } = value;
 	if (!isSafeModelComponent(provider) || provider.includes("/") || !isSafeModelComponent(modelId)) return undefined;
 	const normalizedThinkingLevel = GJC_THINKING_LEVELS.find(level => level === thinkingLevel);
 	return normalizedThinkingLevel === undefined

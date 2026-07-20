@@ -159,7 +159,9 @@ export async function snapshotSourceFamily(databasePath: string): Promise<unknow
 		path.dirname(databasePath),
 		path.dirname(source),
 	];
-	return Promise.all([...new Set(names)].sort().map(snapshotPath));
+	return Promise.all(
+		[...new Set(names)].sort().map(target => snapshotPath(target, target === path.dirname(databasePath))),
+	);
 }
 
 export async function existingSourceArtifacts(databasePath: string): Promise<readonly string[]> {
@@ -170,7 +172,7 @@ export async function existingSourceArtifacts(databasePath: string): Promise<rea
 	return existing.filter(candidate => candidate !== undefined);
 }
 
-async function snapshotPath(target: string): Promise<unknown> {
+async function snapshotPath(target: string, ignoreDirectoryMetadata = false): Promise<unknown> {
 	try {
 		const metadata = await fs.lstat(target, { bigint: true });
 		const common = [
@@ -188,7 +190,23 @@ async function snapshotPath(target: string): Promise<unknown> {
 			const resolved = path.resolve(path.dirname(target), link);
 			return [...common, "symlink", link, await snapshotPath(resolved), await snapshotPath(path.dirname(resolved))];
 		}
-		if (metadata.isDirectory()) return [...common, "directory", (await fs.readdir(target)).sort()];
+		if (metadata.isDirectory())
+			return [
+				target,
+				...(ignoreDirectoryMetadata
+					? []
+					: [
+							String(metadata.size),
+							String(metadata.mtimeNs),
+							String(metadata.mode),
+							String(metadata.uid),
+							String(metadata.gid),
+							String(metadata.dev),
+							String(metadata.ino),
+						]),
+				"directory",
+				(await fs.readdir(target)).sort(),
+			];
 		if (!metadata.isFile()) return [...common, "other"];
 		return [...common, "file", await fs.readFile(target)];
 	} catch (error) {

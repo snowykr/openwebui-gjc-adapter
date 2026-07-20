@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { ensureSdkSessionFile } from "../gjc/session-file";
 import type { SessionMapping, SessionMappingStore } from "../gjc/session-router";
 import { validateSessionFile } from "../gjc/session-router";
@@ -15,6 +14,11 @@ import type { OutboxStore } from "../state/outbox";
 import { type LiveGatewayRunnerInput, type LiveGatewayRunnerResult, WorkflowGateReplyError } from "./chat-completions";
 import type { GjcSessionTurnRunner } from "./gjc-routing-runner";
 import { ensureProjectionRows } from "./workflow-gate-projection";
+import {
+	markWorkflowGateAccepted,
+	workflowGateOperationHash,
+	workflowGateResponseIdempotencyKey,
+} from "./workflow-gate-turn-utils";
 
 export {
 	buildEventPayloadHash,
@@ -142,7 +146,12 @@ export async function handleWorkflowGateReply(
 
 	try {
 		const sessionRoot = turn.project.sessionRoot ?? `${turn.project.cwd}/.gjc/sessions`;
-		const existingSessionFile = await ensureSdkSessionFile(turn.project, mapping.sessionFile, sessionRoot);
+		const existingSessionFile = await ensureSdkSessionFile(
+			turn.project,
+			mapping.sessionFile,
+			sessionRoot,
+			mapping.sessionId,
+		);
 		const result = await input.turnRunner.respondWorkflowGate({
 			cwd: turn.project.cwd,
 			sessionRoot,
@@ -215,45 +224,4 @@ export function latestPendingWorkflowGate(events: NonNullable<SessionMapping["ev
 		if (gate !== null && gate.status === "pending") return gate;
 	}
 	return null;
-}
-
-function markWorkflowGateAccepted(
-	events: NonNullable<SessionMapping["events"]>,
-	gateId: string,
-): readonly (typeof events)[number][] {
-	return events.map(event => {
-		if (event.type !== "workflow_gate") return event;
-		const gate = pendingWorkflowGateFromEvent(event);
-		if (gate?.gateId !== gateId) return event;
-		return {
-			...event,
-			payload: {
-				...(event.payload ?? {}),
-				status: "accepted",
-			},
-		};
-	});
-}
-
-function workflowGateResponseIdempotencyKey(chatId: string, userMessageId: string): string {
-	return `${chatId}:${userMessageId}`;
-}
-
-function workflowGateOperationHash(turn: LiveGatewayRunnerInput, gate: PendingWorkflowGate): string {
-	return createHash("sha256")
-		.update(
-			JSON.stringify({
-				chatId: turn.chatId,
-				projectId: turn.project.id,
-				parentId: turn.userMessageParentId,
-				prompt: turn.prompt,
-				gateId: gate.gateId,
-				correlation: {
-					commandId: gate.commandId,
-					turnId: gate.turnId,
-					sessionId: gate.sessionId,
-				},
-			}),
-		)
-		.digest("hex");
 }

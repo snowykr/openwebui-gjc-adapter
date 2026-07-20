@@ -57,6 +57,41 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 			await fixture.dispose();
 		}
 	});
+	test("Given a session-only finalized result from another turn and a correlated terminal When prompting Then no stale answer is substituted", async () => {
+		const fixture = createSdkTransportFixture("turn_complete");
+		try {
+			await fixture.attach();
+			const outcome = await fixture.port.prompt("new answer", 500);
+
+			expect(outcome.finalizedAssistantText).toBeUndefined();
+			expect(outcome.events).toContainEqual(
+				expect.objectContaining({ type: "turn_stream", text: "stale session-only assistant" }),
+			);
+			expect(
+				fixture.server.frames.some(
+					frame => frame.type === "query_request" && frame.query === "session.last_assistant",
+				),
+			).toBeFalse();
+		} finally {
+			await fixture.dispose();
+		}
+	});
+	test("Given a correlated finalized result When prompting Then its authoritative text is returned", async () => {
+		const fixture = createSdkTransportFixture("turn_finalized");
+		try {
+			await fixture.attach();
+			const outcome = await fixture.port.prompt("new answer", 500);
+
+			expect(outcome.finalizedAssistantText).toBe("correlated assistant");
+			expect(
+				fixture.server.frames.some(
+					frame => frame.type === "query_request" && frame.query === "session.last_assistant",
+				),
+			).toBeFalse();
+		} finally {
+			await fixture.dispose();
+		}
+	});
 	test("Given a correlated agent_failed When prompting Then it surfaces the upstream typed failure", async () => {
 		const fixture = createSdkTransportFixture("turn_failed");
 		try {
