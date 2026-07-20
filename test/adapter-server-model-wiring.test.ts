@@ -18,11 +18,12 @@ describe("adapter server model wiring", () => {
 				statePath: "/tmp/gjc-adapter-model-wiring-state",
 				sessionRoot: "/tmp/gjc-adapter-model-wiring-sessions",
 				gjcCommand: "/opt/gjc",
-				turnTimeoutMs: 1_000,
+				turnTimeoutMs: 240_000,
 			},
 			{ turnRunner: new FakeGjcTurnRunner(), modelReaderFactory },
 		);
 		expect(options.routes?.modelReaderFactory).toBe(modelReaderFactory);
+		expect(options.turnTimeoutMs).toBe(240_000);
 		expect(options.routes?.neutralWorkspace).toEndWith("/.gjc/openwebui/default-reader");
 	});
 });
