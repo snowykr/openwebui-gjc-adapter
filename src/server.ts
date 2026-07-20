@@ -21,8 +21,8 @@ import {
 	parseProjectAdminJsonRequest,
 	projectIdFromUnlinkPath,
 } from "./projects/admin-routes";
-import { type AdapterRuntimeConfig, createRuntimeReadinessReconciler } from "./server-runtime-readiness";
 import { RuntimeSingletonLock } from "./runtime-singleton-lock";
+import { type AdapterRuntimeConfig, createRuntimeReadinessReconciler } from "./server-runtime-readiness";
 
 export type { AdapterRouteDependencies } from "./live/openai-routes";
 export type { AdapterRuntimeConfig } from "./server-runtime-readiness";
@@ -72,7 +72,13 @@ async function closeOperationId(request: Request): Promise<string | Response> {
 		return value === undefined ? randomUUID() : validateCloseOperationId(value);
 	} catch {
 		return jsonResponse(
-			{ error: { message: "Close request body must be valid JSON.", type: "invalid_request_error", code: "invalid_close_operation_id" } },
+			{
+				error: {
+					message: "Close request body must be valid JSON.",
+					type: "invalid_request_error",
+					code: "invalid_close_operation_id",
+				},
+			},
 			{ status: 400 },
 		);
 	}
@@ -81,7 +87,13 @@ async function closeOperationId(request: Request): Promise<string | Response> {
 function validateCloseOperationId(value: unknown): string | Response {
 	if (typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)) return value;
 	return jsonResponse(
-		{ error: { message: "Close operation ID must be 1-128 URL-safe characters.", type: "invalid_request_error", code: "invalid_close_operation_id" } },
+		{
+			error: {
+				message: "Close operation ID must be 1-128 URL-safe characters.",
+				type: "invalid_request_error",
+				code: "invalid_close_operation_id",
+			},
+		},
 		{ status: 400 },
 	);
 }
@@ -222,15 +234,25 @@ export async function startAdapterServer(options: AdapterServerOptions): Promise
 	const lock = await RuntimeSingletonLock.acquire(options.runtimeRoot);
 	try {
 		const server = Bun.serve({
-			hostname: options.host, port: options.port,
-			fetch: createAdapterRequestHandler({ checks: options.checks, readiness: options.readiness, routes: options.routes, runtime: options.runtime }),
+			hostname: options.host,
+			port: options.port,
+			fetch: createAdapterRequestHandler({
+				checks: options.checks,
+				readiness: options.readiness,
+				routes: options.routes,
+				runtime: options.runtime,
+			}),
 		});
 		return {
 			url: server.url.toString(),
 			async stop(): Promise<void> {
 				const results = await Promise.allSettled([server.stop(), options.routes?.runner.stop?.(), lock.release()]);
 				const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
-				if (failures.length > 0) throw new AggregateError(failures.map(result => result.reason), "Server cleanup failed");
+				if (failures.length > 0)
+					throw new AggregateError(
+						failures.map(result => result.reason),
+						"Server cleanup failed",
+					);
 			},
 		};
 	} catch (error) {

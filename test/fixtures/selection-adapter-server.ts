@@ -13,7 +13,8 @@ for (const [name, value] of [
 	["GJC_SELECTION_RUNTIME_RECEIPT", runtimeReceiptPath],
 	["GJC_OPENWEBUI_STATE_PATH", requireEnv("GJC_OPENWEBUI_STATE_PATH")],
 	["GJC_OPENWEBUI_SESSION_ROOT", requireEnv("GJC_OPENWEBUI_SESSION_ROOT")],
-]) assertFixturePathIsIsolated(name, value);
+])
+	assertFixturePathIsIsolated(name, value);
 
 function record(value: unknown): void {
 	appendFileSync(observationPath, `${JSON.stringify(value)}\n`, "utf8");

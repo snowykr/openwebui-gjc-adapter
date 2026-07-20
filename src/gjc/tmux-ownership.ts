@@ -64,7 +64,13 @@ export async function proveTmuxPaneOwnership(
 	runner: TmuxCommandRunner,
 	pane: OwnedTmuxPane,
 ): Promise<TmuxOwnershipResult> {
-	const result = await runner.run(["display-message", "-p", "-t", pane.target, "#{pane_id}|#{pane_pid}|#{@openwebui_gjc_owner}"]);
+	const result = await runner.run([
+		"display-message",
+		"-p",
+		"-t",
+		pane.target,
+		"#{pane_id}|#{pane_pid}|#{@openwebui_gjc_owner}",
+	]);
 	if (result.exitCode !== 0) {
 		if (isMissingTarget(result.stderr)) return { status: "absent" };
 		return { status: "unavailable", message: tmuxMessage(result) };
@@ -88,7 +94,12 @@ export async function destroyProvisionalTmuxPane(
 		return { status: "unavailable", message: tmuxMessage(proven) };
 	}
 	const [target, pidText, ...extra] = proven.stdout.trim().split("|");
-	if (extra.length !== 0 || target !== pane.target || !/^\d+$/.test(pidText ?? "") || Number(pidText) !== pane.panePid) {
+	if (
+		extra.length !== 0 ||
+		target !== pane.target ||
+		!/^\d+$/.test(pidText ?? "") ||
+		Number(pidText) !== pane.panePid
+	) {
 		return { status: "uncertain", message: "new tmux pane identity changed before ownership tagging" };
 	}
 	const result = await runner.run(["kill-pane", "-t", pane.target]);

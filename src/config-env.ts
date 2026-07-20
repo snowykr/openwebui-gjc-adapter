@@ -1,5 +1,5 @@
-import { resolveGjcRuntimeLocations } from "./configure/runtime-locations";
 import type { AdapterProjectConfig, ResolvedAdapterConfig } from "./config";
+import { resolveGjcRuntimeLocations } from "./configure/runtime-locations";
 
 const DEFAULT_BIND_HOST = "127.0.0.1";
 const DEFAULT_BIND_PORT = 8765;
@@ -110,11 +110,19 @@ export function loadAdapterConfig(env: Record<string, string | undefined> = proc
 		...(openWebUIAdminPassword === undefined ? {} : { openWebUIAdminPassword }),
 		...(ownerUserId === undefined ? {} : { ownerUserId }),
 		statePath: requireNonEmptyString(env.GJC_OPENWEBUI_STATE_PATH, DEFAULT_STATE_PATH, "GJC_OPENWEBUI_STATE_PATH"),
-		gjcCommand: requireNonEmptyString(env.GJC_OPENWEBUI_GJC_COMMAND, DEFAULT_GJC_COMMAND, "GJC_OPENWEBUI_GJC_COMMAND"),
+		gjcCommand: requireNonEmptyString(
+			env.GJC_OPENWEBUI_GJC_COMMAND,
+			DEFAULT_GJC_COMMAND,
+			"GJC_OPENWEBUI_GJC_COMMAND",
+		),
 		gjcConfigDirName: runtimeLocations.childEnvironment.GJC_CONFIG_DIR,
 		gjcCodingAgentDir: runtimeLocations.agentDir,
 		runtimeLocations,
-		turnTimeoutMs: parsePositiveInteger(env.GJC_OPENWEBUI_TURN_TIMEOUT_MS, DEFAULT_TURN_TIMEOUT_MS, "GJC_OPENWEBUI_TURN_TIMEOUT_MS"),
+		turnTimeoutMs: parsePositiveInteger(
+			env.GJC_OPENWEBUI_TURN_TIMEOUT_MS,
+			DEFAULT_TURN_TIMEOUT_MS,
+			"GJC_OPENWEBUI_TURN_TIMEOUT_MS",
+		),
 		sessionRoot: requireNonEmptyString(env.GJC_OPENWEBUI_SESSION_ROOT, process.cwd(), "GJC_OPENWEBUI_SESSION_ROOT"),
 		allowedProjectRoots: parseAllowedProjectRoots(env.GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS, process.cwd()),
 		...(artifactBaseUrl === undefined

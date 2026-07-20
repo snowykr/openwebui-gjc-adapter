@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { NormalizedModelSelection } from "../src/contracts";
 import {
-	FileBackedSessionMappingStore,
 	closeIngressId,
+	FileBackedSessionMappingStore,
 	type RouteGjcTurnInput,
 	routeGjcSessionClose,
 	routeGjcTurn,
@@ -13,7 +13,6 @@ import {
 	type SessionMapping,
 	SessionMappingStore,
 } from "../src/gjc/session-router";
-import { GjcCloseReceipt } from "../src/gjc/turn-runner";
 import type {
 	GjcContinueSessionInput,
 	GjcLifecyclePublicationAddress,
@@ -26,6 +25,7 @@ import type {
 	GjcTurnResult,
 	GjcTurnRunner,
 } from "../src/gjc/turn-runner";
+import { GjcCloseReceipt } from "../src/gjc/turn-runner";
 import type { RegisteredProject } from "../src/projects/registry";
 import { attachmentProof, lifecycleFixture } from "./gjc-lifecycle-fixtures";
 

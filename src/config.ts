@@ -1,3 +1,4 @@
+import { DEFAULT_TURN_TIMEOUT_MS } from "./config-env";
 import {
 	DEFAULT_EXISTING_PROJECT_ROOT,
 	defaultConfigPath,
@@ -7,7 +8,7 @@ import {
 } from "./configure/private-config";
 import { resolveGjcRuntimeLocations } from "./configure/runtime-locations";
 import type { GjcRuntimeLocations } from "./contracts";
-import { DEFAULT_TURN_TIMEOUT_MS } from "./config-env";
+
 export { DEFAULT_TURN_TIMEOUT_MS, loadAdapterConfig } from "./config-env";
 
 export {
@@ -66,7 +67,6 @@ export interface StartupDiagnostic {
 	expectedHeaderNames: RequiredOpenWebUIHeaderName[];
 	messages: string[];
 }
-
 
 export function buildStartupDiagnostics(config: AdapterConfig): StartupDiagnostic {
 	const missingAuth = config.openWebUIApiToken === undefined;

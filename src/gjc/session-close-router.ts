@@ -1,7 +1,7 @@
 import type { SessionOperationResult } from "./session-authority";
-import type { GjcCloseReceipt, GjcLifecycleTransaction } from "./turn-runner";
-import { replayCloseOperation } from "./session-operation-codec";
 import type { SessionMapping, SessionMappingStore } from "./session-mapping-store";
+import { replayCloseOperation } from "./session-operation-codec";
+import type { GjcCloseReceipt, GjcLifecycleTransaction } from "./turn-runner";
 
 export type SessionCloseResult =
 	| { readonly status: "closed" }
@@ -24,12 +24,20 @@ export interface RouteGjcSessionCloseInput extends SessionCloseIngress {
 export async function routeGjcSessionClose(input: RouteGjcSessionCloseInput): Promise<SessionCloseResult> {
 	const prior = input.mappings.operation(input.mapping.chatId, input.ingressId);
 	if (prior !== undefined) return replayPriorClose(input, prior.result, prior.kind, prior.detail, prior.state);
-	input.mappings.beginOperation(input.mapping.chatId, { id: input.ingressId, kind: "close", ingressId: input.ingressId, detail: input.ingressHash });
+	input.mappings.beginOperation(input.mapping.chatId, {
+		id: input.ingressId,
+		kind: "close",
+		ingressId: input.ingressId,
+		detail: input.ingressHash,
+	});
 	try {
 		const proof = input.mapping.attachment;
 		if (!hasOwnedPaneAttachment(proof)) {
 			input.mappings.transitionOperation(input.mapping.chatId, input.ingressId, "conflict", input.ingressHash);
-			return { status: "uncertain", message: "GJC close requires a complete owned-pane attachment before acknowledgement." };
+			return {
+				status: "uncertain",
+				message: "GJC close requires a complete owned-pane attachment before acknowledgement.",
+			};
 		}
 		let receipt: GjcCloseReceipt;
 		try {
@@ -45,7 +53,13 @@ export async function routeGjcSessionClose(input: RouteGjcSessionCloseInput): Pr
 			return result;
 		}
 		await input.lifecycle.publishClosed(receipt, () => {
-			const mapping = input.mappings.completeOperationWithMapping(input.mapping.chatId, input.ingressId, input.ingressHash, input.mapping, "close");
+			const mapping = input.mappings.completeOperationWithMapping(
+				input.mapping.chatId,
+				input.ingressId,
+				input.ingressHash,
+				input.mapping,
+				"close",
+			);
 			input.afterPublish?.(mapping);
 			return mapping;
 		});
@@ -56,13 +70,33 @@ export async function routeGjcSessionClose(input: RouteGjcSessionCloseInput): Pr
 	}
 }
 
-function replayPriorClose(input: RouteGjcSessionCloseInput, result: SessionOperationResult | undefined, kind: string, detail: string | undefined, state: string): SessionCloseResult {
-	if (kind !== "close" || detail !== input.ingressHash) throw new Error(`GJC close ${input.ingressId} conflicts with a different ingress payload.`);
-	if (state === "complete") { input.afterPublish?.(input.mapping); return replayCloseOperation(input.ingressId, result); }
+function replayPriorClose(
+	input: RouteGjcSessionCloseInput,
+	result: SessionOperationResult | undefined,
+	kind: string,
+	detail: string | undefined,
+	state: string,
+): SessionCloseResult {
+	if (kind !== "close" || detail !== input.ingressHash)
+		throw new Error(`GJC close ${input.ingressId} conflicts with a different ingress payload.`);
+	if (state === "complete") {
+		input.afterPublish?.(input.mapping);
+		return replayCloseOperation(input.ingressId, result);
+	}
 	if (state === "pending") throw new Error(`GJC close ${input.ingressId} is pending and cannot be replayed.`);
 	throw new Error(`GJC close ${input.ingressId} requires reconciliation.`);
 }
 
-function hasOwnedPaneAttachment(proof: SessionMapping["attachment"]): proof is NonNullable<SessionMapping["attachment"]> & Required<Pick<NonNullable<SessionMapping["attachment"]>, "tmuxSocket" | "tmuxPane" | "tmuxPanePid" | "tmuxOwnershipTag">> {
-	return proof?.tmuxSocket !== undefined && proof.tmuxPane !== undefined && proof.tmuxPanePid !== undefined && proof.tmuxOwnershipTag !== undefined;
+function hasOwnedPaneAttachment(
+	proof: SessionMapping["attachment"],
+): proof is NonNullable<SessionMapping["attachment"]> &
+	Required<
+		Pick<NonNullable<SessionMapping["attachment"]>, "tmuxSocket" | "tmuxPane" | "tmuxPanePid" | "tmuxOwnershipTag">
+	> {
+	return (
+		proof?.tmuxSocket !== undefined &&
+		proof.tmuxPane !== undefined &&
+		proof.tmuxPanePid !== undefined &&
+		proof.tmuxOwnershipTag !== undefined
+	);
 }

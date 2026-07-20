@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import type { NormalizedModelSelection } from "../src/contracts";
 import type {
 	GjcContinueSessionInput,
@@ -47,7 +48,7 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 			sessionId: "session-1",
 			text: `new:${input.text}`,
 			events: this.events,
-			sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
+			sessionFile: join(input.sessionRoot, "session-1.jsonl"),
 			activeLeaf: "leaf-1",
 			rawFrameCursor: 7,
 			eventCursor: 3,

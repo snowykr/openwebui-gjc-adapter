@@ -1,8 +1,14 @@
 import { createHash } from "node:crypto";
 import { GJC_THINKING_LEVELS, type NormalizedModelSelection } from "../contracts";
-import type { SessionAttachmentProof, SessionAuthorityInput, SessionAuthorityRecord, SessionOperation, SessionOperationResult } from "./session-authority-types";
-import type { GjcTurnEvent } from "./turn-runner";
 import { copy } from "./session-authority-copy";
+import type {
+	SessionAttachmentProof,
+	SessionAuthorityInput,
+	SessionAuthorityRecord,
+	SessionOperation,
+	SessionOperationResult,
+} from "./session-authority-types";
+import type { GjcTurnEvent } from "./turn-runner";
 
 export interface SessionOperationMapping {
 	readonly chatId: string;
@@ -26,22 +32,27 @@ export function hashTurnIngress(input: {
 	readonly text: string;
 	readonly modelSelection?: NormalizedModelSelection;
 }): string {
-	return createHash("sha256")
-		.update(JSON.stringify(input))
-		.digest("hex");
+	return createHash("sha256").update(JSON.stringify(input)).digest("hex");
 }
 
 export function closeIngressId(operationId: string, mapping: SessionOperationMapping): string {
-	return `close:${createHash("sha256").update(JSON.stringify({
-		kind: "close",
-		operationId,
-		projectId: mapping.projectId,
-		chatId: mapping.chatId,
-		sessionId: mapping.sessionId,
-	})).digest("hex")}`;
+	return `close:${createHash("sha256")
+		.update(
+			JSON.stringify({
+				kind: "close",
+				operationId,
+				projectId: mapping.projectId,
+				chatId: mapping.chatId,
+				sessionId: mapping.sessionId,
+			}),
+		)
+		.digest("hex")}`;
 }
 
-export function operationResult(kind: "turn" | "control" | "close", mapping: SessionOperationMapping): SessionOperationResult {
+export function operationResult(
+	kind: "turn" | "control" | "close",
+	mapping: SessionOperationMapping,
+): SessionOperationResult {
 	return {
 		kind,
 		assistantText: mapping.assistantText ?? "",
@@ -56,9 +67,7 @@ export function operationResult(kind: "turn" | "control" | "close", mapping: Ses
 			eventCursor: mapping.eventCursor,
 			operationId: mapping.operationId,
 			...(mapping.modelSelection === undefined ? {} : { modelSelection: mapping.modelSelection }),
-			...(mapping.attachment === undefined
-				? {}
-				: { attachment: copyAttachment(mapping.attachment) }),
+			...(mapping.attachment === undefined ? {} : { attachment: copyAttachment(mapping.attachment) }),
 		},
 		...(kind === "close" ? { correlation: { closeStatus: "closed" } } : {}),
 	};
@@ -67,12 +76,17 @@ export function operationResult(kind: "turn" | "control" | "close", mapping: Ses
 export function copyAttachment(attachment: SessionAttachmentProof): SessionAttachmentProof {
 	return { ...attachment, descriptorStat: { ...attachment.descriptorStat } };
 }
-export function appendJournal(existing: readonly SessionOperation[], incoming: readonly SessionOperation[]): SessionOperation[] {
+export function appendJournal(
+	existing: readonly SessionOperation[],
+	incoming: readonly SessionOperation[],
+): SessionOperation[] {
 	const journal = [...existing];
 	for (const operation of incoming) {
-		const duplicate = journal.find(candidate =>
-			candidate.id === operation.id ||
-			(operation.ingressId !== undefined && candidate.ingressId === operation.ingressId));
+		const duplicate = journal.find(
+			candidate =>
+				candidate.id === operation.id ||
+				(operation.ingressId !== undefined && candidate.ingressId === operation.ingressId),
+		);
 		if (duplicate === undefined) journal.push(operation);
 	}
 	return journal;
@@ -95,9 +109,9 @@ export function provisionalKey(chatId: string, ingressId: string): string {
 export function createAuthorityIdentity(input: SessionAuthorityInput): SessionAuthorityRecord {
 	const createdAt = input.createdAt ?? new Date().toISOString();
 	const journal = input.journal ?? [];
-	const operation = journal.find(candidate =>
-		candidate.id === input.operationId ||
-		candidate.ingressId === input.operationId);
+	const operation = journal.find(
+		candidate => candidate.id === input.operationId || candidate.ingressId === input.operationId,
+	);
 	return copy({
 		...input,
 		version: 2,
@@ -107,17 +121,18 @@ export function createAuthorityIdentity(input: SessionAuthorityInput): SessionAu
 			projectId: input.projectId,
 			sessionId: input.sessionId,
 		},
-		journal: operation === undefined
-			? [...journal, implicitOperation(input.operationId, createdAt)]
-			: journal,
+		journal: operation === undefined ? [...journal, implicitOperation(input.operationId, createdAt)] : journal,
 	});
 }
 
-export function updateAuthorityIdentity(input: SessionAuthorityInput, existing: SessionAuthorityRecord): SessionAuthorityRecord {
+export function updateAuthorityIdentity(
+	input: SessionAuthorityInput,
+	existing: SessionAuthorityRecord,
+): SessionAuthorityRecord {
 	const journal = appendJournal(existing.journal, input.journal ?? []);
-	const operation = journal.find(candidate =>
-		candidate.id === input.operationId ||
-		candidate.ingressId === input.operationId);
+	const operation = journal.find(
+		candidate => candidate.id === input.operationId || candidate.ingressId === input.operationId,
+	);
 	if (operation?.state === "conflict" || operation?.state === "uncertain") {
 		throw new Error(`Session operation ${input.operationId} requires reconciliation.`);
 	}
@@ -131,13 +146,15 @@ export function updateAuthorityIdentity(input: SessionAuthorityInput, existing: 
 			projectId: input.projectId,
 			sessionId: input.sessionId,
 		},
-		journal: operation === undefined
-			? [...journal, implicitOperation(input.operationId, existing.createdAt)]
-			: journal,
+		journal:
+			operation === undefined ? [...journal, implicitOperation(input.operationId, existing.createdAt)] : journal,
 	});
 }
 
-export function replayCloseOperation(operationId: string, result: SessionOperationResult | undefined): { readonly status: "closed" } {
+export function replayCloseOperation(
+	operationId: string,
+	result: SessionOperationResult | undefined,
+): { readonly status: "closed" } {
 	if (result?.kind !== "close" || result.correlation?.closeStatus !== "closed")
 		throw new Error(`GJC close ${operationId} completed without a valid immutable result binding.`);
 	return { status: "closed" };
@@ -152,9 +169,16 @@ export function normalizeModelSelection(value: unknown): NormalizedModelSelectio
 	const thinkingLevel = Reflect.get(value, "thinkingLevel");
 	if (!isSafeModelComponent(provider) || provider.includes("/") || !isSafeModelComponent(modelId)) return undefined;
 	const normalizedThinkingLevel = GJC_THINKING_LEVELS.find(level => level === thinkingLevel);
-	return normalizedThinkingLevel === undefined ? undefined : { provider, modelId, thinkingLevel: normalizedThinkingLevel };
+	return normalizedThinkingLevel === undefined
+		? undefined
+		: { provider, modelId, thinkingLevel: normalizedThinkingLevel };
 }
 
 function isSafeModelComponent(value: unknown): value is string {
-	return typeof value === "string" && value.length > 0 && !UNSAFE_MODEL_COMPONENT.test(value) && !value.split("/").some(segment => segment === "." || segment === "..");
+	return (
+		typeof value === "string" &&
+		value.length > 0 &&
+		!UNSAFE_MODEL_COMPONENT.test(value) &&
+		!value.split("/").some(segment => segment === "." || segment === "..")
+	);
 }

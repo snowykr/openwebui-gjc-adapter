@@ -1,3 +1,4 @@
+import { closeIngressId, type SessionCloseIngress, type SessionMapping } from "../gjc/session-router";
 import type { OpenWebUIOwnerContext } from "../openwebui/auth";
 import type { OpenWebUIProjectionRepository } from "../openwebui/client";
 import {
@@ -5,7 +6,6 @@ import {
 	isProjectAdminChatCompletionRequest,
 	type ProjectAdminFailureSink,
 } from "../projects/admin-routes";
-import { closeIngressId, type SessionCloseIngress, type SessionMapping } from "../gjc/session-router";
 import type { ProjectLinkService, SessionCloseResult } from "../projects/link-service";
 import type { RegisteredProject } from "../projects/registry";
 import {
@@ -64,7 +64,14 @@ export async function handleOpenAIChatCloseRequest(
 	const mapping = routes.mappings?.get(chatId);
 	if (mapping === undefined) {
 		return jsonResponse(
-			{ error: { message: "No GJC session is mapped to this chat.", type: "invalid_request_error", code: "chat_session_not_found" }, operationId },
+			{
+				error: {
+					message: "No GJC session is mapped to this chat.",
+					type: "invalid_request_error",
+					code: "chat_session_not_found",
+				},
+				operationId,
+			},
 			{ status: 404 },
 		);
 	}
@@ -77,9 +84,12 @@ export async function handleOpenAIChatCloseRequest(
 	try {
 		const ingressId = closeIngressId(operationId, mapping);
 		const result = await routes.closeSession(mapping, { ingressId, ingressHash: ingressId });
-		return jsonResponse({ ...result, operationId }, {
-			status: result.status === "closed" ? 200 : result.status === "unavailable" ? 503 : 202,
-		});
+		return jsonResponse(
+			{ ...result, operationId },
+			{
+				status: result.status === "closed" ? 200 : result.status === "unavailable" ? 503 : 202,
+			},
+		);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : "GJC session close acknowledgement was not received.";
 		if (message.includes("conflicts")) {
@@ -88,10 +98,7 @@ export async function handleOpenAIChatCloseRequest(
 				{ status: 409 },
 			);
 		}
-		return jsonResponse(
-			{ status: "uncertain", message, operationId },
-			{ status: 202 },
-		);
+		return jsonResponse({ status: "uncertain", message, operationId }, { status: 202 });
 	}
 }
 

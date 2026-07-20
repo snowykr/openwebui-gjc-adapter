@@ -1,18 +1,44 @@
 import { resolve } from "node:path";
+import {
+	assertPublishedSdkAttachmentCurrent,
+	type PublishedSdkEndpointGenerations,
+	samePublishedSdkEndpoint,
+	snapshotPublishedSdkEndpointGenerations,
+} from "./public-sdk-attachment";
 import type { PublicSdkSessionAttachment } from "./public-sdk-contract";
-import { assertPublishedSdkAttachmentCurrent, samePublishedSdkEndpoint, snapshotPublishedSdkEndpointGenerations, type PublishedSdkEndpointGenerations } from "./public-sdk-attachment";
-import { parseRecord, requiredString, type SdkRecord, SdkV3OperationError, SdkV3ProtocolError } from "./sdk-v3-protocol";
+import {
+	parseRecord,
+	requiredString,
+	type SdkRecord,
+	SdkV3OperationError,
+	SdkV3ProtocolError,
+} from "./sdk-v3-protocol";
 
 export interface LifecycleHost {
 	connected(): { readonly attachment: PublicSdkSessionAttachment };
 	mutate(operation: string, input: SdkRecord, idempotencyKey?: string, timeoutMs?: number): Promise<unknown>;
-	withAuthority<T>(timeoutMs: number | undefined, effect: () => Promise<T>, post?: "strict" | "allow_missing" | "skip"): Promise<T>;
-	discover(predecessor: PublicSdkSessionAttachment, baseline: PublishedSdkEndpointGenerations, operation: string, target: string | undefined): Promise<PublicSdkSessionAttachment | undefined>;
+	withAuthority<T>(
+		timeoutMs: number | undefined,
+		effect: () => Promise<T>,
+		post?: "strict" | "allow_missing" | "skip",
+	): Promise<T>;
+	discover(
+		predecessor: PublicSdkSessionAttachment,
+		baseline: PublishedSdkEndpointGenerations,
+		operation: string,
+		target: string | undefined,
+	): Promise<PublicSdkSessionAttachment | undefined>;
 	attach(attachment: PublicSdkSessionAttachment, timeoutMs?: number): Promise<void>;
 	detach(): void;
 	metadata(timeoutMs?: number): Promise<unknown>;
 }
-export async function sessionOperation(host: LifecycleHost, operation: string, input: SdkRecord, idempotencyKey?: string, timeoutMs?: number): Promise<PublicSdkSessionAttachment> {
+export async function sessionOperation(
+	host: LifecycleHost,
+	operation: string,
+	input: SdkRecord,
+	idempotencyKey?: string,
+	timeoutMs?: number,
+): Promise<PublicSdkSessionAttachment> {
 	const predecessor = host.connected().attachment;
 	const canonicalCwd = resolve(predecessor.cwd);
 	const target = lifecycleTargetSessionId(operation, input);
@@ -31,19 +57,11 @@ export async function sessionOperation(host: LifecycleHost, operation: string, i
 			...predecessor,
 			cwd: canonicalCwd,
 		};
-		const successor = await host.discover(
-			discoveryPredecessor,
-			baseline,
-			operation,
-			target,
-		);
+		const successor = await host.discover(discoveryPredecessor, baseline, operation, target);
 		if (successor !== undefined) {
 			try {
 				await host.attach(successor, remaining());
-				const metadata = parseRecord(
-					await host.metadata(remaining()),
-					"session.metadata result",
-				);
+				const metadata = parseRecord(await host.metadata(remaining()), "session.metadata result");
 				assertSuccessorMetadata(metadata, successor, canonicalCwd);
 				assertPublishedSdkAttachmentCurrent(successor);
 				return successor;
@@ -55,13 +73,17 @@ export async function sessionOperation(host: LifecycleHost, operation: string, i
 		await sleep(remaining());
 	}
 }
-export async function discoverLifecycleSuccessor(predecessor: PublicSdkSessionAttachment, baseline: PublishedSdkEndpointGenerations, operation: string, target: string | undefined): Promise<PublicSdkSessionAttachment | undefined> {
+export async function discoverLifecycleSuccessor(
+	predecessor: PublicSdkSessionAttachment,
+	baseline: PublishedSdkEndpointGenerations,
+	operation: string,
+	target: string | undefined,
+): Promise<PublicSdkSessionAttachment | undefined> {
 	const published = await snapshotPublishedSdkEndpointGenerations(predecessor.cwd);
 	const candidates: PublicSdkSessionAttachment[] = [];
 	for (const [sessionId, candidate] of published) {
 		const previous = baseline.get(sessionId);
-		const changed = previous === undefined
-			|| !samePublishedSdkEndpoint(candidate, previous);
+		const changed = previous === undefined || !samePublishedSdkEndpoint(candidate, previous);
 		if (target !== undefined) {
 			if (sessionId === target && changed) {
 				candidates.push(candidate);
@@ -71,18 +93,12 @@ export async function discoverLifecycleSuccessor(predecessor: PublicSdkSessionAt
 		}
 	}
 	if (candidates.length > 1) {
-		throw new SdkV3OperationError(
-			"endpoint_stale",
-			`${operation} successor discovery is ambiguous`,
-		);
+		throw new SdkV3OperationError("endpoint_stale", `${operation} successor discovery is ambiguous`);
 	}
 	if (candidates.length === 0) return undefined;
 	const successor = candidates[0];
 	if (target !== undefined && successor.sessionId !== target) {
-		throw new SdkV3OperationError(
-			"endpoint_stale",
-			"Published successor does not match the requested session",
-		);
+		throw new SdkV3OperationError("endpoint_stale", "Published successor does not match the requested session");
 	}
 	return successor;
 }
@@ -91,17 +107,15 @@ function assertLifecycleOperationResult(operation: string, value: unknown): void
 	const successField = lifecycleSuccessField(operation);
 	if (successField !== undefined) {
 		if (result[successField] !== true) {
-			throw new SdkV3ProtocolError(
-				`${operation} result`,
-				`${successField} must be true`,
-			);
+			throw new SdkV3ProtocolError(`${operation} result`, `${successField} must be true`);
 		}
 		return;
 	}
 	if (isSuccessfulBranchResult(operation, result)) return;
-	const message = operation === "session.branch"
-		? "must contain selectedText and cancelled: false"
-		: "unsupported lifecycle operation";
+	const message =
+		operation === "session.branch"
+			? "must contain selectedText and cancelled: false"
+			: "unsupported lifecycle operation";
 	throw new SdkV3ProtocolError(`${operation} result`, message);
 }
 function assertSuccessorMetadata(
@@ -109,11 +123,7 @@ function assertSuccessorMetadata(
 	successor: PublicSdkSessionAttachment,
 	canonicalCwd: string,
 ): void {
-	const sessionId = requiredString(
-		metadata,
-		"sessionId",
-		"session.metadata result",
-	);
+	const sessionId = requiredString(metadata, "sessionId", "session.metadata result");
 	const cwd = requiredString(metadata, "cwd", "session.metadata result");
 	if (sessionId !== successor.sessionId || cwd !== canonicalCwd) {
 		throw new SdkV3OperationError(
@@ -124,26 +134,25 @@ function assertSuccessorMetadata(
 }
 function lifecycleTargetSessionId(operation: string, input: SdkRecord): string | undefined {
 	if (operation === "session.new" || operation === "session.branch") return undefined;
-	if (typeof input.sessionId !== "string" || input.sessionId.length === 0) throw new SdkV3ProtocolError(`${operation} input`, "sessionId must be a non-empty string");
+	if (typeof input.sessionId !== "string" || input.sessionId.length === 0)
+		throw new SdkV3ProtocolError(`${operation} input`, "sessionId must be a non-empty string");
 	return input.sessionId;
 }
 function lifecycleControlInput(operation: string, input: SdkRecord, target: string | undefined): SdkRecord {
 	if (operation !== "session.resume" && operation !== "session.switch") return input;
-	if (target === undefined || typeof input.sessionPath !== "string" || input.sessionPath.length === 0) throw new SdkV3ProtocolError(`${operation} input`, target === undefined ? "sessionId must be a non-empty string" : "sessionPath must be a non-empty string");
+	if (target === undefined || typeof input.sessionPath !== "string" || input.sessionPath.length === 0)
+		throw new SdkV3ProtocolError(
+			`${operation} input`,
+			target === undefined ? "sessionId must be a non-empty string" : "sessionPath must be a non-empty string",
+		);
 	return { id: resolve(input.sessionPath) };
 }
-function createRemainingDeadline(
-	operation: string,
-	timeoutMs: number | undefined,
-): () => number {
+function createRemainingDeadline(operation: string, timeoutMs: number | undefined): () => number {
 	const deadline = Date.now() + (timeoutMs ?? 60_000);
 	return () => {
 		const remaining = deadline - Date.now();
 		if (remaining <= 0) {
-			throw new SdkV3OperationError(
-				"timeout",
-				`${operation} successor discovery timed out`,
-			);
+			throw new SdkV3OperationError("timeout", `${operation} successor discovery timed out`);
 		}
 		return remaining;
 	};
@@ -161,9 +170,7 @@ function lifecycleSuccessField(operation: string): string | undefined {
 	}
 }
 function isSuccessfulBranchResult(operation: string, result: SdkRecord): boolean {
-	return operation === "session.branch"
-		&& typeof result.selectedText === "string"
-		&& result.cancelled === false;
+	return operation === "session.branch" && typeof result.selectedText === "string" && result.cancelled === false;
 }
 function sleep(timeoutMs: number): Promise<void> {
 	return new Promise(resolve => {

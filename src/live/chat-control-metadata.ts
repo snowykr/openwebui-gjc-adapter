@@ -6,7 +6,12 @@ export function controlFromMetadata(metadata: Record<string, unknown> | undefine
 	if (!isRecord(control)) return { operation: "unsupported", surface: "invalid" };
 
 	const operation = control.operation;
-	if (operation === "abort" || operation === "steer" || operation === "follow_up" || operation === "abort_and_prompt") {
+	if (
+		operation === "abort" ||
+		operation === "steer" ||
+		operation === "follow_up" ||
+		operation === "abort_and_prompt"
+	) {
 		return typeof control.text === "string" ? { operation, text: control.text } : { operation };
 	}
 	if (operation === "action_reply" && typeof control.actionId === "string") {

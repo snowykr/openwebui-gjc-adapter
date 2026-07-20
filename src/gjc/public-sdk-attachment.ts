@@ -12,10 +12,7 @@ export type PublishedSdkEndpointGenerations = ReadonlyMap<string, PublicSdkSessi
 
 export function openPublishedDescriptor(path: string): number {
 	try {
-		return openSync(
-			path,
-			constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW,
-		);
+		return openSync(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
 	} catch {
 		throw new SdkV3OperationError(
 			"endpoint_stale",
@@ -23,27 +20,52 @@ export function openPublishedDescriptor(path: string): number {
 		);
 	}
 }
-export function assertAttachmentAuthority(attachment: PublicSdkSessionAttachment): asserts attachment is PublicSdkSessionAttachment & { readonly authority: NonNullable<PublicSdkSessionAttachment["authority"]> } {
+export function assertAttachmentAuthority(
+	attachment: PublicSdkSessionAttachment,
+): asserts attachment is PublicSdkSessionAttachment & {
+	readonly authority: NonNullable<PublicSdkSessionAttachment["authority"]>;
+} {
 	const authority = attachment.authority;
-	if (authority === undefined) throw new SdkV3OperationError("endpoint_stale", "Session attachment has no descriptor authority proof");
-	if (!SHA256_HEX.test(authority.payloadDigest)) throw new SdkV3OperationError("endpoint_stale", "Session attachment has an invalid descriptor payload digest");
+	if (authority === undefined)
+		throw new SdkV3OperationError("endpoint_stale", "Session attachment has no descriptor authority proof");
+	if (!SHA256_HEX.test(authority.payloadDigest))
+		throw new SdkV3OperationError("endpoint_stale", "Session attachment has an invalid descriptor payload digest");
 }
 export function readHeldDescriptor(descriptor: number, expectedSize: number): Buffer {
-	if (!Number.isSafeInteger(expectedSize) || expectedSize < 0 || expectedSize > MAX_PUBLISHED_SDK_ENDPOINT_DESCRIPTOR_BYTES)
-		throw new SdkV3OperationError("endpoint_stale", `Published session endpoint descriptor size must be between 0 and ${MAX_PUBLISHED_SDK_ENDPOINT_DESCRIPTOR_BYTES} bytes`);
+	if (
+		!Number.isSafeInteger(expectedSize) ||
+		expectedSize < 0 ||
+		expectedSize > MAX_PUBLISHED_SDK_ENDPOINT_DESCRIPTOR_BYTES
+	)
+		throw new SdkV3OperationError(
+			"endpoint_stale",
+			`Published session endpoint descriptor size must be between 0 and ${MAX_PUBLISHED_SDK_ENDPOINT_DESCRIPTOR_BYTES} bytes`,
+		);
 	const bytes = Buffer.alloc(expectedSize);
 	let offset = 0;
 	while (offset < bytes.length) {
 		const read = readSync(descriptor, bytes, offset, bytes.length - offset, offset);
-		if (read === 0) throw new SdkV3OperationError("endpoint_stale", "Published session endpoint descriptor ended before its validated size");
+		if (read === 0)
+			throw new SdkV3OperationError(
+				"endpoint_stale",
+				"Published session endpoint descriptor ended before its validated size",
+			);
 		offset += read;
 	}
-	if (fstatSync(descriptor).size !== expectedSize) throw new SdkV3OperationError("endpoint_stale", "Published session endpoint descriptor size changed while it was read");
+	if (fstatSync(descriptor).size !== expectedSize)
+		throw new SdkV3OperationError(
+			"endpoint_stale",
+			"Published session endpoint descriptor size changed while it was read",
+		);
 	return bytes;
 }
-export function descriptorPayloadDigest(bytes: Uint8Array): string { return createHash("sha256").update(bytes).digest("hex"); }
+export function descriptorPayloadDigest(bytes: Uint8Array): string {
+	return createHash("sha256").update(bytes).digest("hex");
+}
 export function sameDescriptorStat(left: DescriptorStat, right: DescriptorStat): boolean {
-	return left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeMs === right.mtimeMs;
+	return (
+		left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeMs === right.mtimeMs
+	);
 }
 export function assertPublishedSdkAttachmentCurrent(attachment: PublicSdkSessionAttachment): void {
 	assertAttachmentAuthority(attachment);
@@ -51,35 +73,65 @@ export function assertPublishedSdkAttachmentCurrent(attachment: PublicSdkSession
 	const descriptor = openPublishedDescriptor(authority.descriptorPath);
 	try {
 		const stat = fstatSync(descriptor);
-		if (!sameDescriptorStat(stat, authority.descriptorStat) || authority.generation !== authority.descriptorStat.mtimeMs) throw new SdkV3OperationError("endpoint_stale", "Session endpoint descriptor changed after attachment");
-		if (descriptorPayloadDigest(readHeldDescriptor(descriptor, authority.descriptorStat.size)) !== authority.payloadDigest) throw new SdkV3OperationError("endpoint_stale", "Session endpoint descriptor payload changed after attachment");
+		if (
+			!sameDescriptorStat(stat, authority.descriptorStat) ||
+			authority.generation !== authority.descriptorStat.mtimeMs
+		)
+			throw new SdkV3OperationError("endpoint_stale", "Session endpoint descriptor changed after attachment");
+		if (
+			descriptorPayloadDigest(readHeldDescriptor(descriptor, authority.descriptorStat.size)) !==
+			authority.payloadDigest
+		)
+			throw new SdkV3OperationError(
+				"endpoint_stale",
+				"Session endpoint descriptor payload changed after attachment",
+			);
 		const named = lstatSync(authority.descriptorPath);
-		if (!named.isFile() || !sameDescriptorStat(named, authority.descriptorStat)) throw new SdkV3OperationError("endpoint_stale", "Session endpoint descriptor changed after attachment");
+		if (!named.isFile() || !sameDescriptorStat(named, authority.descriptorStat))
+			throw new SdkV3OperationError("endpoint_stale", "Session endpoint descriptor changed after attachment");
 	} finally {
 		closeSync(descriptor);
 	}
 }
-export function attachmentFromPublishedSdkEndpoint(cwd: string, sessionId: string, endpoint: NonNullable<Awaited<ReturnType<typeof readSdkSessionEndpoint>>>): PublicSdkSessionAttachment {
+export function attachmentFromPublishedSdkEndpoint(
+	cwd: string,
+	sessionId: string,
+	endpoint: NonNullable<Awaited<ReturnType<typeof readSdkSessionEndpoint>>>,
+): PublicSdkSessionAttachment {
 	const canonicalCwd = resolve(cwd);
-	if (endpoint.sessionId !== sessionId) throw new SdkV3OperationError("endpoint_stale", `Published endpoint identity ${endpoint.sessionId} does not match ${sessionId}`);
-	if (basename(endpoint.path) !== `${sessionId}.json`) throw new SdkV3OperationError("endpoint_stale", "Published session endpoint path does not match the expected session");
+	if (endpoint.sessionId !== sessionId)
+		throw new SdkV3OperationError(
+			"endpoint_stale",
+			`Published endpoint identity ${endpoint.sessionId} does not match ${sessionId}`,
+		);
+	if (basename(endpoint.path) !== `${sessionId}.json`)
+		throw new SdkV3OperationError(
+			"endpoint_stale",
+			"Published session endpoint path does not match the expected session",
+		);
 	const descriptor = openPublishedDescriptor(endpoint.path);
 	try {
 		try {
 			const opened = fstatSync(descriptor);
-			if (!opened.isFile()) throw new SdkV3OperationError("endpoint_stale", "Published session endpoint descriptor is not a regular file");
+			if (!opened.isFile())
+				throw new SdkV3OperationError(
+					"endpoint_stale",
+					"Published session endpoint descriptor is not a regular file",
+				);
 			const bytes = readHeldDescriptor(descriptor, opened.size);
 			const descriptorStat = fstatSync(descriptor);
-			if (!sameDescriptorStat(opened, descriptorStat)) throw new SdkV3OperationError("endpoint_stale", "Published session endpoint descriptor changed while it was read");
+			if (!sameDescriptorStat(opened, descriptorStat))
+				throw new SdkV3OperationError(
+					"endpoint_stale",
+					"Published session endpoint descriptor changed while it was read",
+				);
 			const named = lstatSync(endpoint.path);
-			if (!named.isFile() || !sameDescriptorStat(named, descriptorStat)) throw new SdkV3OperationError("endpoint_stale", "Published session endpoint descriptor changed during discovery");
-			const attachment = createPublishedSdkAttachment(
-				canonicalCwd,
-				sessionId,
-				endpoint.path,
-				descriptorStat,
-				bytes,
-			);
+			if (!named.isFile() || !sameDescriptorStat(named, descriptorStat))
+				throw new SdkV3OperationError(
+					"endpoint_stale",
+					"Published session endpoint descriptor changed during discovery",
+				);
+			const attachment = createPublishedSdkAttachment(canonicalCwd, sessionId, endpoint.path, descriptorStat, bytes);
 			return attachment;
 		} catch (error) {
 			throwPublishedDescriptorValidationError(error);
@@ -90,10 +142,15 @@ export function attachmentFromPublishedSdkEndpoint(cwd: string, sessionId: strin
 }
 export async function snapshotPublishedSdkEndpointGenerations(cwd: string): Promise<PublishedSdkEndpointGenerations> {
 	const published = await listSdkSessionEndpoints(cwd);
-	if (published.warnings.length !== 0) throw new SdkV3OperationError("endpoint_stale", "Published session endpoint discovery returned warnings");
+	if (published.warnings.length !== 0)
+		throw new SdkV3OperationError("endpoint_stale", "Published session endpoint discovery returned warnings");
 	const generations = new Map<string, PublicSdkSessionAttachment>();
 	for (const endpoint of published.endpoints) {
-		if (generations.has(endpoint.sessionId)) throw new SdkV3OperationError("endpoint_stale", "Published session endpoint discovery contains duplicate session identities");
+		if (generations.has(endpoint.sessionId))
+			throw new SdkV3OperationError(
+				"endpoint_stale",
+				"Published session endpoint discovery contains duplicate session identities",
+			);
 		generations.set(endpoint.sessionId, attachmentFromPublishedSdkEndpoint(cwd, endpoint.sessionId, endpoint));
 	}
 	return generations;
@@ -101,7 +158,19 @@ export async function snapshotPublishedSdkEndpointGenerations(cwd: string): Prom
 export function samePublishedSdkEndpoint(left: PublicSdkSessionAttachment, right: PublicSdkSessionAttachment): boolean {
 	const a = left.authority;
 	const b = right.authority;
-	return a !== undefined && b !== undefined && left.sessionId === right.sessionId && left.cwd === right.cwd && left.endpoint.url === right.endpoint.url && left.endpoint.token === right.endpoint.token && a.descriptorPath === b.descriptorPath && sameDescriptorStat(a.descriptorStat, b.descriptorStat) && a.payloadDigest === b.payloadDigest && a.expectedSessionId === b.expectedSessionId && a.expectedCwd === b.expectedCwd;
+	return (
+		a !== undefined &&
+		b !== undefined &&
+		left.sessionId === right.sessionId &&
+		left.cwd === right.cwd &&
+		left.endpoint.url === right.endpoint.url &&
+		left.endpoint.token === right.endpoint.token &&
+		a.descriptorPath === b.descriptorPath &&
+		sameDescriptorStat(a.descriptorStat, b.descriptorStat) &&
+		a.payloadDigest === b.payloadDigest &&
+		a.expectedSessionId === b.expectedSessionId &&
+		a.expectedCwd === b.expectedCwd
+	);
 }
 function createPublishedSdkAttachment(
 	cwd: string,
@@ -135,8 +204,5 @@ function createPublishedSdkAttachment(
 }
 function throwPublishedDescriptorValidationError(error: unknown): never {
 	if (error instanceof SdkV3OperationError) throw error;
-	throw new SdkV3OperationError(
-		"endpoint_stale",
-		"Published session endpoint descriptor cannot be stably validated",
-	);
+	throw new SdkV3OperationError("endpoint_stale", "Published session endpoint descriptor cannot be stably validated");
 }

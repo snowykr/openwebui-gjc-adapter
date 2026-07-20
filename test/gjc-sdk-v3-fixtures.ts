@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PublicSdkSessionClient } from "../src/gjc/public-sdk-session-port";
 import type { PublicSdkSessionAttachment } from "../src/gjc/public-sdk-contract";
+import { PublicSdkSessionClient } from "../src/gjc/public-sdk-session-port";
 import type { SdkFixtureScenario } from "./gjc-sdk-v3-fixture-types";
 import { startSdkFixtureServer } from "./gjc-sdk-v3-server-fixture";
 

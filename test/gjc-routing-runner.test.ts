@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionMappingStore } from "../src/gjc/session-router";
-import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
+import { createGjcRoutingLiveGatewayRunner, createPublicSdkGjcTurnRunner } from "../src/live/gjc-routing-runner";
 import { FakeGjcTurnRunner, project } from "./gjc-routing-runner-fixtures";
 
 describe("createGjcRoutingLiveGatewayRunner", () => {
@@ -20,6 +20,41 @@ describe("createGjcRoutingLiveGatewayRunner", () => {
 		await runner.stop?.();
 
 		expect(cleaned).toBe(true);
+	});
+	test("uses the configured project session root with the production public SDK runner", async () => {
+		const delegate = new FakeGjcTurnRunner();
+		const turnRunner = Object.assign(
+			createPublicSdkGjcTurnRunner({
+				cliPath: "/missing-gjc-cli",
+				runtimeLocations: {
+					home: "/tmp",
+					configDomain: "/tmp/.gjc",
+					agentDir: "/tmp/.gjc",
+					readerWorkspace: "/tmp",
+					readerSessionRoot: "/tmp/.gjc/sessions",
+					protectedProjectPaths: ["/tmp", "/tmp/.gjc", "/tmp/.gjc/sessions", "/tmp/.gjc/state"],
+					childEnvironment: { HOME: "/tmp", GJC_CONFIG_DIR: "/tmp/.gjc", GJC_CODING_AGENT_DIR: "/tmp/.gjc" },
+				},
+				turnTimeoutMs: 1_000,
+			}),
+			{ startNewSession: delegate.startNewSession.bind(delegate) },
+		);
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings: new SessionMappingStore() });
+		const sessionRoot = "/configured/gjc-sessions";
+
+		expect(turnRunner.resolveSessionRoot).toBeUndefined();
+
+		await runner.run({
+			project: { ...project, sessionRoot },
+			prompt: "start",
+			chatId: "chat-configured-root",
+			messageId: "assistant-1",
+			userMessageId: "user-1",
+			userMessageParentId: null,
+			continued: false,
+		});
+
+		expect(delegate.starts[0]?.sessionRoot).toBe(sessionRoot);
 	});
 
 	test("continues mapped HTTP-style turns through switchSession and getState", async () => {

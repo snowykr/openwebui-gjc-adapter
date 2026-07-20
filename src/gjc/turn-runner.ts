@@ -1,17 +1,16 @@
 import type { NormalizedModelSelection } from "../contracts";
-import type { SessionAttachmentProof } from "./session-authority";
+import type { LiveGatewayRunnerInput } from "../live/chat-completions";
 import type { WorkflowGateAnswer } from "../projection/workflow-gates";
 import type { RegisteredProject } from "../projects/registry";
-import type { SessionMapping } from "./session-router";
-import type { LiveGatewayRunnerInput } from "../live/chat-completions";
 import type {
 	GjcLifecyclePublicationAddress,
 	GjcLifecycleScoped,
 	GjcLifecycleTransaction,
 	GjcSessionAddress,
 } from "./lifecycle-transaction";
+import type { SessionAttachmentProof } from "./session-authority";
+import type { SessionMapping } from "./session-router";
 
-export { GjcCloseReceipt } from "./lifecycle-transaction";
 export type {
 	GjcLifecycleOwner,
 	GjcLifecyclePublicationAddress,
@@ -22,6 +21,7 @@ export type {
 	GjcLifecycleTransaction,
 	GjcSessionAddress,
 } from "./lifecycle-transaction";
+export { GjcCloseReceipt } from "./lifecycle-transaction";
 
 export interface GjcStartNewSessionInput {
 	readonly cwd: string;
@@ -110,18 +110,27 @@ export interface GjcControlResult {
 	readonly attachment?: SessionAttachmentProof;
 }
 
-
 export interface GjcTurnRunner {
 	stop?(): void;
 	resolveSessionRoot?(cwd: string): string;
 	discardSessionAttachment?(cwd: string, sessionId: string): void;
-	withLifecyclePublication?<T>(address: GjcLifecyclePublicationAddress, effect: (lifecycle: GjcLifecycleTransaction) => Promise<T>): Promise<T>;
+	withLifecyclePublication?<T>(
+		address: GjcLifecyclePublicationAddress,
+		effect: (lifecycle: GjcLifecycleTransaction) => Promise<T>,
+	): Promise<T>;
 	/** Runs a close-only lifecycle transaction without recovering or attaching a dropped cache entry. */
-	withLifecycleClosePreflight?<T>(address: GjcLifecyclePublicationAddress, effect: (lifecycle: GjcLifecycleTransaction) => Promise<T>): Promise<T>;
+	withLifecycleClosePreflight?<T>(
+		address: GjcLifecyclePublicationAddress,
+		effect: (lifecycle: GjcLifecycleTransaction) => Promise<T>,
+	): Promise<T>;
 	startNewSession<T>(
 		input: GjcStartNewSessionInput,
 		publish: (result: GjcSessionAddress & GjcTurnResult, lifecycle: GjcLifecycleTransaction) => Promise<T>,
-		beforePrompt: (address: GjcSessionAddress & { readonly sessionFile: string }, attachment: SessionAttachmentProof, lifecycle: GjcLifecycleTransaction) => Promise<void>,
+		beforePrompt: (
+			address: GjcSessionAddress & { readonly sessionFile: string },
+			attachment: SessionAttachmentProof,
+			lifecycle: GjcLifecycleTransaction,
+		) => Promise<void>,
 		onFailure?: (lifecycle: GjcLifecycleTransaction, error: unknown) => Promise<void>,
 	): Promise<T>;
 	continueSession(input: GjcContinueSessionInput): Promise<GjcTurnResult>;

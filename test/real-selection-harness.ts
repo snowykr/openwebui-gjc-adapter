@@ -1,11 +1,11 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { DEFAULT_TURN_TIMEOUT_MS } from "../src/config";
+import type { OpenAIModelListResponse } from "../src/live/openai-types";
 import * as cli from "./cli-fixtures";
 import { RealSelectionCoordinator } from "./real-selection-coordinator";
 import { eventModels, parseObservations, parseOutbox } from "./real-selection-effect-schemas";
-import { DEFAULT_TURN_TIMEOUT_MS } from "../src/config";
-import type { OpenAIModelListResponse } from "../src/live/openai-types";
 import {
 	parseCompletion,
 	parseError,
@@ -181,10 +181,14 @@ export class RealSelectionHarness {
 		return eventModels(parseObservations(await readOptional(this.observationPath)), chatId);
 	}
 	async runnerFailures(): Promise<readonly unknown[]> {
-		return parseObservations(await readOptional(this.observationPath)).filter(entry => entry.type === "runner_failure");
+		return parseObservations(await readOptional(this.observationPath)).filter(
+			entry => entry.type === "runner_failure",
+		);
 	}
 	async adminFailures(): Promise<readonly unknown[]> {
-		return parseObservations(await readOptional(this.observationPath)).filter(entry => entry.type === "admin_failure");
+		return parseObservations(await readOptional(this.observationPath)).filter(
+			entry => entry.type === "admin_failure",
+		);
 	}
 
 	async removeModelBinding(chatId: string): Promise<void> {

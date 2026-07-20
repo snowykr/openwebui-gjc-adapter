@@ -66,7 +66,8 @@ export function resolveBranchRegenerateAction(input: ResolveBranchRegenerateInpu
 		return { action: "uncertain", reason: "missing-owner", sourceSessionId: mapping.sessionId };
 	}
 	const adapterMetadata = adapterMetadataFrom(input.messageMetadata);
-	const metadataOwnerUserId = stringMetadata(adapterMetadata?.ownerUserId) ?? stringMetadata(adapterMetadata?.owner_user_id);
+	const metadataOwnerUserId =
+		stringMetadata(adapterMetadata?.ownerUserId) ?? stringMetadata(adapterMetadata?.owner_user_id);
 	if (metadataOwnerUserId === undefined) {
 		return { action: "uncertain", reason: "missing-lineage-metadata", sourceSessionId: mapping.sessionId };
 	}
@@ -80,7 +81,8 @@ export function resolveBranchRegenerateAction(input: ResolveBranchRegenerateInpu
 	if (metadataProjectId !== input.project.id) {
 		return { action: "uncertain", reason: "project-mismatch", sourceSessionId: mapping.sessionId };
 	}
-	const metadataSessionId = stringMetadata(adapterMetadata?.gjcSessionId) ?? stringMetadata(adapterMetadata?.session_id);
+	const metadataSessionId =
+		stringMetadata(adapterMetadata?.gjcSessionId) ?? stringMetadata(adapterMetadata?.session_id);
 	if (metadataSessionId === undefined) {
 		return { action: "uncertain", reason: "missing-lineage-metadata", sourceSessionId: mapping.sessionId };
 	}

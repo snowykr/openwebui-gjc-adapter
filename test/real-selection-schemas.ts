@@ -2,6 +2,7 @@ import type { NormalizedModelSelection } from "../src/contracts";
 import type { OpenAIErrorResponse } from "../src/live/chat-response-format";
 import { decodeStrictModelCatalog, formatCanonicalModelId, parseCanonicalModelId } from "../src/live/models";
 import { isSseChoice } from "./real-selection-openai-schemas";
+
 type MappingDocument = Record<string, unknown> & { readonly mappings: readonly Record<string, unknown>[] };
 
 import type { OpenAIChatCompletionResponse, OpenAIModelListResponse } from "../src/live/openai-types";
@@ -119,7 +120,6 @@ function removeModelSelectionFromOperation(operation: unknown, chatId: string | 
 	Reflect.deleteProperty(mappingCopy, "modelSelection");
 	return { ...operation, result: { ...result, mapping: mappingCopy } };
 }
-
 
 export function parseCoordinatorCatalog(value: unknown): readonly object[] {
 	const models = isRecord(value) ? Reflect.get(value, "models") : undefined;

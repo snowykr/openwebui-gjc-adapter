@@ -1,7 +1,13 @@
 import type { PublicSdkGate, PublicSdkSessionAttachment, PublicSdkTurnOutcome } from "./public-sdk-contract";
 import type { SdkV3Client } from "./sdk-v3-client";
+import {
+	parseLastAssistant,
+	parseRecord,
+	requiredString,
+	type SdkRecord,
+	SdkV3OperationError,
+} from "./sdk-v3-protocol";
 import { SdkTerminalWindow } from "./sdk-v3-terminal";
-import { parseLastAssistant, parseRecord, requiredString, type SdkRecord, SdkV3OperationError } from "./sdk-v3-protocol";
 
 export interface PublicSdkTurnContext {
 	readonly client: SdkV3Client;
@@ -55,12 +61,14 @@ export async function runGateTurn(
 	try {
 		await window.captureGateBaseline(timeoutMs);
 		window.beginMutation();
-		await context.authority(timeoutMs, () => context.mutate(
-			"workflow.gate_answer",
-			{ id: gate.gateId, response: answer, expectedSessionId: attachment.sessionId },
-			key,
-			timeoutMs,
-		));
+		await context.authority(timeoutMs, () =>
+			context.mutate(
+				"workflow.gate_answer",
+				{ id: gate.gateId, response: answer, expectedSessionId: attachment.sessionId },
+				key,
+				timeoutMs,
+			),
+		);
 		window.accept(gate.correlation);
 		const value = await addAssistantFallback(context, window.wait(gate.correlation, timeoutMs), timeoutMs);
 		await context.authority(timeoutMs, async () => undefined);
@@ -102,13 +110,21 @@ export function waitForReply(
 	}, timeoutMs);
 	timeout.unref?.();
 	unsubscribe = client.onFrame(frame => {
-		const event = frame.type === "event" && typeof frame.payload === "object" && frame.payload !== null
-			? parseRecord(frame.payload, "event payload")
-			: frame;
+		const event =
+			frame.type === "event" && typeof frame.payload === "object" && frame.payload !== null
+				? parseRecord(frame.payload, "event payload")
+				: frame;
 		if (event.type !== "action_resolved" && event.type !== "reply_rejected") return;
 		if (event.sessionId !== sessionId || (event.actionId !== actionId && event.id !== actionId)) return;
 		if (event.type === "reply_rejected") {
-			settle(() => reject(new SdkV3OperationError("reply_rejected", typeof event.message === "string" ? event.message : "SDK rejected reply")));
+			settle(() =>
+				reject(
+					new SdkV3OperationError(
+						"reply_rejected",
+						typeof event.message === "string" ? event.message : "SDK rejected reply",
+					),
+				),
+			);
 			return;
 		}
 		settle(resolve);

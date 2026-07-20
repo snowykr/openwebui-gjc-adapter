@@ -53,9 +53,7 @@ describe("managed installation rendering and preflight", () => {
 		const dockerfile = readFileSync(new URL("../Dockerfile.adapter", import.meta.url), "utf8");
 		expect(dockerfile).toContain("COPY package.json bun.lock ./");
 		expect(dockerfile).toContain("bun install --frozen-lockfile --production");
-		expect(dockerfile).toContain(
-			"GJC_OPENWEBUI_GJC_COMMAND=/opt/openwebui-gjc-adapter/node_modules/.bin/gjc",
-		);
+		expect(dockerfile).toContain("GJC_OPENWEBUI_GJC_COMMAND=/opt/openwebui-gjc-adapter/node_modules/.bin/gjc");
 		expect(dockerfile).not.toContain("COPY patches");
 		expect(dockerfile).not.toContain("gjc-builder");
 		expect(dockerfile).toContain("COPY src ./src");

@@ -48,7 +48,11 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 				expect.objectContaining({ type: "agent_end", commandId: "command-right", turnId: "turn-right" }),
 			]);
 			expect(outcome.finalizedAssistantText).not.toBe("quarantined final");
-			expect(fixture.server.frames.some(frame => frame.type === "query_request" && frame.query === "workflow.gates.list")).toBe(true);
+			expect(
+				fixture.server.frames.some(
+					frame => frame.type === "query_request" && frame.query === "workflow.gates.list",
+				),
+			).toBe(true);
 		} finally {
 			await fixture.dispose();
 		}
@@ -261,12 +265,7 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 			await fixture.port.replyToAction("action-1", { approved: true }, "action-key", 500);
 			await fixture.port.planApprove({ planId: "plan-1" }, "plan-key", 500);
 
-			for (const operation of [
-				"turn.steer",
-				"turn.abort",
-				"ask.answer",
-				"workflow.plan_approve",
-			]) {
+			for (const operation of ["turn.steer", "turn.abort", "ask.answer", "workflow.plan_approve"]) {
 				expectSdkRequest(fixture.server.frames, "control_request", operation);
 			}
 		} finally {

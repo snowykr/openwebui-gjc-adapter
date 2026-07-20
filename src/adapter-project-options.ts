@@ -1,7 +1,7 @@
 import type { AdapterConfig, ResolvedAdapterConfig } from "./config";
 import { resolveGjcRuntimeLocations } from "./configure/runtime-locations";
-import { disambiguateRegisteredProjects, registerProjectDirectory } from "./projects/registry";
 import type { RegisteredProject } from "./projects/registry";
+import { disambiguateRegisteredProjects, registerProjectDirectory } from "./projects/registry";
 import type { AllowedRoot } from "./security/paths";
 
 export function resolveAdapterConfig(config: AdapterConfig): ResolvedAdapterConfig {
@@ -21,15 +21,23 @@ export function assertResolvedAdapterConfig(config: AdapterConfig): asserts conf
 	if (!isResolvedAdapterConfig(config)) throw new TypeError("resolved runtime locations are required");
 }
 
-async function loadConfiguredProjects(config: AdapterConfig, allowedRoots: readonly AllowedRoot[]): Promise<RegisteredProject[]> {
+async function loadConfiguredProjects(
+	config: AdapterConfig,
+	allowedRoots: readonly AllowedRoot[],
+): Promise<RegisteredProject[]> {
 	const projects: RegisteredProject[] = [];
 	for (const project of config.projects) {
-		projects.push(await registerProjectDirectory({
-			cwd: project.cwd,
-			name: project.name,
-			openWebUIFolderId: project.openWebUIFolderId,
-			sessionRoot: project.sessionRoot,
-		}, allowedRoots));
+		projects.push(
+			await registerProjectDirectory(
+				{
+					cwd: project.cwd,
+					name: project.name,
+					openWebUIFolderId: project.openWebUIFolderId,
+					sessionRoot: project.sessionRoot,
+				},
+				allowedRoots,
+			),
+		);
 	}
 	return [...disambiguateRegisteredProjects(projects)];
 }
@@ -37,7 +45,9 @@ async function loadConfiguredProjects(config: AdapterConfig, allowedRoots: reado
 export { loadConfiguredProjects };
 
 function isResolvedAdapterConfig(config: AdapterConfig): config is ResolvedAdapterConfig {
-	return typeof config.gjcConfigDirName === "string" &&
+	return (
+		typeof config.gjcConfigDirName === "string" &&
 		typeof config.gjcCodingAgentDir === "string" &&
-		config.runtimeLocations !== undefined;
+		config.runtimeLocations !== undefined
+	);
 }

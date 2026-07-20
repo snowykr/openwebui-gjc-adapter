@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, statSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { execFileSync } from "node:child_process";
 import {
 	attachmentFromPublishedSdkEndpoint,
 	PublicSdkSessionClient,
@@ -111,9 +111,14 @@ describe("published SDK endpoint attachment", () => {
 				JSON.stringify({ version: 1, url: "ws://2130706433:4123", token: "token" }),
 			]) {
 				writeFileSync(path, descriptor);
-				expect(() => attachmentFromPublishedSdkEndpoint("/workspace", "session-1", {
-					sessionId: "session-1", path, url: "ws://127.0.0.1:1", token: "discovery-token",
-				})).toThrow();
+				expect(() =>
+					attachmentFromPublishedSdkEndpoint("/workspace", "session-1", {
+						sessionId: "session-1",
+						path,
+						url: "ws://127.0.0.1:1",
+						token: "discovery-token",
+					}),
+				).toThrow();
 			}
 		} finally {
 			rmSync(root, { recursive: true, force: true });
@@ -125,14 +130,24 @@ describe("published SDK endpoint attachment", () => {
 		const sparsePath = join(root, "session-2.json");
 		try {
 			execFileSync("mkfifo", [fifoPath]);
-			expect(() => attachmentFromPublishedSdkEndpoint("/workspace", "session-1", {
-				sessionId: "session-1", path: fifoPath, url: "ws://127.0.0.1:1", token: "token",
-			})).toThrow();
+			expect(() =>
+				attachmentFromPublishedSdkEndpoint("/workspace", "session-1", {
+					sessionId: "session-1",
+					path: fifoPath,
+					url: "ws://127.0.0.1:1",
+					token: "token",
+				}),
+			).toThrow();
 			writeFileSync(sparsePath, "");
 			truncateSync(sparsePath, 16 * 1024 + 1);
-			expect(() => attachmentFromPublishedSdkEndpoint("/workspace", "session-2", {
-				sessionId: "session-2", path: sparsePath, url: "ws://127.0.0.1:1", token: "token",
-			})).toThrow();
+			expect(() =>
+				attachmentFromPublishedSdkEndpoint("/workspace", "session-2", {
+					sessionId: "session-2",
+					path: sparsePath,
+					url: "ws://127.0.0.1:1",
+					token: "token",
+				}),
+			).toThrow();
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}

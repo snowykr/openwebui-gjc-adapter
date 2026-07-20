@@ -35,7 +35,9 @@ export function handleQuery(
 					: scenario === "branch_candidate_drift"
 						? [{ entry: { id: "entry-q16", type: "drifted-message" }, children: [] }]
 						: [{ entry: { id: "entry-q16", type: "message" }, children: [] }];
-		socket.send(JSON.stringify({ type: "query_response", id, ok: true, page: { items, complete: true, revision: 16 } }));
+		socket.send(
+			JSON.stringify({ type: "query_response", id, ok: true, page: { items, complete: true, revision: 16 } }),
+		);
 		return;
 	}
 	const items: readonly unknown[] =

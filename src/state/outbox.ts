@@ -1,11 +1,11 @@
 import { createOperationId } from "./metadata";
 import {
-	copyOperation,
 	assertSameEnqueueIdentity,
-	toTimestamp,
+	copyOperation,
 	type EnqueueProjectionOperationInput,
 	type OutboxStore,
 	type ProjectionOperation,
+	toTimestamp,
 } from "./outbox-types";
 
 export { FileBackedOutboxStore, nodeOutboxFileSystem } from "./file-outbox";

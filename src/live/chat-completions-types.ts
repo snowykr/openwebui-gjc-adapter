@@ -15,7 +15,11 @@ export type OpenWebUIControl =
 	| { readonly operation: "branch" }
 	/** Attached lifecycle operations remain on the public session controller. */
 	| { readonly operation: "session.new" }
-	| { readonly operation: "session.resume" | "session.switch"; readonly sessionId: string; readonly sessionFile: string }
+	| {
+			readonly operation: "session.resume" | "session.switch";
+			readonly sessionId: string;
+			readonly sessionFile: string;
+	  }
 	| { readonly operation: "unsupported"; readonly surface: string };
 
 export interface LiveGatewayRunnerInput {

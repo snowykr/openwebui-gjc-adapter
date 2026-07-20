@@ -1,9 +1,13 @@
+import {
+	assertPublishedSdkAttachmentCurrent,
+	withPublicSdkSessionMutationCoordinator,
+} from "../gjc/public-sdk-session-port";
 import { SdkV3OperationError } from "../gjc/sdk-v3-protocol";
-import { GjcCloseReceipt } from "../gjc/turn-runner";
 import type { GjcLifecycleTransaction } from "../gjc/turn-runner";
-import { assertPublishedSdkAttachmentCurrent } from "../gjc/public-sdk-session-port";
-import { withPublicSdkSessionMutationCoordinator } from "../gjc/public-sdk-session-port";
+import { GjcCloseReceipt } from "../gjc/turn-runner";
+import { ensureAttachment } from "./gjc-public-sdk-session-ops";
 import { attachmentKey } from "./gjc-routing-endpoints";
+import type { LifecycleAddress, LifecycleEffect, PublicSdkRunnerContext } from "./gjc-routing-lifecycle";
 import {
 	runLifecycleTestBarrier,
 	sameActiveAttachmentProof,
@@ -12,12 +16,6 @@ import {
 	sameLifecycleAddress,
 	samePublishedAttachmentSnapshot,
 } from "./gjc-routing-proof";
-import type {
-	LifecycleAddress,
-	LifecycleEffect,
-	PublicSdkRunnerContext,
-} from "./gjc-routing-lifecycle";
-import { ensureAttachment } from "./gjc-public-sdk-session-ops";
 
 export async function withLifecycle<T>(
 	context: PublicSdkRunnerContext,
@@ -35,7 +33,10 @@ export async function withLifecycle<T>(
 		assertClosePreflight: proof => {
 			const attachment = context.attachments.get(attachmentKey(activeAddress));
 			if (attachment?.published === undefined || !sameExactActiveCloseProof(proof, attachment)) {
-				throw new SdkV3OperationError("endpoint_stale", "Close preflight proof no longer matches the exact active owned attachment");
+				throw new SdkV3OperationError(
+					"endpoint_stale",
+					"Close preflight proof no longer matches the exact active owned attachment",
+				);
 			}
 			assertPublishedSdkAttachmentCurrent(attachment.published);
 			const receipt = GjcCloseReceipt.fromPreflight(activeAddress, proof, attachment.published);
@@ -45,7 +46,10 @@ export async function withLifecycle<T>(
 		publish: async (proof, write) => {
 			const attachment = context.attachments.get(attachmentKey(activeAddress));
 			if (attachment?.published === undefined || !sameActiveAttachmentProof(proof, attachment)) {
-				throw new SdkV3OperationError("endpoint_stale", "Lifecycle publication proof no longer matches the active attachment");
+				throw new SdkV3OperationError(
+					"endpoint_stale",
+					"Lifecycle publication proof no longer matches the active attachment",
+				);
 			}
 			assertPublishedSdkAttachmentCurrent(attachment.published);
 			await runLifecycleTestBarrier(context.input.testBarrierHook, "pre_durable_publication", attachment.published);
@@ -96,13 +100,22 @@ function assertCurrentReceipt(
 	receipt: GjcCloseReceipt,
 	issued: import("./gjc-routing-lifecycle").CloseReceiptBinding | undefined,
 	attachment: import("./gjc-routing-proof").SessionAttachment | undefined,
-): asserts attachment is import("./gjc-routing-proof").SessionAttachment & { readonly published: NonNullable<import("./gjc-routing-proof").SessionAttachment["published"]> } {
+): asserts attachment is import("./gjc-routing-proof").SessionAttachment & {
+	readonly published: NonNullable<import("./gjc-routing-proof").SessionAttachment["published"]>;
+} {
 	if (
-		attachment?.published === undefined || issued === undefined || issued.owner !== owner ||
-		issued.attachment !== attachment || !sameLifecycleAddress(receipt.address, address) ||
-		!sameCloseReceiptSnapshot(receipt, issued.snapshot) || !sameExactActiveCloseProof(receipt.proof, attachment) ||
+		attachment?.published === undefined ||
+		issued === undefined ||
+		issued.owner !== owner ||
+		issued.attachment !== attachment ||
+		!sameLifecycleAddress(receipt.address, address) ||
+		!sameCloseReceiptSnapshot(receipt, issued.snapshot) ||
+		!sameExactActiveCloseProof(receipt.proof, attachment) ||
 		!samePublishedAttachmentSnapshot(receipt.attachment, attachment.published)
 	) {
-		throw new SdkV3OperationError("endpoint_stale", "Close receipt no longer matches the exact active owned attachment");
+		throw new SdkV3OperationError(
+			"endpoint_stale",
+			"Close receipt no longer matches the exact active owned attachment",
+		);
 	}
 }

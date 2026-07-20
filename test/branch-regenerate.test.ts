@@ -53,7 +53,14 @@ describe("branch regenerate projection", () => {
 			chatId: "chat-1",
 			messageId: "entry-1",
 			mappings: storeWithMapping(),
-			messageMetadata: { gjc_adapter: { ownerUserId: "owner-1", projectId: project.id, gjcSessionId: "session-1", gjcEntryId: "entry-1" } },
+			messageMetadata: {
+				gjc_adapter: {
+					ownerUserId: "owner-1",
+					projectId: project.id,
+					gjcSessionId: "session-1",
+					gjcEntryId: "entry-1",
+				},
+			},
 		});
 		if (decision.action !== "branch") throw new Error("expected branch");
 		expect(authorizeBranchRegenerateCandidate(decision, [])).toEqual({
@@ -61,13 +68,17 @@ describe("branch regenerate projection", () => {
 			reason: "branch-candidate-absent",
 			sourceSessionId: "session-1",
 		});
-		expect(authorizeBranchRegenerateCandidate(decision, [
-			{ entryId: "entry-1", source: { id: "entry-1", type: "message" } },
-			{ entryId: "entry-1", source: { id: "entry-1", type: "message" } },
-		])).toEqual({ action: "uncertain", reason: "branch-candidate-duplicate", sourceSessionId: "session-1" });
-		expect(authorizeBranchRegenerateCandidate(decision, [
-			{ entryId: "entry-1", source: { id: "other", type: "message" } },
-		])).toEqual({ action: "uncertain", reason: "branch-candidate-drift", sourceSessionId: "session-1" });
+		expect(
+			authorizeBranchRegenerateCandidate(decision, [
+				{ entryId: "entry-1", source: { id: "entry-1", type: "message" } },
+				{ entryId: "entry-1", source: { id: "entry-1", type: "message" } },
+			]),
+		).toEqual({ action: "uncertain", reason: "branch-candidate-duplicate", sourceSessionId: "session-1" });
+		expect(
+			authorizeBranchRegenerateCandidate(decision, [
+				{ entryId: "entry-1", source: { id: "other", type: "message" } },
+			]),
+		).toEqual({ action: "uncertain", reason: "branch-candidate-drift", sourceSessionId: "session-1" });
 	});
 
 	test("reports uncertainty when explicit OpenWebUI message id metadata mismatches", () => {
@@ -196,7 +207,11 @@ describe("branch regenerate projection", () => {
 			},
 		});
 
-		expect(decision).toEqual({ action: "uncertain", reason: "missing-lineage-metadata", sourceSessionId: "session-1" });
+		expect(decision).toEqual({
+			action: "uncertain",
+			reason: "missing-lineage-metadata",
+			sourceSessionId: "session-1",
+		});
 	});
 
 	test("reports uncertainty when no stored mapping exists", () => {

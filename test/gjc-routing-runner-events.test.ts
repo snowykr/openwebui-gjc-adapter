@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { SessionMappingStore } from "../src/gjc/session-router";
 import type {
 	GjcContinueSessionInput,
 	GjcSessionAddress,
@@ -9,11 +10,10 @@ import type {
 	GjcTurnResult,
 	GjcTurnRunner,
 } from "../src/gjc/turn-runner";
-import { SessionMappingStore } from "../src/gjc/session-router";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
 import type { RegisteredProject } from "../src/projects/registry";
-import { staticModelReaderFactory } from "./model-selection-fixtures";
 import { attachmentProof, lifecycleFixture } from "./gjc-lifecycle-fixtures";
+import { staticModelReaderFactory } from "./model-selection-fixtures";
 
 class FakeGjcTurnRunner implements GjcTurnRunner {
 	events: GjcTurnResult["events"] = [{ type: "assistant", text: "assistant from gjc" }];
@@ -26,7 +26,10 @@ class FakeGjcTurnRunner implements GjcTurnRunner {
 
 	async startNewSession<T>(
 		input: GjcStartNewSessionInput,
-		publish: (result: GjcSessionAddress & GjcTurnResult, lifecycle: ReturnType<typeof lifecycleFixture>) => Promise<T>,
+		publish: (
+			result: GjcSessionAddress & GjcTurnResult,
+			lifecycle: ReturnType<typeof lifecycleFixture>,
+		) => Promise<T>,
 	): Promise<T> {
 		const result = {
 			cwd: input.cwd,

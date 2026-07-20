@@ -214,14 +214,25 @@ describe("project admin routes", () => {
 		await fs.mkdir(path.dirname(descriptor), { recursive: true });
 		await writeSdkDescriptor(projectDirectory, sessionId, { url: "ws://127.0.0.1:9876", token: "healthy-token" });
 		const started = await runTmux(socket, [
-			"new-session", "-d", "-P", "-F", "#{pane_id}|#{pane_pid}", "-s", "default-close",
-			"--", "sh", "-c", `while IFS= read -r line; do if [ "$line" = /exit ]; then printf 'exit\n' >> '${trace}'; rm -f '${descriptor}'; exit; fi; done`,
+			"new-session",
+			"-d",
+			"-P",
+			"-F",
+			"#{pane_id}|#{pane_pid}",
+			"-s",
+			"default-close",
+			"--",
+			"sh",
+			"-c",
+			`while IFS= read -r line; do if [ "$line" = /exit ]; then printf 'exit\n' >> '${trace}'; rm -f '${descriptor}'; exit; fi; done`,
 		]);
 		if (started.exitCode !== 0) throw new Error(started.stderr);
 		const [tmuxPane, pid] = started.stdout.trim().split("|");
 		if (tmuxPane === undefined || pid === undefined) throw new Error("tmux did not return a pane");
 		const owner = "default-close-owner";
-		await expect(runTmux(socket, ["set-option", "-p", "-t", tmuxPane, "@openwebui_gjc_owner", owner])).resolves.toMatchObject({ exitCode: 0 });
+		await expect(
+			runTmux(socket, ["set-option", "-p", "-t", tmuxPane, "@openwebui_gjc_owner", owner]),
+		).resolves.toMatchObject({ exitCode: 0 });
 		const mappings = new SessionMappingStore();
 		const calls: string[] = [];
 		const options = await buildAdapterServerOptionsFromEnv(
@@ -231,39 +242,90 @@ describe("project admin routes", () => {
 				mappings,
 				modelReaderFactory,
 				sessionPortFactory: (): PublicSdkSessionPort => ({
-					async attach() { calls.push("attach"); },
-					detach() { calls.push("detach"); },
-					async closeSession() { calls.push("close"); },
-					async getState() { return unexpectedSessionPortCall("getState"); },
-					async getAvailableModels() { return unexpectedSessionPortCall("getAvailableModels"); },
-					async setModel() { return unexpectedSessionPortCall("setModel"); },
-					async setThinking() { return unexpectedSessionPortCall("setThinking"); },
-					async prompt() { return unexpectedSessionPortCall("prompt"); },
-					async reply() { return unexpectedSessionPortCall("reply"); },
-					async steer() { return unexpectedSessionPortCall("steer"); },
-					async followUp() { return unexpectedSessionPortCall("followUp"); },
-					async abort() { return unexpectedSessionPortCall("abort"); },
-					async abortAndPrompt() { return unexpectedSessionPortCall("abortAndPrompt"); },
-					async replyToAction() { return unexpectedSessionPortCall("replyToAction"); },
-					async planApprove() { return unexpectedSessionPortCall("planApprove"); },
-					async answerGate() { return unexpectedSessionPortCall("answerGate"); },
-					async branchCandidates() { return unexpectedSessionPortCall("branchCandidates"); },
-					async branch() { return unexpectedSessionPortCall("branch"); },
-					async newSession() { return unexpectedSessionPortCall("newSession"); },
-					async resumeSession() { return unexpectedSessionPortCall("resumeSession"); },
-					async switchSession() { return unexpectedSessionPortCall("switchSession"); },
+					async attach() {
+						calls.push("attach");
+					},
+					detach() {
+						calls.push("detach");
+					},
+					async closeSession() {
+						calls.push("close");
+					},
+					async getState() {
+						return unexpectedSessionPortCall("getState");
+					},
+					async getAvailableModels() {
+						return unexpectedSessionPortCall("getAvailableModels");
+					},
+					async setModel() {
+						return unexpectedSessionPortCall("setModel");
+					},
+					async setThinking() {
+						return unexpectedSessionPortCall("setThinking");
+					},
+					async prompt() {
+						return unexpectedSessionPortCall("prompt");
+					},
+					async reply() {
+						return unexpectedSessionPortCall("reply");
+					},
+					async steer() {
+						return unexpectedSessionPortCall("steer");
+					},
+					async followUp() {
+						return unexpectedSessionPortCall("followUp");
+					},
+					async abort() {
+						return unexpectedSessionPortCall("abort");
+					},
+					async abortAndPrompt() {
+						return unexpectedSessionPortCall("abortAndPrompt");
+					},
+					async replyToAction() {
+						return unexpectedSessionPortCall("replyToAction");
+					},
+					async planApprove() {
+						return unexpectedSessionPortCall("planApprove");
+					},
+					async answerGate() {
+						return unexpectedSessionPortCall("answerGate");
+					},
+					async branchCandidates() {
+						return unexpectedSessionPortCall("branchCandidates");
+					},
+					async branch() {
+						return unexpectedSessionPortCall("branch");
+					},
+					async newSession() {
+						return unexpectedSessionPortCall("newSession");
+					},
+					async resumeSession() {
+						return unexpectedSessionPortCall("resumeSession");
+					},
+					async switchSession() {
+						return unexpectedSessionPortCall("switchSession");
+					},
 				}),
 			},
 		);
 		const routes = options.routes;
-		if (routes?.projectLinkService === undefined || routes.closeSession === undefined) throw new Error("expected project close routes");
+		if (routes?.projectLinkService === undefined || routes.closeSession === undefined)
+			throw new Error("expected project close routes");
 		const linked = await routes.projectLinkService.linkProject({ cwd: projectDirectory, name: "Default Project" });
 		mappings.set({
 			...mappingFor(linked.project.id, sessionId),
-			attachment: { ...(await currentSdkAttachment(projectDirectory, sessionId)).authority!, tmuxSocket: socket, tmuxPane, tmuxPanePid: Number(pid), tmuxOwnershipTag: owner },
+			attachment: {
+				...(await currentSdkAttachment(projectDirectory, sessionId)).authority!,
+				tmuxSocket: socket,
+				tmuxPane,
+				tmuxPanePid: Number(pid),
+				tmuxOwnershipTag: owner,
+			},
 		});
 		const closeIngress = { ingressId: "default-close", ingressHash: "default-close" };
-		await expect(routes.closeSession(mappings.get("dynamic-chat")!, closeIngress)).resolves.toEqual({ status: "closed" });
+		await expect(routes.closeSession(mappings.get("dynamic-chat")!, closeIngress)).resolves.toEqual({
+			status: "closed",
+		});
 		expect(calls).toEqual(["attach", "close", "detach"]);
 		expect(await fs.readFile(trace, "utf8")).toBe("exit\n");
 		expect(await readSdkSessionEndpoint(projectDirectory, sessionId)).toBeNull();
@@ -282,7 +344,9 @@ describe("project admin routes", () => {
 				mapping: { chatId: "dynamic-chat", sessionId },
 			},
 		});
-		await expect(routes.closeSession(mappings.get("dynamic-chat")!, closeIngress)).resolves.toEqual({ status: "closed" });
+		await expect(routes.closeSession(mappings.get("dynamic-chat")!, closeIngress)).resolves.toEqual({
+			status: "closed",
+		});
 		expect(calls).toEqual(["attach", "close", "detach"]);
 		await runTmux(socket, ["kill-server"]);
 	});
@@ -293,7 +357,11 @@ describe("project admin routes", () => {
 		await fs.mkdir(projectDirectory);
 		const sessionId = "same-id";
 		await fs.mkdir(path.join(projectDirectory, ".gjc", "state", "sdk"), { recursive: true });
-		await writeSdkDescriptor(projectDirectory, sessionId, { url: "ws://127.0.0.1:9876", token: "original-token", pid: 42 });
+		await writeSdkDescriptor(projectDirectory, sessionId, {
+			url: "ws://127.0.0.1:9876",
+			token: "original-token",
+			pid: 42,
+		});
 		const mappings = new SessionMappingStore();
 		const discarded: string[] = [];
 		const turnRunner = Object.assign(strictCloseTurnRunner(), {
@@ -391,7 +459,11 @@ describe("project admin routes", () => {
 			attachment: { ...(await currentSdkAttachment(projectDirectory, sessionId)).authority!, ...pane },
 		});
 
-		await writeSdkDescriptor(projectDirectory, sessionId, { url: "ws://127.0.0.1:9876", token: "successor-token", pid: 42 });
+		await writeSdkDescriptor(projectDirectory, sessionId, {
+			url: "ws://127.0.0.1:9876",
+			token: "successor-token",
+			pid: 42,
+		});
 		await expect(
 			routes.closeSession(mappings.get("dynamic-chat")!, { ingressId: "stale-close", ingressHash: "stale-close" }),
 		).resolves.toMatchObject({ status: "uncertain" });
@@ -715,7 +787,10 @@ async function writeSdkDescriptor(
 ): Promise<void> {
 	await fs.writeFile(path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`), JSON.stringify(endpoint));
 }
-async function runTmux(socket: string, args: readonly string[]): Promise<{ readonly exitCode: number; readonly stdout: string; readonly stderr: string }> {
+async function runTmux(
+	socket: string,
+	args: readonly string[],
+): Promise<{ readonly exitCode: number; readonly stdout: string; readonly stderr: string }> {
 	const child = Bun.spawn(["tmux", "-L", socket, ...args], { stdout: "pipe", stderr: "pipe" });
 	const [stdout, stderr, exitCode] = await Promise.all([
 		new Response(child.stdout).text(),
@@ -796,7 +871,10 @@ function strictCloseTurnRunner(): FakeGjcTurnRunner {
 	return runner;
 }
 
-function assertExactAttachmentProof(candidate: NonNullable<SessionMapping["attachment"]>, expected: NonNullable<SessionMapping["attachment"]>): void {
+function assertExactAttachmentProof(
+	candidate: NonNullable<SessionMapping["attachment"]>,
+	expected: NonNullable<SessionMapping["attachment"]>,
+): void {
 	expect(candidate).toEqual(expected);
 }
 function jsonRequest(url: string, body: unknown): Request {

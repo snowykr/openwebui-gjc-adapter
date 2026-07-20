@@ -1,8 +1,20 @@
 import type { NormalizedModelSelection } from "../contracts";
-import type { PublicSdkBranchCandidate, PublicSdkSessionAttachment, PublicSdkSessionState } from "./public-sdk-contract";
-import { ensureCapabilityCatalog, parseRecord, parseSelection, parseState, requiredString, SdkV3OperationError, SdkV3ProtocolError } from "./sdk-v3-protocol";
 import { queryOne } from "./public-sdk-authority";
+import type {
+	PublicSdkBranchCandidate,
+	PublicSdkSessionAttachment,
+	PublicSdkSessionState,
+} from "./public-sdk-contract";
 import type { SdkV3Client } from "./sdk-v3-client";
+import {
+	ensureCapabilityCatalog,
+	parseRecord,
+	parseSelection,
+	parseState,
+	requiredString,
+	SdkV3OperationError,
+	SdkV3ProtocolError,
+} from "./sdk-v3-protocol";
 
 export async function readSessionState(
 	client: SdkV3Client,
@@ -20,7 +32,10 @@ export async function readAvailableModels(client: SdkV3Client, timeoutMs?: numbe
 	return ensureCapabilityCatalog(await client.queryAll("models.list/current", {}, timeoutMs));
 }
 
-export async function readBranchCandidates(client: SdkV3Client, timeoutMs?: number): Promise<readonly PublicSdkBranchCandidate[]> {
+export async function readBranchCandidates(
+	client: SdkV3Client,
+	timeoutMs?: number,
+): Promise<readonly PublicSdkBranchCandidate[]> {
 	const candidates: PublicSdkBranchCandidate[] = [];
 	const seen = new Set<string>();
 	for (const root of await client.queryAll("session.branch_candidates", {}, timeoutMs)) {
@@ -53,7 +68,9 @@ export async function confirmSelection(
 	});
 	if (
 		expected !== undefined &&
-		(selection.provider !== expected.provider || selection.modelId !== expected.modelId || selection.thinkingLevel !== expected.thinkingLevel)
+		(selection.provider !== expected.provider ||
+			selection.modelId !== expected.modelId ||
+			selection.thinkingLevel !== expected.thinkingLevel)
 	) {
 		throw new SdkV3OperationError("invalid_result", "models.list/current did not confirm the mutation result");
 	}

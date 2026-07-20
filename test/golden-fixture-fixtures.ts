@@ -50,7 +50,10 @@ export class GoldenTurnRunner implements GjcTurnRunner {
 
 	async startNewSession<T>(
 		input: GjcStartNewSessionInput,
-		publish: (result: GjcSessionAddress & GjcTurnResult, lifecycle: ReturnType<typeof lifecycleFixture>) => Promise<T>,
+		publish: (
+			result: GjcSessionAddress & GjcTurnResult,
+			lifecycle: ReturnType<typeof lifecycleFixture>,
+		) => Promise<T>,
 	): Promise<T> {
 		this.starts.push(input);
 		const result = {

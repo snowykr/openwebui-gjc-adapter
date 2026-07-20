@@ -26,11 +26,17 @@ async function respond(request: Request): Promise<Response> {
 		`data: ${JSON.stringify({ id: "compat", object: "chat.completion.chunk", created, model: "hermetic-model", choices: [{ index: 0, delta, finish_reason: finishReason }] })}\n\n`;
 	const content = "compatibility-ok\n\nThere is nothing left to do.";
 	if (input.stream)
-		return new Response(`${chunk({ role: "assistant" }, null)}${chunk({ content }, null)}${chunk({}, "stop")}data: [DONE]\n\n`, {
-			headers: { "content-type": "text/event-stream" },
-		});
+		return new Response(
+			`${chunk({ role: "assistant" }, null)}${chunk({ content }, null)}${chunk({}, "stop")}data: [DONE]\n\n`,
+			{
+				headers: { "content-type": "text/event-stream" },
+			},
+		);
 	return Response.json({
-		id: "compat", object: "chat.completion", created, model: "hermetic-model",
+		id: "compat",
+		object: "chat.completion",
+		created,
+		model: "hermetic-model",
 		choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
 		usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
 	});
@@ -38,7 +44,9 @@ async function respond(request: Request): Promise<Response> {
 
 export async function writeLocalProviderConfig(agentDirectory: string, baseUrl: string): Promise<void> {
 	await mkdir(agentDirectory, { recursive: true });
-	await writeFile(join(agentDirectory, "models.yml"), `providers:
+	await writeFile(
+		join(agentDirectory, "models.yml"),
+		`providers:
   compat-local:
     baseUrl: ${baseUrl}/v1
     apiKeyEnv: GJC_COMPAT_LOCAL_API_KEY
@@ -54,6 +62,7 @@ export async function writeLocalProviderConfig(agentDirectory: string, baseUrl: 
         contextWindow: 8192
         maxTokens: 1024
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
-`);
+`,
+	);
 	await writeFile(join(agentDirectory, "config.yml"), "compaction:\n  autoContinue: false\n");
 }

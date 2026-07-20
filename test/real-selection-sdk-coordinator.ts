@@ -137,7 +137,8 @@ export function startRealSelectionSdkServer(coordinatorUrl: string): RealSelecti
 		}
 		if (operation === "thinking.set") {
 			const selection =
-				sessionSelections.get(socket.data.sessionId) ?? selectionFromRecord(await fetchRecord(`${coordinatorUrl}/state`));
+				sessionSelections.get(socket.data.sessionId) ??
+				selectionFromRecord(await fetchRecord(`${coordinatorUrl}/state`));
 			const response = await fetch(`${coordinatorUrl}/setter`, {
 				method: "POST",
 				headers: { "content-type": "application/json" },

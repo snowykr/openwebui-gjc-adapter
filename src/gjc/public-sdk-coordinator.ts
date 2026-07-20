@@ -3,14 +3,28 @@ import { resolve } from "node:path";
 import type { PublicSdkSessionCoordinatorOwner } from "./public-sdk-contract";
 import { SdkV3OperationError } from "./sdk-v3-protocol";
 
-export interface PublicSdkSessionCoordinatorScope { readonly cwd: string; readonly sessionId: string; }
-interface SessionMutationCoordinator { owner: PublicSdkSessionCoordinatorOwner | undefined; tail: Promise<void>; }
+export interface PublicSdkSessionCoordinatorScope {
+	readonly cwd: string;
+	readonly sessionId: string;
+}
+interface SessionMutationCoordinator {
+	owner: PublicSdkSessionCoordinatorOwner | undefined;
+	tail: Promise<void>;
+}
 const coordinators = new Map<string, SessionMutationCoordinator>();
 const ambientOwner = new AsyncLocalStorage<PublicSdkSessionCoordinatorOwner>();
 
 /** Serializes mutations and descriptor refreshes by canonical session lookup scope. */
-export async function withPublicSdkSessionMutationCoordinator<T>(scope: PublicSdkSessionCoordinatorScope, owner: PublicSdkSessionCoordinatorOwner, effect: () => Promise<T>): Promise<T> {
-	if (typeof owner !== "object" || owner === null) throw new SdkV3OperationError("coordinator_owner_mismatch", "Session mutation coordinator owner must be a non-null object");
+export async function withPublicSdkSessionMutationCoordinator<T>(
+	scope: PublicSdkSessionCoordinatorScope,
+	owner: PublicSdkSessionCoordinatorOwner,
+	effect: () => Promise<T>,
+): Promise<T> {
+	if (typeof owner !== "object" || owner === null)
+		throw new SdkV3OperationError(
+			"coordinator_owner_mismatch",
+			"Session mutation coordinator owner must be a non-null object",
+		);
 	const key = `${resolve(scope.cwd)}\u0000${scope.sessionId}`;
 	const active = coordinators.get(key);
 	const storedOwner = ambientOwner.getStore();

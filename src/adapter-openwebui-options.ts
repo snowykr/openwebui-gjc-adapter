@@ -19,7 +19,8 @@ export function buildOpenWebUIPromptHintClient(config: AdapterConfig): OpenWebUI
 export function buildOpenWebUIEventSink(client: OpenWebUIHttpClient | undefined): LiveGatewayEventSink | undefined {
 	if (client === undefined) return undefined;
 	return async input => {
-		for (const event of input.events) await client.postMessageEvent({ chatId: input.chatId, messageId: input.messageId, event });
+		for (const event of input.events)
+			await client.postMessageEvent({ chatId: input.chatId, messageId: input.messageId, event });
 	};
 }
 
@@ -30,7 +31,9 @@ export function buildOpenWebUIMessageSink(client: OpenWebUIHttpClient | undefine
 	};
 }
 
-export function buildOpenWebUIFileContextResolver(client: OpenWebUIHttpClient | undefined): LiveGatewayFileContextResolver | undefined {
+export function buildOpenWebUIFileContextResolver(
+	client: OpenWebUIHttpClient | undefined,
+): LiveGatewayFileContextResolver | undefined {
 	return client === undefined ? undefined : createOpenWebUIFileContextResolver(client);
 }
 

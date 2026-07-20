@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
-import type { SessionAttachmentProof } from "./session-authority";
 import type { PublicSdkSessionAttachment } from "./public-sdk-contract";
+import type { SessionAttachmentProof } from "./session-authority";
 
 export type GjcLifecycleOwner = object;
 
@@ -31,17 +31,39 @@ export class GjcCloseReceipt implements SessionAttachmentProof {
 	) {
 		Object.freeze(this);
 	}
-	get descriptorPath(): string { return this.proof.descriptorPath; }
-	get descriptorStat(): SessionAttachmentProof["descriptorStat"] { return this.proof.descriptorStat; }
-	get payloadDigest(): string { return this.proof.payloadDigest; }
-	get generation(): number { return this.proof.generation; }
-	get expectedSessionId(): string { return this.proof.expectedSessionId; }
-	get expectedCwd(): string { return this.proof.expectedCwd; }
-	get tmuxSocket(): string | undefined { return this.proof.tmuxSocket; }
-	get tmuxPane(): string | undefined { return this.proof.tmuxPane; }
-	get tmuxPanePid(): number | undefined { return this.proof.tmuxPanePid; }
-	get tmuxOwnershipTag(): string | undefined { return this.proof.tmuxOwnershipTag; }
-	get ownedAt(): string | undefined { return this.proof.ownedAt; }
+	get descriptorPath(): string {
+		return this.proof.descriptorPath;
+	}
+	get descriptorStat(): SessionAttachmentProof["descriptorStat"] {
+		return this.proof.descriptorStat;
+	}
+	get payloadDigest(): string {
+		return this.proof.payloadDigest;
+	}
+	get generation(): number {
+		return this.proof.generation;
+	}
+	get expectedSessionId(): string {
+		return this.proof.expectedSessionId;
+	}
+	get expectedCwd(): string {
+		return this.proof.expectedCwd;
+	}
+	get tmuxSocket(): string | undefined {
+		return this.proof.tmuxSocket;
+	}
+	get tmuxPane(): string | undefined {
+		return this.proof.tmuxPane;
+	}
+	get tmuxPanePid(): number | undefined {
+		return this.proof.tmuxPanePid;
+	}
+	get tmuxOwnershipTag(): string | undefined {
+		return this.proof.tmuxOwnershipTag;
+	}
+	get ownedAt(): string | undefined {
+		return this.proof.ownedAt;
+	}
 	static fromPreflight(
 		address: GjcLifecyclePublicationAddress,
 		proof: SessionAttachmentProof,
@@ -70,16 +92,16 @@ export class GjcCloseReceipt implements SessionAttachmentProof {
 				...(attachment.authority === undefined
 					? {}
 					: {
-						authority: Object.freeze({
-							...proof,
-							descriptorPath: attachment.authority.descriptorPath,
-							descriptorStat: Object.freeze({ ...attachment.authority.descriptorStat }),
-							payloadDigest: attachment.authority.payloadDigest,
-							generation: attachment.authority.generation,
-							expectedSessionId: attachment.authority.expectedSessionId,
-							expectedCwd: attachment.authority.expectedCwd,
+							authority: Object.freeze({
+								...proof,
+								descriptorPath: attachment.authority.descriptorPath,
+								descriptorStat: Object.freeze({ ...attachment.authority.descriptorStat }),
+								payloadDigest: attachment.authority.payloadDigest,
+								generation: attachment.authority.generation,
+								expectedSessionId: attachment.authority.expectedSessionId,
+								expectedCwd: attachment.authority.expectedCwd,
+							}),
 						}),
-					}),
 			}),
 		);
 	}

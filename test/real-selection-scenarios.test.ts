@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { LOW_MODEL_ID, MEDIUM_MODEL_ID, OFF_MODEL_ID } from "./model-selection-fixtures";
 import { expectNoDeliveryMutation, expectSelectionError } from "./real-selection-expectations";
 import { RealSelectionHarness } from "./real-selection-harness";
+
 function expectNoPersistedModelSelectionBinding(document: unknown, chatId: string): void {
 	expect(document).toEqual(expect.objectContaining({ mappings: expect.any(Array) }));
 	const mappings = (document as { mappings: unknown[] }).mappings.filter(
@@ -25,7 +26,6 @@ function expectNoPersistedModelSelectionBinding(document: unknown, chatId: strin
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
-
 
 describe("real canonical model selection scenarios", () => {
 	test("returns every typed selection error with the required side-effect boundaries", async () => {
@@ -181,7 +181,9 @@ describe("real canonical model selection scenarios", () => {
 				readonly provisionalOperations: readonly Record<string, unknown>[];
 			};
 			expect(mappingDocument.mappings.some(mapping => mapping.chatId === "chat-prompt-failed")).toBeFalse();
-			const provisional = mappingDocument.provisionalOperations.filter(operation => operation.chatId === "chat-prompt-failed");
+			const provisional = mappingDocument.provisionalOperations.filter(
+				operation => operation.chatId === "chat-prompt-failed",
+			);
 			expect(provisional).toHaveLength(1);
 			const operation = provisional[0] as Record<string, unknown>;
 			const attachment = operation.attachment as Record<string, unknown>;

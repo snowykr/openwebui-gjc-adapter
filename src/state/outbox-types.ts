@@ -28,7 +28,8 @@ export interface EnqueueProjectionOperationInput {
 }
 export function assertSameEnqueueIdentity(existing: ProjectionOperation, input: EnqueueProjectionOperationInput): void {
 	for (const field of ["ownerUserId", "projectId", "chatId", "kind", "payloadHash"] as const) {
-		if (existing[field] !== input[field]) throw new Error(`Projection operation ID conflict: ${existing.operationId}`);
+		if (existing[field] !== input[field])
+			throw new Error(`Projection operation ID conflict: ${existing.operationId}`);
 	}
 }
 
@@ -67,7 +68,12 @@ export function parsePersistedOutboxDocument(serialized: string): PersistedOutbo
 	} catch (error) {
 		throw new Error(`Invalid outbox document JSON: ${getErrorMessage(error)}`);
 	}
-	if (!isRecord(value) || !hasOnlyKeys(value, ["version", "operations"]) || value.version !== OUTBOX_DOCUMENT_VERSION || !Array.isArray(value.operations)) {
+	if (
+		!isRecord(value) ||
+		!hasOnlyKeys(value, ["version", "operations"]) ||
+		value.version !== OUTBOX_DOCUMENT_VERSION ||
+		!Array.isArray(value.operations)
+	) {
 		throw new Error("Invalid outbox document");
 	}
 	const operationIds = new Set<string>();
@@ -81,7 +87,18 @@ export function parsePersistedOutboxDocument(serialized: string): PersistedOutbo
 }
 
 function parseOperation(value: unknown, index: number): ProjectionOperation {
-	const keys = ["operationId", "ownerUserId", "projectId", "chatId", "kind", "state", "payloadHash", "attempts", "createdAt", "updatedAt"];
+	const keys = [
+		"operationId",
+		"ownerUserId",
+		"projectId",
+		"chatId",
+		"kind",
+		"state",
+		"payloadHash",
+		"attempts",
+		"createdAt",
+		"updatedAt",
+	];
 	if (!isRecord(value) || !hasOnlyKeys(value, [...keys, "lastError"]) || keys.some(key => !(key in value))) {
 		throw new Error(`Invalid outbox operation at index ${index}`);
 	}
@@ -100,7 +117,8 @@ function parseOperation(value: unknown, index: number): ProjectionOperation {
 		value.attempts < 0 ||
 		!isTimestamp(value.createdAt) ||
 		!isTimestamp(value.updatedAt)
-	) throw new Error(`Invalid outbox operation at index ${index}`);
+	)
+		throw new Error(`Invalid outbox operation at index ${index}`);
 	let parsedLastError: string | undefined;
 	if (hasLastError) {
 		if (typeof lastError !== "string") throw new Error(`Invalid outbox operation at index ${index}`);
@@ -135,11 +153,19 @@ function isNonEmptyString(value: unknown): value is string {
 }
 
 function isProjectionKind(value: unknown): value is ProjectionOperationKind {
-	return value === "folder" || value === "chat" || value === "chat_message" || value === "event" || value === "session_mapping";
+	return (
+		value === "folder" ||
+		value === "chat" ||
+		value === "chat_message" ||
+		value === "event" ||
+		value === "session_mapping"
+	);
 }
 
 function isProjectionState(value: unknown): value is ProjectionOperationState {
-	return value === "pending" || value === "applying" || value === "applied" || value === "failed" || value === "reconcile";
+	return (
+		value === "pending" || value === "applying" || value === "applied" || value === "failed" || value === "reconcile"
+	);
 }
 
 function isTimestamp(value: unknown): value is string {

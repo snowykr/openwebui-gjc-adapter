@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants, createReadStream, closeSync, fstatSync, openSync, realpathSync } from "node:fs";
+import { closeSync, constants, createReadStream, fstatSync, openSync, realpathSync } from "node:fs";
 import { copyFile, link, mkdir, rm } from "node:fs/promises";
 import { basename, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import type { RegisteredProject } from "../projects/registry";
@@ -30,7 +30,8 @@ export function openAbsoluteRegularSessionFile(sessionFile: string): OpenedRegul
 	const descriptor = openSync(canonicalPath, constants.O_RDONLY | constants.O_NOFOLLOW);
 	try {
 		const stat = fstatSync(descriptor);
-		if (!stat.isFile()) throw new SessionFileBoundaryError(`Stored GJC session path is not a regular file: ${sessionFile}`);
+		if (!stat.isFile())
+			throw new SessionFileBoundaryError(`Stored GJC session path is not a regular file: ${sessionFile}`);
 		let closed = false;
 		return {
 			canonicalPath,
@@ -54,7 +55,10 @@ export function openAbsoluteRegularSessionFile(sessionFile: string): OpenedRegul
  */
 export function revalidateOpenedRegularSessionFile(opened: OpenedRegularSessionFile): void {
 	const held = fstatSync(opened.descriptor);
-	if (!held.isFile()) throw new SessionFileBoundaryError(`Held GJC session descriptor is no longer a regular file: ${opened.canonicalPath}`);
+	if (!held.isFile())
+		throw new SessionFileBoundaryError(
+			`Held GJC session descriptor is no longer a regular file: ${opened.canonicalPath}`,
+		);
 	const currentDescriptor = openSync(opened.canonicalPath, constants.O_RDONLY | constants.O_NOFOLLOW);
 	try {
 		const current = fstatSync(currentDescriptor);
@@ -87,7 +91,8 @@ export function rereadValidatedSessionFile(
 	if (canonical === undefined) throw new SessionFileBoundaryError("Session file is required.");
 	const descriptor = openSync(canonical, constants.O_RDONLY | constants.O_NOFOLLOW);
 	try {
-		if (!fstatSync(descriptor).isFile()) throw new SessionFileBoundaryError(`Stored GJC session path is not a regular file: ${sessionFile}`);
+		if (!fstatSync(descriptor).isFile())
+			throw new SessionFileBoundaryError(`Stored GJC session path is not a regular file: ${sessionFile}`);
 		return validatePathWithinRoot(canonical, sessionRoot);
 	} finally {
 		closeSync(descriptor);
@@ -115,7 +120,9 @@ function validatePathWithinRoot(sessionFile: string, sessionRoot: string): strin
 	const resolvedSessionFile = resolveExistingOrProspectivePath(sessionFile);
 	const relativeSessionFile = relative(resolvedSessionRoot, resolvedSessionFile);
 	if (relativeSessionFile.length === 0 || relativeSessionFile.startsWith("..") || isAbsolute(relativeSessionFile)) {
-		throw new SessionFileBoundaryError(`Stored GJC session file is not a file within project session root: ${sessionFile}`);
+		throw new SessionFileBoundaryError(
+			`Stored GJC session file is not a file within project session root: ${sessionFile}`,
+		);
 	}
 	return resolvedSessionFile;
 }

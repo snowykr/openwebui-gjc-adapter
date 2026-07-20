@@ -1,6 +1,6 @@
 import { classifySessionFrame } from "../gjc/session-frames";
-import type { GjcTurnEvent } from "../gjc/turn-runner";
 import { normalizeModelSelection, type SessionMapping, type SessionMappingStore } from "../gjc/session-router";
+import type { GjcTurnEvent } from "../gjc/turn-runner";
 import type { OpenWebUIMessageEvent } from "../openwebui/events";
 import { type ProjectableAgentFrame, projectAgentFrame } from "../projection/events";
 import {
@@ -8,10 +8,15 @@ import {
 	pendingWorkflowGateFromEvent,
 	projectPendingWorkflowGateMessage,
 } from "../projection/workflow-gates";
-import { buildProjectionPayloadHash, type EnqueueProjectionOperationInput, type OutboxStore, type ProjectionOperation } from "../state/outbox";
-import { sessionEventToProjectableFrame } from "./session-event-frames";
-import { formatCanonicalModelId } from "./models";
+import {
+	buildProjectionPayloadHash,
+	type EnqueueProjectionOperationInput,
+	type OutboxStore,
+	type ProjectionOperation,
+} from "../state/outbox";
 import type { ProjectionOperationApplier } from "../state/reconciler";
+import { formatCanonicalModelId } from "./models";
+import { sessionEventToProjectableFrame } from "./session-event-frames";
 
 export function projectTurnEvents(
 	events: readonly GjcTurnEvent[],
@@ -97,7 +102,15 @@ export function synthesizeProjectionRows(
 	for (const mapping of mappings.entries()) {
 		const operation = mappings.operation(mapping.chatId, mapping.operationId);
 		if (operation?.state !== "complete" || operation.result?.mapping.operationId !== mapping.operationId) continue;
-		ensureProjectionRows(outbox, { ...operation.result.mapping, assistantText: operation.result.assistantText, events: operation.result.events }, ownerUserId);
+		ensureProjectionRows(
+			outbox,
+			{
+				...operation.result.mapping,
+				assistantText: operation.result.assistantText,
+				events: operation.result.events,
+			},
+			ownerUserId,
+		);
 	}
 }
 
@@ -126,12 +139,21 @@ export function createProjectionOperationApplier(
 }
 
 function projectionMapping(mappings: SessionMappingStore, operation: ProjectionOperation): SessionMapping {
-	const operationId = operation.kind === "event" ? operation.operationId.slice(0, -":event".length) : operation.operationId;
+	const operationId =
+		operation.kind === "event" ? operation.operationId.slice(0, -":event".length) : operation.operationId;
 	const recorded = mappings.operation(operation.chatId, operationId);
 	if (recorded !== undefined) {
-		if (recorded.state !== "complete" || recorded.result === undefined || recorded.result.mapping.operationId !== operationId)
+		if (
+			recorded.state !== "complete" ||
+			recorded.result === undefined ||
+			recorded.result.mapping.operationId !== operationId
+		)
 			throw new Error(`Projection operation ${operation.operationId} has no completed durable result`);
-		return { ...recorded.result.mapping, assistantText: recorded.result.assistantText, events: recorded.result.events };
+		return {
+			...recorded.result.mapping,
+			assistantText: recorded.result.assistantText,
+			events: recorded.result.events,
+		};
 	}
 	const mapping = mappings.get(operation.chatId);
 	if (mapping === undefined || mapping.operationId !== operationId)
@@ -141,7 +163,10 @@ function projectionMapping(mappings: SessionMappingStore, operation: ProjectionO
 
 function projectedMappingEvents(mapping: SessionMapping): readonly OpenWebUIMessageEvent[] {
 	const selection = normalizeModelSelection(mapping.modelSelection);
-	return projectTurnEvents(mapping.events ?? [], selection === undefined ? undefined : formatCanonicalModelId(selection));
+	return projectTurnEvents(
+		mapping.events ?? [],
+		selection === undefined ? undefined : formatCanonicalModelId(selection),
+	);
 }
 
 function turnEventToProjectableFrame(event: GjcTurnEvent): ProjectableAgentFrame | null {

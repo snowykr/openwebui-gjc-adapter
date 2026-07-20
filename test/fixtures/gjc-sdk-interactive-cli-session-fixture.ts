@@ -31,7 +31,6 @@ appendFileSync(
 	})}\n`,
 );
 
-
 await runInteractiveCli();
 
 function valueAfter(flag: string): string | undefined {
@@ -40,7 +39,10 @@ function valueAfter(flag: string): string | undefined {
 }
 async function runInteractiveCli(): Promise<void> {
 	const resumedSessionPath = valueAfter("--resume");
-	if (resumedSessionPath !== undefined && (!isAbsolute(resumedSessionPath) || !resumedSessionPath.endsWith(".jsonl"))) {
+	if (
+		resumedSessionPath !== undefined &&
+		(!isAbsolute(resumedSessionPath) || !resumedSessionPath.endsWith(".jsonl"))
+	) {
 		throw new TypeError("interactive fixture resume session must be an absolute .jsonl path");
 	}
 
@@ -129,7 +131,6 @@ async function readSessionId(sessionPath: string): Promise<string> {
 	}
 	return Reflect.get(value, "id") as string;
 }
-
 
 function requiredEnvironment(name: string): string {
 	const value = process.env[name] ?? fixtureDescriptor[name];

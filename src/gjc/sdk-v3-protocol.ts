@@ -12,7 +12,6 @@ export interface SdkEndpoint {
 
 export interface SdkSessionAuthority extends PublicSdkSessionAttachment {}
 
-
 export interface SdkExpectedSessionAuthority {
 	readonly cwd: string;
 	readonly sessionId?: string;
@@ -65,7 +64,10 @@ export function requiredString(record: SdkRecord, field: string, boundary: strin
 export function parsePublishedSdkEndpointDescriptor(bytes: string, boundary: string): SdkEndpoint {
 	const endpoint = parseJsonRecord(bytes, boundary);
 	const version = endpoint.version;
-	if (version !== undefined && (typeof version !== "number" || !Number.isInteger(version) || version < 0 || version > 1)) {
+	if (
+		version !== undefined &&
+		(typeof version !== "number" || !Number.isInteger(version) || version < 0 || version > 1)
+	) {
 		throw new SdkV3ProtocolError(boundary, "version must be a supported non-negative integer");
 	}
 	const pid = endpoint.pid;
@@ -113,7 +115,6 @@ export function parseSessionAuthority(
 		},
 	};
 }
-
 
 export function parseQueryPage(
 	frame: SdkRecord,
@@ -201,7 +202,6 @@ export function parseLastAssistant(items: readonly unknown[]): string | null {
 	if (typeof text !== "string") throw new SdkV3ProtocolError("session.last_assistant result", "text must be a string");
 	return text;
 }
-
 
 function isThinkingLevel(value: string): value is NormalizedModelSelection["thinkingLevel"] {
 	return GJC_THINKING_LEVELS.some(level => level === value);

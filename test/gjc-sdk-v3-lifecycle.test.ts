@@ -44,7 +44,11 @@ describe("public SDK lifecycle contract", () => {
 
 	test("public close remains an explicit session-port operation", async () => {
 		const calls: string[] = [];
-		const port = { async closeSession() { calls.push("closeSession"); } } as PublicSdkSessionPort;
+		const port = {
+			async closeSession() {
+				calls.push("closeSession");
+			},
+		} as PublicSdkSessionPort;
 
 		await port.closeSession("close-key");
 
@@ -58,21 +62,41 @@ describe("public SDK lifecycle contract", () => {
 		let closeControls = 0;
 		let releaseMetadata: (() => void) | undefined;
 		let metadataRequested: (() => void) | undefined;
-		const metadataPending = new Promise<void>(resolve => { metadataRequested = resolve; });
-		const metadataReleased = new Promise<void>(resolve => { releaseMetadata = resolve; });
+		const metadataPending = new Promise<void>(resolve => {
+			metadataRequested = resolve;
+		});
+		const metadataReleased = new Promise<void>(resolve => {
+			releaseMetadata = resolve;
+		});
 		const server = Bun.serve({
 			port: 0,
 			fetch(request, bunServer) {
-				return bunServer.upgrade(request, { data: undefined }) ? undefined : new Response("upgrade required", { status: 426 });
+				return bunServer.upgrade(request, { data: undefined })
+					? undefined
+					: new Response("upgrade required", { status: 426 });
 			},
 			websocket: {
-				open(socket) { socket.send(JSON.stringify({ type: "server_hello", protocolVersion: 3, connectionId: "test" })); },
+				open(socket) {
+					socket.send(JSON.stringify({ type: "server_hello", protocolVersion: 3, connectionId: "test" }));
+				},
 				async message(socket, message) {
-					const frame = JSON.parse(String(message)) as { type: string; id: string; query?: string; operation?: string };
+					const frame = JSON.parse(String(message)) as {
+						type: string;
+						id: string;
+						query?: string;
+						operation?: string;
+					};
 					if (frame.type === "query_request" && frame.query === "session.metadata") {
 						metadataRequested?.();
 						await metadataReleased;
-						socket.send(JSON.stringify({ type: "query_response", id: frame.id, ok: true, page: { items: [{ sessionId: "session-1", cwd: "/workspace" }], complete: true } }));
+						socket.send(
+							JSON.stringify({
+								type: "query_response",
+								id: frame.id,
+								ok: true,
+								page: { items: [{ sessionId: "session-1", cwd: "/workspace" }], complete: true },
+							}),
+						);
 					}
 					if (frame.type === "control_request" && frame.operation === "session.close") closeControls += 1;
 				},
@@ -86,7 +110,12 @@ describe("public SDK lifecycle contract", () => {
 				endpoint: { url: `ws://127.0.0.1:${server.port}`, token: "token" },
 				authority: {
 					descriptorPath,
-					descriptorStat: { dev: descriptorStat.dev, ino: descriptorStat.ino, size: descriptorStat.size, mtimeMs: descriptorStat.mtimeMs },
+					descriptorStat: {
+						dev: descriptorStat.dev,
+						ino: descriptorStat.ino,
+						size: descriptorStat.size,
+						mtimeMs: descriptorStat.mtimeMs,
+					},
 					payloadDigest: digest("{}"),
 					generation: descriptorStat.mtimeMs,
 					expectedSessionId: "session-1",
@@ -96,7 +125,7 @@ describe("public SDK lifecycle contract", () => {
 			const close = client.closeSession(undefined, 1_000);
 			await metadataPending;
 			const replacement = join(root, "replacement.json");
-			writeFileSync(replacement, "{\"replaced\":true}");
+			writeFileSync(replacement, '{"replaced":true}');
 			renameSync(replacement, descriptorPath);
 			releaseMetadata?.();
 			await expect(close).rejects.toThrow("descriptor changed");
@@ -116,11 +145,16 @@ describe("public SDK lifecycle contract", () => {
 			correlation: { sessionId: "session-1", commandId: "command-1", turnId: "turn-1" },
 			payload: {},
 		};
-		await expectDescriptorReplacementBlocksControl(client => client.answerGate(gate, { approved: true }, undefined, 1_000));
+		await expectDescriptorReplacementBlocksControl(client =>
+			client.answerGate(gate, { approved: true }, undefined, 1_000),
+		);
 	});
 	test("refuses abort and steer after their acknowledged control replaces the descriptor before final authority proof", async () => {
 		await expectDescriptorReplacementAfterControl(client => client.abort("abort-key", 1_000), "turn.abort");
-		await expectDescriptorReplacementAfterControl(client => client.steer("replacement-safe steer", "steer-key", 1_000), "turn.steer");
+		await expectDescriptorReplacementAfterControl(
+			client => client.steer("replacement-safe steer", "steer-key", 1_000),
+			"turn.steer",
+		);
 	});
 	test("coordinates three owners FIFO, permits owner reentry, and releases after a thrown effect", async () => {
 		const scope = { cwd: "/workspace", sessionId: "coordinated-session" };
@@ -130,12 +164,20 @@ describe("public SDK lifecycle contract", () => {
 		const order: string[] = [];
 		let releaseFirst: (() => void) | undefined;
 		let releaseSecond: (() => void) | undefined;
-		const firstHeld = new Promise<void>(resolve => { releaseFirst = resolve; });
-		const secondHeld = new Promise<void>(resolve => { releaseSecond = resolve; });
+		const firstHeld = new Promise<void>(resolve => {
+			releaseFirst = resolve;
+		});
+		const secondHeld = new Promise<void>(resolve => {
+			releaseSecond = resolve;
+		});
 		let firstStarted: (() => void) | undefined;
 		let secondStarted: (() => void) | undefined;
-		const firstStartedPromise = new Promise<void>(resolve => { firstStarted = resolve; });
-		const secondStartedPromise = new Promise<void>(resolve => { secondStarted = resolve; });
+		const firstStartedPromise = new Promise<void>(resolve => {
+			firstStarted = resolve;
+		});
+		const secondStartedPromise = new Promise<void>(resolve => {
+			secondStarted = resolve;
+		});
 
 		const first = withPublicSdkSessionMutationCoordinator(scope, firstOwner, async () => {
 			order.push("first");
@@ -163,9 +205,11 @@ describe("public SDK lifecycle contract", () => {
 		await Promise.all([first, second, third]);
 		expect(order).toEqual(["first", "first-reentry", "second", "third"]);
 
-		await expect(withPublicSdkSessionMutationCoordinator(scope, firstOwner, async () => {
-			throw new Error("effect failed");
-		})).rejects.toThrow("effect failed");
+		await expect(
+			withPublicSdkSessionMutationCoordinator(scope, firstOwner, async () => {
+				throw new Error("effect failed");
+			}),
+		).rejects.toThrow("effect failed");
 		await withPublicSdkSessionMutationCoordinator(scope, secondOwner, async () => {
 			order.push("after-throw");
 		});
@@ -204,24 +248,46 @@ async function expectDescriptorReplacementBlocksControl(
 	let controls = 0;
 	let releaseMetadata: (() => void) | undefined;
 	let metadataRequested: (() => void) | undefined;
-	const metadataPending = new Promise<void>(resolve => { metadataRequested = resolve; });
-	const metadataReleased = new Promise<void>(resolve => { releaseMetadata = resolve; });
+	const metadataPending = new Promise<void>(resolve => {
+		metadataRequested = resolve;
+	});
+	const metadataReleased = new Promise<void>(resolve => {
+		releaseMetadata = resolve;
+	});
 	const server = Bun.serve({
 		port: 0,
 		fetch(request, bunServer) {
-			return bunServer.upgrade(request, { data: undefined }) ? undefined : new Response("upgrade required", { status: 426 });
+			return bunServer.upgrade(request, { data: undefined })
+				? undefined
+				: new Response("upgrade required", { status: 426 });
 		},
 		websocket: {
-			open(socket) { socket.send(JSON.stringify({ type: "server_hello", protocolVersion: 3, connectionId: "test" })); },
+			open(socket) {
+				socket.send(JSON.stringify({ type: "server_hello", protocolVersion: 3, connectionId: "test" }));
+			},
 			async message(socket, message) {
 				const frame = JSON.parse(String(message)) as { type: string; id: string; query?: string };
 				if (frame.type === "query_request" && frame.query === "workflow.gates.list") {
-					socket.send(JSON.stringify({ type: "query_response", id: frame.id, ok: true, page: { items: [], complete: true } }));
+					socket.send(
+						JSON.stringify({
+							type: "query_response",
+							id: frame.id,
+							ok: true,
+							page: { items: [], complete: true },
+						}),
+					);
 				}
 				if (frame.type === "query_request" && frame.query === "session.metadata") {
 					metadataRequested?.();
 					await metadataReleased;
-					socket.send(JSON.stringify({ type: "query_response", id: frame.id, ok: true, page: { items: [{ sessionId: "session-1", cwd: "/workspace" }], complete: true } }));
+					socket.send(
+						JSON.stringify({
+							type: "query_response",
+							id: frame.id,
+							ok: true,
+							page: { items: [{ sessionId: "session-1", cwd: "/workspace" }], complete: true },
+						}),
+					);
 				}
 				if (frame.type === "control_request") controls += 1;
 			},
@@ -235,7 +301,12 @@ async function expectDescriptorReplacementBlocksControl(
 			endpoint: { url: `ws://127.0.0.1:${server.port}`, token: "token" },
 			authority: {
 				descriptorPath,
-				descriptorStat: { dev: descriptorStat.dev, ino: descriptorStat.ino, size: descriptorStat.size, mtimeMs: descriptorStat.mtimeMs },
+				descriptorStat: {
+					dev: descriptorStat.dev,
+					ino: descriptorStat.ino,
+					size: descriptorStat.size,
+					mtimeMs: descriptorStat.mtimeMs,
+				},
 				payloadDigest: digest("{}"),
 				generation: descriptorStat.mtimeMs,
 				expectedSessionId: "session-1",
@@ -245,7 +316,7 @@ async function expectDescriptorReplacementBlocksControl(
 		const mutation = invoke(client);
 		await metadataPending;
 		const replacement = join(root, "replacement.json");
-		writeFileSync(replacement, "{\"replaced\":true}");
+		writeFileSync(replacement, '{"replaced":true}');
 		renameSync(replacement, descriptorPath);
 		releaseMetadata?.();
 		await expect(mutation).rejects.toThrow("descriptor changed");
@@ -268,22 +339,40 @@ async function expectDescriptorReplacementAfterControl(
 	const server = Bun.serve({
 		port: 0,
 		fetch(request, bunServer) {
-			return bunServer.upgrade(request, { data: undefined }) ? undefined : new Response("upgrade required", { status: 426 });
+			return bunServer.upgrade(request, { data: undefined })
+				? undefined
+				: new Response("upgrade required", { status: 426 });
 		},
 		websocket: {
-			open(socket) { socket.send(JSON.stringify({ type: "server_hello", protocolVersion: 3, connectionId: "test" })); },
+			open(socket) {
+				socket.send(JSON.stringify({ type: "server_hello", protocolVersion: 3, connectionId: "test" }));
+			},
 			message(socket, message) {
-				const frame = JSON.parse(String(message)) as { type: string; id: string; query?: string; operation?: string };
+				const frame = JSON.parse(String(message)) as {
+					type: string;
+					id: string;
+					query?: string;
+					operation?: string;
+				};
 				if (frame.type === "query_request" && frame.query === "session.metadata") {
-					socket.send(JSON.stringify({ type: "query_response", id: frame.id, ok: true, page: { items: [{ sessionId: "session-1", cwd: "/workspace" }], complete: true } }));
+					socket.send(
+						JSON.stringify({
+							type: "query_response",
+							id: frame.id,
+							ok: true,
+							page: { items: [{ sessionId: "session-1", cwd: "/workspace" }], complete: true },
+						}),
+					);
 					return;
 				}
 				if (frame.type === "control_request") {
 					controls.push(frame.operation ?? "");
 					const replacement = join(root, "replacement.json");
-					writeFileSync(replacement, "{\"replaced\":true}");
+					writeFileSync(replacement, '{"replaced":true}');
 					renameSync(replacement, descriptorPath);
-					socket.send(JSON.stringify({ type: "control_response", id: frame.id, ok: true, result: { accepted: true } }));
+					socket.send(
+						JSON.stringify({ type: "control_response", id: frame.id, ok: true, result: { accepted: true } }),
+					);
 				}
 			},
 		},
@@ -296,7 +385,12 @@ async function expectDescriptorReplacementAfterControl(
 			endpoint: { url: `ws://127.0.0.1:${server.port}`, token: "token" },
 			authority: {
 				descriptorPath,
-				descriptorStat: { dev: descriptorStat.dev, ino: descriptorStat.ino, size: descriptorStat.size, mtimeMs: descriptorStat.mtimeMs },
+				descriptorStat: {
+					dev: descriptorStat.dev,
+					ino: descriptorStat.ino,
+					size: descriptorStat.size,
+					mtimeMs: descriptorStat.mtimeMs,
+				},
 				payloadDigest: digest("{}"),
 				generation: descriptorStat.mtimeMs,
 				expectedSessionId: "session-1",
@@ -328,37 +422,89 @@ async function expectLifecycleWireInput(
 	const targetServer = Bun.serve({
 		port: 0,
 		fetch(request, server) {
-			return server.upgrade(request, { data: undefined }) ? undefined : new Response("upgrade required", { status: 426 });
+			return server.upgrade(request, { data: undefined })
+				? undefined
+				: new Response("upgrade required", { status: 426 });
 		},
 		websocket: {
-			open(socket) { socket.send(JSON.stringify({ type: "server_hello", protocolVersion: 3, connectionId: "target" })); },
+			open(socket) {
+				socket.send(JSON.stringify({ type: "server_hello", protocolVersion: 3, connectionId: "target" }));
+			},
 			message(socket, message) {
 				const frame = JSON.parse(String(message)) as { type: string; id: string; query?: string };
 				if (frame.type === "query_request" && frame.query === "session.metadata")
-					socket.send(JSON.stringify({ type: "query_response", id: frame.id, ok: true, page: { items: [{ sessionId: outcome === "mismatch" ? "wrong-session" : targetSessionId, cwd: root }], complete: true } }));
+					socket.send(
+						JSON.stringify({
+							type: "query_response",
+							id: frame.id,
+							ok: true,
+							page: {
+								items: [{ sessionId: outcome === "mismatch" ? "wrong-session" : targetSessionId, cwd: root }],
+								complete: true,
+							},
+						}),
+					);
 			},
 		},
 	});
 	const targetDescriptor = join(stateDirectory, `${targetSessionId}.json`);
-	writeFileSync(targetDescriptor, JSON.stringify({ sessionId: targetSessionId, url: `ws://127.0.0.1:${targetServer.port}`, token: "target-token-baseline" }));
+	writeFileSync(
+		targetDescriptor,
+		JSON.stringify({
+			sessionId: targetSessionId,
+			url: `ws://127.0.0.1:${targetServer.port}`,
+			token: "target-token-baseline",
+		}),
+	);
 	const targetDescriptorStat = await Bun.file(targetDescriptor).stat();
 	const sourceServer = Bun.serve({
 		port: 0,
 		fetch(request, server) {
-			return server.upgrade(request, { data: undefined }) ? undefined : new Response("upgrade required", { status: 426 });
+			return server.upgrade(request, { data: undefined })
+				? undefined
+				: new Response("upgrade required", { status: 426 });
 		},
 		websocket: {
-			open(socket) { socket.send(JSON.stringify({ type: "server_hello", protocolVersion: 3, connectionId: "source" })); },
+			open(socket) {
+				socket.send(JSON.stringify({ type: "server_hello", protocolVersion: 3, connectionId: "source" }));
+			},
 			message(socket, message) {
-				const frame = JSON.parse(String(message)) as { type: string; id: string; query?: string; operation?: string; input?: unknown };
+				const frame = JSON.parse(String(message)) as {
+					type: string;
+					id: string;
+					query?: string;
+					operation?: string;
+					input?: unknown;
+				};
 				if (frame.type === "query_request" && frame.query === "session.metadata") {
-					socket.send(JSON.stringify({ type: "query_response", id: frame.id, ok: true, page: { items: [{ sessionId: sourceSessionId, cwd: root }], complete: true } }));
+					socket.send(
+						JSON.stringify({
+							type: "query_response",
+							id: frame.id,
+							ok: true,
+							page: { items: [{ sessionId: sourceSessionId, cwd: root }], complete: true },
+						}),
+					);
 				} else if (frame.type === "control_request" && frame.operation === operation) {
 					receivedInput = frame.input;
-					socket.send(JSON.stringify({ type: "control_response", id: frame.id, ok: true, result: { [acknowledgement]: true } }));
+					socket.send(
+						JSON.stringify({
+							type: "control_response",
+							id: frame.id,
+							ok: true,
+							result: { [acknowledgement]: true },
+						}),
+					);
 					if (outcome !== "unchanged") {
 						const replacement = join(stateDirectory, `${targetSessionId}.replacement.json`);
-						writeFileSync(replacement, JSON.stringify({ sessionId: targetSessionId, url: `ws://127.0.0.1:${targetServer.port}`, token: "target-token-successor" }));
+						writeFileSync(
+							replacement,
+							JSON.stringify({
+								sessionId: targetSessionId,
+								url: `ws://127.0.0.1:${targetServer.port}`,
+								token: "target-token-successor",
+							}),
+						);
 						renameSync(replacement, targetDescriptor);
 					}
 				}
@@ -366,7 +512,10 @@ async function expectLifecycleWireInput(
 		},
 	});
 	const sourceDescriptor = join(stateDirectory, `${sourceSessionId}.json`);
-	writeFileSync(sourceDescriptor, JSON.stringify({ sessionId: sourceSessionId, url: `ws://127.0.0.1:${sourceServer.port}`, token: "source-token" }));
+	writeFileSync(
+		sourceDescriptor,
+		JSON.stringify({ sessionId: sourceSessionId, url: `ws://127.0.0.1:${sourceServer.port}`, token: "source-token" }),
+	);
 	const stat = await Bun.file(sourceDescriptor).stat();
 	const client = new PublicSdkSessionClient();
 	try {
@@ -383,9 +532,10 @@ async function expectLifecycleWireInput(
 				expectedCwd: root,
 			},
 		});
-		const mutation = operation === "session.resume"
-			? client.resumeSession({ sessionId: targetSessionId, sessionPath: targetSessionPath }, undefined, 1_000)
-			: client.switchSession({ sessionId: targetSessionId, sessionPath: targetSessionPath }, undefined, 1_000);
+		const mutation =
+			operation === "session.resume"
+				? client.resumeSession({ sessionId: targetSessionId, sessionPath: targetSessionPath }, undefined, 1_000)
+				: client.switchSession({ sessionId: targetSessionId, sessionPath: targetSessionPath }, undefined, 1_000);
 		if (outcome === "mismatch") await expect(mutation).rejects.toThrow("does not match");
 		else if (outcome === "unchanged") await expect(mutation).rejects.toThrow("timed out");
 		else {
@@ -403,7 +553,9 @@ async function expectLifecycleWireInput(
 	}
 }
 
-async function expectMissingLifecycleTargetBlocksControl(operation: "session.resume" | "session.switch"): Promise<void> {
+async function expectMissingLifecycleTargetBlocksControl(
+	operation: "session.resume" | "session.switch",
+): Promise<void> {
 	const root = mkdtempSync(join(tmpdir(), "gjc-sdk-lifecycle-missing-target-"));
 	const stateDirectory = join(root, ".gjc", "state", "sdk");
 	mkdirSync(stateDirectory, { recursive: true });
@@ -411,10 +563,14 @@ async function expectMissingLifecycleTargetBlocksControl(operation: "session.res
 	const server = Bun.serve({
 		port: 0,
 		fetch(request, bunServer) {
-			return bunServer.upgrade(request, { data: undefined }) ? undefined : new Response("upgrade required", { status: 426 });
+			return bunServer.upgrade(request, { data: undefined })
+				? undefined
+				: new Response("upgrade required", { status: 426 });
 		},
 		websocket: {
-			open(socket) { socket.send(JSON.stringify({ type: "server_hello", protocolVersion: 3, connectionId: "validation" })); },
+			open(socket) {
+				socket.send(JSON.stringify({ type: "server_hello", protocolVersion: 3, connectionId: "validation" }));
+			},
 			message(_socket, message) {
 				const frame = JSON.parse(String(message)) as { type: string };
 				if (frame.type === "control_request") controls += 1;
@@ -422,26 +578,33 @@ async function expectMissingLifecycleTargetBlocksControl(operation: "session.res
 		},
 	});
 	const descriptorPath = join(stateDirectory, "session-1.json");
-	writeFileSync(descriptorPath, JSON.stringify({
-		version: 1,
-		url: `ws://127.0.0.1:${server.port}`,
-		token: "token",
-	}));
-	const client = new PublicSdkSessionClient();
-	try {
-		await client.attach(attachmentFromPublishedSdkEndpoint(root, "session-1", {
-			sessionId: "session-1",
-			path: descriptorPath,
+	writeFileSync(
+		descriptorPath,
+		JSON.stringify({
+			version: 1,
 			url: `ws://127.0.0.1:${server.port}`,
 			token: "token",
-		}));
-		const missingSessionId = operation === "session.resume"
-			? client.resumeSession({ sessionPath: "/sessions/target.jsonl" })
-			: client.switchSession({ sessionPath: "/sessions/target.jsonl" });
+		}),
+	);
+	const client = new PublicSdkSessionClient();
+	try {
+		await client.attach(
+			attachmentFromPublishedSdkEndpoint(root, "session-1", {
+				sessionId: "session-1",
+				path: descriptorPath,
+				url: `ws://127.0.0.1:${server.port}`,
+				token: "token",
+			}),
+		);
+		const missingSessionId =
+			operation === "session.resume"
+				? client.resumeSession({ sessionPath: "/sessions/target.jsonl" })
+				: client.switchSession({ sessionPath: "/sessions/target.jsonl" });
 		await expect(missingSessionId).rejects.toThrow("sessionId must be a non-empty string");
-		const missingSessionPath = operation === "session.resume"
-			? client.resumeSession({ sessionId: "target-session" })
-			: client.switchSession({ sessionId: "target-session" });
+		const missingSessionPath =
+			operation === "session.resume"
+				? client.resumeSession({ sessionId: "target-session" })
+				: client.switchSession({ sessionId: "target-session" });
 		await expect(missingSessionPath).rejects.toThrow("sessionPath must be a non-empty string");
 		expect(controls).toBe(0);
 	} finally {

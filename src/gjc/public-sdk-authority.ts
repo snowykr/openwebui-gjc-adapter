@@ -1,11 +1,11 @@
 import { closeSync, fstatSync, lstatSync } from "node:fs";
-import type { PublicSdkSessionAttachment } from "./public-sdk-contract";
 import {
 	assertAttachmentAuthority,
 	descriptorPayloadDigest,
 	openPublishedDescriptor,
 	readHeldDescriptor,
 } from "./public-sdk-attachment";
+import type { PublicSdkSessionAttachment } from "./public-sdk-contract";
 import type { SdkV3Client } from "./sdk-v3-client";
 import { SdkV3OperationError } from "./sdk-v3-protocol";
 
@@ -48,11 +48,7 @@ export async function withPublicSdkAuthority<T>(
 	}
 }
 
-export async function queryOne(
-	client: SdkV3Client,
-	query: string,
-	timeoutMs?: number,
-): Promise<unknown> {
+export async function queryOne(client: SdkV3Client, query: string, timeoutMs?: number): Promise<unknown> {
 	const items = await client.queryAll(query, {}, timeoutMs);
 	if (items.length !== 1) {
 		throw new SdkV3OperationError("invalid_result", `${query} returned ${items.length} items`);
@@ -67,11 +63,13 @@ function assertIdentity(
 	context: PublicSdkClientContext,
 ): void {
 	if (
-		typeof metadata !== "object" || metadata === null ||
+		typeof metadata !== "object" ||
+		metadata === null ||
 		Reflect.get(metadata, "sessionId") !== authority.expectedSessionId ||
 		Reflect.get(metadata, "cwd") !== authority.expectedCwd ||
 		authority.expectedSessionId !== attachment.sessionId ||
-		authority.expectedCwd !== attachment.cwd || !context.isCurrent()
+		authority.expectedCwd !== attachment.cwd ||
+		!context.isCurrent()
 	) {
 		throw new SdkV3OperationError("endpoint_stale", "Session endpoint identity changed after attachment");
 	}
@@ -81,7 +79,9 @@ function assertDescriptorPayload(
 	descriptor: number,
 	authority: NonNullable<PublicSdkSessionAttachment["authority"]>,
 ): void {
-	if (descriptorPayloadDigest(readHeldDescriptor(descriptor, authority.descriptorStat.size)) !== authority.payloadDigest) {
+	if (
+		descriptorPayloadDigest(readHeldDescriptor(descriptor, authority.descriptorStat.size)) !== authority.payloadDigest
+	) {
 		throw new SdkV3OperationError("endpoint_stale", "Session endpoint descriptor payload changed after attachment");
 	}
 }

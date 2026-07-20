@@ -192,10 +192,12 @@ describe("createAdapterRequestHandler", () => {
 			},
 		});
 
-		const response = await handler(new Request("http://adapter.test/v1/chats/chat-1/close", {
-			method: "POST",
-			headers: { authorization: "Bearer adapter-token", "idempotency-key": "close-operation-1" },
-		}));
+		const response = await handler(
+			new Request("http://adapter.test/v1/chats/chat-1/close", {
+				method: "POST",
+				headers: { authorization: "Bearer adapter-token", "idempotency-key": "close-operation-1" },
+			}),
+		);
 
 		expect(response.status).toBe(200);
 		expect(await response.json()).toEqual({ status: "closed", operationId: "close-operation-1" });

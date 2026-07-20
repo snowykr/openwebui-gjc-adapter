@@ -1,12 +1,22 @@
 import type { NormalizedModelSelection } from "../contracts";
 import type { RegisteredProject } from "../projects/registry";
-import type { GjcTurnEvent, GjcTurnResult, GjcTurnRunner } from "./turn-runner";
 import type { SessionMapping, SessionMappingStore } from "./session-mapping-store";
+import type { GjcTurnEvent, GjcTurnResult, GjcTurnRunner } from "./turn-runner";
 
+export {
+	type RouteGjcSessionCloseInput,
+	routeGjcSessionClose,
+	type SessionCloseIngress,
+	type SessionCloseResult,
+} from "./session-close-router";
 export { SessionFileBoundaryError, validateSessionFile } from "./session-file";
-export { FileBackedSessionMappingStore, SessionMappingStore, type SessionMapping } from "./session-mapping-store";
-export { closeIngressId, normalizeModelSelection, operationResult, replayCloseOperation } from "./session-operation-codec";
-export { routeGjcSessionClose, type RouteGjcSessionCloseInput, type SessionCloseIngress, type SessionCloseResult } from "./session-close-router";
+export { FileBackedSessionMappingStore, type SessionMapping, SessionMappingStore } from "./session-mapping-store";
+export {
+	closeIngressId,
+	normalizeModelSelection,
+	operationResult,
+	replayCloseOperation,
+} from "./session-operation-codec";
 export { replayOperation, routeGjcTurn } from "./session-turn-router";
 
 export interface RouteGjcTurnInput {

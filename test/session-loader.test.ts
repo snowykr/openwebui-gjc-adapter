@@ -172,9 +172,9 @@ describe("fresh GJC session discovery", () => {
 			return bytes;
 		};
 		try {
-			await expect(discoverFreshGjcSessionFile(sessionRoot, baseline, "successor", projectCwd)).rejects.toBeInstanceOf(
-				GjcSessionLoadError,
-			);
+			await expect(
+				discoverFreshGjcSessionFile(sessionRoot, baseline, "successor", projectCwd),
+			).rejects.toBeInstanceOf(GjcSessionLoadError);
 		} finally {
 			prototype.readFile = originalReadFile;
 		}
@@ -194,7 +194,11 @@ describe("fresh GJC session discovery", () => {
 
 		await fs.rm(path.join(sessionRoot, "successor-b.jsonl"));
 		await fs.rm(path.join(sessionRoot, "successor-a.jsonl"));
-		await writeSessionHeader(path.join(sessionRoot, "wrong-cwd.jsonl"), "successor", path.join(sessionRoot, "other-project"));
+		await writeSessionHeader(
+			path.join(sessionRoot, "wrong-cwd.jsonl"),
+			"successor",
+			path.join(sessionRoot, "other-project"),
+		);
 		await expect(discoverFreshGjcSessionFile(sessionRoot, baseline, "successor", projectCwd)).rejects.toBeInstanceOf(
 			GjcSessionLoadError,
 		);

@@ -2,8 +2,19 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
 import * as path from "node:path";
+import { join } from "node:path";
+import { SessionMappingStore } from "../src/gjc/session-router";
+import {
+	createProjectionOperationApplier,
+	expectedProjectionRows,
+	synthesizeProjectionRows,
+} from "../src/live/workflow-gate-projection";
+import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
+import { ProjectLinkService } from "../src/projects/link-service";
+import { SqliteProjectRegistrationStore } from "../src/projects/registration-store";
+import { registerProjectDirectory } from "../src/projects/registry";
+import { resolveAllowedRoots } from "../src/security/paths";
 import {
 	buildProjectionPayloadHash,
 	FileBackedOutboxStore,
@@ -12,14 +23,7 @@ import {
 	type OutboxFileSystem,
 	type OutboxStore,
 } from "../src/state/outbox";
-import { createProjectionOperationApplier, expectedProjectionRows, synthesizeProjectionRows } from "../src/live/workflow-gate-projection";
-import { SessionMappingStore } from "../src/gjc/session-router";
 import { reconcilePendingOperations } from "../src/state/reconciler";
-import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
-import { ProjectLinkService } from "../src/projects/link-service";
-import { SqliteProjectRegistrationStore } from "../src/projects/registration-store";
-import { registerProjectDirectory } from "../src/projects/registry";
-import { resolveAllowedRoots } from "../src/security/paths";
 import { messageEntry, writeSessionFile } from "./session-sync-fixtures";
 
 const createdAt = new Date("2026-07-08T00:00:00.000Z");
@@ -344,9 +348,14 @@ describe("durable projection reconciliation", () => {
 		for (const row of expectedProjectionRows(mapping, "user-1")) outbox.enqueue(row);
 
 		const synchronizedProjectIds: string[] = [];
-		const result = await reconcilePendingOperations(outbox, createProjectionOperationApplier(mappings, {
-			syncLinkedProject: async projectId => { synchronizedProjectIds.push(projectId); },
-		}));
+		const result = await reconcilePendingOperations(
+			outbox,
+			createProjectionOperationApplier(mappings, {
+				syncLinkedProject: async projectId => {
+					synchronizedProjectIds.push(projectId);
+				},
+			}),
+		);
 
 		expect(result.failed).toEqual([]);
 		expect(result.applied.map(operation => operation.kind)).toEqual(["session_mapping", "event"]);
@@ -386,7 +395,15 @@ describe("durable projection reconciliation", () => {
 				await resolveAllowedRoots([workspace]),
 			);
 			const mappings = new SessionMappingStore();
-			const mapping = { chatId: "chat-1", projectId: project.id, sessionId: "session-1", sessionFile, rawFrameCursor: 1, eventCursor: 1, operationId: "op-1" };
+			const mapping = {
+				chatId: "chat-1",
+				projectId: project.id,
+				sessionId: "session-1",
+				sessionFile,
+				rawFrameCursor: 1,
+				eventCursor: 1,
+				operationId: "op-1",
+			};
 			mappings.beginOperation("chat-1", { id: "op-1", kind: "prompt", detail: "request" });
 			mappings.completeOperationWithMapping("chat-1", "op-1", "request", mapping, "turn");
 			const repository = new InMemoryOpenWebUIProjectionRepository();
@@ -430,9 +447,12 @@ describe("durable projection reconciliation", () => {
 		const row = expectedProjectionRows(mapping, "user-1")[1]!;
 		outbox.enqueue({ ...row, payloadHash: buildProjectionPayloadHash({ tampered: true }) });
 
-		const result = await reconcilePendingOperations(outbox, createProjectionOperationApplier(mappings, {
-			syncLinkedProject: async () => undefined,
-		}));
+		const result = await reconcilePendingOperations(
+			outbox,
+			createProjectionOperationApplier(mappings, {
+				syncLinkedProject: async () => undefined,
+			}),
+		);
 
 		expect(result.applied).toEqual([]);
 		expect(result.failed.map(operation => operation.operationId)).toEqual(["op-1:event"]);

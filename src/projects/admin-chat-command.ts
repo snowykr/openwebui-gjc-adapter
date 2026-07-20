@@ -1,6 +1,6 @@
 import type { OpenAIChatCompletionRequest } from "../live/openai-types";
-import { ProjectLinkError } from "./project-admission";
 import type { ProjectLinkService } from "./link-service";
+import { ProjectLinkError } from "./project-admission";
 
 export async function executeProjectCommand(service: ProjectLinkService, command: string): Promise<string> {
 	if (command === "/gjc project list") {

@@ -119,7 +119,11 @@ describe("latest dev SDK v3 transport contract", () => {
 			await fixture.attach();
 
 			const models = await fixture.port.getAvailableModels();
-			const selection = await fixture.port.setModel({ provider: "future", modelId: "capable", thinkingLevel: "high" });
+			const selection = await fixture.port.setModel({
+				provider: "future",
+				modelId: "capable",
+				thinkingLevel: "high",
+			});
 
 			expect(models).toContainEqual(
 				expect.objectContaining({
@@ -143,15 +147,25 @@ describe("latest dev SDK v3 transport contract", () => {
 			new RegExp(`\\b${legacyName("r", "pc")}(?:[-_](?:client|runner|frames|workflow|errors))\\b`, "i"),
 			new RegExp(`\\b(?:parse|create)${legacyName("R", "pc")}\\w*\\b`),
 			new RegExp(`--mode\\s+${legacyName("r", "pc")}\\b`, "i"),
-			new RegExp(`\\b(?:private[-_\\s]+daemon|daemon\\/(?:runtime|control)|${legacyName("broker", "_hello")})\\b`, "i"),
+			new RegExp(
+				`\\b(?:private[-_\\s]+daemon|daemon\\/(?:runtime|control)|${legacyName("broker", "_hello")})\\b`,
+				"i",
+			),
 		];
 		expect(sources.filter(source => forbidden.some(pattern => pattern.test(source.text)))).toEqual([]);
-		expect(await Bun.file(join(root, "src/gjc", `${legacyName("r", "pc")}-client-transport.ts`)).exists()).toBe(false);
+		expect(await Bun.file(join(root, "src/gjc", `${legacyName("r", "pc")}-client-transport.ts`)).exists()).toBe(
+			false,
+		);
 		expect(await Bun.file(join(root, "src/gjc", `${legacyName("r", "pc")}-client-runner.ts`)).exists()).toBe(false);
 		expect(await Bun.file(join(root, "src/gjc", `${legacyName("r", "pc")}-runner.ts`)).exists()).toBe(false);
 		expect(await Bun.file(join(root, "src/gjc", "sdk-v3-cli.ts")).exists()).toBe(false);
 		const publicEntrypoint = await Bun.file(join(root, "src/index.ts")).text();
-		for (const privateLifecycleModule of ["session-frames", "turn-runner", "cli-lifecycle-backend", "tmux-ownership"]) {
+		for (const privateLifecycleModule of [
+			"session-frames",
+			"turn-runner",
+			"cli-lifecycle-backend",
+			"tmux-ownership",
+		]) {
 			expect(publicEntrypoint).not.toContain(`./gjc/${privateLifecycleModule}`);
 		}
 		const exports = Reflect.get(manifest, "exports");

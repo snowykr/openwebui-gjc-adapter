@@ -748,7 +748,9 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				),
 			).toHaveLength(1);
 			expect(
-				fixture.server.frames.filter(frame => frame.type === "control_request" && frame.operation === "turn.prompt"),
+				fixture.server.frames.filter(
+					frame => frame.type === "control_request" && frame.operation === "turn.prompt",
+				),
 			).toHaveLength(0);
 			expect(new FileBackedSessionMappingStore(fixture.mappingFile).get("chat-q16")).toMatchObject({
 				sessionId: "sdk-session-created",
@@ -1194,7 +1196,12 @@ test("retains a generation-bound persisted pane through a live restart and drops
 		});
 
 		unlinkSync(descriptorPath);
-		const secondDescriptor = JSON.stringify({ version: 1, url: secondUrl, token: "second", pid: Number(panePid) + 1 });
+		const secondDescriptor = JSON.stringify({
+			version: 1,
+			url: secondUrl,
+			token: "second",
+			pid: Number(panePid) + 1,
+		});
 		writeFileSync(descriptorPath, secondDescriptor);
 		const restartedMappings = new FileBackedSessionMappingStore(mappingFile);
 		const restarted = createGjcRoutingLiveGatewayRunner({
@@ -1213,39 +1220,40 @@ test("retains a generation-bound persisted pane through a live restart and drops
 	}
 });
 
-test.each(["post_mutation_pre_proof", "pre_durable_publication"] as const)(
-	"rejects stale public SDK work at %s without a durable result",
-	async phase => {
-		const fixture = setupPublicRunnerBarrierFixture(phase);
-		try {
-			await withLifecyclePublication(fixture.runner, fixture.address, lifecycle =>
-				fixture.runner.switchSession({ ...fixture.address, lifecycle }),
-			);
-			const continued = withLifecyclePublication(fixture.runner, fixture.address, async lifecycle => {
-				const result = await fixture.runner.continueSession({
-					...fixture.address,
-					text: phase,
-					userMessageId: phase,
-					rawFrameCursor: 0,
-					eventCursor: 0,
-					operationId: phase,
-					lifecycle,
-				});
-				if (phase === "pre_durable_publication") {
-					if (result.attachment === undefined) throw new Error("expected an attachment proof for durable publication");
-					await lifecycle.publish(result.attachment, () => undefined);
-				}
+test.each([
+	"post_mutation_pre_proof",
+	"pre_durable_publication",
+] as const)("rejects stale public SDK work at %s without a durable result", async phase => {
+	const fixture = setupPublicRunnerBarrierFixture(phase);
+	try {
+		await withLifecyclePublication(fixture.runner, fixture.address, lifecycle =>
+			fixture.runner.switchSession({ ...fixture.address, lifecycle }),
+		);
+		const continued = withLifecyclePublication(fixture.runner, fixture.address, async lifecycle => {
+			const result = await fixture.runner.continueSession({
+				...fixture.address,
+				text: phase,
+				userMessageId: phase,
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: phase,
+				lifecycle,
 			});
-			await expect(continued).rejects.toThrow("endpoint descriptor");
-			expect(fixture.hits).toBe(1);
-			expect(
-				fixture.server.frames.filter(frame => frame.type === "control_request" && frame.operation === "turn.prompt"),
-			).toHaveLength(1);
-		} finally {
-			fixture.dispose();
-		}
-	},
-);
+			if (phase === "pre_durable_publication") {
+				if (result.attachment === undefined)
+					throw new Error("expected an attachment proof for durable publication");
+				await lifecycle.publish(result.attachment, () => undefined);
+			}
+		});
+		await expect(continued).rejects.toThrow("endpoint descriptor");
+		expect(fixture.hits).toBe(1);
+		expect(
+			fixture.server.frames.filter(frame => frame.type === "control_request" && frame.operation === "turn.prompt"),
+		).toHaveLength(1);
+	} finally {
+		fixture.dispose();
+	}
+});
 test("rejects a close commit when its public SDK descriptor changes after proof", async () => {
 	const fixture = setupPublicRunnerBarrierFixture("post_close_proof_pre_commit");
 	try {
@@ -1270,77 +1278,77 @@ test("rejects a close commit when its public SDK descriptor changes after proof"
 		fixture.dispose();
 	}
 });
-	test("fails closed when a newly published CLI endpoint disappears before public SDK binding", async () => {
-		const root = mkdtempSync(join(tmpdir(), "gjc-post-cli-pre-bind-"));
-		const sessionRoot = join(root, ".gjc", "sessions");
-		const mappingFile = join(root, "mappings.json");
-		const server = startSdkFixtureServer("turn_complete", root);
-		let sessionId: string | undefined;
-		let barrierHits = 0;
-		let releaseBarrier: (() => void) | undefined;
-		let barrierReached: (() => void) | undefined;
-		const released = new Promise<void>(resolve => {
-			releaseBarrier = resolve;
-		});
-		const reached = new Promise<void>(resolve => {
-			barrierReached = resolve;
-		});
-		try {
-			writeFileSync(
-				join(root, "gjc-sdk-fixture.json"),
-				JSON.stringify({
-					GJC_SDK_FIXTURE_CLI_TRANSCRIPT: join(root, "sdk-cli.jsonl"),
-					GJC_SDK_FIXTURE_ENDPOINT_URL: server.url,
-					GJC_SDK_FIXTURE_ENDPOINT_TOKEN: server.token,
-					GJC_SDK_FIXTURE_DYNAMIC_AUTHORITY: "1",
-				}),
-			);
-			const publicRunner = createPublicSdkGjcTurnRunner({
-				cliPath: join(import.meta.dir, "fixtures", "gjc-sdk-interactive-cli-session-fixture.ts"),
-				runtimeLocations: {
-					childEnvironment: {
-						HOME: root,
-						GJC_CONFIG_DIR: join(root, ".gjc"),
-						GJC_CODING_AGENT_DIR: join(root, ".gjc"),
-					},
-				} as GjcRuntimeLocations,
-				turnTimeoutMs: 1_000,
-				testBarrierHook: async (phase, evidence) => {
-					expect(phase).toBe("post_cli_pre_bind");
-					barrierHits += 1;
-					sessionId = evidence.sessionId;
-					unlinkSync(join(evidence.cwd, ".gjc", "state", "sdk", `${evidence.sessionId}.json`));
-					if (barrierReached === undefined) throw new Error("post-CLI barrier was not initialized");
-					barrierReached();
-					await released;
-				},
-			});
-			const runner = createGjcRoutingLiveGatewayRunner({
-				turnRunner: publicRunner,
-				mappings: new FileBackedSessionMappingStore(mappingFile),
-			});
-			const started = runner.run({
-				...turn("post-cli-pre-bind", "post-cli-pre-bind"),
-				project: { ...project, cwd: root, sessionRoot },
-			});
-			await reached;
-			if (releaseBarrier === undefined) throw new Error("post-CLI barrier release was not initialized");
-			releaseBarrier();
-			await expect(started).rejects.toThrow("endpoint descriptor");
-			if (sessionId === undefined) throw new Error("post-CLI barrier did not report a session id");
-			expect(barrierHits).toBe(1);
-			expect(new FileBackedSessionMappingStore(mappingFile).get("post-cli-pre-bind")).toBeUndefined();
-			expect(await Bun.file(join(root, ".gjc", "state", "sdk", `${sessionId}.json`)).exists()).toBe(false);
-			expect(readFileSync(mappingFile, "utf8")).not.toContain("tmuxPane");
-			expect(readFileSync(join(root, "sdk-cli.jsonl"), "utf8")).toContain('"interactive":"create"');
-			expect(
-				server.frames.some(frame => frame.type === "control_request" && frame.operation === "turn.prompt"),
-			).toBe(false);
-		} finally {
-			server.stop();
-			rmSync(root, { recursive: true, force: true });
-		}
+test("fails closed when a newly published CLI endpoint disappears before public SDK binding", async () => {
+	const root = mkdtempSync(join(tmpdir(), "gjc-post-cli-pre-bind-"));
+	const sessionRoot = join(root, ".gjc", "sessions");
+	const mappingFile = join(root, "mappings.json");
+	const server = startSdkFixtureServer("turn_complete", root);
+	let sessionId: string | undefined;
+	let barrierHits = 0;
+	let releaseBarrier: (() => void) | undefined;
+	let barrierReached: (() => void) | undefined;
+	const released = new Promise<void>(resolve => {
+		releaseBarrier = resolve;
 	});
+	const reached = new Promise<void>(resolve => {
+		barrierReached = resolve;
+	});
+	try {
+		writeFileSync(
+			join(root, "gjc-sdk-fixture.json"),
+			JSON.stringify({
+				GJC_SDK_FIXTURE_CLI_TRANSCRIPT: join(root, "sdk-cli.jsonl"),
+				GJC_SDK_FIXTURE_ENDPOINT_URL: server.url,
+				GJC_SDK_FIXTURE_ENDPOINT_TOKEN: server.token,
+				GJC_SDK_FIXTURE_DYNAMIC_AUTHORITY: "1",
+			}),
+		);
+		const publicRunner = createPublicSdkGjcTurnRunner({
+			cliPath: join(import.meta.dir, "fixtures", "gjc-sdk-interactive-cli-session-fixture.ts"),
+			runtimeLocations: {
+				childEnvironment: {
+					HOME: root,
+					GJC_CONFIG_DIR: join(root, ".gjc"),
+					GJC_CODING_AGENT_DIR: join(root, ".gjc"),
+				},
+			} as GjcRuntimeLocations,
+			turnTimeoutMs: 1_000,
+			testBarrierHook: async (phase, evidence) => {
+				expect(phase).toBe("post_cli_pre_bind");
+				barrierHits += 1;
+				sessionId = evidence.sessionId;
+				unlinkSync(join(evidence.cwd, ".gjc", "state", "sdk", `${evidence.sessionId}.json`));
+				if (barrierReached === undefined) throw new Error("post-CLI barrier was not initialized");
+				barrierReached();
+				await released;
+			},
+		});
+		const runner = createGjcRoutingLiveGatewayRunner({
+			turnRunner: publicRunner,
+			mappings: new FileBackedSessionMappingStore(mappingFile),
+		});
+		const started = runner.run({
+			...turn("post-cli-pre-bind", "post-cli-pre-bind"),
+			project: { ...project, cwd: root, sessionRoot },
+		});
+		await reached;
+		if (releaseBarrier === undefined) throw new Error("post-CLI barrier release was not initialized");
+		releaseBarrier();
+		await expect(started).rejects.toThrow("endpoint descriptor");
+		if (sessionId === undefined) throw new Error("post-CLI barrier did not report a session id");
+		expect(barrierHits).toBe(1);
+		expect(new FileBackedSessionMappingStore(mappingFile).get("post-cli-pre-bind")).toBeUndefined();
+		expect(await Bun.file(join(root, ".gjc", "state", "sdk", `${sessionId}.json`)).exists()).toBe(false);
+		expect(readFileSync(mappingFile, "utf8")).not.toContain("tmuxPane");
+		expect(readFileSync(join(root, "sdk-cli.jsonl"), "utf8")).toContain('"interactive":"create"');
+		expect(server.frames.some(frame => frame.type === "control_request" && frame.operation === "turn.prompt")).toBe(
+			false,
+		);
+	} finally {
+		server.stop();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
 
 const lowSelection = { provider: "anthropic", modelId: "claude-sonnet-4", thinkingLevel: "low" } as const;
 const mediumSelection = { ...lowSelection, thinkingLevel: "medium" } as const;
@@ -1471,10 +1479,7 @@ function turn(chatId: string, userMessageId: string, continued = false) {
 		continued,
 	};
 }
-function setupPublicSdkBranchFixture(
-	scenario: SdkFixtureScenario,
-	routingBarrierHook?: GjcLifecycleTestBarrierHook,
-) {
+function setupPublicSdkBranchFixture(scenario: SdkFixtureScenario, routingBarrierHook?: GjcLifecycleTestBarrierHook) {
 	const root = mkdtempSync(join(tmpdir(), "gjc-public-sdk-branch-"));
 	const sessionRoot = join(root, ".gjc", "sessions");
 	const endpointRoot = join(root, ".gjc", "state", "sdk");
@@ -1587,7 +1592,10 @@ function setupPublicRunnerBarrierFixture(
 		sessionFile,
 		`${JSON.stringify({ type: "session", version: 3, id: sessionId, timestamp: "2026-01-01T00:00:00.000Z", cwd: root })}\n`,
 	);
-	writeFileSync(join(endpointRoot, `${sessionId}.json`), JSON.stringify({ version: 1, url: server.url, token: server.token }));
+	writeFileSync(
+		join(endpointRoot, `${sessionId}.json`),
+		JSON.stringify({ version: 1, url: server.url, token: server.token }),
+	);
 	const runner = createPublicSdkGjcTurnRunner({
 		cliPath: join(root, "missing-gjc-cli"),
 		runtimeLocations: {

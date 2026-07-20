@@ -27,6 +27,7 @@ import { registerProjectDirectory } from "../src/projects/registry";
 import { resolveAllowedRoots } from "../src/security/paths";
 import { FileBackedOutboxStore } from "../src/state/outbox";
 import { reconcilePendingOperations } from "../src/state/reconciler";
+import { attachmentProof } from "./gjc-lifecycle-fixtures";
 import {
 	createdAt,
 	deliveredEvents,
@@ -38,7 +39,6 @@ import {
 	ownerUserId,
 	sseInput,
 } from "./golden-fixture-fixtures";
-import { attachmentProof } from "./gjc-lifecycle-fixtures";
 import * as selectionFixture from "./model-selection-fixtures";
 
 describe("GJC-primary OpenWebUI golden MVP fixture", () => {

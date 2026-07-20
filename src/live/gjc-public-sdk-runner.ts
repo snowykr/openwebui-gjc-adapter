@@ -1,5 +1,6 @@
-import { join } from "node:path";
 import type { GjcRuntimeLocations } from "../contracts";
+import type { PublicSdkSessionPort } from "../gjc/public-sdk-contract";
+import type { routeGjcTurn, SessionMapping } from "../gjc/session-router";
 import type {
 	GjcContinueSessionInput,
 	GjcControlResult,
@@ -12,10 +13,7 @@ import type {
 	GjcTurnResult,
 	GjcTurnRunner,
 } from "../gjc/turn-runner";
-import type { PublicSdkSessionPort } from "../gjc/public-sdk-contract";
-import type { routeGjcTurn, SessionMapping } from "../gjc/session-router";
 import type { LiveGatewayRunnerInput } from "./chat-completions";
-import { attachmentKey } from "./gjc-routing-endpoints";
 import { withLifecycle } from "./gjc-public-sdk-close";
 import { runControl } from "./gjc-public-sdk-control-ops";
 import {
@@ -26,6 +24,7 @@ import {
 	startNewSession,
 	switchSession,
 } from "./gjc-public-sdk-session-ops";
+import { attachmentKey } from "./gjc-routing-endpoints";
 import {
 	createPublicSdkRunnerContext,
 	type LifecycleAddress,
@@ -53,23 +52,30 @@ class PublicSdkGjcTurnRunner implements GjcTurnRunner {
 		this.#context = createPublicSdkRunnerContext(input);
 	}
 
-	resolveSessionRoot(cwd: string): string {
-		return join(cwd, ".gjc", "sessions");
-	}
-
 	discardSessionAttachment(cwd: string, sessionId: string): void {
 		this.#context.attachments.delete(attachmentKey({ cwd, sessionId }));
 	}
 
-	withLifecyclePublication<T>(address: LifecycleAddress, effect: (lifecycle: GjcLifecycleTransaction) => Promise<T>): Promise<T> {
+	withLifecyclePublication<T>(
+		address: LifecycleAddress,
+		effect: (lifecycle: GjcLifecycleTransaction) => Promise<T>,
+	): Promise<T> {
 		return withLifecycle(this.#context, address, effect, true);
 	}
 
-	withLifecycleClosePreflight<T>(address: LifecycleAddress, effect: (lifecycle: GjcLifecycleTransaction) => Promise<T>): Promise<T> {
+	withLifecycleClosePreflight<T>(
+		address: LifecycleAddress,
+		effect: (lifecycle: GjcLifecycleTransaction) => Promise<T>,
+	): Promise<T> {
 		return withLifecycle(this.#context, address, effect, false);
 	}
 
-	startNewSession<T>(input: GjcStartNewSessionInput, publish: (result: GjcSessionAddress & GjcTurnResult, lifecycle: GjcLifecycleTransaction) => Promise<T>, beforePrompt: Parameters<GjcTurnRunner["startNewSession"]>[2], onFailure?: Parameters<GjcTurnRunner["startNewSession"]>[3]): Promise<T> {
+	startNewSession<T>(
+		input: GjcStartNewSessionInput,
+		publish: (result: GjcSessionAddress & GjcTurnResult, lifecycle: GjcLifecycleTransaction) => Promise<T>,
+		beforePrompt: Parameters<GjcTurnRunner["startNewSession"]>[2],
+		onFailure?: Parameters<GjcTurnRunner["startNewSession"]>[3],
+	): Promise<T> {
 		return startNewSession(this.#context, input, publish, beforePrompt, onFailure);
 	}
 
@@ -92,7 +98,11 @@ class PublicSdkGjcTurnRunner implements GjcTurnRunner {
 		return continueSession(this.#context, input);
 	}
 
-	runControl(input: LiveGatewayRunnerInput, mapping: SessionMapping, lifecycle: GjcLifecycleTransaction): Promise<GjcControlResult> {
+	runControl(
+		input: LiveGatewayRunnerInput,
+		mapping: SessionMapping,
+		lifecycle: GjcLifecycleTransaction,
+	): Promise<GjcControlResult> {
 		return runControl(this.#context, input, mapping, lifecycle);
 	}
 }

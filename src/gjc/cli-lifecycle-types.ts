@@ -16,8 +16,12 @@ export interface CliLifecycleAttachment {
 	readonly pane: OwnedTmuxPane;
 }
 
-export interface CliCreateInput { readonly sessionRoot: string; }
-export interface CliColdResumeInput { readonly existingSessionPath: string; }
+export interface CliCreateInput {
+	readonly sessionRoot: string;
+}
+export interface CliColdResumeInput {
+	readonly existingSessionPath: string;
+}
 export interface CliLifecycleBackendOptions {
 	readonly cliPath: string;
 	readonly cwd: string;

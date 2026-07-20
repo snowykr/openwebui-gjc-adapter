@@ -11,8 +11,8 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { dirname } from "node:path";
-import { isAlreadyExists, parseAuthorityMutationLockRecord } from "./session-authority-validation";
 import type { AuthorityMutationLockRecord } from "./session-authority-types";
+import { isAlreadyExists, parseAuthorityMutationLockRecord } from "./session-authority-validation";
 
 const LEASE_MS = 30_000;
 const RECOVERY_ATTEMPTS = 3;
@@ -51,9 +51,9 @@ export class AuthorityMutationLock {
 	release(): void {
 		const current = readLock(this.path);
 		if (
-			current === undefined
-			|| current.owner !== this.record.owner
-			|| current.leaseExpiresAt !== this.record.leaseExpiresAt
+			current === undefined ||
+			current.owner !== this.record.owner ||
+			current.leaseExpiresAt !== this.record.leaseExpiresAt
 		) {
 			throw new Error("Session authority mutation lease ownership changed before release.");
 		}
@@ -101,10 +101,10 @@ function recoverExpiredLease(path: string): boolean {
 
 	const moved = readLock(recovered);
 	if (
-		moved === undefined
-		|| moved.owner !== current.owner
-		|| moved.leaseExpiresAt !== current.leaseExpiresAt
-		|| moved.leaseExpiresAt > Date.now()
+		moved === undefined ||
+		moved.owner !== current.owner ||
+		moved.leaseExpiresAt !== current.leaseExpiresAt ||
+		moved.leaseExpiresAt > Date.now()
 	) {
 		throw new Error("Refusing to recover an unverifiable authority lease.");
 	}
@@ -148,10 +148,5 @@ function processIsLive(pid: number): boolean {
 }
 
 function hasErrorCode(error: unknown, code: string): boolean {
-	return (
-		typeof error === "object"
-		&& error !== null
-		&& "code" in error
-		&& (error as { code?: unknown }).code === code
-	);
+	return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === code;
 }

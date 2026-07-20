@@ -42,7 +42,9 @@ export function lifecycleFixture(address: GjcLifecyclePublicationAddress): GjcLi
 	};
 }
 
-export function attachmentProof<T extends { readonly cwd: string; readonly sessionId: string }>(address: T): SessionAttachmentProof {
+export function attachmentProof<T extends { readonly cwd: string; readonly sessionId: string }>(
+	address: T,
+): SessionAttachmentProof {
 	return {
 		descriptorPath: `${address.cwd}/.gjc/state/sdk/${address.sessionId}.json`,
 		descriptorStat: { dev: 1, ino: 1, size: 1, mtimeMs: 1 },

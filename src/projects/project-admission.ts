@@ -1,9 +1,9 @@
 import * as path from "node:path";
 import type { GjcRuntimeLocations } from "../contracts";
-import { pathsOverlap, resolveExistingOrProspectivePath } from "../security/paths";
 import type { AllowedRoot } from "../security/paths";
+import { pathsOverlap, resolveExistingOrProspectivePath } from "../security/paths";
 import type { ProjectRegistrationSource } from "./registration-store";
-import type { RegisterProjectDirectoryInput, RegisteredProject } from "./registry";
+import type { RegisteredProject, RegisterProjectDirectoryInput } from "./registry";
 
 export class ProjectLinkError extends Error {
 	readonly code: string;

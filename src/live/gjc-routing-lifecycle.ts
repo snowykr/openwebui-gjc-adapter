@@ -1,11 +1,11 @@
 import type { GjcRuntimeLocations } from "../contracts";
+import type { PublicSdkSessionPort } from "../gjc/public-sdk-contract";
 import type {
+	GjcCloseReceipt,
 	GjcLifecycleTestBarrierHook,
 	GjcLifecycleTransaction,
 	GjcSessionAddress,
 } from "../gjc/turn-runner";
-import type { PublicSdkSessionPort } from "../gjc/public-sdk-contract";
-import type { GjcCloseReceipt } from "../gjc/turn-runner";
 import type { SessionAttachment } from "./gjc-routing-proof";
 
 export interface PublicSdkRunnerOptions {
@@ -33,9 +33,7 @@ export type LifecycleAddress = GjcSessionAddress & {
 	readonly recoveryAttachment?: import("../gjc/session-authority").SessionAttachmentProof;
 };
 
-export function createPublicSdkRunnerContext(
-	input: PublicSdkRunnerOptions,
-): PublicSdkRunnerContext {
+export function createPublicSdkRunnerContext(input: PublicSdkRunnerOptions): PublicSdkRunnerContext {
 	return {
 		input,
 		attachments: new Map(),

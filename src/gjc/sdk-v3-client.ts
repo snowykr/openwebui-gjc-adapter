@@ -51,7 +51,6 @@ export class SdkV3Client {
 		void client?.close();
 	}
 
-
 	onFrame(listener: (frame: SdkRecord) => void): () => void {
 		const client = this.requireClient();
 		return client.onFrame(frame => listener(asRecord(frame, "SDK frame")));
@@ -94,7 +93,8 @@ export class SdkV3Client {
 	}
 
 	private requireClient(): SdkClient {
-		if (this.#client === undefined) throw new SdkV3OperationError("connection_closed", "SDK WebSocket is not connected");
+		if (this.#client === undefined)
+			throw new SdkV3OperationError("connection_closed", "SDK WebSocket is not connected");
 		return this.#client;
 	}
 }

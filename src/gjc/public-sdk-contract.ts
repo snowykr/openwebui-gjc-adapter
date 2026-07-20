@@ -15,7 +15,12 @@ export interface PublicSdkSessionAttachment {
 /** Descriptor-only proof for one public SDK endpoint; pane ownership is adapter lifecycle evidence, not transport authority. */
 export interface PublicSdkAttachmentAuthority {
 	readonly descriptorPath: string;
-	readonly descriptorStat: Readonly<{ readonly dev: number; readonly ino: number; readonly size: number; readonly mtimeMs: number }>;
+	readonly descriptorStat: Readonly<{
+		readonly dev: number;
+		readonly ino: number;
+		readonly size: number;
+		readonly mtimeMs: number;
+	}>;
 	/** SHA-256 of the exact descriptor bytes, encoded as 64 lowercase hexadecimal characters. */
 	readonly payloadDigest: string;
 	readonly generation: number;
@@ -55,26 +60,64 @@ export interface PublicSdkSessionState {
 /** Reentrant lease token for mutations of one durable session descriptor. */
 export type PublicSdkSessionCoordinatorOwner = object;
 export interface PublicSdkSessionPort {
-	attach(attachment: PublicSdkSessionAttachment, timeoutMs?: number, coordinatorOwner?: PublicSdkSessionCoordinatorOwner): Promise<void>;
+	attach(
+		attachment: PublicSdkSessionAttachment,
+		timeoutMs?: number,
+		coordinatorOwner?: PublicSdkSessionCoordinatorOwner,
+	): Promise<void>;
 	/** Disconnects this transport only; it never closes the remote session. */
 	detach(): void;
 	getState(timeoutMs?: number): Promise<PublicSdkSessionState>;
 	getAvailableModels(timeoutMs?: number): Promise<readonly unknown[]>;
-	setModel(selection: NormalizedModelSelection, idempotencyKey?: string, timeoutMs?: number): Promise<NormalizedModelSelection>;
-	setThinking(thinkingLevel: NormalizedModelSelection["thinkingLevel"], idempotencyKey?: string, timeoutMs?: number): Promise<NormalizedModelSelection>;
+	setModel(
+		selection: NormalizedModelSelection,
+		idempotencyKey?: string,
+		timeoutMs?: number,
+	): Promise<NormalizedModelSelection>;
+	setThinking(
+		thinkingLevel: NormalizedModelSelection["thinkingLevel"],
+		idempotencyKey?: string,
+		timeoutMs?: number,
+	): Promise<NormalizedModelSelection>;
 	prompt(text: string, timeoutMs?: number): Promise<PublicSdkTurnOutcome>;
-	reply(operation: string, input: Readonly<Record<string, unknown>>, idempotencyKey?: string, timeoutMs?: number): Promise<unknown>;
+	reply(
+		operation: string,
+		input: Readonly<Record<string, unknown>>,
+		idempotencyKey?: string,
+		timeoutMs?: number,
+	): Promise<unknown>;
 	steer(text: string, idempotencyKey?: string, timeoutMs?: number): Promise<unknown>;
 	followUp(text: string, idempotencyKey?: string, timeoutMs?: number): Promise<PublicSdkTurnOutcome>;
 	abort(idempotencyKey?: string, timeoutMs?: number): Promise<unknown>;
 	abortAndPrompt(text: string, idempotencyKey?: string, timeoutMs?: number): Promise<PublicSdkTurnOutcome>;
 	replyToAction(actionId: string, answer: unknown, idempotencyKey?: string, timeoutMs?: number): Promise<unknown>;
 	planApprove(input: Readonly<Record<string, unknown>>, idempotencyKey?: string, timeoutMs?: number): Promise<unknown>;
-	answerGate(gate: PublicSdkGate, answer: unknown, idempotencyKey?: string, timeoutMs?: number): Promise<PublicSdkTurnOutcome>;
+	answerGate(
+		gate: PublicSdkGate,
+		answer: unknown,
+		idempotencyKey?: string,
+		timeoutMs?: number,
+	): Promise<PublicSdkTurnOutcome>;
 	branchCandidates(timeoutMs?: number): Promise<readonly PublicSdkBranchCandidate[]>;
-	branch(input: Readonly<Record<string, unknown>>, idempotencyKey?: string, timeoutMs?: number): Promise<PublicSdkSessionAttachment>;
-	newSession(input?: Readonly<Record<string, unknown>>, idempotencyKey?: string, timeoutMs?: number): Promise<PublicSdkSessionAttachment>;
-	resumeSession(input?: Readonly<Record<string, unknown>>, idempotencyKey?: string, timeoutMs?: number): Promise<PublicSdkSessionAttachment>;
-	switchSession(input: Readonly<Record<string, unknown>>, idempotencyKey?: string, timeoutMs?: number): Promise<PublicSdkSessionAttachment>;
+	branch(
+		input: Readonly<Record<string, unknown>>,
+		idempotencyKey?: string,
+		timeoutMs?: number,
+	): Promise<PublicSdkSessionAttachment>;
+	newSession(
+		input?: Readonly<Record<string, unknown>>,
+		idempotencyKey?: string,
+		timeoutMs?: number,
+	): Promise<PublicSdkSessionAttachment>;
+	resumeSession(
+		input?: Readonly<Record<string, unknown>>,
+		idempotencyKey?: string,
+		timeoutMs?: number,
+	): Promise<PublicSdkSessionAttachment>;
+	switchSession(
+		input: Readonly<Record<string, unknown>>,
+		idempotencyKey?: string,
+		timeoutMs?: number,
+	): Promise<PublicSdkSessionAttachment>;
 	closeSession(idempotencyKey?: string, timeoutMs?: number): Promise<void>;
 }

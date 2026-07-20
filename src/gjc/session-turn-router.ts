@@ -1,9 +1,9 @@
-import { ensureSdkSessionFile, validateSessionFile } from "./session-file";
-import { resolveEffectiveGjcSessionRoot } from "./session-root";
-import { type GjcTurnRunner, getProjectSessionRoot } from "./turn-runner";
 import type { ProvisionalSessionOperation, SessionOperationResult } from "./session-authority";
+import { ensureSdkSessionFile, validateSessionFile } from "./session-file";
 import { copyAttachment, hashTurnIngress, normalizeModelSelection } from "./session-operation-codec";
+import { resolveEffectiveGjcSessionRoot } from "./session-root";
 import type { RouteGjcTurnInput, RouteGjcTurnResult } from "./session-router";
+import { type GjcTurnRunner, getProjectSessionRoot } from "./turn-runner";
 
 export async function routeGjcTurn(input: RouteGjcTurnInput): Promise<RouteGjcTurnResult> {
 	const existing = input.mappings.get(input.chatId);
@@ -14,7 +14,8 @@ export async function routeGjcTurn(input: RouteGjcTurnInput): Promise<RouteGjcTu
 		text: input.text,
 		...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
 	});
-	const priorOperation = existing === undefined ? undefined : input.mappings.operation(input.chatId, input.userMessageId);
+	const priorOperation =
+		existing === undefined ? undefined : input.mappings.operation(input.chatId, input.userMessageId);
 	if (priorOperation?.state === "complete") {
 		if (priorOperation.detail !== operationHash)
 			throw new Error(`GJC operation ${input.userMessageId} conflicts with a different ingress payload.`);
@@ -65,58 +66,83 @@ export async function routeGjcTurn(input: RouteGjcTurnInput): Promise<RouteGjcTu
 		sessionId: existing.sessionId,
 		chatId: input.chatId,
 	};
-	return withLifecyclePublication(input.runner, { ...address, sessionFile: existingSessionFile, recoveryAttachment: existing.attachment }, async lifecycle => {
-		const operation = beginDurableOperation(input);
-		try {
-			await input.runner.switchSession({ ...address, lifecycle, sessionFile: existingSessionFile, recoveryAttachment: existing.attachment });
-			const state = await input.runner.getState({ ...address, lifecycle, sessionFile: existingSessionFile, recoveryAttachment: existing.attachment });
-			const result = await input.runner.continueSession({
-				...address,
-				sessionFile: existingSessionFile,
-				userMessageId: input.userMessageId,
-				parentId: input.parentId,
-				text: input.text,
-				activeLeaf: state.activeLeaf,
-				rawFrameCursor: state.rawFrameCursor,
-				eventCursor: state.eventCursor,
-				operationId: input.userMessageId,
-				recoveryAttachment: existing.attachment,
-				lifecycle,
-				...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
-			});
-			const completedSelection =
-				input.modelSelection === undefined ? undefined : normalizeModelSelection(result.modelSelection);
-			if (input.modelSelection !== undefined && completedSelection === undefined)
-				throw new TypeError("Missing selected GJC outcome");
-			const sessionFile = [result.sessionFile, state.sessionFile, existingSessionFile].find(candidate => candidate !== undefined);
-			const assistantText = input.projectAssistantText?.(result) ?? result.text;
-			const nextMapping = {
-				chatId: input.chatId,
-				projectId: input.project.id,
-				sessionId: existing.sessionId,
-				sessionFile: sessionFile === undefined ? undefined : validateSessionFile(input.project, sessionFile, sessionRoot),
-				activeLeaf: result.activeLeaf ?? state.activeLeaf,
-				rawFrameCursor: result.rawFrameCursor,
-				eventCursor: result.eventCursor,
-				operationId: input.userMessageId,
-				assistantText,
-				events: result.events,
-				...((result.attachment ?? state.attachment ?? existing.attachment) === undefined ? {} : { attachment: result.attachment ?? state.attachment ?? existing.attachment }),
-				...(completedSelection === undefined ? {} : { modelSelection: completedSelection }),
-			};
-			const proof = result.attachment ?? state.attachment ?? existing.attachment;
-			if (proof === undefined) throw new Error("GJC turn did not return a validated current attachment.");
-			const mapping = await lifecycle.publish(proof, () => {
-				const published = input.mappings.completeOperationWithMapping(input.chatId, operation.key, operation.hash, nextMapping, "turn");
-				input.afterPublish?.({ assistantText, events: result.events, mapping: published });
-				return published;
-			});
-			return { assistantText, events: result.events, mapping };
-		} catch (error) {
-			input.mappings.transitionOperation(input.chatId, operation.key, "uncertain", operation.hash);
-			throw error;
-		}
-	});
+	return withLifecyclePublication(
+		input.runner,
+		{ ...address, sessionFile: existingSessionFile, recoveryAttachment: existing.attachment },
+		async lifecycle => {
+			const operation = beginDurableOperation(input);
+			try {
+				await input.runner.switchSession({
+					...address,
+					lifecycle,
+					sessionFile: existingSessionFile,
+					recoveryAttachment: existing.attachment,
+				});
+				const state = await input.runner.getState({
+					...address,
+					lifecycle,
+					sessionFile: existingSessionFile,
+					recoveryAttachment: existing.attachment,
+				});
+				const result = await input.runner.continueSession({
+					...address,
+					sessionFile: existingSessionFile,
+					userMessageId: input.userMessageId,
+					parentId: input.parentId,
+					text: input.text,
+					activeLeaf: state.activeLeaf,
+					rawFrameCursor: state.rawFrameCursor,
+					eventCursor: state.eventCursor,
+					operationId: input.userMessageId,
+					recoveryAttachment: existing.attachment,
+					lifecycle,
+					...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
+				});
+				const completedSelection =
+					input.modelSelection === undefined ? undefined : normalizeModelSelection(result.modelSelection);
+				if (input.modelSelection !== undefined && completedSelection === undefined)
+					throw new TypeError("Missing selected GJC outcome");
+				const sessionFile = [result.sessionFile, state.sessionFile, existingSessionFile].find(
+					candidate => candidate !== undefined,
+				);
+				const assistantText = input.projectAssistantText?.(result) ?? result.text;
+				const nextMapping = {
+					chatId: input.chatId,
+					projectId: input.project.id,
+					sessionId: existing.sessionId,
+					sessionFile:
+						sessionFile === undefined ? undefined : validateSessionFile(input.project, sessionFile, sessionRoot),
+					activeLeaf: result.activeLeaf ?? state.activeLeaf,
+					rawFrameCursor: result.rawFrameCursor,
+					eventCursor: result.eventCursor,
+					operationId: input.userMessageId,
+					assistantText,
+					events: result.events,
+					...((result.attachment ?? state.attachment ?? existing.attachment) === undefined
+						? {}
+						: { attachment: result.attachment ?? state.attachment ?? existing.attachment }),
+					...(completedSelection === undefined ? {} : { modelSelection: completedSelection }),
+				};
+				const proof = result.attachment ?? state.attachment ?? existing.attachment;
+				if (proof === undefined) throw new Error("GJC turn did not return a validated current attachment.");
+				const mapping = await lifecycle.publish(proof, () => {
+					const published = input.mappings.completeOperationWithMapping(
+						input.chatId,
+						operation.key,
+						operation.hash,
+						nextMapping,
+						"turn",
+					);
+					input.afterPublish?.({ assistantText, events: result.events, mapping: published });
+					return published;
+				});
+				return { assistantText, events: result.events, mapping };
+			} catch (error) {
+				input.mappings.transitionOperation(input.chatId, operation.key, "uncertain", operation.hash);
+				throw error;
+			}
+		},
+	);
 }
 
 async function startNewMappedSession(input: RouteGjcTurnInput): Promise<RouteGjcTurnResult> {
@@ -137,7 +163,12 @@ async function startNewMappedSession(input: RouteGjcTurnInput): Promise<RouteGjc
 	let authorityCompleted = false;
 	const markUncertain = () => {
 		if (!authorityCompleted)
-			input.mappings.transitionProvisionalOperation(input.chatId, input.userMessageId, "uncertain", operation.detail);
+			input.mappings.transitionProvisionalOperation(
+				input.chatId,
+				input.userMessageId,
+				"uncertain",
+				operation.detail,
+			);
 	};
 	try {
 		const routed = await input.runner.startNewSession(
@@ -156,7 +187,8 @@ async function startNewMappedSession(input: RouteGjcTurnInput): Promise<RouteGjc
 					input.modelSelection === undefined ? undefined : normalizeModelSelection(result.modelSelection);
 				if (input.modelSelection !== undefined && completedSelection === undefined)
 					throw new TypeError("Missing selected GJC outcome");
-				if (result.attachment === undefined) throw new Error("New GJC session did not return a validated current attachment.");
+				if (result.attachment === undefined)
+					throw new Error("New GJC session did not return a validated current attachment.");
 				const assistantText = input.projectAssistantText?.(result) ?? result.text;
 				const mapping = await lifecycle.publish(result.attachment, () => {
 					const published = input.mappings.publishProvisionalOperation(operation, {
@@ -179,8 +211,16 @@ async function startNewMappedSession(input: RouteGjcTurnInput): Promise<RouteGjc
 				});
 				return { assistantText, events: result.events, mapping };
 			},
-			async (address, attachment) => { input.mappings.attachProvisionalOperation(input.chatId, input.userMessageId, { sessionId: address.sessionId, sessionFile: validateSessionFile(input.project, address.sessionFile, sessionRoot), attachment }); },
-			async () => { markUncertain(); },
+			async (address, attachment) => {
+				input.mappings.attachProvisionalOperation(input.chatId, input.userMessageId, {
+					sessionId: address.sessionId,
+					sessionFile: validateSessionFile(input.project, address.sessionFile, sessionRoot),
+					attachment,
+				});
+			},
+			async () => {
+				markUncertain();
+			},
 		);
 		return routed;
 	} catch (error) {
@@ -211,7 +251,9 @@ async function withLifecyclePublication<T>(
 	return runner.withLifecyclePublication(address, effect);
 }
 
-function provisionalOperation(input: RouteGjcTurnInput): Omit<ProvisionalSessionOperation, "state" | "startedAt" | "completedAt"> {
+function provisionalOperation(
+	input: RouteGjcTurnInput,
+): Omit<ProvisionalSessionOperation, "state" | "startedAt" | "completedAt"> {
 	return {
 		id: input.userMessageId,
 		kind: "create",

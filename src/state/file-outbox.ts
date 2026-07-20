@@ -1,16 +1,27 @@
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+	closeSync,
+	existsSync,
+	fsyncSync,
+	lstatSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { createOperationId } from "./metadata";
 import {
-	copyOperation,
-	OUTBOX_DOCUMENT_VERSION,
 	assertSameEnqueueIdentity,
-	toTimestamp,
-	parsePersistedOutboxDocument,
+	copyOperation,
 	type EnqueueProjectionOperationInput,
+	OUTBOX_DOCUMENT_VERSION,
 	type OutboxFileSystem,
 	type OutboxStore,
 	type ProjectionOperation,
+	parsePersistedOutboxDocument,
+	toTimestamp,
 } from "./outbox-types";
 
 export const nodeOutboxFileSystem: OutboxFileSystem = {
@@ -136,14 +147,18 @@ export class FileBackedOutboxStore implements OutboxStore {
 	}
 
 	private copyOperations(): Map<string, ProjectionOperation> {
-		return new Map(Array.from(this.operations, ([operationId, operation]) => [operationId, copyOperation(operation)]));
+		return new Map(
+			Array.from(this.operations, ([operationId, operation]) => [operationId, copyOperation(operation)]),
+		);
 	}
 
 	private load(): void {
 		if (!this.fileSystem.exists(this.filePath)) return;
 		assertRegularFile(this.fileSystem, this.filePath);
 		const document = parsePersistedOutboxDocument(this.fileSystem.readFile(this.filePath, "utf8"));
-		this.operations = new Map(document.operations.map(operation => [operation.operationId, copyOperation(operation)]));
+		this.operations = new Map(
+			document.operations.map(operation => [operation.operationId, copyOperation(operation)]),
+		);
 	}
 
 	private persist(operations: ReadonlyMap<string, ProjectionOperation>): void {
@@ -159,7 +174,10 @@ export class FileBackedOutboxStore implements OutboxStore {
 		let renamed = false;
 		try {
 			tempFileDescriptor = this.fileSystem.open(tempPath, "wx", 0o600);
-			this.fileSystem.writeFile(tempFileDescriptor, JSON.stringify({ version: OUTBOX_DOCUMENT_VERSION, operations: Array.from(operations.values()) }, null, 2));
+			this.fileSystem.writeFile(
+				tempFileDescriptor,
+				JSON.stringify({ version: OUTBOX_DOCUMENT_VERSION, operations: Array.from(operations.values()) }, null, 2),
+			);
 			this.fileSystem.fsync(tempFileDescriptor);
 			this.fileSystem.close(tempFileDescriptor);
 			tempFileDescriptor = undefined;

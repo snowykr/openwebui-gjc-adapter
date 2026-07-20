@@ -1,6 +1,11 @@
 import type { GjcRuntimeLocations } from "../contracts";
 import type { GjcSessionStorageLocations } from "../gjc/session-root";
-import { closeIngressId, type SessionCloseResult, type SessionMapping, type SessionMappingStore } from "../gjc/session-router";
+import {
+	closeIngressId,
+	type SessionCloseResult,
+	type SessionMapping,
+	type SessionMappingStore,
+} from "../gjc/session-router";
 import type { OpenWebUIProjectionRepository } from "../openwebui/client";
 import { type SyncProjectSessionsResult, syncProjectSessionsToOpenWebUI } from "../projection/session-sync";
 import type { AllowedRoot } from "../security/paths";
@@ -187,7 +192,9 @@ export class ProjectLinkService {
 		});
 	}
 
-	async #closeProjectSessions(projectId: string): Promise<readonly { readonly chatId: string; readonly result: SessionCloseResult }[]> {
+	async #closeProjectSessions(
+		projectId: string,
+	): Promise<readonly { readonly chatId: string; readonly result: SessionCloseResult }[]> {
 		if (this.#closeSession === undefined || this.#mappings === undefined) return [];
 		return await Promise.all(
 			this.#mappings
@@ -208,7 +215,10 @@ export class ProjectLinkService {
 							chatId: mapping.chatId,
 							result: {
 								status: "uncertain",
-								message: error instanceof Error ? error.message : "GJC session close acknowledgement was not received.",
+								message:
+									error instanceof Error
+										? error.message
+										: "GJC session close acknowledgement was not received.",
 							},
 						};
 					}
@@ -232,7 +242,6 @@ export class ProjectLinkService {
 		}
 		this.#store.unlinkProject(previous?.id ?? projectId);
 	}
-
 }
 
 export { assertProjectsAdmitted, ProjectLinkError } from "./project-admission";

@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import type { GjcRuntimeLocations } from "../src/contracts";
 import type { PublicSdkSessionAttachment, PublicSdkSessionPort } from "../src/gjc/public-sdk-contract";
-import { ModelReaderUnavailableError, createModelReaderFactory, registerTemporaryModelAttachment } from "../src/live/model-reader";
+import {
+	createModelReaderFactory,
+	ModelReaderUnavailableError,
+	registerTemporaryModelAttachment,
+} from "../src/live/model-reader";
 
 describe("createModelReaderFactory", () => {
 	test("attaches a fresh public SDK port for each reader and detaches on stop", async () => {

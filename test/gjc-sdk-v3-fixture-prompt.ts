@@ -13,15 +13,39 @@ export function handlePrompt(
 	const correlation = { commandId: "command-right", turnId: "turn-right" } as const;
 	if (scenario === "pre_accept_correlated_frames") {
 		socket.send(JSON.stringify({ type: "agent_end", sessionId: "sdk-session-created", ...correlation }));
-		socket.send(JSON.stringify({ type: "action_needed", id: "pre-accept-action", kind: "ask", sessionId: "sdk-session-created", ...correlation }));
-		socket.send(JSON.stringify({ type: "turn_stream", sessionId: "sdk-session-created", phase: "finalized", finalAnswer: true, text: "quarantined final", ...correlation }));
-		socket.send(JSON.stringify({ type: "control_response", id, ok: true, result: { accepted: true, ...correlation } }));
+		socket.send(
+			JSON.stringify({
+				type: "action_needed",
+				id: "pre-accept-action",
+				kind: "ask",
+				sessionId: "sdk-session-created",
+				...correlation,
+			}),
+		);
+		socket.send(
+			JSON.stringify({
+				type: "turn_stream",
+				sessionId: "sdk-session-created",
+				phase: "finalized",
+				finalAnswer: true,
+				text: "quarantined final",
+				...correlation,
+			}),
+		);
+		socket.send(
+			JSON.stringify({ type: "control_response", id, ok: true, result: { accepted: true, ...correlation } }),
+		);
 		setTimeout(() => sendEvent(socket, { type: "agent_end", sessionId: "sdk-session-created", ...correlation }), 20);
 		return;
 	}
 	socket.send(JSON.stringify({ type: "control_response", id, ok: true, result: { accepted: true, ...correlation } }));
 	if (scenario === "turn_complete" || scenario === "resumed_session") {
-		sendEvent(socket, { type: "agent_end", sessionId: "sdk-session-created", commandId: "command-wrong", turnId: "turn-wrong" });
+		sendEvent(socket, {
+			type: "agent_end",
+			sessionId: "sdk-session-created",
+			commandId: "command-wrong",
+			turnId: "turn-wrong",
+		});
 		sendEvent(socket, { type: "agent_end", sessionId: "sdk-session-created", ...correlation });
 	}
 	if (scenario === "branch_regenerate") {
@@ -68,10 +92,20 @@ export function handlePrompt(
 			finalAnswer: true,
 			text: "current dev assistant",
 		});
-		sendEvent(socket, { type: "action_needed", id: "idle:sdk-session-created#0", kind: "idle", sessionId: "sdk-session-created" });
+		sendEvent(socket, {
+			type: "action_needed",
+			id: "idle:sdk-session-created#0",
+			kind: "idle",
+			sessionId: "sdk-session-created",
+		});
 	}
 	if (scenario === "idle_without_finalized_turn") {
-		sendEvent(socket, { type: "action_needed", id: "idle:sdk-session-created#stale", kind: "idle", sessionId: "sdk-session-created" });
+		sendEvent(socket, {
+			type: "action_needed",
+			id: "idle:sdk-session-created#stale",
+			kind: "idle",
+			sessionId: "sdk-session-created",
+		});
 	}
 	if (scenario === "slow_turn_without_gate") {
 		setTimeout(() => sendEvent(socket, { type: "agent_end", sessionId: "sdk-session-created", ...correlation }), 120);

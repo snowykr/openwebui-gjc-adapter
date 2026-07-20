@@ -4,20 +4,32 @@ import type { GjcTurnEvent } from "./turn-runner";
 export const SESSION_AUTHORITY_VERSION = 2 as const;
 
 export class SessionAuthorityLoadError extends Error {
-	constructor(readonly filePath: string, message: string, readonly cause?: unknown) {
+	constructor(
+		readonly filePath: string,
+		message: string,
+		readonly cause?: unknown,
+	) {
 		super(`Cannot use session authority ${filePath}: ${message}`);
 		this.name = "SessionAuthorityLoadError";
 	}
 }
 
 export type SessionOperationState = "pending" | "complete" | "uncertain" | "conflict";
-export type SessionOperationKind = "create" | "resume" | "close" | "prompt" | "reply" | "gate" | "branch" | "model" | "thinking";
+export type SessionOperationKind =
+	| "create"
+	| "resume"
+	| "close"
+	| "prompt"
+	| "reply"
+	| "gate"
+	| "branch"
+	| "model"
+	| "thinking";
 export interface AuthorityMutationLockRecord {
 	readonly owner: string;
 	readonly pid: number;
 	readonly leaseExpiresAt: number;
 }
-
 
 export interface SessionAttachmentProof {
 	readonly descriptorPath: string;
@@ -97,4 +109,5 @@ export interface SessionAuthorityRecord {
 	readonly journal: readonly SessionOperation[];
 }
 
-export type SessionAuthorityInput = Omit<SessionAuthorityRecord, "version" | "createdAt" | "header" | "journal"> & Partial<Pick<SessionAuthorityRecord, "createdAt" | "journal" | "header" | "version">>;
+export type SessionAuthorityInput = Omit<SessionAuthorityRecord, "version" | "createdAt" | "header" | "journal"> &
+	Partial<Pick<SessionAuthorityRecord, "createdAt" | "journal" | "header" | "version">>;
