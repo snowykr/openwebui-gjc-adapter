@@ -1,10 +1,9 @@
 import type { NormalizedModelSelection } from "../contracts";
 import type { PublicSdkSessionAttachment } from "./public-sdk-contract";
 import { createPublicSdkDeadline } from "./public-sdk-deadline";
-import { parseMutationSelection } from "./public-sdk-state";
 import { waitForReply } from "./public-sdk-turns";
 import type { SdkV3Client } from "./sdk-v3-client";
-import { parseRecord, type SdkRecord, SdkV3OperationError } from "./sdk-v3-protocol";
+import { parseRecord, parseSelection, type SdkRecord, SdkV3OperationError } from "./sdk-v3-protocol";
 
 export interface PublicSdkActionHost {
 	authority<T>(
@@ -49,20 +48,13 @@ export async function setModel(
 }
 
 function modelMutationSelection(result: unknown, requested: NormalizedModelSelection): NormalizedModelSelection {
-	const record = parseRecord(result, "model.set result");
-	if (record.status !== undefined && record.status !== "accepted")
-		throw new SdkV3OperationError("invalid_result", "model.set result was not accepted");
-	const fields = [record.provider, record.modelId, record.thinkingLevel];
-	if (fields.every(value => value === undefined || value === "")) return requested;
-	if (fields.some(value => value === undefined || value === ""))
-		throw new SdkV3OperationError("invalid_result", "model.set result contained a partial selection");
-	const accepted = parseMutationSelection(record);
+	const accepted = completeMutationSelection(result, "model.set");
 	if (
 		accepted.provider !== requested.provider ||
 		accepted.modelId !== requested.modelId ||
 		accepted.thinkingLevel !== requested.thinkingLevel
 	)
-		throw new SdkV3OperationError("invalid_result", "model.set did not confirm the requested selection");
+		throw new SdkV3OperationError("invalid_result", "model.set result did not confirm the requested selection");
 	return accepted;
 }
 
@@ -95,8 +87,9 @@ export async function closeSession(
 		client => host.mutate(client, "session.close", {}, key, deadline.remaining()),
 		"allow_missing",
 	);
-	if (parseRecord(value, "session.close result").closed !== true)
-		throw new SdkV3OperationError("invalid_result", "session.close result must be acknowledged with closed: true");
+	const result = parseRecord(value, "session.close result");
+	if (!hasExactKeys(result, ["closed"]) || result.closed !== true)
+		throw new SdkV3OperationError("invalid_result", "session.close result must be exactly { closed: true }");
 	host.detach();
 }
 export async function reply(
@@ -128,23 +121,26 @@ function mutationThinkingSelection(
 	thinkingLevel: NormalizedModelSelection["thinkingLevel"],
 ): NormalizedModelSelection {
 	const record = parseRecord(result, "thinking.set result");
-	if (record.changed === false)
-		throw new SdkV3OperationError("invalid_result", "thinking.set result was not acknowledged");
-	if (record.status !== undefined && record.status !== "accepted")
-		throw new SdkV3OperationError("invalid_result", "thinking.set result was not accepted");
-	const fields = [record.provider, record.modelId, record.thinkingLevel];
-	if (fields.every(value => value === undefined || value === "")) {
-		if (record.changed === true || record.status === "accepted") return { ...selected, thinkingLevel };
-		throw new SdkV3OperationError("invalid_result", "thinking.set result was not acknowledged");
+	if (!hasExactKeys(record, ["changed"]) || record.changed !== true)
+		throw new SdkV3OperationError("invalid_result", "thinking.set result must be exactly { changed: true }");
+	return { ...selected, thinkingLevel };
+}
+
+function completeMutationSelection(result: unknown, operation: "model.set"): NormalizedModelSelection {
+	const record = parseRecord(result, `${operation} result`);
+	if (!hasExactKeys(record, ["provider", "modelId", "thinkingLevel"]))
+		throw new SdkV3OperationError(
+			"invalid_result",
+			`${operation} result must contain only a complete selection tuple`,
+		);
+	try {
+		return parseSelection(record);
+	} catch {
+		throw new SdkV3OperationError("invalid_result", `${operation} result contains an invalid selection tuple`);
 	}
-	if (fields.some(value => value === undefined || value === ""))
-		throw new SdkV3OperationError("invalid_result", "thinking.set result contained a partial selection");
-	const accepted = parseMutationSelection(record);
-	if (
-		accepted.provider !== selected.provider ||
-		accepted.modelId !== selected.modelId ||
-		accepted.thinkingLevel !== thinkingLevel
-	)
-		throw new SdkV3OperationError("invalid_result", "thinking.set did not confirm the requested selection");
-	return accepted;
+}
+
+function hasExactKeys(record: SdkRecord, expected: readonly string[]): boolean {
+	const keys = Object.keys(record);
+	return keys.length === expected.length && expected.every(key => keys.includes(key));
 }

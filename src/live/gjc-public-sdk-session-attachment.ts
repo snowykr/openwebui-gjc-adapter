@@ -22,9 +22,10 @@ import {
 	requireLifecycleAttachment,
 	validateCachedAttachment,
 	validatePersistedSessionIdentity,
+	verifyPublishedEndpointAttachment,
 	waitForSdkEndpoint,
 } from "./gjc-routing-endpoints";
-import type { PublicSdkRunnerContext } from "./gjc-routing-lifecycle";
+import { cleanupColdResumeFailure, type PublicSdkRunnerContext } from "./gjc-routing-lifecycle";
 import {
 	attachmentProof,
 	canRetainColdResumePane,
@@ -52,7 +53,7 @@ export async function ensureAttachment(
 	await validatePersistedSessionIdentity({ ...input, sessionFile: input.sessionFile });
 	const published = await discoverPublishedSdkEndpoint(input.cwd, input.sessionId);
 	if (published !== undefined) {
-		await verifyPublishedAttachment(context, published, lifecycle);
+		await verifyPublishedEndpointAttachment(context, published, lifecycle);
 		const attachment = attachmentFor(input, {
 			...(await recoverAttachment(context, { ...input, sessionFile: input.sessionFile, published })),
 			published,
@@ -66,22 +67,26 @@ export async function ensureAttachment(
 		childEnvironment: context.input.runtimeLocations.childEnvironment,
 	});
 	const resumed = requireLifecycleAttachment(await backend.coldResume({ existingSessionPath: input.sessionFile }));
-	if (resumed.sessionId !== input.sessionId) {
-		const cleanup = await backend.fallbackBeforeCloseAcknowledgement(resumed);
-		const detail = cleanup.status === "closed" ? "" : `; owned pane cleanup is ${cleanup.status}: ${cleanup.message}`;
-		throw new Error(
-			`Resumed GJC session identity ${resumed.sessionId} does not match persisted mapping ${input.sessionId}${detail}`,
+	if (resumed.sessionId !== input.sessionId)
+		return cleanupColdResumeFailure(
+			new Error(
+				`Resumed GJC session identity ${resumed.sessionId} does not match persisted mapping ${input.sessionId}`,
+			),
+			() => backend.fallbackBeforeCloseAcknowledgement(resumed),
 		);
+	try {
+		const publishedAfterResume = await waitForSdkEndpoint(input.cwd, input.sessionId);
+		await runLifecycleTestBarrier(context.input.testBarrierHook, "post_cli_pre_bind", publishedAfterResume);
+		const attachment = attachmentFor(input, {
+			...resumed,
+			published: await requireCurrentPublishedSdkEndpoint(input.cwd, publishedAfterResume),
+			...(canRetainColdResumePane(resumed, publishedAfterResume) ? {} : { pane: undefined }),
+		});
+		context.attachments.set(key, attachment);
+		return attachment;
+	} catch (error) {
+		return cleanupColdResumeFailure(error, () => backend.fallbackBeforeCloseAcknowledgement(resumed));
 	}
-	const publishedAfterResume = await waitForSdkEndpoint(input.cwd, input.sessionId);
-	await runLifecycleTestBarrier(context.input.testBarrierHook, "post_cli_pre_bind", publishedAfterResume);
-	const attachment = attachmentFor(input, {
-		...resumed,
-		published: await requireCurrentPublishedSdkEndpoint(input.cwd, publishedAfterResume),
-		...(canRetainColdResumePane(resumed, publishedAfterResume) ? {} : { pane: undefined }),
-	});
-	context.attachments.set(key, attachment);
-	return attachment;
 }
 async function refreshKnownAttachment(
 	context: PublicSdkRunnerContext,
@@ -102,7 +107,7 @@ async function refreshKnownAttachment(
 	context.attachments.delete(key);
 	if (input.sessionFile === undefined || published === undefined)
 		throw new SdkV3OperationError("endpoint_stale", "Cached GJC endpoint disappeared during lifecycle transaction");
-	await verifyPublishedAttachment(context, published, lifecycle);
+	await verifyPublishedEndpointAttachment(context, published, lifecycle);
 	const replacement = attachmentFor(input, {
 		...(await recoverAttachment(context, { ...input, sessionFile: input.sessionFile, published })),
 		published,
@@ -233,16 +238,4 @@ export async function prompt(
 		}
 	}
 	return { outcome: await port.prompt(text, context.input.turnTimeoutMs), modelSelection };
-}
-async function verifyPublishedAttachment(
-	context: PublicSdkRunnerContext,
-	attachment: PublicSdkSessionAttachment,
-	lifecycle: GjcLifecycleTransaction,
-): Promise<void> {
-	const port = (context.input.sessionPortFactory ?? (() => new PublicSdkSessionClient()))();
-	try {
-		await port.attach(attachment, context.input.turnTimeoutMs, lifecycle.owner);
-	} finally {
-		port.detach();
-	}
 }

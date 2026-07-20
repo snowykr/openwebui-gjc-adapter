@@ -1,10 +1,15 @@
 import { resolve } from "node:path";
 import { readSdkSessionEndpoint } from "@gajae-code/coding-agent/sdk";
 import type { PublicSdkSessionAttachment } from "../gjc/public-sdk-contract";
-import { attachmentFromPublishedSdkEndpoint, samePublishedSdkEndpoint } from "../gjc/public-sdk-session-port";
+import {
+	attachmentFromPublishedSdkEndpoint,
+	PublicSdkSessionClient,
+	samePublishedSdkEndpoint,
+} from "../gjc/public-sdk-session-port";
 import { SdkV3OperationError } from "../gjc/sdk-v3-protocol";
 import { loadAbsoluteGjcSessionFile, validateGjcSessionPathWithinRoot } from "../gjc/session-loader";
 import type { GjcSessionAddress } from "../gjc/turn-runner";
+import type { PublicSdkRunnerContext } from "./gjc-routing-lifecycle";
 import type { SessionAttachment } from "./gjc-routing-proof";
 export const DEFAULT_SDK_ENDPOINT_PUBLICATION_TIMEOUT_MS = 10_000;
 export const SDK_ENDPOINT_PUBLICATION_POLL_INTERVAL_MS = 100;
@@ -14,6 +19,18 @@ export function requireLifecycleAttachment(
 ): import("../gjc/cli-lifecycle-backend").CliLifecycleAttachment {
 	if (result.status === "closed") return result.value;
 	throw new Error(`GJC CLI lifecycle is ${result.status}: ${result.message}`);
+}
+export async function verifyPublishedEndpointAttachment(
+	context: PublicSdkRunnerContext,
+	attachment: PublicSdkSessionAttachment,
+	lifecycle: import("../gjc/turn-runner").GjcLifecycleTransaction,
+): Promise<void> {
+	const port = (context.input.sessionPortFactory ?? (() => new PublicSdkSessionClient()))();
+	try {
+		await port.attach(attachment, context.input.turnTimeoutMs, lifecycle.owner);
+	} finally {
+		port.detach();
+	}
 }
 
 export function addressFor(

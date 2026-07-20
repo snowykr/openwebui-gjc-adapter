@@ -42,3 +42,19 @@ export function createPublicSdkRunnerContext(input: PublicSdkRunnerOptions): Pub
 }
 
 export type LifecycleEffect<T> = (lifecycle: GjcLifecycleTransaction) => Promise<T>;
+export async function cleanupColdResumeFailure(
+	error: unknown,
+	cleanup: () => Promise<{ readonly status: string; readonly message?: string }>,
+): Promise<never> {
+	try {
+		const result = await cleanup();
+		if (result.status !== "closed")
+			throw new Error(`owned pane cleanup is ${result.status}: ${result.message ?? "no detail"}`);
+	} catch (cleanupError) {
+		throw new AggregateError(
+			[error, cleanupError],
+			"cold-resumed GJC session pre-acknowledgement cleanup is uncertain",
+		);
+	}
+	throw error;
+}

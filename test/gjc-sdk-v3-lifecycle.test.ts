@@ -11,9 +11,48 @@ import {
 	withPublicSdkSessionMutationCoordinator,
 } from "../src/gjc/public-sdk-session-port";
 import { waitForSdkEndpoint } from "../src/live/gjc-routing-endpoints";
+import { cleanupColdResumeFailure } from "../src/live/gjc-routing-lifecycle";
 import { createModelReaderFactory } from "../src/live/model-reader";
 
 describe("public SDK lifecycle contract", () => {
+	test("rethrows the original cold-resume failure after successful closed cleanup", async () => {
+		const primary = new Error("resume failed");
+		const failure = await cleanupColdResumeFailure(primary, async () => ({ status: "closed" })).then(
+			() => undefined,
+			error => error,
+		);
+
+		expect(failure).toBe(primary);
+	});
+	test("aggregates the original cold-resume failure before non-closed cleanup detail", async () => {
+		const primary = new Error("resume failed");
+		const failure = await cleanupColdResumeFailure(primary, async () => ({
+			status: "uncertain",
+			message: "pane is still running",
+		})).then(
+			() => undefined,
+			error => error,
+		);
+
+		if (!(failure instanceof AggregateError)) throw new TypeError("expected aggregate cleanup failure");
+		expect(failure.errors[0]).toBe(primary);
+		expect(failure.errors[1]).toEqual(new Error("owned pane cleanup is uncertain: pane is still running"));
+	});
+	test("aggregates the original cold-resume failure before thrown cleanup failure", async () => {
+		const primary = new Error("resume failed");
+		const cleanup = new Error("cleanup failed");
+		const failure = await cleanupColdResumeFailure(primary, async () => {
+			throw cleanup;
+		}).then(
+			() => undefined,
+			error => error,
+		);
+
+		if (!(failure instanceof AggregateError)) throw new TypeError("expected aggregate cleanup failure");
+		expect(failure.errors).toEqual([primary, cleanup]);
+		expect(failure.errors[0]).toBe(primary);
+		expect(failure.errors[1]).toBe(cleanup);
+	});
 	test("waits through cold model endpoint publication beyond the ordinary routing deadline and remains bounded", async () => {
 		const root = mkdtempSync(join(tmpdir(), "gjc-sdk-endpoint-publication-"));
 		const stateDirectory = join(root, ".gjc", "state", "sdk");

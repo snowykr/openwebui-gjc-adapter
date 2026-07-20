@@ -114,7 +114,7 @@ export function startSdkFixtureServer(scenario: SdkFixtureScenario, expectedCwd?
 								type: "control_response",
 								id,
 								ok: true,
-								result: { status: "accepted" },
+								result: { changed: true },
 							}),
 						);
 						return;

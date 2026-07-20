@@ -2,8 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { readdir, stat } from "node:fs/promises";
 import { join, relative } from "node:path";
 import type { PublicSdkSessionPort, PublicSdkTurnOutcome } from "../src/gjc/public-sdk-contract";
-import { type PublicSdkActionHost, setModel, setThinking } from "../src/gjc/public-sdk-session-actions";
-import { parseSelection, parseSessionAuthority, parseState } from "../src/gjc/sdk-v3-protocol";
+import { closeSession, type PublicSdkActionHost, setModel, setThinking } from "../src/gjc/public-sdk-session-actions";
+import { parseSelection, parseSessionAuthority, parseState, SdkV3OperationError } from "../src/gjc/sdk-v3-protocol";
 import { normalizeOpenWebUIModelId, parseCanonicalModelId } from "../src/live/models";
 import { createSdkTransportFixture } from "./gjc-sdk-v3-fixtures";
 
@@ -208,24 +208,26 @@ describe("latest dev SDK v3 transport contract", () => {
 		]);
 		expect(selected).toEqual({ ...selection, thinkingLevel: "low" });
 	});
-	test("accepts only full matching model.set tuples or acknowledgement-only selection fields", async () => {
+	test("accepts only a full exact model.set tuple", async () => {
 		const selection = { provider: "openai-codex", modelId: "codex-auto-review", thinkingLevel: "off" } as const;
 		const cases: readonly [string, unknown, boolean][] = [
 			["full tuple", selection, true],
-			["blank acknowledgement", { status: "accepted", provider: "", modelId: "", thinkingLevel: "" }, true],
-			["absent acknowledgement", { status: "accepted" }, true],
-			["partial tuple", { status: "accepted", provider: "openai-codex" }, false],
+			["tuple with status", { ...selection, status: "accepted" }, false],
+			["tuple with unknown key", { ...selection, extra: true }, false],
+			["empty result", {}, false],
+			["blank tuple", { provider: "", modelId: "", thinkingLevel: "" }, false],
+			["status-only acknowledgement", { status: "accepted" }, false],
+			["partial tuple", { provider: "openai-codex" }, false],
 			["mismatched tuple", { provider: "openai-codex", modelId: "other", thinkingLevel: "off" }, false],
 			["error reply", { status: "error" }, false],
 		];
 
-		for (const [name, result, accepted] of cases) {
+		for (const [_name, result, accepted] of cases) {
 			let selected: typeof selection | undefined;
 			const host = {
 				authority: async <T>(_timeoutMs: number, effect: (client: never) => Promise<T>): Promise<T> =>
 					effect(undefined as never),
-				mutate: async (_client: never, operation: string) =>
-					operation === "thinking.set" ? { status: "accepted" } : result,
+				mutate: async () => result,
 				selectedModel: () => selected,
 				setSelectedModel: (value: typeof selection | undefined) => {
 					selected = value;
@@ -238,30 +240,30 @@ describe("latest dev SDK v3 transport contract", () => {
 
 			if (accepted) {
 				await expect(setModel(host, selection, undefined, 1_000)).resolves.toEqual(selection);
-				if (name === "blank acknowledgement")
-					await expect(setThinking(host, "low", undefined, 1_000)).resolves.toEqual({
-						...selection,
-						thinkingLevel: "low",
-					});
-				else expect(selected).toEqual(selection);
+				expect(selected).toEqual(selection);
 			} else {
 				await expect(setModel(host, selection, undefined, 1_000)).rejects.toMatchObject({ code: "invalid_result" });
 				expect(selected).toBeUndefined();
 			}
 		}
 	});
-	test("accepts only acknowledged or exact matching thinking.set results", async () => {
+	test("accepts only an exact { changed: true } thinking.set acknowledgement", async () => {
 		const selected = { provider: "openai-codex", modelId: "codex-auto-review", thinkingLevel: "off" } as const;
 		const cases: readonly [string, unknown, boolean][] = [
 			["changed acknowledgement", { changed: true }, true],
-			["accepted acknowledgement", { status: "accepted" }, true],
-			["matching tuple", { ...selected, thinkingLevel: "low" }, true],
+			["matching tuple", { ...selected, thinkingLevel: "low" }, false],
+			["changed acknowledgement with unknown key", { changed: true, extra: true }, false],
+			["tuple with status", { ...selected, thinkingLevel: "low", status: "accepted" }, false],
+			["tuple with unknown key", { ...selected, thinkingLevel: "low", extra: true }, false],
 			["changed false", { changed: false }, false],
+			["status-only acknowledgement", { status: "accepted" }, false],
+			["empty result", {}, false],
+			["blank tuple", { provider: "", modelId: "", thinkingLevel: "" }, false],
 			["partial tuple", { changed: true, provider: selected.provider }, false],
+			["status with changed acknowledgement", { changed: true, status: "accepted" }, false],
 			["mismatched provider", { provider: "other", modelId: selected.modelId, thinkingLevel: "low" }, false],
 			["mismatched model", { provider: selected.provider, modelId: "other", thinkingLevel: "low" }, false],
 			["mismatched thinking", { ...selected }, false],
-			["unknown empty result", {}, false],
 		];
 
 		for (const [_name, result, accepted] of cases) {
@@ -285,38 +287,69 @@ describe("latest dev SDK v3 transport contract", () => {
 					...selected,
 					thinkingLevel: "low",
 				});
-			else
+			else {
 				await expect(setThinking(host, "low", undefined, 1_000)).rejects.toMatchObject({ code: "invalid_result" });
+				expect(current).toEqual(selected);
+			}
 		}
 	});
-	test("Given a model.set acknowledgement with the confirmed selection and an acknowledgement-only thinking.set When applying a selection Then it remains strict without requiring an optional current-model marker", async () => {
-		const fixture = createSdkTransportFixture("model_catalog");
-		try {
-			await fixture.attach();
+	test("detaches only after an exact released session.close acknowledgement", async () => {
+		const cases: readonly [string, unknown, boolean][] = [
+			["exact acknowledgement", { closed: true }, true],
+			["additional key", { closed: true, status: "accepted" }, false],
+			["closed false", { closed: false }, false],
+			["empty object", {}, false],
+			["null", null, false],
+			["array", [], false],
+			["string", "closed", false],
+		];
 
-			await expect(
-				fixture.port.setModel({
-					provider: "anthropic",
-					modelId: "claude-sonnet-4",
-					thinkingLevel: "medium",
-				}),
-			).resolves.toEqual({ provider: "anthropic", modelId: "claude-sonnet-4", thinkingLevel: "medium" });
-			await expect(fixture.port.setThinking("low")).resolves.toEqual({
-				provider: "anthropic",
-				modelId: "claude-sonnet-4",
-				thinkingLevel: "low",
-			});
-			await expect(
-				fixture.port.setModel({ provider: "openai", modelId: "gpt-5", thinkingLevel: "high" }),
-			).rejects.toMatchObject({ code: "invalid_result" });
-			expect(
-				fixture.server.frames.filter(
-					frame => frame.type === "query_request" && frame.query === "models.list/current",
-				),
-			).toHaveLength(0);
-		} finally {
-			await fixture.dispose();
+		for (const [_name, result, accepted] of cases) {
+			let detached = 0;
+			const host = {
+				authority: async <T>(_timeoutMs: number, effect: (client: never) => Promise<T>): Promise<T> =>
+					effect(undefined as never),
+				mutate: async () => result,
+				selectedModel: () => undefined,
+				setSelectedModel() {},
+				detach: () => {
+					detached += 1;
+				},
+				connected: () => {
+					throw new Error("not used by session.close");
+				},
+			} satisfies PublicSdkActionHost;
+
+			if (accepted) await expect(closeSession(host, undefined, 1_000)).resolves.toBeUndefined();
+			else await expect(closeSession(host, undefined, 1_000)).rejects.toThrow();
+			expect(detached).toBe(accepted ? 1 : 0);
 		}
+	});
+	test("preserves a typed pre-acknowledgement failure without detaching", async () => {
+		let mutated = 0;
+		let detached = 0;
+		const failure = new SdkV3OperationError("endpoint_stale", "close preflight failed");
+		const host = {
+			authority: async <T>(): Promise<T> => {
+				throw failure;
+			},
+			mutate: async () => {
+				mutated += 1;
+				return { closed: true };
+			},
+			selectedModel: () => undefined,
+			setSelectedModel() {},
+			detach: () => {
+				detached += 1;
+			},
+			connected: () => {
+				throw new Error("not used by session.close");
+			},
+		} satisfies PublicSdkActionHost;
+
+		await expect(closeSession(host, undefined, 1_000)).rejects.toBe(failure);
+		expect(mutated).toBe(0);
+		expect(detached).toBe(0);
 	});
 
 	test("Given repository delivery surfaces When inspected Then legacy transports and private lifecycle exports are absent", async () => {

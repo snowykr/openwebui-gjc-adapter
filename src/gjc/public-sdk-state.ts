@@ -1,4 +1,3 @@
-import type { NormalizedModelSelection } from "../contracts";
 import { queryOne } from "./public-sdk-authority";
 import type {
 	PublicSdkBranchCandidate,
@@ -9,10 +8,8 @@ import type { SdkV3Client } from "./sdk-v3-client";
 import {
 	ensureCapabilityCatalog,
 	parseRecord,
-	parseSelection,
 	parseState,
 	requiredString,
-	SdkV3OperationError,
 	SdkV3ProtocolError,
 } from "./sdk-v3-protocol";
 
@@ -43,43 +40,6 @@ export async function readBranchCandidates(
 		collectCandidates(root, candidates, seen);
 	}
 	return candidates;
-}
-
-export async function confirmSelection(
-	client: SdkV3Client,
-	expected: NormalizedModelSelection | undefined,
-	timeoutMs?: number,
-): Promise<NormalizedModelSelection> {
-	const current = (await client.queryAll("models.list/current", {}, timeoutMs)).filter(item => {
-		return parseRecord(item, "models.list/current result").current === true;
-	});
-	if (current.length !== 1) {
-		throw new SdkV3OperationError("invalid_result", `models.list/current returned ${current.length} current models`);
-	}
-	const model = parseRecord(current[0], "models.list/current current result");
-	const provider = requiredString(model, "provider", "models.list/current current result");
-	if (provider.includes("/")) {
-		throw new SdkV3OperationError("invalid_result", "models.list/current current provider contains /");
-	}
-	const modelId = requiredString(model, "id", "models.list/current current result");
-	const selection = parseSelection({
-		provider,
-		modelId,
-		thinkingLevel: requiredString(model, "currentThinkingLevel", "models.list/current current result"),
-	});
-	if (
-		expected !== undefined &&
-		(selection.provider !== expected.provider ||
-			selection.modelId !== expected.modelId ||
-			selection.thinkingLevel !== expected.thinkingLevel)
-	) {
-		throw new SdkV3OperationError("invalid_result", "models.list/current did not confirm the mutation result");
-	}
-	return selection;
-}
-
-export function parseMutationSelection(value: unknown): NormalizedModelSelection {
-	return parseSelection(value);
 }
 
 function collectCandidates(value: unknown, candidates: PublicSdkBranchCandidate[], seen: Set<string>): void {

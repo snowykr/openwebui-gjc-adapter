@@ -61,58 +61,72 @@ export async function startNewSession<T>(
 	const lifecycleAttachment = requireLifecycleAttachment(
 		await backend.createEphemeral({ sessionRoot: input.sessionRoot }),
 	);
-	const address = {
-		...addressFor(input, lifecycleAttachment.sessionId),
-	};
-	const initialPublished = await waitForSdkEndpoint(input.cwd, lifecycleAttachment.sessionId);
-	await runLifecycleTestBarrier(context.input.testBarrierHook, "post_cli_pre_bind", initialPublished);
-	const published = await requireCurrentPublishedSdkEndpoint(input.cwd, initialPublished);
-	const attachment = attachmentFor(address, { ...lifecycleAttachment, published });
-	context.attachments.set(attachmentKey(address), attachment);
-	const { withLifecycle } = await import("./gjc-public-sdk-close");
-	return withLifecycle(
-		context,
-		address,
-		async lifecycle => {
-			try {
-				const provisionalProof = await currentAttachmentProof(published, attachment, lifecycle);
-				requireExactProvisionalProof(provisionalProof);
-				await beforePrompt(address, provisionalProof, lifecycle);
-				const result = await withMutationPort(context, attachment, lifecycle, port =>
-					prompt(context, port, input.text, input.modelSelection),
-				);
-				const transcript = await discoverFreshGjcSessionFile(
-					input.sessionRoot,
-					baseline,
-					lifecycleAttachment.sessionId,
-					resolve(input.cwd),
-				);
-				const addressWithSessionFile = { ...address, sessionFile: transcript.filePath };
-				const durableAttachment = attachmentFor(addressWithSessionFile, {
-					...lifecycleAttachment,
-					sessionPath: transcript.filePath,
-					published: await requireCurrentPublishedSdkEndpoint(input.cwd, attachment.published!),
-				});
-				context.attachments.set(attachmentKey(addressWithSessionFile), durableAttachment);
-				const currentProof = await currentAttachmentProof(
-					durableAttachment.published!,
-					durableAttachment,
-					lifecycle,
-				);
-				return publish(
-					{
-						...addressWithSessionFile,
-						...turnResult(result.outcome, transcript.filePath, result.modelSelection, currentProof),
-					},
-					lifecycle,
-				);
-			} catch (error) {
-				await onFailure?.(lifecycle, error);
-				throw error;
-			}
-		},
-		false,
-	);
+	let provisionalAuthorityPersisted = false;
+	try {
+		const address = {
+			...addressFor(input, lifecycleAttachment.sessionId),
+		};
+		const initialPublished = await waitForSdkEndpoint(input.cwd, lifecycleAttachment.sessionId);
+		await runLifecycleTestBarrier(context.input.testBarrierHook, "post_cli_pre_bind", initialPublished);
+		const published = await requireCurrentPublishedSdkEndpoint(input.cwd, initialPublished);
+		const attachment = attachmentFor(address, { ...lifecycleAttachment, published });
+		context.attachments.set(attachmentKey(address), attachment);
+		const { withLifecycle } = await import("./gjc-public-sdk-close");
+		return await withLifecycle(
+			context,
+			address,
+			async lifecycle => {
+				try {
+					const provisionalProof = await currentAttachmentProof(published, attachment, lifecycle);
+					requireExactProvisionalProof(provisionalProof);
+					await beforePrompt(address, provisionalProof, lifecycle);
+					provisionalAuthorityPersisted = true;
+					const result = await withMutationPort(context, attachment, lifecycle, port =>
+						prompt(context, port, input.text, input.modelSelection),
+					);
+					const transcript = await discoverFreshGjcSessionFile(
+						input.sessionRoot,
+						baseline,
+						lifecycleAttachment.sessionId,
+						resolve(input.cwd),
+					);
+					const addressWithSessionFile = { ...address, sessionFile: transcript.filePath };
+					const durableAttachment = attachmentFor(addressWithSessionFile, {
+						...lifecycleAttachment,
+						sessionPath: transcript.filePath,
+						published: await requireCurrentPublishedSdkEndpoint(input.cwd, attachment.published!),
+					});
+					context.attachments.set(attachmentKey(addressWithSessionFile), durableAttachment);
+					const currentProof = await currentAttachmentProof(
+						durableAttachment.published!,
+						durableAttachment,
+						lifecycle,
+					);
+					return publish(
+						{
+							...addressWithSessionFile,
+							...turnResult(result.outcome, transcript.filePath, result.modelSelection, currentProof),
+						},
+						lifecycle,
+					);
+				} catch (error) {
+					await onFailure?.(lifecycle, error);
+					throw error;
+				}
+			},
+			false,
+		);
+	} catch (error) {
+		if (provisionalAuthorityPersisted) throw error;
+		context.attachments.delete(attachmentKey(addressFor(input, lifecycleAttachment.sessionId)));
+		try {
+			const fallback = await backend.fallbackBeforeCloseAcknowledgement(lifecycleAttachment);
+			if (fallback.status !== "closed") throw new Error(fallback.message);
+		} catch (cleanupError) {
+			throw new AggregateError([error, cleanupError], "new GJC session pre-prompt cleanup is uncertain");
+		}
+		throw error;
+	}
 }
 
 export async function switchSession(context: PublicSdkRunnerContext, input: GjcSwitchSessionInput): Promise<void> {

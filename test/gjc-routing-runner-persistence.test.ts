@@ -1379,21 +1379,13 @@ test("applies released model selection responses across fresh and continuation t
 		rmSync(root, { recursive: true, force: true });
 	}
 });
-test("fails closed when a newly published CLI endpoint disappears before public SDK binding", async () => {
+test("cleans up exactly the owned CLI pane when the post-CLI binding barrier fails", async () => {
 	const root = mkdtempSync(join(tmpdir(), "gjc-post-cli-pre-bind-"));
 	const sessionRoot = join(root, ".gjc", "sessions");
 	const mappingFile = join(root, "mappings.json");
 	const server = startSdkFixtureServer("turn_complete", root);
 	let sessionId: string | undefined;
 	let barrierHits = 0;
-	let releaseBarrier: (() => void) | undefined;
-	let barrierReached: (() => void) | undefined;
-	const released = new Promise<void>(resolve => {
-		releaseBarrier = resolve;
-	});
-	const reached = new Promise<void>(resolve => {
-		barrierReached = resolve;
-	});
 	try {
 		writeFileSync(
 			join(root, "gjc-sdk-fixture.json"),
@@ -1414,43 +1406,60 @@ test("fails closed when a newly published CLI endpoint disappears before public 
 				},
 			} as GjcRuntimeLocations,
 			turnTimeoutMs: 1_000,
-			testBarrierHook: async (phase, evidence) => {
+			testBarrierHook: (phase, evidence) => {
 				expect(phase).toBe("post_cli_pre_bind");
 				barrierHits += 1;
 				sessionId = evidence.sessionId;
-				unlinkSync(join(evidence.cwd, ".gjc", "state", "sdk", `${evidence.sessionId}.json`));
-				if (barrierReached === undefined) throw new Error("post-CLI barrier was not initialized");
-				barrierReached();
-				await released;
+				throw new Error("post-CLI binding barrier failed");
 			},
 		});
 		const runner = createGjcRoutingLiveGatewayRunner({
 			turnRunner: publicRunner,
 			mappings: new FileBackedSessionMappingStore(mappingFile),
 		});
-		const started = runner.run({
-			...turn("post-cli-pre-bind", "post-cli-pre-bind"),
-			project: { ...project, cwd: root, sessionRoot },
-		});
-		await reached;
-		if (releaseBarrier === undefined) throw new Error("post-CLI barrier release was not initialized");
-		releaseBarrier();
-		await expect(started).rejects.toThrow("endpoint descriptor");
+		await expect(
+			runner.run({
+				...turn("post-cli-pre-bind", "post-cli-pre-bind"),
+				project: { ...project, cwd: root, sessionRoot },
+			}),
+		).rejects.toThrow("post-CLI binding barrier failed");
 		if (sessionId === undefined) throw new Error("post-CLI barrier did not report a session id");
 		expect(barrierHits).toBe(1);
+		expect(tmuxPanesInCwd(root)).toEqual([]);
 		expect(new FileBackedSessionMappingStore(mappingFile).get("post-cli-pre-bind")).toBeUndefined();
-		expect(await Bun.file(join(root, ".gjc", "state", "sdk", `${sessionId}.json`)).exists()).toBe(false);
+		expect(await Bun.file(join(root, ".gjc", "state", "sdk", `${sessionId}.json`)).exists()).toBe(true);
 		expect(readFileSync(mappingFile, "utf8")).not.toContain("tmuxPane");
 		expect(readFileSync(join(root, "sdk-cli.jsonl"), "utf8")).toContain('"interactive":"create"');
 		expect(server.frames.some(frame => frame.type === "control_request" && frame.operation === "turn.prompt")).toBe(
 			false,
 		);
 	} finally {
+		for (const pane of tmuxPanesInCwd(root))
+			Bun.spawnSync({
+				cmd: ["tmux", "kill-pane", "-t", pane],
+				stdout: "ignore",
+				stderr: "ignore",
+			});
 		server.stop();
 		rmSync(root, { recursive: true, force: true });
 	}
 });
 
+function tmuxPanesInCwd(cwd: string): string[] {
+	const result = Bun.spawnSync({
+		cmd: ["tmux", "list-panes", "-a", "-F", "#{pane_id}|#{pane_current_path}"],
+		stdout: "pipe",
+		stderr: "ignore",
+	});
+	if (result.exitCode !== 0) return [];
+	return new TextDecoder()
+		.decode(result.stdout)
+		.split(/\r?\n/)
+		.flatMap(line => {
+			const [pane, paneCwd, ...extra] = line.split("|");
+			return extra.length === 0 && pane !== undefined && paneCwd === cwd ? [pane] : [];
+		});
+}
 const lowSelection = { provider: "anthropic", modelId: "claude-sonnet-4", thinkingLevel: "low" } as const;
 const mediumSelection = { ...lowSelection, thinkingLevel: "medium" } as const;
 
