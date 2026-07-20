@@ -138,15 +138,17 @@ export async function runBranchControl(
 			{ entryId: authorized.gjcEntryId },
 			`${input.chatId}:${input.userMessageId}`,
 			context.input.turnTimeoutMs,
+			async successor => {
+				await onAcknowledgedSuccessor?.({
+					sessionId: successor.sessionId,
+					attachment: endpointSuccessorProof(attachmentProof(successor, {})),
+				});
+			},
 		);
 	});
 	if (branched.sessionId === attachment.sessionId) throw new OpenWebUIControlError("branch_successor_identity");
 	const published = await waitForSdkEndpoint(input.project.cwd, branched.sessionId);
 	const acknowledgedAttachment = await successorAttachmentProof(context, attachment, published);
-	await onAcknowledgedSuccessor?.({
-		sessionId: branched.sessionId,
-		attachment: endpointSuccessorProof(acknowledgedAttachment),
-	});
 	const sessionFile = await discoverSuccessorSessionFile(sessionRoot, baseline, branched.sessionId, input.project.cwd);
 	const retainedPane = retainedSuccessorPane(attachment, acknowledgedAttachment);
 	const successorAttachment: SessionAttachment = {

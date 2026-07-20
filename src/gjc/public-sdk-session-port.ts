@@ -2,6 +2,7 @@ import type { NormalizedModelSelection } from "../contracts";
 import { assertAttachmentAuthority } from "./public-sdk-attachment";
 import type {
 	PublicSdkGate,
+	PublicSdkLifecycleSuccessorCallback,
 	PublicSdkSessionAttachment,
 	PublicSdkSessionCoordinatorOwner,
 	PublicSdkSessionPort,
@@ -21,7 +22,7 @@ import { withPublicSdkSessionMutationCoordinator } from "./public-sdk-coordinato
 export type { PublicSdkSessionCoordinatorScope } from "./public-sdk-coordinator";
 export { withPublicSdkSessionMutationCoordinator } from "./public-sdk-coordinator";
 
-import { discoverLifecycleSuccessor, sessionOperation } from "./public-sdk-lifecycle";
+import { createSessionLifecycle, discoverLifecycleSuccessor } from "./public-sdk-lifecycle";
 import { closeSession, type PublicSdkActionHost, reply, setModel, setThinking } from "./public-sdk-session-actions";
 import { readAvailableModels, readBranchCandidates, readSessionState } from "./public-sdk-state";
 import { runGateTurn, runTurn } from "./public-sdk-turns";
@@ -36,6 +37,17 @@ export class PublicSdkSessionClient implements PublicSdkSessionPort {
 	#attachedCoordinatorOwner: PublicSdkSessionCoordinatorOwner = this.#coordinatorOwner;
 	#mutationInFlight = false;
 	#selectedModel: NormalizedModelSelection | undefined;
+	readonly #lifecycle = createSessionLifecycle({
+		connected: () => ({ attachment: this.connected().attachment }),
+		mutate: (op, value, id, timeout) => this.mutate(this.connected().client, op, value, id, timeout),
+		withAuthority: (timeout, effect, post) => this.authority(timeout, () => effect(), post),
+		discover: discoverLifecycleSuccessor,
+		attach: (attachment, timeout, owner) => this.attach(attachment, timeout, owner),
+		detach: () => this.detach(),
+		metadata: timeout => this.queryOne(this.connected().client, "session.metadata", timeout),
+		owner: () => this.#attachedCoordinatorOwner,
+		coordinated: effect => this.coordinated(effect),
+	});
 	async attach(
 		attachment: PublicSdkSessionAttachment,
 		timeoutMs?: number,
@@ -116,20 +128,30 @@ export class PublicSdkSessionClient implements PublicSdkSessionPort {
 		return this.coordinated(() => runGateTurn(this.turnContext(), gate, answer, key, timeoutMs));
 	}
 
-	branch(input: SdkRecord, key?: string, timeoutMs?: number): Promise<PublicSdkSessionAttachment> {
-		return this.lifecycle("session.branch", input, key, timeoutMs);
+	branch(
+		input: SdkRecord,
+		key?: string,
+		timeoutMs?: number,
+		onDiscovered?: PublicSdkLifecycleSuccessorCallback,
+	): Promise<PublicSdkSessionAttachment> {
+		return this.#lifecycle("session.branch", input, key, timeoutMs, onDiscovered);
 	}
 
-	newSession(input: SdkRecord = {}, key?: string, timeoutMs?: number): Promise<PublicSdkSessionAttachment> {
-		return this.lifecycle("session.new", input, key, timeoutMs);
+	newSession(
+		input: SdkRecord = {},
+		key?: string,
+		timeoutMs?: number,
+		onDiscovered?: PublicSdkLifecycleSuccessorCallback,
+	): Promise<PublicSdkSessionAttachment> {
+		return this.#lifecycle("session.new", input, key, timeoutMs, onDiscovered);
 	}
 
 	resumeSession(input: SdkRecord = {}, key?: string, timeoutMs?: number): Promise<PublicSdkSessionAttachment> {
-		return this.lifecycle("session.resume", input, key, timeoutMs);
+		return this.#lifecycle("session.resume", input, key, timeoutMs);
 	}
 
 	switchSession(input: SdkRecord, key?: string, timeoutMs?: number): Promise<PublicSdkSessionAttachment> {
-		return this.lifecycle("session.switch", input, key, timeoutMs);
+		return this.#lifecycle("session.switch", input, key, timeoutMs);
 	}
 
 	async closeSession(key?: string, timeoutMs?: number): Promise<void> {
@@ -138,32 +160,6 @@ export class PublicSdkSessionClient implements PublicSdkSessionPort {
 
 	async reply(operation: string, input: SdkRecord, key?: string, timeoutMs = 60_000): Promise<unknown> {
 		return this.coordinated(() => reply(this.actionHost(), operation, input, key, timeoutMs));
-	}
-
-	private lifecycle(
-		operation: string,
-		input: SdkRecord,
-		key?: string,
-		timeoutMs?: number,
-	): Promise<PublicSdkSessionAttachment> {
-		const owner = this.#attachedCoordinatorOwner;
-		return this.coordinated(() =>
-			sessionOperation(
-				{
-					connected: () => ({ attachment: this.connected().attachment }),
-					mutate: (op, value, id, timeout) => this.mutate(this.connected().client, op, value, id, timeout),
-					withAuthority: (timeout, effect, post) => this.authority(timeout, () => effect(), post),
-					discover: discoverLifecycleSuccessor,
-					attach: (attachment, timeout) => this.attach(attachment, timeout, owner),
-					detach: () => this.detach(),
-					metadata: timeout => this.queryOne(this.connected().client, "session.metadata", timeout),
-				},
-				operation,
-				input,
-				key,
-				timeoutMs,
-			),
-		);
 	}
 
 	private turnContext() {

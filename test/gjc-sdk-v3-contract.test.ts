@@ -1,7 +1,15 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
-import type { PublicSdkSessionPort, PublicSdkTurnOutcome } from "../src/gjc/public-sdk-contract";
+import type {
+	PublicSdkSessionAttachment,
+	PublicSdkSessionPort,
+	PublicSdkTurnOutcome,
+} from "../src/gjc/public-sdk-contract";
+import { type LifecycleHost, sessionOperation } from "../src/gjc/public-sdk-lifecycle";
 import { closeSession, type PublicSdkActionHost, setModel, setThinking } from "../src/gjc/public-sdk-session-actions";
 import { parseSelection, parseSessionAuthority, parseState, SdkV3OperationError } from "../src/gjc/sdk-v3-protocol";
 import { normalizeOpenWebUIModelId, parseCanonicalModelId } from "../src/live/models";
@@ -50,6 +58,69 @@ describe("latest dev SDK v3 transport contract", () => {
 			expect(prompts).toHaveLength(1);
 		} finally {
 			await fixture.dispose();
+		}
+	});
+	test.each([
+		"session.new",
+		"session.branch",
+	] as const)("awaits durable discovered-successor persistence before %s attach, metadata, or descriptor binding failures", async operation => {
+		for (const failure of ["attach", "metadata", "descriptor replacement"] as const) {
+			const root = mkdtempSync(join(tmpdir(), "gjc-lifecycle-ack-"));
+			const descriptorPath = join(root, "successor.json");
+			const descriptor = JSON.stringify({ version: 1, url: "ws://127.0.0.1:1", token: "successor" });
+			writeFileSync(descriptorPath, descriptor);
+			const descriptorStat = statSync(descriptorPath);
+			const successor: PublicSdkSessionAttachment = {
+				sessionId: "successor",
+				cwd: root,
+				endpoint: { url: "ws://127.0.0.1:1", token: "successor" },
+				authority: {
+					descriptorPath,
+					descriptorStat,
+					payloadDigest: createHash("sha256").update(descriptor).digest("hex"),
+					generation: descriptorStat.mtimeMs,
+					expectedSessionId: "successor",
+					expectedCwd: root,
+				},
+			};
+			const predecessor: PublicSdkSessionAttachment = {
+				...successor,
+				sessionId: "predecessor",
+				endpoint: { url: "ws://127.0.0.1:2", token: "predecessor" },
+			};
+			let mutations = 0;
+			let persisted = false;
+			const host: LifecycleHost = {
+				connected: () => ({ attachment: predecessor }),
+				mutate: async () => {
+					mutations += 1;
+					return operation === "session.new" ? { created: true } : { selectedText: "selected", cancelled: false };
+				},
+				withAuthority: async (_timeout, effect) => effect(),
+				discover: async () => successor,
+				onDiscovered: async () => {
+					await Promise.resolve();
+					persisted = true;
+				},
+				attach: async () => {
+					expect(persisted).toBe(true);
+					if (failure === "attach") throw new Error("attach failed");
+				},
+				metadata: async () => {
+					expect(persisted).toBe(true);
+					if (failure === "metadata") throw new Error("metadata failed");
+					if (failure === "descriptor replacement") writeFileSync(descriptorPath, `${descriptor}\n`);
+					return { sessionId: "successor", cwd: root };
+				},
+				detach() {},
+			};
+			try {
+				await expect(sessionOperation(host, operation, {}, "mutation-key", 1_000)).rejects.toThrow();
+				expect(persisted).toBe(true);
+				expect(mutations).toBe(1);
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
 		}
 	});
 

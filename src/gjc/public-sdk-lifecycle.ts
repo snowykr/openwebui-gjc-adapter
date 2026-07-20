@@ -5,7 +5,11 @@ import {
 	samePublishedSdkEndpoint,
 	snapshotPublishedSdkEndpointGenerations,
 } from "./public-sdk-attachment";
-import type { PublicSdkSessionAttachment } from "./public-sdk-contract";
+import type {
+	PublicSdkLifecycleSuccessorCallback,
+	PublicSdkSessionAttachment,
+	PublicSdkSessionCoordinatorOwner,
+} from "./public-sdk-contract";
 import {
 	parseRecord,
 	requiredString,
@@ -31,6 +35,52 @@ export interface LifecycleHost {
 	attach(attachment: PublicSdkSessionAttachment, timeoutMs?: number): Promise<void>;
 	detach(): void;
 	metadata(timeoutMs?: number): Promise<unknown>;
+	onDiscovered?: PublicSdkLifecycleSuccessorCallback;
+}
+export interface PublicSdkLifecycleComposition {
+	connected: LifecycleHost["connected"];
+	mutate: LifecycleHost["mutate"];
+	withAuthority: LifecycleHost["withAuthority"];
+	discover: LifecycleHost["discover"];
+	attach(
+		attachment: PublicSdkSessionAttachment,
+		timeoutMs: number | undefined,
+		owner: PublicSdkSessionCoordinatorOwner,
+	): Promise<void>;
+	detach: LifecycleHost["detach"];
+	metadata: LifecycleHost["metadata"];
+	owner(): PublicSdkSessionCoordinatorOwner;
+	coordinated<T>(effect: () => Promise<T>): Promise<T>;
+}
+
+export function createSessionLifecycle(composition: PublicSdkLifecycleComposition) {
+	return (
+		operation: string,
+		input: SdkRecord,
+		key?: string,
+		timeoutMs?: number,
+		onDiscovered?: PublicSdkLifecycleSuccessorCallback,
+	): Promise<PublicSdkSessionAttachment> => {
+		const owner = composition.owner();
+		return composition.coordinated(() =>
+			sessionOperation(
+				{
+					connected: composition.connected,
+					mutate: composition.mutate,
+					withAuthority: composition.withAuthority,
+					discover: composition.discover,
+					attach: (attachment, timeout) => composition.attach(attachment, timeout, owner),
+					detach: composition.detach,
+					metadata: composition.metadata,
+					onDiscovered,
+				},
+				operation,
+				input,
+				key,
+				timeoutMs,
+			),
+		);
+	};
 }
 export async function sessionOperation(
 	host: LifecycleHost,
@@ -59,6 +109,7 @@ export async function sessionOperation(
 		};
 		const successor = await host.discover(discoveryPredecessor, baseline, operation, target);
 		if (successor !== undefined) {
+			await host.onDiscovered?.(successor);
 			try {
 				await host.attach(successor, remaining());
 				const metadata = parseRecord(await host.metadata(remaining()), "session.metadata result");

@@ -68,6 +68,8 @@ export class PublicSdkClosePreAcknowledgementError extends Error {
 		this.name = "PublicSdkClosePreAcknowledgementError";
 	}
 }
+export type PublicSdkLifecycleSuccessorCallback = (successor: PublicSdkSessionAttachment) => Promise<void> | void;
+
 export interface PublicSdkSessionPort {
 	attach(
 		attachment: PublicSdkSessionAttachment,
@@ -112,11 +114,13 @@ export interface PublicSdkSessionPort {
 		input: Readonly<Record<string, unknown>>,
 		idempotencyKey?: string,
 		timeoutMs?: number,
+		onDiscovered?: PublicSdkLifecycleSuccessorCallback,
 	): Promise<PublicSdkSessionAttachment>;
 	newSession(
 		input?: Readonly<Record<string, unknown>>,
 		idempotencyKey?: string,
 		timeoutMs?: number,
+		onDiscovered?: PublicSdkLifecycleSuccessorCallback,
 	): Promise<PublicSdkSessionAttachment>;
 	resumeSession(
 		input?: Readonly<Record<string, unknown>>,

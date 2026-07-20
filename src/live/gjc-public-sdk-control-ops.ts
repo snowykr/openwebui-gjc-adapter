@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import type { PublicSdkSessionAttachment } from "../gjc/public-sdk-contract";
 import { SdkV3OperationError } from "../gjc/sdk-v3-protocol";
 import type { AcknowledgedSuccessor } from "../gjc/session-authority-types";
 import { snapshotGjcSessionFiles } from "../gjc/session-loader";
@@ -17,7 +18,7 @@ import {
 } from "./gjc-public-sdk-successor-authority";
 import { attachmentKey, validatePersistedSessionIdentity } from "./gjc-routing-endpoints";
 import type { PublicSdkRunnerContext } from "./gjc-routing-lifecycle";
-import { type SessionAttachment, turnResult } from "./gjc-routing-proof";
+import { attachmentProof, type SessionAttachment, turnResult } from "./gjc-routing-proof";
 import { runLifecycleTestBarrier } from "./gjc-routing-test-barrier";
 
 export async function runControl(
@@ -121,8 +122,15 @@ async function runSessionControl(
 		});
 	}
 	const key = `${input.chatId}:${input.userMessageId}`;
+	const acknowledgeDiscoveredSuccessor = async (successor: PublicSdkSessionAttachment) => {
+		await onAcknowledgedSuccessor?.({
+			sessionId: successor.sessionId,
+			attachment: endpointSuccessorProof(attachmentProof(successor, {})),
+		});
+	};
 	const successor = await withMutationPort(context, attachment, lifecycle, port => {
-		if (control.operation === "session.new") return port.newSession({}, key, context.input.turnTimeoutMs);
+		if (control.operation === "session.new")
+			return port.newSession({}, key, context.input.turnTimeoutMs, acknowledgeDiscoveredSuccessor);
 		if (sessionTarget === undefined)
 			throw new SdkV3OperationError(
 				"endpoint_stale",
@@ -158,10 +166,6 @@ async function runSessionControl(
 			successor,
 			successorProof,
 		);
-		await onAcknowledgedSuccessor?.({
-			sessionId: successor.sessionId,
-			attachment: endpointSuccessorProof(successorProof),
-		});
 		await runLifecycleTestBarrier(context.input.testBarrierHook, "post_ack_pre_transcript", successor);
 	}
 	const sessionFile = isNewSession

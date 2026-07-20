@@ -1801,6 +1801,26 @@ test("promotes a delayed acknowledged session.new successor after restart", asyn
 				cwd: fixture.root,
 			})}\n`,
 		);
+		const acknowledged = new FileBackedSessionMappingStore(fixture.mappingFile).operation(
+			"chat-session-new",
+			"session-new",
+		)?.acknowledgedSuccessor;
+		expect(acknowledged).toMatchObject({
+			sessionId: "sdk-session-new",
+			attachment: {
+				descriptorPath: fixture.successorEndpointPath,
+				expectedSessionId: "sdk-session-new",
+				expectedCwd: fixture.root,
+			},
+		});
+		expect(Object.keys(acknowledged?.attachment ?? {}).sort()).toEqual([
+			"descriptorPath",
+			"descriptorStat",
+			"expectedCwd",
+			"expectedSessionId",
+			"generation",
+			"payloadDigest",
+		]);
 		const replay = createGjcRoutingLiveGatewayRunner({
 			turnRunner: createPublicSdkGjcTurnRunner(fixture.runnerInput),
 			mappings: new FileBackedSessionMappingStore(fixture.mappingFile),
@@ -1816,6 +1836,9 @@ test("promotes a delayed acknowledged session.new successor after restart", asyn
 			expect.not.objectContaining({ acknowledgedSuccessor: expect.anything() }),
 		);
 		expect(fixture.server.frames.filter(frame => frame.operation === "session.new")).toHaveLength(1);
+		expect(
+			fixture.server.frames.filter(frame => frame.type === "control_request" && frame.operation === "turn.prompt"),
+		).toHaveLength(0);
 	} finally {
 		fixture.dispose();
 	}
