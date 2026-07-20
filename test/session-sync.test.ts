@@ -18,6 +18,41 @@ afterEach(async () => {
 });
 
 describe("syncProjectSessionsToOpenWebUI", () => {
+	test("imports transcripts from the current-dev SDK cwd-scoped session directory", async () => {
+		// Given: a project whose transcript was written under agentDir, not its configured sessionRoot.
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-sync-sdk-root-"));
+		tempDirs.push(workspace);
+		const home = path.join(workspace, "home");
+		const agentDir = path.join(home, ".gjc", "agent");
+		const projectDirectory = path.join(workspace, "Project SDK");
+		const sdkSessionRoot = path.join(agentDir, "sessions", `-tmp-${path.basename(workspace)}-Project SDK`);
+		await fs.mkdir(sdkSessionRoot, { recursive: true });
+		await writeSessionFile(path.join(sdkSessionRoot, "sdk-session.jsonl"), {
+			header: { id: "sdk-session", title: "SDK Session", cwd: projectDirectory },
+			entries: [messageEntry("sdk-user", null, "user", "new SDK transcript")],
+		});
+		await fs.mkdir(projectDirectory, { recursive: true });
+		const allowedRoots = await resolveAllowedRoots([workspace]);
+		const project = await registerProjectDirectory(
+			{ cwd: projectDirectory, name: "Project SDK", sessionRoot: path.join(workspace, "adapter-session-root") },
+			allowedRoots,
+		);
+		const repository = new InMemoryOpenWebUIProjectionRepository();
+
+		// When: historical synchronization runs with the same runtime locations as the SDK broker.
+		const result = await syncProjectSessionsToOpenWebUI({
+			repository,
+			ownerUserId: "owner-1",
+			projects: [project],
+			runtimeLocations: { home, agentDir },
+		});
+
+		// Then: the newly written SDK transcript is imported despite the configured mapping root.
+		expect(result.imported).toMatchObject([
+			{ sessionId: "sdk-session", sessionFile: path.join(sdkSessionRoot, "sdk-session.jsonl") },
+		]);
+	});
+
 	test("imports existing project session files into owner-scoped OpenWebUI folders and mappings", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-sync-"));
 		tempDirs.push(workspace);
@@ -94,6 +129,12 @@ describe("syncProjectSessionsToOpenWebUI", () => {
 			entries: [messageEntry("a-user", null, "user", "from A")],
 		});
 		await Bun.write(path.join(sessionRootA, "broken.jsonl"), "{not-json\n");
+		const loopCwd = path.join(workspace, "loop-cwd");
+		await fs.symlink(loopCwd, loopCwd);
+		await writeSessionFile(path.join(sessionRootA, "loop.jsonl"), {
+			header: { id: "session-loop", title: "Session Loop", cwd: loopCwd },
+			entries: [messageEntry("loop-user", null, "user", "must be skipped")],
+		});
 		await writeSessionFile(path.join(sessionRootB, "b.jsonl"), {
 			header: { id: "session-b", title: "Session B", cwd: projectB },
 			entries: [messageEntry("b-user", null, "user", "from B")],
@@ -118,8 +159,14 @@ describe("syncProjectSessionsToOpenWebUI", () => {
 			expect.objectContaining({
 				projectId: "project-a",
 				filePath: path.join(sessionRootA, "broken.jsonl"),
-				code: "empty_session_file",
+				code: "corrupt_session_file",
 			}),
+			{
+				projectId: "project-a",
+				filePath: path.join(sessionRootA, "loop.jsonl"),
+				code: "session_cwd_invalid",
+				message: "GJC session cwd could not be resolved",
+			},
 		]);
 		expect((await repository.getChat("owner-1", "gjc-project-project-a-session-session-a"))?.folder_id).toBe(
 			"gjc-project-project-a",

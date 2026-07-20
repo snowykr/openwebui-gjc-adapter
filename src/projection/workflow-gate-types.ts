@@ -49,6 +49,9 @@ export interface PendingWorkflowGate {
 	readonly context?: JsonObject;
 	readonly createdAt?: string;
 	readonly required?: boolean;
+	readonly commandId?: string;
+	readonly turnId?: string;
+	readonly sessionId?: string;
 }
 
 export type WorkflowGateResolution =

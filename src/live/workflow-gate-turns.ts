@@ -1,9 +1,7 @@
-import { classifyRpcFrame } from "../gjc/rpc-frames";
-import type { GjcTurnEvent, GjcTurnRunner } from "../gjc/rpc-runner";
+import { ensureSdkSessionFile } from "../gjc/session-file";
 import type { SessionMapping, SessionMappingStore } from "../gjc/session-router";
 import { validateSessionFile } from "../gjc/session-router";
-import type { OpenWebUIMessageEvent } from "../openwebui/events";
-import { type ProjectableAgentFrame, projectAgentFrame } from "../projection/events";
+import type { GjcLifecycleTransaction } from "../gjc/turn-runner";
 import {
 	answerFromWorkflowGateReply,
 	type PendingWorkflowGate,
@@ -12,22 +10,68 @@ import {
 	resolveWorkflowGateAnswer,
 	WorkflowGateStore,
 } from "../projection/workflow-gates";
-import { buildProjectionPayloadHash, type OutboxStore } from "../state/outbox";
+import type { OutboxStore } from "../state/outbox";
 import { type LiveGatewayRunnerInput, type LiveGatewayRunnerResult, WorkflowGateReplyError } from "./chat-completions";
-import { sessionEventToProjectableFrame } from "./session-event-frames";
+import type { GjcSessionTurnRunner } from "./gjc-routing-runner";
+import { ensureProjectionRows } from "./workflow-gate-projection";
+import {
+	markWorkflowGateAccepted,
+	workflowGateOperationHash,
+	workflowGateResponseIdempotencyKey,
+} from "./workflow-gate-turn-utils";
+
+export {
+	buildEventPayloadHash,
+	buildSessionMappingPayloadHash,
+	ensureProjectionRows,
+	projectTurnEvents,
+} from "./workflow-gate-projection";
 
 export interface WorkflowGateTurnDependencies {
-	readonly turnRunner: GjcTurnRunner;
+	readonly turnRunner: GjcSessionTurnRunner;
 	readonly mappings: SessionMappingStore;
 	readonly outbox?: OutboxStore;
 	readonly ownerUserId?: string;
 }
-
+export function replayCompletedWorkflowGateReply(
+	input: WorkflowGateTurnDependencies,
+	turn: LiveGatewayRunnerInput,
+): LiveGatewayRunnerResult | null {
+	const priorOperation = input.mappings.operation(turn.chatId, turn.userMessageId);
+	if (priorOperation?.state !== "complete" || priorOperation.kind !== "gate") return null;
+	const result = priorOperation.result;
+	if (result?.kind !== "control" || result.mapping.operationId !== turn.userMessageId)
+		throw new Error(
+			`GJC workflow gate operation ${turn.userMessageId} completed without a valid immutable result binding.`,
+		);
+	const matchesIngress = result.events.some(event => {
+		if (event.type !== "workflow_gate") return false;
+		const gate = pendingWorkflowGateFromEvent(event);
+		return gate !== null && workflowGateOperationHash(turn, gate) === priorOperation.detail;
+	});
+	if (!matchesIngress)
+		throw new Error(
+			`GJC workflow gate operation ${turn.userMessageId} completed without a valid immutable result binding.`,
+		);
+	ensureProjectionRows(
+		input.outbox,
+		{
+			...result.mapping,
+			operationId: turn.userMessageId,
+			assistantText: result.assistantText,
+			events: result.events,
+		},
+		input.ownerUserId ?? "openwebui-gjc-adapter",
+	);
+	return { content: result.assistantText };
+}
 export async function handleWorkflowGateReply(
 	input: WorkflowGateTurnDependencies,
 	turn: LiveGatewayRunnerInput,
+	preflightMapping: SessionMapping,
+	lifecycle: GjcLifecycleTransaction,
 ): Promise<LiveGatewayRunnerResult | null> {
-	const mapping = input.mappings.get(turn.chatId);
+	const mapping = preflightMapping ?? input.mappings.get(turn.chatId);
 	if (mapping === undefined || mapping.projectId !== turn.project.id) return null;
 	const pendingGate = latestPendingWorkflowGate(mapping.events ?? []);
 	if (pendingGate === null) return null;
@@ -62,48 +106,117 @@ export async function handleWorkflowGateReply(
 			[],
 		);
 	}
+	const operationDetail = workflowGateOperationHash(turn, pendingGate);
+	const priorOperation = input.mappings.operation(turn.chatId, turn.userMessageId);
+	if (priorOperation?.state === "complete") {
+		if (
+			priorOperation.detail !== operationDetail ||
+			priorOperation.result?.kind !== "control" ||
+			priorOperation.result.mapping.operationId !== turn.userMessageId
+		) {
+			throw new Error(
+				`GJC workflow gate operation ${turn.userMessageId} completed without a valid immutable result binding.`,
+			);
+		}
+		ensureProjectionRows(
+			input.outbox,
+			{
+				...priorOperation.result.mapping,
+				operationId: turn.userMessageId,
+				assistantText: priorOperation.result.assistantText,
+				events: priorOperation.result.events,
+			},
+			input.ownerUserId ?? "openwebui-gjc-adapter",
+		);
+		return { content: priorOperation.result.assistantText };
+	}
+	if (
+		priorOperation?.state === "pending" ||
+		priorOperation?.state === "uncertain" ||
+		priorOperation?.state === "conflict"
+	) {
+		throw new Error(`GJC workflow gate operation ${turn.userMessageId} requires reconciliation.`);
+	}
+	input.mappings.beginOperation(turn.chatId, {
+		id: turn.userMessageId,
+		kind: "gate",
+		ingressId: turn.userMessageId,
+		detail: operationDetail,
+	});
 
-	const sessionRoot = turn.project.sessionRoot ?? `${turn.project.cwd}/.gjc/sessions`;
-	const existingSessionFile = validateSessionFile(turn.project, mapping.sessionFile);
-	const result = await input.turnRunner.respondWorkflowGate({
-		cwd: turn.project.cwd,
-		sessionRoot,
-		projectId: mapping.projectId,
-		sessionId: mapping.sessionId,
-		chatId: mapping.chatId,
-		gateId: pendingGate.gateId,
-		answer: answerResult.answer,
-		idempotencyKey: workflowGateResponseIdempotencyKey(turn.chatId, turn.userMessageId),
-		userMessageId: turn.userMessageId,
-		parentId: turn.userMessageParentId ?? undefined,
-		sessionFile: existingSessionFile,
-		activeLeaf: mapping.activeLeaf,
-		rawFrameCursor: mapping.rawFrameCursor,
-		eventCursor: mapping.eventCursor,
-		operationId: turn.userMessageId,
-	});
-	const nextMapping = input.mappings.upsert({
-		...mapping,
-		sessionFile: validateSessionFile(turn.project, result.sessionFile ?? existingSessionFile),
-		activeLeaf: result.activeLeaf ?? mapping.activeLeaf,
-		rawFrameCursor: result.rawFrameCursor,
-		eventCursor: result.eventCursor,
-		operationId: turn.userMessageId,
-		assistantText: result.text,
-		events: [...markWorkflowGateAccepted(mapping.events ?? [], pendingGate.gateId), ...result.events],
-	});
-	input.outbox?.enqueue({
-		operationId: nextMapping.operationId,
-		ownerUserId: input.ownerUserId ?? "openwebui-gjc-adapter",
-		projectId: nextMapping.projectId,
-		chatId: nextMapping.chatId,
-		kind: "session_mapping",
-		payloadHash: buildSessionMappingPayloadHash(nextMapping),
-	});
-	return { content: result.text };
+	try {
+		const sessionRoot = turn.project.sessionRoot ?? `${turn.project.cwd}/.gjc/sessions`;
+		const existingSessionFile = await ensureSdkSessionFile(
+			turn.project,
+			mapping.sessionFile,
+			sessionRoot,
+			mapping.sessionId,
+		);
+		const result = await input.turnRunner.respondWorkflowGate({
+			cwd: turn.project.cwd,
+			sessionRoot,
+			projectId: mapping.projectId,
+			sessionId: mapping.sessionId,
+			chatId: mapping.chatId,
+			gateId: pendingGate.gateId,
+			answer: answerResult.answer,
+			idempotencyKey: workflowGateResponseIdempotencyKey(turn.chatId, turn.userMessageId),
+			userMessageId: turn.userMessageId,
+			parentId: turn.userMessageParentId ?? undefined,
+			sessionFile: existingSessionFile,
+			recoveryAttachment: mapping.attachment,
+			activeLeaf: mapping.activeLeaf,
+			rawFrameCursor: mapping.rawFrameCursor,
+			eventCursor: mapping.eventCursor,
+			operationId: turn.userMessageId,
+			lifecycle,
+			...(pendingGate.commandId === undefined ||
+			pendingGate.turnId === undefined ||
+			pendingGate.sessionId === undefined
+				? {}
+				: {
+						gateCorrelation: {
+							commandId: pendingGate.commandId,
+							turnId: pendingGate.turnId,
+							sessionId: pendingGate.sessionId,
+						},
+					}),
+		});
+		if (result.attachment === undefined) {
+			throw new Error("Workflow gate response did not return a validated current GJC attachment.");
+		}
+		const nextPendingGate = latestPendingWorkflowGate(result.events);
+		const responseText = nextPendingGate === null ? result.text : projectPendingWorkflowGateMessage(nextPendingGate);
+		const nextMapping = {
+			...mapping,
+			sessionFile: validateSessionFile(turn.project, result.sessionFile ?? existingSessionFile, sessionRoot),
+			activeLeaf: result.activeLeaf ?? mapping.activeLeaf,
+			rawFrameCursor: result.rawFrameCursor,
+			eventCursor: result.eventCursor,
+			operationId: turn.userMessageId,
+			assistantText: responseText,
+			events: [...markWorkflowGateAccepted(mapping.events ?? [], pendingGate.gateId), ...result.events],
+			attachment: result.attachment,
+		};
+		await lifecycle.publish(result.attachment, () => {
+			const published = input.mappings.completeOperationWithMapping(
+				turn.chatId,
+				turn.userMessageId,
+				operationDetail,
+				nextMapping,
+				"control",
+			);
+			ensureProjectionRows(input.outbox, published, input.ownerUserId ?? "openwebui-gjc-adapter");
+			return published;
+		});
+		return { content: responseText };
+	} catch (error) {
+		input.mappings.transitionOperation(turn.chatId, turn.userMessageId, "uncertain", operationDetail);
+		throw error;
+	}
 }
 
-export function latestPendingWorkflowGate(events: readonly GjcTurnEvent[]): PendingWorkflowGate | null {
+export function latestPendingWorkflowGate(events: NonNullable<SessionMapping["events"]>): PendingWorkflowGate | null {
 	for (let index = events.length - 1; index >= 0; index -= 1) {
 		const event = events[index];
 		if (event?.type !== "workflow_gate") continue;
@@ -111,136 +224,4 @@ export function latestPendingWorkflowGate(events: readonly GjcTurnEvent[]): Pend
 		if (gate !== null && gate.status === "pending") return gate;
 	}
 	return null;
-}
-
-export function projectTurnEvents(events: readonly GjcTurnEvent[]): readonly OpenWebUIMessageEvent[] {
-	const projected: OpenWebUIMessageEvent[] = [];
-	for (const [index, event] of events.entries()) {
-		const frame = turnEventToProjectableFrame(event);
-		if (frame === null) continue;
-		projected.push(...projectAgentFrame(frame, { id: `gjc-event-${index}`, created: 0, model: "gjc" }).events);
-	}
-	return projected;
-}
-
-export function buildSessionMappingPayloadHash(mapping: SessionMapping): string {
-	return buildProjectionPayloadHash({
-		chatId: mapping.chatId,
-		projectId: mapping.projectId,
-		sessionId: mapping.sessionId,
-		sessionFile: mapping.sessionFile ?? null,
-		activeLeaf: mapping.activeLeaf ?? null,
-		rawFrameCursor: mapping.rawFrameCursor,
-		eventCursor: mapping.eventCursor,
-		operationId: mapping.operationId,
-		assistantText: mapping.assistantText ?? null,
-		events: (mapping.events ?? []).map(event => ({
-			type: event.type,
-			text: event.text ?? null,
-			id: event.id ?? null,
-			payloadJson: event.payload === undefined ? null : JSON.stringify(event.payload),
-		})),
-	});
-}
-
-export function buildEventPayloadHash(events: readonly OpenWebUIMessageEvent[]): string {
-	return buildProjectionPayloadHash({
-		eventsJson: JSON.stringify(events),
-	});
-}
-
-function turnEventToProjectableFrame(event: GjcTurnEvent): ProjectableAgentFrame | null {
-	const classified = classifyRpcFrame({ type: event.type, id: event.id, text: event.text });
-	const sessionFrame = sessionEventToProjectableFrame(event);
-	if (sessionFrame !== undefined) return sessionFrame;
-	if (event.type === "message_update" || event.type === "assistant_text" || event.type === "assistant") return null;
-	if (classified.kind === "workflow_gate" || event.type === "workflow_gate") {
-		const pendingGate = pendingGateFromEvent(event);
-		return {
-			kind: "skill_progress",
-			label: boundedText(projectPendingWorkflowGateMessage(pendingGate)),
-			phase: "start",
-			hidden: false,
-			metadata: {
-				eventType: boundedText(event.type),
-				gateId: boundedNullableText(
-					classified.kind === "workflow_gate" ? (classified.gateId ?? event.id ?? null) : (event.id ?? null),
-				),
-				workflow_gate: workflowGateStatusMetadata(pendingGate),
-			},
-		};
-	}
-	if (event.type.includes("mcp")) return progressFrame("mcp_progress", event);
-	if (event.type.includes("skill") || event.type.includes("workflow")) return progressFrame("skill_progress", event);
-	if (event.type.includes("tool")) return progressFrame("tool_progress", event);
-	if (event.type.includes("agent")) return progressFrame("subagent_progress", event);
-	return {
-		kind: "unsupported",
-		frameType: boundedText(event.type),
-		metadata: { id: boundedNullableText(event.id ?? null), textPresent: event.text !== undefined },
-	};
-}
-
-function progressFrame(
-	kind: "tool_progress" | "mcp_progress" | "skill_progress" | "subagent_progress",
-	event: GjcTurnEvent,
-): ProjectableAgentFrame {
-	return {
-		kind,
-		label: boundedText(event.type),
-		phase: event.type.includes("end") || event.type.includes("complete") ? "end" : "progress",
-		metadata: { eventType: boundedText(event.type), id: boundedNullableText(event.id ?? null) },
-	};
-}
-
-function pendingGateFromEvent(event: GjcTurnEvent): PendingWorkflowGate {
-	return (
-		pendingWorkflowGateFromEvent(event) ?? {
-			gateId: event.id ?? "unknown-gate",
-			schemaHash: "unknown",
-			idempotencyKey: event.id ?? "unknown-gate",
-			boundUserMessageId: null,
-			status: "pending",
-			schema: { type: "string" },
-		}
-	);
-}
-
-function markWorkflowGateAccepted(events: readonly GjcTurnEvent[], gateId: string): readonly GjcTurnEvent[] {
-	return events.map(event => {
-		if (event.type !== "workflow_gate") return event;
-		const gate = pendingWorkflowGateFromEvent(event);
-		if (gate?.gateId !== gateId) return event;
-		return {
-			...event,
-			payload: {
-				...(event.payload ?? {}),
-				status: "accepted",
-			},
-		};
-	});
-}
-
-function workflowGateResponseIdempotencyKey(chatId: string, userMessageId: string): string {
-	return `${chatId}:${userMessageId}`;
-}
-
-function workflowGateStatusMetadata(gate: PendingWorkflowGate): Record<string, unknown> {
-	return {
-		gateId: gate.gateId,
-		...(gate.stage === undefined ? {} : { stage: gate.stage }),
-		...(gate.kind === undefined ? {} : { kind: gate.kind }),
-		schemaHash: gate.schemaHash,
-		...(gate.createdAt === undefined ? {} : { createdAt: gate.createdAt }),
-		...(gate.required === undefined ? {} : { required: gate.required }),
-		optionCount: gate.options?.length ?? 0,
-	};
-}
-
-function boundedNullableText(value: string | null): string | null {
-	return value === null ? null : boundedText(value);
-}
-
-function boundedText(value: string, maxLength = 80): string {
-	return value.length <= maxLength ? value : `${value.slice(0, maxLength - 3)}...`;
 }

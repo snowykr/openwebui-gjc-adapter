@@ -8,18 +8,24 @@ import type { LiveGatewayEventDeliveryInput } from "../src/live/chat-completions
 import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
 import { createAdapterRequestHandler } from "../src/server";
 import { chatRequest, FakeGjcTurnRunner, reserveTcpPort, stopProcess, waitForStartedServer } from "./cli-fixtures";
+import { staticModelReaderFactory } from "./model-selection-fixtures";
 import { messageEntry, writeSessionFile } from "./session-sync-fixtures";
 
 const spawnedProcesses: Bun.Subprocess[] = [];
+const healthStateRoots: string[] = [];
 
 describe("adapter CLI service", () => {
 	afterEach(async () => {
 		await Promise.all(spawnedProcesses.map(stopProcess));
 		spawnedProcesses.length = 0;
+		await Promise.all(healthStateRoots.splice(0).map(root => fs.rm(root, { force: true, recursive: true })));
 	});
 
 	test("serves healthz from bun run start when configured from env", async () => {
 		const port = await reserveTcpPort();
+		const stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-cli-health-"));
+		const sessionRoot = path.join(stateRoot, "sessions");
+		healthStateRoots.push(stateRoot);
 		const proc = Bun.spawn(["bun", "run", "start"], {
 			cwd: process.cwd(),
 			env: {
@@ -27,6 +33,8 @@ describe("adapter CLI service", () => {
 				GJC_OPENWEBUI_BIND_HOST: "127.0.0.1",
 				GJC_OPENWEBUI_BIND_PORT: String(port),
 				GJC_OPENWEBUI_OWNER_USER_ID: "owner-test",
+				GJC_OPENWEBUI_STATE_PATH: path.join(stateRoot, "state"),
+				GJC_OPENWEBUI_SESSION_ROOT: sessionRoot,
 			},
 			stdout: "pipe",
 			stderr: "pipe",
@@ -55,7 +63,7 @@ describe("adapter CLI service", () => {
 		});
 		spawnedProcesses.push(proc);
 
-		const exitCode = await Promise.race([proc.exited, Bun.sleep(1_000).then(() => -1)]);
+		const exitCode = await Promise.race([proc.exited, Bun.sleep(4_000).then(() => -1)]);
 
 		expect(exitCode).toBe(0);
 		if (!(proc.stdout instanceof ReadableStream)) throw new Error("expected CLI stdout");
@@ -145,6 +153,7 @@ describe("adapter CLI service", () => {
 			{
 				turnRunner,
 				projectionRepository: repository,
+				modelReaderFactory: staticModelReaderFactory(),
 				eventSink: input => {
 					delivered.push(input);
 				},

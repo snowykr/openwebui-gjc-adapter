@@ -1,4 +1,4 @@
-import type { GjcTurnEvent } from "../gjc/rpc-runner";
+import type { GjcTurnEvent } from "../gjc/turn-runner";
 import type { ProjectableAgentFrame } from "../projection/events";
 
 export function sessionEventToProjectableFrame(event: GjcTurnEvent): ProjectableAgentFrame | undefined {

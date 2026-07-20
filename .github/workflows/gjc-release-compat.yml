@@ -1,0 +1,76 @@
+name: GJC release compatibility
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Published coding-agent/natives version (for example v0.11.4)
+        required: false
+        type: string
+      tag:
+        description: Release tag for the dispatched release
+        required: false
+        type: string
+      commit:
+        description: Immutable release commit SHA
+        required: false
+        type: string
+  schedule:
+    - cron: "17 4 * * 1"
+  repository_dispatch:
+    types: [gajae-code-release]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gjc-release-compat-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  fixed-compatibility:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.version == '')
+    name: ${{ matrix.lane }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: v0.11.1-pair
+            version: 0.11.1
+            tag: v0.11.1
+          - lane: v0.11.2-pair
+            version: 0.11.2
+            tag: v0.11.2
+          - lane: v0.11.4-pair
+            version: 0.11.4
+            tag: v0.11.4
+    uses: ./.github/workflows/gjc-release-compat-run.yml
+    with:
+      lane: ${{ matrix.lane }}
+      trigger: fixed
+      version: ${{ matrix.version }}
+      natives_version: ${{ matrix.version }}
+      tag: ${{ matrix.tag }}
+      commit: ${{ github.sha }}
+
+  dispatched-repository-compatibility:
+    if: github.event_name == 'repository_dispatch'
+    uses: ./.github/workflows/gjc-release-compat-run.yml
+    with:
+      lane: dispatched
+      trigger: repository_dispatch
+      version: ${{ github.event.client_payload.version }}
+      natives_version: ${{ github.event.client_payload.natives_version }}
+      tag: ${{ github.event.client_payload.tag }}
+      commit: ${{ github.event.client_payload.commit }}
+
+  dispatched-manual-compatibility:
+    if: github.event_name == 'workflow_dispatch' && inputs.version != ''
+    uses: ./.github/workflows/gjc-release-compat-run.yml
+    with:
+      lane: dispatched
+      trigger: workflow_dispatch
+      version: ${{ inputs.version }}
+      natives_version: ${{ inputs.version }}
+      tag: ${{ inputs.tag }}
+      commit: ${{ inputs.commit || github.sha }}

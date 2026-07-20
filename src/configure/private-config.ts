@@ -14,65 +14,30 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-export type InstalledMode = "managed" | "existing";
-function xdgStateDataHome(environment: NodeJS.ProcessEnv = process.env): string {
-	const configured = environment.XDG_STATE_HOME?.trim() || environment.XDG_DATA_HOME?.trim();
-	return configured ?? join(environment.HOME ?? "", ".local", "state");
-}
-export function defaultExistingProjectRoot(environment: NodeJS.ProcessEnv = process.env): string {
-	return join(xdgStateDataHome(environment), "openwebui-gjc-adapter", "workspace");
-}
-export const DEFAULT_EXISTING_PROJECT_ROOT = defaultExistingProjectRoot();
-export interface InstalledConfig {
-	version: 1;
-	mode: InstalledMode;
-	installationId: string;
-	ownerUserId?: string;
-	adapterToken: string;
-	readinessToken: string;
-	openWebUIApiToken?: string;
-	openWebUIApiUrl: string;
-	adapterProviderUrl: string;
-	bindHost: string;
-	bindPort: number;
-	projectRoot?: string;
-}
-export class ConfigFileError extends Error {
-	readonly exitCode = 1;
-}
-export function canonicalizeUrl(value: string, name = "URL"): string {
-	let url: URL;
-	try {
-		url = new URL(value);
-	} catch {
-		throw new ConfigFileError(`${name} must be a valid URL`);
-	}
-	if (url.protocol !== "http:" && url.protocol !== "https:")
-		throw new ConfigFileError(`${name} must use http or https`);
-	if (url.username || url.password || url.hash || url.search)
-		throw new ConfigFileError(`${name} must not contain credentials, query, or fragment`);
-	url.hostname = url.hostname.toLowerCase();
-	if ((url.protocol === "http:" && url.port === "80") || (url.protocol === "https:" && url.port === "443"))
-		url.port = "";
-	url.pathname = url.pathname.replace(/\/+$/, "");
-	return url.toString().replace(/\/$/, "");
-}
+import {
+	ConfigFileError,
+	canonicalizeUrl,
+	DEFAULT_EXISTING_PROJECT_ROOT,
+	defaultExistingProjectRoot,
+	type InstalledConfig,
+	type InstalledMode,
+	validateInstalledConfig,
+	validateProjectRoot,
+	xdgStateDataHome,
+} from "./installed-config-schema";
+
+export {
+	ConfigFileError,
+	canonicalizeUrl,
+	DEFAULT_EXISTING_PROJECT_ROOT,
+	defaultExistingProjectRoot,
+	type InstalledConfig,
+	type InstalledMode,
+	validateInstalledConfig,
+};
 export function defaultConfigPath(home = process.env.HOME): string {
 	if (!home) throw new ConfigFileError("HOME is not set");
 	return join(home, ".config", "openwebui-gjc-adapter", "config.json");
-}
-function validateProjectRoot(value: unknown): string {
-	if (
-		typeof value !== "string" ||
-		!value.trim() ||
-		value !== value.trim() ||
-		!value.startsWith("/") ||
-		value.includes("\0") ||
-		value !== value.replace(/\/+$/, "") ||
-		value.split("/").includes("..")
-	)
-		throw new ConfigFileError("projectRoot must be a normalized absolute path");
-	return value;
 }
 function rejectSymlink(path: string, label: string): void {
 	let current = path;
@@ -130,68 +95,6 @@ export function prepareExistingProjectRoot(value: string = DEFAULT_EXISTING_PROJ
 	rejectSymlink(projectRoot, "projectRoot");
 	mkdirSync(projectRoot, { recursive: true, mode: 0o700 });
 	return projectRoot;
-}
-export function validateInstalledConfig(value: unknown): InstalledConfig {
-	if (!value || typeof value !== "object") throw new ConfigFileError("installed config must be an object");
-	const c = value as Record<string, unknown>;
-	const allowed = new Set([
-		"version",
-		"mode",
-		"installationId",
-		"ownerUserId",
-		"adapterToken",
-		"readinessToken",
-		"openWebUIApiToken",
-		"openWebUIApiUrl",
-		"adapterProviderUrl",
-		"bindHost",
-		"bindPort",
-		"projectRoot",
-	]);
-	if (Object.keys(c).some(k => !allowed.has(k))) throw new ConfigFileError("installed config contains unknown fields");
-	if (c.version !== 1 || (c.mode !== "managed" && c.mode !== "existing"))
-		throw new ConfigFileError("unsupported installed config");
-	for (const k of [
-		"installationId",
-		"adapterToken",
-		"readinessToken",
-		"openWebUIApiUrl",
-		"adapterProviderUrl",
-		"bindHost",
-	])
-		if (typeof c[k] !== "string" || !(c[k] as string).trim())
-			throw new ConfigFileError(`${k} must be a non-empty string`);
-	if (c.ownerUserId !== undefined && (typeof c.ownerUserId !== "string" || !c.ownerUserId.trim()))
-		throw new ConfigFileError("ownerUserId must be a non-empty string");
-	if (c.openWebUIApiToken !== undefined && (typeof c.openWebUIApiToken !== "string" || !c.openWebUIApiToken.trim()))
-		throw new ConfigFileError("openWebUIApiToken must be a non-empty string");
-	if (typeof c.bindPort !== "number" || !Number.isInteger(c.bindPort) || c.bindPort < 1 || c.bindPort > 65535)
-		throw new ConfigFileError("bindPort is invalid");
-	const projectRoot =
-		c.mode === "existing"
-			? validateProjectRoot(c.projectRoot ?? DEFAULT_EXISTING_PROJECT_ROOT)
-			: c.projectRoot === undefined
-				? undefined
-				: validateProjectRoot(c.projectRoot);
-	const result = {
-		version: 1 as const,
-		mode: c.mode as InstalledMode,
-		installationId: c.installationId as string,
-		ownerUserId: c.ownerUserId as string | undefined,
-		adapterToken: c.adapterToken as string,
-		readinessToken: c.readinessToken as string,
-		openWebUIApiToken: c.openWebUIApiToken as string | undefined,
-		openWebUIApiUrl: canonicalizeUrl(c.openWebUIApiUrl as string, "openWebUIApiUrl"),
-		adapterProviderUrl: canonicalizeUrl(c.adapterProviderUrl as string, "adapterProviderUrl"),
-		bindHost: (c.bindHost as string).trim(),
-		bindPort: c.bindPort,
-		projectRoot,
-	};
-	if (result.mode === "managed" && result.bindHost !== "0.0.0.0")
-		throw new ConfigFileError("managed configuration must bind 0.0.0.0");
-	if (result.mode === "existing" && result.bindHost !== "127.0.0.1")
-		throw new ConfigFileError("existing configuration must bind 127.0.0.1");
-	return result;
 }
 export function readInstalledConfig(path = defaultConfigPath()): InstalledConfig {
 	try {

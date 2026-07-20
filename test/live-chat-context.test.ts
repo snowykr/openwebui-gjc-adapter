@@ -45,7 +45,7 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 			runner: {
 				run(input) {
 					inputs.push(input);
-					return { content: "done" };
+					return { content: "done", model: "gjc/anthropic/claude-sonnet-4:low" };
 				},
 			},
 		});
@@ -76,7 +76,7 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 			runner: {
 				run(input) {
 					inputs.push(input);
-					return { content: "done" };
+					return { content: "done", model: "gjc/anthropic/claude-sonnet-4:low" };
 				},
 			},
 		});
@@ -107,7 +107,7 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 			runner: {
 				run(input) {
 					inputs.push(input);
-					return { content: "done" };
+					return { content: "done", model: "gjc/anthropic/claude-sonnet-4:low" };
 				},
 			},
 		});

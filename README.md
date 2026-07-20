@@ -38,7 +38,7 @@ Add the required custom headers on the OpenAI connection:
 }
 ```
 
-Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. Use `@gajae-code/coding-agent` 0.9.4 or newer so the adapter can consume `RpcClient.onSessionEvent` and project full GJC TUI/session progress into OpenWebUI. Background task calls such as title generation are no-ops and must not create GJC sessions.
+Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. The adapter and managed image use the published `@gajae-code/coding-agent` and `@gajae-code/natives` `0.11.4` pair. The image runs the published `gjc` executable as the non-root `adapter` user, including `tmux`; it does not build a private broker or apply an upstream source patch. Background task calls such as title generation are no-ops and must not create GJC sessions.
 
 ## CLI first-install configuration
 
@@ -60,13 +60,21 @@ OPENAI_API_KEY=<adapter-openai-key>
 ENABLE_OPENAI_API=True
 ```
 
-Use the `gjc` model id and add the custom headers shown in [OpenWebUI setup](#openwebui-setup). The placeholders in those headers are required for the adapter to associate requests with the OpenWebUI chat, messages, user, and task.
+OpenWebUI requests may use the input-only `gjc` alias or a canonical model id from `/v1/models`. Add the custom headers shown in [OpenWebUI setup](#openwebui-setup). The placeholders in those headers are required for the adapter to associate requests with the OpenWebUI chat, messages, user, and task.
 
 ### Safety and recovery
 
 The CLI uses a readiness probe before reporting configuration as ready. It may reset or disclose an admin token only when it has a controlling TTY, so a token is not accidentally written to redirected output or unattended logs. If readiness or verification fails, correct the reported local configuration or credentials and rerun the relevant command; do not treat a partially configured deployment as ready.
 
 Both paths preserve the loopback-safe boundary: the UI is not exposed by the CLI, and the adapter remains on its private network where applicable.
+
+### GJC runtime locations and recovery
+
+Existing installations accept exactly two direct runtime-location flags: `--gjc-config-dir-name NAME` and `--gjc-coding-agent-dir PATH`. Direct values are persisted. Runtime resolution uses persisted installed values, then adapter-namespaced environment values, then derived defaults. The namespaced selectors are `GJC_OPENWEBUI_GJC_CONFIG_DIR_NAME` and `GJC_OPENWEBUI_GJC_CODING_AGENT_DIR`. Managed configuration rejects both runtime-location flags because its runtime locations are fixed below `/var/lib/gjc/home`.
+
+Ambient `GJC_CONFIG_DIR`, `PI_CONFIG_DIR`, and `GJC_CODING_AGENT_DIR` do not select shipped SDK runtime locations. Each child receives the resolved `HOME`, `GJC_CONFIG_DIR`, and `GJC_CODING_AGENT_DIR`; inherited `PI_CONFIG_DIR` is removed. XDG variables remain inherited but do not select or relocate these paths.
+
+Recovery preserves the legacy vector when neither location field is present and records config-name only, agent-directory only, and both fields together when locations are explicit. A pending recovery journal is authoritative: a retry may omit both flags to resume the recorded values, while a differing retry is rejected before configuration, journal, reset, or deployment writes.
 
 ## Registering projects
 
@@ -87,9 +95,25 @@ const project = await registerProjectDirectory(
 );
 ```
 
-OpenWebUI should use the stable `gjc` model id. Project folders are not advertised as models; the adapter resolves the GJC working directory from the OpenWebUI chat folder. Historical imports place projected sessions under folder id `gjc-project-<project-id>` and chat id `gjc-project-<project-id>-session-<session-id>` unless OpenWebUI assigns runtime ids.
+Project folders are not advertised as models; the adapter resolves the GJC working directory from the OpenWebUI chat folder. Historical imports place projected sessions under folder id `gjc-project-<project-id>` and chat id `gjc-project-<project-id>-session-<session-id>` unless OpenWebUI assigns runtime ids.
 
-Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. The adapter uses full session events when the installed GJC RPC client exposes `onSessionEvent`; otherwise it falls back to the standard agent-event stream. Background task calls such as title generation are no-ops and must not create GJC sessions.
+The project guard protects exactly four resolved GJC paths: `configDomain`, `agentDir`, `readerWorkspace`, and `readerSessionRoot`. A project `cwd` or explicit `sessionRoot` is rejected when it is equal to, an ancestor of, or a descendant of any one of them. The guard does not cover adapter state, mappings, session stores, or SQLite.
+
+Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. The adapter uses the released public SDK only for supported session attachment and actions. Background task calls such as title generation are no-ops and must not create GJC sessions.
+
+### GJC routing matrix
+
+| Operation | Primary route | Fallback and ownership |
+| --- | --- | --- |
+| Session attachment, turns, model selection, gates, and events | Released public GJC SDK | No fallback. Missing, malformed, or ambiguous SDK authority fails closed. |
+| CLI lifecycle | Published `gjc` CLI | Only create, cold JSONL resume, readiness, and close of an exactly proven owned pane. It never supplies turns, models, events, gates, or an endpoint. |
+| Transport detach | Local transport only | Detach is not `session.close` and never terminates a remote session. |
+| Session close | Published `gjc` CLI `/exit` | For an exact persisted descriptor plus receipt-owned tmux pane/PID/tag, the adapter sends `/exit` first and requires endpoint disappearance and absence of the original pane PID. It never invokes released public `session.close` to terminate an owned CLI lifecycle. Missing pane proof fails closed without a kill or fallback. |
+| Regenerate/branch | Persisted owner, project, session, and message lineage | Any missing, conflicting, or ambiguous authority fails closed; the adapter does not fork or replay the operation. |
+The same exact-proof close applies to admin close and adapter-created temporary catalog sessions. Logical SDK attachment eviction occurs only after physical close proof; there is no destructive fallback after `/exit`.
+
+The adapter does not use private daemon, global broker, private protocol, or GJC database interfaces.
+
 Inside OpenWebUI, send these slash-style commands in a normal `gjc` chat for project administration:
 
 ```text
@@ -111,15 +135,19 @@ Deleting an adapter-created project folder in the OpenWebUI sidebar is treated a
 
 ## Runtime contract
 
-- GJC JSONL and artifacts remain authoritative.
+Canonical model ids use `gjc/<encoded-provider>/<encoded-model>:<thinking>`. Provider and model components use uppercase RFC 3986 percent-encoding; each component must decode exactly once and re-encode to the same bytes. Providers containing `/` are rejected because upstream `model.set` uses the first slash as its provider/model boundary, while model ids may contain `/`, `:`, and Unicode and are encoded normally. The bare `gjc` alias is accepted only as input and is never emitted. Catalog, JSON, SSE, workflow, event, and persisted mapping output use the normalized tuple returned by GJC.
+
+Selection updates the machine-global last-successful-writer-wins default. Operations are serialized per stable client, but the adapter does not provide global request ordering or a distributed ordering guarantee. The adapter invokes the setter once and does not retry, compensate, or roll it back. It also does not roll back an already committed project link or unlink if the later model-selection read needed for the response fails.
+
+- GJC session history and artifacts remain authoritative.
 - OpenWebUI chat rows and chat messages are projection/cache records.
 - Adapter metadata is stored under `gjc_adapter`; user-visible OpenWebUI fields such as title/rating are preserved on reprojection.
 - The live gateway uses `/v1/models` and `/v1/chat/completions`.
-- The package entrypoint wires chat completions through the GJC RPC turn runner and stores OpenWebUI chat-to-GJC session mappings in a file-backed store under `GJC_OPENWEBUI_SESSION_ROOT`.
-- The adapter uses full session events when the installed GJC RPC client exposes `RpcClient.onSessionEvent`; otherwise it safely falls back to the standard agent-event stream. Delivered session events are bounded OpenWebUI message events covering available lifecycle, tool/MCP, subagent, todo, goal, notice, retry, compaction, and workflow progress.
+- The package entrypoint wires chat completions through the released public SDK session surface and stores OpenWebUI chat-to-GJC session mappings in a file-backed store under `GJC_OPENWEBUI_SESSION_ROOT`.
+- The adapter consumes correlated public SDK session events and correlates prompt completion by command and turn identity. Delivered session events are bounded OpenWebUI message events covering available lifecycle, tool/MCP, subagent, todo, goal, notice, retry, compaction, and workflow progress.
 - Raw tool arguments/results and secret-looking text are not emitted directly; the adapter preserves bounded labels, counts, phases, and status descriptions for display.
-- Workflow gates can be rendered as assistant-visible pending-gate text and validated with the exported gate primitives; wire those primitives into the deployment's event sink/continuation policy before claiming automatic gate approval handling.
-- Regenerate/branch only proceeds when owner, project, session, and message lineage metadata match; otherwise the adapter forks safely.
+- Workflow gates are rendered as assistant-visible pending-gate text. A matching user reply is validated against the persisted gate schema and resumed through the public SDK session; replies that do not match the stored project, session, message lineage, or gate correlation fail closed.
+- Regenerate/branch requires matching persisted owner, project, session, and message lineage authority. Missing, conflicting, or ambiguous authority is rejected without fork, replay, or fallback.
 
 ## Operator notes
 

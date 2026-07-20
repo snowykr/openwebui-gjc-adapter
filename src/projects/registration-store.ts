@@ -2,6 +2,8 @@ import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import * as path from "node:path";
+import type { GjcRuntimeLocations } from "../contracts";
+import { assertProjectsAdmitted } from "./link-service";
 import type { RegisteredProject } from "./registry";
 
 export type ProjectRegistrationSource = "env" | "admin";
@@ -34,9 +36,20 @@ export class SqliteProjectRegistrationStore {
 		if (databasePath !== ":memory:") {
 			mkdirSync(path.dirname(databasePath), { recursive: true });
 		}
-		this.#db = new Database(databasePath);
-		this.#db.exec("PRAGMA journal_mode = WAL");
-		this.#ensureSchema();
+		const database = new Database(databasePath);
+		try {
+			database.exec("PRAGMA journal_mode = WAL");
+			database.exec(projectRegistrationSchema());
+			migrateLegacyModelIdColumn(database);
+		} catch (error) {
+			try {
+				database.close();
+			} catch (closeError) {
+				attachCleanupError(error, closeError);
+			}
+			throw error;
+		}
+		this.#db = database;
 	}
 
 	seedConfiguredProjects(projects: readonly RegisteredProject[]): void {
@@ -107,40 +120,6 @@ export class SqliteProjectRegistrationStore {
 		this.#db.close();
 	}
 
-	#ensureSchema(): void {
-		this.#db.exec(projectRegistrationSchema());
-		this.#migrateLegacyModelIdColumn();
-	}
-
-	#migrateLegacyModelIdColumn(): void {
-		const columns = this.#db
-			.query("PRAGMA table_info(project_registration)")
-			.all()
-			.map(row => tableColumnName(row));
-		if (!columns.includes("model_id")) return;
-		const legacyTable = `project_registration_legacy_${Date.now()}`;
-		this.#db.exec("BEGIN");
-		try {
-			this.#db.exec(`ALTER TABLE project_registration RENAME TO ${legacyTable}`);
-			this.#db.exec(projectRegistrationSchema());
-			this.#db.exec(`
-				INSERT INTO project_registration (
-					id, name, open_webui_folder_name, cwd, open_webui_folder_id,
-					allowed_root, session_root, created_at, updated_at, source, status
-				)
-				SELECT
-					id, name, open_webui_folder_name, cwd, open_webui_folder_id,
-					allowed_root, session_root, created_at, updated_at, source, status
-				FROM ${legacyTable}
-			`);
-			this.#db.exec(`DROP TABLE ${legacyTable}`);
-			this.#db.exec("COMMIT");
-		} catch (error) {
-			this.#db.exec("ROLLBACK");
-			throw error;
-		}
-	}
-
 	#updateProjectFields(
 		id: string,
 		project: RegisteredProject,
@@ -185,7 +164,8 @@ export class SqliteProjectRegistrationStore {
 	#assignProjectIdentity(project: RegisteredProject): RegisteredProject {
 		const sameId = this.#getById(project.id);
 		if (sameId === undefined || sameId.cwd === project.cwd) return project;
-		const fingerprintedId = `${project.id}-${projectPathFingerprint(project.cwd)}`;
+		const fingerprint = createHash("sha256").update(project.cwd).digest("hex").slice(0, 8);
+		const fingerprintedId = `${project.id}-${fingerprint}`;
 		return { ...project, id: fingerprintedId };
 	}
 
@@ -220,8 +200,11 @@ export class SqliteProjectRegistrationStore {
 	}
 }
 
-function projectPathFingerprint(cwd: string): string {
-	return createHash("sha256").update(cwd).digest("hex").slice(0, 8);
+export async function auditProjectRegistrations(
+	store: SqliteProjectRegistrationStore,
+	protectedPaths: GjcRuntimeLocations["protectedProjectPaths"],
+): Promise<void> {
+	await assertProjectsAdmitted(store.listProjects(), protectedPaths);
 }
 
 function projectRegistrationSchema(): string {
@@ -247,6 +230,41 @@ function tableColumnName(row: unknown): string {
 		throw new Error("SQLite PRAGMA table_info returned an invalid row.");
 	}
 	return row.name;
+}
+
+function migrateLegacyModelIdColumn(database: Database): void {
+	const columns = database.query("PRAGMA table_info(project_registration)").all().map(tableColumnName);
+	if (!columns.includes("model_id")) return;
+	const legacyTable = `project_registration_legacy_${Date.now()}`;
+	database.exec("BEGIN");
+	try {
+		database.exec(`ALTER TABLE project_registration RENAME TO ${legacyTable}`);
+		database.exec(projectRegistrationSchema());
+		database.exec(`
+			INSERT INTO project_registration (
+				id, name, open_webui_folder_name, cwd, open_webui_folder_id,
+				allowed_root, session_root, created_at, updated_at, source, status
+			)
+			SELECT
+				id, name, open_webui_folder_name, cwd, open_webui_folder_id,
+				allowed_root, session_root, created_at, updated_at, source, status
+			FROM ${legacyTable}
+		`);
+		database.exec(`DROP TABLE ${legacyTable}`);
+		database.exec("COMMIT");
+	} catch (error) {
+		try {
+			database.exec("ROLLBACK");
+		} catch (rollbackError) {
+			attachCleanupError(error, rollbackError);
+		}
+		throw error;
+	}
+}
+
+function attachCleanupError(primary: unknown, cleanup: unknown): void {
+	if (primary instanceof Error && primary.cause === undefined)
+		Reflect.defineProperty(primary, "cause", { value: cleanup });
 }
 
 function preserveRuntimeFolderId(project: RegisteredProject, existing: ProjectRegistration): RegisteredProject {

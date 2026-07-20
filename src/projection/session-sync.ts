@@ -2,9 +2,11 @@ import type { Dirent } from "node:fs";
 import { readdir } from "node:fs/promises";
 import * as path from "node:path";
 import { GjcSessionLoadError, loadGjcSessionFile } from "../gjc/session-loader";
-import type { SessionMappingStore } from "../gjc/session-router";
+import { type GjcSessionStorageLocations, resolveGjcSdkSessionRoot } from "../gjc/session-root";
+import type { SessionMapping, SessionMappingStore } from "../gjc/session-router";
 import type { OpenWebUIProjectionRepository } from "../openwebui/client";
 import { buildProjectFolderMetadata, type RegisteredProject } from "../projects/registry";
+import { resolveExistingOrProspectivePath } from "../security/paths";
 import { projectGjcSessionToOpenWebUIChat } from "./chat-tree";
 import { importProjectedSession, type ProjectedProjectReference, upsertProjectedProjectFolder } from "./importer";
 
@@ -13,6 +15,7 @@ export interface SyncProjectSessionsInput {
 	readonly ownerUserId: string;
 	readonly projects: readonly RegisteredProject[];
 	readonly mappings?: SessionMappingStore;
+	readonly runtimeLocations?: GjcSessionStorageLocations;
 }
 
 export interface ImportedProjectSession {
@@ -58,10 +61,33 @@ export async function syncProjectSessionsToOpenWebUI(
 			project: projectReference,
 		});
 		folders.push({ projectId: project.id, folderId });
+		const projectCwd = await resolveExistingOrProspectivePath(project.cwd);
 
-		for (const filePath of await listSessionFiles(project)) {
+		for (const filePath of await listSessionFiles(project, input.runtimeLocations)) {
 			try {
 				const loaded = await loadGjcSessionFile(filePath);
+				let sessionCwd: string;
+				try {
+					sessionCwd = await resolveExistingOrProspectivePath(loaded.header.cwd);
+				} catch (error) {
+					if (!(error instanceof Error)) throw error;
+					skipped.push({
+						projectId: project.id,
+						filePath,
+						code: "session_cwd_invalid",
+						message: "GJC session cwd could not be resolved",
+					});
+					continue;
+				}
+				if (sessionCwd !== projectCwd) {
+					skipped.push({
+						projectId: project.id,
+						filePath,
+						code: "session_cwd_mismatch",
+						message: `GJC session cwd ${loaded.header.cwd} does not match project cwd ${project.cwd}`,
+					});
+					continue;
+				}
 				if (importedSessionIds.has(loaded.header.id)) {
 					skipped.push({
 						projectId: project.id,
@@ -72,7 +98,7 @@ export async function syncProjectSessionsToOpenWebUI(
 					continue;
 				}
 				importedSessionIds.add(loaded.header.id);
-				const existingChatId = findMappedChatId(input.mappings, project.id, loaded.header.id);
+				const existingMapping = findMappedMapping(input.mappings, project.id, loaded.header.id);
 				const projectedChat = projectGjcSessionToOpenWebUIChat({
 					sessionFile: loaded.filePath,
 					header: loaded.header,
@@ -84,18 +110,20 @@ export async function syncProjectSessionsToOpenWebUI(
 					project: projectReference,
 					projectedChat: {
 						...projectedChat,
-						openWebUIChatId: existingChatId ?? historicalChatId(project.id, loaded.header.id),
+						openWebUIChatId: existingMapping?.chatId ?? historicalChatId(project.id, loaded.header.id),
 					},
 				});
-				input.mappings?.upsert({
-					chatId: result.chatId,
-					projectId: project.id,
-					sessionId: loaded.header.id,
-					sessionFile: loaded.filePath,
-					rawFrameCursor: 0,
-					eventCursor: 0,
-					operationId: "historical-import",
-				});
+				if (existingMapping === undefined || existingMapping.operationId === "historical-import") {
+					input.mappings?.upsert({
+						chatId: result.chatId,
+						projectId: project.id,
+						sessionId: loaded.header.id,
+						sessionFile: loaded.filePath,
+						rawFrameCursor: 0,
+						eventCursor: 0,
+						operationId: "historical-import",
+					});
+				}
 				imported.push({
 					projectId: project.id,
 					sessionId: loaded.header.id,
@@ -128,8 +156,21 @@ function historicalChatId(projectId: string, sessionId: string): string {
 	return `gjc-project-${projectId}-session-${sessionId}`;
 }
 
-async function listSessionFiles(project: RegisteredProject): Promise<readonly string[]> {
-	const sessionRoot = project.sessionRoot ?? path.join(project.cwd, ".gjc", "sessions");
+async function listSessionFiles(
+	project: RegisteredProject,
+	runtimeLocations: GjcSessionStorageLocations | undefined,
+): Promise<readonly string[]> {
+	const configuredRoot = project.sessionRoot ?? path.join(project.cwd, ".gjc", "sessions");
+	const sessionRoots = [
+		...(runtimeLocations === undefined ? [] : [resolveGjcSdkSessionRoot(project.cwd, runtimeLocations)]),
+		configuredRoot,
+	].filter((root, index, roots) => roots.indexOf(root) === index);
+	const files: string[] = [];
+	for (const sessionRoot of sessionRoots) files.push(...(await listRootSessionFiles(sessionRoot)));
+	return files;
+}
+
+async function listRootSessionFiles(sessionRoot: string): Promise<readonly string[]> {
 	let entries: Dirent[];
 	try {
 		entries = await readdir(sessionRoot, { withFileTypes: true });
@@ -143,20 +184,20 @@ async function listSessionFiles(project: RegisteredProject): Promise<readonly st
 		.sort();
 }
 
-function findMappedChatId(
+function findMappedMapping(
 	mappings: SessionMappingStore | undefined,
 	projectId: string,
 	sessionId: string,
-): string | undefined {
+): SessionMapping | undefined {
 	const entries = mappings
 		?.entries()
 		.filter(mapping => mapping.projectId === projectId && mapping.sessionId === sessionId);
 	if (entries === undefined || entries.length === 0) return undefined;
 	for (let index = entries.length - 1; index >= 0; index -= 1) {
 		const mapping = entries[index];
-		if (mapping?.operationId === "historical-import") return mapping.chatId;
+		if (mapping?.operationId === "historical-import") return mapping;
 	}
-	return entries[entries.length - 1]?.chatId;
+	return entries[entries.length - 1];
 }
 
 function skippedSession(projectId: string, filePath: string, error: unknown): SkippedProjectSession {

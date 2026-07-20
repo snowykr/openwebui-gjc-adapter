@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { OpenWebUIProjectionRepository } from "../openwebui/client";
 import type { RegisteredProject } from "../projects/registry";
+import { classifyGjcModelId } from "./models";
 
 export const GJC_OPENWEBUI_MODEL_ID = "gjc";
 export const DEFAULT_NEUTRAL_WORKSPACE = path.join(os.homedir(), ".gjc", "openwebui", "workspace");
@@ -50,7 +51,8 @@ export async function resolveLiveProjectContext(
 }
 
 export function isGjcOpenWebUIModelId(modelId: string): boolean {
-	return modelId === GJC_OPENWEBUI_MODEL_ID;
+	const classified = classifyGjcModelId(modelId);
+	return classified.kind === "alias" || classified.kind === "canonical";
 }
 
 async function findProjectByOpenWebUIChatFolder(

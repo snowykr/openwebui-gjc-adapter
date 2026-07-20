@@ -113,6 +113,31 @@ describe("projectGjcSessionToOpenWebUIChat", () => {
 		expect(chat.history.messages.a1.parentId).toBe("u1");
 		expect(chat.metadata.gjc_adapter.nonMessageEntryCount).toBe(1);
 	});
+	test("uses first duplicate entry consistently for validation and projection", () => {
+		const entries: SessionEntry[] = [
+			messageEntry("root", null, "user", "canonical"),
+			messageEntry("child", "root", "assistant", "child"),
+			messageEntry("root", "child", "user", "duplicate parent rewrite"),
+		];
+
+		const chat = projectGjcSessionToOpenWebUIChat({ sessionFile: "/tmp/duplicate.jsonl", header, entries });
+
+		expect(chat.metadata.gjc_adapter.diagnostics).toEqual([
+			expect.objectContaining({ code: "duplicate_entry_id", entryId: "root" }),
+		]);
+		expect(chat.history.currentId).toBe("child");
+		expect(chat.history.messages.root).toMatchObject({
+			parentId: null,
+			childrenIds: ["child"],
+			content: "canonical",
+		});
+		expect(chat.history.messages.child.parentId).toBe("root");
+		expect(chat.metadata.gjc_adapter).toMatchObject({
+			entryCount: 2,
+			messageEntryCount: 2,
+			nonMessageEntryCount: 0,
+		});
+	});
 
 	test("rejects parent cycles", () => {
 		const entries: SessionEntry[] = [

@@ -2,14 +2,17 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { resolveGjcRuntimeLocations } from "../src/configure/runtime-locations";
 import type {
 	OpenWebUIChatMessageRecord,
 	OpenWebUIChatRecord,
 	OpenWebUIFolderRecord,
 	OpenWebUIProjectionRepository,
 } from "../src/openwebui/client";
+import * as projectLinkServiceModule from "../src/projects/link-service";
 import { ProjectLinkService } from "../src/projects/link-service";
 import { SqliteProjectRegistrationStore } from "../src/projects/registration-store";
+import * as pathsModule from "../src/security/paths";
 import { resolveAllowedRoots } from "../src/security/paths";
 
 const tempDirs: string[] = [];
@@ -21,6 +24,67 @@ afterEach(async () => {
 });
 
 describe("project link registration failure handling", () => {
+	test("admits prospective projects only through the shared protected-path guard", async () => {
+		// Given: a resolved runtime tuple, a safe sibling, and a protected candidate.
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-shared-admission-"));
+		tempDirs.push(workspace);
+		const protectedPaths = protectedPathsFor(workspace);
+		const safe = projectFixture("safe", path.join(workspace, "projects", "safe"), workspace);
+		const unsafe = projectFixture("unsafe", protectedPaths[0], workspace);
+
+		// When/Then: the public batch guard exists, accepts the sibling, and rejects the protected path exactly.
+		const admissionGuard = projectAdmissionGuardExport();
+		expect(admissionGuard).not.toBeUndefined();
+		if (admissionGuard === undefined) return;
+		await expect(admissionGuard([safe], protectedPaths)).resolves.toBeUndefined();
+		await expect(admissionGuard([safe, unsafe], protectedPaths)).rejects.toMatchObject({
+			code: "invalid_project_link",
+			message: "Project paths must not overlap protected GJC runtime paths.",
+		});
+	});
+
+	test("detects overlap symmetrically while allowing a sibling", () => {
+		// Given: equal, ancestor, descendant, and sibling path pairs.
+		const root = path.join(os.tmpdir(), "gjc-overlap-root");
+		const descendant = path.join(root, "child");
+		const sibling = path.join(path.dirname(root), "gjc-overlap-sibling");
+
+		// When: the public overlap predicate compares both directions.
+		const overlap = pathOverlapExport();
+		expect(overlap).not.toBeUndefined();
+		if (overlap === undefined) return;
+		const relations = [
+			overlap(root, root),
+			overlap(root, descendant),
+			overlap(descendant, root),
+			overlap(root, sibling),
+		];
+
+		// Then: only equality and ancestry in either direction overlap.
+		expect(relations).toEqual([true, true, true, false]);
+	});
+
+	test("resolves an existing symlink and a prospective descendant through its real parent", async () => {
+		// Given: a real directory exposed through a symlink alias.
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-canonical-path-"));
+		tempDirs.push(workspace);
+		const realRoot = path.join(workspace, "real-root");
+		const alias = path.join(workspace, "alias");
+		await fs.mkdir(realRoot);
+		await fs.symlink(realRoot, alias);
+
+		// When: existing and not-yet-created paths are canonicalized.
+		const canonicalize = pathCanonicalizerExport();
+		expect(canonicalize).not.toBeUndefined();
+		if (canonicalize === undefined) return;
+		const existing = await canonicalize(alias);
+		const prospective = await canonicalize(path.join(alias, "future", "project"));
+
+		// Then: both paths are expressed below the canonical real root.
+		expect(existing).toBe(realRoot);
+		expect(prospective).toBe(path.join(realRoot, "future", "project"));
+	});
+
 	test("preserves linked state when projection deletion fails", async () => {
 		const { service, projectDirectory } = await serviceForTempProject(
 			"Delete Failure",
@@ -68,6 +132,7 @@ describe("project link registration failure handling", () => {
 			store: new SqliteProjectRegistrationStore(":memory:"),
 			repository,
 			ownerUserId: "owner-1",
+			protectedPaths: protectedPathsFor(workspace),
 		});
 		await service.linkProject({ cwd: projectDirectory, name: "Equivalent Path" });
 		repository.failNextSync = true;
@@ -80,6 +145,41 @@ describe("project link registration failure handling", () => {
 	});
 });
 
+type PathOverlap = (leftPath: string, rightPath: string) => boolean;
+type PathCanonicalizer = (targetPath: string) => Promise<string>;
+type ProjectAdmissionGuard = (
+	projects: readonly ReturnType<typeof projectFixture>[],
+	protectedPaths: ReturnType<typeof protectedPathsFor>,
+) => Promise<void>;
+
+function projectAdmissionGuardExport(): ProjectAdmissionGuard | undefined {
+	const candidate: unknown = Reflect.get(projectLinkServiceModule, "assertProjectsAdmitted");
+	if (typeof candidate !== "function") return undefined;
+	return async (projects, protectedPaths) => {
+		await Reflect.apply(candidate, projectLinkServiceModule, [projects, protectedPaths]);
+	};
+}
+
+function pathOverlapExport(): PathOverlap | undefined {
+	const candidate: unknown = Reflect.get(pathsModule, "pathsOverlap");
+	if (typeof candidate !== "function") return undefined;
+	return (leftPath, rightPath) => {
+		const result: unknown = Reflect.apply(candidate, pathsModule, [leftPath, rightPath]);
+		if (typeof result !== "boolean") throw new Error("Path overlap export returned an invalid result.");
+		return result;
+	};
+}
+
+function pathCanonicalizerExport(): PathCanonicalizer | undefined {
+	const candidate: unknown = Reflect.get(pathsModule, "resolveExistingOrProspectivePath");
+	if (typeof candidate !== "function") return undefined;
+	return async targetPath => {
+		const result: unknown = await Reflect.apply(candidate, pathsModule, [targetPath]);
+		if (typeof result !== "string") throw new Error("Path canonicalizer export returned an invalid result.");
+		return result;
+	};
+}
+
 async function serviceForTempProject(name: string, repository: OpenWebUIProjectionRepository) {
 	const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-link-service-"));
 	tempDirs.push(workspace);
@@ -90,8 +190,17 @@ async function serviceForTempProject(name: string, repository: OpenWebUIProjecti
 		store: new SqliteProjectRegistrationStore(":memory:"),
 		repository,
 		ownerUserId: "owner-1",
+		protectedPaths: protectedPathsFor(workspace),
 	});
 	return { service, projectDirectory };
+}
+
+function protectedPathsFor(workspace: string) {
+	return resolveGjcRuntimeLocations({ mode: "existing", serviceHome: workspace }).protectedProjectPaths;
+}
+
+function projectFixture(id: string, cwd: string, allowedRoot: string) {
+	return { id, name: id, cwd, allowedRoot, createdAt: new Date("2026-01-01T00:00:00.000Z") };
 }
 
 class FailingDeleteRepository implements OpenWebUIProjectionRepository {

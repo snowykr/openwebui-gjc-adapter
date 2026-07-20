@@ -12,6 +12,7 @@ import type { OpenAIChatCompletionRequest } from "../src/live/openai-types";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
 import type { RegisteredProject } from "../src/projects/registry";
+import { LOW_MODEL_ID, staticModelReaderFactory } from "./model-selection-fixtures";
 
 const project: RegisteredProject = {
 	id: "demo",
@@ -41,7 +42,7 @@ describe("live chat project context", () => {
 	it("builds a stable /v1/models list without linked project ids", () => {
 		expect(buildModelList([project])).toEqual({
 			object: "list",
-			data: [{ id: "gjc", object: "model", created: 1783468800, owned_by: "gjc" }],
+			data: [],
 		});
 	});
 
@@ -62,7 +63,11 @@ describe("live chat project context", () => {
 		});
 
 		expect(calls).toBe(0);
-		expect(result).toMatchObject({ ok: false, status: 404, body: { error: { code: "model_not_found" } } });
+		expect(result).toMatchObject({
+			ok: false,
+			status: 400,
+			body: { error: { code: "model_selection_invalid_id" } },
+		});
 	});
 
 	it("returns metadata-only responses for OpenWebUI background tasks without calling the runner", async () => {
@@ -80,6 +85,7 @@ describe("live chat project context", () => {
 			projects: [project],
 			owner,
 			runner,
+			modelReaderFactory: staticModelReaderFactory(),
 			now: new Date("2026-07-08T00:00:00.000Z"),
 			idFactory: () => "chatcmpl-test",
 		});
@@ -89,6 +95,25 @@ describe("live chat project context", () => {
 		if (!result.ok || !("body" in result)) throw new Error("expected completion body");
 		expect(result.body.choices[0]?.message.content).toBe("");
 		expect(result.body.metadata).toEqual({ task: "title_generation", noop: true });
+	});
+
+	it("maps a missing background reader by requested model ownership", async () => {
+		const results = await Promise.all(
+			["gjc", LOW_MODEL_ID].map(model =>
+				handleChatCompletions({
+					request: { ...request, model },
+					headers: { "X-OpenWebUI-Task": "title_generation", "X-OpenWebUI-User-Id": "owner-1" },
+					projects: [project],
+					owner,
+					runner: fixedRunner("unused"),
+				}),
+			),
+		);
+
+		expect(results).toMatchObject([
+			{ ok: false, status: 409, body: { error: { code: "model_selection_default_read_failed" } } },
+			{ ok: false, status: 404, body: { error: { code: "model_selection_not_available" } } },
+		]);
 	});
 
 	it("rejects forwarded user mismatches", async () => {
@@ -113,7 +138,7 @@ describe("live chat project context", () => {
 			runner: {
 				run(input) {
 					inputs.push(input);
-					return { content: `done: ${input.prompt}` };
+					return { content: `done: ${input.prompt}`, model: "gjc/anthropic/claude-sonnet-4:low" };
 				},
 			},
 			projectContextRepository: await demoRepository(),
@@ -125,7 +150,7 @@ describe("live chat project context", () => {
 		expect(result).toMatchObject({
 			ok: true,
 			status: 200,
-			body: { model: "gjc", choices: [{ message: { content: "done: Build it" } }] },
+			body: { model: "gjc/anthropic/claude-sonnet-4:low", choices: [{ message: { content: "done: Build it" } }] },
 		});
 	});
 
@@ -141,7 +166,10 @@ describe("live chat project context", () => {
 				runner: {
 					run(input) {
 						inputs.push(input);
-						return { content: `cwd: ${input.project.cwd}` };
+						return {
+							content: `cwd: ${input.project.cwd}`,
+							model: "gjc/anthropic/claude-sonnet-4:low",
+						};
 					},
 				},
 				neutralWorkspace,
@@ -176,7 +204,7 @@ describe("live chat project context", () => {
 });
 
 function fixedRunner(content: string): LiveGatewayRunner {
-	return { run: () => ({ content }) };
+	return { run: () => ({ content, model: "gjc/anthropic/claude-sonnet-4:low" }) };
 }
 
 async function demoRepository(): Promise<InMemoryOpenWebUIProjectionRepository> {

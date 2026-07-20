@@ -1,17 +1,23 @@
 import { validateForwardedOwnerUserId } from "../openwebui/auth";
 import { parseOpenWebUIHeaders } from "../openwebui/headers";
+import { deliverChatCompletion } from "./chat-completion-delivery";
 import {
 	type HandleChatCompletionsInput,
 	type LiveChatCompletionsResult,
 	type LiveGatewayRunnerResult,
 	LiveGatewayUnavailableError,
+	OpenWebUIControlError,
 	WorkflowGateReplyError,
 } from "./chat-completions-types";
 import { latestUserText } from "./chat-content";
-import { deliverContentAfterChunks, deliverFinalAssistantContent, deliverRunnerEvents } from "./chat-delivery";
-import { buildCompletion, buildOpenAIErrorResponse, encodeChatCompletionSse } from "./chat-response-format";
+import { controlFromMetadata } from "./chat-control-metadata";
+import { deliverRunnerEvents } from "./chat-delivery";
+import { buildCompletion, buildOpenAIErrorResponse } from "./chat-response-format";
 import { appendResolvedFileContexts } from "./file-contexts";
-import { isGjcOpenWebUIModelId, resolveLiveProjectContext } from "./project-context";
+import { ModelSelectionError, modelSelectionError } from "./model-selection-errors";
+import { createModelSelectionPolicy } from "./model-selection-policy";
+import { classifyGjcModelId, formatCanonicalModelId, normalizeOpenWebUIModelId } from "./models";
+import { resolveLiveProjectContext } from "./project-context";
 
 export type {
 	HandleChatCompletionsInput,
@@ -46,22 +52,39 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 
 	const created = Math.floor((input.now ?? new Date()).getTime() / 1000);
 	const id = input.idFactory?.() ?? `chatcmpl-${created}`;
-	if (!isGjcOpenWebUIModelId(input.request.model)) {
-		return unknownModelResult(input.request.model);
-	}
+	const requestedModelId = normalizeOpenWebUIModelId(input.request.model);
+	const classifiedModel = classifyGjcModelId(requestedModelId);
+	if (classifiedModel.kind === "malformed")
+		return selectionErrorResult(modelSelectionError("model_selection_invalid_id"));
+	if (classifiedModel.kind === "foreign")
+		return selectionErrorResult(modelSelectionError("model_not_found", input.request.model));
 
 	if (headers.isBackgroundTask) {
-		return {
-			ok: true,
-			status: 200,
-			body: buildCompletion({
-				id,
-				created,
-				model: input.request.model,
-				content: "",
-				metadata: { task: headers.task, noop: true },
-			}),
-		};
+		try {
+			if (input.modelReaderFactory === undefined) {
+				throw modelSelectionError(
+					classifiedModel.kind === "canonical"
+						? "model_selection_not_available"
+						: "model_selection_default_read_failed",
+				);
+			}
+			const selection = await createModelSelectionPolicy(input.modelReaderFactory).resolve(requestedModelId);
+			const model = formatCanonicalModelId(selection);
+			return {
+				ok: true,
+				status: 200,
+				body: buildCompletion({ id, created, model, content: "", metadata: { task: headers.task, noop: true } }),
+			};
+		} catch (error) {
+			if (error instanceof ModelSelectionError) return selectionErrorResult(error);
+			return selectionErrorResult(
+				modelSelectionError(
+					classifiedModel.kind === "canonical"
+						? "model_selection_not_available"
+						: "model_selection_default_read_failed",
+				),
+			);
+		}
 	}
 
 	if (!Array.isArray(input.request.messages)) {
@@ -82,9 +105,10 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 			"A chat completion requires a user message with text content.",
 		);
 	}
+	const projects = input.projectProvider === undefined ? input.projects : await input.projectProvider();
 	const projectContext = await resolveLiveProjectContext({
-		projects: input.projects,
-		modelId: input.request.model,
+		projects,
+		modelId: requestedModelId,
 		ownerUserId: input.owner.ownerUserId,
 		chatId: headers.chatId,
 		repository: input.projectContextRepository,
@@ -125,15 +149,34 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 			userMessageId: headers.userMessageId,
 			userMessageParentId: headers.userMessageParentId,
 			continued: headers.userMessageParentId !== null,
+			requestedModelId,
+			ownerUserId: input.owner.ownerUserId,
+			...(input.request.metadata === undefined ? {} : { messageMetadata: input.request.metadata }),
+			...(controlFromMetadata(input.request.metadata) === undefined
+				? {}
+				: { control: controlFromMetadata(input.request.metadata) }),
 		});
 	} catch (error) {
 		if (error instanceof LiveGatewayUnavailableError) {
 			return errorResult(503, "server_error", error.code, error.message);
 		}
+		if (error instanceof OpenWebUIControlError) {
+			return errorResult(400, "invalid_request_error", error.code, error.message);
+		}
 		if (error instanceof WorkflowGateReplyError) {
 			return errorResult(400, "invalid_request_error", error.code, error.message);
 		}
+		if (error instanceof ModelSelectionError) return selectionErrorResult(error);
 		throw error;
+	}
+	const resultModel = runnerResult.model;
+	if (resultModel === undefined || classifyGjcModelId(resultModel).kind !== "canonical") {
+		return errorResult(
+			503,
+			"server_error",
+			"live_runner_error",
+			"GJC live runner returned an invalid model selection.",
+		);
 	}
 
 	await deliverRunnerEvents({
@@ -145,68 +188,26 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 		projectId: project.id,
 	});
 
-	if (input.request.stream === true) {
-		const chunks = runnerResult.chunks ?? [runnerResult.content];
-		return {
-			ok: true,
-			status: 200,
-			stream: encodeChatCompletionSse({
-				id,
-				created,
-				model: input.request.model,
-				chunks: deliverContentAfterChunks({
-					chunks,
-					messageSink: input.messageSink,
-					chatId: headers.chatId,
-					messageId: headers.messageId,
-					ownerUserId: input.owner.ownerUserId,
-					projectId: project.id,
-				}),
-			}),
-		};
-	}
-
-	if (runnerResult.content !== undefined) {
-		await deliverFinalAssistantContent({
-			messageSink: input.messageSink,
-			chatId: headers.chatId,
-			messageId: headers.messageId,
-			ownerUserId: input.owner.ownerUserId,
-			projectId: project.id,
-			content: runnerResult.content,
-		});
-		return {
-			ok: true,
-			status: 200,
-			body: buildCompletion({ id, created, model: input.request.model, content: runnerResult.content }),
-		};
-	}
-
-	let content = "";
-	for await (const chunk of runnerResult.chunks) {
-		content += chunk;
-	}
-	await deliverFinalAssistantContent({
+	return deliverChatCompletion({
+		stream: input.request.stream === true,
+		runnerResult,
+		id,
+		created,
+		model: resultModel,
 		messageSink: input.messageSink,
 		chatId: headers.chatId,
 		messageId: headers.messageId,
 		ownerUserId: input.owner.ownerUserId,
 		projectId: project.id,
-		content,
 	});
-	return {
-		ok: true,
-		status: 200,
-		body: buildCompletion({ id, created, model: input.request.model, content }),
-	};
 }
 
-function unknownModelResult(modelId: string): LiveChatCompletionsResult {
-	return errorResult(404, "invalid_request_error", "model_not_found", `Unknown GJC model: ${modelId}`);
+function selectionErrorResult(error: ModelSelectionError): LiveChatCompletionsResult {
+	return errorResult(error.status, error.type, error.code, error.message);
 }
 
 function errorResult(
-	status: 400 | 401 | 404 | 503,
+	status: 400 | 401 | 404 | 409 | 503,
 	type: string,
 	code: string,
 	message: string,

@@ -1,3 +1,12 @@
+import { matchesPendingRecoveryLinkage } from "./pending-recovery";
+
+export type { PendingRecoveryLinkageInput } from "./pending-recovery";
+export {
+	buildPendingRecoveryLinkage,
+	matchesPendingRecoveryLinkage,
+	parsePendingRecoveryLinkage,
+} from "./pending-recovery";
+
 export type BootstrapPhase = "preflight" | "bootstrap" | "api-key" | "openai" | "route" | "ownership" | "complete";
 
 export interface BootstrapState {
@@ -29,11 +38,11 @@ export interface PendingRecoveryRecord {
 	readonly uiPort: number;
 	readonly bindPort?: number;
 	readonly projectRoot?: string;
+	readonly gjcConfigDirName?: string;
+	readonly gjcCodingAgentDir?: string;
 	readonly priorControllerEnabled: boolean;
 	readonly priorControllerActive: boolean;
-	/** True before any managed controller stop/disable is attempted. */
 	readonly controllerRecoveryRequired: boolean;
-	/** True after reset has successfully stopped and disabled the prior controller. */
 	readonly controllerQuiesced: boolean;
 	readonly linkage: string;
 }
@@ -50,6 +59,7 @@ export interface BootstrapResetProof {
 	readonly failedPhase: BootstrapPhase;
 	readonly evidence: string;
 }
+
 export const BOOTSTRAP_PHASES: readonly BootstrapPhase[] = [
 	"preflight",
 	"bootstrap",
@@ -69,18 +79,25 @@ export const INITIAL_BOOTSTRAP_STATE: BootstrapState = {
 	ownershipVerified: false,
 	openAIConnectionIds: [],
 };
-export function parseBootstrapState(value: unknown): BootstrapState {
-	if (!isBootstrapState(value)) throw new Error("Malformed bootstrap state");
-	return {
-		...value,
-		openAIConnectionIds: [...value.openAIConnectionIds],
-		...(value.pendingRecovery === undefined ? {} : { pendingRecovery: { ...value.pendingRecovery } }),
-	};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isBootstrapPhase(value: unknown): value is BootstrapPhase {
+	return typeof value === "string" && BOOTSTRAP_PHASES.some(phase => phase === value);
+}
+
+function isNonEmptyStringArray(value: unknown): value is readonly string[] {
+	return Array.isArray(value) && value.every(item => typeof item === "string" && item.trim().length > 0);
+}
+
+function isPendingRecoveryRecord(value: unknown): value is PendingRecoveryRecord {
+	return matchesPendingRecoveryLinkage(value);
 }
 
 function isBootstrapState(value: unknown): value is BootstrapState {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-	const state = value as Record<string, unknown>;
+	if (!isRecord(value)) return false;
 	const allowed = new Set([
 		"version",
 		"phase",
@@ -96,144 +113,67 @@ function isBootstrapState(value: unknown): value is BootstrapState {
 		"failureEvidence",
 		"pendingRecovery",
 	]);
-	if (Object.keys(state).some(key => !allowed.has(key))) return false;
+	if (Object.keys(value).some(key => !allowed.has(key))) return false;
+	const phase = value.phase;
+	if (
+		value.version !== 1 ||
+		!isBootstrapPhase(phase) ||
+		typeof value.bootstrapComplete !== "boolean" ||
+		typeof value.apiKeyCreated !== "boolean" ||
+		typeof value.openAIConfigured !== "boolean" ||
+		typeof value.routeVerified !== "boolean" ||
+		typeof value.ownershipVerified !== "boolean" ||
+		!isNonEmptyStringArray(value.openAIConnectionIds)
+	)
+		return false;
+	if (
+		(value.ownerUserId !== undefined &&
+			(typeof value.ownerUserId !== "string" || value.ownerUserId.trim().length === 0)) ||
+		(value.openWebUIApiToken !== undefined &&
+			(typeof value.openWebUIApiToken !== "string" || value.openWebUIApiToken.trim().length === 0)) ||
+		(value.failedPhase !== undefined && !isBootstrapPhase(value.failedPhase)) ||
+		(value.failureEvidence !== undefined && typeof value.failureEvidence !== "string") ||
+		(value.pendingRecovery !== undefined && !isPendingRecoveryRecord(value.pendingRecovery))
+	)
+		return false;
 	const checkpoint = [1, 2, 3, 4, 5];
 	const completed = [
-		state.bootstrapComplete,
-		state.apiKeyCreated,
-		state.openAIConfigured,
-		state.routeVerified,
-		state.ownershipVerified,
+		value.bootstrapComplete,
+		value.apiKeyCreated,
+		value.openAIConfigured,
+		value.routeVerified,
+		value.ownershipVerified,
 	];
 	if (
-		state.version !== 1 ||
-		!isBootstrapPhase(state.phase) ||
-		typeof state.bootstrapComplete !== "boolean" ||
-		typeof state.apiKeyCreated !== "boolean" ||
-		typeof state.openAIConfigured !== "boolean" ||
-		typeof state.routeVerified !== "boolean" ||
-		typeof state.ownershipVerified !== "boolean" ||
-		!Array.isArray(state.openAIConnectionIds) ||
-		!state.openAIConnectionIds.every(id => typeof id === "string" && id.trim().length > 0) ||
-		(state.ownerUserId !== undefined &&
-			(typeof state.ownerUserId !== "string" || state.ownerUserId.trim().length === 0)) ||
-		(state.openWebUIApiToken !== undefined &&
-			(typeof state.openWebUIApiToken !== "string" || state.openWebUIApiToken.trim().length === 0)) ||
-		(state.failedPhase !== undefined && !isBootstrapPhase(state.failedPhase)) ||
-		(state.failureEvidence !== undefined && typeof state.failureEvidence !== "string") ||
-		(state.pendingRecovery !== undefined && !isPendingRecoveryRecord(state.pendingRecovery)) ||
 		completed.some((done, index) =>
 			done
-				? BOOTSTRAP_PHASES.indexOf(state.phase as BootstrapPhase) < checkpoint[index]
-				: state.phase !== "complete" && BOOTSTRAP_PHASES.indexOf(state.phase as BootstrapPhase) > checkpoint[index],
-		) ||
-		(state.failedPhase === undefined) !== (state.failureEvidence === undefined) ||
-		(state.failureEvidence !== undefined && state.failureEvidence.trim().length === 0) ||
-		(state.failedPhase !== undefined && (state.failedPhase === "complete" || state.failedPhase !== state.phase)) ||
-		(state.phase === "complete" &&
-			(!state.bootstrapComplete ||
-				!state.apiKeyCreated ||
-				!state.openAIConfigured ||
-				!state.routeVerified ||
-				!state.ownershipVerified))
+				? BOOTSTRAP_PHASES.indexOf(phase) < checkpoint[index]
+				: phase !== "complete" && BOOTSTRAP_PHASES.indexOf(phase) > checkpoint[index],
+		)
 	)
 		return false;
-	return true;
-}
-function isPendingRecoveryRecord(value: unknown): value is PendingRecoveryRecord {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-	const record = value as Record<string, unknown>;
-	const keys = Object.keys(record).sort();
-	const expected =
-		record.mode === "existing"
-			? "adapterToken,bindPort,controllerQuiesced,controllerRecoveryRequired,installationId,linkage,mode,priorControllerActive,priorControllerEnabled,priorMode,projectRoot,providerUrl,readinessToken,targetUrl,transactionId,uiPort,version"
-			: "adapterToken,controllerQuiesced,controllerRecoveryRequired,installationId,linkage,mode,priorControllerActive,priorControllerEnabled,priorMode,providerUrl,readinessToken,targetUrl,transactionId,uiPort,version";
-	if (keys.join(",") !== expected) return false;
-	if (
-		record.version !== 1 ||
-		(record.mode !== "managed" && record.mode !== "existing") ||
-		(record.priorMode !== "managed" && record.priorMode !== "existing")
-	)
-		return false;
-	if (
-		![
-			"installationId",
-			"transactionId",
-			"adapterToken",
-			"readinessToken",
-			"targetUrl",
-			"providerUrl",
-			"linkage",
-		].every(key => typeof record[key] === "string" && (record[key] as string).trim().length > 0)
-	)
-		return false;
-	if (
-		typeof record.uiPort !== "number" ||
-		!Number.isInteger(record.uiPort) ||
-		record.uiPort < 1 ||
-		record.uiPort > 65535
-	)
-		return false;
-	if (
-		typeof record.priorControllerEnabled !== "boolean" ||
-		typeof record.priorControllerActive !== "boolean" ||
-		typeof record.controllerRecoveryRequired !== "boolean" ||
-		typeof record.controllerQuiesced !== "boolean" ||
-		(record.controllerQuiesced && !record.controllerRecoveryRequired)
-	)
-		return false;
-	if (typeof record.transactionId !== "string" || record.transactionId.trim().length === 0) return false;
-	if (
-		record.mode === "existing" &&
-		(typeof record.bindPort !== "number" ||
-			!Number.isInteger(record.bindPort) ||
-			record.bindPort < 1 ||
-			record.bindPort > 65535)
-	)
-		return false;
-	if (
-		record.mode === "existing" &&
-		(typeof record.projectRoot !== "string" ||
-			!record.projectRoot.startsWith("/") ||
-			record.projectRoot.endsWith("/") ||
-			record.projectRoot.split("/").includes(".."))
-	)
-		return false;
-	if (record.mode === "managed" && record.projectRoot !== undefined) return false;
 	return (
-		isCanonicalRecoveryUrl(record.targetUrl) &&
-		isCanonicalRecoveryUrl(record.providerUrl) &&
-		record.linkage ===
-			`${record.mode}:${record.installationId}:${record.targetUrl}:${record.providerUrl}:${record.uiPort}${record.projectRoot === undefined ? "" : `:${record.projectRoot}`}${record.bindPort === undefined ? "" : `:${record.bindPort}`}:${record.priorMode}:${record.priorControllerEnabled ? "enabled" : "disabled"}:${record.priorControllerActive ? "active" : "inactive"}:${record.controllerRecoveryRequired ? "recovery-required" : "controller-live"}:${record.controllerQuiesced ? "controller-quiesced" : "controller-live"}`
+		(value.failedPhase === undefined) === (value.failureEvidence === undefined) &&
+		!(value.failureEvidence !== undefined && value.failureEvidence.trim().length === 0) &&
+		!(value.failedPhase !== undefined && (value.failedPhase === "complete" || value.failedPhase !== value.phase)) &&
+		!(
+			value.phase === "complete" &&
+			(!value.bootstrapComplete ||
+				!value.apiKeyCreated ||
+				!value.openAIConfigured ||
+				!value.routeVerified ||
+				!value.ownershipVerified)
+		)
 	);
 }
-function isCanonicalRecoveryUrl(value: unknown): value is string {
-	if (typeof value !== "string") return false;
-	try {
-		const url = new URL(value);
-		if (
-			(url.protocol !== "http:" && url.protocol !== "https:") ||
-			url.username ||
-			url.password ||
-			url.search ||
-			url.hash
-		)
-			return false;
-		if (
-			url.hostname !== url.hostname.toLowerCase() ||
-			(url.pathname !== "/" && url.pathname !== url.pathname.replace(/\/+$/, ""))
-		)
-			return false;
-		if ((url.protocol === "http:" && url.port === "80") || (url.protocol === "https:" && url.port === "443"))
-			return false;
-		return url.toString().replace(/\/$/, "") === value;
-	} catch {
-		return false;
-	}
-}
 
-function isBootstrapPhase(value: unknown): value is BootstrapPhase {
-	return typeof value === "string" && (BOOTSTRAP_PHASES as readonly string[]).includes(value);
+export function parseBootstrapState(value: unknown): BootstrapState {
+	if (!isBootstrapState(value)) throw new Error("Malformed bootstrap state");
+	return {
+		...value,
+		openAIConnectionIds: [...value.openAIConnectionIds],
+		...(value.pendingRecovery === undefined ? {} : { pendingRecovery: { ...value.pendingRecovery } }),
+	};
 }
 
 export function isBootstrapPhaseComplete(state: BootstrapState, phase: BootstrapPhase): boolean {
@@ -248,6 +188,7 @@ export function isBootstrapPhaseComplete(state: BootstrapState, phase: Bootstrap
 			(phase === "ownership" && state.ownershipVerified))
 	);
 }
+
 export function recoverBootstrapState(state: BootstrapState): BootstrapState {
 	const phase = state.ownershipVerified
 		? "ownership"
@@ -262,6 +203,7 @@ export function recoverBootstrapState(state: BootstrapState): BootstrapState {
 						: "preflight";
 	return { ...state, version: 1, phase };
 }
+
 export function advanceBootstrapState(
 	state: BootstrapState,
 	phase: BootstrapPhase,
@@ -278,7 +220,6 @@ export function advanceBootstrapState(
 	};
 }
 
-/** Reset is valid only with proof that the named phase actually failed. */
 export function resetBootstrapState(
 	state: BootstrapState,
 	failedPhase: BootstrapPhase,
@@ -307,6 +248,7 @@ export function resetBootstrapState(
 		...(state.pendingRecovery === undefined ? {} : { pendingRecovery: { ...state.pendingRecovery } }),
 	};
 }
+
 export async function withExclusiveMaintenance<T>(
 	boundary: ExclusiveMaintenanceBoundary,
 	action: () => Promise<T>,

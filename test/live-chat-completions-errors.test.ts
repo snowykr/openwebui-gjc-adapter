@@ -37,7 +37,9 @@ describe("live OpenAI-compatible chat completion errors", () => {
 			headers: chatHeaders,
 			projects: [project],
 			owner,
-			runner: { run: () => ({ chunks: ["hello", " world"] }) },
+			runner: {
+				run: () => ({ chunks: ["hello", " world"], model: "gjc/anthropic/claude-sonnet-4:low" }),
+			},
 			now: new Date("2026-07-08T00:00:00.000Z"),
 			idFactory: () => "chatcmpl-stream",
 		});
@@ -52,9 +54,56 @@ describe("live OpenAI-compatible chat completion errors", () => {
 		expect(chunks[0]).toEndWith("\n\n");
 		expect(JSON.parse(chunks[0]?.slice(6).trim() ?? "{}")).toMatchObject({
 			object: "chat.completion.chunk",
+			model: "gjc/anthropic/claude-sonnet-4:low",
 			choices: [{ delta: { role: "assistant", content: "hello" }, finish_reason: null }],
 		});
 		expect(chunks[2]).toBe("data: [DONE]\n\n");
+	});
+
+	it("fails closed before sinks when the runner omits canonical model metadata", async () => {
+		const effects: string[] = [];
+		const result = await handleChatCompletions({
+			request,
+			headers: chatHeaders,
+			projects: [project],
+			owner,
+			runner: { run: () => ({ content: "must not escape" }) },
+			eventSink: () => {
+				effects.push("event");
+			},
+			messageSink: () => {
+				effects.push("message");
+			},
+		});
+		expect(result).toMatchObject({
+			ok: false,
+			status: 503,
+			body: { error: { code: "live_runner_error", type: "server_error" } },
+		});
+		expect(effects).toEqual([]);
+	});
+
+	it.each(["gjc", "gjc/noncanonical"])("fails closed before sinks for runner model %s", async model => {
+		const effects: string[] = [];
+		const result = await handleChatCompletions({
+			request,
+			headers: chatHeaders,
+			projects: [project],
+			owner,
+			runner: { run: () => ({ content: "must not escape", model }) },
+			eventSink: () => {
+				effects.push("event");
+			},
+			messageSink: () => {
+				effects.push("message");
+			},
+		});
+		expect(result).toMatchObject({
+			ok: false,
+			status: 503,
+			body: { error: { code: "live_runner_error", type: "server_error" } },
+		});
+		expect(effects).toEqual([]);
 	});
 
 	it("returns OpenAI-style unavailable errors when no concrete live runner is wired", async () => {

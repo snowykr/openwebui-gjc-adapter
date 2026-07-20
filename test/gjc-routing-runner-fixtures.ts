@@ -1,3 +1,5 @@
+import { join } from "node:path";
+import type { NormalizedModelSelection } from "../src/contracts";
 import type {
 	GjcContinueSessionInput,
 	GjcRespondWorkflowGateInput,
@@ -8,8 +10,9 @@ import type {
 	GjcSwitchSessionInput,
 	GjcTurnResult,
 	GjcTurnRunner,
-} from "../src/gjc/rpc-runner";
+} from "../src/gjc/turn-runner";
 import type { RegisteredProject } from "../src/projects/registry";
+import { attachmentProof, lifecycleFixture } from "./gjc-lifecycle-fixtures";
 
 export class FakeGjcTurnRunner implements GjcTurnRunner {
 	readonly starts: GjcStartNewSessionInput[] = [];
@@ -25,10 +28,19 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 		eventCursor: 3,
 	};
 	events: GjcTurnResult["events"] = [{ type: "assistant", text: "assistant from gjc" }];
+	gateResponseEvents: GjcTurnResult["events"] = [{ type: "assistant", text: "workflow gate accepted" }];
+	startModelSelection?: NormalizedModelSelection;
+	continueModelSelection?: NormalizedModelSelection;
 
-	async startNewSession(input: GjcStartNewSessionInput): Promise<GjcSessionAddress & GjcTurnResult> {
+	async startNewSession<T>(
+		input: GjcStartNewSessionInput,
+		publish: (
+			result: GjcSessionAddress & GjcTurnResult,
+			lifecycle: ReturnType<typeof lifecycleFixture>,
+		) => Promise<T>,
+	): Promise<T> {
 		this.starts.push(input);
-		return {
+		const result = {
 			cwd: input.cwd,
 			sessionRoot: input.sessionRoot,
 			projectId: input.projectId,
@@ -36,11 +48,18 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 			sessionId: "session-1",
 			text: `new:${input.text}`,
 			events: this.events,
-			sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
+			sessionFile: join(input.sessionRoot, "session-1.jsonl"),
 			activeLeaf: "leaf-1",
 			rawFrameCursor: 7,
 			eventCursor: 3,
+			...(this.startModelSelection === undefined
+				? input.modelSelection === undefined
+					? {}
+					: { modelSelection: input.modelSelection }
+				: { modelSelection: this.startModelSelection }),
 		};
+		const lifecycle = lifecycleFixture(result);
+		return await publish({ ...result, attachment: attachmentProof(result) }, lifecycle);
 	}
 
 	async continueSession(input: GjcContinueSessionInput): Promise<GjcTurnResult> {
@@ -52,6 +71,12 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 			activeLeaf: "leaf-2",
 			rawFrameCursor: input.rawFrameCursor + 5,
 			eventCursor: input.eventCursor + 2,
+			...(this.continueModelSelection === undefined
+				? input.modelSelection === undefined
+					? {}
+					: { modelSelection: input.modelSelection }
+				: { modelSelection: this.continueModelSelection }),
+			attachment: attachmentProof(input),
 		};
 	}
 
@@ -59,20 +84,28 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 		this.switches.push(input);
 	}
 
+	async withLifecyclePublication<T>(
+		address: GjcSessionAddress,
+		effect: (lifecycle: ReturnType<typeof lifecycleFixture>) => Promise<T>,
+	): Promise<T> {
+		return await effect(lifecycleFixture(address));
+	}
+
 	async getState(input: GjcSessionStateInput): Promise<GjcSessionState> {
 		this.states.push(input);
-		return this.state;
+		return { ...this.state, attachment: attachmentProof(input) };
 	}
 
 	async respondWorkflowGate(input: GjcRespondWorkflowGateInput): Promise<GjcTurnResult> {
 		this.gateResponses.push(input);
 		return {
 			text: "workflow gate accepted",
-			events: [{ type: "assistant", text: "workflow gate accepted" }],
+			events: this.gateResponseEvents,
 			sessionFile: input.sessionFile,
 			activeLeaf: "leaf-gate",
 			rawFrameCursor: input.rawFrameCursor,
 			eventCursor: input.eventCursor,
+			attachment: attachmentProof(input),
 		};
 	}
 }
@@ -94,6 +127,9 @@ export const deepInterviewWorkflowGateEvent = {
 		kind: "question",
 		schemaHash: "sha256:deep",
 		idempotencyKey: "idem-deep-1",
+		commandId: "command-1",
+		turnId: "turn-1",
+		sessionId: "session-1",
 		context: { prompt: "Choose authentication method" },
 		options: [
 			{ label: "JWT", value: "JWT" },

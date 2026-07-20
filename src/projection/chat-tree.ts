@@ -2,21 +2,14 @@ import * as path from "node:path";
 import type { TextContent } from "@gajae-code/ai";
 import type { SessionEntry, SessionHeader, SessionMessageEntry } from "@gajae-code/coding-agent";
 import { ADAPTER_PROJECTION_VERSION, buildLineageHash } from "../state/metadata";
+import { type SessionEntryGraphDiagnostic, validateSessionEntryGraph } from "./chat-tree-graph";
 
-export type SessionEntryGraphDiagnosticCode = "duplicate_entry_id" | "missing_parent";
-
-export interface SessionEntryGraphDiagnostic {
-	code: SessionEntryGraphDiagnosticCode;
-	message: string;
-	entryId: string;
-	parentId?: string;
-}
-
-export interface SessionEntryGraphValidationResult {
-	diagnostics: SessionEntryGraphDiagnostic[];
-	childrenById: Map<string, string[]>;
-	currentId: string | null;
-}
+export type {
+	SessionEntryGraphDiagnostic,
+	SessionEntryGraphDiagnosticCode,
+	SessionEntryGraphValidationResult,
+} from "./chat-tree-graph";
+export { validateSessionEntryGraph } from "./chat-tree-graph";
 
 export interface GjcSessionProjectionInput {
 	sessionFile: string;
@@ -64,57 +57,15 @@ export interface OpenWebUIProjectedChat {
 	};
 }
 
-export function validateSessionEntryGraph(entries: readonly SessionEntry[]): SessionEntryGraphValidationResult {
-	const diagnostics: SessionEntryGraphDiagnostic[] = [];
-	const entriesById = new Map<string, SessionEntry>();
-	const childrenById = new Map<string, string[]>();
-
-	for (const entry of entries) {
-		if (entriesById.has(entry.id)) {
-			diagnostics.push({
-				code: "duplicate_entry_id",
-				message: `Duplicate GJC session entry id: ${entry.id}`,
-				entryId: entry.id,
-			});
-			continue;
-		}
-		entriesById.set(entry.id, entry);
-		childrenById.set(entry.id, []);
-	}
-
-	for (const entry of entriesById.values()) {
-		if (entry.parentId === null) continue;
-		const siblings = childrenById.get(entry.parentId);
-		if (siblings === undefined) {
-			diagnostics.push({
-				code: "missing_parent",
-				message: `GJC session entry ${entry.id} references missing parent ${entry.parentId}`,
-				entryId: entry.id,
-				parentId: entry.parentId,
-			});
-			continue;
-		}
-		siblings.push(entry.id);
-	}
-
-	assertAcyclic(entriesById);
-
-	return {
-		diagnostics,
-		childrenById,
-		currentId: findCurrentId(entriesById, childrenById),
-	};
-}
-
 export function projectGjcSessionToOpenWebUIChat(input: GjcSessionProjectionInput): OpenWebUIProjectedChat {
 	const validation = validateSessionEntryGraph(input.entries);
-	const entriesById = new Map(input.entries.map(entry => [entry.id, entry]));
+	const entriesById = validation.entriesById;
 	const messages: Record<string, OpenWebUIProjectedMessage> = {};
 	const visibleParentByMessageId = new Map<string, string | null>();
 	const messageChildrenById = new Map<string, string[]>();
 	let messageEntryCount = 0;
 
-	for (const entry of input.entries) {
+	for (const entry of entriesById.values()) {
 		if (entry.type !== "message") continue;
 		messageEntryCount++;
 		visibleParentByMessageId.set(entry.id, findNearestMessageAncestor(entry.parentId, entriesById));
@@ -126,7 +77,7 @@ export function projectGjcSessionToOpenWebUIChat(input: GjcSessionProjectionInpu
 		messageChildrenById.get(parentMessageId)?.push(messageId);
 	}
 
-	for (const entry of input.entries) {
+	for (const entry of entriesById.values()) {
 		if (entry.type !== "message") continue;
 		messages[entry.id] = projectMessageEntry(
 			input,
@@ -136,7 +87,7 @@ export function projectGjcSessionToOpenWebUIChat(input: GjcSessionProjectionInpu
 		);
 	}
 
-	const currentId = findProjectedCurrentId(validation.currentId, input.entries, messages);
+	const currentId = findProjectedCurrentId(validation.currentId, entriesById, messages);
 	const lineageHash = buildLineageHash([input.sessionFile, input.header.id, currentId ?? ""]);
 	const sessionFileName = path.basename(input.sessionFile);
 
@@ -154,49 +105,21 @@ export function projectGjcSessionToOpenWebUIChat(input: GjcSessionProjectionInpu
 				gjcSessionId: input.header.id,
 				gjcEntryId: currentId,
 				lineageHash,
-				entryCount: input.entries.length,
+				entryCount: entriesById.size,
 				messageEntryCount,
-				nonMessageEntryCount: input.entries.length - messageEntryCount,
+				nonMessageEntryCount: entriesById.size - messageEntryCount,
 				diagnostics: validation.diagnostics,
 			},
 		},
 	};
 }
 
-function assertAcyclic(entriesById: Map<string, SessionEntry>): void {
-	const visited = new Set<string>();
-	const visiting = new Set<string>();
-
-	const visit = (entry: SessionEntry): void => {
-		if (visited.has(entry.id)) return;
-		if (visiting.has(entry.id)) throw new Error(`GJC session entry parent cycle detected at ${entry.id}`);
-		visiting.add(entry.id);
-		if (entry.parentId !== null) {
-			const parent = entriesById.get(entry.parentId);
-			if (parent !== undefined) visit(parent);
-		}
-		visiting.delete(entry.id);
-		visited.add(entry.id);
-	};
-
-	for (const entry of entriesById.values()) visit(entry);
-}
-
-function findCurrentId(entriesById: Map<string, SessionEntry>, childrenById: Map<string, string[]>): string | null {
-	let currentId: string | null = null;
-	for (const id of entriesById.keys()) {
-		if ((childrenById.get(id) ?? []).length === 0) currentId = id;
-	}
-	return currentId;
-}
-
 function findProjectedCurrentId(
 	currentId: string | null,
-	entries: readonly SessionEntry[],
+	entriesById: Map<string, SessionEntry>,
 	messages: Record<string, OpenWebUIProjectedMessage>,
 ): string | null {
 	let cursor = currentId;
-	const entriesById = new Map(entries.map(entry => [entry.id, entry]));
 	while (cursor !== null) {
 		if (messages[cursor] !== undefined) return cursor;
 		cursor = entriesById.get(cursor)?.parentId ?? null;

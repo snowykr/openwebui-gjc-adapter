@@ -27,6 +27,7 @@ import { registerProjectDirectory } from "../src/projects/registry";
 import { resolveAllowedRoots } from "../src/security/paths";
 import { FileBackedOutboxStore } from "../src/state/outbox";
 import { reconcilePendingOperations } from "../src/state/reconciler";
+import { attachmentProof } from "./gjc-lifecycle-fixtures";
 import {
 	createdAt,
 	deliveredEvents,
@@ -38,6 +39,7 @@ import {
 	ownerUserId,
 	sseInput,
 } from "./golden-fixture-fixtures";
+import * as selectionFixture from "./model-selection-fixtures";
 
 describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 	test("projects historical sessions, live events, gates, artifacts, routing, crash repair, and safe lineage", async () => {
@@ -59,7 +61,14 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 
 		const allowedRoots = await resolveAllowedRoots([root]);
 		const project = await registerProjectDirectory({ cwd, name: "Golden" }, allowedRoots, createdAt);
-		expect(buildModelList([project]).data[0]).toMatchObject({ id: "gjc", owned_by: "gjc" });
+		expect(
+			buildModelList([
+				selectionFixture.REASONING_OFF_SELECTION,
+				selectionFixture.LOW_SELECTION,
+				selectionFixture.MEDIUM_SELECTION,
+				selectionFixture.OFF_SELECTION,
+			]).data.map(model => model.id),
+		).toEqual([...selectionFixture.CANONICAL_MODEL_IDS]);
 
 		const header = goldenHeader(cwd);
 		const entries = goldenEntries();
@@ -161,7 +170,13 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 
 		const turnRunner = new GoldenTurnRunner(sessionFile);
 		const mappings = new FileBackedSessionMappingStore(join(root, "mappings.json"));
-		const liveRunner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings, outbox, ownerUserId });
+		const liveRunner = createGjcRoutingLiveGatewayRunner({
+			turnRunner,
+			mappings,
+			outbox,
+			ownerUserId,
+			modelReaderFactory: selectionFixture.staticModelReaderFactory(),
+		});
 		await repository.upsertChat({
 			id: "chat-live",
 			owner_user_id: ownerUserId,
@@ -196,6 +211,11 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 		expect(continued.ok).toBe(true);
 		expect(turnRunner.switches).toHaveLength(1);
 		expect(turnRunner.states).toHaveLength(1);
+		expect(turnRunner.continues[0]).toMatchObject({
+			activeLeaf: "assistant-1",
+			rawFrameCursor: 1,
+			eventCursor: 1,
+		});
 		expect(deliveredEvents.some(event => event.events.some(item => item.type === "status"))).toBe(true);
 
 		const background = await handleChatCompletions({
@@ -207,6 +227,7 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 			projects: [project],
 			owner: { ownerUserId, singleOwnerLocalMode: false },
 			runner: liveRunner,
+			modelReaderFactory: selectionFixture.staticModelReaderFactory(),
 		});
 		expect(background.ok).toBe(true);
 		expect(turnRunner.starts).toHaveLength(1);
@@ -220,6 +241,7 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 			rawFrameCursor: 2,
 			eventCursor: 1,
 			operationId: "user-2",
+			attachment: attachmentProof({ cwd, sessionId: "session-golden" }),
 		});
 		expect(
 			resolveBranchRegenerateAction({
@@ -240,7 +262,7 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 				mappings,
 				messageMetadata: importedLeafMetadata,
 			}),
-		).toMatchObject({ action: "fork" });
+		).toMatchObject({ action: "uncertain" });
 
 		expect(await Bun.file(sessionFile).text()).toBe(originalJsonl);
 	});

@@ -1,28 +1,32 @@
-import { buildModelList } from "../live/models";
+import type { ModelReaderFactory } from "../live/model-reader";
+import { ModelSelectionError, modelSelectionError } from "../live/model-selection-errors";
+import { createModelSelectionPolicy } from "../live/model-selection-policy";
+import { buildModelList, classifyGjcModelId, formatCanonicalModelId } from "../live/models";
 import type {
 	OpenAIChatCompletionRequest,
 	OpenAIChatCompletionResponse,
 	OpenAIModelListResponse,
 } from "../live/openai-types";
-import { GJC_OPENWEBUI_MODEL_ID } from "../live/project-context";
 import { type OpenWebUIOwnerContext, validateForwardedOwnerUserId } from "../openwebui/auth";
 import type { OpenWebUIHeaderInput } from "../openwebui/headers";
 import { parseOpenWebUIHeaders } from "../openwebui/headers";
+import { executeProjectCommand, latestUserText } from "./admin-chat-command";
+import {
+	isProjectUnlinkPath,
+	type ProjectAdminJsonResult,
+	type ProjectAdminRouteResult,
+	type ProjectIdPathResult,
+	parseProjectAdminJsonRequest,
+	parseProjectLinkBody,
+	projectIdFromUnlinkPath,
+} from "./admin-request-parser";
 import { ProjectLinkError, type ProjectLinkService } from "./link-service";
 import type { RegisteredProject } from "./registry";
 
-export interface ProjectAdminRouteResult {
-	readonly status: number;
-	readonly body: unknown;
-}
+export type { ProjectAdminJsonResult, ProjectAdminRouteResult, ProjectIdPathResult };
+export { isProjectUnlinkPath, parseProjectAdminJsonRequest, projectIdFromUnlinkPath };
 
-export type ProjectAdminJsonResult =
-	| { readonly ok: true; readonly value: unknown }
-	| { readonly ok: false; readonly result: ProjectAdminRouteResult };
-
-export type ProjectIdPathResult =
-	| { readonly ok: true; readonly value: string }
-	| { readonly ok: false; readonly result: ProjectAdminRouteResult };
+export type ProjectAdminFailureSink = (error: unknown) => void;
 
 export function buildProjectModelList(
 	projects: readonly RegisteredProject[],
@@ -31,26 +35,6 @@ export function buildProjectModelList(
 	void projects;
 	void includeProjectAdmin;
 	return buildModelList();
-}
-
-export async function parseProjectAdminJsonRequest(request: Request): Promise<ProjectAdminJsonResult> {
-	try {
-		return { ok: true, value: await request.json() };
-	} catch {
-		return { ok: false, result: errorResult("Request body must be valid JSON.", "invalid_json", 400) };
-	}
-}
-
-export function isProjectUnlinkPath(pathname: string): boolean {
-	return pathname.startsWith("/admin/projects/") && pathname.endsWith("/unlink");
-}
-
-export function projectIdFromUnlinkPath(pathname: string): ProjectIdPathResult {
-	try {
-		return { ok: true, value: decodeURIComponent(pathname.slice("/admin/projects/".length, -"/unlink".length)) };
-	} catch {
-		return { ok: false, result: errorResult("Project id path segment is malformed.", "invalid_project_id", 400) };
-	}
 }
 
 export async function handleProjectLinkRequest(
@@ -90,6 +74,8 @@ export async function handleProjectAdminChatCompletion(
 	request: OpenAIChatCompletionRequest,
 	headers: OpenWebUIHeaderInput,
 	ownerContext: OpenWebUIOwnerContext,
+	modelReaderFactory?: ModelReaderFactory,
+	failureSink?: ProjectAdminFailureSink,
 ): Promise<ProjectAdminRouteResult> {
 	const parsedHeaders = parseOpenWebUIHeaders(headers);
 	if (!parsedHeaders.ok) {
@@ -100,115 +86,61 @@ export async function handleProjectAdminChatCompletion(
 		return errorResult("Forwarded OpenWebUI owner does not match adapter owner.", owner.reason, 401);
 	}
 	if (parsedHeaders.isBackgroundTask) {
-		return { status: 200, body: chatResponse("") };
+		try {
+			return await canonicalAdminResponse("", request.model, modelReaderFactory);
+		} catch (error) {
+			if (error instanceof ModelSelectionError) return modelSelectionErrorResult(error);
+			failureSink?.(error);
+			return infrastructureErrorResult(error, "project_command_failed");
+		}
 	}
 	const command = latestUserText(request);
 	if (command === undefined) return errorResult("A project command is required.", "invalid_project_command", 400);
 	try {
-		return {
-			status: 200,
-			body: chatResponse(await executeProjectCommand(service, command)),
-		};
+		const content = await executeProjectCommand(service, command);
+		return await canonicalAdminResponse(content, request.model, modelReaderFactory);
 	} catch (error) {
 		if (error instanceof ProjectLinkError) return projectLinkErrorResult(error);
+		if (error instanceof ModelSelectionError) return modelSelectionErrorResult(error);
+		failureSink?.(error);
 		return infrastructureErrorResult(error, "project_command_failed");
 	}
 }
 
 export function isProjectAdminChatCompletionRequest(request: OpenAIChatCompletionRequest): boolean {
 	const command = latestUserText(request);
-	return request.model === GJC_OPENWEBUI_MODEL_ID && (command?.startsWith("/gjc project ") ?? false);
+	const model = classifyGjcModelId(request.model);
+	return (model.kind === "alias" || model.kind === "canonical") && (command?.startsWith("/gjc project ") ?? false);
 }
 
-function parseProjectLinkBody(body: unknown):
-	| {
-			readonly ok: true;
-			readonly value: {
-				readonly cwd: string;
-				readonly name?: string;
-				readonly sessionRoot?: string;
-			};
-	  }
-	| { readonly ok: false; readonly message: string } {
-	if (typeof body !== "object" || body === null || Array.isArray(body)) {
-		return { ok: false, message: "Request body must be an object." };
+async function canonicalAdminResponse(
+	content: string,
+	requestedModelId: string,
+	modelReaderFactory?: ModelReaderFactory,
+): Promise<ProjectAdminRouteResult> {
+	if (modelReaderFactory === undefined) {
+		throw modelSelectionError(
+			classifyGjcModelId(requestedModelId).kind === "canonical"
+				? "model_selection_not_available"
+				: "model_selection_default_read_failed",
+		);
 	}
-	const record = body as Record<string, unknown>;
-	if (typeof record.cwd !== "string" || record.cwd.trim().length === 0) {
-		return { ok: false, message: "cwd must be a non-empty string." };
-	}
-	return {
-		ok: true,
-		value: {
-			cwd: record.cwd,
-			...optionalStringField(record, "name"),
-			...optionalStringField(record, "sessionRoot"),
-		},
-	};
+	const model = formatCanonicalModelId(await createModelSelectionPolicy(modelReaderFactory).resolve(requestedModelId));
+	return { status: 200, body: chatResponse(content, model) };
 }
 
-function optionalStringField<T extends string>(
-	record: Record<string, unknown>,
-	key: T,
-): { readonly [K in T]?: string } {
-	const value = record[key];
-	if (value === undefined) return {};
-	if (typeof value !== "string" || value.trim().length === 0) {
-		throw new ProjectLinkError(`${key} must be a non-empty string when provided.`, "invalid_project_link");
-	}
-	return { [key]: value } as { readonly [K in T]?: string };
-}
-
-async function executeProjectCommand(service: ProjectLinkService, command: string): Promise<string> {
-	if (command === "/gjc project list") {
-		await service.reconcileOpenWebUIFolderLinks();
-		const projects = service.listProjects();
-		if (projects.length === 0) return "No GJC projects are linked.";
-		return projects.map(project => `${project.status}: ${project.id} ${project.cwd}`).join("\n");
-	}
-	const linkPrefix = "/gjc project link ";
-	if (command.startsWith(linkPrefix)) {
-		const cwd = command.slice(linkPrefix.length).trim();
-		const result = await service.linkProject({ cwd });
-		return `Linked ${result.project.id}. Imported ${result.sync.imported.length} session(s).`;
-	}
-	const unlinkPrefix = "/gjc project unlink ";
-	if (command.startsWith(unlinkPrefix)) {
-		const projectId = command.slice(unlinkPrefix.length).trim();
-		const result = await service.unlinkProject(projectId);
-		return `Unlinked ${result.project.id}. Local GJC files were left untouched.`;
-	}
-	throw new ProjectLinkError(
-		"Supported commands: /gjc project list, /gjc project link <path>, /gjc project unlink <id>.",
-		"invalid_project_command",
-	);
-}
-
-function latestUserText(request: OpenAIChatCompletionRequest): string | undefined {
-	for (let index = request.messages.length - 1; index >= 0; index -= 1) {
-		const message = request.messages[index];
-		if (message?.role !== "user") continue;
-		const content = message.content;
-		if (typeof content === "string") return content.trim();
-		if (Array.isArray(content)) {
-			return content
-				.filter(part => part.type === "text")
-				.map(part => part.text)
-				.join("")
-				.trim();
-		}
-	}
-	return undefined;
-}
-
-function chatResponse(content: string): OpenAIChatCompletionResponse {
+function chatResponse(content: string, model: string): OpenAIChatCompletionResponse {
 	return {
 		id: `chatcmpl-${Date.now()}`,
 		object: "chat.completion",
 		created: Math.floor(Date.now() / 1000),
-		model: GJC_OPENWEBUI_MODEL_ID,
+		model,
 		choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
 	};
+}
+
+function modelSelectionErrorResult(error: ModelSelectionError): ProjectAdminRouteResult {
+	return { status: error.status, body: { error: { message: error.message, type: error.type, code: error.code } } };
 }
 
 function projectLinkErrorResult(error: ProjectLinkError): ProjectAdminRouteResult {
@@ -216,10 +148,10 @@ function projectLinkErrorResult(error: ProjectLinkError): ProjectAdminRouteResul
 }
 
 function infrastructureErrorResult(error: unknown, code: string): ProjectAdminRouteResult {
-	const message = error instanceof Error ? error.message : "Project link operation failed.";
+	void error;
 	return {
 		status: 503,
-		body: { error: { message, type: "server_error", code } },
+		body: { error: { message: "Project administration operation failed.", type: "server_error", code } },
 	};
 }
 

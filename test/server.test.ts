@@ -1,8 +1,13 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { LiveGatewayRunner } from "../src/live/chat-completions";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import type { RegisteredProject } from "../src/projects/registry";
-import { createAdapterRequestHandler } from "../src/server";
+import { RuntimeSingletonLock } from "../src/runtime-singleton-lock";
+import { createAdapterRequestHandler, startAdapterServer } from "../src/server";
+import { CANONICAL_MODEL_IDS, LOW_MODEL_ID, staticModelReaderFactory } from "./model-selection-fixtures";
 
 describe("createAdapterRequestHandler", () => {
 	test("returns health status", async () => {
@@ -25,7 +30,7 @@ describe("createAdapterRequestHandler", () => {
 
 	test("returns model list from optional route dependencies", async () => {
 		const handler = createAdapterRequestHandler({
-			routes: { projects: [project], owner, runner: fixedRunner("unused") },
+			routes: { projects: [project], owner, runner: fixedRunner("unused"), modelReaderFactory },
 		});
 
 		const response = await handler(new Request("http://adapter.test/v1/models"));
@@ -33,7 +38,7 @@ describe("createAdapterRequestHandler", () => {
 		expect(response.status).toBe(200);
 		expect(await response.json()).toEqual({
 			object: "list",
-			data: [{ id: "gjc", object: "model", created: 1783468800, owned_by: "gjc" }],
+			data: CANONICAL_MODEL_IDS.map(id => ({ id, object: "model", created: 1783468800, owned_by: "gjc" })),
 		});
 	});
 
@@ -43,6 +48,7 @@ describe("createAdapterRequestHandler", () => {
 				projects: [project],
 				owner,
 				runner: fixedRunner("unused"),
+				modelReaderFactory,
 				adapterApiToken: "adapter-token",
 				requireAdapterApiToken: true,
 			},
@@ -60,7 +66,13 @@ describe("createAdapterRequestHandler", () => {
 
 	test("fails closed when CLI service requires but lacks an adapter API token", async () => {
 		const handler = createAdapterRequestHandler({
-			routes: { projects: [project], owner, runner: fixedRunner("unused"), requireAdapterApiToken: true },
+			routes: {
+				projects: [project],
+				owner,
+				runner: fixedRunner("unused"),
+				modelReaderFactory,
+				requireAdapterApiToken: true,
+			},
 		});
 
 		const response = await handler(new Request("http://adapter.test/v1/models"));
@@ -70,7 +82,7 @@ describe("createAdapterRequestHandler", () => {
 	});
 	test("protects runtime readiness separately from the provider bearer token", async () => {
 		const handler = createAdapterRequestHandler({
-			routes: { projects: [project], owner, runner: fixedRunner("unused") },
+			routes: { projects: [project], owner, runner: fixedRunner("unused"), modelReaderFactory },
 			runtime: {
 				adapterToken: "provider-token",
 				readinessToken: "readiness-token",
@@ -98,7 +110,7 @@ describe("createAdapterRequestHandler", () => {
 
 	test("routes chat completions to optional route dependencies", async () => {
 		const handler = createAdapterRequestHandler({
-			routes: { projects: [project], owner, runner: fixedRunner("handled") },
+			routes: { projects: [project], owner, runner: fixedRunner("handled"), modelReaderFactory },
 		});
 
 		const response = await handler(
@@ -125,7 +137,12 @@ describe("createAdapterRequestHandler", () => {
 	});
 	test("keeps malformed JSON errors and streaming responses on the current chat route", async () => {
 		const handler = createAdapterRequestHandler({
-			routes: { projects: [project], owner, runner: { run: () => ({ chunks: ["a", "b"] }) } },
+			routes: {
+				projects: [project],
+				owner,
+				runner: { run: () => ({ chunks: ["a", "b"], model: LOW_MODEL_ID }) },
+				modelReaderFactory,
+			},
 		});
 		const malformed = await handler(
 			new Request("http://adapter.test/v1/chat/completions", {
@@ -154,6 +171,112 @@ describe("createAdapterRequestHandler", () => {
 		expect(streaming.headers.get("content-type")).toStartWith("text/event-stream");
 		expect(await streaming.text()).toContain("data: [DONE]");
 	});
+	test("uses a client operation ID for close responses without persisting the bearer token", async () => {
+		const mapping = {
+			chatId: "chat-1",
+			projectId: "demo",
+			sessionId: "session-1",
+			rawFrameCursor: 0,
+			eventCursor: 0,
+			operationId: "turn-1",
+		};
+		const ingressIds: string[] = [];
+		const handler = createAdapterRequestHandler({
+			routes: {
+				projects: [project],
+				owner,
+				runner: fixedRunner("unused"),
+				adapterApiToken: "adapter-token",
+				requireAdapterApiToken: true,
+				mappings: { get: chatId => (chatId === mapping.chatId ? mapping : undefined) },
+				closeSession: async (_mapping, ingress) => {
+					ingressIds.push(ingress.ingressId);
+					return { status: "closed" };
+				},
+			},
+		});
+
+		const response = await handler(
+			new Request("http://adapter.test/v1/chats/chat-1/close", {
+				method: "POST",
+				headers: { authorization: "Bearer adapter-token", "idempotency-key": "close-operation-1" },
+			}),
+		);
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({ status: "closed", operationId: "close-operation-1" });
+		expect(ingressIds).toHaveLength(1);
+		expect(ingressIds[0]).not.toContain("adapter-token");
+	});
+});
+describe("Bun transport configuration", () => {
+	test("sets a bounded idle timeout above Bun's default", async () => {
+		const runtimeRoot = await mkdtemp(join(tmpdir(), "openwebui-gjc-adapter-server-"));
+		const serve = spyOn(Bun, "serve");
+		let handle: Awaited<ReturnType<typeof startAdapterServer>> | undefined;
+
+		try {
+			handle = await startAdapterServer({
+				host: "127.0.0.1",
+				port: 0,
+				runtimeRoot,
+				runtimeLock: await RuntimeSingletonLock.acquire(runtimeRoot),
+				turnTimeoutMs: 180_000,
+			});
+			const serverOptions = serve.mock.calls[0]?.[0];
+
+			expect(serverOptions).toMatchObject({ idleTimeout: 181 });
+		} finally {
+			await handle?.stop();
+			serve.mockRestore();
+			await rm(runtimeRoot, { force: true, recursive: true });
+		}
+	});
+	test("rounds configured turn timeouts up, with headroom, and disables idle timeout above Bun's limit", async () => {
+		const runtimeRoot = await mkdtemp(join(tmpdir(), "openwebui-gjc-adapter-server-"));
+		const serve = spyOn(Bun, "serve");
+		const timeouts = [240_000, 240_001, 255_000];
+
+		try {
+			for (const turnTimeoutMs of timeouts) {
+				const handle = await startAdapterServer({
+					host: "127.0.0.1",
+					port: 0,
+					runtimeRoot,
+					runtimeLock: await RuntimeSingletonLock.acquire(runtimeRoot),
+					turnTimeoutMs,
+				});
+				await handle.stop();
+			}
+			expect(serve.mock.calls.map(([options]) => options.idleTimeout)).toEqual([241, 242, 0]);
+		} finally {
+			serve.mockRestore();
+			await rm(runtimeRoot, { force: true, recursive: true });
+		}
+	});
+
+	test("rejects invalid turn timeout values before serving", async () => {
+		const runtimeRoot = await mkdtemp(join(tmpdir(), "openwebui-gjc-adapter-server-"));
+		const serve = spyOn(Bun, "serve");
+
+		try {
+			for (const turnTimeoutMs of [0, Number.NaN, Number.POSITIVE_INFINITY, 1.5]) {
+				await expect(
+					startAdapterServer({
+						host: "127.0.0.1",
+						port: 0,
+						runtimeRoot,
+						runtimeLock: await RuntimeSingletonLock.acquire(runtimeRoot),
+						turnTimeoutMs,
+					}),
+				).rejects.toThrow("turnTimeoutMs must be a positive finite integer");
+			}
+			expect(serve).not.toHaveBeenCalled();
+		} finally {
+			serve.mockRestore();
+			await rm(runtimeRoot, { force: true, recursive: true });
+		}
+	});
 });
 
 const project: RegisteredProject = {
@@ -167,5 +290,7 @@ const project: RegisteredProject = {
 const owner: OpenWebUIOwnerContext = { ownerUserId: "owner-1", singleOwnerLocalMode: false };
 
 function fixedRunner(content: string): LiveGatewayRunner {
-	return { run: () => ({ content }) };
+	return { run: () => ({ content, model: LOW_MODEL_ID }) };
 }
+
+const modelReaderFactory = staticModelReaderFactory();

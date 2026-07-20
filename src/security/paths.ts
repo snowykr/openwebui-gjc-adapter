@@ -40,7 +40,7 @@ export async function assertArtifactPathAllowed(
 	return assertPathInsideAllowedRoots(targetPath, allowedRoots);
 }
 
-async function resolveExistingOrProspectivePath(targetPath: string): Promise<string> {
+export async function resolveExistingOrProspectivePath(targetPath: string): Promise<string> {
 	const absoluteTargetPath = path.resolve(targetPath);
 	try {
 		return await fs.realpath(absoluteTargetPath);
@@ -65,6 +65,16 @@ async function resolveExistingOrProspectivePath(targetPath: string): Promise<str
 	}
 
 	throw new Error(`No existing parent found for path: ${targetPath}`);
+}
+
+export function pathsOverlap(leftPath: string, rightPath: string): boolean {
+	const relativePath = path.relative(leftPath, rightPath);
+	const reverseRelativePath = path.relative(rightPath, leftPath);
+	return (
+		relativePath === "" ||
+		(!relativePath.startsWith("..") && !path.isAbsolute(relativePath)) ||
+		(!reverseRelativePath.startsWith("..") && !path.isAbsolute(reverseRelativePath))
+	);
 }
 
 function splitAbsolutePath(absolutePath: string): string[] {

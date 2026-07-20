@@ -1,8 +1,21 @@
-import * as path from "node:path";
-import type { SessionMappingStore } from "../gjc/session-router";
+import type { GjcRuntimeLocations } from "../contracts";
+import type { GjcSessionStorageLocations } from "../gjc/session-root";
+import {
+	closeIngressId,
+	type SessionCloseResult,
+	type SessionMapping,
+	type SessionMappingStore,
+} from "../gjc/session-router";
 import type { OpenWebUIProjectionRepository } from "../openwebui/client";
 import { type SyncProjectSessionsResult, syncProjectSessionsToOpenWebUI } from "../projection/session-sync";
 import type { AllowedRoot } from "../security/paths";
+import {
+	assertProjectsAdmitted,
+	isProjectAllowed,
+	isProjectPathValidationError,
+	ProjectLinkError,
+	sanitizeProjectInput,
+} from "./project-admission";
 import type {
 	ProjectRegistration,
 	ProjectRegistrationSource,
@@ -11,12 +24,22 @@ import type {
 import type { RegisteredProject, RegisterProjectDirectoryInput } from "./registry";
 import { registerProjectDirectory } from "./registry";
 
+export type { SessionCloseResult } from "../gjc/session-router";
+
+export type ProjectSessionCloser = (
+	mapping: SessionMapping,
+	ingress: Readonly<{ ingressId: string; ingressHash: string }>,
+) => Promise<SessionCloseResult>;
+
 export interface ProjectLinkServiceOptions {
 	readonly allowedRoots: readonly AllowedRoot[];
 	readonly store: SqliteProjectRegistrationStore;
 	readonly ownerUserId: string;
 	readonly repository?: OpenWebUIProjectionRepository;
 	readonly mappings?: SessionMappingStore;
+	readonly protectedPaths: GjcRuntimeLocations["protectedProjectPaths"];
+	readonly runtimeLocations?: GjcSessionStorageLocations;
+	readonly closeSession?: ProjectSessionCloser;
 }
 
 export interface ProjectLinkResult {
@@ -27,6 +50,7 @@ export interface ProjectLinkResult {
 export interface ProjectUnlinkResult {
 	readonly project: ProjectRegistration;
 	readonly projectionRemoved: boolean;
+	readonly closeResults: readonly { readonly chatId: string; readonly result: SessionCloseResult }[];
 }
 
 export interface ProjectReconcileResult {
@@ -46,6 +70,9 @@ export class ProjectLinkService {
 	readonly #ownerUserId: string;
 	readonly #repository?: OpenWebUIProjectionRepository;
 	readonly #mappings?: SessionMappingStore;
+	readonly #protectedPaths: GjcRuntimeLocations["protectedProjectPaths"];
+	readonly #runtimeLocations?: GjcSessionStorageLocations;
+	readonly #closeSession?: ProjectSessionCloser;
 
 	constructor(options: ProjectLinkServiceOptions) {
 		this.#allowedRoots = options.allowedRoots;
@@ -53,9 +80,13 @@ export class ProjectLinkService {
 		this.#ownerUserId = options.ownerUserId;
 		this.#repository = options.repository;
 		this.#mappings = options.mappings;
+		this.#protectedPaths = options.protectedPaths;
+		this.#runtimeLocations = options.runtimeLocations;
+		this.#closeSession = options.closeSession;
 	}
 
-	seedConfiguredProjects(projects: readonly RegisteredProject[]): void {
+	async seedConfiguredProjects(projects: readonly RegisteredProject[]): Promise<void> {
+		await assertProjectsAdmitted(projects, this.#protectedPaths);
 		this.#store.seedConfiguredProjects(projects);
 	}
 
@@ -72,6 +103,7 @@ export class ProjectLinkService {
 			}
 			throw error;
 		}
+		await assertProjectsAdmitted([registered], this.#protectedPaths);
 		const previous = this.#store.getProject(registered.cwd);
 		let project = this.#store.linkProject(registered, source);
 		try {
@@ -92,18 +124,19 @@ export class ProjectLinkService {
 		if (existing === undefined) {
 			throw new ProjectLinkError(`Project is not registered: ${projectIdOrCwd}`, "project_not_found");
 		}
+		const closeResults = await this.#closeProjectSessions(existing.id);
 		const projectionRemoved = await this.#removeProjection(existing);
 		const project = this.#store.unlinkProject(existing.id);
 		if (project === undefined) throw new Error(`Failed to unlink project registration: ${existing.id}`);
-		return { project, projectionRemoved };
+		return { project, projectionRemoved, closeResults };
 	}
 
 	listProjects(): readonly ProjectRegistration[] {
-		return this.#store.listProjects().filter(project => this.#isProjectAllowed(project));
+		return this.#store.listProjects().filter(project => isProjectAllowed(project, this.#allowedRoots));
 	}
 
 	listLinkedProjects(): readonly ProjectRegistration[] {
-		return this.#store.listLinkedProjects().filter(project => this.#isProjectAllowed(project));
+		return this.#store.listLinkedProjects().filter(project => isProjectAllowed(project, this.#allowedRoots));
 	}
 
 	async syncLinkedProjects(): Promise<SyncProjectSessionsResult> {
@@ -113,6 +146,7 @@ export class ProjectLinkService {
 			ownerUserId: this.#ownerUserId,
 			projects: this.listLinkedProjects(),
 			mappings: this.#mappings,
+			runtimeLocations: this.#runtimeLocations,
 		});
 		for (const folder of sync.folders) {
 			const project = this.#store.getProject(folder.projectId);
@@ -121,6 +155,12 @@ export class ProjectLinkService {
 			}
 		}
 		return sync;
+	}
+	async syncLinkedProject(projectId: string): Promise<SyncProjectSessionsResult> {
+		const project = this.listLinkedProjects().find(candidate => candidate.id === projectId);
+		if (project === undefined) throw new Error(`Linked project is unavailable for projection: ${projectId}`);
+		if (this.#repository === undefined) throw new Error("OpenWebUI projection repository is not configured");
+		return await this.#syncProject(project);
 	}
 
 	async reconcileOpenWebUIFolderLinks(input: ProjectReconcileInput = {}): Promise<ProjectReconcileResult> {
@@ -148,9 +188,43 @@ export class ProjectLinkService {
 			ownerUserId: this.#ownerUserId,
 			projects: [project],
 			mappings: this.#mappings,
+			runtimeLocations: this.#runtimeLocations,
 		});
 	}
 
+	async #closeProjectSessions(
+		projectId: string,
+	): Promise<readonly { readonly chatId: string; readonly result: SessionCloseResult }[]> {
+		if (this.#closeSession === undefined || this.#mappings === undefined) return [];
+		return await Promise.all(
+			this.#mappings
+				.entries()
+				.filter(mapping => mapping.projectId === projectId)
+				.map(async mapping => {
+					try {
+						return {
+							chatId: mapping.chatId,
+							result: await this.#closeSession!(mapping, {
+								ingressId: closeIngressId(`project-unlink:${projectId}`, mapping),
+								ingressHash: `project-unlink:${projectId}`,
+							}),
+						};
+					} catch (error) {
+						if (error instanceof Error && error.message.includes("conflicts")) throw error;
+						return {
+							chatId: mapping.chatId,
+							result: {
+								status: "uncertain",
+								message:
+									error instanceof Error
+										? error.message
+										: "GJC session close acknowledgement was not received.",
+							},
+						};
+					}
+				}),
+		);
+	}
 	async #removeProjection(project: ProjectRegistration): Promise<boolean> {
 		const deleteFolder = this.#repository?.deleteFolder;
 		if (deleteFolder === undefined) return false;
@@ -161,11 +235,6 @@ export class ProjectLinkService {
 		});
 		return true;
 	}
-
-	#isProjectAllowed(project: ProjectRegistration): boolean {
-		return this.#allowedRoots.some(root => isPathInsideRoot(project.cwd, root.realPath));
-	}
-
 	#restoreAfterFailedLink(projectId: string, previous: ProjectRegistration | undefined): void {
 		if (previous?.status === "linked") {
 			this.#store.linkProject(previous, previous.source);
@@ -175,38 +244,4 @@ export class ProjectLinkService {
 	}
 }
 
-export class ProjectLinkError extends Error {
-	readonly code: string;
-
-	constructor(message: string, code: string) {
-		super(message);
-		this.name = "ProjectLinkError";
-		this.code = code;
-	}
-}
-
-function isPathInsideRoot(targetPath: string, rootPath: string): boolean {
-	const relativePath = path.relative(rootPath, targetPath);
-	return relativePath === "" || (!relativePath.startsWith("..") && !path.isAbsolute(relativePath));
-}
-
-function sanitizeProjectInput(
-	input: RegisterProjectDirectoryInput,
-	source: ProjectRegistrationSource,
-): RegisterProjectDirectoryInput {
-	if (source !== "admin") return input;
-	return {
-		cwd: input.cwd,
-		...(input.name === undefined ? {} : { name: input.name }),
-		...(input.sessionRoot === undefined ? {} : { sessionRoot: input.sessionRoot }),
-	};
-}
-
-function isProjectPathValidationError(error: unknown): error is Error {
-	return (
-		error instanceof Error &&
-		(error.message.includes("outside allowed artifact roots") ||
-			error.message.includes("No allowed artifact roots configured") ||
-			error.message.includes("No existing parent found for path"))
-	);
-}
+export { assertProjectsAdmitted, ProjectLinkError } from "./project-admission";

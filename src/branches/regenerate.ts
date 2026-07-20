@@ -1,15 +1,19 @@
 import type { SessionMappingStore } from "../gjc/session-router";
 import type { RegisteredProject } from "../projects/registry";
 
-export type BranchRegenerateAction = "branch" | "fork";
-export type BranchRegenerateFallbackReason =
+export type BranchRegenerateAction = "branch" | "uncertain";
+export type BranchRegenerateUncertainReason =
 	| "missing-session-mapping"
+	| "missing-owner"
 	| "owner-mismatch"
 	| "project-mismatch"
 	| "session-mismatch"
 	| "missing-lineage-metadata"
 	| "missing-message-entry"
-	| "message-entry-mismatch";
+	| "message-entry-mismatch"
+	| "branch-candidate-absent"
+	| "branch-candidate-duplicate"
+	| "branch-candidate-drift";
 
 export interface BranchRegenerateMessageMetadata {
 	readonly gjc_adapter?: {
@@ -25,12 +29,12 @@ export interface BranchRegenerateMessageMetadata {
 }
 
 export interface ResolveBranchRegenerateInput {
-	readonly ownerUserId: string;
+	readonly ownerUserId?: string;
 	readonly project: RegisteredProject;
 	readonly chatId: string;
 	readonly messageId: string;
-	readonly mappings: SessionMappingStore;
-	readonly messageMetadata?: BranchRegenerateMessageMetadata;
+	readonly mappings: Pick<SessionMappingStore, "get">;
+	readonly messageMetadata?: unknown;
 }
 
 export type BranchRegenerateDecision =
@@ -40,49 +44,83 @@ export type BranchRegenerateDecision =
 			readonly sessionId: string;
 	  }
 	| {
-			readonly action: "fork";
-			readonly reason: BranchRegenerateFallbackReason;
+			/**
+			 * The lineage cannot safely be replayed. Callers must surface this
+			 * outcome; they must not substitute a CLI fork or another prompt.
+			 */
+			readonly action: "uncertain";
+			readonly reason: BranchRegenerateUncertainReason;
 			readonly sourceSessionId?: string;
 	  };
 
 export function resolveBranchRegenerateAction(input: ResolveBranchRegenerateInput): BranchRegenerateDecision {
 	const mapping = input.mappings.get(input.chatId);
 	if (mapping === undefined) {
-		return { action: "fork", reason: "missing-session-mapping" };
+		return { action: "uncertain", reason: "missing-session-mapping" };
 	}
 	if (mapping.projectId !== input.project.id) {
-		return { action: "fork", reason: "project-mismatch", sourceSessionId: mapping.sessionId };
+		return { action: "uncertain", reason: "project-mismatch", sourceSessionId: mapping.sessionId };
 	}
 
-	const adapterMetadata = input.messageMetadata?.gjc_adapter;
-	const metadataOwnerUserId = adapterMetadata?.ownerUserId ?? adapterMetadata?.owner_user_id;
+	if (input.ownerUserId === undefined || input.ownerUserId.trim().length === 0) {
+		return { action: "uncertain", reason: "missing-owner", sourceSessionId: mapping.sessionId };
+	}
+	const adapterMetadata = adapterMetadataFrom(input.messageMetadata);
+	const metadataOwnerUserId =
+		stringMetadata(adapterMetadata?.ownerUserId) ?? stringMetadata(adapterMetadata?.owner_user_id);
 	if (metadataOwnerUserId === undefined) {
-		return { action: "fork", reason: "missing-lineage-metadata", sourceSessionId: mapping.sessionId };
+		return { action: "uncertain", reason: "missing-lineage-metadata", sourceSessionId: mapping.sessionId };
 	}
 	if (metadataOwnerUserId !== input.ownerUserId) {
-		return { action: "fork", reason: "owner-mismatch", sourceSessionId: mapping.sessionId };
+		return { action: "uncertain", reason: "owner-mismatch", sourceSessionId: mapping.sessionId };
 	}
-	const metadataProjectId = adapterMetadata?.projectId ?? adapterMetadata?.project_id;
+	const metadataProjectId = stringMetadata(adapterMetadata?.projectId) ?? stringMetadata(adapterMetadata?.project_id);
 	if (metadataProjectId === undefined) {
-		return { action: "fork", reason: "missing-lineage-metadata", sourceSessionId: mapping.sessionId };
+		return { action: "uncertain", reason: "missing-lineage-metadata", sourceSessionId: mapping.sessionId };
 	}
 	if (metadataProjectId !== input.project.id) {
-		return { action: "fork", reason: "project-mismatch", sourceSessionId: mapping.sessionId };
+		return { action: "uncertain", reason: "project-mismatch", sourceSessionId: mapping.sessionId };
 	}
-	const metadataSessionId = adapterMetadata?.gjcSessionId ?? adapterMetadata?.session_id;
+	const metadataSessionId =
+		stringMetadata(adapterMetadata?.gjcSessionId) ?? stringMetadata(adapterMetadata?.session_id);
 	if (metadataSessionId === undefined) {
-		return { action: "fork", reason: "missing-lineage-metadata", sourceSessionId: mapping.sessionId };
+		return { action: "uncertain", reason: "missing-lineage-metadata", sourceSessionId: mapping.sessionId };
 	}
 	if (metadataSessionId !== mapping.sessionId) {
-		return { action: "fork", reason: "session-mismatch", sourceSessionId: mapping.sessionId };
+		return { action: "uncertain", reason: "session-mismatch", sourceSessionId: mapping.sessionId };
 	}
-	const gjcEntryId = adapterMetadata?.gjcEntryId;
+	const gjcEntryId = stringMetadata(adapterMetadata?.gjcEntryId);
 	if (gjcEntryId === undefined || gjcEntryId === null || gjcEntryId.length === 0) {
-		return { action: "fork", reason: "missing-message-entry", sourceSessionId: mapping.sessionId };
+		return { action: "uncertain", reason: "missing-message-entry", sourceSessionId: mapping.sessionId };
 	}
-	const expectedMessageId = adapterMetadata?.openwebuiMessageId ?? gjcEntryId;
+	const expectedMessageId = stringMetadata(adapterMetadata?.openwebuiMessageId) ?? gjcEntryId;
 	if (expectedMessageId !== input.messageId) {
-		return { action: "fork", reason: "message-entry-mismatch", sourceSessionId: mapping.sessionId };
+		return { action: "uncertain", reason: "message-entry-mismatch", sourceSessionId: mapping.sessionId };
 	}
 	return { action: "branch", gjcEntryId, sessionId: mapping.sessionId };
+}
+export function authorizeBranchRegenerateCandidate(
+	decision: Extract<BranchRegenerateDecision, { readonly action: "branch" }>,
+	candidates: readonly { readonly entryId: string; readonly source: Readonly<Record<string, unknown>> }[],
+): BranchRegenerateDecision {
+	const matches = candidates.filter(candidate => candidate.entryId === decision.gjcEntryId);
+	if (matches.length === 0)
+		return { action: "uncertain", reason: "branch-candidate-absent", sourceSessionId: decision.sessionId };
+	if (matches.length !== 1)
+		return { action: "uncertain", reason: "branch-candidate-duplicate", sourceSessionId: decision.sessionId };
+	const source = matches[0]?.source;
+	if (source?.id !== decision.gjcEntryId || source.type !== "message")
+		return { action: "uncertain", reason: "branch-candidate-drift", sourceSessionId: decision.sessionId };
+	return decision;
+}
+
+function adapterMetadataFrom(metadata: unknown): BranchRegenerateMessageMetadata["gjc_adapter"] | undefined {
+	if (typeof metadata !== "object" || metadata === null || Array.isArray(metadata)) return undefined;
+	const adapter = Reflect.get(metadata, "gjc_adapter");
+	if (typeof adapter !== "object" || adapter === null || Array.isArray(adapter)) return undefined;
+	return adapter as BranchRegenerateMessageMetadata["gjc_adapter"];
+}
+
+function stringMetadata(value: unknown): string | undefined {
+	return typeof value === "string" ? value : undefined;
 }

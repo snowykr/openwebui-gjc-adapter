@@ -52,7 +52,7 @@ describe("createAdapterRequestHandler attachments", () => {
 				runner: {
 					run(input) {
 						prompts.push(input.prompt);
-						return { content: "handled attachments" };
+						return { content: "handled attachments", model: "gjc/anthropic/claude-sonnet-4:low" };
 					},
 				},
 			},
@@ -99,7 +99,7 @@ describe("createAdapterRequestHandler attachments", () => {
 				runner: {
 					run(input) {
 						prompts.push(input.prompt);
-						return { content: "handled image" };
+						return { content: "handled image", model: "gjc/anthropic/claude-sonnet-4:low" };
 					},
 				},
 			},

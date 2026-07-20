@@ -11,7 +11,8 @@ import {
 	readSecretFromFd,
 	readSecretRecordFromFd,
 } from "../src/configure/credentials";
-import { writeInstalledConfig } from "../src/configure/private-config";
+import { parseCliArguments } from "../src/configure/grammar";
+import { validateInstalledConfig, writeInstalledConfig } from "../src/configure/private-config";
 
 function file(value: string): { directory: string; fd: number; cleanup: () => void } {
 	const directory = mkdtempSync(join(tmpdir(), "gjc-credentials-"));
@@ -32,6 +33,72 @@ function stream(isTTY: boolean, values: string[] = []): NodeJS.ReadStream & Node
 }
 
 describe("configure credential boundaries", () => {
+	test("accepts strict direct installed fields and rejects them in managed records", () => {
+		// Given: a complete installed record with the approved optional fields.
+		const base = {
+			version: 1,
+			installationId: "install",
+			adapterToken: "adapter",
+			readinessToken: "ready",
+			openWebUIApiUrl: "http://localhost:8080",
+			adapterProviderUrl: "http://localhost:8765/v1",
+			bindPort: 8765,
+		} as const;
+		// When/Then: existing mode accepts them, while managed mode rejects either field exactly.
+		expect(
+			validateInstalledConfig({
+				...base,
+				mode: "existing",
+				bindHost: "127.0.0.1",
+				gjcConfigDirName: ".gjc-direct",
+				gjcCodingAgentDir: "/opt/gjc-agent",
+			}),
+		).toMatchObject({ gjcConfigDirName: ".gjc-direct", gjcCodingAgentDir: "/opt/gjc-agent" });
+		for (const runtimeField of [{ gjcConfigDirName: ".gjc" }, { gjcCodingAgentDir: "/opt/gjc-agent" }]) {
+			expect(() =>
+				validateInstalledConfig({
+					...base,
+					mode: "managed",
+					bindHost: "0.0.0.0",
+					...runtimeField,
+				}),
+			).toThrow("managed configuration must not include GJC runtime location fields");
+		}
+		expect(() =>
+			validateInstalledConfig({
+				...base,
+				mode: "existing",
+				bindHost: "127.0.0.1",
+				gjcConfigDirName: ".gjc",
+				unknownRuntimeField: true,
+			}),
+		).toThrow("installed config contains unknown fields");
+	});
+
+	test("parses direct GJC location flags and rejects them together in managed mode", () => {
+		// Given: the two approved direct runtime-location flags.
+		const directArguments = [
+			"configure",
+			"existing",
+			"--gjc-config-dir-name",
+			".gjc-direct",
+			"--gjc-coding-agent-dir=/opt/gjc-agent",
+		];
+		// When/Then: existing mode preserves both values at the grammar boundary.
+		expect(parseCliArguments(directArguments)).toEqual({
+			kind: "configure",
+			mode: "existing",
+			options: { "gjc-config-dir-name": ".gjc-direct", "gjc-coding-agent-dir": "/opt/gjc-agent" },
+		});
+		// When/Then: managed mode rejects the same boundary before any credential or deployment work.
+		expect(() => parseCliArguments(["configure", "managed", "--gjc-config-dir-name", ".gjc"])).toThrow(
+			"managed configuration does not accept GJC runtime location overrides",
+		);
+		expect(() => parseCliArguments(["configure", "managed", "--gjc-coding-agent-dir", "/opt/gjc-agent"])).toThrow(
+			"managed configuration does not accept GJC runtime location overrides",
+		);
+	});
+
 	test("reads exactly one bounded secret from an injected FD", () => {
 		const input = file("token-value\n");
 		try {

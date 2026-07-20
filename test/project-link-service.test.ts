@@ -2,6 +2,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { resolveGjcRuntimeLocations } from "../src/configure/runtime-locations";
+import { resolveGjcSdkSessionRoot } from "../src/gjc/session-root";
 import { SessionMappingStore } from "../src/gjc/session-router";
 import {
 	InMemoryOpenWebUIProjectionRepository,
@@ -25,6 +27,39 @@ afterEach(async () => {
 });
 
 describe("project link registration", () => {
+	test("dynamically linked projects import current-dev SDK transcripts", async () => {
+		// Given: a transcript in the runtime agent directory before an admin project link.
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-link-sdk-root-"));
+		tempDirs.push(workspace);
+		const home = path.join(workspace, "home");
+		const projectDirectory = path.join(workspace, "SDK Project");
+		await fs.mkdir(home);
+		await fs.mkdir(projectDirectory);
+		const runtimeLocations = resolveGjcRuntimeLocations({ mode: "existing", serviceHome: home });
+		const sdkSessionRoot = resolveGjcSdkSessionRoot(projectDirectory, runtimeLocations);
+		await fs.mkdir(sdkSessionRoot, { recursive: true });
+		await writeSessionFile(path.join(sdkSessionRoot, "linked-sdk.jsonl"), {
+			header: { id: "linked-sdk", title: "Linked SDK", cwd: projectDirectory },
+			entries: [messageEntry("linked-user", null, "user", "linked SDK transcript")],
+		});
+		const service = new ProjectLinkService({
+			allowedRoots: await resolveAllowedRoots([workspace]),
+			store: new SqliteProjectRegistrationStore(":memory:"),
+			repository: new InMemoryOpenWebUIProjectionRepository(),
+			ownerUserId: "owner-1",
+			protectedPaths: runtimeLocations.protectedProjectPaths,
+			runtimeLocations,
+		});
+
+		// When: the project is dynamically linked.
+		const linked = await service.linkProject({ cwd: projectDirectory, name: "SDK Project" });
+
+		// Then: link-time historical sync discovers the SDK transcript.
+		expect(linked.sync.imported).toMatchObject([
+			{ sessionId: "linked-sdk", sessionFile: path.join(sdkSessionRoot, "linked-sdk.jsonl") },
+		]);
+	});
+
 	test("keeps an explicit unlink across env seeding until the project is linked again", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-link-store-"));
 		tempDirs.push(workspace);
@@ -67,6 +102,7 @@ describe("project link registration", () => {
 			repository,
 			mappings: new SessionMappingStore(),
 			ownerUserId: "owner-1",
+			protectedPaths: protectedPathsFor(workspace),
 		});
 
 		const linked = await service.linkProject({ cwd: projectDirectory, name: "Demo Project" });
@@ -111,6 +147,7 @@ describe("project link registration", () => {
 			repository,
 			mappings: new SessionMappingStore(),
 			ownerUserId: "owner-1",
+			protectedPaths: protectedPathsFor(workspace),
 		});
 		await service.linkProject({ cwd: projectDirectory, name: "Deleted In UI" });
 
@@ -147,6 +184,7 @@ describe("project link registration", () => {
 			store: new SqliteProjectRegistrationStore(":memory:"),
 			repository,
 			ownerUserId: "owner-1",
+			protectedPaths: protectedPathsFor(workspace),
 		});
 
 		await service.linkProject({ cwd: projectDirectory, name: "HTTP Project" });
@@ -172,6 +210,7 @@ describe("project link registration", () => {
 			store,
 			repository,
 			ownerUserId: "owner-1",
+			protectedPaths: protectedPathsFor(workspace),
 		});
 		await service.linkProject({ cwd: projectDirectory, name: "Env Runtime Folder" });
 		const envProject = await registerProjectDirectory(
@@ -179,7 +218,7 @@ describe("project link registration", () => {
 			allowedRoots,
 		);
 
-		service.seedConfiguredProjects([envProject]);
+		await service.seedConfiguredProjects([envProject]);
 
 		expect(service.listProjects()).toMatchObject([
 			{ id: "env-runtime-folder", openWebUIFolderId: "openwebui-runtime-folder" },
@@ -194,11 +233,16 @@ describe("project link registration", () => {
 			allowedRoots: await resolveAllowedRoots([workspace]),
 			store: new SqliteProjectRegistrationStore(":memory:"),
 			ownerUserId: "owner-1",
+			protectedPaths: protectedPathsFor(workspace),
 		});
 
 		await expect(service.linkProject({ cwd: outside, name: "Outside" })).rejects.toThrow("outside allowed");
 	});
 });
+
+function protectedPathsFor(workspace: string) {
+	return resolveGjcRuntimeLocations({ mode: "existing", serviceHome: workspace }).protectedProjectPaths;
+}
 
 class FolderIdRemappingRepository implements OpenWebUIProjectionRepository {
 	readonly deletedFolders: string[] = [];

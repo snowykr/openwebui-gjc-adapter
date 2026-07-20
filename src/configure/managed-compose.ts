@@ -1,3 +1,6 @@
+import type { GjcRuntimeLocations } from "../contracts";
+import { resolveGjcRuntimeLocations } from "./runtime-locations";
+
 export interface CommandResult {
 	readonly exitCode: number;
 	readonly stdout: string;
@@ -53,6 +56,10 @@ export interface ManagedComposeRenderInput {
 	readonly uid?: number;
 	readonly gid?: number;
 	readonly projectName?: string;
+	readonly runtimeLocations?: GjcRuntimeLocations;
+}
+export interface ResolvedManagedComposeRenderInput extends ManagedComposeRenderInput {
+	readonly runtimeLocations: GjcRuntimeLocations;
 }
 export interface ManagedAdapterImagePlan {
 	readonly image: string;
@@ -73,6 +80,11 @@ export function managedAdapterImagePlan(
 }
 /** Render only; Docker is intentionally never invoked here. */
 export function renderManagedCompose(input: ManagedComposeRenderInput): string {
+	const runtimeLocations = input.runtimeLocations ?? resolveGjcRuntimeLocations({ mode: "managed" });
+	return renderResolvedManagedCompose({ ...input, runtimeLocations });
+}
+export function renderResolvedManagedCompose(input: ResolvedManagedComposeRenderInput): string {
+	if (input.runtimeLocations === undefined) throw new TypeError("resolved runtime locations are required");
 	const port = input.openWebUIPort ?? 8080;
 	if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Ports must be between 1 and 65535");
 	const uid = input.uid ?? 1000,
@@ -84,6 +96,7 @@ export function renderManagedCompose(input: ManagedComposeRenderInput): string {
 		configName = configFile.split("/").pop() ?? "config.json",
 		data = input.openWebUIDataVolume ?? "openwebui-data",
 		project = input.projectName ?? "openwebui-gjc-adapter";
+	const locations = input.runtimeLocations;
 	return `name: ${yaml(project)}
 services:
   adapter:
@@ -92,6 +105,9 @@ services:
     expose:
       - "8765"
     environment:
+      HOME: ${yaml(locations.childEnvironment.HOME)}
+      GJC_CONFIG_DIR: ${yaml(locations.childEnvironment.GJC_CONFIG_DIR)}
+      GJC_CODING_AGENT_DIR: ${yaml(locations.childEnvironment.GJC_CODING_AGENT_DIR)}
       GJC_OPENWEBUI_BIND_HOST: 0.0.0.0
       GJC_OPENWEBUI_BIND_PORT: "8765"
       GJC_OPENWEBUI_BASE_URL: http://openwebui:8080
@@ -109,6 +125,8 @@ services:
       com.gjc.managed: "true"
       com.gjc.role: adapter
       com.gjc.project: ${yaml(project)}
+      com.gjc.reader-workspace: ${yaml(locations.readerWorkspace)}
+      com.gjc.reader-session-root: ${yaml(locations.readerSessionRoot)}
     secrets:
       - adapter-token
   openwebui:

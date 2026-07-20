@@ -1,80 +1,135 @@
-import type { SessionEntry, SessionHeader } from "@gajae-code/coding-agent";
-import { loadEntriesFromFile } from "@gajae-code/coding-agent";
+import { readdir, realpath } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { loadHeldGjcSessionFile } from "./session-discovery-reader";
+import { GjcSessionLoadError, type LoadedGjcSessionFile } from "./session-loader-contract";
 
-export type GjcSessionLoadDiagnosticCode = "missing_session_header" | "empty_session_file" | "corrupt_session_file";
+export type {
+	GjcSessionLoadDiagnostic,
+	GjcSessionLoadDiagnosticCode,
+	LoadedGjcSessionFile,
+} from "./session-loader-contract";
+export { GjcSessionLoadError } from "./session-loader-contract";
 
-export interface GjcSessionLoadDiagnostic {
-	code: GjcSessionLoadDiagnosticCode;
-	message: string;
-	filePath: string;
+/** Validates an absolute canonical JSONL selector without deriving a session identity. */
+export function validateAbsoluteGjcSessionPath(filePath: string): string {
+	if (!isAbsolute(filePath) || !filePath.endsWith(".jsonl")) {
+		throw new GjcSessionLoadError(filePath, [
+			{
+				code: "invalid_session_header",
+				message: `GJC session path must be an absolute .jsonl file: ${filePath}`,
+				filePath,
+			},
+		]);
+	}
+	return resolve(filePath);
 }
 
-export interface LoadedGjcSessionFile {
-	filePath: string;
-	header: SessionHeader;
-	entries: SessionEntry[];
-	diagnostics: GjcSessionLoadDiagnostic[];
+export async function loadAbsoluteGjcSessionFile(filePath: string): Promise<LoadedGjcSessionFile> {
+	return loadGjcSessionFile(validateAbsoluteGjcSessionPath(filePath));
 }
 
-export class GjcSessionLoadError extends Error {
-	readonly filePath: string;
-	readonly diagnostics: GjcSessionLoadDiagnostic[];
-	readonly cause: unknown;
+/**
+ * Finds the one newly-created, validated session transcript whose immutable header
+ * proves the CLI-reported session identity. Ambiguous discovery is deliberately an error.
+ */
+export async function discoverFreshGjcSessionFile(
+	sessionRoot: string,
+	baselinePaths: ReadonlySet<string>,
+	expectedSessionId: string,
+	expectedCwd: string,
+): Promise<LoadedGjcSessionFile> {
+	const root = await canonicalGjcSessionRoot(sessionRoot);
+	const names = await readSessionRoot(root);
+	const matches: LoadedGjcSessionFile[] = [];
+	for (const name of names) {
+		if (!name.endsWith(".jsonl")) continue;
+		const candidate = join(root, name);
+		if (baselinePaths.has(candidate)) continue;
+		try {
+			const loaded = await loadHeldGjcSessionFile(root, validateGjcSessionPathWithinRoot(root, candidate));
+			if (loaded.header.id === expectedSessionId && loaded.header.cwd === expectedCwd) matches.push(loaded);
+		} catch {
+			// An unrelated partial/corrupt transcript cannot prove this attachment.
+		}
+	}
+	if (matches.length !== 1) {
+		throw new GjcSessionLoadError(root, [
+			{
+				code: "corrupt_session_file",
+				message: `Expected exactly one fresh JSONL transcript for CLI session ${expectedSessionId} in ${expectedCwd}; found ${matches.length}`,
+				filePath: root,
+			},
+		]);
+	}
+	return matches[0]!;
+}
 
-	constructor(filePath: string, diagnostics: GjcSessionLoadDiagnostic[], cause?: unknown) {
-		super(
-			diagnostics.map(diagnostic => diagnostic.message).join("; ") || `Failed to load GJC session file: ${filePath}`,
+export async function snapshotGjcSessionFiles(sessionRoot: string): Promise<ReadonlySet<string>> {
+	const root = await canonicalGjcSessionRoot(sessionRoot);
+	const names = await readSessionRoot(root);
+	const paths = new Set<string>();
+	for (const name of names) {
+		if (name.endsWith(".jsonl")) paths.add(join(root, name));
+	}
+	return paths;
+}
+
+export function validateGjcSessionPathWithinRoot(sessionRoot: string, filePath: string): string {
+	const root = validateAbsoluteGjcSessionRoot(sessionRoot);
+	const canonicalPath = validateAbsoluteGjcSessionPath(filePath);
+	const pathFromRoot = relative(root, canonicalPath);
+	if (
+		pathFromRoot.length === 0 ||
+		pathFromRoot === ".." ||
+		pathFromRoot.startsWith(`..${"/"}`) ||
+		isAbsolute(pathFromRoot)
+	) {
+		throw new GjcSessionLoadError(filePath, [
+			{
+				code: "invalid_session_header",
+				message: `GJC session path must be within session root ${root}: ${filePath}`,
+				filePath,
+			},
+		]);
+	}
+	return canonicalPath;
+}
+
+function validateAbsoluteGjcSessionRoot(sessionRoot: string): string {
+	if (!isAbsolute(sessionRoot)) {
+		throw new GjcSessionLoadError(sessionRoot, [
+			{ code: "invalid_session_header", message: "GJC session root must be absolute", filePath: sessionRoot },
+		]);
+	}
+	return resolve(sessionRoot);
+}
+
+async function canonicalGjcSessionRoot(sessionRoot: string): Promise<string> {
+	const root = validateAbsoluteGjcSessionRoot(sessionRoot);
+	try {
+		return await realpath(root);
+	} catch (error) {
+		throw new GjcSessionLoadError(
+			root,
+			[{ code: "corrupt_session_file", message: `Cannot resolve GJC session root ${root}`, filePath: root }],
+			error,
 		);
-		this.name = "GjcSessionLoadError";
-		this.filePath = filePath;
-		this.diagnostics = diagnostics;
-		this.cause = cause;
+	}
+}
+
+async function readSessionRoot(root: string): Promise<string[]> {
+	try {
+		return await readdir(root);
+	} catch (error) {
+		throw new GjcSessionLoadError(
+			root,
+			[{ code: "corrupt_session_file", message: `Cannot read GJC session root ${root}`, filePath: root }],
+			error,
+		);
 	}
 }
 
 export async function loadGjcSessionFile(filePath: string): Promise<LoadedGjcSessionFile> {
-	try {
-		const fileEntries = await loadEntriesFromFile(filePath);
-		if (fileEntries.length === 0) {
-			throw new GjcSessionLoadError(filePath, [
-				{
-					code: "empty_session_file",
-					message: `No valid GJC session entries found in ${filePath}`,
-					filePath,
-				},
-			]);
-		}
-
-		const [firstEntry] = fileEntries;
-		const sessionEntries = fileEntries.slice(1) as SessionEntry[];
-		if (firstEntry.type !== "session") {
-			throw new GjcSessionLoadError(filePath, [
-				{
-					code: "missing_session_header",
-					message: `GJC session file ${filePath} does not start with a session header`,
-					filePath,
-				},
-			]);
-		}
-
-		return {
-			filePath,
-			header: firstEntry,
-			entries: sessionEntries,
-			diagnostics: [],
-		};
-	} catch (error) {
-		if (error instanceof GjcSessionLoadError) throw error;
-		throw new GjcSessionLoadError(
-			filePath,
-			[
-				{
-					code: "corrupt_session_file",
-					message: `Failed to load GJC session file ${filePath}`,
-					filePath,
-				},
-			],
-			error,
-		);
-	}
+	const candidate = validateAbsoluteGjcSessionPath(filePath);
+	return loadHeldGjcSessionFile(dirname(candidate), candidate);
 }

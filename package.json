@@ -19,7 +19,7 @@
 		"openwebui-gjc-adapter": "./bin/openwebui-gjc-adapter"
 	},
 	"scripts": {
-		"start": "bun run src/cli.ts",
+		"start": "bun src/cli.ts",
 		"check": "biome check . && bun run check:types",
 		"check:types": "tsgo -p tsconfig.json --noEmit",
 		"lint": "biome lint .",
@@ -28,8 +28,10 @@
 		"fmt": "biome format --write ."
 	},
 	"dependencies": {
-		"@gajae-code/ai": "0.9.6",
-		"@gajae-code/coding-agent": "0.9.6"
+		"@gajae-code/ai": "0.11.4",
+		"@gajae-code/bridge-client": "0.11.4",
+		"@gajae-code/coding-agent": "0.11.4",
+		"@gajae-code/natives": "0.11.4"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.4.14",
@@ -77,14 +79,27 @@
 			"types": "./src/security/*.ts",
 			"import": "./src/security/*.ts"
 		},
-		"./gjc/*": {
-			"types": "./src/gjc/*.ts",
-			"import": "./src/gjc/*.ts"
+		"./gjc/public-sdk-contract": {
+			"types": "./src/gjc/public-sdk-contract.ts",
+			"import": "./src/gjc/public-sdk-contract.ts"
 		},
-		"./live/*": {
-			"types": "./src/live/*.ts",
-			"import": "./src/live/*.ts"
+		"./live/chat-completions": {
+			"types": "./src/live/chat-completions.ts",
+			"import": "./src/live/chat-completions.ts"
 		},
+		"./live/gjc-routing-runner": {
+			"types": "./src/live/gjc-routing-runner.ts",
+			"import": "./src/live/gjc-routing-runner.ts"
+		},
+		"./live/models": {
+			"types": "./src/live/models.ts",
+			"import": "./src/live/models.ts"
+		},
+		"./live/openai-types": {
+			"types": "./src/live/openai-types.ts",
+			"import": "./src/live/openai-types.ts"
+		},
+		"./live/*": null,
 		"./projection/*": {
 			"types": "./src/projection/*.ts",
 			"import": "./src/projection/*.ts"

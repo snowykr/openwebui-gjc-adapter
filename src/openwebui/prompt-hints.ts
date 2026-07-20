@@ -234,7 +234,8 @@ export function promptHintsPayloadMatches(value: unknown): boolean {
 
 export function promptHintsFromConfig(value: unknown): unknown {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-	return (value as { default_prompt_suggestions?: unknown }).default_prompt_suggestions;
+	const config = value as { default_prompt_suggestions?: unknown };
+	return Object.hasOwn(config, "default_prompt_suggestions") ? config.default_prompt_suggestions : [];
 }
 
 export function mergePromptHints(existing: unknown): OpenWebUIPromptHintsPayload | undefined {
