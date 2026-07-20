@@ -1,3 +1,5 @@
+import { rm } from "node:fs/promises";
+import { join } from "node:path";
 export interface RealSelectionSdkServer {
 	readonly url: string;
 	readonly token: string;
@@ -8,12 +10,18 @@ interface SelectionSocketData {
 	readonly sessionId: string;
 	readonly cwd: string;
 }
+interface Selection {
+	readonly provider: string;
+	readonly modelId: string;
+	readonly thinkingLevel: string;
+}
 
 export function startRealSelectionSdkServer(coordinatorUrl: string): RealSelectionSdkServer {
 	const token = "selection-sdk-token";
 	let pendingGate = false;
 	let pendingCorrelation: Readonly<{ commandId: string; turnId: string }> | undefined;
 	let sequence = 0;
+	const sessionSelections = new Map<string, Selection>();
 	const server = Bun.serve<SelectionSocketData>({
 		hostname: "127.0.0.1",
 		port: 0,
@@ -70,15 +78,17 @@ export function startRealSelectionSdkServer(coordinatorUrl: string): RealSelecti
 			if (query === "models.list/current") {
 				const payload = await fetchRecord(`${coordinatorUrl}/catalog`);
 				if (!Array.isArray(payload.models)) throw new TypeError("catalog query failed");
-				items = payload.models;
+				const selection = sessionSelections.get(socket.data.sessionId);
+				items =
+					selection === undefined ? payload.models : payload.models.map(item => currentModelRow(item, selection));
 			} else if (query === "session.metadata") {
 				items = [{ sessionId: socket.data.sessionId, cwd: socket.data.cwd, kind: "saved" }];
 			} else if (query === "config.list/get") {
-				const selection = await fetchRecord(`${coordinatorUrl}/state`);
+				const selection = selectionFromRecord(await fetchRecord(`${coordinatorUrl}/state`));
 				items = [
 					{
-						model: `${requiredString(selection, "provider")}/${requiredString(selection, "modelId")}`,
-						thinking: requiredString(selection, "thinkingLevel"),
+						model: `${selection.provider}/${selection.modelId}`,
+						thinking: selection.thinkingLevel,
 					},
 				];
 			} else if (query === "session.last_assistant") {
@@ -121,7 +131,34 @@ export function startRealSelectionSdkServer(coordinatorUrl: string): RealSelecti
 				sendFailure(socket, id, "model_set_failed", "scripted setter failure");
 				return;
 			}
+			sessionSelections.set(socket.data.sessionId, selectionFromRecord(payload.selection));
 			socket.send(JSON.stringify({ type: "control_response", id, ok: true, result: payload.selection }));
+			return;
+		}
+		if (operation === "thinking.set") {
+			const selection =
+				sessionSelections.get(socket.data.sessionId) ?? selectionFromRecord(await fetchRecord(`${coordinatorUrl}/state`));
+			const response = await fetch(`${coordinatorUrl}/setter`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					provider: selection.provider,
+					modelId: selection.modelId,
+					thinkingLevel: requiredString(input, "level"),
+				}),
+			});
+			const payload: unknown = await response.json();
+			if (!response.ok || !isRecord(payload) || !isRecord(payload.selection)) {
+				sendFailure(socket, id, "thinking_set_failed", "scripted thinking setter failure");
+				return;
+			}
+			sessionSelections.set(socket.data.sessionId, selectionFromRecord(payload.selection));
+			socket.send(JSON.stringify({ type: "control_response", id, ok: true, result: payload.selection }));
+			return;
+		}
+		if (operation === "session.close") {
+			await rm(join(socket.data.cwd, ".gjc", "state", "sdk", `${socket.data.sessionId}.json`), { force: true });
+			socket.send(JSON.stringify({ type: "control_response", id, ok: true, result: { closed: true } }));
 			return;
 		}
 		if (operation === "turn.prompt") {
@@ -138,6 +175,7 @@ export function startRealSelectionSdkServer(coordinatorUrl: string): RealSelecti
 			socket.send(
 				JSON.stringify({ type: "control_response", id, ok: true, result: { accepted: true, ...correlation } }),
 			);
+			await immediate();
 			if (payload.gate === true) {
 				pendingGate = true;
 				pendingCorrelation = correlation;
@@ -159,6 +197,7 @@ export function startRealSelectionSdkServer(coordinatorUrl: string): RealSelecti
 			await fetchRecord(`${coordinatorUrl}/gate`, { method: "POST" });
 			pendingGate = false;
 			socket.send(JSON.stringify({ type: "control_response", id, ok: true, result: { status: "accepted" } }));
+			await immediate();
 			if (pendingCorrelation === undefined) throw new TypeError("gate correlation is unavailable");
 			socket.send(JSON.stringify({ type: "agent_end", sessionId: socket.data.sessionId, ...pendingCorrelation }));
 			pendingCorrelation = undefined;
@@ -173,6 +212,9 @@ async function fetchRecord(url: string, init?: RequestInit): Promise<Record<stri
 	const payload: unknown = await response.json();
 	if (!response.ok || !isRecord(payload)) throw new TypeError("coordinator request failed");
 	return payload;
+}
+function immediate(): Promise<void> {
+	return new Promise(resolve => setImmediate(resolve));
 }
 
 function parseFrame(raw: string): Record<string, unknown> {
@@ -196,6 +238,22 @@ function sendFailure(
 	socket.send(JSON.stringify({ type: "control_response", id, ok: false, error: { code, message } }));
 }
 
+function selectionFromRecord(value: Record<string, unknown>): Selection {
+	return {
+		provider: requiredString(value, "provider"),
+		modelId: requiredString(value, "modelId"),
+		thinkingLevel: requiredString(value, "thinkingLevel"),
+	};
+}
+function currentModelRow(value: unknown, selection: Selection): unknown {
+	if (!isRecord(value)) throw new TypeError("catalog model must be an object");
+	const current = value.provider === selection.provider && value.id === selection.modelId;
+	return {
+		...value,
+		current,
+		...(current ? { currentThinkingLevel: selection.thinkingLevel } : {}),
+	};
+}
 function parseAuthorityToken(value: string | null, expectedPrefix: string): SelectionSocketData | undefined {
 	if (value === null || !value.startsWith(`${expectedPrefix}.`)) return undefined;
 	try {

@@ -9,7 +9,7 @@ describe("SDK v3 client boundaries", () => {
 		["malformed JSON", "{"],
 		["wrong protocol version", JSON.stringify({ type: "server_hello", protocolVersion: 2 })],
 		["error before hello", JSON.stringify({ type: "error", code: "unauthorized", message: "denied" })],
-	])("Given %s before hello When reconnecting Then the invalid socket is closed and never reused", async (_caseName, firstFrame) => {
+	])("Given %s before hello When reconnecting Then the released client retries until a hello is accepted", async (_caseName, firstFrame) => {
 		// Given
 		let connections = 0;
 		let firstConnectionClosed = false;
@@ -51,15 +51,15 @@ describe("SDK v3 client boundaries", () => {
 
 		try {
 			// When
-			await expect(client.connect(200)).rejects.toBeInstanceOf(SdkV3ProtocolError);
+			await client.connect(500);
 			const items = await client.queryAll("models.list/current", {}, 200);
 
 			// Then
 			expect(items).toEqual(["reconnected"]);
-			expect(connections).toBe(2);
-			expect(firstConnectionClosed).toBe(true);
+			expect(connections).toBe(_caseName === "wrong protocol version" ? 1 : 2);
+			expect(firstConnectionClosed).toBe(_caseName !== "wrong protocol version");
 		} finally {
-			client.close();
+			client.detach();
 			server.stop(true);
 		}
 	});
@@ -79,6 +79,7 @@ describe("SDK v3 client boundaries", () => {
 		const client = new SdkV3Client({ url: server.url, token: "test" });
 
 		try {
+			await client.connect(200);
 			// When
 			const result = client.queryAll("models.list/current", {}, 200);
 
@@ -86,7 +87,7 @@ describe("SDK v3 client boundaries", () => {
 			await expect(result).rejects.toBeInstanceOf(SdkV3ProtocolError);
 			expect(requests).toBe(2);
 		} finally {
-			client.close();
+			client.detach();
 			server.stop();
 		}
 	});
@@ -106,6 +107,7 @@ describe("SDK v3 client boundaries", () => {
 		const client = new SdkV3Client({ url: server.url, token: "test" });
 
 		try {
+			await client.connect(2_000);
 			// When
 			const result = client.queryAll("models.list/current", {}, 2_000);
 
@@ -113,7 +115,7 @@ describe("SDK v3 client boundaries", () => {
 			await expect(result).rejects.toBeInstanceOf(SdkV3ProtocolError);
 			expect(requests).toBe(256);
 		} finally {
-			client.close();
+			client.detach();
 			server.stop();
 		}
 	});
@@ -129,13 +131,14 @@ describe("SDK v3 client boundaries", () => {
 		const client = new SdkV3Client({ url: server.url, token: "test" });
 
 		try {
+			await client.connect(2_000);
 			// When
 			const result = client.queryAll("models.list/current", {}, 2_000);
 
 			// Then
 			await expect(result).rejects.toBeInstanceOf(SdkV3ProtocolError);
 		} finally {
-			client.close();
+			client.detach();
 			server.stop();
 		}
 	});
@@ -174,6 +177,7 @@ describe("SDK v3 client boundaries", () => {
 		const client = new SdkV3Client({ url: `ws://127.0.0.1:${server.port}`, token: "test" });
 
 		try {
+			await client.connect(60);
 			// When
 			const result = client.queryAll("models.list/current", {}, 60);
 
@@ -181,7 +185,7 @@ describe("SDK v3 client boundaries", () => {
 			await expect(result).rejects.toMatchObject({ code: "timeout" });
 			expect(requests).toBe(2);
 		} finally {
-			client.close();
+			client.detach();
 			server.stop(true);
 		}
 	});

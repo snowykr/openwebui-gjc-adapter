@@ -8,11 +8,12 @@ import type {
 	GjcSwitchSessionInput,
 	GjcTurnResult,
 	GjcTurnRunner,
-} from "../src/gjc/rpc-runner";
+} from "../src/gjc/turn-runner";
 import { SessionMappingStore } from "../src/gjc/session-router";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
 import type { RegisteredProject } from "../src/projects/registry";
 import { staticModelReaderFactory } from "./model-selection-fixtures";
+import { attachmentProof, lifecycleFixture } from "./gjc-lifecycle-fixtures";
 
 class FakeGjcTurnRunner implements GjcTurnRunner {
 	events: GjcTurnResult["events"] = [{ type: "assistant", text: "assistant from gjc" }];
@@ -23,8 +24,11 @@ class FakeGjcTurnRunner implements GjcTurnRunner {
 		eventCursor: 3,
 	};
 
-	async startNewSession(input: GjcStartNewSessionInput): Promise<GjcSessionAddress & GjcTurnResult> {
-		return {
+	async startNewSession<T>(
+		input: GjcStartNewSessionInput,
+		publish: (result: GjcSessionAddress & GjcTurnResult, lifecycle: ReturnType<typeof lifecycleFixture>) => Promise<T>,
+	): Promise<T> {
+		const result = {
 			cwd: input.cwd,
 			sessionRoot: input.sessionRoot,
 			projectId: input.projectId,
@@ -38,6 +42,7 @@ class FakeGjcTurnRunner implements GjcTurnRunner {
 			eventCursor: 3,
 			...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
 		};
+		return await publish({ ...result, attachment: attachmentProof(result) }, lifecycleFixture(result));
 	}
 
 	async continueSession(input: GjcContinueSessionInput): Promise<GjcTurnResult> {

@@ -2,12 +2,7 @@ import type { NormalizedModelSelection } from "../src/contracts";
 import type { OpenAIErrorResponse } from "../src/live/chat-response-format";
 import { decodeStrictModelCatalog, formatCanonicalModelId, parseCanonicalModelId } from "../src/live/models";
 import { isSseChoice } from "./real-selection-openai-schemas";
-import { parseRpcOutput, parseRpcRequest, type RpcPayload } from "./real-selection-rpc-schemas";
-
-export { parseRpcRequest } from "./real-selection-rpc-schemas";
-
 type MappingDocument = Record<string, unknown> & { readonly mappings: readonly Record<string, unknown>[] };
-type TranscriptEntry = { readonly direction: "request" | "response" | "frame"; readonly payload: RpcPayload };
 
 import type { OpenAIChatCompletionResponse, OpenAIModelListResponse } from "../src/live/openai-types";
 
@@ -102,26 +97,29 @@ export function parseMappingDocument(value: unknown, chatIdToUnbind?: string): M
 	return {
 		...value,
 		mappings: mappings.map(mapping => {
+			if (Reflect.get(mapping, "chatId") !== chatIdToUnbind) return mapping;
 			const copy = { ...mapping };
-			if (Reflect.get(copy, "chatId") === chatIdToUnbind) Reflect.deleteProperty(copy, "modelSelection");
+			Reflect.deleteProperty(copy, "modelSelection");
+			const journal = Reflect.get(copy, "journal");
+			if (Array.isArray(journal)) {
+				copy.journal = journal.map(operation => removeModelSelectionFromOperation(operation, chatIdToUnbind));
+			}
 			return copy;
 		}),
 	};
 }
 
-export function parseTranscriptEntry(value: unknown): TranscriptEntry {
-	if (!isRecord(value)) throw new TypeError("invalid transcript entry");
-	const direction = Reflect.get(value, "direction");
-	const payload = Reflect.get(value, "payload");
-	if ((direction !== "request" && direction !== "response" && direction !== "frame") || !isRecord(payload)) {
-		throw new TypeError("invalid transcript fields");
-	}
-	if (typeof Reflect.get(payload, "type") !== "string") throw new TypeError("invalid transcript payload");
-	if (direction === "request") parseRpcRequest(payload);
-	else if (direction === "frame") parseEventFrame(payload);
-	else parseRpcOutput(payload);
-	return { direction, payload: { ...payload, type: String(Reflect.get(payload, "type")) } };
+function removeModelSelectionFromOperation(operation: unknown, chatId: string | undefined): unknown {
+	if (!isRecord(operation)) return operation;
+	const result = Reflect.get(operation, "result");
+	if (!isRecord(result)) return operation;
+	const mapping = Reflect.get(result, "mapping");
+	if (!isRecord(mapping) || Reflect.get(mapping, "chatId") !== chatId) return operation;
+	const mappingCopy = { ...mapping };
+	Reflect.deleteProperty(mappingCopy, "modelSelection");
+	return { ...operation, result: { ...result, mapping: mappingCopy } };
 }
+
 
 export function parseCoordinatorCatalog(value: unknown): readonly object[] {
 	const models = isRecord(value) ? Reflect.get(value, "models") : undefined;
@@ -211,25 +209,4 @@ function isNormalizedSelection(value: unknown): value is NormalizedModelSelectio
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function parseEventFrame(value: Record<string, unknown>): void {
-	const payload = Reflect.get(value, "payload");
-	const event = isRecord(payload) ? Reflect.get(payload, "event") : undefined;
-	const eventType = isRecord(payload) ? Reflect.get(payload, "event_type") : undefined;
-	if (
-		Reflect.get(value, "type") !== "event" ||
-		Reflect.get(value, "protocol_version") !== 2 ||
-		typeof Reflect.get(value, "session_id") !== "string" ||
-		!Number.isSafeInteger(Reflect.get(value, "seq")) ||
-		Number(Reflect.get(value, "seq")) < 1 ||
-		typeof Reflect.get(value, "frame_id") !== "string" ||
-		!isRecord(payload) ||
-		typeof eventType !== "string" ||
-		!isRecord(event) ||
-		Reflect.get(event, "type") !== eventType ||
-		(eventType === "agent_end" &&
-			(!Array.isArray(Reflect.get(event, "messages")) || typeof Reflect.get(event, "stopReason") !== "string"))
-	)
-		throw new TypeError("invalid RPC event frame");
 }

@@ -28,8 +28,10 @@
 		"fmt": "biome format --write ."
 	},
 	"dependencies": {
-		"@gajae-code/ai": "0.10.1",
-		"@gajae-code/coding-agent": "0.10.1"
+		"@gajae-code/ai": "0.11.2",
+		"@gajae-code/bridge-client": "0.11.2",
+		"@gajae-code/coding-agent": "0.11.2",
+		"@gajae-code/natives": "0.11.2"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.4.14",
@@ -46,7 +48,6 @@
 		"CHANGELOG.md",
 		"bin",
 		"Dockerfile.adapter",
-		"patches",
 		"bun.lock"
 	],
 	"exports": {
@@ -78,9 +79,9 @@
 			"types": "./src/security/*.ts",
 			"import": "./src/security/*.ts"
 		},
-		"./gjc/*": {
-			"types": "./src/gjc/*.ts",
-			"import": "./src/gjc/*.ts"
+		"./gjc/public-sdk-contract": {
+			"types": "./src/gjc/public-sdk-contract.ts",
+			"import": "./src/gjc/public-sdk-contract.ts"
 		},
 		"./live/*": {
 			"types": "./src/live/*.ts",

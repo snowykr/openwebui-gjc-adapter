@@ -1,0 +1,121 @@
+name: Run GJC release compatibility lane
+
+on:
+  workflow_call:
+    inputs:
+      lane:
+        required: true
+        type: string
+      trigger:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+      natives_version:
+        required: true
+        type: string
+      tag:
+        required: false
+        type: string
+      commit:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      BUN_INSTALL: ${{ runner.temp }}/bun
+      BUN_INSTALL_CACHE_DIR: ${{ runner.temp }}/bun-cache
+      HOME: ${{ runner.temp }}/home
+      GJC_COMPAT_LANE: ${{ inputs.lane }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.3.14
+      - name: Normalize and validate release provenance
+        shell: bash
+        env:
+          INPUT_TRIGGER: ${{ inputs.trigger }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_NATIVES_VERSION: ${{ inputs.natives_version }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_COMMIT: ${{ inputs.commit }}
+        run: |
+          set -euo pipefail
+          version_pattern='^v?[0-9]+\.[0-9]+\.[0-9]+$'
+          sha_pattern='^[0-9a-f]{40}$'
+          if [[ "$INPUT_TRIGGER" = repository_dispatch ]]; then
+            test -n "$INPUT_VERSION"
+            test -n "$INPUT_NATIVES_VERSION"
+            test -n "$INPUT_TAG"
+            test -n "$INPUT_COMMIT"
+          fi
+          [[ "$INPUT_VERSION" =~ $version_pattern ]]
+          [[ "$INPUT_NATIVES_VERSION" =~ $version_pattern ]]
+          version="${INPUT_VERSION#v}"
+          natives_version="${INPUT_NATIVES_VERSION#v}"
+          tag="${INPUT_TAG:-v$version}"
+          [[ "$version" = "$natives_version" ]]
+          [[ "$tag" = "v$version" ]]
+          [[ "$INPUT_COMMIT" =~ $sha_pattern ]]
+          {
+            echo "GJC_CODING_AGENT_VERSION=$version"
+            echo "GJC_NATIVES_VERSION=$natives_version"
+            echo "GJC_RELEASE_TAG=$tag"
+            echo "GJC_RELEASE_COMMIT=$INPUT_COMMIT"
+          } >> "$GITHUB_ENV"
+      - name: Create hermetic runtime directories
+        run: mkdir -p "$HOME" "$BUN_INSTALL_CACHE_DIR"
+      - name: Install adapter without lifecycle scripts
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Exercise hermetic published CLI session and public SDK behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          compat_root="$RUNNER_TEMP/gjc-compat-$GJC_COMPAT_LANE"
+          mkdir -p "$compat_root"
+          printf '%s\n' '{"name":"gjc-release-compat","private":true}' > "$compat_root/package.json"
+          bun add --cwd "$compat_root" --exact --ignore-scripts "@gajae-code/coding-agent@$GJC_CODING_AGENT_VERSION" "@gajae-code/natives@$GJC_NATIVES_VERSION"
+          gjc="$compat_root/node_modules/.bin/gjc"
+          test "$("$gjc" --version)" = "$GJC_CODING_AGENT_VERSION"
+          cp scripts/gjc-release-compat.ts "$compat_root/gjc-release-compat.ts"
+          bun --no-env-file --config=/dev/null --cwd "$compat_root" gjc-release-compat.ts --root "$compat_root" --gjc "$gjc"
+      - name: Publish observed compatibility report
+        shell: bash
+        run: |
+          set -euo pipefail
+          compat_root="$RUNNER_TEMP/gjc-compat-$GJC_COMPAT_LANE"
+          python3 - <<'PY'
+          import json, os
+          root = os.environ["RUNNER_TEMP"] + "/gjc-compat-" + os.environ["GJC_COMPAT_LANE"]
+          path = root + "/operation-report.json"
+          report = json.load(open(path))
+          report.update({
+              "lane": os.environ["GJC_COMPAT_LANE"],
+              "codingAgentVersion": os.environ["GJC_CODING_AGENT_VERSION"],
+              "nativesVersion": os.environ["GJC_NATIVES_VERSION"],
+              "tag": os.environ["GJC_RELEASE_TAG"],
+              "commit": os.environ["GJC_RELEASE_COMMIT"],
+              "hermetic": True,
+          })
+          with open(path, "w") as output:
+              json.dump(report, output, sort_keys=True)
+              output.write("\n")
+          PY
+          cat "$compat_root/operation-report.md" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: gjc-compat-${{ inputs.lane }}
+          path: |
+            ${{ runner.temp }}/gjc-compat-${{ inputs.lane }}/operation-report.json
+            ${{ runner.temp }}/gjc-compat-${{ inputs.lane }}/operation-report.md
+          if-no-files-found: error

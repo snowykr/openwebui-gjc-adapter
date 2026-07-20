@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, normalize, relative, resolve } from "node:path";
 import {
 	type AdapterRouteDependencies,
@@ -51,28 +52,33 @@ function expectAcyclic(): void {
 
 describe("server module boundaries", () => {
 	test("preserves the public server contract and JavaScript arities", async () => {
-		const runtime: AdapterRuntimeConfig = { adapterToken: "adapter", readinessToken: "ready" };
-		const routes: AdapterRouteDependencies = {
-			projects: [],
-			owner: { ownerUserId: "owner", singleOwnerLocalMode: false },
-			runner: { run: () => ({ content: "unused" }) },
-		};
-		const options: AdapterServerOptions = { host: "127.0.0.1", port: 0, runtime, routes };
-		const handle: AdapterServerHandle | undefined = undefined;
-		void options;
-		void handle;
+		const runtimeRoot = mkdtempSync(join(tmpdir(), "gjc-server-module-boundaries-"));
+		try {
+			const runtime: AdapterRuntimeConfig = { adapterToken: "adapter", readinessToken: "ready" };
+			const routes: AdapterRouteDependencies = {
+				projects: [],
+				owner: { ownerUserId: "owner", singleOwnerLocalMode: false },
+				runner: { run: () => ({ content: "unused" }) },
+			};
+			const options: AdapterServerOptions = { host: "127.0.0.1", port: 0, runtimeRoot, runtime, routes };
+			const handle: AdapterServerHandle | undefined = undefined;
+			void options;
+			void handle;
 
-		const facade = await import("../src/server");
-		expect(Object.keys(facade).sort()).toEqual([
-			"createAdapterRequestHandler",
-			"initializeRuntimeReadiness",
-			"startAdapterServer",
-		]);
-		expect([
-			createAdapterRequestHandler.length,
-			initializeRuntimeReadiness.length,
-			startAdapterServer.length,
-		]).toEqual([0, 1, 1]);
+			const facade = await import("../src/server");
+			expect(Object.keys(facade).sort()).toEqual([
+				"createAdapterRequestHandler",
+				"initializeRuntimeReadiness",
+				"startAdapterServer",
+			]);
+			expect([
+				createAdapterRequestHandler.length,
+				initializeRuntimeReadiness.length,
+				startAdapterServer.length,
+			]).toEqual([0, 1, 1]);
+		} finally {
+			rmSync(runtimeRoot, { force: true, recursive: true });
+		}
 	});
 
 	test("pins provider auth readiness route order and response bytes", async () => {

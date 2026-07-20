@@ -99,7 +99,7 @@ describe("real runtime project safety scenarios", () => {
 			turnRunner: new FakeGjcTurnRunner(),
 			projectRegistrationStore: store,
 		});
-		const handle = startAdapterServer(options);
+		const handle = await startAdapterServer(options);
 		handles.push(handle);
 		const protectedPath = path.join(workspace, "home", ".gjc", "openwebui", "default-reader");
 

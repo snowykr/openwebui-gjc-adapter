@@ -1,0 +1,71 @@
+import { resolve } from "node:path";
+import { readSdkSessionEndpoint } from "@gajae-code/coding-agent/sdk";
+import { attachmentFromPublishedSdkEndpoint, samePublishedSdkEndpoint } from "../gjc/public-sdk-session-port";
+import { loadAbsoluteGjcSessionFile, validateGjcSessionPathWithinRoot } from "../gjc/session-loader";
+import { SdkV3OperationError } from "../gjc/sdk-v3-protocol";
+import type { GjcSessionAddress } from "../gjc/turn-runner";
+import type { PublicSdkSessionAttachment } from "../gjc/public-sdk-contract";
+import type { SessionAttachment } from "./gjc-routing-proof";
+
+export function requireLifecycleAttachment(result: Awaited<ReturnType<import("../gjc/cli-lifecycle-backend").CliLifecycleBackend["create"]>>): import("../gjc/cli-lifecycle-backend").CliLifecycleAttachment {
+	if (result.status === "closed") return result.value;
+	throw new Error(`GJC CLI lifecycle is ${result.status}: ${result.message}`);
+}
+
+export function addressFor(input: import("../gjc/turn-runner").GjcStartNewSessionInput, sessionId: string): GjcSessionAddress {
+	return { cwd: input.cwd, sessionRoot: input.sessionRoot, projectId: input.projectId, chatId: input.chatId, sessionId };
+}
+export async function waitForSdkEndpoint(cwd: string, sessionId: string): Promise<PublicSdkSessionAttachment> {
+	const endpoint = await discoverPublishedSdkEndpoint(cwd, sessionId);
+	if (endpoint !== undefined) return endpoint;
+	throw new Error(`GJC public SDK endpoint was not published for session ${sessionId}.`);
+}
+
+export async function readPublishedSdkEndpoint(cwd: string, sessionId: string): Promise<PublicSdkSessionAttachment | undefined> {
+	const endpoint = await readSdkSessionEndpoint(cwd, sessionId);
+	return endpoint === null ? undefined : attachmentFromPublishedSdkEndpoint(cwd, sessionId, endpoint);
+}
+export async function requireCurrentPublishedSdkEndpoint(cwd: string, expected: PublicSdkSessionAttachment): Promise<PublicSdkSessionAttachment> {
+	const current = await readPublishedSdkEndpoint(cwd, expected.sessionId);
+	if (current === undefined || !samePublishedSdkEndpoint(expected, current))
+		throw new SdkV3OperationError("endpoint_stale", "GJC public SDK endpoint descriptor disappeared or changed during lifecycle transaction");
+	return current;
+}
+export async function discoverPublishedSdkEndpoint(cwd: string, sessionId: string): Promise<PublicSdkSessionAttachment | undefined> {
+	const deadline = Date.now() + 10_000;
+	for (;;) {
+		const endpoint = await readPublishedSdkEndpoint(cwd, sessionId);
+		if (endpoint !== undefined) return endpoint;
+		if (Date.now() >= deadline) return undefined;
+		await Bun.sleep(100);
+	}
+}
+
+export async function validatePersistedSessionIdentity(input: GjcSessionAddress & { readonly sessionFile: string }): Promise<void> {
+	const sessionFile = validateGjcSessionPathWithinRoot(input.sessionRoot, input.sessionFile);
+	const loaded = await loadAbsoluteGjcSessionFile(sessionFile);
+	if (loaded.filePath !== sessionFile || loaded.header.id !== input.sessionId || loaded.header.cwd !== input.cwd)
+		throw new SdkV3OperationError("endpoint_stale", "Persisted GJC JSONL session identity does not match the requested attachment");
+}
+
+export function attachmentKey<T extends { readonly cwd: string; readonly sessionId: string }>(input: T): string {
+	return `${resolve(input.cwd)}\u0000${input.sessionId}`;
+}
+
+export function attachmentFor(input: GjcSessionAddress, attachment: Omit<SessionAttachment, "projectId">): SessionAttachment {
+	const cwd = resolve(input.cwd);
+	const sessionRoot = resolve(input.sessionRoot);
+	if (attachment.cwd !== cwd || attachment.sessionRoot !== sessionRoot || attachment.sessionId !== input.sessionId)
+		throw new SdkV3OperationError("endpoint_stale", "CLI lifecycle attachment does not match the requested session address");
+	return { ...attachment, projectId: input.projectId };
+}
+
+export async function validateCachedAttachment(attachment: SessionAttachment, input: GjcSessionAddress & { readonly sessionFile?: string }): Promise<void> {
+	if (attachment.cwd !== resolve(input.cwd) || attachment.sessionRoot !== resolve(input.sessionRoot) || attachment.projectId !== input.projectId || attachment.sessionId !== input.sessionId || input.sessionFile === undefined)
+		throw new SdkV3OperationError("endpoint_stale", "Cached GJC attachment does not match the requested session address");
+	const cachedPath = validateGjcSessionPathWithinRoot(input.sessionRoot, attachment.sessionPath);
+	const requestedPath = validateGjcSessionPathWithinRoot(input.sessionRoot, input.sessionFile);
+	if (cachedPath !== requestedPath)
+		throw new SdkV3OperationError("endpoint_stale", "Cached GJC attachment session path does not match the persisted mapping");
+	await validatePersistedSessionIdentity({ ...input, sessionFile: cachedPath });
+}

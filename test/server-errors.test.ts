@@ -126,7 +126,7 @@ describe("createAdapterRequestHandler chat completion errors", () => {
 				owner,
 				runner: {
 					run() {
-						throw new Error("GJC RPC start failed: configured CLI is unavailable");
+						throw new Error("GJC live start failed: configured CLI is unavailable");
 					},
 				},
 			},

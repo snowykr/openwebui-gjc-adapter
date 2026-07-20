@@ -1,8 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { join } from "node:path";
-import type { RpcClientTransportClient } from "../src/gjc/rpc-client-transport";
-import { createRpcTransportFromClient } from "../src/gjc/rpc-client-transport";
-import type { GjcRpcRunnerTransportEvent, GjcRpcTransportState } from "../src/gjc/rpc-runner";
+import { readdir, stat } from "node:fs/promises";
+import { join, relative } from "node:path";
+import type { PublicSdkSessionPort, PublicSdkTurnOutcome } from "../src/gjc/public-sdk-contract";
 import { parseSelection, parseSessionAuthority } from "../src/gjc/sdk-v3-protocol";
 import { createSdkTransportFixture } from "./gjc-sdk-v3-fixtures";
 
@@ -39,10 +38,9 @@ describe("latest dev SDK v3 transport contract", () => {
 	test("Given a disconnected prompt mutation When reconnecting Then the mutation is never auto-resubmitted", async () => {
 		const fixture = createSdkTransportFixture("disconnect");
 		try {
-			await fixture.transport.start();
-			await fixture.transport.newSession();
+			await fixture.attach();
 
-			await expect(fixture.transport.promptAndWait("once only", 500)).rejects.toThrow();
+			await expect(fixture.port.prompt("once only", 500)).rejects.toThrow();
 
 			const prompts = fixture.server.frames.filter(
 				frame => frame.type === "control_request" && frame.operation === "turn.prompt",
@@ -53,11 +51,26 @@ describe("latest dev SDK v3 transport contract", () => {
 		}
 	});
 
-	test("Given current-dev Q10 metadata When crossing the transport boundary Then it remains available to policy", async () => {
-		const client = new CurrentOnlyCatalogClient();
-		const transport = createRpcTransportFromClient(client);
+	test("Given current-dev Q10 metadata When crossing the public session boundary Then it remains available to policy", async () => {
+		const port: Pick<PublicSdkSessionPort, "getAvailableModels"> = {
+			async getAvailableModels() {
+				return [
+					{
+						provider: "openai",
+						id: "gpt-current",
+						name: "Current only",
+						contextWindow: 128_000,
+						maxTokens: 32_000,
+						reasoning: true,
+						thinking: { validLevels: ["off", "low", "xhigh", "max"] },
+						current: true,
+						currentThinkingLevel: "inherit",
+					},
+				];
+			},
+		};
 
-		await expect(transport.getAvailableModels()).resolves.toEqual([
+		await expect(port.getAvailableModels()).resolves.toEqual([
 			{
 				provider: "openai",
 				id: "gpt-current",
@@ -70,6 +83,15 @@ describe("latest dev SDK v3 transport contract", () => {
 				currentThinkingLevel: "inherit",
 			},
 		]);
+	});
+	test("Given public SDK turn events When consuming an outcome Then event records remain opaque public frames", () => {
+		const outcome: PublicSdkTurnOutcome = {
+			events: [{ type: "message_update", text: "hello" }],
+			finalizedAssistantText: "hello",
+		};
+
+		expect(outcome.events).toEqual([{ type: "message_update", text: "hello" }]);
+		expect(outcome.finalizedAssistantText).toBe("hello");
 	});
 
 	test("Given current-dev max thinking When model.set returns Then the normalized selection is accepted", () => {
@@ -94,11 +116,10 @@ describe("latest dev SDK v3 transport contract", () => {
 	test("Given future capability metadata When enumerating canonical tuples Then supported levels remain usable", async () => {
 		const fixture = createSdkTransportFixture("turn_complete");
 		try {
-			await fixture.transport.start();
-			await fixture.transport.newSession();
+			await fixture.attach();
 
-			const models = await fixture.transport.getAvailableModels();
-			const selection = await fixture.transport.setDefaultModelSelection("future", "capable", "high");
+			const models = await fixture.port.getAvailableModels();
+			const selection = await fixture.port.setModel({ provider: "future", modelId: "capable", thinkingLevel: "high" });
 
 			expect(models).toContainEqual(
 				expect.objectContaining({
@@ -114,63 +135,66 @@ describe("latest dev SDK v3 transport contract", () => {
 		}
 	});
 
-	test("Given production sources When inspected Then no legacy RpcClient or --mode rpc invocation remains", async () => {
+	test("Given repository delivery surfaces When inspected Then legacy transports and private lifecycle exports are absent", async () => {
 		const root = join(import.meta.dir, "..");
-		const transportSource = await Bun.file(join(root, "src/gjc/rpc-client-transport.ts")).text();
 		const manifest = await Bun.file(join(root, "package.json")).json();
-		const patchPath = join(root, "patches", "@gajae-code%2Fcoding-agent@0.10.0.patch");
-
-		expect(transportSource).not.toContain("import { RpcClient }");
-		expect(transportSource).not.toContain("new RpcClient(");
-		expect(Reflect.get(Reflect.get(manifest, "dependencies"), "@gajae-code/coding-agent")).toBe("0.10.1");
+		const sources = await inventorySources(root);
+		const forbidden = [
+			new RegExp(`\\b${legacyName("r", "pc")}(?:[-_](?:client|runner|frames|workflow|errors))\\b`, "i"),
+			new RegExp(`\\b(?:parse|create)${legacyName("R", "pc")}\\w*\\b`),
+			new RegExp(`--mode\\s+${legacyName("r", "pc")}\\b`, "i"),
+			new RegExp(`\\b(?:private[-_\\s]+daemon|daemon\\/(?:runtime|control)|${legacyName("broker", "_hello")})\\b`, "i"),
+		];
+		expect(sources.filter(source => forbidden.some(pattern => pattern.test(source.text)))).toEqual([]);
+		expect(await Bun.file(join(root, "src/gjc", `${legacyName("r", "pc")}-client-transport.ts`)).exists()).toBe(false);
+		expect(await Bun.file(join(root, "src/gjc", `${legacyName("r", "pc")}-client-runner.ts`)).exists()).toBe(false);
+		expect(await Bun.file(join(root, "src/gjc", `${legacyName("r", "pc")}-runner.ts`)).exists()).toBe(false);
+		expect(await Bun.file(join(root, "src/gjc", "sdk-v3-cli.ts")).exists()).toBe(false);
+		const publicEntrypoint = await Bun.file(join(root, "src/index.ts")).text();
+		for (const privateLifecycleModule of ["session-frames", "turn-runner", "cli-lifecycle-backend", "tmux-ownership"]) {
+			expect(publicEntrypoint).not.toContain(`./gjc/${privateLifecycleModule}`);
+		}
+		const exports = Reflect.get(manifest, "exports");
+		expect(Reflect.get(exports, "./gjc/*")).toBeUndefined();
+		expect(Reflect.get(exports, "./gjc/public-sdk-contract")).toEqual({
+			types: "./src/gjc/public-sdk-contract.ts",
+			import: "./src/gjc/public-sdk-contract.ts",
+		});
+		expect(Reflect.get(Reflect.get(manifest, "dependencies"), "@gajae-code/coding-agent")).toBe("0.11.2");
 		expect(Reflect.get(manifest, "patchedDependencies")).toBeUndefined();
-		expect(await Bun.file(patchPath).exists()).toBe(false);
+		expect(await Bun.file(join(root, "patches", "@gajae-code%2Fcoding-agent@0.10.0.patch")).exists()).toBe(false);
+		expect(await Bun.file(join(root, "patches", "@gajae-code%2Fcoding-agent@0.11.2.patch")).exists()).toBe(false);
 	});
 });
 
-const parseAuthorityWithExpectation = parseSessionAuthority;
-
-class CurrentOnlyCatalogClient implements RpcClientTransportClient {
-	async start(): Promise<void> {}
-	stop(): void {}
-	async newSession() {
-		return { cancelled: false };
-	}
-	async switchSession() {
-		return { cancelled: false };
-	}
-	async getState(): Promise<GjcRpcTransportState> {
-		return { sessionId: "current-only" };
-	}
-	async getAvailableModels(): Promise<readonly unknown[]> {
-		return [
-			{
-				provider: "openai",
-				id: "gpt-current",
-				name: "Current only",
-				contextWindow: 128_000,
-				maxTokens: 32_000,
-				reasoning: true,
-				thinking: { validLevels: ["off", "low", "xhigh", "max"] },
-				current: true,
-				currentThinkingLevel: "inherit",
-			},
-		];
-	}
-	async prompt(): Promise<void> {}
-	onEvent(_listener: (event: GjcRpcRunnerTransportEvent) => void): () => void {
-		return () => undefined;
-	}
-	onWorkflowGate(_listener: (event: GjcRpcRunnerTransportEvent) => void): () => void {
-		return () => undefined;
-	}
-	async respondGate(): Promise<unknown> {
-		return { status: "accepted" };
-	}
-	async getLastAssistantText(): Promise<string | null> {
-		return null;
-	}
-	getStderr(): string {
-		return "";
-	}
+async function inventorySources(root: string): Promise<readonly { readonly path: string; readonly text: string }[]> {
+	const paths = [
+		join(root, "src"),
+		join(root, "test"),
+		join(root, ".github", "workflows"),
+		join(root, "package.json"),
+		join(root, "tsconfig.json"),
+	];
+	const files = await Promise.all(paths.map(path => inventoryFiles(path)));
+	return Promise.all(
+		files.flat().map(async path => ({
+			path: relative(root, path),
+			text: await Bun.file(path).text(),
+		})),
+	);
 }
+
+async function inventoryFiles(path: string): Promise<readonly string[]> {
+	const metadata = await stat(path);
+	if (metadata.isFile()) return [path];
+	const entries = await readdir(path, { recursive: true, withFileTypes: true });
+	return entries
+		.filter(entry => entry.isFile() && /\.(?:ts|json|ya?ml)$/.test(entry.name))
+		.map(entry => join(entry.parentPath, entry.name));
+}
+
+function legacyName(...parts: readonly string[]): string {
+	return parts.join("");
+}
+
+const parseAuthorityWithExpectation = parseSessionAuthority;

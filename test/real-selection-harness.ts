@@ -4,6 +4,8 @@ import * as path from "node:path";
 import * as cli from "./cli-fixtures";
 import { RealSelectionCoordinator } from "./real-selection-coordinator";
 import { eventModels, parseObservations, parseOutbox } from "./real-selection-effect-schemas";
+import { DEFAULT_TURN_TIMEOUT_MS } from "../src/config";
+import type { OpenAIModelListResponse } from "../src/live/openai-types";
 import {
 	parseCompletion,
 	parseError,
@@ -38,6 +40,17 @@ export class RealSelectionHarness {
 		try {
 			port = await cli.reserveTcpPort();
 			coordinator = new RealSelectionCoordinator({ catalogMode: options.catalogMode ?? "capabilities" });
+			await writeFile(
+				path.join(root, "gjc-sdk-fixture.json"),
+				JSON.stringify({
+					GJC_SDK_FIXTURE_CLI_TRANSCRIPT: path.join(root, "sdk-cli-transcript.jsonl"),
+					GJC_SDK_FIXTURE_ENDPOINT_URL: coordinator.sdkUrl,
+					GJC_SDK_FIXTURE_ENDPOINT_TOKEN: coordinator.sdkToken,
+					GJC_SDK_FIXTURE_SESSION_ID: "selection-session",
+					GJC_SDK_FIXTURE_DYNAMIC_AUTHORITY: "1",
+				}),
+				"utf8",
+			);
 			child = spawnServer(root, port, coordinator, options);
 			const harness = new RealSelectionHarness(root, port, child, coordinator);
 			await cli.waitForStartedServer(child, `${harness.baseUrl}/healthz`);
@@ -71,8 +84,12 @@ export class RealSelectionHarness {
 		}
 	}
 
-	async models() {
+	async models(): Promise<{ readonly status: number; readonly body: OpenAIModelListResponse }> {
 		const response = await fetch(`${this.baseUrl}/v1/models`, { headers: this.authHeaders() });
+		if (!response.ok) {
+			const error = parseError(await response.json());
+			throw new Error(`models request failed with status ${response.status}: ${JSON.stringify(error)}`);
+		}
 		return { status: response.status, body: parseModelList(await response.json()) };
 	}
 
@@ -116,10 +133,22 @@ export class RealSelectionHarness {
 				status: response.status,
 				contentType: response.headers.get("content-type"),
 				error: parseError(await response.json()),
+				runnerFailures: await this.runnerFailures(),
+				adminFailures: await this.adminFailures(),
 			};
 		}
 		if (options.stream) return { status: response.status, sseModels: parseSseModels(await response.text()) };
 		return { status: response.status, body: parseCompletion(await response.json()) };
+	}
+	async runtimeReceipt(): Promise<{
+		readonly cwd: string;
+		readonly config: {
+			readonly statePath: string;
+			readonly sessionRoot: string;
+			readonly neutralWorkspace: string;
+		};
+	}> {
+		return JSON.parse(await readFile(path.join(this.root, "selection-runtime-receipt.json"), "utf8"));
 	}
 
 	async mappingBytes(): Promise<string> {
@@ -136,6 +165,8 @@ export class RealSelectionHarness {
 		return {
 			coordinator: this.coordinator.snapshot(),
 			projectLookups: observations.filter(entry => entry.type === "project_lookup").length,
+			runnerFailures: observations.filter(entry => entry.type === "runner_failure"),
+			adminFailures: observations.filter(entry => entry.type === "admin_failure"),
 			events: observations.filter(entry => entry.type === "event"),
 			eventModels: eventModels(observations),
 			messages: observations.filter(entry => entry.type === "message"),
@@ -149,16 +180,48 @@ export class RealSelectionHarness {
 	async eventModels(chatId: string): Promise<readonly string[]> {
 		return eventModels(parseObservations(await readOptional(this.observationPath)), chatId);
 	}
+	async runnerFailures(): Promise<readonly unknown[]> {
+		return parseObservations(await readOptional(this.observationPath)).filter(entry => entry.type === "runner_failure");
+	}
+	async adminFailures(): Promise<readonly unknown[]> {
+		return parseObservations(await readOptional(this.observationPath)).filter(entry => entry.type === "admin_failure");
+	}
 
 	async removeModelBinding(chatId: string): Promise<void> {
 		const file = path.join(this.root, "sessions", "openwebui-session-mappings.json");
 		const document = parseMappingDocument(JSON.parse(await readFile(file, "utf8")), chatId);
 		await writeFile(file, JSON.stringify(document, null, 2), "utf8");
 	}
+	async removeOutboxOperations(chatId: string): Promise<void> {
+		const file = path.join(this.root, "state", "openwebui-projection-outbox.json");
+		let document: unknown;
+		try {
+			document = JSON.parse(await readFile(file, "utf8"));
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+			throw error;
+		}
+		if (!isRecord(document) || !Array.isArray(document.operations)) throw new TypeError("invalid projection outbox");
+		await writeFile(
+			file,
+			JSON.stringify(
+				{
+					...document,
+					operations: document.operations.filter(
+						operation => !isRecord(operation) || Reflect.get(operation, "chatId") !== chatId,
+					),
+				},
+				null,
+				2,
+			),
+			"utf8",
+		);
+	}
 
 	async restartAfterRemovingModelBinding(chatId: string): Promise<void> {
 		await cli.stopProcess(this.#process);
 		await this.removeModelBinding(chatId);
+		await this.removeOutboxOperations(chatId);
 		this.#process = spawnServer(this.root, this.#port, this.coordinator, {});
 		await cli.waitForStartedServer(this.#process, `${this.baseUrl}/healthz`);
 	}
@@ -194,7 +257,7 @@ export class RealSelectionHarness {
 }
 
 function selectionFixturePath(): string {
-	return path.join(process.cwd(), "test/fixtures/gjc-sdk-daemon-fixture.ts");
+	return path.join(process.cwd(), "test/fixtures/gjc-sdk-interactive-cli-session-fixture.ts");
 }
 
 function serverFixturePath(): string {
@@ -208,10 +271,11 @@ function spawnServer(
 	options: cli.RealSelectionStartOptions,
 ): Bun.Subprocess {
 	return Bun.spawn([process.execPath, serverFixturePath()], {
-		cwd: process.cwd(),
+		cwd: root,
 		env: {
 			HOME: root,
 			PATH: `${path.dirname(process.execPath)}:${process.env.PATH ?? ""}`,
+			TERM: process.env.TERM ?? "xterm-256color",
 			TMPDIR: root,
 			GJC_CONFIG_DIR: "hostile-ignored",
 			PI_CONFIG_DIR: "hostile-ignored",
@@ -223,7 +287,7 @@ function spawnServer(
 			GJC_OPENWEBUI_BIND_PORT: String(port),
 			GJC_OPENWEBUI_ADAPTER_API_TOKEN: "selection-harness-token",
 			GJC_OPENWEBUI_OWNER_USER_ID: "owner-selection",
-			GJC_OPENWEBUI_TURN_TIMEOUT_MS: "750",
+			GJC_OPENWEBUI_TURN_TIMEOUT_MS: String(DEFAULT_TURN_TIMEOUT_MS),
 			GJC_OPENWEBUI_STATE_PATH: path.join(root, "state"),
 			GJC_OPENWEBUI_SESSION_ROOT: path.join(root, "sessions"),
 			GJC_OPENWEBUI_GJC_COMMAND: selectionFixturePath(),
@@ -242,6 +306,9 @@ function spawnServer(
 		stdout: "pipe",
 		stderr: "pipe",
 	});
+}
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 async function assertPortRebind(port: number): Promise<void> {

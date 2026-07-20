@@ -1,9 +1,19 @@
 import { describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FileBackedSessionMappingStore, SessionMappingStore } from "../src/gjc/session-router";
+import { SessionAuthorityLoadError } from "../src/gjc/session-authority";
+import {
+	FileBackedSessionMappingStore,
+	SessionFileBoundaryError,
+	SessionMappingStore,
+} from "../src/gjc/session-router";
+import type {
+	GjcLifecycleTransaction,
+	GjcSessionAddress,
+	GjcStartNewSessionInput,
+	GjcTurnResult,
+} from "../src/gjc/turn-runner";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
 import { InMemoryOutboxStore } from "../src/state/outbox";
 import {
@@ -52,6 +62,37 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 				gateCorrelation: { commandId: "command-1", turnId: "turn-1", sessionId: "session-1" },
 			},
 		]);
+		expect(mappings.get("chat-1")?.attachment).toMatchObject({
+			expectedSessionId: "session-1",
+			expectedCwd: project.cwd,
+		});
+	});
+	test("cold-resumes a persisted gate binding and answers its exact session without starting a new turn", async () => {
+		const root = mkdtempSync(join(tmpdir(), "gjc-cold-gate-"));
+		try {
+			const filePath = join(root, "mappings.json");
+			const first = new FileBackedSessionMappingStore(filePath);
+			for (const mapping of pendingGateMappings(deepInterviewWorkflowGateEvent).entries()) first.set(mapping);
+			const turnRunner = new FakeGjcTurnRunner();
+			const resumed = createGjcRoutingLiveGatewayRunner({
+				turnRunner,
+				mappings: new FileBackedSessionMappingStore(filePath),
+			});
+
+			await expect(resumed.run(replyInput("1"))).resolves.toEqual({ content: "workflow gate accepted" });
+			expect(turnRunner.starts).toHaveLength(0);
+			expect(turnRunner.continues).toHaveLength(0);
+			expect(turnRunner.gateResponses).toMatchObject([
+				{
+					gateId: "gate-deep-1",
+					sessionId: "session-1",
+					sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
+					gateCorrelation: { commandId: "command-1", turnId: "turn-1", sessionId: "session-1" },
+				},
+			]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	test("rejects invalid numbered workflow gate replies without answering GJC", async () => {
@@ -69,7 +110,7 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 		const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent, "/tmp/outside-session.jsonl");
 		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings });
 
-		await expect(runner.run(replyInput("1"))).rejects.toThrow("outside project session root");
+		await expect(runner.run(replyInput("1"))).rejects.toBeInstanceOf(SessionFileBoundaryError);
 		expect(turnRunner.gateResponses).toHaveLength(0);
 	});
 
@@ -177,12 +218,22 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 				const mappings = new FileBackedSessionMappingStore(filePath);
 				mappings.set({ ...baseMapping("seed-chat"), operationId: "seed-user" });
 				const before = readFileSync(filePath, "utf8");
-				const turnRunner = new FakeGjcTurnRunner();
-				const start = turnRunner.startNewSession.bind(turnRunner);
-				turnRunner.startNewSession = async input => {
-					if (failure === "prompt") await start(input);
-					throw new Error(`${failure} failed`);
-				};
+				class FailingStartFakeGjcTurnRunner extends FakeGjcTurnRunner {
+					async startNewSession<T>(
+						input: GjcStartNewSessionInput,
+						publish: (
+							result: GjcSessionAddress & GjcTurnResult,
+							lifecycle: GjcLifecycleTransaction,
+						) => Promise<T>,
+					): Promise<T> {
+						if (failure === "setter") throw new Error(`${failure} failed`);
+						return await super.startNewSession(input, async (result, lifecycle) => {
+							if (failure === "prompt") throw new Error(`${failure} failed`);
+							return await publish(result, lifecycle);
+						});
+					}
+				}
+				const turnRunner = new FailingStartFakeGjcTurnRunner();
 				const outbox = new InMemoryOutboxStore();
 				const runner = createGjcRoutingLiveGatewayRunner({
 					turnRunner,
@@ -196,14 +247,96 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 					`${failure} failed`,
 				);
 				expect(mappings.get("failed-chat")).toBeUndefined();
-				expect(readFileSync(filePath, "utf8")).toBe(before);
-				expect(hashText(readFileSync(filePath, "utf8"))).toBe(hashText(before));
+				const document = JSON.parse(readFileSync(filePath, "utf8")) as {
+					readonly mappings: readonly { readonly chatId?: unknown }[];
+					readonly provisionalOperations: readonly Record<string, unknown>[];
+				};
+				expect(document.mappings).toEqual(
+					(JSON.parse(before) as { readonly mappings: readonly { readonly chatId?: unknown }[] }).mappings,
+				);
+				expect(document.mappings.some(mapping => mapping.chatId === "failed-chat")).toBeFalse();
+				expect(document.provisionalOperations).toHaveLength(1);
+				expect(document.provisionalOperations[0]).toMatchObject({
+					id: "user-2",
+					ingressId: "user-2",
+					kind: "create",
+					state: "uncertain",
+					chatId: "failed-chat",
+					projectId: "project",
+					detail: expect.stringMatching(/^[a-f0-9]{64}$/),
+				});
+				expect(Object.keys(document.provisionalOperations[0] ?? {}).sort()).toEqual([
+					"chatId",
+					"detail",
+					"id",
+					"ingressId",
+					"kind",
+					"projectId",
+					"startedAt",
+					"state",
+				]);
+				expect(JSON.stringify(document.provisionalOperations[0])).not.toMatch(/assistant|hello/);
 				expect(outbox.listPending()).toHaveLength(0);
 			} finally {
 				rmSync(root, { recursive: true, force: true });
 			}
 		});
 	}
+	test("loads a v2 document without provisional operations until its next mutation", () => {
+		const root = mkdtempSync(join(tmpdir(), "gjc-v2-provisional-"));
+		try {
+			const filePath = join(root, "mappings.json");
+			const mapping = {
+				...baseMapping("legacy-chat"),
+				version: 2,
+				createdAt: "2026-01-01T00:00:00.000Z",
+				header: { chatId: "legacy-chat", projectId: project.id, sessionId: "session-1" },
+				journal: [],
+			};
+			const legacy = `${JSON.stringify(
+				{ kind: "openwebui-gjc-session-authority", version: 2, mappings: [mapping] },
+				null,
+				2,
+			)}\n`;
+			writeFileSync(filePath, legacy, "utf8");
+
+			const mappings = new FileBackedSessionMappingStore(filePath);
+			expect(mappings.get("legacy-chat")).toMatchObject({ chatId: "legacy-chat" });
+			expect(readFileSync(filePath, "utf8")).toBe(legacy);
+
+			mappings.set({ ...baseMapping("next-chat"), operationId: "next-user" });
+			expect(JSON.parse(readFileSync(filePath, "utf8"))).toMatchObject({
+				provisionalOperations: [],
+			});
+
+			writeFileSync(filePath, JSON.stringify({ ...JSON.parse(legacy), provisionalOperations: {} }), "utf8");
+			expect(() => new FileBackedSessionMappingStore(filePath)).toThrow(SessionAuthorityLoadError);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+	test("quarantines a legacy authority before writing v2 state", () => {
+		const root = mkdtempSync(join(tmpdir(), "gjc-v2-quarantine-"));
+		try {
+			const filePath = join(root, "mappings.json");
+			const legacy = JSON.stringify([{ chatId: "old-chat" }]);
+			writeFileSync(filePath, legacy, "utf8");
+
+			const mappings = new FileBackedSessionMappingStore(filePath);
+			expect(mappings.entries()).toEqual([]);
+			const quarantines = readdirSync(root).filter(name => name.startsWith("mappings.json.legacy-"));
+			expect(quarantines).toHaveLength(1);
+			expect(readFileSync(join(root, quarantines[0]!), "utf8")).toBe(legacy);
+
+			mappings.set({ ...baseMapping("new-chat"), operationId: "new-user" });
+			expect(JSON.parse(readFileSync(filePath, "utf8"))).toMatchObject({
+				kind: "openwebui-gjc-session-authority",
+				version: 2,
+			});
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
 });
 
 function pendingGateMappings(event: unknown, sessionFile = "/workspace/project/.gjc/sessions/session-1.jsonl") {
@@ -270,8 +403,4 @@ function selectedReader() {
 		},
 		stop() {},
 	};
-}
-
-function hashText(value: string): string {
-	return createHash("sha256").update(value).digest("hex");
 }

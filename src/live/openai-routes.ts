@@ -1,7 +1,12 @@
 import type { OpenWebUIOwnerContext } from "../openwebui/auth";
 import type { OpenWebUIProjectionRepository } from "../openwebui/client";
-import { handleProjectAdminChatCompletion, isProjectAdminChatCompletionRequest } from "../projects/admin-routes";
-import type { ProjectLinkService } from "../projects/link-service";
+import {
+	handleProjectAdminChatCompletion,
+	isProjectAdminChatCompletionRequest,
+	type ProjectAdminFailureSink,
+} from "../projects/admin-routes";
+import { closeIngressId, type SessionCloseIngress, type SessionMapping } from "../gjc/session-router";
+import type { ProjectLinkService, SessionCloseResult } from "../projects/link-service";
 import type { RegisteredProject } from "../projects/registry";
 import {
 	handleChatCompletions,
@@ -20,6 +25,8 @@ export type ProjectProvider =
 	| readonly RegisteredProject[]
 	| (() => readonly RegisteredProject[] | Promise<readonly RegisteredProject[]>);
 
+export type ChatSessionCloser = (mapping: SessionMapping, ingress: SessionCloseIngress) => Promise<SessionCloseResult>;
+
 export interface AdapterRouteDependencies {
 	readonly projects: readonly RegisteredProject[];
 	readonly projectProvider?: ProjectProvider;
@@ -34,6 +41,9 @@ export interface AdapterRouteDependencies {
 	readonly requireAdapterApiToken?: boolean;
 	readonly modelReaderFactory?: ModelReaderFactory;
 	readonly neutralWorkspace?: string;
+	readonly mappings?: { get(chatId: string): SessionMapping | undefined };
+	readonly closeSession?: ChatSessionCloser;
+	readonly projectAdminFailureSink?: ProjectAdminFailureSink;
 }
 
 export function jsonResponse(value: unknown, init?: ResponseInit): Response {
@@ -46,6 +56,54 @@ export function jsonResponse(value: unknown, init?: ResponseInit): Response {
 	});
 }
 
+export async function handleOpenAIChatCloseRequest(
+	chatId: string,
+	operationId: string,
+	routes: AdapterRouteDependencies,
+): Promise<Response> {
+	const mapping = routes.mappings?.get(chatId);
+	if (mapping === undefined) {
+		return jsonResponse(
+			{ error: { message: "No GJC session is mapped to this chat.", type: "invalid_request_error", code: "chat_session_not_found" }, operationId },
+			{ status: 404 },
+		);
+	}
+	if (routes.closeSession === undefined) {
+		return jsonResponse(
+			{ status: "unavailable", message: "GJC session close is unavailable.", operationId },
+			{ status: 503 },
+		);
+	}
+	try {
+		const ingressId = closeIngressId(operationId, mapping);
+		const result = await routes.closeSession(mapping, { ingressId, ingressHash: ingressId });
+		return jsonResponse({ ...result, operationId }, {
+			status: result.status === "closed" ? 200 : result.status === "unavailable" ? 503 : 202,
+		});
+	} catch (error) {
+		const message = error instanceof Error ? error.message : "GJC session close acknowledgement was not received.";
+		if (message.includes("conflicts")) {
+			return jsonResponse(
+				{ error: { message, type: "invalid_request_error", code: "chat_close_conflict" }, operationId },
+				{ status: 409 },
+			);
+		}
+		return jsonResponse(
+			{ status: "uncertain", message, operationId },
+			{ status: 202 },
+		);
+	}
+}
+
+export function chatIdFromClosePath(pathname: string): string | undefined {
+	const match = /^\/v1\/chats\/([^/]+)\/close$/.exec(pathname);
+	if (match === null) return undefined;
+	try {
+		return decodeURIComponent(match[1]);
+	} catch {
+		return undefined;
+	}
+}
 export async function handleOpenAIModelsRequest(routes: AdapterRouteDependencies): Promise<Response> {
 	try {
 		if (routes.modelReaderFactory === undefined) throw new TypeError("GJC model reader is unavailable");
@@ -94,6 +152,7 @@ export async function handleOpenAIChatCompletionsRequest(
 			request.headers,
 			routes.owner,
 			routes.modelReaderFactory,
+			routes.projectAdminFailureSink,
 		);
 		return jsonResponse(result.body, { status: result.status });
 	}

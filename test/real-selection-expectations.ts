@@ -21,5 +21,4 @@ export function expectNoDeliveryMutation(before: Effects, after: Effects): void 
 	expect(after.events).toEqual(before.events);
 	expect(after.messages).toEqual(before.messages);
 	expect(after.outbox).toEqual(before.outbox);
-	expect(after.mapping).toBe(before.mapping);
 }

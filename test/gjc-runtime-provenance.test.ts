@@ -1,173 +1,235 @@
 import { describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { closeTmux, exitAndObservePostCloseFailure } from "../scripts/gjc-release-compat-lifecycle";
 
 const ROOT = join(import.meta.dir, "..");
-const UPSTREAM_REPOSITORY = "https://github.com/Yeachan-Heo/gajae-code.git";
-const UPSTREAM_COMMIT = "c439e85141f882ebbe926885d8b6673b9893cbb8";
+const GJC_VERSION = "0.11.2";
 const BUN_IMAGE_DIGEST = "sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4";
-const RUST_IMAGE_DIGEST = "sha256:57d415bbd61ce11e2d5f73de068103c7bd9f3188dc132c97cef4a8f62989e944";
 const PYTHON_IMAGE_DIGEST = "sha256:8a7e7cc04fd3e2bd787f7f24e22d5d119aa590d429b50c95dfe12b3abe52f48b";
-const BROKER_RUNTIME_PATH = "packages/coding-agent/src/sdk/broker/runtime.ts";
-const BROKER_FIXTURE_PATH = "test/fixtures/gajae-code-c439e85-sdk-broker-runtime.txt";
-const BROKER_FIXTURE_SHA256 = "767be871319a7ef50da5aea230bbe32964e563caf8259e7d3eee95fa4b49434a";
-const BROKER_PATCH_PATH = "patches/gajae-code-c439e85-sdk-broker-safe-bun.patch";
-const STALE_PROVENANCE_PREFIXES = [
-	["15f", "1691"].join(""),
-	["825", "ea2d"].join(""),
-	["6fa", "e7cc"].join(""),
-	["d13", "c09c"].join(""),
-	["44a", "8645"].join(""),
-	["d29", "da7a"].join(""),
-	["67a", "8fd4"].join(""),
-	["a8f", "9602"].join(""),
-] as const;
+
+function normalizeRelease(version: string, nativesVersion: string, tag = "") {
+	const versionPattern = /^v?\d+\.\d+\.\d+$/;
+	if (!versionPattern.test(version) || !versionPattern.test(nativesVersion)) throw new Error("invalid version");
+	const normalizedVersion = version.replace(/^v/, "");
+	if (nativesVersion.replace(/^v/, "") !== normalizedVersion) throw new Error("mismatched natives");
+	const normalizedTag = tag || `v${normalizedVersion}`;
+	if (normalizedTag !== `v${normalizedVersion}`) throw new Error("invalid tag");
+	return { version: normalizedVersion, nativesVersion: normalizedVersion, tag: normalizedTag };
+}
+function releaseRoute(event: "repository_dispatch" | "schedule" | "workflow_dispatch", version = "") {
+	if (event === "repository_dispatch") return "dispatched-repository";
+	if (event === "workflow_dispatch" && version !== "") return "dispatched-manual";
+	return "fixed";
+}
 
 describe("GJC SDK runtime provenance", () => {
-	test("pins the released packages used by adapter source to exact 0.10.1 versions", async () => {
-		// Given
+	test("pins the published coding-agent and natives runtime to the same exact release", async () => {
 		const manifest = await Bun.file(join(ROOT, "package.json")).json();
-
-		// When
 		const dependencies = Reflect.get(manifest, "dependencies");
-		const patchedDependencies = Reflect.get(manifest, "patchedDependencies");
 
-		// Then
-		expect(dependencies).toEqual({
-			"@gajae-code/ai": "0.10.1",
-			"@gajae-code/coding-agent": "0.10.1",
-		});
-		expect(patchedDependencies).toBeUndefined();
+		expect(Reflect.get(dependencies, "@gajae-code/coding-agent")).toBe(GJC_VERSION);
+		expect(Reflect.get(dependencies, "@gajae-code/natives")).toBe(GJC_VERSION);
+		expect(Reflect.get(manifest, "patchedDependencies")).toBeUndefined();
+		expect(Reflect.get(manifest, "files")).not.toContain("patches");
 	});
 
-	test("pins the executable runtime to the inspected immutable dev commit", async () => {
-		// Given
+	test("installs and invokes the released CLI from the production dependency tree", async () => {
 		const dockerfile = await Bun.file(join(ROOT, "Dockerfile.adapter")).text();
 
-		// When
-		const repositoryDeclaration = `GJC_UPSTREAM_REPOSITORY=${UPSTREAM_REPOSITORY}`;
-		const commitDeclaration = `GJC_UPSTREAM_COMMIT=${UPSTREAM_COMMIT}`;
-
-		// Then
-		expect(dockerfile).toContain(repositoryDeclaration);
-		expect(dockerfile).toContain(commitDeclaration);
-		expect(dockerfile).toContain('git fetch --depth=1 "$GJC_UPSTREAM_REPOSITORY" "$GJC_UPSTREAM_COMMIT"');
-		expect(dockerfile).toContain('test "$(git rev-parse HEAD)" = "$GJC_UPSTREAM_COMMIT"');
-		expect(dockerfile).toContain("bun install --frozen-lockfile --ignore-scripts");
-		expect(dockerfile).toContain("bun --cwd=packages/natives run build");
-		for (const stalePrefix of STALE_PROVENANCE_PREFIXES) expect(dockerfile).not.toContain(stalePrefix);
+		expect(dockerfile).toContain("COPY package.json bun.lock ./");
+		expect(dockerfile).toContain("bun install --frozen-lockfile --production");
+		expect(dockerfile).toContain(`test "$(bun --no-env-file --config=/dev/null ./node_modules/.bin/gjc --version)" = "${GJC_VERSION}"`);
+		expect(dockerfile).toContain("GJC_OPENWEBUI_GJC_COMMAND=/opt/openwebui-gjc-adapter/node_modules/.bin/gjc");
+		expect(dockerfile).not.toContain("/opt/gajae-code");
+		expect(dockerfile).not.toContain("git fetch");
+		expect(dockerfile).not.toContain("git apply");
+		expect(dockerfile).not.toContain("packages/natives");
+		expect(dockerfile).not.toContain("GJC_UPSTREAM_COMMIT");
 	});
 
-	test("pins every external build image and sources Bun from its immutable image", async () => {
-		// Given
+	test("keeps pinned base images and runs as a non-root adapter user", async () => {
 		const dockerfile = await Bun.file(join(ROOT, "Dockerfile.adapter")).text();
 
-		// Then
 		expect(dockerfile).toContain(`FROM oven/bun:1.3.14@${BUN_IMAGE_DIGEST} AS bun-runtime`);
-		expect(dockerfile).toContain(`FROM rust:1.86-slim-bookworm@${RUST_IMAGE_DIGEST} AS gjc-builder`);
 		expect(dockerfile).toContain(`FROM python:3.12-slim-bookworm@${PYTHON_IMAGE_DIGEST}`);
 		expect(dockerfile).toContain("COPY --from=bun-runtime /usr/local/bin/bun /opt/bun/bin/bun");
-		expect(dockerfile).not.toContain("https://bun.sh/install");
-		expect(dockerfile).not.toContain("curl -fsSL");
+		expect(dockerfile).toContain(`LABEL org.opencontainers.image.version="${GJC_VERSION}"`);
+		expect(dockerfile).toContain("/usr/sbin/groupadd --system --gid 10001 adapter");
+		expect(dockerfile).toContain("/usr/sbin/useradd --system --uid 10001 --gid adapter");
+		expect(dockerfile).toContain("USER adapter:adapter");
 	});
 
-	test("exposes the exact upstream revision through runtime metadata", async () => {
-		// Given
-		const dockerfile = await Bun.file(join(ROOT, "Dockerfile.adapter")).text();
-		const runtimeStageMarker = `FROM python:3.12-slim-bookworm@${PYTHON_IMAGE_DIGEST}`;
+	test("normalizes manual versions and structurally routes release lanes", async () => {
+		const workflow = await Bun.file(join(ROOT, ".github/workflows/gjc-release-compat.yml")).text();
+		const reusable = await Bun.file(join(ROOT, ".github/workflows/gjc-release-compat-run.yml")).text();
 
-		// When
-		const runtimeStage = dockerfile.slice(dockerfile.indexOf(runtimeStageMarker));
+		for (const fixture of [
+			{ version: "0.11.2", nativesVersion: "0.11.2", tag: "", expected: { version: "0.11.2", nativesVersion: "0.11.2", tag: "v0.11.2" } },
+			{ version: "v0.11.2", nativesVersion: "v0.11.2", tag: "v0.11.2", expected: { version: "0.11.2", nativesVersion: "0.11.2", tag: "v0.11.2" } },
+		]) expect(normalizeRelease(fixture.version, fixture.nativesVersion, fixture.tag)).toEqual(fixture.expected);
+		expect(() => normalizeRelease("0.11.2", "0.11.1", "v0.11.2")).toThrow();
+		expect(() => normalizeRelease("0.11.2", "0.11.2", "v0.11.1")).toThrow();
+		for (const fixture of [
+			{ event: "schedule" as const, version: "", route: "fixed" },
+			{ event: "workflow_dispatch" as const, version: "", route: "fixed" },
+			{ event: "workflow_dispatch" as const, version: "v0.11.2", route: "dispatched-manual" },
+			{ event: "repository_dispatch" as const, version: "", route: "dispatched-repository" },
+		]) expect(releaseRoute(fixture.event, fixture.version)).toBe(fixture.route);
 
-		// Then
-		expect(dockerfile).toContain(runtimeStageMarker);
-		expect(runtimeStage).toContain(`GJC_UPSTREAM_COMMIT=${UPSTREAM_COMMIT}`);
-		expect(runtimeStage).toContain("org.opencontainers.image.revision=$GJC_UPSTREAM_COMMIT");
+		expect(workflow).toContain("types: [gajae-code-release]");
+		expect(workflow).toContain("fixed-compatibility:");
+		expect(workflow).toContain("dispatched-repository-compatibility:");
+		expect(workflow).toContain("dispatched-manual-compatibility:");
+		expect(workflow).toContain("if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.version == '')");
+		expect(workflow).toContain("if: github.event_name == 'repository_dispatch'");
+		expect(workflow).toContain("if: github.event_name == 'workflow_dispatch' && inputs.version != ''");
+		expect(workflow).toContain(`version: \${{ inputs.version }}`);
+		expect(workflow).toContain(`natives_version: \${{ inputs.version }}`);
+		expect(workflow).toContain(`commit: \${{ inputs.commit || github.sha }}`);
+		expect(workflow).toContain("- lane: v0.11.1-pair");
+		expect(workflow).toContain("- lane: v0.11.2-pair");
+		expect(workflow).not.toMatch(/^\s+if:.*\bmatrix\./m);
+
+		expect(reusable).toContain("on:\n  workflow_call:");
+		expect(reusable).toContain('[[ "$INPUT_VERSION" =~ $version_pattern ]]');
+		expect(reusable).toContain(`version="\${INPUT_VERSION#v}"`);
+		expect(reusable).toContain(`natives_version="\${INPUT_NATIVES_VERSION#v}"`);
+		expect(reusable).toContain(`tag="\${INPUT_TAG:-v$version}"`);
+		expect(reusable).toContain('[[ "$tag" = "v$version" ]]');
+		expect(reusable).toContain('[[ "$INPUT_COMMIT" =~ $sha_pattern ]]');
+		expect(reusable).toContain('if [[ "$INPUT_TRIGGER" = repository_dispatch ]]; then');
+		expect(reusable).toContain('test -n "$INPUT_NATIVES_VERSION"');
+		expect(reusable).toContain("bun install --frozen-lockfile --ignore-scripts");
+		expect(reusable).toContain("operation-report.json");
+		expect(reusable).not.toContain("bun update");
+		expect(reusable).not.toContain("git apply");
 	});
 
-	test("prevents stale platform packages from shadowing the freshly built dev native addon", async () => {
-		// Given
-		const dockerfile = await Bun.file(join(ROOT, "Dockerfile.adapter")).text();
+	test("records actual SDK responses through split SDK, runtime, and lifecycle harnesses", async () => {
+		const runner = await Bun.file(join(ROOT, "scripts/gjc-release-compat.ts")).text();
+		const sdk = await Bun.file(join(ROOT, "scripts/gjc-release-compat-sdk.ts")).text();
+		const runtime = await Bun.file(join(ROOT, "scripts/gjc-release-compat-runtime.ts")).text();
+		const lifecycle = await Bun.file(join(ROOT, "scripts/gjc-release-compat-lifecycle.ts")).text();
+		const fixtures = await Bun.file(join(ROOT, "scripts/gjc-release-compat-fixtures.ts")).text();
 
-		// Then
-		expect(dockerfile).toContain("rm -rf packages/natives-*/native");
+		expect(runner).toContain('from "./gjc-release-compat-sdk"');
+		expect(runner).toContain('from "./gjc-release-compat-runtime"');
+		expect(runner).toContain('from "./gjc-release-compat-lifecycle"');
+		expect(runner).toContain('client!.query("session.metadata")');
+		expect(runner).toContain('client!.query("workflow.gates.list")');
+		expect(runner).toContain('client!.query("models.list/current")');
+		expect(runner).toContain('client!.control("model.set"');
+		expect(runner).toContain('client!.control("thinking.set"');
+		expect(runner).toContain('push({ name, shape: shapeOf(value), observed: value })');
+		expect(runner).toContain('Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: providerResponse })');
+		expect(fixtures).toContain("providers:\n  compat-local:");
+		expect(runner).toMatch(/"--model",\s*"compat-local\/hermetic-model"/);
+		expect(runner).not.toContain("promptInteractive");
+		expect(runner).not.toContain("--op");
+
+		expect(sdk).toContain("SdkClient.connect(endpoint.url, endpoint.token");
+		expect(sdk).toContain('client.control(operation, input');
+		expect(sdk).toContain("snapshotPublicEndpoints(workspace)");
+		expect(sdk).toContain("endpointFingerprint(previous) !== endpointFingerprint(endpoint)");
+		expect(sdk).toContain("session.metadata");
+		expect(sdk).toContain("targetSessionId: requestedSessionId");
+
+		expect(runtime).toContain('client.control("turn.prompt", { text })');
+		expect(runtime).toContain('probe.query("session.branch_candidates")');
+		expect(runtime).toContain("rediscoverSessionId");
+		expect(runtime).toContain("client.onFrame(frame =>");
+		expect(runtime).toContain('frame.type !== "agent_end" && frame.type !== "agent_failed"');
+		expect(runtime).toContain("matches(frame, pendingCorrelation!)");
+		expect(runtime).toContain("pendingFrames.push(frame)");
+		expect(runtime).toContain('send-keys", "-t", target, "/session", "Enter"');
+
+		expect(lifecycle).toContain('phase: "sdkLogicalClose"');
+		expect(lifecycle).toContain('phase: "cliLifecycleTermination"');
+		expect(lifecycle).toContain("postAcknowledgement:");
+		expect(lifecycle).toContain("tmuxTargetLive: live");
+		expect(lifecycle).toContain("awaitLifecycleTermination(");
+		expect(lifecycle).toContain('action: "/exit"');
+		expect(lifecycle).toContain('send-keys", "-t", target, "/exit", "Enter"]);');
+		expect(lifecycle).toContain("tmuxTargetAbsent: true");
+		expect(lifecycle).toContain("tmuxPanePid(tmuxTarget)");
+		expect(lifecycle).toContain("const originalPanePid = await tmuxPanePid(tmuxTarget);");
+		expect(lifecycle).toContain("postAcknowledgementPanePid !== originalPanePid");
+		expect(lifecycle).toContain("originalPanePidLive");
+		expect(lifecycle).toContain("endpoint: { descriptor: endpoint.descriptor, fingerprint, originalPanePid },");
+		expect(lifecycle).toContain("originalPanePidAbsent: true");
+		expect(lifecycle).toContain("process.kill(pid, 0)");
+		expect(runner).toContain("awaitTmuxTermination(resumedTarget, \"resumed compatibility tmux session\")");
+		expect(lifecycle).toContain('phase: "gracefulTmuxTermination"');
+		expect(runner).toContain("observed.cleanup = { forcedTmuxSessions: [] };");
+		expect(runner).not.toContain("forbiddenFallbacks:");
 	});
 
-	test("runs the adapter against the pinned source CLI instead of the released legacy binary", async () => {
-		// Given
-		const dockerfile = await Bun.file(join(ROOT, "Dockerfile.adapter")).text();
+	test("allows broad tmux cleanup only before public close invocation", async () => {
+		const runner = await Bun.file(join(ROOT, "scripts/gjc-release-compat.ts")).text();
+		const lifecycle = await Bun.file(join(ROOT, "scripts/gjc-release-compat-lifecycle.ts")).text();
+		const commands: string[][] = [];
+		const run = async (_command: string, args: readonly string[]) => {
+			commands.push([...args]);
+			return args[0] === "list-sessions" ? "gjc-compat-before\nunrelated\n" : "";
+		};
 
-		// When
-		const runtimeCommand =
-			'exec bun --no-env-file --config=/dev/null /opt/gajae-code/packages/coding-agent/src/cli.ts "$@"';
+		expect(await closeTmux("gjc-compat-", run)).toEqual(["gjc-compat-before"]);
+		expect(commands).toContainEqual(["kill-session", "-t", "gjc-compat-before"]);
+		commands.length = 0;
+		const evidence = await exitAndObservePostCloseFailure("/unused", undefined, "gjc-compat-after", run);
+		expect(commands).toEqual([["send-keys", "-t", "gjc-compat-after", "/exit", "Enter"]]);
+		expect(evidence).toMatchObject({ phase: "postCloseFailureCleanup", action: "/exit", uncertainty: { reason: "exact endpoint identity unavailable" } });
 
-		// Then
-		expect(dockerfile).toContain(runtimeCommand);
-		expect(dockerfile).toContain("GJC_OPENWEBUI_GJC_COMMAND=/usr/local/bin/gjc");
-		expect(dockerfile).not.toContain("node_modules/.bin/gjc");
+		const invokedAt = runner.indexOf("publicCloseInvoked = true;");
+		const closeAt = runner.indexOf("closeWithPublicSdkProof", invokedAt);
+		const guardedCleanupAt = runner.indexOf("publicCloseInvoked\n\t\t? { forcedTmuxSessions: [], postClose:");
+		expect(invokedAt).toBeGreaterThan(0);
+		expect(closeAt).toBeGreaterThan(invokedAt);
+		expect(guardedCleanupAt).toBeGreaterThan(closeAt);
+		expect(runner).toContain("publicCloseInvoked\n\t\t? { forcedTmuxSessions: [], postClose: await exitAndObservePostCloseFailure(workspace, sdkLogicalClose?.endpoint, tmuxSession, run) }\n\t\t: { forcedTmuxSessions: await closeTmux(tmuxSession, run) };");
+		expect(lifecycle).toContain('phase: "postCloseFailureCleanup"');
 	});
+	test("parses released /session surfaces and strict released CLI version output, then conditions startup flags by probed version", async () => {
+		const runner = await Bun.file(join(ROOT, "scripts/gjc-release-compat.ts")).text();
+		const runtime = await Bun.file(join(ROOT, "scripts/gjc-release-compat-runtime.ts")).text();
+		const parseSessionBootstrap = (output: string) => ({
+			sessionId: /(?:^|\n)\s*(?:ID|Session ID)\s*:\s*([^\s]+)\s*$/im.exec(output)?.[1],
+			sessionFile: /(?:^|\n)\s*File\s*:\s*(\S(?:.*\S)?)\s*$/im.exec(output)?.[1],
+		});
+		const startupArguments = (version: string) =>
+			version === "0.11.1" ? ["--model", "compat-local/hermetic-model"] : ["--model", "compat-local/hermetic-model", "--thinking", "off"];
+		const parseReleasedCliVersion = (output: string) => {
+			const match = /^(?:gjc\/)?(\d+\.\d+\.\d+)$/.exec(output.trim());
+			if (match === null) throw new Error("invalid version");
+			return match[1];
+		};
 
-	test("applies the pinned source-mode broker isolation patch before installing upstream dependencies", async () => {
-		// Given
-		const dockerfile = await Bun.file(join(ROOT, "Dockerfile.adapter")).text();
-		const manifest = await Bun.file(join(ROOT, "package.json")).json();
-
-		// Then
-		const checkoutIndex = dockerfile.indexOf('test "$(git rev-parse HEAD)" = "$GJC_UPSTREAM_COMMIT"');
-		const patchCheckIndex = dockerfile.indexOf("git apply --check /tmp/gajae-code-sdk-broker.patch");
-		const patchApplyIndex = dockerfile.indexOf("git apply /tmp/gajae-code-sdk-broker.patch");
-		const installIndex = dockerfile.indexOf("bun install --frozen-lockfile --ignore-scripts");
-		expect(dockerfile).toContain(
-			"COPY patches/gajae-code-c439e85-sdk-broker-safe-bun.patch /tmp/gajae-code-sdk-broker.patch",
-		);
-		expect(checkoutIndex).toBeGreaterThan(-1);
-		expect(patchCheckIndex).toBeGreaterThan(checkoutIndex);
-		expect(patchApplyIndex).toBeGreaterThan(patchCheckIndex);
-		expect(installIndex).toBeGreaterThan(patchApplyIndex);
-		expect(Reflect.get(manifest, "files")).toContain("patches");
-		for (const stalePrefix of STALE_PROVENANCE_PREFIXES) {
-			expect(readdirSync(join(ROOT, "patches")).join("\n")).not.toContain(stalePrefix);
-			expect(readdirSync(join(ROOT, "test/fixtures")).join("\n")).not.toContain(stalePrefix);
-		}
+		expect(parseSessionBootstrap("Session Info\nFile: /tmp/sessions/alpha.jsonl\nID: alpha-123\n")).toEqual({
+			sessionId: "alpha-123",
+			sessionFile: "/tmp/sessions/alpha.jsonl",
+		});
+		expect(parseSessionBootstrap("Sessions dashboard\nSession ID: beta-456\n")).toEqual({
+			sessionId: "beta-456",
+			sessionFile: undefined,
+		});
+		expect(startupArguments("0.11.1")).not.toContain("--thinking");
+		expect(startupArguments("0.11.2")).toEqual(["--model", "compat-local/hermetic-model", "--thinking", "off"]);
+		expect(parseReleasedCliVersion("gjc/0.11.1\n")).toBe("0.11.1");
+		expect(parseReleasedCliVersion("0.11.2\n")).toBe("0.11.2");
+		expect(() => parseReleasedCliVersion("gjc/0.11.1 extra")).toThrow("invalid version");
+		expect(runner).toContain('const match = /^(?:gjc\\/)?(\\d+\\.\\d+\\.\\d+)$/.exec(output);');
+		expect(runner).toContain('await run(command, ["--version"])');
+		expect(runner).toContain('version === "0.11.1" ? arguments_ : [...arguments_, "--thinking", "off"]');
+		expect(runtime).toContain('output.includes("Sessions dashboard")');
+		expect(runtime).toContain('output.includes("Session Info") && bootstrap.sessionId !== undefined && bootstrap.sessionFile !== undefined');
+		expect(runtime).toContain('const sessionFile = /(?:^|\\n)\\s*File\\s*:\\s*(\\S(?:.*\\S)?)\\s*$/im.exec(output)?.[1];');
+		expect(runner).toContain('if (thinkingSupported) await observe("thinking.set"');
 	});
+	test("cites the structural scanner as a separate artifact without fabricating runtime observation", async () => {
+		const runner = await Bun.file(join(ROOT, "scripts/gjc-release-compat.ts")).text();
 
-	test("patches only source-mode internal Bun argv and applies cleanly to the exact dev source", () => {
-		// Given
-		const root = mkdtempSync(join(tmpdir(), "gjc-broker-patch-"));
-		const target = join(root, BROKER_RUNTIME_PATH);
-		mkdirSync(join(target, ".."), { recursive: true });
-		const fixture = readFileSync(join(ROOT, BROKER_FIXTURE_PATH));
-		expect(createHash("sha256").update(fixture).digest("hex")).toBe(BROKER_FIXTURE_SHA256);
-		writeFileSync(target, fixture);
-
-		try {
-			// When
-			const patch = join(ROOT, BROKER_PATCH_PATH);
-			const checked = Bun.spawnSync(["git", "apply", "--check", patch], { cwd: root });
-			expect(checked.exitCode).toBe(0);
-			const applied = Bun.spawnSync(["git", "apply", patch], { cwd: root });
-			expect(applied.exitCode).toBe(0);
-			const source = readFileSync(target, "utf8");
-
-			// Then
-			expect(source).toContain(
-				'if (runtime.mode === "compiled") return { file: runtime.execPath, args: ["sdk", action] };',
-			);
-			expect(source).toContain('args: ["--no-env-file", "--config=/dev/null", entrypoint, "sdk", action]');
-			expect(source.match(/--no-env-file/g)).toHaveLength(1);
-		} finally {
-			rmSync(root, { recursive: true });
-		}
-	});
-
-	test("uses absolute system paths when creating the unprivileged adapter user", async () => {
-		// Given
-		const dockerfile = await Bun.file(join(ROOT, "Dockerfile.adapter")).text();
-
-		// Then
-		expect(dockerfile).toContain("/usr/sbin/groupadd --system adapter");
-		expect(dockerfile).toContain("/usr/sbin/useradd --system --gid adapter");
+		expect(runner).toContain("Static source contract artifact: \\`test/gjc-sdk-v3-contract.test.ts\\` (separate test artifact; not observed by this runtime harness).");
+		expect(runner).not.toContain("structuralFallbackEvidence");
+		expect(runner).not.toContain("passed-by-test");
 	});
 });

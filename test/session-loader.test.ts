@@ -3,7 +3,12 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { SessionHeader, SessionMessageEntry } from "@gajae-code/coding-agent";
-import { GjcSessionLoadError, loadGjcSessionFile } from "../src/gjc/session-loader";
+import {
+	discoverFreshGjcSessionFile,
+	GjcSessionLoadError,
+	loadGjcSessionFile,
+	snapshotGjcSessionFiles,
+} from "../src/gjc/session-loader";
 
 const tempDirs: string[] = [];
 
@@ -92,3 +97,113 @@ describe("loadGjcSessionFile", () => {
 		});
 	});
 });
+describe("fresh GJC session discovery", () => {
+	test("selects the unique fresh successor transcript", async () => {
+		const sessionRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-discovery-"));
+		tempDirs.push(sessionRoot);
+		const projectCwd = path.join(sessionRoot, "project");
+		const baseline = await snapshotGjcSessionFiles(sessionRoot);
+
+		await writeSessionHeader(path.join(sessionRoot, "successor.jsonl"), "successor", projectCwd);
+
+		await expect(discoverFreshGjcSessionFile(sessionRoot, baseline, "successor", projectCwd)).resolves.toMatchObject({
+			filePath: path.join(sessionRoot, "successor.jsonl"),
+			header: { id: "successor", cwd: projectCwd },
+		});
+	});
+
+	test("rejects symlink transcript escapes", async () => {
+		const sessionRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-discovery-"));
+		const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-outside-"));
+		tempDirs.push(sessionRoot, outsideRoot);
+		const projectCwd = path.join(sessionRoot, "project");
+		const baseline = await snapshotGjcSessionFiles(sessionRoot);
+		const outsideTranscript = path.join(outsideRoot, "successor.jsonl");
+		await writeSessionHeader(outsideTranscript, "successor", projectCwd);
+		await fs.symlink(outsideTranscript, path.join(sessionRoot, "escape.jsonl"));
+
+		await expect(discoverFreshGjcSessionFile(sessionRoot, baseline, "successor", projectCwd)).rejects.toBeInstanceOf(
+			GjcSessionLoadError,
+		);
+		expect(await snapshotGjcSessionFiles(sessionRoot)).toEqual(new Set([path.join(sessionRoot, "escape.jsonl")]));
+	});
+	test("excludes baseline names even when they were invalid or symlinks", async () => {
+		const sessionRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-discovery-"));
+		const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-outside-"));
+		tempDirs.push(sessionRoot, outsideRoot);
+		const projectCwd = path.join(sessionRoot, "project");
+		const invalidPath = path.join(sessionRoot, "invalid.jsonl");
+		const symlinkPath = path.join(sessionRoot, "symlink.jsonl");
+		await Bun.write(invalidPath, "not jsonl\n");
+		await fs.symlink(path.join(outsideRoot, "outside.jsonl"), symlinkPath);
+		const baseline = await snapshotGjcSessionFiles(sessionRoot);
+
+		await writeSessionHeader(invalidPath, "successor", projectCwd);
+		await fs.rm(symlinkPath);
+		await writeSessionHeader(symlinkPath, "successor", projectCwd);
+		await writeSessionHeader(path.join(sessionRoot, "fresh.jsonl"), "successor", projectCwd);
+
+		await expect(discoverFreshGjcSessionFile(sessionRoot, baseline, "successor", projectCwd)).resolves.toMatchObject({
+			filePath: path.join(sessionRoot, "fresh.jsonl"),
+		});
+	});
+
+	test("rejects a pathname replacement coordinated after held-byte ingestion", async () => {
+		const sessionRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-discovery-"));
+		const replacementRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-replacement-"));
+		tempDirs.push(sessionRoot, replacementRoot);
+		const projectCwd = path.join(sessionRoot, "project");
+		const baseline = await snapshotGjcSessionFiles(sessionRoot);
+		const candidate = path.join(sessionRoot, "successor.jsonl");
+		const replacement = path.join(replacementRoot, "replacement.jsonl");
+		await writeSessionHeader(candidate, "successor", projectCwd);
+		await writeSessionHeader(replacement, "successor", projectCwd);
+		const handle = await fs.open(candidate, "r");
+		const prototype = Object.getPrototypeOf(handle) as { readFile: () => Promise<Buffer> };
+		await handle.close();
+		const originalReadFile = prototype.readFile;
+		let swapped = false;
+		prototype.readFile = async function (this: { readFile: () => Promise<Buffer> }): Promise<Buffer> {
+			const bytes = await originalReadFile.call(this);
+			if (!swapped) {
+				swapped = true;
+				await fs.rename(replacement, candidate);
+			}
+			return bytes;
+		};
+		try {
+			await expect(discoverFreshGjcSessionFile(sessionRoot, baseline, "successor", projectCwd)).rejects.toBeInstanceOf(
+				GjcSessionLoadError,
+			);
+		} finally {
+			prototype.readFile = originalReadFile;
+		}
+	});
+
+	test("rejects ambiguous fresh transcripts and transcripts from another cwd", async () => {
+		const sessionRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-discovery-"));
+		tempDirs.push(sessionRoot);
+		const projectCwd = path.join(sessionRoot, "project");
+		const baseline = await snapshotGjcSessionFiles(sessionRoot);
+
+		await writeSessionHeader(path.join(sessionRoot, "successor-a.jsonl"), "successor", projectCwd);
+		await writeSessionHeader(path.join(sessionRoot, "successor-b.jsonl"), "successor", projectCwd);
+		await expect(discoverFreshGjcSessionFile(sessionRoot, baseline, "successor", projectCwd)).rejects.toMatchObject({
+			diagnostics: [expect.objectContaining({ code: "corrupt_session_file" })],
+		});
+
+		await fs.rm(path.join(sessionRoot, "successor-b.jsonl"));
+		await fs.rm(path.join(sessionRoot, "successor-a.jsonl"));
+		await writeSessionHeader(path.join(sessionRoot, "wrong-cwd.jsonl"), "successor", path.join(sessionRoot, "other-project"));
+		await expect(discoverFreshGjcSessionFile(sessionRoot, baseline, "successor", projectCwd)).rejects.toBeInstanceOf(
+			GjcSessionLoadError,
+		);
+	});
+});
+
+async function writeSessionHeader(filePath: string, id: string, cwd: string): Promise<void> {
+	await Bun.write(
+		filePath,
+		`${JSON.stringify({ type: "session", version: 3, id, timestamp: "2026-07-08T00:00:00.000Z", cwd })}\n`,
+	);
+}

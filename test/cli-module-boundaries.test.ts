@@ -75,6 +75,7 @@ function pureLines(source: string): number {
 function relativeImports(source: string): readonly string[] {
 	return [...source.matchAll(/from\s+["'](\.\.?\/[^"']+)["']/g)].map(match => match[1] ?? "");
 }
+const retiredRuntimeFactory = ["createGjc", "R" + "pc", "TurnRunner"].join("");
 
 describe("CLI module boundaries", () => {
 	test("exposes the pinned facade runtime manifest and function arities", async () => {
@@ -212,12 +213,17 @@ describe("CLI module boundaries", () => {
 		const cliSource = readFileSync(join(ROOT, "src", "cli.ts"), "utf8");
 		const baseSource = readFileSync(join(ROOT, "src", CLI_MODULES[0]), "utf8");
 		const installedSource = readFileSync(join(ROOT, "src", CLI_MODULES[1]), "utf8");
-		const runnerSource = readFileSync(join(ROOT, "src/gjc/rpc-client-runner.ts"), "utf8");
-		const transportSource = readFileSync(join(ROOT, "src/gjc/rpc-client-transport.ts"), "utf8");
+		const serverSource = readFileSync(join(ROOT, "src", "server.ts"), "utf8");
+		const runtimeSingletonLockSource = readFileSync(join(ROOT, "src", "runtime-singleton-lock.ts"), "utf8");
+		const runnerSource = readFileSync(join(ROOT, "src/live/gjc-routing-runner.ts"), "utf8");
+		const publicSdkRunnerSource = readFileSync(join(ROOT, "src/live/gjc-public-sdk-runner.ts"), "utf8");
+		const publicSdkSessionOpsSource = readFileSync(join(ROOT, "src/live/gjc-public-sdk-session-ops.ts"), "utf8");
 		const deploymentSource = readFileSync(join(ROOT, "src/configure/deployment-artifacts.ts"), "utf8");
 		const cliImports = relativeImports(cliSource);
 		const baseImports = relativeImports(baseSource);
 		const installedImports = relativeImports(installedSource);
+		const serverImports = relativeImports(serverSource);
+		const runtimeSingletonLockImports = relativeImports(runtimeSingletonLockSource);
 
 		// When: runtime edges and forbidden reverse edges are inspected.
 		const graph = {
@@ -227,28 +233,41 @@ describe("CLI module boundaries", () => {
 			baseToFacade: baseImports.includes("./cli"),
 			baseToInstalled: baseImports.includes("./installed-adapter-server-options"),
 			installedToFacade: installedImports.includes("./cli"),
+			serverToRuntimeSingletonLock: serverImports.includes("./runtime-singleton-lock"),
+			serverToCliOrConfigurationInternals: serverImports.some(importPath =>
+				[
+					"./adapter-server-options",
+					"./cli",
+					"./config",
+					"./config-env",
+					"./installed-adapter-server-options",
+				].includes(importPath),
+			),
+			runtimeSingletonLockToAdapterRouterOrCli: runtimeSingletonLockImports.some(importPath =>
+				/\/?(?:adapter|router|cli)(?:[-/]|$)/.test(importPath),
+			),
 			resolvedServerChain:
 				baseSource.includes("buildResolvedAdapterServerOptions(loadAdapterConfig(env), dependencies)") &&
 				cliSource.includes("buildResolvedInstalledAdapterServerOptions(config)") &&
 				installedSource.includes("buildResolvedAdapterServerOptions(config") &&
-				baseSource.includes("createResolvedGjcRpcTurnRunner({") &&
-				runnerSource.includes("input.clientFactory ?? createDefaultRpcTransport") &&
-				transportSource.includes("new SdkV3Transport(") &&
-				transportSource.includes("new SdkV3Cli({") &&
-				transportSource.includes("new SdkV3Client(authority.endpoint)"),
+				baseSource.includes("createPublicSdkGjcTurnRunner({") &&
+				runnerSource.includes('from "./gjc-public-sdk-runner"') &&
+				publicSdkRunnerSource.includes('from "./gjc-public-sdk-session-ops"') &&
+				publicSdkSessionOpsSource.includes("new CliLifecycleBackend(") &&
+				publicSdkSessionOpsSource.includes("new PublicSdkSessionClient()"),
 			resolvedDeploymentChain:
 				deploymentSource.includes("renderResolvedManagedCompose({") &&
 				deploymentSource.includes("renderResolvedSystemdComposeUnit({") &&
 				deploymentSource.includes("renderResolvedExistingSystemdUnit({"),
 			forbiddenProductionWrapperCalls:
-				/\bcreateGjcRpcTurnRunner\(/.test(baseSource) ||
+				new RegExp(`\\b${retiredRuntimeFactory}\\(`).test(baseSource) ||
 				/\bbuildAdapterServerOptions\(config/.test(installedSource) ||
 				/await buildInstalledAdapterServerOptions\(config\)/.test(cliSource) ||
 				/\brender(?:ManagedCompose|SystemdComposeUnit|ExistingSystemdUnit)\(\{/.test(deploymentSource),
 			ownedRuntimeExports: [Object.keys(base).sort(), Object.keys(installed).sort()],
 		};
 
-		// Then: the sole topological chain is facade to installed to base.
+		// Then: the CLI chain is facade to installed to base; server reaches the dedicated runtime lock without CLI/config internals.
 		expect(graph).toEqual({
 			cliToBase: true,
 			cliToInstalled: true,
@@ -256,6 +275,9 @@ describe("CLI module boundaries", () => {
 			baseToFacade: false,
 			baseToInstalled: false,
 			installedToFacade: false,
+			serverToRuntimeSingletonLock: true,
+			serverToCliOrConfigurationInternals: false,
+			runtimeSingletonLockToAdapterRouterOrCli: false,
 			resolvedServerChain: true,
 			resolvedDeploymentChain: true,
 			forbiddenProductionWrapperCalls: false,

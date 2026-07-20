@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
 	type AdapterHealthCheck,
 	type AdapterReadinessOptions,
@@ -6,6 +7,8 @@ import {
 } from "./health";
 import {
 	type AdapterRouteDependencies,
+	chatIdFromClosePath,
+	handleOpenAIChatCloseRequest,
 	handleOpenAIChatCompletionsRequest,
 	handleOpenAIModelsRequest,
 	jsonResponse,
@@ -19,6 +22,7 @@ import {
 	projectIdFromUnlinkPath,
 } from "./projects/admin-routes";
 import { type AdapterRuntimeConfig, createRuntimeReadinessReconciler } from "./server-runtime-readiness";
+import { RuntimeSingletonLock } from "./runtime-singleton-lock";
 
 export type { AdapterRouteDependencies } from "./live/openai-routes";
 export type { AdapterRuntimeConfig } from "./server-runtime-readiness";
@@ -27,6 +31,7 @@ export { initializeRuntimeReadiness } from "./server-runtime-readiness";
 export interface AdapterServerOptions {
 	host: string;
 	port: number;
+	runtimeRoot: string;
 	checks?: readonly AdapterHealthCheck[];
 	readiness?: AdapterReadinessOptions;
 	runtime?: AdapterRuntimeConfig;
@@ -53,6 +58,32 @@ function bearerToken(request: Request): string | undefined {
 
 function unauthorized(): Response {
 	return jsonResponse({ error: "unauthorized" }, { status: 401, headers: { "www-authenticate": "Bearer" } });
+}
+async function closeOperationId(request: Request): Promise<string | Response> {
+	const headerOperationId = request.headers.get("idempotency-key") ?? request.headers.get("x-operation-id");
+	if (headerOperationId !== null) return validateCloseOperationId(headerOperationId);
+
+	const body = await request.text();
+	if (body.trim() === "") return randomUUID();
+	try {
+		const parsed: unknown = JSON.parse(body);
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return randomUUID();
+		const value = Object.entries(parsed).find(([key]) => key === "operationId" || key === "idempotencyKey")?.[1];
+		return value === undefined ? randomUUID() : validateCloseOperationId(value);
+	} catch {
+		return jsonResponse(
+			{ error: { message: "Close request body must be valid JSON.", type: "invalid_request_error", code: "invalid_close_operation_id" } },
+			{ status: 400 },
+		);
+	}
+}
+
+function validateCloseOperationId(value: unknown): string | Response {
+	if (typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)) return value;
+	return jsonResponse(
+		{ error: { message: "Close operation ID must be 1-128 URL-safe characters.", type: "invalid_request_error", code: "invalid_close_operation_id" } },
+		{ status: 400 },
+	);
 }
 
 export function createAdapterRequestHandler(
@@ -97,6 +128,12 @@ export function createAdapterRequestHandler(
 			await reconcileRuntimeReadiness();
 			const report = buildReadinessReport(runtimeReadiness);
 			return jsonResponse(report, { status: report.status === "ready" ? 200 : 503 });
+		}
+		const closeChatId = request.method === "POST" ? chatIdFromClosePath(url.pathname) : undefined;
+		if (routes !== undefined && closeChatId !== undefined) {
+			const operationId = await closeOperationId(request);
+			if (operationId instanceof Response) return operationId;
+			return handleOpenAIChatCloseRequest(closeChatId, operationId, routes);
 		}
 		if (routes !== undefined && request.method === "GET" && url.pathname === "/v1/models") {
 			return handleOpenAIModelsRequest(routes);
@@ -181,27 +218,23 @@ function isHealthCheckList(
 	return Array.isArray(options);
 }
 
-export function startAdapterServer(options: AdapterServerOptions): AdapterServerHandle {
-	const server = Bun.serve({
-		hostname: options.host,
-		port: options.port,
-		fetch: createAdapterRequestHandler({
-			checks: options.checks,
-			readiness: options.readiness,
-			routes: options.routes,
-			runtime: options.runtime,
-		}),
-	});
-	return {
-		url: server.url.toString(),
-		async stop(): Promise<void> {
-			const results = await Promise.allSettled([server.stop(), options.routes?.runner.stop?.()]);
-			const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
-			if (failures.length > 0)
-				throw new AggregateError(
-					failures.map(result => result.reason),
-					"Server cleanup failed",
-				);
-		},
-	};
+export async function startAdapterServer(options: AdapterServerOptions): Promise<AdapterServerHandle> {
+	const lock = await RuntimeSingletonLock.acquire(options.runtimeRoot);
+	try {
+		const server = Bun.serve({
+			hostname: options.host, port: options.port,
+			fetch: createAdapterRequestHandler({ checks: options.checks, readiness: options.readiness, routes: options.routes, runtime: options.runtime }),
+		});
+		return {
+			url: server.url.toString(),
+			async stop(): Promise<void> {
+				const results = await Promise.allSettled([server.stop(), options.routes?.runner.stop?.(), lock.release()]);
+				const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+				if (failures.length > 0) throw new AggregateError(failures.map(result => result.reason), "Server cleanup failed");
+			},
+		};
+	} catch (error) {
+		await lock.release();
+		throw error;
+	}
 }

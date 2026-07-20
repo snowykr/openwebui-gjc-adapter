@@ -4,7 +4,28 @@ import { parseCanonicalModelId } from "../src/live/models";
 type Observation =
 	| { readonly type: "project_lookup" }
 	| { readonly type: "event"; readonly input: Record<string, unknown> }
-	| { readonly type: "message"; readonly input: Record<string, unknown> };
+	| { readonly type: "message"; readonly input: Record<string, unknown> }
+	| {
+			readonly type: "runner_failure";
+			readonly name: string;
+			readonly message: string;
+			readonly code?: string;
+			readonly stack?: string;
+			readonly cause?: Record<string, unknown>;
+			readonly operation: {
+				readonly chatId: string;
+				readonly userMessageId: string;
+				readonly requestedModelId?: string;
+			};
+	  }
+	| {
+			readonly type: "admin_failure";
+			readonly name: string;
+			readonly message: string;
+			readonly code?: string;
+			readonly stack?: string;
+			readonly cause?: Record<string, unknown>;
+	  };
 
 export type OutboxOperation = {
 	readonly operationId: string;
@@ -67,7 +88,47 @@ export function eventModels(observations: readonly Observation[], chatId?: strin
 function parseObservation(value: unknown): Observation {
 	if (!isRecord(value)) throw new TypeError("invalid observation");
 	const type = Reflect.get(value, "type");
+	const cause = Reflect.get(value, "cause");
+	const operation = Reflect.get(value, "operation");
 	if (type === "project_lookup") return { type };
+	if (
+		(type === "runner_failure" || type === "admin_failure") &&
+		typeof Reflect.get(value, "name") === "string" &&
+		typeof Reflect.get(value, "message") === "string" &&
+		(Reflect.get(value, "code") === undefined || typeof Reflect.get(value, "code") === "string") &&
+		(Reflect.get(value, "stack") === undefined || typeof Reflect.get(value, "stack") === "string") &&
+		(cause === undefined || isRecord(cause))
+	) {
+		const diagnostic = {
+			name: String(Reflect.get(value, "name")),
+			message: String(Reflect.get(value, "message")),
+			...(Reflect.get(value, "code") === undefined ? {} : { code: String(Reflect.get(value, "code")) }),
+			...(Reflect.get(value, "stack") === undefined ? {} : { stack: String(Reflect.get(value, "stack")) }),
+			...(cause === undefined ? {} : { cause }),
+		};
+		if (type === "admin_failure") return { type: "admin_failure", ...diagnostic };
+		if (isRecord(operation)) {
+			const chatId = Reflect.get(operation, "chatId");
+			const userMessageId = Reflect.get(operation, "userMessageId");
+			const requestedModelId = Reflect.get(operation, "requestedModelId");
+			if (
+				typeof chatId === "string" &&
+				typeof userMessageId === "string" &&
+				(requestedModelId === undefined || typeof requestedModelId === "string")
+			) {
+				return {
+					type: "runner_failure",
+					...diagnostic,
+					operation: {
+						...operation,
+						chatId,
+						userMessageId,
+						...(requestedModelId === undefined ? {} : { requestedModelId }),
+					},
+				};
+			}
+		}
+	}
 	const input = Reflect.get(value, "input");
 	if ((type !== "event" && type !== "message") || !isDeliveryInput(input, type)) {
 		throw new TypeError("invalid delivery observation");

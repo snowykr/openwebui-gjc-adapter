@@ -8,6 +8,16 @@ import type { OpenAIErrorResponse } from "./chat-response-format";
 import type { LiveGatewayFileContextResolver } from "./file-contexts";
 import type { OpenAIChatCompletionRequest, OpenAIChatCompletionResponse } from "./openai-types";
 
+export type OpenWebUIControl =
+	| { readonly operation: "abort" | "steer" | "follow_up" | "abort_and_prompt"; readonly text?: string }
+	| { readonly operation: "action_reply"; readonly actionId: string; readonly answer: unknown }
+	| { readonly operation: "workflow.plan_approve"; readonly input: Readonly<Record<string, unknown>> }
+	| { readonly operation: "branch" }
+	/** Attached lifecycle operations remain on the public session controller. */
+	| { readonly operation: "session.new" }
+	| { readonly operation: "session.resume" | "session.switch"; readonly sessionId: string; readonly sessionFile: string }
+	| { readonly operation: "unsupported"; readonly surface: string };
+
 export interface LiveGatewayRunnerInput {
 	readonly project: RegisteredProject;
 	readonly prompt: string;
@@ -17,6 +27,11 @@ export interface LiveGatewayRunnerInput {
 	readonly userMessageParentId: string | null;
 	readonly continued: boolean;
 	readonly requestedModelId?: string;
+	/** Authenticated OpenWebUI owner bound by the request handler for branch controls. */
+	readonly ownerUserId?: string;
+	/** Message lineage supplied by OpenWebUI for the regenerated message. */
+	readonly messageMetadata?: Readonly<Record<string, unknown>>;
+	readonly control?: OpenWebUIControl;
 }
 
 export type LiveGatewayRunnerResult =
@@ -42,6 +57,14 @@ export class LiveGatewayUnavailableError extends Error {
 	readonly code = "live_runner_unavailable";
 }
 
+export class OpenWebUIControlError extends Error {
+	readonly code = "unsupported_openwebui_control";
+
+	constructor(surface: string) {
+		super(`Unsupported or ambiguous OpenWebUI control surface: ${surface}.`);
+		this.name = "OpenWebUIControlError";
+	}
+}
 export class WorkflowGateReplyError extends Error {
 	constructor(
 		message: string,

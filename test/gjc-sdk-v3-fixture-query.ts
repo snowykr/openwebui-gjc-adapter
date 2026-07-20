@@ -9,6 +9,8 @@ export function handleQuery(
 	gateAnswered: boolean,
 	sequentialGate: string,
 	promptStarted: boolean,
+	activeSessionId: string,
+	activeSessionCwd: string,
 ): void {
 	if (query === "session.last_assistant" && scenario === "idle_terminal_without_lifecycle") {
 		socket.send(
@@ -19,6 +21,21 @@ export function handleQuery(
 				error: { code: "resource_gone", message: "snapshot payload is unavailable" },
 			}),
 		);
+		return;
+	}
+	if (query === "session.branch_candidates") {
+		const items =
+			scenario === "branch_candidate_absent"
+				? []
+				: scenario === "branch_candidate_duplicate"
+					? [
+							{ entry: { id: "entry-q16", type: "message" }, children: [] },
+							{ entry: { id: "entry-q16", type: "message" }, children: [] },
+						]
+					: scenario === "branch_candidate_drift"
+						? [{ entry: { id: "entry-q16", type: "drifted-message" }, children: [] }]
+						: [{ entry: { id: "entry-q16", type: "message" }, children: [] }];
+		socket.send(JSON.stringify({ type: "query_response", id, ok: true, page: { items, complete: true, revision: 16 } }));
 		return;
 	}
 	const items: readonly unknown[] =
@@ -73,8 +90,8 @@ export function handleQuery(
 					: query === "session.metadata"
 						? [
 								{
-									sessionId: scenario === "resumed_session" ? "sdk-session-resumed" : "sdk-session-created",
-									cwd: process.env.GJC_SDK_FIXTURE_EXPECTED_CWD ?? "/workspace",
+									sessionId: activeSessionId,
+									cwd: activeSessionCwd,
 									kind: "saved",
 								},
 							]

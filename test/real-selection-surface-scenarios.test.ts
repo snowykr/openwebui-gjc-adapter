@@ -56,7 +56,7 @@ describe("real canonical model selection surfaces", () => {
 		}
 	}, 15_000);
 
-	test("drives catalog JSON SSE background normalization admin and setter failure", async () => {
+	test("drives catalog JSON SSE background normalization admin and setter failure without durable projection rows", async () => {
 		const harness = await RealSelectionHarness.start();
 		try {
 			const models = await harness.models();
@@ -76,10 +76,8 @@ describe("real canonical model selection surfaces", () => {
 			expect(mapping).not.toContain(LOW_MODEL_ID);
 			expect(await harness.eventModels("chat-normalized")).toEqual([MEDIUM_MODEL_ID]);
 			const normalizedEffects = await harness.effects();
-			expect(normalizedEffects.outbox.filter(row => row.chatId === "chat-normalized").map(row => row.kind)).toEqual([
-				"session_mapping",
-				"event",
-			]);
+			// Without an OpenWebUIProjectionRepository, live event sink delivery still occurs but durable projection rows are disabled.
+			expect(normalizedEffects.outbox).toEqual([]);
 			expect(await harness.chat("gjc", { id: "alias-admin", content: "/gjc project list" })).toMatchObject({
 				status: 200,
 				body: { model: MEDIUM_MODEL_ID },

@@ -167,6 +167,41 @@ describe("createAdapterRequestHandler", () => {
 		expect(streaming.headers.get("content-type")).toStartWith("text/event-stream");
 		expect(await streaming.text()).toContain("data: [DONE]");
 	});
+	test("uses a client operation ID for close responses without persisting the bearer token", async () => {
+		const mapping = {
+			chatId: "chat-1",
+			projectId: "demo",
+			sessionId: "session-1",
+			rawFrameCursor: 0,
+			eventCursor: 0,
+			operationId: "turn-1",
+		};
+		const ingressIds: string[] = [];
+		const handler = createAdapterRequestHandler({
+			routes: {
+				projects: [project],
+				owner,
+				runner: fixedRunner("unused"),
+				adapterApiToken: "adapter-token",
+				requireAdapterApiToken: true,
+				mappings: { get: chatId => (chatId === mapping.chatId ? mapping : undefined) },
+				closeSession: async (_mapping, ingress) => {
+					ingressIds.push(ingress.ingressId);
+					return { status: "closed" };
+				},
+			},
+		});
+
+		const response = await handler(new Request("http://adapter.test/v1/chats/chat-1/close", {
+			method: "POST",
+			headers: { authorization: "Bearer adapter-token", "idempotency-key": "close-operation-1" },
+		}));
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({ status: "closed", operationId: "close-operation-1" });
+		expect(ingressIds).toHaveLength(1);
+		expect(ingressIds[0]).not.toContain("adapter-token");
+	});
 });
 
 const project: RegisteredProject = {

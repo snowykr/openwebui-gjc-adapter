@@ -38,6 +38,7 @@ import {
 	ownerUserId,
 	sseInput,
 } from "./golden-fixture-fixtures";
+import { attachmentProof } from "./gjc-lifecycle-fixtures";
 import * as selectionFixture from "./model-selection-fixtures";
 
 describe("GJC-primary OpenWebUI golden MVP fixture", () => {
@@ -240,6 +241,7 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 			rawFrameCursor: 2,
 			eventCursor: 1,
 			operationId: "user-2",
+			attachment: attachmentProof({ cwd, sessionId: "session-golden" }),
 		});
 		expect(
 			resolveBranchRegenerateAction({
@@ -260,7 +262,7 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 				mappings,
 				messageMetadata: importedLeafMetadata,
 			}),
-		).toMatchObject({ action: "fork" });
+		).toMatchObject({ action: "uncertain" });
 
 		expect(await Bun.file(sessionFile).text()).toBe(originalJsonl);
 	});

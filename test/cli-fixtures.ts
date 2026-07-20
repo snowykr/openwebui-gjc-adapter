@@ -8,7 +8,8 @@ import type {
 	GjcSwitchSessionInput,
 	GjcTurnResult,
 	GjcTurnRunner,
-} from "../src/gjc/rpc-runner";
+} from "../src/gjc/turn-runner";
+import { attachmentProof, lifecycleFixture } from "./gjc-lifecycle-fixtures";
 
 export async function reserveTcpPort(): Promise<number> {
 	const server = Bun.serve({
@@ -71,9 +72,12 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 	readonly starts: GjcStartNewSessionInput[] = [];
 	events: GjcTurnResult["events"] = [{ type: "assistant", text: "assistant from gjc" }];
 
-	async startNewSession(input: GjcStartNewSessionInput): Promise<GjcSessionAddress & GjcTurnResult> {
+	async startNewSession<T>(
+		input: GjcStartNewSessionInput,
+		publish: (result: GjcSessionAddress & GjcTurnResult, lifecycle: ReturnType<typeof lifecycleFixture>) => Promise<T>,
+	): Promise<T> {
 		this.starts.push(input);
-		return {
+		const result = {
 			cwd: input.cwd,
 			sessionRoot: input.sessionRoot,
 			projectId: input.projectId,
@@ -87,6 +91,8 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 			eventCursor: 1,
 			...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
 		};
+		const lifecycle = lifecycleFixture(result);
+		return await publish({ ...result, attachment: attachmentProof(result) }, lifecycle);
 	}
 
 	async continueSession(input: GjcContinueSessionInput): Promise<GjcTurnResult> {
@@ -98,10 +104,23 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 			rawFrameCursor: input.rawFrameCursor + 1,
 			eventCursor: input.eventCursor + 1,
 			...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
+			attachment: attachmentProof(input),
 		};
 	}
 
 	async switchSession(_input: GjcSwitchSessionInput): Promise<void> {}
+	async withLifecyclePublication<T>(
+		address: GjcSessionAddress,
+		effect: (lifecycle: ReturnType<typeof lifecycleFixture>) => Promise<T>,
+	): Promise<T> {
+		return await effect(lifecycleFixture(address));
+	}
+	async withLifecycleClosePreflight<T>(
+		address: GjcSessionAddress,
+		effect: (lifecycle: ReturnType<typeof lifecycleFixture>) => Promise<T>,
+	): Promise<T> {
+		return await effect(lifecycleFixture(address));
+	}
 
 	async getState(input: GjcSessionStateInput): Promise<GjcSessionState> {
 		return {
@@ -109,6 +128,7 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 			activeLeaf: "leaf-1",
 			rawFrameCursor: 1,
 			eventCursor: 1,
+			attachment: attachmentProof(input),
 		};
 	}
 }

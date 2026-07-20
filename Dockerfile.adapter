@@ -2,77 +2,37 @@
 
 FROM oven/bun:1.3.14@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4 AS bun-runtime
 
-FROM rust:1.86-slim-bookworm@sha256:57d415bbd61ce11e2d5f73de068103c7bd9f3188dc132c97cef4a8f62989e944 AS gjc-builder
-
-ENV BUN_INSTALL=/opt/bun \
-    GJC_UPSTREAM_REPOSITORY=https://github.com/Yeachan-Heo/gajae-code.git \
-    GJC_UPSTREAM_COMMIT=c439e85141f882ebbe926885d8b6673b9893cbb8 \
-    PATH=/opt/bun/bin:/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git libssl-dev pkg-config unzip \
-    && rm -rf /var/lib/apt/lists/*
-COPY --from=bun-runtime /usr/local/bin/bun /opt/bun/bin/bun
-RUN bun --version
-RUN git init /opt/gajae-code \
-    && cd /opt/gajae-code \
-    && git fetch --depth=1 "$GJC_UPSTREAM_REPOSITORY" "$GJC_UPSTREAM_COMMIT" \
-    && git checkout --detach FETCH_HEAD \
-    && test "$(git rev-parse HEAD)" = "$GJC_UPSTREAM_COMMIT"
-COPY patches/gajae-code-c439e85-sdk-broker-safe-bun.patch /tmp/gajae-code-sdk-broker.patch
-RUN cd /opt/gajae-code \
-    && git apply --check /tmp/gajae-code-sdk-broker.patch \
-    && git apply /tmp/gajae-code-sdk-broker.patch
-
-WORKDIR /opt/gajae-code
-RUN bun install --frozen-lockfile --ignore-scripts
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
-    --mount=type=cache,target=/opt/gajae-code/target \
-    bun --cwd=packages/natives run build \
-    && rm -rf packages/natives-*/native \
-    && cp packages/natives/native/pi_natives.linux-*.node /opt/bun/bin/
-RUN bun --cwd=packages/coding-agent run generate-docs-index \
-    && rm -rf .git target packages/natives/native/.build
-
 FROM python:3.12-slim-bookworm@sha256:8a7e7cc04fd3e2bd787f7f24e22d5d119aa590d429b50c95dfe12b3abe52f48b
 
 ENV BUN_INSTALL=/opt/bun \
-    GJC_UPSTREAM_COMMIT=c439e85141f882ebbe926885d8b6673b9893cbb8 \
+    HOME=/home/adapter \
     PATH=/opt/bun/bin:/usr/local/bin:/usr/bin:/bin
-LABEL org.opencontainers.image.revision=$GJC_UPSTREAM_COMMIT
+LABEL org.opencontainers.image.version="0.11.2"
 
 RUN apt-get update \
-	&& apt-get install -y --no-install-recommends ca-certificates curl git openssh-client sqlite3 tini unzip \
+    && apt-get install -y --no-install-recommends ca-certificates curl git openssh-client sqlite3 tini tmux unzip \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=gjc-builder /opt/bun /opt/bun
-COPY --from=gjc-builder /opt/gajae-code /opt/gajae-code
-RUN printf '%s\n' \
-    '#!/usr/bin/env bash' \
-    'set -euo pipefail' \
-    'exec bun --no-env-file --config=/dev/null /opt/gajae-code/packages/coding-agent/src/cli.ts "$@"' \
-    > /usr/local/bin/gjc \
-    && chmod +x /usr/local/bin/gjc \
-    && gjc --version
+COPY --from=bun-runtime /usr/local/bin/bun /opt/bun/bin/bun
 
 WORKDIR /opt/openwebui-gjc-adapter
 
 COPY package.json bun.lock ./
-RUN bun install --frozen-lockfile --production
+RUN bun install --frozen-lockfile --production \
+    && test "$(bun --no-env-file --config=/dev/null ./node_modules/.bin/gjc --version)" = "0.11.2"
 COPY src ./src
 COPY bin ./bin
 
 ENV GJC_OPENWEBUI_BIND_HOST=0.0.0.0 \
     GJC_OPENWEBUI_BIND_PORT=8765 \
-    GJC_OPENWEBUI_GJC_COMMAND=/usr/local/bin/gjc \
+    GJC_OPENWEBUI_GJC_COMMAND=/opt/openwebui-gjc-adapter/node_modules/.bin/gjc \
     GJC_OPENWEBUI_STATE_PATH=/var/lib/gjc \
     GJC_OPENWEBUI_SESSION_ROOT=/run/gjc-session \
-    GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS=/workspace \
-    GJC_SDK_SESSION_COMMAND="/usr/local/bin/gjc sdk session-host-internal"
+    GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS=/workspace
 EXPOSE 8765
 
-RUN /usr/sbin/groupadd --system adapter \
-	&& /usr/sbin/useradd --system --gid adapter --no-create-home --shell /usr/sbin/nologin adapter
+RUN /usr/sbin/groupadd --system --gid 10001 adapter \
+    && /usr/sbin/useradd --system --uid 10001 --gid adapter --create-home --home-dir /home/adapter --shell /usr/sbin/nologin adapter \
+    && install -d --owner=adapter --group=adapter --mode=0700 /var/lib/gjc /run/gjc-session /workspace
 USER adapter:adapter
 
 ENTRYPOINT ["/usr/bin/tini", "--", "bun", "/opt/openwebui-gjc-adapter/bin/openwebui-gjc-adapter"]

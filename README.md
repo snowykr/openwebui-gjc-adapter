@@ -38,7 +38,7 @@ Add the required custom headers on the OpenAI connection:
 }
 ```
 
-Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. The adapter package pins the published GJC 0.10.1 metadata packages, while the managed image builds and runs the exact reviewed current-`dev` source commit declared in `Dockerfile.adapter`. Upstream SDK v3 monitoring was last checked against `Yeachan-Heo/gajae-code` `dev` commit `26bb02e724f971b3c7927637fb68967fea4a6ae0` (2026-07-15); it is an unreleased upstream reference, not a supported runtime pin. Session control uses the authenticated localhost SDK v3 WebSocket contract; the removed legacy JSONL RPC mode is not supported. Background task calls such as title generation are no-ops and must not create GJC sessions.
+Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. The adapter and managed image use the published `@gajae-code/coding-agent` and `@gajae-code/natives` `0.11.2` pair. The image runs the published `gjc` executable as the non-root `adapter` user, including `tmux`; it does not build a private broker or apply an upstream source patch. Background task calls such as title generation are no-ops and must not create GJC sessions.
 
 ## CLI first-install configuration
 
@@ -99,7 +99,21 @@ Project folders are not advertised as models; the adapter resolves the GJC worki
 
 The project guard protects exactly four resolved GJC paths: `configDomain`, `agentDir`, `readerWorkspace`, and `readerSessionRoot`. A project `cwd` or explicit `sessionRoot` is rejected when it is equal to, an ancestor of, or a descendant of any one of them. The guard does not cover adapter state, mappings, session stores, or SQLite.
 
-Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. The adapter authenticates to each SDK v3 session endpoint before consuming its correlated lifecycle, turn, gate, and stream events. Background task calls such as title generation are no-ops and must not create GJC sessions.
+Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. The adapter uses only the released public SDK session surface after lifecycle acknowledgement. Background task calls such as title generation are no-ops and must not create GJC sessions.
+
+### GJC routing matrix
+
+| Operation | Primary route | Fallback and ownership |
+| --- | --- | --- |
+| Session lifecycle, turns, model selection, gates, and events | Released public GJC SDK | No fallback. Missing, malformed, or ambiguous SDK authority fails closed. |
+| CLI lifecycle | Published `gjc` CLI | Only create, cold JSONL resume, readiness, and cleanup of an exactly proven owned pane before SDK lifecycle acknowledgement. After a possibly-applied close acknowledgement, it may send `/exit` only to the exact receipt-owned tmux pane; it never supplies turns, models, events, gates, or an endpoint. |
+| Transport detach | Local transport only | Detach is not `session.close` and never terminates a remote session. |
+| Public `session.close` | Released public SDK, then receipt-owned CLI/tmux `/exit` | SDK close is logical acknowledgement, not lifecycle termination. For an acknowledged close, the adapter sends `/exit` to the exact receipt-owned pane and then requires both endpoint disappearance and absence of the original pane PID. It sends no kill or other destructive fallback after a possibly-applied acknowledgement. |
+| Regenerate/branch | Persisted owner, project, session, and message lineage | Any missing, conflicting, or ambiguous authority fails closed; the adapter does not fork or replay the operation. |
+The same two-phase owned close applies to admin close and adapter-created temporary catalog sessions. A destructive kill fallback is permitted only before an acknowledgement may have been applied, and only for an exactly proven owned pane.
+
+The adapter does not use private daemon, global broker, private protocol, or GJC database interfaces.
+
 Inside OpenWebUI, send these slash-style commands in a normal `gjc` chat for project administration:
 
 ```text
@@ -129,11 +143,11 @@ Selection updates the machine-global last-successful-writer-wins default. Operat
 - OpenWebUI chat rows and chat messages are projection/cache records.
 - Adapter metadata is stored under `gjc_adapter`; user-visible OpenWebUI fields such as title/rating are preserved on reprojection.
 - The live gateway uses `/v1/models` and `/v1/chat/completions`.
-- The package entrypoint wires chat completions through the GJC SDK v3 turn runner and stores OpenWebUI chat-to-GJC session mappings in a file-backed store under `GJC_OPENWEBUI_SESSION_ROOT`.
-- The adapter consumes authenticated SDK v3 session events and correlates prompt completion by command and turn identity. Delivered session events are bounded OpenWebUI message events covering available lifecycle, tool/MCP, subagent, todo, goal, notice, retry, compaction, and workflow progress.
+- The package entrypoint wires chat completions through the released public SDK session surface and stores OpenWebUI chat-to-GJC session mappings in a file-backed store under `GJC_OPENWEBUI_SESSION_ROOT`.
+- The adapter consumes correlated public SDK session events and correlates prompt completion by command and turn identity. Delivered session events are bounded OpenWebUI message events covering available lifecycle, tool/MCP, subagent, todo, goal, notice, retry, compaction, and workflow progress.
 - Raw tool arguments/results and secret-looking text are not emitted directly; the adapter preserves bounded labels, counts, phases, and status descriptions for display.
-- Workflow gates are rendered as assistant-visible pending-gate text. A matching user reply is validated against the persisted gate schema and resumed through the authenticated SDK session; replies that do not match the stored project, session, message lineage, or gate correlation fail closed.
-- Regenerate/branch only proceeds when owner, project, session, and message lineage metadata match; otherwise the adapter forks safely.
+- Workflow gates are rendered as assistant-visible pending-gate text. A matching user reply is validated against the persisted gate schema and resumed through the public SDK session; replies that do not match the stored project, session, message lineage, or gate correlation fail closed.
+- Regenerate/branch requires matching persisted owner, project, session, and message lineage authority. Missing, conflicting, or ambiguous authority is rejected without fork, replay, or fallback.
 
 ## Operator notes
 

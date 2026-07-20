@@ -4,6 +4,28 @@ import * as path from "node:path";
 import { LOW_MODEL_ID, MEDIUM_MODEL_ID, OFF_MODEL_ID } from "./model-selection-fixtures";
 import { expectNoDeliveryMutation, expectSelectionError } from "./real-selection-expectations";
 import { RealSelectionHarness } from "./real-selection-harness";
+function expectNoPersistedModelSelectionBinding(document: unknown, chatId: string): void {
+	expect(document).toEqual(expect.objectContaining({ mappings: expect.any(Array) }));
+	const mappings = (document as { mappings: unknown[] }).mappings.filter(
+		(mapping): mapping is Record<string, unknown> => isRecord(mapping) && mapping.chatId === chatId,
+	);
+	expect(mappings).toHaveLength(1);
+	for (const mapping of mappings) {
+		expect(mapping).not.toHaveProperty("modelSelection");
+		const journal = mapping.journal;
+		expect(Array.isArray(journal)).toBe(true);
+		const snapshots = (journal as unknown[])
+			.map(operation => (isRecord(operation) && isRecord(operation.result) ? operation.result.mapping : undefined))
+			.filter(snapshot => isRecord(snapshot) && snapshot.chatId === chatId);
+		expect(snapshots.length).toBeGreaterThan(0);
+		for (const snapshot of snapshots) expect(snapshot).not.toHaveProperty("modelSelection");
+	}
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 
 describe("real canonical model selection scenarios", () => {
 	test("returns every typed selection error with the required side-effect boundaries", async () => {
@@ -100,7 +122,9 @@ describe("real canonical model selection scenarios", () => {
 
 			harness.coordinator.emitGateOnNextPrompt();
 			expect(await harness.chat(LOW_MODEL_ID, { id: "gate-missing" })).toMatchObject({ status: 200 });
+			await expect(access(path.join(harness.root, "state", "openwebui-projection-outbox.json"))).rejects.toThrow();
 			await harness.restartAfterRemovingModelBinding("chat-gate-missing");
+			expectNoPersistedModelSelectionBinding(JSON.parse(await harness.mappingBytes()), "chat-gate-missing");
 			const beforeMissing = await harness.effects();
 			await expectSelectionError(
 				harness.chat(LOW_MODEL_ID, {
@@ -142,10 +166,87 @@ describe("real canonical model selection scenarios", () => {
 			});
 			expect(JSON.stringify(failed)).not.toMatch(/private|TOKEN|\\u0000/);
 			expect(failed).toMatchObject({ contentType: expect.stringContaining("application/json") });
-			expect(await harness.mappingBytes()).not.toContain("chat-prompt-failed");
+			expect(failed.runnerFailures).toEqual([
+				expect.objectContaining({
+					code: "prompt_failed",
+					operation: {
+						chatId: "chat-prompt-failed",
+						userMessageId: "user-prompt-failed",
+						requestedModelId: OFF_MODEL_ID,
+					},
+				}),
+			]);
+			const mappingDocument = JSON.parse(await harness.mappingBytes()) as {
+				readonly mappings: readonly { readonly chatId?: unknown }[];
+				readonly provisionalOperations: readonly Record<string, unknown>[];
+			};
+			expect(mappingDocument.mappings.some(mapping => mapping.chatId === "chat-prompt-failed")).toBeFalse();
+			const provisional = mappingDocument.provisionalOperations.filter(operation => operation.chatId === "chat-prompt-failed");
+			expect(provisional).toHaveLength(1);
+			const operation = provisional[0] as Record<string, unknown>;
+			const attachment = operation.attachment as Record<string, unknown>;
+			const sessionId = operation.sessionId as string;
+			const workspace = path.join(harness.root, ".gjc", "openwebui", "default-reader");
+			const descriptorStat = attachment.descriptorStat as Record<string, unknown>;
+			expect(attachment.generation).toBe(descriptorStat.mtimeMs);
+			expect(operation).toMatchObject({
+				id: "user-prompt-failed",
+				ingressId: "user-prompt-failed",
+				kind: "create",
+				state: "uncertain",
+				chatId: "chat-prompt-failed",
+				projectId: "openwebui",
+				detail: expect.stringMatching(/^[a-f0-9]{64}$/),
+				sessionFile: path.join(workspace, ".gjc", "sessions", `${sessionId}.jsonl`),
+			});
+			expect(sessionId).toMatch(/^[0-9a-f-]{36}$/);
+			expect(Object.keys(operation).sort()).toEqual([
+				"attachment",
+				"chatId",
+				"detail",
+				"id",
+				"ingressId",
+				"kind",
+				"projectId",
+				"sessionFile",
+				"sessionId",
+				"startedAt",
+				"state",
+			]);
+			expect(attachment).toMatchObject({
+				descriptorPath: path.join(workspace, ".gjc", "state", "sdk", `${sessionId}.json`),
+				descriptorStat: {
+					dev: expect.any(Number),
+					ino: expect.any(Number),
+					size: expect.any(Number),
+					mtimeMs: expect.any(Number),
+				},
+				payloadDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+				expectedSessionId: sessionId,
+				expectedCwd: workspace,
+				tmuxSocket: expect.any(String),
+				tmuxPane: expect.stringMatching(/^%\d+$/),
+				tmuxPanePid: expect.any(Number),
+				tmuxOwnershipTag: expect.stringMatching(/^openwebui-gjc-[0-9a-f-]{36}$/),
+				ownedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+			});
+			expect(Object.keys(attachment).sort()).toEqual([
+				"descriptorPath",
+				"descriptorStat",
+				"expectedCwd",
+				"expectedSessionId",
+				"generation",
+				"ownedAt",
+				"payloadDigest",
+				"tmuxOwnershipTag",
+				"tmuxPane",
+				"tmuxPanePid",
+				"tmuxSocket",
+			]);
+			expect(JSON.stringify(operation)).not.toMatch(/assistant|PASS|private|TOKEN|\\u0000/);
 			const afterFailure = await harness.effects();
-			expect(afterFailure.coordinator.setterAttempts).toBe(beforeFailure.coordinator.setterAttempts + 1);
-			expect(afterFailure.coordinator.setters).toHaveLength(beforeFailure.coordinator.setters.length + 1);
+			expect(afterFailure.coordinator.setterAttempts).toBe(beforeFailure.coordinator.setterAttempts + 2);
+			expect(afterFailure.coordinator.setters).toHaveLength(beforeFailure.coordinator.setters.length + 2);
 			expect(afterFailure.coordinator.promptCount).toBe(beforeFailure.coordinator.promptCount + 1);
 			expect(afterFailure.coordinator.selection.thinkingLevel).toBe("off");
 			expect(afterFailure.projectLookups).toBe(beforeFailure.projectLookups + 1);
@@ -158,6 +259,13 @@ describe("real canonical model selection scenarios", () => {
 	test("proves sequential and overlapping global LWW from setter-success transcript order", async () => {
 		const harness = await RealSelectionHarness.start();
 		try {
+			const runtime = await harness.runtimeReceipt();
+			expect(runtime.cwd).toBe(harness.root);
+			expect(runtime.config).toMatchObject({
+				statePath: path.join(harness.root, "state"),
+				sessionRoot: path.join(harness.root, "sessions"),
+			});
+			expect(path.relative(harness.root, runtime.config.neutralWorkspace).startsWith("..")).toBeFalse();
 			await harness.chat(LOW_MODEL_ID, { id: "a-to-b-a" });
 			await harness.chat(OFF_MODEL_ID, { id: "a-to-b-b" });
 			expect(harness.coordinator.snapshot().selection.thinkingLevel).toBe("off");

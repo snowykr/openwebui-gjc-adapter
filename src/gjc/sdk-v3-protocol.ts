@@ -1,23 +1,17 @@
 import { GJC_THINKING_LEVELS, type NormalizedModelSelection } from "../contracts";
-import type { GjcRpcRunnerTransportEvent, GjcRpcTransportState } from "./rpc-runner";
+import type { PublicSdkSessionAttachment, PublicSdkSessionState } from "./public-sdk-contract";
 
 export type SdkRecord = Readonly<Record<string, unknown>>;
 
 export interface SdkEndpoint {
 	readonly url: string;
 	readonly token: string;
+	/** Released SDK descriptor process identity; absent on older descriptors. */
+	readonly pid?: number;
 }
 
-export interface SdkSessionAuthority {
-	readonly sessionId: string;
-	readonly cwd: string;
-	readonly endpoint: SdkEndpoint;
-}
+export interface SdkSessionAuthority extends PublicSdkSessionAttachment {}
 
-export interface SdkSavedSession {
-	readonly sessionId: string;
-	readonly path: string;
-}
 
 export interface SdkExpectedSessionAuthority {
 	readonly cwd: string;
@@ -68,6 +62,21 @@ export function requiredString(record: SdkRecord, field: string, boundary: strin
 	}
 	return value;
 }
+export function parsePublishedSdkEndpointDescriptor(bytes: string, boundary: string): SdkEndpoint {
+	const endpoint = parseJsonRecord(bytes, boundary);
+	const version = endpoint.version;
+	if (version !== undefined && (typeof version !== "number" || !Number.isInteger(version) || version < 0 || version > 1)) {
+		throw new SdkV3ProtocolError(boundary, "version must be a supported non-negative integer");
+	}
+	const pid = endpoint.pid;
+	if (pid !== undefined && (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0))
+		throw new SdkV3ProtocolError(boundary, "pid must be a positive safe integer");
+	return {
+		url: parseLocalEndpointUrl(requiredString(endpoint, "url", boundary), boundary),
+		token: requiredString(endpoint, "token", boundary),
+		...(typeof pid === "number" ? { pid } : {}),
+	};
+}
 
 export function parseOperationResult(frame: SdkRecord, boundary: string): unknown {
 	if (frame.ok === false) {
@@ -105,21 +114,6 @@ export function parseSessionAuthority(
 	};
 }
 
-export function parseResolvedSession(value: unknown, expectedSessionId: string): SdkSavedSession {
-	const result = parseRecord(value, "session.list result");
-	const saved = parseRecord(result.savedSession, "session.list result.savedSession");
-	const sessionId = requiredString(saved, "id", "session.list result.savedSession");
-	if (sessionId !== expectedSessionId) {
-		throw new SdkV3ProtocolError(
-			"session.list result.savedSession",
-			"session id does not match the requested session",
-		);
-	}
-	return {
-		sessionId,
-		path: requiredString(saved, "path", "session.list result.savedSession"),
-	};
-}
 
 export function parseQueryPage(
 	frame: SdkRecord,
@@ -166,7 +160,7 @@ export function parseState(
 	metadataValue: unknown,
 	configValue: unknown,
 	authority: Pick<SdkSessionAuthority, "sessionId" | "cwd">,
-): GjcRpcTransportState {
+): PublicSdkSessionState {
 	const metadata = parseRecord(metadataValue, "session.metadata result");
 	const sessionId = requiredString(metadata, "sessionId", "session.metadata result");
 	const cwd = requiredString(metadata, "cwd", "session.metadata result");
@@ -182,30 +176,16 @@ export function parseState(
 	return {
 		sessionId: authority.sessionId,
 		model: { provider: model.slice(0, separator), id: model.slice(separator + 1) },
-		thinkingLevel: config.thinking,
+		thinkingLevel: requiredString(config, "thinking", "config.list/get result"),
 	};
 }
 
 function parseLocalEndpointUrl(value: string, boundary: string): string {
-	let url: URL;
-	try {
-		url = new URL(value);
-	} catch {
-		throw new SdkV3ProtocolError(`${boundary}.endpoint`, "url must be a valid URL");
-	}
-	if (
-		url.protocol !== "ws:" ||
-		url.hostname !== "127.0.0.1" ||
-		url.port.length === 0 ||
-		url.username.length > 0 ||
-		url.password.length > 0 ||
-		url.search.length > 0 ||
-		url.hash.length > 0 ||
-		url.pathname !== "/"
-	) {
+	const match = /^ws:\/\/127\.0\.0\.1:([1-9][0-9]{0,4})$/.exec(value);
+	if (match === null || Number(match[1]) > 65_535) {
 		throw new SdkV3ProtocolError(
 			`${boundary}.endpoint`,
-			"url must be an uncredentialed ws://127.0.0.1:<port> endpoint",
+			"url must be exactly ws://127.0.0.1:<port> with a port from 1 through 65535",
 		);
 	}
 	return value;
@@ -222,10 +202,6 @@ export function parseLastAssistant(items: readonly unknown[]): string | null {
 	return text;
 }
 
-export function asTransportEvent(value: unknown, boundary = "event"): GjcRpcRunnerTransportEvent {
-	const record = parseRecord(value, boundary);
-	return { ...record, type: requiredString(record, "type", boundary) };
-}
 
 function isThinkingLevel(value: string): value is NormalizedModelSelection["thinkingLevel"] {
 	return GJC_THINKING_LEVELS.some(level => level === value);

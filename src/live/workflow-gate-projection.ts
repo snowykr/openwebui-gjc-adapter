@@ -1,6 +1,6 @@
-import { classifyRpcFrame } from "../gjc/rpc-frames";
-import type { GjcTurnEvent } from "../gjc/rpc-runner";
-import { normalizeModelSelection, type SessionMapping } from "../gjc/session-router";
+import { classifySessionFrame } from "../gjc/session-frames";
+import type { GjcTurnEvent } from "../gjc/turn-runner";
+import { normalizeModelSelection, type SessionMapping, type SessionMappingStore } from "../gjc/session-router";
 import type { OpenWebUIMessageEvent } from "../openwebui/events";
 import { type ProjectableAgentFrame, projectAgentFrame } from "../projection/events";
 import {
@@ -8,8 +8,10 @@ import {
 	pendingWorkflowGateFromEvent,
 	projectPendingWorkflowGateMessage,
 } from "../projection/workflow-gates";
-import { buildProjectionPayloadHash } from "../state/outbox";
+import { buildProjectionPayloadHash, type EnqueueProjectionOperationInput, type OutboxStore, type ProjectionOperation } from "../state/outbox";
 import { sessionEventToProjectableFrame } from "./session-event-frames";
+import { formatCanonicalModelId } from "./models";
+import type { ProjectionOperationApplier } from "../state/reconciler";
 
 export function projectTurnEvents(
 	events: readonly GjcTurnEvent[],
@@ -55,8 +57,95 @@ export function buildEventPayloadHash(events: readonly OpenWebUIMessageEvent[]):
 	return buildProjectionPayloadHash({ eventsJson: JSON.stringify(events) });
 }
 
+export function expectedProjectionRows(
+	mapping: SessionMapping,
+	ownerUserId: string,
+): readonly EnqueueProjectionOperationInput[] {
+	const events = projectedMappingEvents(mapping);
+	return [
+		{
+			operationId: mapping.operationId,
+			ownerUserId,
+			projectId: mapping.projectId,
+			chatId: mapping.chatId,
+			kind: "session_mapping",
+			payloadHash: buildSessionMappingPayloadHash(mapping),
+		},
+		{
+			operationId: `${mapping.operationId}:event`,
+			ownerUserId,
+			projectId: mapping.projectId,
+			chatId: mapping.chatId,
+			kind: "event",
+			payloadHash: buildEventPayloadHash(events),
+		},
+	];
+}
+
+export function ensureProjectionRows(
+	outbox: OutboxStore | undefined,
+	mapping: SessionMapping,
+	ownerUserId: string,
+): void {
+	for (const row of expectedProjectionRows(mapping, ownerUserId)) outbox?.enqueue(row);
+}
+export function synthesizeProjectionRows(
+	outbox: OutboxStore,
+	mappings: SessionMappingStore,
+	ownerUserId: string,
+): void {
+	for (const mapping of mappings.entries()) {
+		const operation = mappings.operation(mapping.chatId, mapping.operationId);
+		if (operation?.state !== "complete" || operation.result?.mapping.operationId !== mapping.operationId) continue;
+		ensureProjectionRows(outbox, { ...operation.result.mapping, assistantText: operation.result.assistantText, events: operation.result.events }, ownerUserId);
+	}
+}
+
+export interface ProjectionSessionSynchronizer {
+	syncLinkedProject(projectId: string): Promise<unknown>;
+}
+
+export function createProjectionOperationApplier(
+	mappings: SessionMappingStore,
+	synchronizer: ProjectionSessionSynchronizer,
+): ProjectionOperationApplier {
+	return async (operation: ProjectionOperation) => {
+		const mapping = projectionMapping(mappings, operation);
+		const expected = expectedProjectionRows(mapping, operation.ownerUserId).find(row => row.kind === operation.kind);
+		if (
+			expected === undefined ||
+			expected.operationId !== operation.operationId ||
+			expected.projectId !== operation.projectId ||
+			expected.chatId !== operation.chatId ||
+			expected.payloadHash !== operation.payloadHash
+		) {
+			throw new Error(`Projection operation ${operation.operationId} does not match a durable session mapping`);
+		}
+		await synchronizer.syncLinkedProject(mapping.projectId);
+	};
+}
+
+function projectionMapping(mappings: SessionMappingStore, operation: ProjectionOperation): SessionMapping {
+	const operationId = operation.kind === "event" ? operation.operationId.slice(0, -":event".length) : operation.operationId;
+	const recorded = mappings.operation(operation.chatId, operationId);
+	if (recorded !== undefined) {
+		if (recorded.state !== "complete" || recorded.result === undefined || recorded.result.mapping.operationId !== operationId)
+			throw new Error(`Projection operation ${operation.operationId} has no completed durable result`);
+		return { ...recorded.result.mapping, assistantText: recorded.result.assistantText, events: recorded.result.events };
+	}
+	const mapping = mappings.get(operation.chatId);
+	if (mapping === undefined || mapping.operationId !== operationId)
+		throw new Error(`Projection operation ${operation.operationId} has no durable session mapping`);
+	return mapping;
+}
+
+function projectedMappingEvents(mapping: SessionMapping): readonly OpenWebUIMessageEvent[] {
+	const selection = normalizeModelSelection(mapping.modelSelection);
+	return projectTurnEvents(mapping.events ?? [], selection === undefined ? undefined : formatCanonicalModelId(selection));
+}
+
 function turnEventToProjectableFrame(event: GjcTurnEvent): ProjectableAgentFrame | null {
-	const classified = classifyRpcFrame({ type: event.type, id: event.id, text: event.text });
+	const classified = classifySessionFrame({ type: event.type, id: event.id, text: event.text });
 	const sessionFrame = sessionEventToProjectableFrame(event);
 	if (sessionFrame !== undefined) return sessionFrame;
 	if (event.type === "message_update" || event.type === "assistant_text" || event.type === "assistant") return null;

@@ -1,30 +1,47 @@
 import * as path from "node:path";
-import { type AdapterConfig, buildStartupDiagnostics, loadAdapterConfig, type ResolvedAdapterConfig } from "./config";
-import { resolveGjcRuntimeLocations } from "./configure/runtime-locations";
-import { createResolvedGjcRpcTurnRunner, type GjcTurnRunner } from "./gjc/rpc-runner";
-import { FileBackedSessionMappingStore, type SessionMappingStore } from "./gjc/session-router";
-import type { AdapterHealthCheck } from "./health";
+import { type AdapterConfig, loadAdapterConfig, type ResolvedAdapterConfig } from "./config";
+import { createAdapterSessionCloser } from "./adapter-close-options";
+import {
+	buildOpenWebUIClient,
+	buildOpenWebUIEventSink,
+	buildOpenWebUIFileContextResolver,
+	buildOpenWebUIMessageSink,
+	buildOpenWebUIPromptHintClient,
+	buildOwnerContext,
+} from "./adapter-openwebui-options";
+import { assertResolvedAdapterConfig, loadConfiguredProjects, resolveAdapterConfig } from "./adapter-project-options";
+import { buildRuntimeHealthChecks } from "./adapter-runtime-health";
+import {
+	createGjcRoutingLiveGatewayRunner,
+	createPublicSdkGjcTurnRunner,
+	createPublicSdkModelAttachmentResolver,
+	type GjcSessionTurnRunner,
+} from "./live/gjc-routing-runner";
+import { createProjectionOperationApplier, synthesizeProjectionRows } from "./live/workflow-gate-projection";
+import type { GjcCloseReceipt } from "./gjc/turn-runner";
+import { FileBackedSessionMappingStore, type SessionMapping, type SessionMappingStore } from "./gjc/session-router";
 import type { LiveGatewayEventSink, LiveGatewayMessageSink } from "./live/chat-completions";
-import type { LiveGatewayFileContextResolver } from "./live/file-contexts";
-import { createGjcRoutingLiveGatewayRunner } from "./live/gjc-routing-runner";
-import { createModelReaderFactory, type ModelReaderFactory, resolveGjcCliPath } from "./live/model-reader";
-import { buildOpenWebUIAuthStartupDiagnostic, type OpenWebUIOwnerContext } from "./openwebui/auth";
-import { OpenWebUIHttpClient, type OpenWebUIProjectionRepository } from "./openwebui/client";
-import { createOpenWebUIFileContextResolver } from "./openwebui/file-context-resolver";
-import { OpenWebUIPromptHintClient } from "./openwebui/prompt-hints";
-import { ProjectLinkService } from "./projects/link-service";
+import {
+	createModelReaderFactory,
+	type ModelReaderFactory,
+	type PublicSdkAttachmentResolver,
+	type PublicSdkSessionPortFactory,
+	resolveGjcCliPath,
+} from "./live/model-reader";
+import type { OpenWebUIProjectionRepository } from "./openwebui/client";
+import { ProjectLinkService, type SessionCloseResult } from "./projects/link-service";
 import { preflightProjectRegistrationDatabase } from "./projects/registration-preflight";
 import { auditProjectRegistrations, SqliteProjectRegistrationStore } from "./projects/registration-store";
-import { disambiguateRegisteredProjects, type RegisteredProject, registerProjectDirectory } from "./projects/registry";
-import { type AllowedRoot, resolveAllowedRoots } from "./security/paths";
+import { resolveAllowedRoots } from "./security/paths";
 import { type AdapterServerHandle, type AdapterServerOptions, startAdapterServer } from "./server";
 import { FileBackedOutboxStore, type OutboxStore } from "./state/outbox";
+import { reconcilePendingOperations, type ProjectionOperationApplier } from "./state/reconciler";
 
 const SESSION_MAPPING_STORE_FILE = "openwebui-session-mappings.json";
 const PROJECTION_OUTBOX_STORE_FILE = "openwebui-projection-outbox.json";
 
 export interface BuildAdapterServerOptionsDependencies {
-	readonly turnRunner?: GjcTurnRunner;
+	readonly turnRunner?: GjcSessionTurnRunner;
 	readonly mappings?: SessionMappingStore;
 	readonly eventSink?: LiveGatewayEventSink;
 	readonly messageSink?: LiveGatewayMessageSink;
@@ -32,6 +49,13 @@ export interface BuildAdapterServerOptionsDependencies {
 	readonly projectRegistrationStore?: SqliteProjectRegistrationStore;
 	readonly modelReaderFactory?: ModelReaderFactory;
 	readonly outbox?: OutboxStore;
+	readonly projectionOperationApplier?: ProjectionOperationApplier;
+	readonly resolveModelAttachment?: PublicSdkAttachmentResolver;
+	readonly sessionPortFactory?: PublicSdkSessionPortFactory;
+	/** Must destroy only a pane whose ownership has been proven for this mapping. */
+	readonly fallbackCloseSession?: (mapping: SessionMapping, cause: unknown) => Promise<SessionCloseResult>;
+	/** Post-ack proof must observe endpoint disappearance and the persisted owned pane/process; it must never kill. */
+	readonly proveClosedSession?: (mapping: SessionMapping, receipt: GjcCloseReceipt) => Promise<SessionCloseResult>;
 }
 
 interface BuildAdapterServerOptionsBehavior {
@@ -61,26 +85,36 @@ export async function buildResolvedAdapterServerOptions(
 	assertResolvedAdapterConfig(config);
 	const internalStore = dependencies.projectRegistrationStore === undefined;
 	const databasePath = path.join(config.statePath, "adapter-state.sqlite");
-	if (internalStore)
-		await preflightProjectRegistrationDatabase(databasePath, config.runtimeLocations.protectedProjectPaths);
+	if (internalStore) await preflightProjectRegistrationDatabase(databasePath, config.runtimeLocations.protectedProjectPaths);
 	const projectStore = dependencies.projectRegistrationStore ?? new SqliteProjectRegistrationStore(databasePath);
 	try {
-		// This second audit catches pathname replacement after the immutable snapshot; it cannot make reopen atomic.
 		await auditProjectRegistrations(projectStore, config.runtimeLocations.protectedProjectPaths);
 		const allowedRoots = await resolveAllowedRoots(config.allowedProjectRoots);
 		const projects = await loadConfiguredProjects(config, allowedRoots);
 		const owner = buildOwnerContext(config);
-		const mappings =
-			dependencies.mappings ??
-			new FileBackedSessionMappingStore(path.join(config.sessionRoot, SESSION_MAPPING_STORE_FILE));
-		const outbox =
-			dependencies.outbox ?? new FileBackedOutboxStore(path.join(config.statePath, PROJECTION_OUTBOX_STORE_FILE));
-		const cliPath = resolveGjcCliPath(config.gjcCommand);
-		const modelReaderFactory =
-			dependencies.modelReaderFactory ??
-			createModelReaderFactory({ cliPath, runtimeLocations: config.runtimeLocations });
+		const mappings = dependencies.mappings ?? new FileBackedSessionMappingStore(path.join(config.sessionRoot, SESSION_MAPPING_STORE_FILE));
 		const openWebUIClient = buildOpenWebUIClient(config);
 		const projectionRepository = dependencies.projectionRepository ?? openWebUIClient;
+		const outbox = dependencies.outbox ?? (projectionRepository === undefined ? undefined : new FileBackedOutboxStore(path.join(config.statePath, PROJECTION_OUTBOX_STORE_FILE)));
+		const cliPath = resolveGjcCliPath(config.gjcCommand);
+		const turnRunner = dependencies.turnRunner ?? createPublicSdkGjcTurnRunner({
+			cliPath,
+			runtimeLocations: config.runtimeLocations,
+			turnTimeoutMs: config.turnTimeoutMs,
+			sessionPortFactory: dependencies.sessionPortFactory,
+		});
+		const modelReaderFactory = dependencies.modelReaderFactory ?? createModelReaderFactory({
+			cliPath,
+			runtimeLocations: config.runtimeLocations,
+			resolveAttachment: dependencies.resolveModelAttachment ?? createPublicSdkModelAttachmentResolver({
+				cliPath,
+				cwd: config.runtimeLocations.readerWorkspace,
+				childEnvironment: config.runtimeLocations.childEnvironment,
+				onProvenClosed: (cwd, sessionId) => turnRunner.discardSessionAttachment?.(cwd, sessionId),
+			}),
+			sessionPortFactory: dependencies.sessionPortFactory,
+		});
+		const closeSession = createAdapterSessionCloser(config, cliPath, { ...dependencies, turnRunner }, mappings);
 		const projectLinkService = new ProjectLinkService({
 			allowedRoots,
 			store: projectStore,
@@ -89,20 +123,21 @@ export async function buildResolvedAdapterServerOptions(
 			mappings,
 			protectedPaths: config.runtimeLocations.protectedProjectPaths,
 			runtimeLocations: config.runtimeLocations,
+			...(closeSession === undefined ? {} : { closeSession }),
 		});
 		const previouslyLinkedProjectIds = new Set(projectLinkService.listLinkedProjects().map(project => project.id));
 		await projectLinkService.seedConfiguredProjects(projects);
-		const turnRunner =
-			dependencies.turnRunner ??
-			createResolvedGjcRpcTurnRunner({
-				cliPath,
-				turnTimeoutMs: config.turnTimeoutMs,
-				runtimeLocations: config.runtimeLocations,
-			});
-		const promptHintClient = buildOpenWebUIPromptHintClient(config);
-		if (promptHintClient !== undefined && !behavior.deferOpenWebUIInitialization) {
-			await promptHintClient.seedGjcPromptHints();
+		if (outbox !== undefined) {
+			synthesizeProjectionRows(outbox, mappings, owner.ownerUserId);
+			await reconcileOutboxBeforeServing(
+				outbox,
+				projectionRepository === undefined
+					? dependencies.projectionOperationApplier
+					: (dependencies.projectionOperationApplier ?? createProjectionOperationApplier(mappings, projectLinkService)),
+			);
 		}
+		const promptHintClient = buildOpenWebUIPromptHintClient(config);
+		if (promptHintClient !== undefined && !behavior.deferOpenWebUIInitialization) await promptHintClient.seedGjcPromptHints();
 		if (projectionRepository !== undefined && !behavior.deferOpenWebUIInitialization) {
 			await projectLinkService.reconcileOpenWebUIFolderLinks({ projectIds: previouslyLinkedProjectIds });
 			await projectLinkService.syncLinkedProjects();
@@ -113,6 +148,7 @@ export async function buildResolvedAdapterServerOptions(
 		return {
 			host: config.bindHost,
 			port: config.bindPort,
+			runtimeRoot: config.statePath,
 			checks: buildRuntimeHealthChecks(config),
 			routes: {
 				projects: [...projectLinkService.listLinkedProjects()],
@@ -128,9 +164,11 @@ export async function buildResolvedAdapterServerOptions(
 					mappings,
 					ownerUserId: owner.ownerUserId,
 					modelReaderFactory,
-					outbox,
+					...(outbox === undefined ? {} : { outbox }),
 				}),
 				modelReaderFactory,
+				mappings,
+				closeSession,
 				neutralWorkspace: config.runtimeLocations.readerWorkspace,
 				requireAdapterApiToken: true,
 				...(config.adapterApiToken === undefined ? {} : { adapterApiToken: config.adapterApiToken }),
@@ -144,124 +182,25 @@ export async function buildResolvedAdapterServerOptions(
 		try {
 			projectStore.close();
 		} catch (closeError) {
-			if (error instanceof Error && error.cause === undefined)
-				Reflect.defineProperty(error, "cause", { value: closeError });
+			if (error instanceof Error && error.cause === undefined) Reflect.defineProperty(error, "cause", { value: closeError });
 		}
 		throw error;
 	}
 }
 
-export function resolveAdapterConfig(config: AdapterConfig): ResolvedAdapterConfig {
-	if (isResolvedAdapterConfig(config)) return config;
-	const runtimeLocations = resolveGjcRuntimeLocations(
-		config.mode === "managed" ? { mode: "managed" } : { mode: "existing", installedConfig: config },
-	);
-	return Object.freeze({
-		...config,
-		gjcConfigDirName: runtimeLocations.childEnvironment.GJC_CONFIG_DIR,
-		gjcCodingAgentDir: runtimeLocations.agentDir,
-		runtimeLocations,
-	});
-}
+export { resolveAdapterConfig };
 
-function assertResolvedAdapterConfig(config: AdapterConfig): asserts config is ResolvedAdapterConfig {
-	if (!isResolvedAdapterConfig(config)) throw new TypeError("resolved runtime locations are required");
-}
-
-function isResolvedAdapterConfig(config: AdapterConfig): config is ResolvedAdapterConfig {
-	return (
-		typeof config.gjcConfigDirName === "string" &&
-		typeof config.gjcCodingAgentDir === "string" &&
-		config.runtimeLocations !== undefined
-	);
-}
-
-export async function startAdapterServiceFromEnv(
-	env: Record<string, string | undefined> = process.env,
-): Promise<AdapterServerHandle> {
+export async function startAdapterServiceFromEnv(env: Record<string, string | undefined> = process.env): Promise<AdapterServerHandle> {
 	return startAdapterServer(await buildAdapterServerOptionsFromEnv(env));
 }
-
-async function loadConfiguredProjects(
-	config: AdapterConfig,
-	allowedRoots: readonly AllowedRoot[],
-): Promise<RegisteredProject[]> {
-	const projects: RegisteredProject[] = [];
-	for (const project of config.projects) {
-		projects.push(
-			await registerProjectDirectory(
-				{
-					cwd: project.cwd,
-					name: project.name,
-					openWebUIFolderId: project.openWebUIFolderId,
-					sessionRoot: project.sessionRoot,
-				},
-				allowedRoots,
-			),
-		);
+async function reconcileOutboxBeforeServing(outbox: OutboxStore, applier: ProjectionOperationApplier | undefined): Promise<void> {
+	const hasOutstandingOperations = outbox.listPending().length > 0 || (outbox.listApplying?.().length ?? 0) > 0;
+	if (applier === undefined) {
+		if (hasOutstandingOperations) throw new Error("Projection outbox has pending work but no ProjectionOperationApplier is configured");
+		return;
 	}
-	return [...disambiguateRegisteredProjects(projects)];
-}
-
-function buildRuntimeHealthChecks(config: AdapterConfig): AdapterHealthCheck[] {
-	const configDiagnostic = buildStartupDiagnostics(config);
-	const authDiagnostic = buildOpenWebUIAuthStartupDiagnostic(config);
-	return [
-		{
-			name: "config",
-			status: configDiagnostic.status,
-			detail: configDiagnostic.messages.join(" "),
-		},
-		{
-			name: "openwebui-auth",
-			status: authDiagnostic.status,
-			detail: authDiagnostic.messages.join(" "),
-		},
-		{
-			name: "gjc-live-runner",
-			status: "ok",
-			detail: "GJC live runner is wired to the authenticated SDK v3 turn runner.",
-		},
-	];
-}
-
-function buildOpenWebUIClient(config: AdapterConfig): OpenWebUIHttpClient | undefined {
-	if (config.openWebUIApiToken === undefined) return undefined;
-	return new OpenWebUIHttpClient({ baseUrl: config.openWebUIBaseUrl, apiToken: config.openWebUIApiToken });
-}
-
-function buildOpenWebUIPromptHintClient(config: AdapterConfig): OpenWebUIPromptHintClient | undefined {
-	if (config.openWebUIApiToken === undefined) return undefined;
-	return new OpenWebUIPromptHintClient({ baseUrl: config.openWebUIBaseUrl, apiToken: config.openWebUIApiToken });
-}
-
-function buildOpenWebUIEventSink(client: OpenWebUIHttpClient | undefined): LiveGatewayEventSink | undefined {
-	if (client === undefined) return undefined;
-	return async input => {
-		for (const event of input.events) {
-			await client.postMessageEvent({ chatId: input.chatId, messageId: input.messageId, event });
-		}
-	};
-}
-
-function buildOpenWebUIMessageSink(client: OpenWebUIHttpClient | undefined): LiveGatewayMessageSink | undefined {
-	if (client === undefined) return undefined;
-	return async input => {
-		await client.updateMessageContent({
-			chatId: input.chatId,
-			messageId: input.messageId,
-			content: input.content,
-		});
-	};
-}
-
-function buildOpenWebUIFileContextResolver(
-	client: OpenWebUIHttpClient | undefined,
-): LiveGatewayFileContextResolver | undefined {
-	if (client === undefined) return undefined;
-	return createOpenWebUIFileContextResolver(client);
-}
-
-function buildOwnerContext(config: AdapterConfig): OpenWebUIOwnerContext {
-	return { ownerUserId: config.ownerUserId ?? "", singleOwnerLocalMode: false };
+	const result = await reconcilePendingOperations(outbox, applier);
+	if (result.failed.length > 0) {
+		throw new Error(`Projection outbox reconciliation failed: ${result.failed.map(operation => operation.operationId).join(", ")}`);
+	}
 }

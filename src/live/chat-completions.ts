@@ -6,10 +6,13 @@ import {
 	type LiveGatewayRunnerResult,
 	LiveGatewayUnavailableError,
 	WorkflowGateReplyError,
+	OpenWebUIControlError,
 } from "./chat-completions-types";
 import { latestUserText } from "./chat-content";
-import { deliverContentAfterChunks, deliverFinalAssistantContent, deliverRunnerEvents } from "./chat-delivery";
-import { buildCompletion, buildOpenAIErrorResponse, encodeChatCompletionSse } from "./chat-response-format";
+import { deliverChatCompletion } from "./chat-completion-delivery";
+import { controlFromMetadata } from "./chat-control-metadata";
+import { deliverRunnerEvents } from "./chat-delivery";
+import { buildCompletion, buildOpenAIErrorResponse } from "./chat-response-format";
 import { appendResolvedFileContexts } from "./file-contexts";
 import { ModelSelectionError, modelSelectionError } from "./model-selection-errors";
 import { createModelSelectionPolicy } from "./model-selection-policy";
@@ -146,10 +149,18 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 			userMessageParentId: headers.userMessageParentId,
 			continued: headers.userMessageParentId !== null,
 			requestedModelId: input.request.model,
+			ownerUserId: input.owner.ownerUserId,
+			...(input.request.metadata === undefined ? {} : { messageMetadata: input.request.metadata }),
+			...(controlFromMetadata(input.request.metadata) === undefined
+				? {}
+				: { control: controlFromMetadata(input.request.metadata) }),
 		});
 	} catch (error) {
 		if (error instanceof LiveGatewayUnavailableError) {
 			return errorResult(503, "server_error", error.code, error.message);
+		}
+		if (error instanceof OpenWebUIControlError) {
+			return errorResult(400, "invalid_request_error", error.code, error.message);
 		}
 		if (error instanceof WorkflowGateReplyError) {
 			return errorResult(400, "invalid_request_error", error.code, error.message);
@@ -176,60 +187,18 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 		projectId: project.id,
 	});
 
-	if (input.request.stream === true) {
-		const chunks = runnerResult.chunks ?? [runnerResult.content];
-		return {
-			ok: true,
-			status: 200,
-			stream: encodeChatCompletionSse({
-				id,
-				created,
-				model: resultModel,
-				chunks: deliverContentAfterChunks({
-					chunks,
-					messageSink: input.messageSink,
-					chatId: headers.chatId,
-					messageId: headers.messageId,
-					ownerUserId: input.owner.ownerUserId,
-					projectId: project.id,
-				}),
-			}),
-		};
-	}
-
-	if (runnerResult.content !== undefined) {
-		await deliverFinalAssistantContent({
-			messageSink: input.messageSink,
-			chatId: headers.chatId,
-			messageId: headers.messageId,
-			ownerUserId: input.owner.ownerUserId,
-			projectId: project.id,
-			content: runnerResult.content,
-		});
-		return {
-			ok: true,
-			status: 200,
-			body: buildCompletion({ id, created, model: resultModel, content: runnerResult.content }),
-		};
-	}
-
-	let content = "";
-	for await (const chunk of runnerResult.chunks) {
-		content += chunk;
-	}
-	await deliverFinalAssistantContent({
+	return deliverChatCompletion({
+		stream: input.request.stream === true,
+		runnerResult,
+		id,
+		created,
+		model: resultModel,
 		messageSink: input.messageSink,
 		chatId: headers.chatId,
 		messageId: headers.messageId,
 		ownerUserId: input.owner.ownerUserId,
 		projectId: project.id,
-		content,
 	});
-	return {
-		ok: true,
-		status: 200,
-		body: buildCompletion({ id, created, model: resultModel, content }),
-	};
 }
 
 function selectionErrorResult(error: ModelSelectionError): LiveChatCompletionsResult {
