@@ -171,6 +171,7 @@ export async function buildResolvedAdapterServerOptions(
 			port: config.bindPort,
 			runtimeRoot: config.statePath,
 			runtimeLock: lock,
+			turnTimeoutMs: config.turnTimeoutMs,
 			checks: buildRuntimeHealthChecks(config),
 			routes: {
 				projects: [...projectLinkService.listLinkedProjects()],

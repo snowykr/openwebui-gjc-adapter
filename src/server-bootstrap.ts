@@ -4,8 +4,10 @@ import type { RuntimeSingletonLock } from "./runtime-singleton-lock";
 import { createAdapterRequestHandler } from "./server-request-handler";
 import type { AdapterRuntimeConfig } from "./server-runtime-readiness";
 
-// Keeps Bun's transport timeout aligned with the adapter's bounded 180-second turn budget.
-const BUN_SERVER_IDLE_TIMEOUT_SECONDS = 180;
+// Bun accepts idle timeouts up to 255 seconds; zero disables the timeout.
+const BUN_SERVER_IDLE_TIMEOUT_MAX_SECONDS = 255;
+const BUN_SERVER_IDLE_TIMEOUT_DISABLED = 0;
+const IDLE_TIMEOUT_HEADROOM_SECONDS = 1;
 
 export interface AdapterServerOptions {
 	host: string;
@@ -16,6 +18,7 @@ export interface AdapterServerOptions {
 	readiness?: AdapterReadinessOptions;
 	runtime?: AdapterRuntimeConfig;
 	routes?: AdapterRouteDependencies;
+	turnTimeoutMs: number;
 }
 export interface AdapterServerHandle {
 	url: string;
@@ -25,10 +28,11 @@ export interface AdapterServerHandle {
 export async function startAdapterServer(options: AdapterServerOptions): Promise<AdapterServerHandle> {
 	const lock = options.runtimeLock;
 	try {
+		const idleTimeout = idleTimeoutSeconds(options.turnTimeoutMs);
 		const server = Bun.serve({
 			hostname: options.host,
 			port: options.port,
-			idleTimeout: BUN_SERVER_IDLE_TIMEOUT_SECONDS,
+			idleTimeout,
 			fetch: createAdapterRequestHandler({
 				checks: options.checks,
 				readiness: options.readiness,
@@ -52,4 +56,10 @@ export async function startAdapterServer(options: AdapterServerOptions): Promise
 		await lock.release();
 		throw error;
 	}
+}
+function idleTimeoutSeconds(turnTimeoutMs: number): number {
+	if (!Number.isFinite(turnTimeoutMs) || !Number.isInteger(turnTimeoutMs) || turnTimeoutMs <= 0)
+		throw new TypeError("turnTimeoutMs must be a positive finite integer");
+	const requiredSeconds = Math.ceil(turnTimeoutMs / 1_000) + IDLE_TIMEOUT_HEADROOM_SECONDS;
+	return requiredSeconds > BUN_SERVER_IDLE_TIMEOUT_MAX_SECONDS ? BUN_SERVER_IDLE_TIMEOUT_DISABLED : requiredSeconds;
 }

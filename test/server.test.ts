@@ -221,12 +221,58 @@ describe("Bun transport configuration", () => {
 				port: 0,
 				runtimeRoot,
 				runtimeLock: await RuntimeSingletonLock.acquire(runtimeRoot),
+				turnTimeoutMs: 180_000,
 			});
 			const serverOptions = serve.mock.calls[0]?.[0];
 
-			expect(serverOptions).toMatchObject({ idleTimeout: 180 });
+			expect(serverOptions).toMatchObject({ idleTimeout: 181 });
 		} finally {
 			await handle?.stop();
+			serve.mockRestore();
+			await rm(runtimeRoot, { force: true, recursive: true });
+		}
+	});
+	test("rounds configured turn timeouts up, with headroom, and disables idle timeout above Bun's limit", async () => {
+		const runtimeRoot = await mkdtemp(join(tmpdir(), "openwebui-gjc-adapter-server-"));
+		const serve = spyOn(Bun, "serve");
+		const timeouts = [240_000, 240_001, 255_000];
+
+		try {
+			for (const turnTimeoutMs of timeouts) {
+				const handle = await startAdapterServer({
+					host: "127.0.0.1",
+					port: 0,
+					runtimeRoot,
+					runtimeLock: await RuntimeSingletonLock.acquire(runtimeRoot),
+					turnTimeoutMs,
+				});
+				await handle.stop();
+			}
+			expect(serve.mock.calls.map(([options]) => options.idleTimeout)).toEqual([241, 242, 0]);
+		} finally {
+			serve.mockRestore();
+			await rm(runtimeRoot, { force: true, recursive: true });
+		}
+	});
+
+	test("rejects invalid turn timeout values before serving", async () => {
+		const runtimeRoot = await mkdtemp(join(tmpdir(), "openwebui-gjc-adapter-server-"));
+		const serve = spyOn(Bun, "serve");
+
+		try {
+			for (const turnTimeoutMs of [0, Number.NaN, Number.POSITIVE_INFINITY, 1.5]) {
+				await expect(
+					startAdapterServer({
+						host: "127.0.0.1",
+						port: 0,
+						runtimeRoot,
+						runtimeLock: await RuntimeSingletonLock.acquire(runtimeRoot),
+						turnTimeoutMs,
+					}),
+				).rejects.toThrow("turnTimeoutMs must be a positive finite integer");
+			}
+			expect(serve).not.toHaveBeenCalled();
+		} finally {
 			serve.mockRestore();
 			await rm(runtimeRoot, { force: true, recursive: true });
 		}

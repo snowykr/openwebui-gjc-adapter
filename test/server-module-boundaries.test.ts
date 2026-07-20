@@ -68,6 +68,7 @@ describe("server module boundaries", () => {
 				runtimeLock: await RuntimeSingletonLock.acquire(runtimeRoot),
 				runtime,
 				routes,
+				turnTimeoutMs: 180_000,
 			};
 			const handle: AdapterServerHandle | undefined = undefined;
 			void options;
