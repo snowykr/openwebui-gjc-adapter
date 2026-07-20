@@ -30,11 +30,21 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
-      BUN_INSTALL: ${{ runner.temp }}/bun
-      BUN_INSTALL_CACHE_DIR: ${{ runner.temp }}/bun-cache
-      HOME: ${{ runner.temp }}/home
       GJC_COMPAT_LANE: ${{ inputs.lane }}
     steps:
+      - name: Configure hermetic Bun runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUN_INSTALL="$RUNNER_TEMP/bun"
+          BUN_INSTALL_CACHE_DIR="$RUNNER_TEMP/bun-cache"
+          HOME="$RUNNER_TEMP/home"
+          mkdir -p "$BUN_INSTALL" "$BUN_INSTALL_CACHE_DIR" "$HOME"
+          {
+            echo "BUN_INSTALL=$BUN_INSTALL"
+            echo "BUN_INSTALL_CACHE_DIR=$BUN_INSTALL_CACHE_DIR"
+            echo "HOME=$HOME"
+          } >> "$GITHUB_ENV"
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           persist-credentials: false
@@ -73,8 +83,6 @@ jobs:
             echo "GJC_RELEASE_TAG=$tag"
             echo "GJC_RELEASE_COMMIT=$INPUT_COMMIT"
           } >> "$GITHUB_ENV"
-      - name: Create hermetic runtime directories
-        run: mkdir -p "$HOME" "$BUN_INSTALL_CACHE_DIR"
       - name: Install adapter without lifecycle scripts
         run: bun install --frozen-lockfile --ignore-scripts
       - name: Exercise hermetic published CLI session and public SDK behavior
