@@ -128,12 +128,23 @@ function mutationThinkingSelection(
 	thinkingLevel: NormalizedModelSelection["thinkingLevel"],
 ): NormalizedModelSelection {
 	const record = parseRecord(result, "thinking.set result");
-	if (record.status === "accepted") return { ...selected, thinkingLevel };
+	if (record.changed === false)
+		throw new SdkV3OperationError("invalid_result", "thinking.set result was not acknowledged");
+	if (record.status !== undefined && record.status !== "accepted")
+		throw new SdkV3OperationError("invalid_result", "thinking.set result was not accepted");
+	const fields = [record.provider, record.modelId, record.thinkingLevel];
+	if (fields.every(value => value === undefined || value === "")) {
+		if (record.changed === true || record.status === "accepted") return { ...selected, thinkingLevel };
+		throw new SdkV3OperationError("invalid_result", "thinking.set result was not acknowledged");
+	}
+	if (fields.some(value => value === undefined || value === ""))
+		throw new SdkV3OperationError("invalid_result", "thinking.set result contained a partial selection");
 	const accepted = parseMutationSelection(record);
-	if (accepted.thinkingLevel !== thinkingLevel)
-		throw new SdkV3OperationError(
-			"invalid_result",
-			"thinking.set result thinking level did not match the requested level",
-		);
+	if (
+		accepted.provider !== selected.provider ||
+		accepted.modelId !== selected.modelId ||
+		accepted.thinkingLevel !== thinkingLevel
+	)
+		throw new SdkV3OperationError("invalid_result", "thinking.set did not confirm the requested selection");
 	return accepted;
 }

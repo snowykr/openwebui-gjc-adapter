@@ -165,7 +165,7 @@ describe("latest dev SDK v3 transport contract", () => {
 			await fixture.dispose();
 		}
 	});
-	test("carries the exact prefixed OpenWebUI selection into model.set", async () => {
+	test("accepts a full model.set tuple followed by a changed thinking.set acknowledgement", async () => {
 		const canonical = normalizeOpenWebUIModelId("gjc-adapter.gjc/openai-codex/codex-auto-review:off");
 		const selection = parseCanonicalModelId(canonical);
 		if (selection === null) throw new TypeError("expected canonical OpenWebUI selection");
@@ -179,7 +179,7 @@ describe("latest dev SDK v3 transport contract", () => {
 				effect(undefined as never),
 			mutate: async (_client: never, operation: string, input: Record<string, unknown>) => {
 				mutations.push({ operation, input });
-				return selection;
+				return operation === "thinking.set" ? { changed: true } : selection;
 			},
 			selectedModel: () => selected,
 			setSelectedModel: (value: typeof selection | undefined) => {
@@ -192,13 +192,21 @@ describe("latest dev SDK v3 transport contract", () => {
 		} satisfies PublicSdkActionHost;
 
 		await expect(setModel(host, selection, undefined, 1_000)).resolves.toEqual(selection);
+		await expect(setThinking(host, "low", undefined, 1_000)).resolves.toEqual({
+			...selection,
+			thinkingLevel: "low",
+		});
 		expect(mutations).toEqual([
 			{
 				operation: "model.set",
 				input: { id: "openai-codex/codex-auto-review", thinkingLevel: "off" },
 			},
+			{
+				operation: "thinking.set",
+				input: { level: "low" },
+			},
 		]);
-		expect(selected).toEqual(selection);
+		expect(selected).toEqual({ ...selection, thinkingLevel: "low" });
 	});
 	test("accepts only full matching model.set tuples or acknowledgement-only selection fields", async () => {
 		const selection = { provider: "openai-codex", modelId: "codex-auto-review", thinkingLevel: "off" } as const;
@@ -240,6 +248,45 @@ describe("latest dev SDK v3 transport contract", () => {
 				await expect(setModel(host, selection, undefined, 1_000)).rejects.toMatchObject({ code: "invalid_result" });
 				expect(selected).toBeUndefined();
 			}
+		}
+	});
+	test("accepts only acknowledged or exact matching thinking.set results", async () => {
+		const selected = { provider: "openai-codex", modelId: "codex-auto-review", thinkingLevel: "off" } as const;
+		const cases: readonly [string, unknown, boolean][] = [
+			["changed acknowledgement", { changed: true }, true],
+			["accepted acknowledgement", { status: "accepted" }, true],
+			["matching tuple", { ...selected, thinkingLevel: "low" }, true],
+			["changed false", { changed: false }, false],
+			["partial tuple", { changed: true, provider: selected.provider }, false],
+			["mismatched provider", { provider: "other", modelId: selected.modelId, thinkingLevel: "low" }, false],
+			["mismatched model", { provider: selected.provider, modelId: "other", thinkingLevel: "low" }, false],
+			["mismatched thinking", { ...selected }, false],
+			["unknown empty result", {}, false],
+		];
+
+		for (const [_name, result, accepted] of cases) {
+			let current = selected;
+			const host = {
+				authority: async <T>(_timeoutMs: number, effect: (client: never) => Promise<T>): Promise<T> =>
+					effect(undefined as never),
+				mutate: async () => result,
+				selectedModel: () => current,
+				setSelectedModel: (value: typeof selected | undefined) => {
+					if (value !== undefined) current = value;
+				},
+				detach() {},
+				connected: () => {
+					throw new Error("not used by thinking.set");
+				},
+			} satisfies PublicSdkActionHost;
+
+			if (accepted)
+				await expect(setThinking(host, "low", undefined, 1_000)).resolves.toEqual({
+					...selected,
+					thinkingLevel: "low",
+				});
+			else
+				await expect(setThinking(host, "low", undefined, 1_000)).rejects.toMatchObject({ code: "invalid_result" });
 		}
 	});
 	test("Given a model.set acknowledgement with the confirmed selection and an acknowledgement-only thinking.set When applying a selection Then it remains strict without requiring an optional current-model marker", async () => {
