@@ -1,8 +1,11 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { LiveGatewayRunner } from "../src/live/chat-completions";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import type { RegisteredProject } from "../src/projects/registry";
-import { createAdapterRequestHandler } from "../src/server";
+import { createAdapterRequestHandler, startAdapterServer } from "../src/server";
 import { CANONICAL_MODEL_IDS, LOW_MODEL_ID, staticModelReaderFactory } from "./model-selection-fixtures";
 
 describe("createAdapterRequestHandler", () => {
@@ -203,6 +206,24 @@ describe("createAdapterRequestHandler", () => {
 		expect(await response.json()).toEqual({ status: "closed", operationId: "close-operation-1" });
 		expect(ingressIds).toHaveLength(1);
 		expect(ingressIds[0]).not.toContain("adapter-token");
+	});
+});
+describe("Bun transport configuration", () => {
+	test("sets a bounded idle timeout above Bun's default", async () => {
+		const runtimeRoot = await mkdtemp(join(tmpdir(), "openwebui-gjc-adapter-server-"));
+		const serve = spyOn(Bun, "serve");
+		let handle: Awaited<ReturnType<typeof startAdapterServer>> | undefined;
+
+		try {
+			handle = await startAdapterServer({ host: "127.0.0.1", port: 0, runtimeRoot });
+			const serverOptions = serve.mock.calls[0]?.[0];
+
+			expect(serverOptions).toMatchObject({ idleTimeout: 180 });
+		} finally {
+			await handle?.stop();
+			serve.mockRestore();
+			await rm(runtimeRoot, { force: true, recursive: true });
+		}
 	});
 });
 

@@ -182,6 +182,7 @@ export async function handleOpenAIChatCompletionsRequest(
 		});
 	} catch (error) {
 		if (error instanceof ModelSelectionError) return modelSelectionErrorResponse(error);
+		console.error("GJC live runner failed:", sanitizeRunnerError(error));
 		return jsonResponse(
 			{
 				error: {
@@ -210,6 +211,10 @@ function modelSelectionErrorResponse(error: unknown): Response {
 		{ error: { message: selectionError.message, type: selectionError.type, code: selectionError.code } },
 		{ status: selectionError.status },
 	);
+}
+function sanitizeRunnerError(error: unknown): string {
+	const message = error instanceof Error ? error.message : String(error);
+	return message.replace(/Bearer\s+\S+/gi, "Bearer [redacted]").replace(/[A-Za-z0-9_-]{24,}/g, "[redacted]");
 }
 
 async function resolveProjects(provider: ProjectProvider): Promise<readonly RegisteredProject[]> {

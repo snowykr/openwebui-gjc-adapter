@@ -12,6 +12,7 @@ const RFC3986_EXTRA = /[!'()*]/g;
 const HEX_ESCAPE = /%[0-9a-fA-F]{2}/;
 const CONTROL_OR_WHITESPACE = /[\p{Cc}\p{White_Space}]/u;
 const textEncoder = new TextEncoder();
+const OPENWEBUI_CONNECTION_PREFIX = /^([A-Za-z0-9_-]+)\.(gjc\/.+)$/;
 
 export function buildModelList(input: readonly unknown[] = []): OpenAIModelListResponse {
 	const selections = input.flatMap(decodeNormalizedSelection);
@@ -66,6 +67,16 @@ export function parseCanonicalModelId(value: unknown): NormalizedModelSelection 
 	const modelId = decodeCanonicalComponent(encodedModel);
 	if (provider === null || !isSafeProvider(provider) || modelId === null) return null;
 	return { provider, modelId, thinkingLevel };
+}
+
+/**
+ * OpenWebUI namespaces an upstream OpenAI-compatible model as
+ * `<connection-id>.<upstream-model-id>`. Only one such prefix is accepted;
+ * anything else remains invalid or foreign to the adapter.
+ */
+export function normalizeOpenWebUIModelId(value: string): string {
+	const prefixed = OPENWEBUI_CONNECTION_PREFIX.exec(value);
+	return prefixed?.[2] ?? value;
 }
 
 export function classifyGjcModelId(value: string): GjcModelIdClassification {

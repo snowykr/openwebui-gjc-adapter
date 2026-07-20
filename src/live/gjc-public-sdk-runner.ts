@@ -76,7 +76,17 @@ class PublicSdkGjcTurnRunner implements GjcTurnRunner {
 		beforePrompt: Parameters<GjcTurnRunner["startNewSession"]>[2],
 		onFailure?: Parameters<GjcTurnRunner["startNewSession"]>[3],
 	): Promise<T> {
-		return startNewSession(this.#context, input, publish, beforePrompt, onFailure);
+		return startNewSession(
+			this.#context,
+			input,
+			publish,
+			beforePrompt as (
+				address: GjcSessionAddress,
+				attachment: import("../gjc/session-authority").SessionAttachmentProof,
+				lifecycle: GjcLifecycleTransaction,
+			) => Promise<void>,
+			onFailure,
+		);
 	}
 
 	switchSession(input: GjcSwitchSessionInput): Promise<void> {

@@ -86,25 +86,46 @@ jobs:
           printf '%s\n' '{"name":"gjc-release-compat","private":true}' > "$compat_root/package.json"
           bun add --cwd "$compat_root" --exact --ignore-scripts "@gajae-code/coding-agent@$GJC_CODING_AGENT_VERSION" "@gajae-code/natives@$GJC_NATIVES_VERSION"
           gjc="$compat_root/node_modules/.bin/gjc"
-          test "$("$gjc" --version)" = "$GJC_CODING_AGENT_VERSION"
-          cp scripts/gjc-release-compat.ts "$compat_root/gjc-release-compat.ts"
+          cli_version_output="$("$gjc" --version)"
+          cli_version_pattern='^(gjc/)?([0-9]+\.[0-9]+\.[0-9]+)$'
+          [[ "$cli_version_output" =~ $cli_version_pattern ]]
+          cli_version="${BASH_REMATCH[2]}"
+          [[ "$cli_version" = "$GJC_CODING_AGENT_VERSION" ]]
+          cp scripts/gjc-release-compat.ts scripts/gjc-release-compat-fixtures.ts scripts/gjc-release-compat-lifecycle.ts scripts/gjc-release-compat-runtime.ts scripts/gjc-release-compat-sdk.ts "$compat_root/"
           bun --no-env-file --config=/dev/null --cwd "$compat_root" gjc-release-compat.ts --root "$compat_root" --gjc "$gjc"
       - name: Publish observed compatibility report
         shell: bash
         run: |
           set -euo pipefail
           compat_root="$RUNNER_TEMP/gjc-compat-$GJC_COMPAT_LANE"
-          python3 - <<'PY'
+          ADAPTER_REPOSITORY="${{ github.repository }}" ADAPTER_COMMIT="${{ github.sha }}" python3 - <<'PY'
           import json, os
           root = os.environ["RUNNER_TEMP"] + "/gjc-compat-" + os.environ["GJC_COMPAT_LANE"]
           path = root + "/operation-report.json"
           report = json.load(open(path))
+
+          def sanitize(value, key=""):
+              normalized = key.lower().replace("_", "").replace("-", "")
+              if any(part in normalized for part in ("apikey", "authorization", "password", "secret", "token")):
+                  return "[redacted]"
+              if isinstance(value, dict):
+                  return {child_key: sanitize(child, child_key) for child_key, child in value.items()}
+              if isinstance(value, list):
+                  return [sanitize(child) for child in value]
+              return value
+          report = sanitize(report)
           report.update({
               "lane": os.environ["GJC_COMPAT_LANE"],
-              "codingAgentVersion": os.environ["GJC_CODING_AGENT_VERSION"],
-              "nativesVersion": os.environ["GJC_NATIVES_VERSION"],
-              "tag": os.environ["GJC_RELEASE_TAG"],
-              "commit": os.environ["GJC_RELEASE_COMMIT"],
+              "adapter": {
+                  "repository": os.environ["ADAPTER_REPOSITORY"],
+                  "commit": os.environ["ADAPTER_COMMIT"],
+              },
+              "upstream": {
+                  "codingAgentVersion": os.environ["GJC_CODING_AGENT_VERSION"],
+                  "nativesVersion": os.environ["GJC_NATIVES_VERSION"],
+                  "tag": os.environ["GJC_RELEASE_TAG"],
+                  "commit": os.environ["GJC_RELEASE_COMMIT"],
+              },
               "hermetic": True,
           })
           with open(path, "w") as output:

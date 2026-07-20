@@ -22,16 +22,11 @@ export type { PublicSdkSessionCoordinatorScope } from "./public-sdk-coordinator"
 export { withPublicSdkSessionMutationCoordinator } from "./public-sdk-coordinator";
 
 import { discoverLifecycleSuccessor, sessionOperation } from "./public-sdk-lifecycle";
-import {
-	confirmSelection,
-	parseMutationSelection,
-	readAvailableModels,
-	readBranchCandidates,
-	readSessionState,
-} from "./public-sdk-state";
-import { runGateTurn, runTurn, waitForReply } from "./public-sdk-turns";
+import { closeSession, type PublicSdkActionHost, reply, setModel, setThinking } from "./public-sdk-session-actions";
+import { readAvailableModels, readBranchCandidates, readSessionState } from "./public-sdk-state";
+import { runGateTurn, runTurn } from "./public-sdk-turns";
 import { SdkV3Client } from "./sdk-v3-client";
-import { parseRecord, type SdkRecord, SdkV3OperationError } from "./sdk-v3-protocol";
+import { type SdkRecord, SdkV3OperationError } from "./sdk-v3-protocol";
 
 /** Public, per-session SDK adapter. It owns only its WebSocket attachment. */
 export class PublicSdkSessionClient implements PublicSdkSessionPort {
@@ -40,7 +35,7 @@ export class PublicSdkSessionClient implements PublicSdkSessionPort {
 	readonly #coordinatorOwner: PublicSdkSessionCoordinatorOwner = {};
 	#attachedCoordinatorOwner: PublicSdkSessionCoordinatorOwner = this.#coordinatorOwner;
 	#mutationInFlight = false;
-
+	#selectedModel: NormalizedModelSelection | undefined;
 	async attach(
 		attachment: PublicSdkSessionAttachment,
 		timeoutMs?: number,
@@ -59,93 +54,53 @@ export class PublicSdkSessionClient implements PublicSdkSessionPort {
 		this.#attachedCoordinatorOwner = coordinatorOwner;
 		this.#client = client;
 	}
-
 	detach(): void {
 		this.#client?.detach();
 		this.#client = undefined;
 		this.#attachment = undefined;
 		this.#attachedCoordinatorOwner = this.#coordinatorOwner;
 		this.#mutationInFlight = false;
+		this.#selectedModel = undefined;
 	}
-
 	getState(timeoutMs?: number): Promise<PublicSdkSessionState> {
 		return this.authority(timeoutMs, client => readSessionState(client, this.connected().attachment, timeoutMs));
 	}
-
 	getAvailableModels(timeoutMs?: number): Promise<readonly unknown[]> {
 		return this.authority(timeoutMs, client => readAvailableModels(client, timeoutMs));
 	}
-
 	branchCandidates(timeoutMs?: number) {
 		return this.authority(timeoutMs, client => readBranchCandidates(client, timeoutMs));
 	}
-
 	setModel(selection: NormalizedModelSelection, key?: string, timeoutMs?: number): Promise<NormalizedModelSelection> {
-		return this.coordinated(async () =>
-			this.selection(
-				parseMutationSelection(
-					await this.authority(timeoutMs, client =>
-						this.mutate(
-							client,
-							"model.set",
-							{ id: `${selection.provider}/${selection.modelId}`, thinkingLevel: selection.thinkingLevel },
-							key,
-							timeoutMs,
-						),
-					),
-				),
-				timeoutMs,
-			),
-		);
+		return this.coordinated(() => setModel(this.actionHost(), selection, key, timeoutMs));
 	}
-
 	setThinking(
 		thinkingLevel: NormalizedModelSelection["thinkingLevel"],
 		key?: string,
 		timeoutMs?: number,
 	): Promise<NormalizedModelSelection> {
-		return this.coordinated(async () => {
-			const accepted = parseMutationSelection(
-				await this.authority(timeoutMs, client =>
-					this.mutate(client, "thinking.set", { level: thinkingLevel }, key, timeoutMs),
-				),
-			);
-			if (accepted.thinkingLevel !== thinkingLevel) {
-				throw new SdkV3OperationError(
-					"invalid_result",
-					"thinking.set result thinking level did not match the requested level",
-				);
-			}
-			return this.selection(accepted, timeoutMs);
-		});
+		return this.coordinated(() => setThinking(this.actionHost(), thinkingLevel, key, timeoutMs));
 	}
-
 	prompt(text: string, timeoutMs = 60_000): Promise<PublicSdkTurnOutcome> {
 		return this.coordinated(() => runTurn(this.turnContext(), "turn.prompt", { text }, undefined, timeoutMs));
 	}
-
 	steer(text: string, key?: string, timeoutMs?: number): Promise<unknown> {
 		return this.reply("turn.steer", { text }, key, timeoutMs);
 	}
-
 	followUp(text: string, key?: string, timeoutMs?: number): Promise<PublicSdkTurnOutcome> {
 		return this.coordinated(() => runTurn(this.turnContext(), "turn.follow_up", { text }, key, timeoutMs ?? 60_000));
 	}
-
 	abort(key?: string, timeoutMs?: number): Promise<unknown> {
 		return this.reply("turn.abort", {}, key, timeoutMs);
 	}
-
 	abortAndPrompt(text: string, key?: string, timeoutMs?: number): Promise<PublicSdkTurnOutcome> {
 		return this.coordinated(() =>
 			runTurn(this.turnContext(), "turn.abort_and_prompt", { text }, key, timeoutMs ?? 60_000),
 		);
 	}
-
 	replyToAction(id: string, answer: unknown, key?: string, timeoutMs?: number): Promise<unknown> {
 		return this.reply("ask.answer", { id, answer }, key, timeoutMs);
 	}
-
 	planApprove(input: SdkRecord, key?: string, timeoutMs = 60_000): Promise<unknown> {
 		return this.coordinated(() =>
 			runTurn(
@@ -157,7 +112,6 @@ export class PublicSdkSessionClient implements PublicSdkSessionPort {
 			),
 		);
 	}
-
 	answerGate(gate: PublicSdkGate, answer: unknown, key?: string, timeoutMs = 60_000): Promise<PublicSdkTurnOutcome> {
 		return this.coordinated(() => runGateTurn(this.turnContext(), gate, answer, key, timeoutMs));
 	}
@@ -179,39 +133,11 @@ export class PublicSdkSessionClient implements PublicSdkSessionPort {
 	}
 
 	async closeSession(key?: string, timeoutMs?: number): Promise<void> {
-		await this.coordinated(async () => {
-			const value = await this.authority(
-				timeoutMs,
-				client => this.mutate(client, "session.close", {}, key, timeoutMs),
-				"allow_missing",
-			);
-			if (parseRecord(value, "session.close result").closed !== true) {
-				throw new SdkV3OperationError(
-					"invalid_result",
-					"session.close result must be acknowledged with closed: true",
-				);
-			}
-			this.detach();
-		});
+		await this.coordinated(() => closeSession(this.actionHost(), key, timeoutMs));
 	}
 
 	async reply(operation: string, input: SdkRecord, key?: string, timeoutMs = 60_000): Promise<unknown> {
-		return this.coordinated(async () => {
-			const { attachment, client } = this.connected();
-			const actionId = typeof input.id === "string" ? input.id : undefined;
-			const resolution =
-				actionId === undefined ? undefined : waitForReply(client, attachment.sessionId, actionId, timeoutMs);
-			try {
-				const value = await this.authority(timeoutMs, authorized =>
-					this.mutate(authorized, operation, input, key, timeoutMs),
-				);
-				await resolution?.promise;
-				await this.authority(timeoutMs, async () => undefined);
-				return value;
-			} finally {
-				resolution?.cancel();
-			}
-		});
+		return this.coordinated(() => reply(this.actionHost(), operation, input, key, timeoutMs));
 	}
 
 	private lifecycle(
@@ -252,6 +178,18 @@ export class PublicSdkSessionClient implements PublicSdkSessionPort {
 		};
 	}
 
+	private actionHost(): PublicSdkActionHost {
+		return {
+			authority: (timeoutMs, effect, post) => this.authority(timeoutMs, effect, post),
+			mutate: (client, operation, input, key, timeoutMs) => this.mutate(client, operation, input, key, timeoutMs),
+			selectedModel: () => this.#selectedModel,
+			setSelectedModel: selection => {
+				this.#selectedModel = selection;
+			},
+			detach: () => this.detach(),
+			connected: () => this.connected(),
+		};
+	}
 	private mutate(
 		client: SdkV3Client,
 		operation: string,
@@ -283,13 +221,6 @@ export class PublicSdkSessionClient implements PublicSdkSessionPort {
 			effect,
 			post,
 		);
-	}
-
-	private selection(
-		expected: NormalizedModelSelection | undefined,
-		timeoutMs?: number,
-	): Promise<NormalizedModelSelection> {
-		return confirmSelection(this.connected().client, expected, timeoutMs);
 	}
 
 	private queryOne(client: SdkV3Client, query: string, timeoutMs?: number): Promise<unknown> {

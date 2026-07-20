@@ -203,7 +203,7 @@ describe("project admin routes", () => {
 		expect(calls).toEqual([]);
 		expect(fallbackCalls).toBe(0);
 	});
-	test("default close wiring retains a completed close replay after SDK acknowledgement and owned /exit proof", async () => {
+	test("uses exact owned /exit proof without invoking released SDK session.close and replays the completed close", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-default-close-wiring-"));
 		tempDirs.push(workspace);
 		const projectDirectory = path.join(workspace, "Default Project");
@@ -326,7 +326,7 @@ describe("project admin routes", () => {
 		await expect(routes.closeSession(mappings.get("dynamic-chat")!, closeIngress)).resolves.toEqual({
 			status: "closed",
 		});
-		expect(calls).toEqual(["attach", "close", "detach"]);
+		expect(calls).toEqual([]);
 		expect(await fs.readFile(trace, "utf8")).toBe("exit\n");
 		expect(await readSdkSessionEndpoint(projectDirectory, sessionId)).toBeNull();
 		const pane = await runTmux(socket, ["display-message", "-p", "-t", tmuxPane, "#{pane_id}"]);
@@ -347,10 +347,10 @@ describe("project admin routes", () => {
 		await expect(routes.closeSession(mappings.get("dynamic-chat")!, closeIngress)).resolves.toEqual({
 			status: "closed",
 		});
-		expect(calls).toEqual(["attach", "close", "detach"]);
+		expect(calls).toEqual([]);
 		await runTmux(socket, ["kill-server"]);
 	});
-	test("acknowledges a same-ID successor but only applies pane proof bound to its exact descriptor generation", async () => {
+	test("fails closed when exact descriptor or owned-pane proof cannot establish lifecycle closure", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-current-close-"));
 		tempDirs.push(workspace);
 		const projectDirectory = path.join(workspace, "Current Project");
@@ -371,7 +371,6 @@ describe("project admin routes", () => {
 		});
 		let closes = 0;
 		let proofs = 0;
-		let provenPanePid: number | undefined;
 		const options = await buildAdapterServerOptionsFromEnv(adapterEnv(workspace), {
 			turnRunner,
 			mappings,
@@ -437,9 +436,8 @@ describe("project admin routes", () => {
 					closes += 1;
 				},
 			}),
-			proveClosedSession: async (provenMapping, _attachment) => {
+			proveClosedSession: async (_provenMapping, _attachment) => {
 				proofs += 1;
-				provenPanePid = provenMapping.attachment?.tmuxPanePid;
 				return { status: "closed", message: "current pane absent" };
 			},
 		});
@@ -480,10 +478,9 @@ describe("project admin routes", () => {
 				ingressId: "current-close",
 				ingressHash: "current-close",
 			}),
-		).resolves.toMatchObject({ status: "closed" });
-		expect(closes).toBe(1);
-		expect(proofs).toBe(1);
-		expect(provenPanePid).toBe(pane.tmuxPanePid);
+		).resolves.toMatchObject({ status: "uncertain" });
+		expect(closes).toBe(0);
+		expect(proofs).toBe(0);
 		expect(discarded).toEqual([]);
 	});
 	test("keeps duplicate live session IDs isolated by canonical project cwd during close", async () => {

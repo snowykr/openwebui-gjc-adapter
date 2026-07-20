@@ -15,6 +15,9 @@ export function startSdkFixtureServer(scenario: SdkFixtureScenario, expectedCwd?
 	let activeSessionId = "sdk-session-created";
 	let activeSessionCwd = expectedCwd ?? process.env.GJC_SDK_FIXTURE_EXPECTED_CWD ?? "/workspace";
 	let persistenceObservedBeforePrompt = false;
+	let selectedModel:
+		| { readonly provider: string; readonly modelId: string; readonly thinkingLevel: string }
+		| undefined;
 	const server = Bun.serve({
 		port: 0,
 		fetch(request, bunServer) {
@@ -67,16 +70,51 @@ export function startSdkFixtureServer(scenario: SdkFixtureScenario, expectedCwd?
 					if (operation === "turn.prompt") {
 						promptStarted = true;
 						if (scenario === "branch_regenerate") persistenceObservedBeforePrompt = persistedSuccessorExists();
-						handlePrompt(socket, id, scenario, activeSessionId);
+						if (scenario === "model_catalog") {
+							socket.send(
+								JSON.stringify({
+									type: "control_response",
+									id,
+									ok: true,
+									result: { accepted: true, commandId: "command-right", turnId: "turn-right" },
+								}),
+							);
+							socket.send(
+								JSON.stringify({
+									type: "agent_end",
+									sessionId: activeSessionId,
+									commandId: "command-right",
+									turnId: "turn-right",
+								}),
+							);
+						} else {
+							handlePrompt(socket, id, scenario, activeSessionId);
+						}
 						return;
 					}
 					if (operation === "model.set") {
+						if (scenario === "model_catalog") selectedModel = selectedFixtureModel(input, selectedModel);
 						socket.send(
 							JSON.stringify({
 								type: "control_response",
 								id,
 								ok: true,
-								result: { provider: "future", modelId: "capable", thinkingLevel: "high" },
+								result:
+									scenario === "model_catalog"
+										? selectedModel
+										: { provider: "future", modelId: "capable", thinkingLevel: "high" },
+							}),
+						);
+						return;
+					}
+					if (operation === "thinking.set" && scenario === "model_catalog") {
+						selectedModel = selectedFixtureThinking(input, selectedModel);
+						socket.send(
+							JSON.stringify({
+								type: "control_response",
+								id,
+								ok: true,
+								result: { status: "accepted" },
 							}),
 						);
 						return;
@@ -175,10 +213,22 @@ export function startSdkFixtureServer(scenario: SdkFixtureScenario, expectedCwd?
 					}
 				}
 				if (type === "query_request") {
+					const query = requiredString(frame, "query");
+					if (scenario === "model_catalog" && query === "models.list/current" && selectedModel !== undefined) {
+						socket.send(
+							JSON.stringify({
+								type: "query_response",
+								id,
+								ok: true,
+								page: { items: [], complete: true, revision: 16 },
+							}),
+						);
+						return;
+					}
 					handleQuery(
 						socket,
 						id,
-						requiredString(frame, "query"),
+						query,
 						scenario,
 						gateAnswered,
 						sequentialGate,
@@ -254,6 +304,36 @@ function requiredString(frame: SdkFrame, field: string): string {
 	const value = frame[field];
 	if (typeof value !== "string" || value.length === 0) throw new TypeError(`${field} must be a non-empty string`);
 	return value;
+}
+function selectedFixtureModel(
+	input: SdkFrame | undefined,
+	current: { readonly provider: string; readonly modelId: string; readonly thinkingLevel: string } | undefined,
+): { readonly provider: string; readonly modelId: string; readonly thinkingLevel: string } | undefined {
+	const id = typeof input?.id === "string" ? input.id : undefined;
+	const thinkingLevel = typeof input?.thinkingLevel === "string" ? input.thinkingLevel : undefined;
+	if (
+		id === "anthropic/claude-sonnet-4" &&
+		(thinkingLevel === "off" || thinkingLevel === "low" || thinkingLevel === "medium")
+	)
+		return { provider: "anthropic", modelId: "claude-sonnet-4", thinkingLevel };
+	if (id === "openai/gpt-5" && thinkingLevel === "off") return { provider: "openai", modelId: "gpt-5", thinkingLevel };
+	return current;
+}
+
+function selectedFixtureThinking(
+	input: SdkFrame | undefined,
+	current: { readonly provider: string; readonly modelId: string; readonly thinkingLevel: string } | undefined,
+): { readonly provider: string; readonly modelId: string; readonly thinkingLevel: string } | undefined {
+	const thinkingLevel = typeof input?.level === "string" ? input.level : undefined;
+	if (
+		current?.provider === "anthropic" &&
+		current.modelId === "claude-sonnet-4" &&
+		(thinkingLevel === "off" || thinkingLevel === "low" || thinkingLevel === "medium")
+	)
+		return { ...current, thinkingLevel };
+	if (current?.provider === "openai" && current.modelId === "gpt-5" && thinkingLevel === "off")
+		return { ...current, thinkingLevel };
+	return current;
 }
 function lifecycleControlResult(operation: string): SdkFrame {
 	if (operation === "session.new") return { created: true };

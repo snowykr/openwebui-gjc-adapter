@@ -7,38 +7,36 @@ export async function readCliSession(
 	cwd: string,
 	captureLines: number,
 	pane: OwnedTmuxPane,
+	endpointPublicationTimeoutMs: number,
 ): Promise<CliLifecycleResult<string>> {
-	const ready = await awaitPaneReadiness(tmux, captureLines, pane);
+	const deadline = Date.now() + endpointPublicationTimeoutMs;
+	const ready = await awaitPaneReadiness(tmux, captureLines, pane, deadline);
 	if (ready.status !== "closed") return ready;
-	const sent = await tmux.run(["send-keys", "-t", pane.target, "/session", "Enter"]);
-	if (sent.exitCode !== 0)
-		return { status: "unavailable", message: sent.stderr.trim() || "tmux could not send /session" };
-	const deadline = Date.now() + 10_000;
+	const initialIds = parseSessionIds(ready.value.capture);
+	if (initialIds.length > 1)
+		return { status: "uncertain", message: "startup /session capture contains duplicate or ambiguous session ids" };
 	let previous = ready.value;
-	let sessionId: string | undefined;
+	let sessionId = initialIds[0];
 	for (;;) {
 		const position = await panePosition(tmux, pane);
 		if (position.status !== "closed") return position;
 		if (position.value < previous.position)
-			return { status: "uncertain", message: "tmux pane position rolled over after /session" };
+			return { status: "uncertain", message: "tmux pane position rolled over while awaiting session endpoint" };
 		const captured = await tmux.run(["capture-pane", "-p", "-t", pane.target, "-S", `-${captureLines}`]);
 		if (captured.exitCode !== 0)
 			return { status: "uncertain", message: captured.stderr.trim() || "tmux capture failed" };
 		const fresh = newCaptureBytes(previous.capture, captured.stdout, position.value - previous.position);
-		const ids =
-			sessionId === undefined
-				? parseSessionIds(fresh).length === 0 &&
-					parseSessionIds(previous.capture).length === 0 &&
-					captured.stdout !== previous.capture
+		if (sessionId === undefined) {
+			const ids =
+				parseSessionIds(fresh).length === 0 && captured.stdout !== previous.capture
 					? parseSessionIds(captured.stdout)
-					: parseSessionIds(fresh)
-				: [];
-		if (ids.length > 1)
-			return { status: "uncertain", message: "fresh /session capture contains duplicate or ambiguous session ids" };
-		if (ids.length === 1) {
-			if (position.value <= ready.value.position)
-				return { status: "uncertain", message: "tmux pane position did not advance after /session" };
-			sessionId = ids[0]!;
+					: parseSessionIds(fresh);
+			if (ids.length > 1)
+				return {
+					status: "uncertain",
+					message: "startup /session capture contains duplicate or ambiguous session ids",
+				};
+			sessionId = ids[0];
 		}
 		if (sessionId !== undefined) {
 			try {
@@ -46,12 +44,12 @@ export async function readCliSession(
 			} catch (error) {
 				return {
 					status: "uncertain",
-					message: error instanceof Error ? error.message : "cannot read fresh CLI session endpoint",
+					message: error instanceof Error ? error.message : "cannot read startup CLI session endpoint",
 				};
 			}
 		}
 		if (Date.now() >= deadline)
-			return { status: "uncertain", message: "fresh /session capture did not publish a session endpoint" };
+			return { status: "uncertain", message: "startup /session capture did not publish a session endpoint" };
 		previous = { position: position.value, capture: captured.stdout };
 		await Bun.sleep(50);
 	}
@@ -61,8 +59,8 @@ async function awaitPaneReadiness(
 	tmux: TmuxCommandRunner,
 	captureLines: number,
 	pane: OwnedTmuxPane,
+	deadline: number,
 ): Promise<CliLifecycleResult<{ readonly position: number; readonly capture: string }>> {
-	const deadline = Date.now() + 10_000;
 	for (;;) {
 		const process = await paneProcessReady(tmux, pane);
 		if (process.status !== "closed") return process;
@@ -124,7 +122,11 @@ async function panePosition(tmux: TmuxCommandRunner, pane: OwnedTmuxPane): Promi
 }
 
 function parseSessionIds(capture: string): string[] {
-	return [...capture.matchAll(/(?:^|\n)\s*(?:ID|Session ID)\s*:\s*([^\s]+)\s*$/gim)].map(match => match[1]!);
+	const unwrapped = capture.replace(
+		/((?:^|\n)\s*(?:ID|Session ID)\s*:\s*[^\s]+)\n(\s*-[^\s]+)(?=\s*(?:\n|$))/gim,
+		"$1$2",
+	);
+	return [...unwrapped.matchAll(/(?:^|\n)\s*(?:ID|Session ID)\s*:\s*([^\s]+)\s*$/gim)].map(match => match[1]!);
 }
 function newCaptureBytes(previous: string, current: string, advancedLines: number): string {
 	if (current.startsWith(previous)) return current.slice(previous.length);

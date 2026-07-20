@@ -51,21 +51,15 @@ describe("real canonical model selection scenarios", () => {
 				409,
 				"model_selection_default_read_failed",
 			);
-			harness.coordinator.useUnusableStateOnce();
-			await expectSelectionError(
-				harness.chat("gjc", { id: "state-unusable" }),
-				409,
-				"model_selection_default_unusable",
-			);
 			const afterReadErrors = await harness.effects();
 			expect(afterReadErrors.coordinator).toMatchObject({
 				selection: initial.coordinator.selection,
 				setterAttempts: initial.coordinator.setterAttempts,
 				promptCount: initial.coordinator.promptCount,
-				catalogReads: initial.coordinator.catalogReads + 4,
-				stateReads: initial.coordinator.stateReads + 2,
+				catalogReads: initial.coordinator.catalogReads + 3,
+				stateReads: initial.coordinator.stateReads + 3,
 			});
-			expect(afterReadErrors.projectLookups).toBe(initial.projectLookups + 3);
+			expect(afterReadErrors.projectLookups).toBe(initial.projectLookups + 2);
 			expectNoDeliveryMutation(initial, afterReadErrors);
 
 			harness.coordinator.failNextSetter();
@@ -199,7 +193,6 @@ describe("real canonical model selection scenarios", () => {
 				chatId: "chat-prompt-failed",
 				projectId: "openwebui",
 				detail: expect.stringMatching(/^[a-f0-9]{64}$/),
-				sessionFile: path.join(workspace, ".gjc", "sessions", `${sessionId}.jsonl`),
 			});
 			expect(sessionId).toMatch(/^[0-9a-f-]{36}$/);
 			expect(Object.keys(operation).sort()).toEqual([
@@ -210,7 +203,6 @@ describe("real canonical model selection scenarios", () => {
 				"ingressId",
 				"kind",
 				"projectId",
-				"sessionFile",
 				"sessionId",
 				"startedAt",
 				"state",

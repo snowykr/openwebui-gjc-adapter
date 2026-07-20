@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { closeTmux, exitAndObservePostCloseFailure } from "../scripts/gjc-release-compat-lifecycle";
 
 const ROOT = join(import.meta.dir, "..");
-const GJC_VERSION = "0.11.2";
+const GJC_VERSION = "0.11.4";
 const BUN_IMAGE_DIGEST = "sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4";
 const PYTHON_IMAGE_DIGEST = "sha256:8a7e7cc04fd3e2bd787f7f24e22d5d119aa590d429b50c95dfe12b3abe52f48b";
 
@@ -39,8 +39,14 @@ describe("GJC SDK runtime provenance", () => {
 		expect(dockerfile).toContain("COPY package.json bun.lock ./");
 		expect(dockerfile).toContain("bun install --frozen-lockfile --production");
 		expect(dockerfile).toContain(
-			`test "$(bun --no-env-file --config=/dev/null ./node_modules/.bin/gjc --version)" = "${GJC_VERSION}"`,
+			'gjc_version="$(bun --no-env-file --config=/dev/null ./node_modules/.bin/gjc --version)"',
 		);
+		expect(dockerfile).toContain(`gjc_version="\${gjc_version#gjc/}"`);
+		expect(dockerfile).toContain(`test "$gjc_version" = "${GJC_VERSION}"`);
+		expect(dockerfile.match(/org\.opencontainers\.image\.version="[^"]+"/g)).toEqual([
+			`org.opencontainers.image.version="${GJC_VERSION}"`,
+		]);
+		expect(dockerfile).not.toContain("0.11.2");
 		expect(dockerfile).toContain("GJC_OPENWEBUI_GJC_COMMAND=/opt/openwebui-gjc-adapter/node_modules/.bin/gjc");
 		expect(dockerfile).not.toContain("/opt/gajae-code");
 		expect(dockerfile).not.toContain("git fetch");
@@ -67,25 +73,25 @@ describe("GJC SDK runtime provenance", () => {
 
 		for (const fixture of [
 			{
-				version: "0.11.2",
-				nativesVersion: "0.11.2",
+				version: "0.11.4",
+				nativesVersion: "0.11.4",
 				tag: "",
-				expected: { version: "0.11.2", nativesVersion: "0.11.2", tag: "v0.11.2" },
+				expected: { version: "0.11.4", nativesVersion: "0.11.4", tag: "v0.11.4" },
 			},
 			{
-				version: "v0.11.2",
-				nativesVersion: "v0.11.2",
-				tag: "v0.11.2",
-				expected: { version: "0.11.2", nativesVersion: "0.11.2", tag: "v0.11.2" },
+				version: "v0.11.4",
+				nativesVersion: "v0.11.4",
+				tag: "v0.11.4",
+				expected: { version: "0.11.4", nativesVersion: "0.11.4", tag: "v0.11.4" },
 			},
 		])
 			expect(normalizeRelease(fixture.version, fixture.nativesVersion, fixture.tag)).toEqual(fixture.expected);
-		expect(() => normalizeRelease("0.11.2", "0.11.1", "v0.11.2")).toThrow();
-		expect(() => normalizeRelease("0.11.2", "0.11.2", "v0.11.1")).toThrow();
+		expect(() => normalizeRelease("0.11.4", "0.11.2", "v0.11.4")).toThrow();
+		expect(() => normalizeRelease("0.11.4", "0.11.4", "v0.11.2")).toThrow();
 		for (const fixture of [
 			{ event: "schedule" as const, version: "", route: "fixed" },
 			{ event: "workflow_dispatch" as const, version: "", route: "fixed" },
-			{ event: "workflow_dispatch" as const, version: "v0.11.2", route: "dispatched-manual" },
+			{ event: "workflow_dispatch" as const, version: "v0.11.4", route: "dispatched-manual" },
 			{ event: "repository_dispatch" as const, version: "", route: "dispatched-repository" },
 		])
 			expect(releaseRoute(fixture.event, fixture.version)).toBe(fixture.route);
@@ -104,6 +110,9 @@ describe("GJC SDK runtime provenance", () => {
 		expect(workflow).toContain(`commit: \${{ inputs.commit || github.sha }}`);
 		expect(workflow).toContain("- lane: v0.11.1-pair");
 		expect(workflow).toContain("- lane: v0.11.2-pair");
+		expect(workflow).toContain("- lane: v0.11.4-pair");
+		expect(workflow).toContain("- lane: v0.11.4-pair\n            version: 0.11.4\n            tag: v0.11.4");
+		expect(workflow).toContain(`natives_version: \${{ matrix.version }}`);
 		expect(workflow).not.toMatch(/^\s+if:.*\bmatrix\./m);
 
 		expect(reusable).toContain("on:\n  workflow_call:");
@@ -116,6 +125,16 @@ describe("GJC SDK runtime provenance", () => {
 		expect(reusable).toContain('if [[ "$INPUT_TRIGGER" = repository_dispatch ]]; then');
 		expect(reusable).toContain('test -n "$INPUT_NATIVES_VERSION"');
 		expect(reusable).toContain("bun install --frozen-lockfile --ignore-scripts");
+		expect(reusable).toContain(
+			'cp scripts/gjc-release-compat.ts scripts/gjc-release-compat-fixtures.ts scripts/gjc-release-compat-lifecycle.ts scripts/gjc-release-compat-runtime.ts scripts/gjc-release-compat-sdk.ts "$compat_root/"',
+		);
+		expect(reusable).toContain(`cli_version_pattern='^(gjc/)?([0-9]+\\.[0-9]+\\.[0-9]+)$'`);
+		expect(reusable).toContain(`cli_version="\${BASH_REMATCH[2]}"`);
+		expect(reusable).toContain('[[ "$cli_version" = "$GJC_CODING_AGENT_VERSION" ]]');
+		expect(reusable).toContain("def sanitize(value, key=");
+		expect(reusable).toContain('"adapter": {');
+		expect(reusable).toContain('"upstream": {');
+		expect(reusable).toContain("ADAPTER_REPOSITORY");
 		expect(reusable).toContain("operation-report.json");
 		expect(reusable).not.toContain("bun update");
 		expect(reusable).not.toContain("git apply");
@@ -243,9 +262,9 @@ describe("GJC SDK runtime provenance", () => {
 			sessionFile: undefined,
 		});
 		expect(startupArguments("0.11.1")).not.toContain("--thinking");
-		expect(startupArguments("0.11.2")).toEqual(["--model", "compat-local/hermetic-model", "--thinking", "off"]);
+		expect(startupArguments("0.11.4")).toEqual(["--model", "compat-local/hermetic-model", "--thinking", "off"]);
 		expect(parseReleasedCliVersion("gjc/0.11.1\n")).toBe("0.11.1");
-		expect(parseReleasedCliVersion("0.11.2\n")).toBe("0.11.2");
+		expect(parseReleasedCliVersion("0.11.4\n")).toBe("0.11.4");
 		expect(() => parseReleasedCliVersion("gjc/0.11.1 extra")).toThrow("invalid version");
 		expect(runner).toContain("const match = /^(?:gjc\\/)?(\\d+\\.\\d+\\.\\d+)$/.exec(output);");
 		expect(runner).toContain('await run(command, ["--version"])');

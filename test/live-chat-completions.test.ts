@@ -41,6 +41,28 @@ describe("live OpenAI-compatible chat completions", () => {
 			data: [],
 		});
 	});
+	it("passes one OpenWebUI connection-prefixed canonical model to the runner without its prefix", async () => {
+		let requestedModelId: string | undefined;
+		const result = await handleChatCompletions({
+			request: {
+				...request,
+				model: "gjc-adapter.gjc/anthropic/claude-sonnet-4:low",
+			},
+			headers: chatHeaders,
+			projects: [projectWithFolder],
+			owner,
+			projectContextRepository: await demoRepository(),
+			runner: {
+				run(input) {
+					requestedModelId = input.requestedModelId;
+					return { content: "done", model: "gjc/anthropic/claude-sonnet-4:low" };
+				},
+			},
+		});
+
+		expect(result.ok).toBe(true);
+		expect(requestedModelId).toBe("gjc/anthropic/claude-sonnet-4:low");
+	});
 	it("returns an OpenAI-style 400 for invalid workflow gate replies", async () => {
 		const result = await handleChatCompletions({
 			request,

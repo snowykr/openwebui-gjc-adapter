@@ -19,6 +19,7 @@ import { InMemoryOutboxStore } from "../src/state/outbox";
 import { FakeGjcTurnRunner, project } from "./gjc-routing-runner-fixtures";
 import type { SdkFixtureScenario, SdkFixtureServer } from "./gjc-sdk-v3-fixture-types";
 import { expectSdkRequest, startSdkFixtureServer } from "./gjc-sdk-v3-fixtures";
+import { staticModelReaderFactory } from "./model-selection-fixtures";
 
 describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 	test("persists mappings across file-backed store instances", () => {
@@ -382,7 +383,7 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		expect(replayRunner.continues).toHaveLength(0);
 		expect(replayRunner.gateResponses).toHaveLength(0);
 	});
-	test("retains a durable provisional create proof across restart without publishing a mapping", () => {
+	test("persists endpoint-backed provisional create authority before a transcript exists and reconciles it on restart", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-mapping-")), "mappings.json");
 		const first = new FileBackedSessionMappingStore(filePath);
 		first.reserveProvisionalOperation({
@@ -408,7 +409,6 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		};
 		first.attachProvisionalOperation("chat-1", "user-1", {
 			sessionId: "session-created",
-			sessionFile: "/workspace/project/.gjc/sessions/session-created.jsonl",
 			attachment,
 		});
 
@@ -424,7 +424,6 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			state: "uncertain",
 			startedAt: expect.any(String),
 			sessionId: "session-created",
-			sessionFile: "/workspace/project/.gjc/sessions/session-created.jsonl",
 			attachment,
 		});
 		expect(second.provisionalOperation("chat-1", "user-1")?.attachment?.expectedSessionId).toBe(
@@ -856,7 +855,39 @@ test("reuses a live published endpoint from a file-backed restart without invoki
 							type: "query_response",
 							id: frame.id,
 							ok: true,
-							page: { items: [{ model: "anthropic/claude-sonnet-4", thinking: "medium" }], complete: true },
+							page: {
+								items: [
+									{
+										mode: "default",
+										thinking: "medium",
+										steeringMode: "all",
+										followUpMode: "all",
+										interruptMode: "all",
+									},
+								],
+								complete: true,
+							},
+						}),
+					);
+					return;
+				}
+				if (frame.query === "models.list/current") {
+					socket.send(
+						JSON.stringify({
+							type: "query_response",
+							id: frame.id,
+							ok: true,
+							page: {
+								items: [
+									{
+										provider: "anthropic",
+										id: "claude-sonnet-4",
+										current: true,
+										currentThinkingLevel: "medium",
+									},
+								],
+								complete: true,
+							},
 						}),
 					);
 				}
@@ -908,7 +939,7 @@ test("reuses a live published endpoint from a file-backed restart without invoki
 					lifecycle,
 				}),
 		);
-		expect(metadataQueries).toBe(2);
+		expect(metadataQueries).toBe(0);
 	} finally {
 		server.stop(true);
 		rmSync(root, { recursive: true, force: true });
@@ -1276,6 +1307,76 @@ test("rejects a close commit when its public SDK descriptor changes after proof"
 		await expect(close).rejects.toThrow("Close preflight proof");
 	} finally {
 		fixture.dispose();
+	}
+});
+test("applies released model selection responses across fresh and continuation turns", async () => {
+	const root = mkdtempSync(join(tmpdir(), "gjc-first-turn-continuation-"));
+	const sessionRoot = join(root, ".gjc", "sessions");
+	const mappingFile = join(root, "mappings.json");
+	const server = startSdkFixtureServer("model_catalog", root);
+	try {
+		writeFileSync(
+			join(root, "gjc-sdk-fixture.json"),
+			JSON.stringify({
+				GJC_SDK_FIXTURE_CLI_TRANSCRIPT: join(root, "sdk-cli.jsonl"),
+				GJC_SDK_FIXTURE_ENDPOINT_URL: server.url,
+				GJC_SDK_FIXTURE_ENDPOINT_TOKEN: server.token,
+				GJC_SDK_FIXTURE_DYNAMIC_AUTHORITY: "1",
+			}),
+		);
+		const runner = createGjcRoutingLiveGatewayRunner({
+			turnRunner: createPublicSdkGjcTurnRunner({
+				cliPath: join(import.meta.dir, "fixtures", "gjc-sdk-interactive-cli-session-fixture.ts"),
+				runtimeLocations: {
+					childEnvironment: {
+						HOME: root,
+						GJC_CONFIG_DIR: join(root, ".gjc"),
+						GJC_CODING_AGENT_DIR: join(root, ".gjc"),
+					},
+				} as GjcRuntimeLocations,
+				turnTimeoutMs: 1_000,
+			}),
+			mappings: new FileBackedSessionMappingStore(mappingFile),
+			requestedModelId: () => "gjc/anthropic/claude-sonnet-4:medium",
+			modelReaderFactory: staticModelReaderFactory(),
+		});
+		const firstTurn = {
+			project: { ...project, cwd: root, sessionRoot },
+			prompt: "first",
+			chatId: "same-session",
+			messageId: "assistant-first",
+			userMessageId: "user-first",
+			userMessageParentId: null,
+			continued: false,
+		};
+		await runner.run(firstTurn);
+		const persisted = new FileBackedSessionMappingStore(mappingFile).get("same-session");
+		expect(persisted?.sessionFile).toMatch(new RegExp(`^${sessionRoot}/[^/]+\\.jsonl$`));
+		expect(persisted?.sessionFile).toBeDefined();
+		await runner.run({
+			...firstTurn,
+			prompt: "second",
+			messageId: "assistant-second",
+			userMessageId: "user-second",
+			userMessageParentId: "assistant-first",
+			continued: true,
+		});
+		expect(
+			server.frames.filter(frame => frame.type === "control_request" && frame.operation === "turn.prompt"),
+		).toHaveLength(2);
+		expect(
+			server.frames.filter(frame => frame.type === "control_request" && frame.operation === "model.set"),
+		).toHaveLength(2);
+		expect(
+			server.frames.filter(frame => frame.type === "control_request" && frame.operation === "thinking.set"),
+		).toHaveLength(2);
+		expect(
+			server.frames.filter(frame => frame.type === "query_request" && frame.query === "models.list/current"),
+		).toHaveLength(0);
+		expect(readFileSync(join(root, "sdk-cli.jsonl"), "utf8")).toContain('"interactive":"create"');
+	} finally {
+		server.stop();
+		rmSync(root, { recursive: true, force: true });
 	}
 });
 test("fails closed when a newly published CLI endpoint disappears before public SDK binding", async () => {

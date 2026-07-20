@@ -78,19 +78,14 @@ export function startRealSelectionSdkServer(coordinatorUrl: string): RealSelecti
 			if (query === "models.list/current") {
 				const payload = await fetchRecord(`${coordinatorUrl}/catalog`);
 				if (!Array.isArray(payload.models)) throw new TypeError("catalog query failed");
-				const selection = sessionSelections.get(socket.data.sessionId);
-				items =
-					selection === undefined ? payload.models : payload.models.map(item => currentModelRow(item, selection));
+				const selection =
+					sessionSelections.get(socket.data.sessionId) ??
+					selectionFromRecord(await fetchRecord(`${coordinatorUrl}/state`));
+				items = payload.models.map(item => currentModelRow(item, selection));
 			} else if (query === "session.metadata") {
 				items = [{ sessionId: socket.data.sessionId, cwd: socket.data.cwd, kind: "saved" }];
 			} else if (query === "config.list/get") {
-				const selection = selectionFromRecord(await fetchRecord(`${coordinatorUrl}/state`));
-				items = [
-					{
-						model: `${selection.provider}/${selection.modelId}`,
-						thinking: selection.thinkingLevel,
-					},
-				];
+				items = [{}];
 			} else if (query === "session.last_assistant") {
 				items = [requiredString(await fetchRecord(`${coordinatorUrl}/assistant`), "text")];
 			} else if (query === "workflow.gates.list") {

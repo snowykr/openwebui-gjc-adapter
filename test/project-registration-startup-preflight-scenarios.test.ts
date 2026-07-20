@@ -195,7 +195,7 @@ async function cliCase(legacy: boolean, argv: readonly string[]) {
 		1,
 		false,
 		"",
-		`$ bun run src/cli.ts\n${PROTECTED}\nerror: script "start" exited with code 1\n`,
+		`$ bun src/cli.ts\n${PROTECTED}\nerror: script "start" exited with code 1\n`,
 	]);
 	expect({ requests, runner: await Bun.file(marker).exists() }).toEqual({ requests: 0, runner: false });
 	expect(await fixture.snapshotSourceFamily(context.databasePath)).toEqual(before);

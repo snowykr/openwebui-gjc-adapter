@@ -53,6 +53,7 @@ async function runInteractiveCli(): Promise<void> {
 		url: requiredEnvironment("GJC_SDK_FIXTURE_ENDPOINT_URL"),
 		token: authorityToken(sessionId, process.cwd()),
 	});
+	if (argv.includes("/session")) process.stdout.write(`Session ID: ${sessionId}\n`);
 	const exit = waitForExit(sessionId);
 	appendFileSync(
 		transcript,

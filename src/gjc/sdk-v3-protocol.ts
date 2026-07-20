@@ -160,6 +160,7 @@ export function ensureCapabilityCatalog(items: readonly unknown[]): readonly unk
 export function parseState(
 	metadataValue: unknown,
 	configValue: unknown,
+	currentModelsValue: readonly unknown[],
 	authority: Pick<SdkSessionAuthority, "sessionId" | "cwd">,
 ): PublicSdkSessionState {
 	const metadata = parseRecord(metadataValue, "session.metadata result");
@@ -168,16 +169,24 @@ export function parseState(
 	if (sessionId !== authority.sessionId || cwd !== authority.cwd) {
 		throw new SdkV3ProtocolError("session.metadata result", "session authority does not match lifecycle authority");
 	}
-	const config = parseRecord(configValue, "config.list/get result");
-	const model = requiredString(config, "model", "config.list/get result");
-	const separator = model.indexOf("/");
-	if (separator < 1 || separator === model.length - 1) {
-		throw new SdkV3ProtocolError("config.list/get result", "model must be provider/id");
+	parseRecord(configValue, "config.list/get result");
+	const current = currentModelsValue.filter(item => parseRecord(item, "models.list/current result").current === true);
+	if (current.length !== 1) {
+		throw new SdkV3ProtocolError(
+			"models.list/current result",
+			`expected one current model, received ${current.length}`,
+		);
 	}
+	const model = parseRecord(current[0], "models.list/current current result");
+	const selection = parseSelection({
+		provider: requiredString(model, "provider", "models.list/current current result"),
+		modelId: requiredString(model, "id", "models.list/current current result"),
+		thinkingLevel: requiredString(model, "currentThinkingLevel", "models.list/current current result"),
+	});
 	return {
 		sessionId: authority.sessionId,
-		model: { provider: model.slice(0, separator), id: model.slice(separator + 1) },
-		thinkingLevel: requiredString(config, "thinking", "config.list/get result"),
+		model: { provider: selection.provider, id: selection.modelId },
+		thinkingLevel: selection.thinkingLevel,
 	};
 }
 

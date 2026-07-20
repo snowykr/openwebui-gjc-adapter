@@ -95,7 +95,7 @@ describe("adapter CLI auth and start", () => {
 			.trim()
 			.split("\n")
 			.map(line => JSON.parse(line) as { readonly sessionCommand?: string; readonly sessionPath?: string });
-		expect(transcriptEntries.filter(entry => entry.sessionCommand === "/session")).toHaveLength(1);
+		expect(transcriptEntries.filter(entry => entry.sessionCommand === "/session")).toHaveLength(0);
 		expect(
 			sdkServer.frames.filter(frame => frame.type === "control_request" && frame.operation === "session.close"),
 		).toHaveLength(1);

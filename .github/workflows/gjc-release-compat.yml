@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Published coding-agent/natives version (for example v0.11.2)
+        description: Published coding-agent/natives version (for example v0.11.4)
         required: false
         type: string
       tag:
@@ -41,6 +41,9 @@ jobs:
           - lane: v0.11.2-pair
             version: 0.11.2
             tag: v0.11.2
+          - lane: v0.11.4-pair
+            version: 0.11.4
+            tag: v0.11.4
     uses: ./.github/workflows/gjc-release-compat-run.yml
     with:
       lane: ${{ matrix.lane }}

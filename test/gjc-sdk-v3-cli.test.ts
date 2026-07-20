@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,7 +6,7 @@ import { CliLifecycleBackend } from "../src/gjc/cli-lifecycle-backend";
 import type { TmuxCommandResult, TmuxCommandRunner } from "../src/gjc/tmux-ownership";
 
 describe("endpoint-less CLI lifecycle boundary", () => {
-	test("creates a tagged CLI session and discovers its id through /session", async () =>
+	test("creates a tagged CLI session from the startup /session built-in and discovers its authoritative id", async () =>
 		withSessionRoot(async sessionRoot => {
 			const tmux = new FakeTmuxRunner(sessionRoot);
 			const backend = new CliLifecycleBackend({
@@ -27,7 +27,7 @@ describe("endpoint-less CLI lifecycle boundary", () => {
 				value: { sessionId: "session-1", sessionPath: join(sessionRoot, "session-1.jsonl") },
 			});
 			if (result.status !== "closed") throw new TypeError("fixture must create an attachment");
-			expect(tmux.calls).toContainEqual(["send-keys", "-t", result.value.pane.target, "/session", "Enter"]);
+			expect(tmux.calls.filter(call => call[0] === "send-keys" && call.at(-2) === "/session")).toEqual([]);
 			expect(tmux.calls[0]).toEqual([
 				"new-session",
 				"-d",
@@ -39,10 +39,83 @@ describe("endpoint-less CLI lifecycle boundary", () => {
 				"-c",
 				sessionRoot,
 				"--",
-				`'env' 'HOME=/runtime-home' 'GJC_CONFIG_DIR=.gjc' 'GJC_CODING_AGENT_DIR=/runtime-home/.gjc/agent' '/opt/gjc' '--session-dir' '${sessionRoot}'`,
+				`'env' 'HOME=/runtime-home' 'GJC_CONFIG_DIR=.gjc' 'GJC_CODING_AGENT_DIR=/runtime-home/.gjc/agent' '/opt/gjc' '--session-dir' '${sessionRoot}' '/session'`,
 			]);
 		}));
-	test("sends /session exactly once across capture rollover and rejects ambiguous fresh captures", async () =>
+	test("creates an endpoint-backed ephemeral session when GJC has not yet persisted a JSONL transcript", async () =>
+		withSessionRoot(async sessionRoot => {
+			const backend = new CliLifecycleBackend({
+				cliPath: "/opt/gjc",
+				cwd: sessionRoot,
+				tmux: new FakeTmuxRunner(sessionRoot, undefined, { persistTranscript: false }),
+			});
+
+			await expect(backend.createEphemeral({ sessionRoot })).resolves.toMatchObject({
+				status: "closed",
+				value: { sessionId: "session-1", sessionPath: "" },
+			});
+		}));
+	test("accepts a session id wrapped by the tmux pane width", async () =>
+		withSessionRoot(async sessionRoot => {
+			const backend = new CliLifecycleBackend({
+				cliPath: "/opt/gjc",
+				cwd: sessionRoot,
+				tmux: new FakeTmuxRunner(sessionRoot, undefined, { wrapped: true }),
+			});
+
+			await expect(backend.create({ sessionRoot })).resolves.toMatchObject({
+				status: "closed",
+				value: { sessionId: "session-1-extra" },
+			});
+		}));
+	test("waits for a model-catalog endpoint published after the ordinary timeout without killing its pane", async () =>
+		withFakeClock(async clock =>
+			withSessionRoot(async sessionRoot => {
+				const tmux = new FakeTmuxRunner(sessionRoot, undefined, {
+					publishEndpointWhen: () => clock() >= 10_100,
+				});
+				const backend = new CliLifecycleBackend({
+					cliPath: "/opt/gjc",
+					cwd: sessionRoot,
+					tmux,
+					endpointPublicationTimeoutMs: 30_000,
+				});
+
+				await expect(backend.create({ sessionRoot })).resolves.toMatchObject({
+					status: "closed",
+					value: { sessionId: "session-1" },
+				});
+				expect(clock()).toBeGreaterThanOrEqual(10_100);
+				expect(tmux.calls.some(call => call[0] === "kill-pane")).toBe(false);
+			}),
+		));
+	test("cleans up its owned pane when the endpoint is missing at its bounded publication deadline", async () =>
+		withFakeClock(async () =>
+			withSessionRoot(async sessionRoot => {
+				const tmux = new FakeTmuxRunner(sessionRoot, undefined, { publishEndpointWhen: () => false });
+				const backend = new CliLifecycleBackend({
+					cliPath: "/opt/gjc",
+					cwd: sessionRoot,
+					tmux,
+					endpointPublicationTimeoutMs: 100,
+				});
+
+				await expect(backend.create({ sessionRoot })).resolves.toMatchObject({
+					status: "uncertain",
+					message: "startup /session capture did not publish a session endpoint",
+				});
+				expect(tmux.calls).toContainEqual(["kill-pane", "-t", "%4"]);
+			}),
+		));
+	test("rejects invalid endpoint publication timeouts", () => {
+		expect(
+			() => new CliLifecycleBackend({ cliPath: "/opt/gjc", cwd: "/tmp", endpointPublicationTimeoutMs: 0 }),
+		).toThrow("endpointPublicationTimeoutMs must be a positive integer");
+		expect(
+			() => new CliLifecycleBackend({ cliPath: "/opt/gjc", cwd: "/tmp", endpointPublicationTimeoutMs: 1.5 }),
+		).toThrow("endpointPublicationTimeoutMs must be a positive integer");
+	});
+	test("uses the startup /session exactly once across capture rollover and rejects ambiguous startup captures", async () =>
 		withSessionRoot(async sessionRoot => {
 			const tmux = new FakeTmuxRunner(sessionRoot, undefined, { rollover: true });
 			const backend = new CliLifecycleBackend({ cliPath: "/opt/gjc", cwd: sessionRoot, tmux });
@@ -50,7 +123,7 @@ describe("endpoint-less CLI lifecycle boundary", () => {
 				status: "closed",
 				value: { sessionId: "session-1" },
 			});
-			expect(tmux.calls.filter(call => call[0] === "send-keys" && call.at(-2) === "/session")).toHaveLength(1);
+			expect(tmux.calls.filter(call => call[0] === "send-keys" && call.at(-2) === "/session")).toHaveLength(0);
 
 			const ambiguous = new FakeTmuxRunner(sessionRoot, undefined, { ambiguous: true });
 			const second = new CliLifecycleBackend({ cliPath: "/opt/gjc", cwd: sessionRoot, tmux: ambiguous });
@@ -58,7 +131,7 @@ describe("endpoint-less CLI lifecycle boundary", () => {
 				status: "uncertain",
 				message: expect.stringContaining("duplicate or ambiguous"),
 			});
-			expect(ambiguous.calls.filter(call => call[0] === "send-keys" && call.at(-2) === "/session")).toHaveLength(1);
+			expect(ambiguous.calls.filter(call => call[0] === "send-keys" && call.at(-2) === "/session")).toHaveLength(0);
 		}));
 	test("resumes with absolute JSONL and its parent session directory", async () =>
 		withSessionRoot(async sessionRoot => {
@@ -375,6 +448,19 @@ async function withSessionRoot(run: (sessionRoot: string) => Promise<void>): Pro
 		await rm(sessionRoot, { recursive: true, force: true });
 	}
 }
+async function withFakeClock(run: (clock: () => number) => Promise<void>): Promise<void> {
+	let now = 0;
+	const nowSpy = spyOn(Date, "now").mockImplementation(() => now);
+	const sleepSpy = spyOn(Bun, "sleep").mockImplementation(async milliseconds => {
+		now += typeof milliseconds === "number" ? milliseconds : milliseconds.getTime() - now;
+	});
+	try {
+		await run(() => now);
+	} finally {
+		sleepSpy.mockRestore();
+		nowSpy.mockRestore();
+	}
+}
 
 function sessionJsonl(id: string, cwd: string): string {
 	return `${JSON.stringify({ type: "session", id, timestamp: "2026-07-19T00:00:00.000Z", cwd })}\n`;
@@ -389,12 +475,19 @@ class FakeTmuxRunner implements TmuxCommandRunner {
 			readonly rollover?: boolean;
 			readonly ambiguous?: boolean;
 			readonly exitClosesSession?: boolean;
+			readonly wrapped?: boolean;
+			readonly publishEndpointWhen?: () => boolean;
+			readonly persistTranscript?: boolean;
 		} = {},
 	) {}
 	private ownershipTag = "";
 	private exists = true;
-	private sessionRequested = false;
+	private sessionRequested = true;
 	private ownershipState: "normal" | "absent" | "replaced" | "uncertain" | "unavailable" = "normal";
+	private endpointPublished = false;
+	private get sessionId(): string {
+		return this.behavior.wrapped ? "session-1-extra" : "session-1";
+	}
 	makeOwnershipUnobservable(): void {
 		this.ownershipState = "uncertain";
 	}
@@ -407,8 +500,12 @@ class FakeTmuxRunner implements TmuxCommandRunner {
 			case "new-session": {
 				const cwd = argv[argv.indexOf("-c") + 1];
 				if (cwd === undefined) throw new TypeError("tmux session cwd is required");
-				await writeFile(join(this.sessionRoot, "session-1.jsonl"), sessionJsonl("session-1", cwd));
-				await publishSdkSessionEndpoint(cwd, "session-1");
+				if (this.behavior.persistTranscript !== false)
+					await writeFile(join(this.sessionRoot, `${this.sessionId}.jsonl`), sessionJsonl(this.sessionId, cwd));
+				if (this.behavior.publishEndpointWhen === undefined) {
+					await publishSdkSessionEndpoint(cwd, this.sessionId);
+					this.endpointPublished = true;
+				}
 				await this.afterOpen?.();
 				return { exitCode: 0, stdout: "%4|123\n", stderr: "" };
 			}
@@ -445,10 +542,15 @@ class FakeTmuxRunner implements TmuxCommandRunner {
 				this.sessionRequested ||= argv.at(-2) === "/session";
 				if (argv.at(-2) === "/exit" && this.behavior.exitClosesSession) {
 					this.exists = false;
-					await rm(join(this.sessionRoot, ".gjc", "state", "sdk", "session-1.json"));
+					await rm(join(this.sessionRoot, ".gjc", "state", "sdk", `${this.sessionId}.json`));
 				}
 				return { exitCode: 0, stdout: "", stderr: "" };
 			case "capture-pane":
+				if (!this.endpointPublished && this.sessionRequested && this.behavior.publishEndpointWhen?.() === true) {
+					const cwd = this.sessionRoot;
+					await publishSdkSessionEndpoint(cwd, this.sessionId);
+					this.endpointPublished = true;
+				}
 				return {
 					exitCode: 0,
 					stdout: this.sessionRequested
@@ -456,7 +558,9 @@ class FakeTmuxRunner implements TmuxCommandRunner {
 							? "new screen\nSession ID: session-1\n"
 							: this.behavior.ambiguous
 								? "ready\nSession ID: session-1\nSession ID: session-2\n"
-								: "ready\nSession ID: session-1\n"
+								: this.behavior.wrapped
+									? "ready\nSession ID: session-1\n-extra\n"
+									: `ready\nSession ID: ${this.sessionId}\n`
 						: this.behavior.rollover
 							? "old screen\n"
 							: "ready\n",

@@ -6,6 +6,8 @@ import { SdkV3OperationError } from "../gjc/sdk-v3-protocol";
 import { loadAbsoluteGjcSessionFile, validateGjcSessionPathWithinRoot } from "../gjc/session-loader";
 import type { GjcSessionAddress } from "../gjc/turn-runner";
 import type { SessionAttachment } from "./gjc-routing-proof";
+export const DEFAULT_SDK_ENDPOINT_PUBLICATION_TIMEOUT_MS = 10_000;
+export const SDK_ENDPOINT_PUBLICATION_POLL_INTERVAL_MS = 100;
 
 export function requireLifecycleAttachment(
 	result: Awaited<ReturnType<import("../gjc/cli-lifecycle-backend").CliLifecycleBackend["create"]>>,
@@ -26,10 +28,14 @@ export function addressFor(
 		sessionId,
 	};
 }
-export async function waitForSdkEndpoint(cwd: string, sessionId: string): Promise<PublicSdkSessionAttachment> {
-	const endpoint = await discoverPublishedSdkEndpoint(cwd, sessionId);
+export async function waitForSdkEndpoint(
+	cwd: string,
+	sessionId: string,
+	timeoutMs = DEFAULT_SDK_ENDPOINT_PUBLICATION_TIMEOUT_MS,
+): Promise<PublicSdkSessionAttachment> {
+	const endpoint = await discoverPublishedSdkEndpoint(cwd, sessionId, timeoutMs);
 	if (endpoint !== undefined) return endpoint;
-	throw new Error(`GJC public SDK endpoint was not published for session ${sessionId}.`);
+	throw new Error(`GJC public SDK endpoint was not published for session ${sessionId} within ${timeoutMs}ms.`);
 }
 
 export async function readPublishedSdkEndpoint(
@@ -54,13 +60,17 @@ export async function requireCurrentPublishedSdkEndpoint(
 export async function discoverPublishedSdkEndpoint(
 	cwd: string,
 	sessionId: string,
+	timeoutMs = DEFAULT_SDK_ENDPOINT_PUBLICATION_TIMEOUT_MS,
 ): Promise<PublicSdkSessionAttachment | undefined> {
-	const deadline = Date.now() + 10_000;
+	if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0)
+		throw new RangeError("SDK endpoint publication timeout must be a non-negative safe integer");
+	const deadline = Date.now() + timeoutMs;
 	for (;;) {
 		const endpoint = await readPublishedSdkEndpoint(cwd, sessionId);
 		if (endpoint !== undefined) return endpoint;
-		if (Date.now() >= deadline) return undefined;
-		await Bun.sleep(100);
+		const remaining = deadline - Date.now();
+		if (remaining <= 0) return undefined;
+		await Bun.sleep(Math.min(SDK_ENDPOINT_PUBLICATION_POLL_INTERVAL_MS, remaining));
 	}
 }
 

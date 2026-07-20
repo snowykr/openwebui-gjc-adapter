@@ -42,11 +42,11 @@ export function handlePrompt(
 	if (scenario === "turn_complete" || scenario === "resumed_session") {
 		sendEvent(socket, {
 			type: "agent_end",
-			sessionId: "sdk-session-created",
+			sessionId,
 			commandId: "command-wrong",
 			turnId: "turn-wrong",
 		});
-		sendEvent(socket, { type: "agent_end", sessionId: "sdk-session-created", ...correlation });
+		sendEvent(socket, { type: "agent_end", sessionId, ...correlation });
 	}
 	if (scenario === "branch_regenerate") {
 		sendEvent(socket, {

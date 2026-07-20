@@ -6,6 +6,8 @@ import type { PublicSdkSessionAttachment } from "../gjc/public-sdk-contract";
 import { requireLifecycleAttachment, waitForSdkEndpoint } from "./gjc-routing-endpoints";
 import { registerTemporaryModelAttachment } from "./model-reader";
 
+const MODEL_CATALOG_ENDPOINT_PUBLICATION_TIMEOUT_MS = 30_000;
+
 export function createPublicSdkModelAttachmentResolver(input: {
 	readonly cliPath: string;
 	readonly cwd: string;
@@ -20,10 +22,15 @@ export function createPublicSdkModelAttachmentResolver(input: {
 			cliPath: input.cliPath,
 			cwd: input.cwd,
 			childEnvironment: input.childEnvironment,
+			endpointPublicationTimeoutMs: MODEL_CATALOG_ENDPOINT_PUBLICATION_TIMEOUT_MS,
 		});
-		const lifecycle = requireLifecycleAttachment(await backend.create({ sessionRoot }));
+		const lifecycle = requireLifecycleAttachment(await backend.createEphemeral({ sessionRoot }));
 		try {
-			const attachment = await waitForSdkEndpoint(input.cwd, lifecycle.sessionId);
+			const attachment = await waitForSdkEndpoint(
+				input.cwd,
+				lifecycle.sessionId,
+				MODEL_CATALOG_ENDPOINT_PUBLICATION_TIMEOUT_MS,
+			);
 			return registerTemporaryModelAttachment(attachment, async port => {
 				let closePossiblyApplied = false;
 				try {

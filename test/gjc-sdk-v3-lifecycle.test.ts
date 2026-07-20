@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -10,9 +10,41 @@ import {
 	PublicSdkSessionClient,
 	withPublicSdkSessionMutationCoordinator,
 } from "../src/gjc/public-sdk-session-port";
+import { waitForSdkEndpoint } from "../src/live/gjc-routing-endpoints";
 import { createModelReaderFactory } from "../src/live/model-reader";
 
 describe("public SDK lifecycle contract", () => {
+	test("waits through cold model endpoint publication beyond the ordinary routing deadline and remains bounded", async () => {
+		const root = mkdtempSync(join(tmpdir(), "gjc-sdk-endpoint-publication-"));
+		const stateDirectory = join(root, ".gjc", "state", "sdk");
+		const sessionId = "cold-model-session";
+		let now = 0;
+		let publish = true;
+		const dateNow = spyOn(Date, "now").mockImplementation(() => now);
+		const sleep = spyOn(Bun, "sleep").mockImplementation(async milliseconds => {
+			now += Number(milliseconds);
+			if (publish && now > 10_000) {
+				mkdirSync(stateDirectory, { recursive: true });
+				writeFileSync(
+					join(stateDirectory, `${sessionId}.json`),
+					JSON.stringify({ sessionId, url: "ws://127.0.0.1:1234", token: "cold-model-token" }),
+				);
+				publish = false;
+			}
+		});
+		try {
+			const attachment = await waitForSdkEndpoint(root, sessionId, 30_000);
+			expect(attachment.endpoint.token).toBe("cold-model-token");
+			expect(now).toBe(10_100);
+
+			await expect(waitForSdkEndpoint(root, "missing-model-session", 30_000)).rejects.toThrow("within 30000ms");
+			expect(now).toBe(40_100);
+		} finally {
+			sleep.mockRestore();
+			dateNow.mockRestore();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
 	test("transport stop detaches without issuing remote session.close", async () => {
 		const calls: string[] = [];
 		const port = {

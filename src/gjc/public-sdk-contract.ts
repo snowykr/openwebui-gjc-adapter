@@ -59,6 +59,15 @@ export interface PublicSdkSessionState {
 
 /** Reentrant lease token for mutations of one durable session descriptor. */
 export type PublicSdkSessionCoordinatorOwner = object;
+/** A close failure that the public SDK port proved happened before it received or could apply an acknowledgement. */
+export class PublicSdkClosePreAcknowledgementError extends Error {
+	readonly acknowledged = false;
+
+	constructor(message: string, options?: ErrorOptions) {
+		super(message, options);
+		this.name = "PublicSdkClosePreAcknowledgementError";
+	}
+}
 export interface PublicSdkSessionPort {
 	attach(
 		attachment: PublicSdkSessionAttachment,

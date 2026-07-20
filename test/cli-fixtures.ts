@@ -24,14 +24,23 @@ export async function reserveTcpPort(): Promise<number> {
 }
 
 export async function waitForStartedServer(proc: Bun.Subprocess, url: string): Promise<Response> {
-	const response = waitForHttpResponse(url);
+	const abort = new AbortController();
+	const stdout = observeSubprocessOutput(proc.stdout);
+	const response = waitForHttpResponse(url, abort.signal);
+	const ready = stdout.ready.then(() => fetch(url, { signal: abort.signal }));
 	const exited = proc.exited.then(async code => {
-		const stdout = await readSubprocessOutput(proc.stdout);
-		const stderr = await readSubprocessOutput(proc.stderr);
-		throw new Error(`start command exited with ${code}\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+		const [capturedStdout, stderr] = await Promise.all([stdout.complete, readSubprocessOutput(proc.stderr)]);
+		throw new Error(`start command exited with ${code}\nstdout:\n${capturedStdout}\nstderr:\n${stderr}`);
 	});
 	exited.catch(() => undefined);
-	return await Promise.race([response, exited]);
+	try {
+		return await Promise.race([ready, response, exited]);
+	} catch (error) {
+		if (proc.exitCode === null) await stopProcess(proc);
+		throw error;
+	} finally {
+		abort.abort();
+	}
 }
 
 export const SERVER_START_DEADLINE_MS = 5_000;
@@ -157,13 +166,14 @@ export function chatRequest(
 	});
 }
 
-async function waitForHttpResponse(url: string): Promise<Response> {
+async function waitForHttpResponse(url: string, signal: AbortSignal): Promise<Response> {
 	const startedAt = Date.now();
 	let lastError: Error | null = null;
 	while (Date.now() - startedAt < SERVER_START_DEADLINE_MS) {
 		try {
-			return await fetch(url);
+			return await fetch(url, { signal });
 		} catch (error) {
+			if (signal.aborted) throw error;
 			if (error instanceof Error) {
 				lastError = error;
 			} else {
@@ -175,6 +185,40 @@ async function waitForHttpResponse(url: string): Promise<Response> {
 	throw lastError ?? new Error(`Timed out waiting for ${url}`);
 }
 
+function observeSubprocessOutput(output: Bun.Subprocess["stdout"]): {
+	readonly ready: Promise<void>;
+	readonly complete: Promise<string>;
+} {
+	if (!(output instanceof ReadableStream)) {
+		const unavailable = Promise.reject(new Error("start command stdout is unavailable"));
+		unavailable.catch(() => undefined);
+		return { ready: unavailable, complete: Promise.resolve("") };
+	}
+	const reader = output.getReader();
+	const decoder = new TextDecoder();
+	let captured = "";
+	let resolveReady: () => void;
+	const ready = new Promise<void>(resolve => {
+		resolveReady = resolve;
+	});
+	const complete = (async () => {
+		try {
+			for (;;) {
+				const chunk = await reader.read();
+				if (chunk.done) break;
+				captured += decoder.decode(chunk.value, { stream: true });
+				if (/openwebui-gjc-adapter listening on \S+/.test(captured)) resolveReady!();
+			}
+			captured += decoder.decode();
+			if (/openwebui-gjc-adapter listening on \S+/.test(captured)) resolveReady!();
+			return captured;
+		} finally {
+			reader.releaseLock();
+		}
+	})();
+	ready.catch(() => undefined);
+	return { ready, complete };
+}
 async function readSubprocessOutput(output: Bun.Subprocess["stdout"]): Promise<string> {
 	if (output instanceof ReadableStream) return await new Response(output).text();
 	return "";

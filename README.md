@@ -38,7 +38,7 @@ Add the required custom headers on the OpenAI connection:
 }
 ```
 
-Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. The adapter and managed image use the published `@gajae-code/coding-agent` and `@gajae-code/natives` `0.11.2` pair. The image runs the published `gjc` executable as the non-root `adapter` user, including `tmux`; it does not build a private broker or apply an upstream source patch. Background task calls such as title generation are no-ops and must not create GJC sessions.
+Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. The adapter and managed image use the published `@gajae-code/coding-agent` and `@gajae-code/natives` `0.11.4` pair. The image runs the published `gjc` executable as the non-root `adapter` user, including `tmux`; it does not build a private broker or apply an upstream source patch. Background task calls such as title generation are no-ops and must not create GJC sessions.
 
 ## CLI first-install configuration
 
@@ -99,18 +99,18 @@ Project folders are not advertised as models; the adapter resolves the GJC worki
 
 The project guard protects exactly four resolved GJC paths: `configDomain`, `agentDir`, `readerWorkspace`, and `readerSessionRoot`. A project `cwd` or explicit `sessionRoot` is rejected when it is equal to, an ancestor of, or a descendant of any one of them. The guard does not cover adapter state, mappings, session stores, or SQLite.
 
-Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. The adapter uses only the released public SDK session surface after lifecycle acknowledgement. Background task calls such as title generation are no-ops and must not create GJC sessions.
+Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. The adapter uses the released public SDK only for supported session attachment and actions. Background task calls such as title generation are no-ops and must not create GJC sessions.
 
 ### GJC routing matrix
 
 | Operation | Primary route | Fallback and ownership |
 | --- | --- | --- |
-| Session lifecycle, turns, model selection, gates, and events | Released public GJC SDK | No fallback. Missing, malformed, or ambiguous SDK authority fails closed. |
-| CLI lifecycle | Published `gjc` CLI | Only create, cold JSONL resume, readiness, and cleanup of an exactly proven owned pane before SDK lifecycle acknowledgement. After a possibly-applied close acknowledgement, it may send `/exit` only to the exact receipt-owned tmux pane; it never supplies turns, models, events, gates, or an endpoint. |
+| Session attachment, turns, model selection, gates, and events | Released public GJC SDK | No fallback. Missing, malformed, or ambiguous SDK authority fails closed. |
+| CLI lifecycle | Published `gjc` CLI | Only create, cold JSONL resume, readiness, and close of an exactly proven owned pane. It never supplies turns, models, events, gates, or an endpoint. |
 | Transport detach | Local transport only | Detach is not `session.close` and never terminates a remote session. |
-| Public `session.close` | Released public SDK, then receipt-owned CLI/tmux `/exit` | SDK close is logical acknowledgement, not lifecycle termination. For an acknowledged close, the adapter sends `/exit` to the exact receipt-owned pane and then requires both endpoint disappearance and absence of the original pane PID. It sends no kill or other destructive fallback after a possibly-applied acknowledgement. |
+| Session close | Published `gjc` CLI `/exit` | For an exact persisted descriptor plus receipt-owned tmux pane/PID/tag, the adapter sends `/exit` first and requires endpoint disappearance and absence of the original pane PID. It never invokes released public `session.close` to terminate an owned CLI lifecycle. Missing pane proof fails closed without a kill or fallback. |
 | Regenerate/branch | Persisted owner, project, session, and message lineage | Any missing, conflicting, or ambiguous authority fails closed; the adapter does not fork or replay the operation. |
-The same two-phase owned close applies to admin close and adapter-created temporary catalog sessions. A destructive kill fallback is permitted only before an acknowledgement may have been applied, and only for an exactly proven owned pane.
+The same exact-proof close applies to admin close and adapter-created temporary catalog sessions. Logical SDK attachment eviction occurs only after physical close proof; there is no destructive fallback after `/exit`.
 
 The adapter does not use private daemon, global broker, private protocol, or GJC database interfaces.
 

@@ -213,11 +213,14 @@ describe("CLI module boundaries", () => {
 		const cliSource = readFileSync(join(ROOT, "src", "cli.ts"), "utf8");
 		const baseSource = readFileSync(join(ROOT, "src", CLI_MODULES[0]), "utf8");
 		const installedSource = readFileSync(join(ROOT, "src", CLI_MODULES[1]), "utf8");
-		const serverSource = readFileSync(join(ROOT, "src", "server.ts"), "utf8");
+		const serverSource = readFileSync(join(ROOT, "src", "server-bootstrap.ts"), "utf8");
 		const runtimeSingletonLockSource = readFileSync(join(ROOT, "src", "runtime-singleton-lock.ts"), "utf8");
 		const runnerSource = readFileSync(join(ROOT, "src/live/gjc-routing-runner.ts"), "utf8");
 		const publicSdkRunnerSource = readFileSync(join(ROOT, "src/live/gjc-public-sdk-runner.ts"), "utf8");
-		const publicSdkSessionOpsSource = readFileSync(join(ROOT, "src/live/gjc-public-sdk-session-ops.ts"), "utf8");
+		const publicSdkSessionAttachmentSource = readFileSync(
+			join(ROOT, "src/live/gjc-public-sdk-session-attachment.ts"),
+			"utf8",
+		);
 		const deploymentSource = readFileSync(join(ROOT, "src/configure/deployment-artifacts.ts"), "utf8");
 		const cliImports = relativeImports(cliSource);
 		const baseImports = relativeImports(baseSource);
@@ -253,8 +256,8 @@ describe("CLI module boundaries", () => {
 				baseSource.includes("createPublicSdkGjcTurnRunner({") &&
 				runnerSource.includes('from "./gjc-public-sdk-runner"') &&
 				publicSdkRunnerSource.includes('from "./gjc-public-sdk-session-ops"') &&
-				publicSdkSessionOpsSource.includes("new CliLifecycleBackend(") &&
-				publicSdkSessionOpsSource.includes("new PublicSdkSessionClient()"),
+				publicSdkSessionAttachmentSource.includes("new CliLifecycleBackend(") &&
+				publicSdkSessionAttachmentSource.includes("new PublicSdkSessionClient()"),
 			resolvedDeploymentChain:
 				deploymentSource.includes("renderResolvedManagedCompose({") &&
 				deploymentSource.includes("renderResolvedSystemdComposeUnit({") &&

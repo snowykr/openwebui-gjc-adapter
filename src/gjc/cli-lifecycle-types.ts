@@ -31,6 +31,7 @@ export interface CliLifecycleBackendOptions {
 	readonly isProcessAlive?: (pid: number) => boolean | Promise<boolean>;
 	readonly cliArgs?: readonly string[];
 	readonly captureLines?: number;
+	readonly endpointPublicationTimeoutMs?: number;
 }
 
 export function unavailable(error: unknown, fallback: string): CliLifecycleResult<never> {

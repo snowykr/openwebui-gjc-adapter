@@ -21,11 +21,12 @@ export async function readSessionState(
 	attachment: PublicSdkSessionAttachment,
 	timeoutMs?: number,
 ): Promise<PublicSdkSessionState> {
-	const [metadata, config] = await Promise.all([
+	const [metadata, config, currentModels] = await Promise.all([
 		queryOne(client, "session.metadata", timeoutMs),
 		queryOne(client, "config.list/get", timeoutMs),
+		client.queryAll("models.list/current", {}, timeoutMs),
 	]);
-	return parseState(metadata, config, attachment);
+	return parseState(metadata, config, currentModels, attachment);
 }
 
 export async function readAvailableModels(client: SdkV3Client, timeoutMs?: number): Promise<readonly unknown[]> {

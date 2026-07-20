@@ -1,8 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, statSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createPublicSdkDeadline } from "../src/gjc/public-sdk-deadline";
 import {
 	attachmentFromPublishedSdkEndpoint,
 	PublicSdkSessionClient,
@@ -150,6 +151,35 @@ describe("published SDK endpoint attachment", () => {
 			).toThrow();
 		} finally {
 			rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+describe("SDK transaction deadlines", () => {
+	test("uses one fake-clock budget across baseline, control, terminal, and proof phases", () => {
+		let now = 1_000;
+		const nowSpy = spyOn(Date, "now").mockImplementation(() => now);
+		try {
+			const deadline = createPublicSdkDeadline(100, "turn.prompt timed out after 100ms");
+			expect(deadline.remaining()).toBe(100);
+			now += 25; // baseline
+			expect(deadline.remaining()).toBe(75);
+			now += 35; // control
+			expect(deadline.remaining()).toBe(40);
+			now += 30; // terminal
+			expect(deadline.remaining()).toBe(10);
+		} finally {
+			nowSpy.mockRestore();
+		}
+	});
+	test("fails before a late fallback/proof phase receives a renewed timeout", () => {
+		let now = 1_000;
+		const nowSpy = spyOn(Date, "now").mockImplementation(() => now);
+		try {
+			const deadline = createPublicSdkDeadline(100, "turn.prompt timed out after 100ms");
+			now += 100; // baseline, control, and terminal consumed the entire transaction
+			expect(() => deadline.remaining()).toThrow("turn.prompt timed out after 100ms");
+		} finally {
+			nowSpy.mockRestore();
 		}
 	});
 });

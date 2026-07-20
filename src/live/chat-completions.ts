@@ -16,7 +16,7 @@ import { buildCompletion, buildOpenAIErrorResponse } from "./chat-response-forma
 import { appendResolvedFileContexts } from "./file-contexts";
 import { ModelSelectionError, modelSelectionError } from "./model-selection-errors";
 import { createModelSelectionPolicy } from "./model-selection-policy";
-import { classifyGjcModelId, formatCanonicalModelId } from "./models";
+import { classifyGjcModelId, formatCanonicalModelId, normalizeOpenWebUIModelId } from "./models";
 import { resolveLiveProjectContext } from "./project-context";
 
 export type {
@@ -52,7 +52,8 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 
 	const created = Math.floor((input.now ?? new Date()).getTime() / 1000);
 	const id = input.idFactory?.() ?? `chatcmpl-${created}`;
-	const classifiedModel = classifyGjcModelId(input.request.model);
+	const requestedModelId = normalizeOpenWebUIModelId(input.request.model);
+	const classifiedModel = classifyGjcModelId(requestedModelId);
 	if (classifiedModel.kind === "malformed")
 		return selectionErrorResult(modelSelectionError("model_selection_invalid_id"));
 	if (classifiedModel.kind === "foreign")
@@ -67,7 +68,7 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 						: "model_selection_default_read_failed",
 				);
 			}
-			const selection = await createModelSelectionPolicy(input.modelReaderFactory).resolve(input.request.model);
+			const selection = await createModelSelectionPolicy(input.modelReaderFactory).resolve(requestedModelId);
 			const model = formatCanonicalModelId(selection);
 			return {
 				ok: true,
@@ -107,7 +108,7 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 	const projects = input.projectProvider === undefined ? input.projects : await input.projectProvider();
 	const projectContext = await resolveLiveProjectContext({
 		projects,
-		modelId: input.request.model,
+		modelId: requestedModelId,
 		ownerUserId: input.owner.ownerUserId,
 		chatId: headers.chatId,
 		repository: input.projectContextRepository,
@@ -148,7 +149,7 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 			userMessageId: headers.userMessageId,
 			userMessageParentId: headers.userMessageParentId,
 			continued: headers.userMessageParentId !== null,
-			requestedModelId: input.request.model,
+			requestedModelId,
 			ownerUserId: input.owner.ownerUserId,
 			...(input.request.metadata === undefined ? {} : { messageMetadata: input.request.metadata }),
 			...(controlFromMetadata(input.request.metadata) === undefined

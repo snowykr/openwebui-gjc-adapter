@@ -1,4 +1,5 @@
 import type { PublicSdkGate, PublicSdkSessionAttachment, PublicSdkTurnOutcome } from "./public-sdk-contract";
+import { createPublicSdkDeadline } from "./public-sdk-deadline";
 import type { SdkV3Client } from "./sdk-v3-client";
 import {
 	parseLastAssistant,
@@ -24,12 +25,15 @@ export async function runTurn(
 	timeoutMs: number,
 ): Promise<PublicSdkTurnOutcome> {
 	const { attachment, client } = context;
+	const deadline = createPublicSdkDeadline(timeoutMs, `${operation} timed out after ${timeoutMs}ms`);
 	const window = new SdkTerminalWindow(client, attachment.sessionId);
 	try {
-		await window.captureGateBaseline(timeoutMs);
+		await window.captureGateBaseline(deadline.remaining());
 		window.beginMutation();
 		const accepted = parseRecord(
-			await context.authority(timeoutMs, () => context.mutate(operation, input, key, timeoutMs)),
+			await context.authority(deadline.remaining(), () =>
+				context.mutate(operation, input, key, deadline.remaining()),
+			),
 			`${operation} result`,
 		);
 		const correlation = {
@@ -38,8 +42,8 @@ export async function runTurn(
 			turnId: requiredString(accepted, "turnId", `${operation} result`),
 		};
 		window.accept(correlation);
-		const value = await addAssistantFallback(context, window.wait(correlation, timeoutMs), timeoutMs);
-		await context.authority(timeoutMs, async () => undefined);
+		const value = await addAssistantFallback(context, window.wait(correlation, deadline.remaining()), deadline);
+		await context.authority(deadline.remaining(), async () => undefined);
 		return value;
 	} finally {
 		window.close();
@@ -57,21 +61,22 @@ export async function runGateTurn(
 	if (gate.correlation.sessionId !== attachment.sessionId) {
 		throw new SdkV3OperationError("endpoint_stale", "Workflow gate belongs to another session");
 	}
+	const deadline = createPublicSdkDeadline(timeoutMs, `workflow.gate_answer timed out after ${timeoutMs}ms`);
 	const window = new SdkTerminalWindow(client, attachment.sessionId);
 	try {
-		await window.captureGateBaseline(timeoutMs);
+		await window.captureGateBaseline(deadline.remaining());
 		window.beginMutation();
-		await context.authority(timeoutMs, () =>
+		await context.authority(deadline.remaining(), () =>
 			context.mutate(
 				"workflow.gate_answer",
 				{ id: gate.gateId, response: answer, expectedSessionId: attachment.sessionId },
 				key,
-				timeoutMs,
+				deadline.remaining(),
 			),
 		);
 		window.accept(gate.correlation);
-		const value = await addAssistantFallback(context, window.wait(gate.correlation, timeoutMs), timeoutMs);
-		await context.authority(timeoutMs, async () => undefined);
+		const value = await addAssistantFallback(context, window.wait(gate.correlation, deadline.remaining()), deadline);
+		await context.authority(deadline.remaining(), async () => undefined);
 		return value;
 	} finally {
 		window.close();
@@ -136,10 +141,10 @@ export function waitForReply(
 async function addAssistantFallback(
 	context: PublicSdkTurnContext,
 	outcome: Promise<PublicSdkTurnOutcome>,
-	timeoutMs: number,
+	deadline: ReturnType<typeof createPublicSdkDeadline>,
 ): Promise<PublicSdkTurnOutcome> {
 	const value = await outcome;
 	if (value.finalizedAssistantText !== undefined) return value;
-	const text = parseLastAssistant(await context.client.queryAll("session.last_assistant", {}, timeoutMs));
+	const text = parseLastAssistant(await context.client.queryAll("session.last_assistant", {}, deadline.remaining()));
 	return text === null ? value : { ...value, finalizedAssistantText: text };
 }

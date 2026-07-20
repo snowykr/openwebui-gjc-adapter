@@ -27,7 +27,6 @@ export class RealSelectionCoordinator {
 	#failNextPrompt = false;
 	#failNextState = false;
 	#malformedCatalogOnce = false;
-	#unusableStateOnce = false;
 	#gateNextPrompt = false;
 	#assistantText = "selection fixture assistant";
 	#promptCount = 0;
@@ -71,10 +70,6 @@ export class RealSelectionCoordinator {
 
 	malformNextCatalog(): void {
 		this.#malformedCatalogOnce = true;
-	}
-
-	useUnusableStateOnce(): void {
-		this.#unusableStateOnce = true;
 	}
 
 	emitGateOnNextPrompt(): void {
@@ -140,10 +135,6 @@ export class RealSelectionCoordinator {
 			if (this.#failNextState) {
 				this.#failNextState = false;
 				return Response.json({ error: "private state failure" }, { status: 503 });
-			}
-			if (this.#unusableStateOnce) {
-				this.#unusableStateOnce = false;
-				return Response.json({ provider: "missing", modelId: "missing", thinkingLevel: "off" });
 			}
 			return Response.json(this.#selection);
 		}
