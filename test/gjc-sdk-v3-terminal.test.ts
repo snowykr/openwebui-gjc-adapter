@@ -318,9 +318,19 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 				payload: {
 					type: "turn_stream",
 					sessionId: correlation.sessionId,
+					phase: "live",
+					messageRef: "message-0116",
+				},
+			});
+			emit({
+				type: "turn_stream",
+				payload: {
+					type: "turn_stream",
+					sessionId: correlation.sessionId,
 					phase: "finalized",
 					text: "exact finalized text",
 					finalAnswer: true,
+					messageRef: "message-0116",
 				},
 			});
 			for (const assistantMessageEvent of [
@@ -350,6 +360,7 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 			expect(outcome.finalizedAssistantText).toBe("exact finalized text");
 			expect(outcome.events.map(event => event.type)).toEqual([
 				"turn_stream",
+				"turn_stream",
 				"message_update",
 				"message_update",
 				"message_update",
@@ -361,6 +372,30 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 				expect.objectContaining({ assistantMessageEvent: { type: "tool_call", name: "read" } }),
 			]);
 			expect(result.events.some(event => event.type === "event")).toBeFalse();
+		} finally {
+			terminal.close();
+		}
+	});
+	test("Given reference-less session streams from different turns When the current turn ends Then stale final text is rejected", async () => {
+		const { terminal, emit } = await terminalFixture();
+		try {
+			const pending = terminal.wait(correlation, 500);
+			emit({ type: "turn_stream", sessionId: correlation.sessionId, phase: "live" });
+			emit({
+				type: "turn_stream",
+				sessionId: correlation.sessionId,
+				phase: "finalized",
+				finalAnswer: true,
+				text: "stale assistant text",
+			});
+			emit({
+				type: "message_update",
+				...correlation,
+				assistantMessageEvent: { type: "text_delta", text: "current activity" },
+			});
+			emit({ type: "agent_end", ...correlation });
+
+			expect((await pending).finalizedAssistantText).toBeUndefined();
 		} finally {
 			terminal.close();
 		}

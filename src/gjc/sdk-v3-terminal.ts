@@ -165,12 +165,6 @@ export class SdkTerminalWindow {
 
 	private finalizedText(correlation: SdkTurnCorrelation): string | undefined {
 		const events = this.postAcceptEvents();
-		const hasCorrelatedActivity = events.some(
-			frame =>
-				(frame.type === "message_update" || frame.type === "message_end") &&
-				frame.commandId === correlation.commandId &&
-				frame.turnId === correlation.turnId,
-		);
 		for (let index = events.length - 1; index >= 0; index -= 1) {
 			const frame = events[index]!;
 			const hasMatchingLiveStream = events
@@ -180,13 +174,14 @@ export class SdkTerminalWindow {
 						previous.type === "turn_stream" &&
 						previous.phase === "live" &&
 						previous.sessionId === correlation.sessionId &&
+						typeof frame.messageRef === "string" &&
+						frame.messageRef.length > 0 &&
 						previous.messageRef === frame.messageRef,
 				);
 			if (
 				frame.type === "turn_stream" &&
 				(matchesTurnStream(frame, correlation) ||
-					((hasCorrelatedActivity || hasMatchingLiveStream) &&
-						matchesSessionOnlyTurnStream(frame, correlation))) &&
+					(hasMatchingLiveStream && matchesSessionOnlyTurnStream(frame, correlation))) &&
 				frame.phase === "finalized" &&
 				frame.finalAnswer === true &&
 				typeof frame.text === "string"
