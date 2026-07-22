@@ -204,6 +204,7 @@ async function withSessionArtifactEvents(
 	sessionFile: string | undefined,
 	promptText: string,
 ): Promise<import("../gjc/public-sdk-contract").PublicSdkTurnOutcome> {
+	if (hasNativeLifecycleEvents(outcome)) return outcome;
 	const artifactEvents = await projectSessionArtifactEvents(sessionFile, promptText);
 	if (artifactEvents.length === 0) return outcome;
 	return mergeSessionArtifactEvents(outcome, artifactEvents);
@@ -213,6 +214,7 @@ export function mergeSessionArtifactEvents(
 	outcome: import("../gjc/public-sdk-contract").PublicSdkTurnOutcome,
 	artifactEvents: readonly { readonly type: string; readonly payload?: Readonly<Record<string, unknown>> }[],
 ): import("../gjc/public-sdk-contract").PublicSdkTurnOutcome {
+	if (hasNativeLifecycleEvents(outcome)) return outcome;
 	const projected = artifactEvents.map(event => ({
 		type: event.type,
 		...(event.payload === undefined ? {} : event.payload),
@@ -225,6 +227,13 @@ export function mergeSessionArtifactEvents(
 		...outcome,
 		events: [...outcome.events.slice(0, insertionIndex), ...projected, ...outcome.events.slice(insertionIndex)],
 	};
+}
+function hasNativeLifecycleEvents(outcome: import("../gjc/public-sdk-contract").PublicSdkTurnOutcome): boolean {
+	return outcome.events.some(event =>
+		["message_update", "tool_execution_start", "tool_execution_update", "tool_execution_end"].includes(
+			String(event.type),
+		),
+	);
 }
 function requireExactProvisionalProof(proof: import("../gjc/session-authority").SessionAttachmentProof): void {
 	if (

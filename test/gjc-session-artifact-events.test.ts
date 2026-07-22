@@ -79,6 +79,25 @@ describe("GJC session artifact event projection", () => {
 			"agent_end",
 		]);
 	});
+	test("keeps native lifecycle events without appending artifact duplicates", () => {
+		const outcome = {
+			events: [
+				{
+					type: "message_update",
+					assistantMessageEvent: { type: "thinking", text: "native summary" },
+				},
+				{ type: "tool_execution_start", toolName: "read" },
+				{ type: "agent_end" },
+			],
+		};
+
+		expect(
+			mergeSessionArtifactEvents(outcome, [
+				{ type: "message_update", payload: { assistantMessageEvent: { type: "thinking_end" } } },
+				{ type: "tool_execution_start", payload: { toolName: "read" } },
+			]),
+		).toBe(outcome);
+	});
 	test("fails closed for malformed, unknown, and oversized artifacts", async () => {
 		const fixture = await artifact([
 			user(prompt),
