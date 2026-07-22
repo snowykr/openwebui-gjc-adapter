@@ -182,7 +182,13 @@ export function createGjcRoutingLiveGatewayRunner(
 					const assistantType =
 						assistant !== undefined && typeof assistant.type === "string" ? assistant.type : undefined;
 					if (event.type === "message_update" && assistantType === "text_delta") {
-						if (typeof assistant?.delta === "string") await queue.push(assistant.delta);
+						const delta =
+							typeof assistant?.delta === "string"
+								? assistant.delta
+								: typeof assistant?.text === "string"
+									? assistant.text
+									: undefined;
+						if (delta !== undefined) await queue.push(delta);
 						return;
 					}
 					const projected = projectTurnEvents(

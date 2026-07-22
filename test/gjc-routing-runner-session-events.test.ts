@@ -156,52 +156,55 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 			);
 		}
 	});
-	test("streams native text deltas before terminal persistence completes", async () => {
-		const turnRunner = new FakeGjcTurnRunner();
-		let release!: () => void;
-		turnRunner.completionBarrier = new Promise<void>(resolve => {
-			release = resolve;
-		});
-		turnRunner.events = [
-			{
-				type: "message_update",
-				payload: { assistantMessageEvent: { type: "text_delta", delta: "new:" } },
-			},
-		];
-		const runner = createGjcRoutingLiveGatewayRunner({
-			turnRunner,
-			mappings: new SessionMappingStore(),
-			modelReaderFactory: staticModelReaderFactory(),
-		});
+	test.each(["delta", "text"] as const)(
+		"streams native text deltas from %s before terminal persistence completes",
+		async field => {
+			const turnRunner = new FakeGjcTurnRunner();
+			let release!: () => void;
+			turnRunner.completionBarrier = new Promise<void>(resolve => {
+				release = resolve;
+			});
+			turnRunner.events = [
+				{
+					type: "message_update",
+					payload: { assistantMessageEvent: { type: "text_delta", [field]: "new:" } },
+				},
+			];
+			const runner = createGjcRoutingLiveGatewayRunner({
+				turnRunner,
+				mappings: new SessionMappingStore(),
+				modelReaderFactory: staticModelReaderFactory(),
+			});
 
-		const result = await runner.run({
-			project,
-			prompt: "hello",
-			chatId: "chat-stream",
-			messageId: "assistant-stream",
-			userMessageId: "user-stream",
-			userMessageParentId: null,
-			continued: false,
-			requestedModelId: "gjc",
-			onLiveEvents: () => undefined,
-		});
-		if (result.chunks === undefined) throw new Error("expected live chunks");
-		if (!(Symbol.asyncIterator in result.chunks)) throw new Error("expected async live chunks");
-		const iterator = result.chunks[Symbol.asyncIterator]();
+			const result = await runner.run({
+				project,
+				prompt: "hello",
+				chatId: "chat-stream",
+				messageId: "assistant-stream",
+				userMessageId: "user-stream",
+				userMessageParentId: null,
+				continued: false,
+				requestedModelId: "gjc",
+				onLiveEvents: () => undefined,
+			});
+			if (result.chunks === undefined) throw new Error("expected live chunks");
+			if (!(Symbol.asyncIterator in result.chunks)) throw new Error("expected async live chunks");
+			const iterator = result.chunks[Symbol.asyncIterator]();
 
-		expect(await iterator.next()).toEqual({ value: "new:", done: false });
-		let secondSettled = false;
-		const second = iterator.next().then(value => {
-			secondSettled = true;
-			return value;
-		});
-		await Promise.resolve();
-		expect(secondSettled).toBeFalse();
+			expect(await iterator.next()).toEqual({ value: "new:", done: false });
+			let secondSettled = false;
+			const second = iterator.next().then(value => {
+				secondSettled = true;
+				return value;
+			});
+			await Promise.resolve();
+			expect(secondSettled).toBeFalse();
 
-		release();
-		expect(await second).toEqual({ value: "hello", done: false });
-		expect(await iterator.next()).toEqual({ value: undefined, done: true });
-	});
+			release();
+			expect(await second).toEqual({ value: "hello", done: false });
+			expect(await iterator.next()).toEqual({ value: undefined, done: true });
+		},
+	);
 });
 
 function status(description: string, done?: boolean, frameKind?: string) {
