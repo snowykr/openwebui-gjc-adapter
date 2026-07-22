@@ -15,6 +15,11 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 				type: "message_update",
 				payload: { assistantMessageEvent: { type: "thinking_end", text: secret, nested: { secret } } },
 			},
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "thinking", text: secret } } },
+			{
+				type: "message_update",
+				payload: { assistantMessageEvent: { type: "tool_call", name: "read", args: { secret } } },
+			},
 			{
 				type: "tool_execution_start",
 				text: secret,
@@ -67,6 +72,8 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 			status("Thinking started", false, "skill_progress"),
 			status("Thinking in progress", false, "skill_progress"),
 			status("Thinking completed", true, "skill_progress"),
+			status("Thinking completed", true, "skill_progress"),
+			status("Tool read started", false, "tool_progress"),
 			status("MCP tool mcp__filesystem__read_file started", false, "mcp_progress"),
 			status("Tool updated", false, "tool_progress"),
 			status("Tool read_file finished", true, "tool_progress"),

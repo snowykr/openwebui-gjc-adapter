@@ -54,13 +54,23 @@ function thinkingFrame(event: GjcTurnEvent): ProjectableAgentFrame | undefined {
 			return skillFrame("Thinking in progress", "progress");
 		case "thinking_end":
 			return skillFrame("Thinking completed", "end");
+		case "thinking":
+			return skillFrame("Thinking completed", "end");
+		case "tool_call":
+			return toolFrameForName(
+				safeToolNameValue(assistant === undefined ? undefined : textField(assistant, "name")),
+				"start",
+			);
 		default:
 			return undefined;
 	}
 }
 
 function toolFrame(event: GjcTurnEvent, phase: "start" | "progress" | "end"): ProjectableAgentFrame {
-	const toolName = safeToolName(event);
+	return toolFrameForName(safeToolName(event), phase);
+}
+
+function toolFrameForName(toolName: string | undefined, phase: "start" | "progress" | "end"): ProjectableAgentFrame {
 	const isMcpTool = toolName?.startsWith("mcp__") ?? false;
 	const verb = phase === "start" ? "started" : phase === "end" ? "finished" : "updated";
 	return {
@@ -82,7 +92,10 @@ function subagentFrame(label: string): ProjectableAgentFrame {
 }
 
 function safeToolName(event: GjcTurnEvent): string | undefined {
-	const toolName = textPayload(event, "toolName");
+	return safeToolNameValue(textPayload(event, "toolName"));
+}
+
+function safeToolNameValue(toolName: string | undefined): string | undefined {
 	if (toolName === undefined || toolName.length === 0 || toolName.length > 64) return undefined;
 	return /^[a-z0-9][a-z0-9_.-]*$/iu.test(toolName) ? toolName : undefined;
 }
