@@ -21,7 +21,6 @@ export class SdkTerminalWindow {
 	readonly #unsubscribe: () => void;
 	readonly #observer?: PublicSdkTurnEventObserver;
 	#observerChain = Promise.resolve();
-	#observerError: unknown;
 	#acceptedCorrelation: SdkTurnCorrelation | undefined;
 	readonly #waiters = new Set<() => void>();
 	#gateBaseline: ReadonlySet<string> | undefined;
@@ -73,13 +72,7 @@ export class SdkTerminalWindow {
 		if (this.#acceptedCorrelation === undefined || this.#observer === undefined) return;
 		const event = normalizeEvent(frame);
 		if (event === undefined || !matchesObserved(event, this.#acceptedCorrelation)) return;
-		this.#observerChain = this.#observerChain
-			.then(() => this.#observer!(event))
-			.catch(error => {
-				this.#observerError ??= error;
-				for (const wake of this.#waiters) wake();
-				this.#waiters.clear();
-			});
+		this.#observerChain = this.#observerChain.then(() => this.#observer!(event)).catch(() => undefined);
 	}
 	private async flushObserver(): Promise<void> {
 		for (;;) {
@@ -87,7 +80,6 @@ export class SdkTerminalWindow {
 			await chain;
 			if (chain === this.#observerChain) break;
 		}
-		if (this.#observerError !== undefined) throw this.#observerError;
 	}
 
 	async wait(

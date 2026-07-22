@@ -64,6 +64,7 @@ export interface GjcSessionStateInput extends GjcSessionAddress, GjcLifecycleSco
 export interface GjcRespondWorkflowGateInput extends GjcSessionAddress, GjcLifecycleScoped {
 	readonly gateId: string;
 	readonly answer: WorkflowGateAnswer;
+	readonly promptText: string;
 	readonly idempotencyKey?: string;
 	readonly userMessageId: string;
 	readonly parentId?: string;

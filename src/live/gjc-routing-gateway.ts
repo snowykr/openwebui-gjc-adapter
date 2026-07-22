@@ -105,6 +105,8 @@ export function createGjcRoutingLiveGatewayRunner(
 				} else {
 					const queue = new LiveChunkQueue();
 					let activityStarted = false;
+					let observedNativeLifecycle = false;
+					const terminalEvents: ReturnType<typeof projectTurnEvents>[number][] = [];
 					let resolveActivity!: () => void;
 					let rejectActivity!: (error: unknown) => void;
 					const firstActivity = new Promise<void>((resolve, reject) => {
@@ -117,6 +119,7 @@ export function createGjcRoutingLiveGatewayRunner(
 						resolveActivity();
 					};
 					const observer = async (event: import("../gjc/turn-runner").GjcTurnEvent) => {
+						if (isNativeLifecycleEvent(event.type)) observedNativeLifecycle = true;
 						if (event.type !== "agent_failed") markActivityStarted();
 						const payload = isRecord(event.payload) ? event.payload : undefined;
 						const assistant =
@@ -137,7 +140,11 @@ export function createGjcRoutingLiveGatewayRunner(
 							[event],
 							boundSelection === undefined ? undefined : formatCanonicalModelId(boundSelection),
 						);
-						if (projected.length > 0) await turn.onLiveEvents?.(projected);
+						if (isTerminalEvent(event.type)) {
+							terminalEvents.push(...projected);
+							return;
+						}
+						if (projected.length > 0) await deliverLiveEvents(turn, projected);
 					};
 					void input.turnRunner
 						.withLifecyclePublication(gateAddress, lifecycle =>
@@ -146,6 +153,8 @@ export function createGjcRoutingLiveGatewayRunner(
 						.then(async result => {
 							markActivityStarted();
 							if (result === null) throw new Error("Pending workflow gate disappeared before its reply.");
+							const completionEvents = observedNativeLifecycle ? terminalEvents : (result.events ?? []);
+							if (completionEvents.length > 0) await deliverLiveEvents(turn, completionEvents);
 							await queue.finish(result.content ?? "");
 						})
 						.catch(error => {
@@ -254,7 +263,7 @@ export function createGjcRoutingLiveGatewayRunner(
 					);
 					if (projected.length > 0) {
 						if (event.type === "agent_start") agentStartDelivered = true;
-						await turn.onLiveEvents?.(projected);
+						await deliverLiveEvents(turn, projected);
 					}
 				},
 				...(modelSelection === undefined ? {} : { modelSelection }),
@@ -273,7 +282,7 @@ export function createGjcRoutingLiveGatewayRunner(
 								? result.events.filter(event => isTerminalEvent(event.type))
 								: result.events.filter(event => !(agentStartDelivered && event.type === "agent_start"));
 					const projected = projectTurnEvents(completionEvents, canonicalModel);
-					if (projected.length > 0) await turn.onLiveEvents?.(projected);
+					if (projected.length > 0) await deliverLiveEvents(turn, projected);
 					await queue.finish(result.assistantText);
 				})
 				.catch(error => {
@@ -353,5 +362,15 @@ class LiveChunkQueue implements AsyncIterable<string> {
 					: new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
 			},
 		};
+	}
+}
+async function deliverLiveEvents(
+	turn: LiveGatewayRunnerInput,
+	events: NonNullable<LiveGatewayRunnerResult["events"]>,
+): Promise<void> {
+	try {
+		await turn.onLiveEvents?.(events);
+	} catch {
+		// OpenWebUI progress delivery is best-effort and cannot invalidate an accepted GJC turn.
 	}
 }

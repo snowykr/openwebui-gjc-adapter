@@ -13,7 +13,8 @@ import {
 import type { OutboxStore } from "../state/outbox";
 import { type LiveGatewayRunnerInput, type LiveGatewayRunnerResult, WorkflowGateReplyError } from "./chat-completions";
 import type { GjcSessionTurnRunner } from "./gjc-routing-runner";
-import { ensureProjectionRows } from "./workflow-gate-projection";
+import { formatCanonicalModelId } from "./models";
+import { ensureProjectionRows, projectTurnEvents } from "./workflow-gate-projection";
 import {
 	markWorkflowGateAccepted,
 	workflowGateOperationHash,
@@ -161,6 +162,7 @@ export async function handleWorkflowGateReply(
 			chatId: mapping.chatId,
 			gateId: pendingGate.gateId,
 			answer: answerResult.answer,
+			promptText: turn.prompt,
 			idempotencyKey: workflowGateResponseIdempotencyKey(turn.chatId, turn.userMessageId),
 			userMessageId: turn.userMessageId,
 			parentId: turn.userMessageParentId ?? undefined,
@@ -211,7 +213,13 @@ export async function handleWorkflowGateReply(
 			ensureProjectionRows(input.outbox, published, input.ownerUserId ?? "openwebui-gjc-adapter");
 			return published;
 		});
-		return { content: responseText };
+		const projectedEvents = projectTurnEvents(
+			result.events,
+			mapping.modelSelection === undefined ? undefined : formatCanonicalModelId(mapping.modelSelection),
+		);
+		return projectedEvents.length === 0
+			? { content: responseText }
+			: { content: responseText, events: projectedEvents };
 	} catch (error) {
 		input.mappings.transitionOperation(turn.chatId, turn.userMessageId, "uncertain", operationDetail);
 		throw error;

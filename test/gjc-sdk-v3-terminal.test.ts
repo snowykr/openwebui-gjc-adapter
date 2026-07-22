@@ -430,6 +430,28 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 			terminal.close();
 		}
 	});
+	test("Given live event delivery failure When the accepted turn completes Then terminal success is preserved", async () => {
+		const { terminal, emit } = await terminalFixture(() => {
+			throw new Error("event endpoint unavailable");
+		});
+		try {
+			const pending = terminal.wait(correlation, 500);
+			emit({
+				type: "message_update",
+				payload: {
+					type: "message_update",
+					assistantMessageEvent: { type: "thinking_start" },
+				},
+			});
+			emit({ type: "agent_end", ...correlation });
+
+			await expect(pending).resolves.toMatchObject({
+				events: expect.arrayContaining([expect.objectContaining({ type: "agent_end" })]),
+			});
+		} finally {
+			terminal.close();
+		}
+	});
 	test("Given malformed or mismatched 0.11.6 agent_end envelopes When waiting Then they cannot terminate another turn", async () => {
 		const { terminal, emit } = await terminalFixture();
 		try {

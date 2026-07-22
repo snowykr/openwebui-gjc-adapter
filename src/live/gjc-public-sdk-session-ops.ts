@@ -199,7 +199,7 @@ export async function respondWorkflowGate(
 		),
 	);
 	return turnResult(
-		outcome,
+		await withSessionArtifactEvents(outcome, input.sessionFile, input.promptText),
 		input.sessionFile,
 		undefined,
 		await freshAttachmentProof(input.cwd, attachment, input.lifecycle),
