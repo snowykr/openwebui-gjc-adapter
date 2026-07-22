@@ -167,9 +167,7 @@ describe("CLI module boundaries", () => {
 		expect(results[2]?.stdout).not.toContain("--gjc-");
 		expect(results[0]?.stdout).toContain("probe-ready checks adapter/OpenWebUI readiness only");
 		expect(results[1]?.stdout).toContain("--openwebui-url URL");
-		expect(results[1]?.stdout).toContain(
-			"Shared by managed and existing: user systemd and OpenWebUI >=0.10.0.",
-		);
+		expect(results[1]?.stdout).toContain("Shared by managed and existing: user systemd and OpenWebUI >=0.10.0.");
 		expect(results[1]?.stdout).toContain(
 			"For rootless Docker or Docker userns-remap incompatibilities, choose existing",
 		);
@@ -182,15 +180,9 @@ describe("CLI module boundaries", () => {
 		expect(results[0]?.stdout).toContain(
 			"Shared: managed and existing both require user systemd and OpenWebUI >=0.10.0.",
 		);
-		expect(results[0]?.stdout).toContain(
-			"rootless Docker or Docker userns-remap incompatibilities.",
-		);
-		expect(results[2]?.stdout).toContain(
-			"Shared by managed and existing: user systemd and OpenWebUI >=0.10.0.",
-		);
-		expect(results[2]?.stdout).toContain(
-			"Use configure existing for rootless Docker or Docker userns-remap",
-		);
+		expect(results[0]?.stdout).toContain("rootless Docker or Docker userns-remap incompatibilities.");
+		expect(results[2]?.stdout).toContain("Shared by managed and existing: user systemd and OpenWebUI >=0.10.0.");
+		expect(results[2]?.stdout).toContain("Use configure existing for rootless Docker or Docker userns-remap");
 		expect(results[2]?.stdout).not.toContain("those Docker prerequisites");
 		expect(results[0]?.stdout).not.toContain("when those Docker prerequisites");
 		expect(results[2]?.stdout).not.toContain("user systemd or OpenWebUI");
@@ -198,9 +190,7 @@ describe("CLI module boundaries", () => {
 		expect(readme).toContain(
 			"route-specific help for first-install guidance. Route help documents required first-install inputs and prerequisites",
 		);
-		expect(readme).toContain(
-			"Both CLI-managed routes require user systemd and OpenWebUI >=0.10.0;",
-		);
+		expect(readme).toContain("Both CLI-managed routes require user systemd and OpenWebUI >=0.10.0;");
 		expect(readme).toContain("existing mode is not a fallback for missing shared prerequisites.");
 		expect(readme).toContain("Choose existing mode for rootless or userns-remapped Docker");
 		expect(readme).not.toContain("Any managed Docker prerequisite does not hold");
