@@ -104,6 +104,8 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 
 	async respondWorkflowGate(input: GjcRespondWorkflowGateInput): Promise<GjcTurnResult> {
 		this.gateResponses.push(input);
+		for (const event of this.gateResponseEvents) await input.observer?.(event);
+		await this.completionBarrier;
 		return {
 			text: "workflow gate accepted",
 			events: this.gateResponseEvents,

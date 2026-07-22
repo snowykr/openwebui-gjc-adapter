@@ -85,25 +85,77 @@ export function createGjcRoutingLiveGatewayRunner(
 				const selection = assertBoundRequest(boundMapping, requestedModelId, "pending");
 				if (requestedModelId !== undefined) boundSelection = selection;
 			}
-			const gateReplyResult =
-				pendingPreflight === null || boundMapping === undefined
-					? null
-					: input.turnRunner.withLifecyclePublication === undefined
-						? (() => {
-								throw new Error("GJC runner must provide lifecycle publication for workflow gates.");
-							})()
-						: await input.turnRunner.withLifecyclePublication(
-								{
-									cwd: turn.project.cwd,
-									sessionRoot: turn.project.sessionRoot ?? `${turn.project.cwd}/.gjc/sessions`,
-									projectId: boundMapping.projectId,
-									chatId: boundMapping.chatId,
-									sessionId: boundMapping.sessionId,
-									sessionFile: boundMapping.sessionFile,
-									recoveryAttachment: boundMapping.attachment,
-								},
-								lifecycle => handleWorkflowGateReply(input, turn, boundMapping, lifecycle),
+			let gateReplyResult: LiveGatewayRunnerResult | null = null;
+			if (pendingPreflight !== null && boundMapping !== undefined) {
+				if (input.turnRunner.withLifecyclePublication === undefined)
+					throw new Error("GJC runner must provide lifecycle publication for workflow gates.");
+				const gateAddress = {
+					cwd: turn.project.cwd,
+					sessionRoot: turn.project.sessionRoot ?? `${turn.project.cwd}/.gjc/sessions`,
+					projectId: boundMapping.projectId,
+					chatId: boundMapping.chatId,
+					sessionId: boundMapping.sessionId,
+					sessionFile: boundMapping.sessionFile,
+					recoveryAttachment: boundMapping.attachment,
+				};
+				if (turn.onLiveEvents === undefined) {
+					gateReplyResult = await input.turnRunner.withLifecyclePublication(gateAddress, lifecycle =>
+						handleWorkflowGateReply(input, turn, boundMapping, lifecycle),
+					);
+				} else {
+					const queue = new LiveChunkQueue();
+					let activityStarted = false;
+					let resolveActivity!: () => void;
+					let rejectActivity!: (error: unknown) => void;
+					const firstActivity = new Promise<void>((resolve, reject) => {
+						resolveActivity = resolve;
+						rejectActivity = reject;
+					});
+					const markActivityStarted = () => {
+						if (activityStarted) return;
+						activityStarted = true;
+						resolveActivity();
+					};
+					const observer = async (event: import("../gjc/turn-runner").GjcTurnEvent) => {
+						markActivityStarted();
+						const payload = isRecord(event.payload) ? event.payload : undefined;
+						const assistant =
+							payload !== undefined && isRecord(payload.assistantMessageEvent)
+								? payload.assistantMessageEvent
+								: undefined;
+						if (
+							event.type === "message_update" &&
+							assistant?.type === "text_delta" &&
+							(typeof assistant.delta === "string" || typeof assistant.text === "string")
+						) {
+							await queue.push(
+								typeof assistant.delta === "string" ? assistant.delta : (assistant.text as string),
 							);
+							return;
+						}
+						const projected = projectTurnEvents(
+							[event],
+							boundSelection === undefined ? undefined : formatCanonicalModelId(boundSelection),
+						);
+						if (projected.length > 0) await turn.onLiveEvents?.(projected);
+					};
+					void input.turnRunner
+						.withLifecyclePublication(gateAddress, lifecycle =>
+							handleWorkflowGateReply(input, turn, boundMapping, lifecycle, observer),
+						)
+						.then(async result => {
+							markActivityStarted();
+							if (result === null) throw new Error("Pending workflow gate disappeared before its reply.");
+							await queue.finish(result.content ?? "");
+						})
+						.catch(error => {
+							if (!activityStarted) rejectActivity(error);
+							queue.fail(error);
+						});
+					await firstActivity;
+					return withCanonicalModel({ chunks: queue }, boundSelection);
+				}
+			}
 			if (gateReplyResult !== null) return withCanonicalModel(gateReplyResult, boundSelection);
 			const modelSelection =
 				requestedModelId === undefined ? undefined : await resolveNormalSelection(input, turn, requestedModelId);

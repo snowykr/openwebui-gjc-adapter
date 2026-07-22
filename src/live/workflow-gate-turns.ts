@@ -1,7 +1,7 @@
 import { ensureSdkSessionFile } from "../gjc/session-file";
 import type { SessionMapping, SessionMappingStore } from "../gjc/session-router";
 import { validateSessionFile } from "../gjc/session-router";
-import type { GjcLifecycleTransaction } from "../gjc/turn-runner";
+import type { GjcLifecycleTransaction, GjcTurnEventObserver } from "../gjc/turn-runner";
 import {
 	answerFromWorkflowGateReply,
 	type PendingWorkflowGate,
@@ -70,6 +70,7 @@ export async function handleWorkflowGateReply(
 	turn: LiveGatewayRunnerInput,
 	preflightMapping: SessionMapping,
 	lifecycle: GjcLifecycleTransaction,
+	observer?: GjcTurnEventObserver,
 ): Promise<LiveGatewayRunnerResult | null> {
 	const mapping = preflightMapping ?? input.mappings.get(turn.chatId);
 	if (mapping === undefined || mapping.projectId !== turn.project.id) return null;
@@ -170,6 +171,7 @@ export async function handleWorkflowGateReply(
 			eventCursor: mapping.eventCursor,
 			operationId: turn.userMessageId,
 			lifecycle,
+			...(observer === undefined ? {} : { observer }),
 			...(pendingGate.commandId === undefined ||
 			pendingGate.turnId === undefined ||
 			pendingGate.sessionId === undefined
