@@ -60,69 +60,71 @@ describe("latest dev SDK v3 transport contract", () => {
 			await fixture.dispose();
 		}
 	});
-	test.each([
-		"session.new",
-		"session.branch",
-	] as const)("awaits durable discovered-successor persistence before %s attach, metadata, or descriptor binding failures", async operation => {
-		for (const failure of ["attach", "metadata", "descriptor replacement"] as const) {
-			const root = mkdtempSync(join(tmpdir(), "gjc-lifecycle-ack-"));
-			const descriptorPath = join(root, "successor.json");
-			const descriptor = JSON.stringify({ version: 1, url: "ws://127.0.0.1:1", token: "successor" });
-			writeFileSync(descriptorPath, descriptor);
-			const descriptorStat = statSync(descriptorPath);
-			const successor: PublicSdkSessionAttachment = {
-				sessionId: "successor",
-				cwd: root,
-				endpoint: { url: "ws://127.0.0.1:1", token: "successor" },
-				authority: {
-					descriptorPath,
-					descriptorStat,
-					payloadDigest: createHash("sha256").update(descriptor).digest("hex"),
-					generation: descriptorStat.mtimeMs,
-					expectedSessionId: "successor",
-					expectedCwd: root,
-				},
-			};
-			const predecessor: PublicSdkSessionAttachment = {
-				...successor,
-				sessionId: "predecessor",
-				endpoint: { url: "ws://127.0.0.1:2", token: "predecessor" },
-			};
-			let mutations = 0;
-			let persisted = false;
-			const host: LifecycleHost = {
-				connected: () => ({ attachment: predecessor }),
-				mutate: async () => {
-					mutations += 1;
-					return operation === "session.new" ? { created: true } : { selectedText: "selected", cancelled: false };
-				},
-				withAuthority: async (_timeout, effect) => effect(),
-				discover: async () => successor,
-				onDiscovered: async () => {
-					await Promise.resolve();
-					persisted = true;
-				},
-				attach: async () => {
+	test.each(["session.new", "session.branch"] as const)(
+		"awaits durable discovered-successor persistence before %s attach, metadata, or descriptor binding failures",
+		async operation => {
+			for (const failure of ["attach", "metadata", "descriptor replacement"] as const) {
+				const root = mkdtempSync(join(tmpdir(), "gjc-lifecycle-ack-"));
+				const descriptorPath = join(root, "successor.json");
+				const descriptor = JSON.stringify({ version: 1, url: "ws://127.0.0.1:1", token: "successor" });
+				writeFileSync(descriptorPath, descriptor);
+				const descriptorStat = statSync(descriptorPath);
+				const successor: PublicSdkSessionAttachment = {
+					sessionId: "successor",
+					cwd: root,
+					endpoint: { url: "ws://127.0.0.1:1", token: "successor" },
+					authority: {
+						descriptorPath,
+						descriptorStat,
+						payloadDigest: createHash("sha256").update(descriptor).digest("hex"),
+						generation: descriptorStat.mtimeMs,
+						expectedSessionId: "successor",
+						expectedCwd: root,
+					},
+				};
+				const predecessor: PublicSdkSessionAttachment = {
+					...successor,
+					sessionId: "predecessor",
+					endpoint: { url: "ws://127.0.0.1:2", token: "predecessor" },
+				};
+				let mutations = 0;
+				let persisted = false;
+				const host: LifecycleHost = {
+					connected: () => ({ attachment: predecessor }),
+					mutate: async () => {
+						mutations += 1;
+						return operation === "session.new"
+							? { created: true }
+							: { selectedText: "selected", cancelled: false };
+					},
+					withAuthority: async (_timeout, effect) => effect(),
+					discover: async () => successor,
+					onDiscovered: async () => {
+						await Promise.resolve();
+						persisted = true;
+					},
+					attach: async () => {
+						expect(persisted).toBe(true);
+						if (failure === "attach") throw new Error("attach failed");
+					},
+					metadata: async () => {
+						expect(persisted).toBe(true);
+						if (failure === "metadata") throw new Error("metadata failed");
+						if (failure === "descriptor replacement") writeFileSync(descriptorPath, `${descriptor}\n`);
+						return { sessionId: "successor", cwd: root };
+					},
+					detach() {},
+				};
+				try {
+					await expect(sessionOperation(host, operation, {}, "mutation-key", 1_000)).rejects.toThrow();
 					expect(persisted).toBe(true);
-					if (failure === "attach") throw new Error("attach failed");
-				},
-				metadata: async () => {
-					expect(persisted).toBe(true);
-					if (failure === "metadata") throw new Error("metadata failed");
-					if (failure === "descriptor replacement") writeFileSync(descriptorPath, `${descriptor}\n`);
-					return { sessionId: "successor", cwd: root };
-				},
-				detach() {},
-			};
-			try {
-				await expect(sessionOperation(host, operation, {}, "mutation-key", 1_000)).rejects.toThrow();
-				expect(persisted).toBe(true);
-				expect(mutations).toBe(1);
-			} finally {
-				rmSync(root, { recursive: true, force: true });
+					expect(mutations).toBe(1);
+				} finally {
+					rmSync(root, { recursive: true, force: true });
+				}
 			}
-		}
-	});
+		},
+	);
 
 	test("Given current-dev Q10 metadata When crossing the public session boundary Then it remains available to policy", async () => {
 		const port: Pick<PublicSdkSessionPort, "getAvailableModels"> = {
