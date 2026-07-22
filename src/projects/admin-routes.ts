@@ -1,7 +1,7 @@
 import type { ModelReaderFactory } from "../live/model-reader";
 import { ModelSelectionError, modelSelectionError } from "../live/model-selection-errors";
 import { createModelSelectionPolicy } from "../live/model-selection-policy";
-import { buildModelList, classifyGjcModelId, formatCanonicalModelId } from "../live/models";
+import { buildModelList, classifyGjcModelId, formatCanonicalModelId, normalizeOpenWebUIModelId } from "../live/models";
 import type {
 	OpenAIChatCompletionRequest,
 	OpenAIChatCompletionResponse,
@@ -109,7 +109,7 @@ export async function handleProjectAdminChatCompletion(
 
 export function isProjectAdminChatCompletionRequest(request: OpenAIChatCompletionRequest): boolean {
 	const command = latestUserText(request);
-	const model = classifyGjcModelId(request.model);
+	const model = classifyGjcModelId(normalizeOpenWebUIModelId(request.model));
 	return (
 		(model.kind === "alias" || model.kind === "base" || model.kind === "canonical") &&
 		(command?.startsWith("/gjc project ") ?? false)
@@ -122,16 +122,17 @@ async function canonicalAdminResponse(
 	reasoningEffort: string | undefined,
 	modelReaderFactory?: ModelReaderFactory,
 ): Promise<ProjectAdminRouteResult> {
+	const normalizedModelId = normalizeOpenWebUIModelId(requestedModelId);
 	if (modelReaderFactory === undefined) {
 		throw modelSelectionError(
-			classifyGjcModelId(requestedModelId).kind === "canonical" ||
-				classifyGjcModelId(requestedModelId).kind === "base"
+			classifyGjcModelId(normalizedModelId).kind === "canonical" ||
+				classifyGjcModelId(normalizedModelId).kind === "base"
 				? "model_selection_not_available"
 				: "model_selection_default_read_failed",
 		);
 	}
 	const model = formatCanonicalModelId(
-		await createModelSelectionPolicy(modelReaderFactory).resolve(requestedModelId, reasoningEffort),
+		await createModelSelectionPolicy(modelReaderFactory).resolve(normalizedModelId, reasoningEffort),
 	);
 	return { status: 200, body: chatResponse(content, model) };
 }

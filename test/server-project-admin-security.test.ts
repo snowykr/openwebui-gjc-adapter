@@ -107,6 +107,24 @@ describe("project admin route security boundaries", () => {
 		});
 	});
 
+	test("normalizes a connection-prefixed base model before routing an admin command", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-admin-"));
+		tempDirs.push(workspace);
+		const { handler } = await buildHandler(workspace);
+		const response = await handler(
+			chatCommandRequest({
+				model: "gjc-adapter.gjc/anthropic/claude-sonnet-4",
+				reasoning_effort: "medium",
+				messages: [{ role: "user", content: "/gjc project list" }],
+			}),
+		);
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toMatchObject({
+			model: "gjc/anthropic/claude-sonnet-4:medium",
+		});
+	});
+
 	test("rejects malformed unlink path encoding with a client error", async () => {
 		const { handler } = await adminHandlerForTempProject("Unused");
 

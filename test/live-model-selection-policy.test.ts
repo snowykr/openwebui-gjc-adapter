@@ -209,6 +209,29 @@ describe("createModelSelectionPolicy", () => {
 		).rejects.toMatchObject({ code: "model_catalog_unavailable", status: 503 });
 	});
 
+	test("resolves the base ID advertised by a current-only catalog", async () => {
+		const currentOnlyCatalog = [
+			{
+				provider: "anthropic",
+				id: "claude-sonnet-4",
+				current: true,
+				currentThinkingLevel: "low",
+			},
+		];
+		const policy = createModelSelectionPolicy(
+			readerFactory(currentOnlyCatalog, {
+				model: { provider: "anthropic", id: "claude-sonnet-4" },
+				thinkingLevel: "low",
+			}),
+		);
+
+		expect((await policy.listModels()).data.map(model => model.id)).toEqual(["gjc/anthropic/claude-sonnet-4"]);
+		await expect(policy.resolve("gjc/anthropic/claude-sonnet-4")).resolves.toEqual(LOW_SELECTION);
+		await expect(policy.resolve("gjc/anthropic/claude-sonnet-4", "medium")).rejects.toMatchObject({
+			code: "model_catalog_unavailable",
+		});
+	});
+
 	test.each([
 		[
 			"catalog",

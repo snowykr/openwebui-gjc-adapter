@@ -123,7 +123,6 @@ async function resolveRequestedModel(
 			}
 			const stateSelection = selectionFromCatalogCurrent(rawCatalog) ?? selectionFromState(await reader.getState());
 			if (descriptors === null || stateSelection === undefined) {
-				const legacySelection = classified.kind === "canonical" ? classified.selection : undefined;
 				const current = currentSelection(rawCatalog, {
 					model:
 						stateSelection === undefined
@@ -131,8 +130,22 @@ async function resolveRequestedModel(
 							: { provider: stateSelection.provider, id: stateSelection.modelId },
 					thinkingLevel: stateSelection?.thinkingLevel,
 				});
-				if (legacySelection !== undefined && current !== undefined && sameSelection(current, legacySelection)) {
-					return legacySelection;
+				const requestedSelection =
+					classified.kind === "canonical"
+						? reasoningEffort === undefined || reasoningEffort === classified.selection.thinkingLevel
+							? classified.selection
+							: undefined
+						: current !== undefined &&
+								sameModel(current, classified.model) &&
+								(reasoningEffort === undefined || reasoningEffort === current.thinkingLevel)
+							? current
+							: undefined;
+				if (
+					requestedSelection !== undefined &&
+					current !== undefined &&
+					sameSelection(current, requestedSelection)
+				) {
+					return current;
 				}
 				throw modelSelectionError("model_catalog_unavailable");
 			}
