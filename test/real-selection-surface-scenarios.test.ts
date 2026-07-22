@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { access } from "node:fs/promises";
 import type { FailedStartCleanupReceipt } from "./cli-fixtures";
-import { CANONICAL_MODEL_IDS, LOW_MODEL_ID, MEDIUM_MODEL_ID } from "./model-selection-fixtures";
+import { ADVERTISED_MODEL_IDS, LOW_MODEL_ID, MEDIUM_MODEL_ID } from "./model-selection-fixtures";
 import { expectNoDeliveryMutation, expectSelectionError } from "./real-selection-expectations";
 import { RealSelectionHarness } from "./real-selection-harness";
 
@@ -45,7 +45,7 @@ describe("real canonical model selection surfaces", () => {
 		try {
 			const models = await harness.models();
 			expect(models).toMatchObject({ status: 200 });
-			expect(models.body.data.map(model => model.id)).toEqual([...CANONICAL_MODEL_IDS]);
+			expect(models.body.data.map(model => model.id)).toEqual([...ADVERTISED_MODEL_IDS]);
 			expect(models.body.data.map(model => model.id)).not.toContain("gjc/anthropic/claude-sonnet-4:inherit");
 			expect(await harness.chat("gjc", { id: "current-alias" })).toMatchObject({
 				status: 200,
@@ -61,7 +61,7 @@ describe("real canonical model selection surfaces", () => {
 		try {
 			const models = await harness.models();
 			expect(models).toMatchObject({ status: 200 });
-			expect(models.body.data.map(model => model.id)).toEqual([...CANONICAL_MODEL_IDS]);
+			expect(models.body.data.map(model => model.id)).toEqual([...ADVERTISED_MODEL_IDS]);
 			expect(await harness.chat("gjc", { id: "alias" })).toMatchObject({
 				status: 200,
 				body: { model: LOW_MODEL_ID },

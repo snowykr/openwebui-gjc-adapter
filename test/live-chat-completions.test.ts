@@ -41,12 +41,14 @@ describe("live OpenAI-compatible chat completions", () => {
 			data: [],
 		});
 	});
-	it("passes one OpenWebUI connection-prefixed canonical model to the runner without its prefix", async () => {
+	it("passes a connection-prefixed base model and reasoning effort to the runner", async () => {
 		let requestedModelId: string | undefined;
+		let reasoningEffort: string | undefined;
 		const result = await handleChatCompletions({
 			request: {
 				...request,
-				model: "gjc-adapter.gjc/anthropic/claude-sonnet-4:low",
+				model: "gjc-adapter.gjc/anthropic/claude-sonnet-4",
+				reasoning_effort: "high",
 			},
 			headers: chatHeaders,
 			projects: [projectWithFolder],
@@ -55,13 +57,15 @@ describe("live OpenAI-compatible chat completions", () => {
 			runner: {
 				run(input) {
 					requestedModelId = input.requestedModelId;
+					reasoningEffort = input.reasoningEffort;
 					return { content: "done", model: "gjc/anthropic/claude-sonnet-4:low" };
 				},
 			},
 		});
 
 		expect(result.ok).toBe(true);
-		expect(requestedModelId).toBe("gjc/anthropic/claude-sonnet-4:low");
+		expect(requestedModelId).toBe("gjc/anthropic/claude-sonnet-4");
+		expect(reasoningEffort).toBe("high");
 	});
 	it("returns an OpenAI-style 400 for invalid workflow gate replies", async () => {
 		const result = await handleChatCompletions({

@@ -5,8 +5,17 @@ export type LiveGatewayModelEntry = OpenAIModelEntry;
 export type GjcModelIdClassification =
 	| { readonly kind: "alias" }
 	| { readonly kind: "canonical"; readonly selection: NormalizedModelSelection }
+	| { readonly kind: "base"; readonly model: GjcBaseModelReference }
 	| { readonly kind: "malformed" }
 	| { readonly kind: "foreign" };
+export type GjcBaseModelReference = {
+	readonly provider: string;
+	readonly modelId: string;
+};
+export type GjcModelDescriptor = GjcBaseModelReference & {
+	readonly validThinkingLevels: readonly GjcThinkingLevel[];
+	readonly defaultThinkingLevel?: GjcThinkingLevel;
+};
 
 const RFC3986_EXTRA = /[!'()*]/g;
 const HEX_ESCAPE = /%[0-9a-fA-F]{2}/;
@@ -20,6 +29,23 @@ export function buildModelList(input: readonly unknown[] = []): OpenAIModelListR
 		object: "list",
 		data: selections.map(selection => ({
 			id: formatCanonicalModelId(selection),
+			object: "model",
+			created: 1783468800,
+			owned_by: "gjc",
+		})),
+	};
+}
+
+export function buildBaseModelList(input: readonly GjcBaseModelReference[] = []): OpenAIModelListResponse {
+	const models = new Map<string, GjcBaseModelReference>();
+	for (const candidate of input) {
+		if (!isSafeProvider(candidate.provider) || !isSafeComponent(candidate.modelId)) continue;
+		models.set(formatBaseModelId(candidate), candidate);
+	}
+	return {
+		object: "list",
+		data: [...models.values()].sort(compareBaseModels).map(model => ({
+			id: formatBaseModelId(model),
 			object: "model",
 			created: 1783468800,
 			owned_by: "gjc",
@@ -49,6 +75,22 @@ export function formatCanonicalModelId(selection: NormalizedModelSelection): str
 	const provider = encodeComponent(selection.provider);
 	const modelId = encodeComponent(selection.modelId);
 	return `gjc/${provider}/${modelId}:${selection.thinkingLevel}`;
+}
+
+export function formatBaseModelId(model: GjcBaseModelReference): string {
+	if (!isSafeProvider(model.provider)) throw new TypeError("Invalid GJC model provider");
+	return `gjc/${encodeComponent(model.provider)}/${encodeComponent(model.modelId)}`;
+}
+
+export function parseBaseModelId(value: unknown): GjcBaseModelReference | null {
+	if (typeof value !== "string" || !value.startsWith("gjc/")) return null;
+	const body = value.slice(4);
+	const slash = body.indexOf("/");
+	if (slash <= 0 || slash !== body.lastIndexOf("/")) return null;
+	const provider = decodeCanonicalComponent(body.slice(0, slash));
+	const modelId = decodeCanonicalComponent(body.slice(slash + 1));
+	if (provider === null || !isSafeProvider(provider) || modelId === null) return null;
+	return { provider, modelId };
 }
 
 export function parseCanonicalModelId(value: unknown): NormalizedModelSelection | null {
@@ -83,6 +125,8 @@ export function classifyGjcModelId(value: string): GjcModelIdClassification {
 	if (value === "gjc") return { kind: "alias" };
 	const selection = parseCanonicalModelId(value);
 	if (selection !== null) return { kind: "canonical", selection };
+	const model = parseBaseModelId(value);
+	if (model !== null) return { kind: "base", model };
 	return value.startsWith("gjc") ? { kind: "malformed" } : { kind: "foreign" };
 }
 
@@ -101,6 +145,44 @@ export function decodeStrictModelCatalog(input: unknown): readonly NormalizedMod
 	const unique = new Map<string, NormalizedModelSelection>();
 	for (const selection of selections) unique.set(formatCanonicalModelId(selection), selection);
 	return [...unique.values()].sort(compareSelections);
+}
+
+export function decodeStrictModelDescriptors(input: unknown): readonly GjcModelDescriptor[] | null {
+	if (!Array.isArray(input)) return null;
+	const descriptors: GjcModelDescriptor[] = [];
+	for (const inputDescriptor of input) {
+		const descriptor = decodeModelDescriptor(inputDescriptor);
+		if (descriptor === null) return null;
+		descriptors.push(descriptor);
+	}
+	const unique = new Map<string, GjcModelDescriptor>();
+	for (const descriptor of descriptors) unique.set(formatBaseModelId(descriptor), descriptor);
+	return [...unique.values()].sort(compareBaseModels);
+}
+
+function decodeModelDescriptor(input: unknown): GjcModelDescriptor | null {
+	if (!isRecord(input)) return null;
+	const provider = Reflect.get(input, "provider");
+	const modelId = Reflect.get(input, "id");
+	const reasoning = Reflect.get(input, "reasoning");
+	if (typeof provider !== "string" || typeof modelId !== "string" || typeof reasoning !== "boolean") return null;
+	if (!isSafeProvider(provider) || !isSafeComponent(modelId)) return null;
+	const thinking = Reflect.get(input, "thinking");
+	if (!isRecord(thinking)) return null;
+	const levels = decodeThinkingDescriptor(thinking, reasoning);
+	if (levels === null) return null;
+	const defaultThinkingLevel = Reflect.get(thinking, "defaultLevel");
+	if (
+		defaultThinkingLevel !== undefined &&
+		(!isThinkingLevel(defaultThinkingLevel) || !levels.includes(defaultThinkingLevel))
+	)
+		return null;
+	return {
+		provider,
+		modelId,
+		validThinkingLevels: levels,
+		...(defaultThinkingLevel === undefined ? {} : { defaultThinkingLevel }),
+	};
 }
 
 function decodeDescriptor(input: unknown): readonly NormalizedModelSelection[] | null {
@@ -175,6 +257,10 @@ function compareSelections(left: NormalizedModelSelection, right: NormalizedMode
 		compareUtf8(left.modelId, right.modelId) ||
 		thinkingRank(left.thinkingLevel) - thinkingRank(right.thinkingLevel)
 	);
+}
+
+function compareBaseModels(left: GjcBaseModelReference, right: GjcBaseModelReference): number {
+	return compareUtf8(left.provider, right.provider) || compareUtf8(left.modelId, right.modelId);
 }
 
 function compareUtf8(left: string, right: string): number {

@@ -58,17 +58,28 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 		return selectionErrorResult(modelSelectionError("model_selection_invalid_id"));
 	if (classifiedModel.kind === "foreign")
 		return selectionErrorResult(modelSelectionError("model_not_found", input.request.model));
+	if (input.request.reasoning_effort !== undefined && typeof input.request.reasoning_effort !== "string") {
+		return errorResult(
+			400,
+			"invalid_request_error",
+			"invalid_reasoning_effort",
+			"reasoning_effort must be a supported string value.",
+		);
+	}
 
 	if (headers.isBackgroundTask) {
 		try {
 			if (input.modelReaderFactory === undefined) {
 				throw modelSelectionError(
-					classifiedModel.kind === "canonical"
+					classifiedModel.kind === "canonical" || classifiedModel.kind === "base"
 						? "model_selection_not_available"
 						: "model_selection_default_read_failed",
 				);
 			}
-			const selection = await createModelSelectionPolicy(input.modelReaderFactory).resolve(requestedModelId);
+			const selection = await createModelSelectionPolicy(input.modelReaderFactory).resolve(
+				requestedModelId,
+				input.request.reasoning_effort,
+			);
 			const model = formatCanonicalModelId(selection);
 			return {
 				ok: true,
@@ -79,7 +90,7 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 			if (error instanceof ModelSelectionError) return selectionErrorResult(error);
 			return selectionErrorResult(
 				modelSelectionError(
-					classifiedModel.kind === "canonical"
+					classifiedModel.kind === "canonical" || classifiedModel.kind === "base"
 						? "model_selection_not_available"
 						: "model_selection_default_read_failed",
 				),
@@ -151,6 +162,7 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 			userMessageParentId: headers.userMessageParentId,
 			continued: headers.userMessageParentId !== null,
 			requestedModelId,
+			...(input.request.reasoning_effort === undefined ? {} : { reasoningEffort: input.request.reasoning_effort }),
 			ownerUserId: input.owner.ownerUserId,
 			...(input.request.metadata === undefined ? {} : { messageMetadata: input.request.metadata }),
 			...(controlFromMetadata(input.request.metadata) === undefined

@@ -68,7 +68,7 @@ export function createGjcRoutingLiveGatewayRunner(
 				isSameProject(existing, turn) &&
 				existing.operationId === turn.userMessageId
 			) {
-				const selection = assertBoundRequest(existing, requestedModelId, "duplicate");
+				const selection = assertBoundRequest(existing, requestedModelId, turn.reasoningEffort, "duplicate");
 				const events = projectTurnEvents(existing.events ?? [], formatCanonicalModelId(selection));
 				const result =
 					events.length === 0
@@ -82,7 +82,7 @@ export function createGjcRoutingLiveGatewayRunner(
 			const pendingPreflight = latestPendingWorkflowGate(boundMapping?.events ?? []);
 			let boundSelection: NormalizedModelSelection | undefined;
 			if (pendingPreflight !== null && boundMapping !== undefined) {
-				const selection = assertBoundRequest(boundMapping, requestedModelId, "pending");
+				const selection = assertBoundRequest(boundMapping, requestedModelId, turn.reasoningEffort, "pending");
 				if (requestedModelId !== undefined) boundSelection = selection;
 			}
 			let gateReplyResult: LiveGatewayRunnerResult | null = null;

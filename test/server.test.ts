@@ -7,7 +7,7 @@ import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import type { RegisteredProject } from "../src/projects/registry";
 import { RuntimeSingletonLock } from "../src/runtime-singleton-lock";
 import { createAdapterRequestHandler, startAdapterServer } from "../src/server";
-import { CANONICAL_MODEL_IDS, LOW_MODEL_ID, staticModelReaderFactory } from "./model-selection-fixtures";
+import { LOW_MODEL_ID, staticModelReaderFactory } from "./model-selection-fixtures";
 
 describe("createAdapterRequestHandler", () => {
 	test("returns health status", async () => {
@@ -38,7 +38,14 @@ describe("createAdapterRequestHandler", () => {
 		expect(response.status).toBe(200);
 		expect(await response.json()).toEqual({
 			object: "list",
-			data: CANONICAL_MODEL_IDS.map(id => ({ id, object: "model", created: 1783468800, owned_by: "gjc" })),
+			data: [
+				{
+					id: "gjc/anthropic/claude-sonnet-4",
+					object: "model",
+					created: 1783468800,
+					owned_by: "gjc",
+				},
+			],
 		});
 	});
 

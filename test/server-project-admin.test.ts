@@ -18,7 +18,7 @@ import { SqliteProjectRegistrationStore } from "../src/projects/registration-sto
 import { resolveAllowedRoots } from "../src/security/paths";
 import { createAdapterRequestHandler } from "../src/server";
 import { FakeGjcTurnRunner } from "./cli-fixtures";
-import { CANONICAL_MODEL_IDS, LOW_MODEL_ID, staticModelReaderFactory } from "./model-selection-fixtures";
+import { ADVERTISED_MODEL_IDS, LOW_MODEL_ID, staticModelReaderFactory } from "./model-selection-fixtures";
 import { messageEntry, writeSessionFile } from "./session-sync-fixtures";
 
 const tempDirs: string[] = [];
@@ -74,7 +74,7 @@ describe("project admin routes", () => {
 			project: { id: "admin-project", status: "linked" },
 			sync: { imported: [{ sessionId: "session-one" }] },
 		});
-		expect(await modelIds(handler)).toEqual([...CANONICAL_MODEL_IDS]);
+		expect(await modelIds(handler)).toEqual([...ADVERTISED_MODEL_IDS]);
 
 		const unlinked = await handler(
 			new Request("http://adapter.test/admin/projects/admin-project/unlink", {
@@ -84,7 +84,7 @@ describe("project admin routes", () => {
 		);
 		expect(unlinked.status).toBe(200);
 		expect(await unlinked.json()).toMatchObject({ project: { id: "admin-project", status: "unlinked" } });
-		expect(await modelIds(handler)).toEqual([...CANONICAL_MODEL_IDS]);
+		expect(await modelIds(handler)).toEqual([...ADVERTISED_MODEL_IDS]);
 		expect(await fs.stat(sessionFile)).toBeTruthy();
 		expect(await repository.getChat("owner-1", "gjc-project-admin-project-session-session-one")).toBeUndefined();
 
@@ -95,7 +95,7 @@ describe("project admin routes", () => {
 			}),
 		);
 		expect(relinked.status).toBe(200);
-		expect(await modelIds(handler)).toEqual([...CANONICAL_MODEL_IDS]);
+		expect(await modelIds(handler)).toEqual([...ADVERTISED_MODEL_IDS]);
 		expect(await repository.getChat("owner-1", "gjc-project-admin-project-session-session-one")).toMatchObject({
 			title: "Admin Session",
 		});
@@ -622,7 +622,7 @@ describe("project admin routes", () => {
 		expect(linked.status).toBe(200);
 		const linkedBody = (await linked.json()) as ChatCompletionBody;
 		expect(linkedBody.choices[0].message.content).toContain("Linked slash-project");
-		expect(await modelIds(handler)).toEqual([...CANONICAL_MODEL_IDS]);
+		expect(await modelIds(handler)).toEqual([...ADVERTISED_MODEL_IDS]);
 
 		const unlinked = await handler(
 			chatCommandRequest({
@@ -633,7 +633,7 @@ describe("project admin routes", () => {
 		expect(unlinked.status).toBe(200);
 		const unlinkedBody = (await unlinked.json()) as ChatCompletionBody;
 		expect(unlinkedBody.choices[0].message.content).toContain("Unlinked slash-project");
-		expect(await modelIds(handler)).toEqual([...CANONICAL_MODEL_IDS]);
+		expect(await modelIds(handler)).toEqual([...ADVERTISED_MODEL_IDS]);
 	});
 
 	test("rejects admin link requests outside allowed roots", async () => {

@@ -11,9 +11,13 @@ function exportedFunction(name: string): (...args: readonly unknown[]) => unknow
 }
 
 describe("canonical GJC model codec", () => {
-	test("classifies alias canonical malformed and foreign ids", () => {
+	test("classifies alias base canonical malformed and foreign ids", () => {
 		const classify = exportedFunction("classifyGjcModelId");
 		expect(classify("gjc")).toEqual({ kind: "alias" });
+		expect(classify("gjc/openai/gpt-5")).toEqual({
+			kind: "base",
+			model: { provider: "openai", modelId: "gpt-5" },
+		});
 		expect(classify("gjc/openai/gpt-5:off")).toMatchObject({ kind: "canonical" });
 		expect(classify("gjc/noncanonical")).toEqual({ kind: "malformed" });
 		expect(classify("openai/gpt-5")).toEqual({ kind: "foreign" });
@@ -70,6 +74,14 @@ describe("canonical GJC model codec", () => {
 		// Then
 		expect(decoded).toEqual(malformed.map(() => null));
 	});
+});
+
+test("round-trips base model ids without embedding thinking level", () => {
+	const format = exportedFunction("formatBaseModelId");
+	const parse = exportedFunction("parseBaseModelId");
+	const model = { provider: "openai-codex", modelId: "gpt-5.6/terra" };
+	expect(format(model)).toBe("gjc/openai-codex/gpt-5.6%2Fterra");
+	expect(parse(format(model))).toEqual(model);
 });
 
 describe("atomic GJC catalog decoder", () => {
@@ -203,6 +215,28 @@ describe("atomic GJC catalog decoder", () => {
 		expect(response).toEqual({
 			object: "list",
 			data: [{ id: "gjc/p/m:off", object: "model", created: 1783468800, owned_by: "gjc" }],
+		});
+	});
+});
+
+describe("base model catalog", () => {
+	test("deduplicates thinking tuples into one advertised model", () => {
+		const build = exportedFunction("buildBaseModelList");
+		expect(
+			build([
+				{ provider: "openai-codex", modelId: "gpt-5.6-terra" },
+				{ provider: "openai-codex", modelId: "gpt-5.6-terra" },
+			]),
+		).toEqual({
+			object: "list",
+			data: [
+				{
+					id: "gjc/openai-codex/gpt-5.6-terra",
+					object: "model",
+					created: 1783468800,
+					owned_by: "gjc",
+				},
+			],
 		});
 	});
 });

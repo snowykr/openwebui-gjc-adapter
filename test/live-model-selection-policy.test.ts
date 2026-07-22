@@ -7,7 +7,6 @@ import {
 } from "../src/live/model-selection-errors";
 import { createModelSelectionPolicy } from "../src/live/model-selection-policy";
 import {
-	CANONICAL_MODEL_IDS,
 	LOW_MODEL_ID,
 	LOW_SELECTION,
 	MEDIUM_MODEL_ID,
@@ -78,7 +77,7 @@ describe("createModelSelectionPolicy", () => {
 	test("reads a strict catalog and stops its fresh reader", async () => {
 		const transcript: string[] = [];
 		const policy = createModelSelectionPolicy(staticModelReaderFactory(transcript));
-		expect((await policy.listModels()).data.map(model => model.id)).toEqual([...CANONICAL_MODEL_IDS]);
+		expect((await policy.listModels()).data.map(model => model.id)).toEqual(["gjc/anthropic/claude-sonnet-4"]);
 		expect(transcript).toEqual(["catalog", "stop"]);
 	});
 
@@ -117,16 +116,51 @@ describe("createModelSelectionPolicy", () => {
 			),
 		);
 
-		expect((await policy.listModels()).data.map(model => model.id)).toEqual([
-			"gjc/anthropic/claude-sonnet-4:off",
-			"gjc/anthropic/claude-sonnet-4:low",
-			"gjc/anthropic/claude-sonnet-4:xhigh",
-			"gjc/anthropic/claude-sonnet-4:max",
-		]);
+		expect((await policy.listModels()).data.map(model => model.id)).toEqual(["gjc/anthropic/claude-sonnet-4"]);
 		expect(await policy.resolve("gjc")).toEqual(LOW_SELECTION);
 		expect(await policy.resolve("gjc/anthropic/claude-sonnet-4:max")).toEqual({
 			...LOW_SELECTION,
 			thinkingLevel: "max",
+		});
+	});
+
+	test("resolves a base model with OpenWebUI reasoning effort and preserves the current level by default", async () => {
+		const policy = createModelSelectionPolicy(staticModelReaderFactory());
+		await expect(policy.resolve("gjc/anthropic/claude-sonnet-4", "medium")).resolves.toEqual({
+			...LOW_SELECTION,
+			thinkingLevel: "medium",
+		});
+		await expect(policy.resolve("gjc/anthropic/claude-sonnet-4")).resolves.toEqual(LOW_SELECTION);
+	});
+
+	test("does not advertise other providers, code-review pseudo-models, or image models", async () => {
+		const catalog = [
+			...MODEL_DESCRIPTORS,
+			{
+				provider: "anthropic",
+				id: "codex-auto-review",
+				reasoning: true,
+				thinking: { validLevels: ["off", "low"] },
+			},
+			{
+				provider: "anthropic",
+				id: "gpt-image-2",
+				reasoning: false,
+				thinking: { validLevels: ["off"] },
+			},
+		];
+		const policy = createModelSelectionPolicy(
+			readerFactory(catalog, {
+				model: { provider: "anthropic", id: "claude-sonnet-4" },
+				thinkingLevel: "low",
+			}),
+		);
+		expect((await policy.listModels()).data.map(model => model.id)).toEqual(["gjc/anthropic/claude-sonnet-4"]);
+		await expect(policy.resolve("gjc/anthropic/codex-auto-review", "low")).rejects.toMatchObject({
+			code: "model_selection_not_available",
+		});
+		await expect(policy.resolve("gjc/anthropic/gpt-image-2", "off")).rejects.toMatchObject({
+			code: "model_selection_not_available",
 		});
 	});
 

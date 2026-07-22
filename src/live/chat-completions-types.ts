@@ -31,6 +31,7 @@ export interface LiveGatewayRunnerInput {
 	readonly userMessageParentId: string | null;
 	readonly continued: boolean;
 	readonly requestedModelId?: string;
+	readonly reasoningEffort?: string;
 	/** Authenticated OpenWebUI owner bound by the request handler for branch controls. */
 	readonly ownerUserId?: string;
 	/** Message lineage supplied by OpenWebUI for the regenerated message. */

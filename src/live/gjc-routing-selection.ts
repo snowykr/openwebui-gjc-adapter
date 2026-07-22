@@ -6,11 +6,12 @@ import type { LiveGatewayRunnerInput, LiveGatewayRunnerResult } from "./chat-com
 import type { ModelReader, ModelReaderFactory } from "./model-reader";
 import { modelSelectionError } from "./model-selection-errors";
 import { createModelSelectionPolicy } from "./model-selection-policy";
-import { formatCanonicalModelId, parseCanonicalModelId } from "./models";
+import { formatCanonicalModelId, parseBaseModelId, parseCanonicalModelId } from "./models";
 
 export function assertBoundRequest(
 	mapping: SessionMapping,
 	requestedModelId: string | undefined,
+	reasoningEffort: string | undefined,
 	branch: "duplicate" | "pending",
 ): NormalizedModelSelection {
 	const selection = normalizeModelSelection(mapping.modelSelection);
@@ -18,11 +19,16 @@ export function assertBoundRequest(
 		throw modelSelectionError(
 			branch === "duplicate" ? "model_selection_idempotency_conflict" : "model_selection_gate_binding_missing",
 		);
+	const canonical = parseCanonicalModelId(requestedModelId);
 	const requested =
 		requestedModelId === undefined || requestedModelId === "gjc"
 			? selection
-			: parseCanonicalModelId(requestedModelId);
-	if (requested === null || !sameSelection(selection, requested))
+			: (canonical ?? parseBaseModelId(requestedModelId));
+	const matchesModel =
+		requested !== null && selection.provider === requested.provider && selection.modelId === requested.modelId;
+	const requestedThinking = reasoningEffort ?? canonical?.thinkingLevel;
+	const matchesThinking = requestedThinking === undefined || selection.thinkingLevel === requestedThinking;
+	if (!matchesModel || !matchesThinking)
 		throw modelSelectionError(
 			branch === "duplicate" ? "model_selection_idempotency_conflict" : "model_selection_gate_mismatch",
 		);
@@ -45,7 +51,7 @@ export async function resolveNormalSelection(
 		const reader = await createReader();
 		if (reader === undefined) throw new TypeError("GJC model selection reader is unavailable");
 		return reader;
-	}).resolve(requestedModelId);
+	}).resolve(requestedModelId, turn.reasoningEffort);
 }
 
 export async function replayWithLifecyclePublication<T>(
@@ -82,11 +88,5 @@ export function isModelSelectionApplyFailure(error: unknown): boolean {
 		return ["model_set_failed", "thinking_set_failed", "invalid_result"].includes(error.code);
 	return (
 		typeof error === "object" && error !== null && Reflect.get(error, "command") === "set_default_model_selection"
-	);
-}
-
-function sameSelection(left: NormalizedModelSelection, right: NormalizedModelSelection): boolean {
-	return (
-		left.provider === right.provider && left.modelId === right.modelId && left.thinkingLevel === right.thinkingLevel
 	);
 }

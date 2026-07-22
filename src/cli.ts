@@ -23,8 +23,9 @@ Commands:
   credentials show adapter-token  Display an installed adapter token
 
 Models:
-  gjc/<encoded-provider>/<encoded-model>:<thinking>  Canonical GJC model id
-  gjc  Input-only alias for the current machine-global default
+  gjc/<encoded-provider>/<encoded-model>  Advertised GJC base model id
+  reasoning_effort                      Optional OpenWebUI thinking level
+  gjc                                   Input-only alias for the current machine-global default
 `;
 const EXISTING_CONFIGURE_USAGE = `Usage: openwebui-gjc-adapter configure existing [options]
 

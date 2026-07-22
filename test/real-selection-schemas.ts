@@ -1,6 +1,11 @@
 import type { NormalizedModelSelection } from "../src/contracts";
 import type { OpenAIErrorResponse } from "../src/live/chat-response-format";
-import { decodeStrictModelCatalog, formatCanonicalModelId, parseCanonicalModelId } from "../src/live/models";
+import {
+	decodeStrictModelCatalog,
+	formatCanonicalModelId,
+	parseBaseModelId,
+	parseCanonicalModelId,
+} from "../src/live/models";
 import { isSseChoice } from "./real-selection-openai-schemas";
 
 type MappingDocument = Record<string, unknown> & { readonly mappings: readonly Record<string, unknown>[] };
@@ -171,7 +176,7 @@ export function parseCoordinatorSequence(value: unknown): number {
 function isModelEntry(value: unknown): value is OpenAIModelListResponse["data"][number] {
 	return (
 		isRecord(value) &&
-		parseCanonicalModelId(Reflect.get(value, "id")) !== null &&
+		parseBaseModelId(Reflect.get(value, "id")) !== null &&
 		Reflect.get(value, "object") === "model" &&
 		typeof Reflect.get(value, "created") === "number" &&
 		Reflect.get(value, "owned_by") === "gjc"

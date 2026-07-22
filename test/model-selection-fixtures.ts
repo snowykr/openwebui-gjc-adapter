@@ -51,6 +51,7 @@ export const MEDIUM_MODEL_ID = "gjc/anthropic/claude-sonnet-4:medium";
 export const OFF_MODEL_ID = "gjc/openai/gpt-5:off";
 
 export const CANONICAL_MODEL_IDS = [REASONING_OFF_MODEL_ID, LOW_MODEL_ID, MEDIUM_MODEL_ID, OFF_MODEL_ID] as const;
+export const ADVERTISED_MODEL_IDS = ["gjc/anthropic/claude-sonnet-4"] as const;
 
 export function staticModelReaderFactory(
 	transcript: string[] = [],

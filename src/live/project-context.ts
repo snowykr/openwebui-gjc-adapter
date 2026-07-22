@@ -52,7 +52,7 @@ export async function resolveLiveProjectContext(
 
 export function isGjcOpenWebUIModelId(modelId: string): boolean {
 	const classified = classifyGjcModelId(modelId);
-	return classified.kind === "alias" || classified.kind === "canonical";
+	return classified.kind === "alias" || classified.kind === "base" || classified.kind === "canonical";
 }
 
 async function findProjectByOpenWebUIChatFolder(

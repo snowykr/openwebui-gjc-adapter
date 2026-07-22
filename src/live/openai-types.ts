@@ -48,6 +48,7 @@ export interface OpenAIChatCompletionRequest {
 	readonly model: string;
 	readonly messages: readonly OpenAIChatMessage[];
 	readonly stream?: boolean;
+	readonly reasoning_effort?: string;
 	readonly metadata?: Record<string, unknown>;
 	readonly files?: readonly OpenAIChatAttachment[];
 }

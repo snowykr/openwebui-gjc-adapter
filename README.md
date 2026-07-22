@@ -60,7 +60,7 @@ OPENAI_API_KEY=<adapter-openai-key>
 ENABLE_OPENAI_API=True
 ```
 
-OpenWebUI requests may use the input-only `gjc` alias or a canonical model id from `/v1/models`. Add the custom headers shown in [OpenWebUI setup](#openwebui-setup). The placeholders in those headers are required for the adapter to associate requests with the OpenWebUI chat, messages, user, and task.
+OpenWebUI requests may use the input-only `gjc` alias or a base model id from `/v1/models`. The catalog advertises chat models from the active GJC provider once per model and omits non-chat `codex-auto-review` and `gpt-image*` entries. Select a supported thinking level through OpenWebUI's **Advanced Parameters → Reasoning Effort** field (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` as supported by that model); when omitted, the adapter preserves the current level when valid and otherwise uses the model default. Legacy model ids containing a `:<thinking>` suffix remain accepted but are not advertised. Add the custom headers shown in [OpenWebUI setup](#openwebui-setup). The placeholders in those headers are required for the adapter to associate requests with the OpenWebUI chat, messages, user, and task.
 
 ### Safety and recovery
 

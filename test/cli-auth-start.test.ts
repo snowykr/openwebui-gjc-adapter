@@ -6,7 +6,7 @@ import { buildAdapterServerOptionsFromEnv } from "../src/cli";
 import { createAdapterRequestHandler } from "../src/server";
 import { chatRequest, FakeGjcTurnRunner, reserveTcpPort, stopProcess, waitForStartedServer } from "./cli-fixtures";
 import { type SdkFixtureServer, startSdkFixtureServer } from "./gjc-sdk-v3-fixtures";
-import { CANONICAL_MODEL_IDS } from "./model-selection-fixtures";
+import { ADVERTISED_MODEL_IDS } from "./model-selection-fixtures";
 
 const spawnedProcesses: Bun.Subprocess[] = [];
 const sdkServers: SdkFixtureServer[] = [];
@@ -89,7 +89,7 @@ describe("adapter CLI auth and start", () => {
 		expect({ status: modelsResponse.status, body }).toMatchObject({ status: 200 });
 		expect(modelsResponse.status).toBe(200);
 		expect(body.object).toBe("list");
-		expect(body.data.map(model => model.id)).toEqual([...CANONICAL_MODEL_IDS]);
+		expect(body.data.map(model => model.id)).toEqual([...ADVERTISED_MODEL_IDS]);
 		expect(await fs.readFile(fixtureTranscript, "utf8")).toContain('"interactive":"create"');
 		const transcriptEntries = (await fs.readFile(fixtureTranscript, "utf8"))
 			.trim()
