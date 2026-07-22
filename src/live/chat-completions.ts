@@ -156,7 +156,7 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 			...(controlFromMetadata(input.request.metadata) === undefined
 				? {}
 				: { control: controlFromMetadata(input.request.metadata) }),
-			...(input.eventSink === undefined
+			...(input.eventSink === undefined || input.request.stream !== true
 				? {}
 				: {
 						onLiveEvents: async events => {

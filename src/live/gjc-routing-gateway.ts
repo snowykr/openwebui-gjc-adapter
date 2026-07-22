@@ -145,7 +145,8 @@ export function createGjcRoutingLiveGatewayRunner(
 			}
 			const queue = new LiveChunkQueue();
 			let activityStarted = false;
-			let observedTurnEvent = false;
+			let observedNativeLifecycle = false;
+			let agentStartDelivered = false;
 			let resolveActivity!: () => void;
 			let rejectActivity!: (error: unknown) => void;
 			const firstActivity = new Promise<void>((resolve, reject) => {
@@ -173,7 +174,8 @@ export function createGjcRoutingLiveGatewayRunner(
 					ensureProjectionRows(input.outbox, routed.mapping, input.ownerUserId ?? "openwebui-gjc-adapter"),
 				onObservedTurn: async event => {
 					markActivityStarted();
-					observedTurnEvent = true;
+					if (isNativeLifecycleEvent(event.type)) observedNativeLifecycle = true;
+					if (isTerminalEvent(event.type)) return;
 					const payload = isRecord(event.payload) ? event.payload : undefined;
 					const assistant =
 						payload !== undefined && isRecord(payload.assistantMessageEvent)
@@ -198,7 +200,10 @@ export function createGjcRoutingLiveGatewayRunner(
 						projectedEvent =>
 							projectedEvent.type !== "status" || projectedEvent.data.description !== "Unsupported GJC frame",
 					);
-					if (projected.length > 0) await turn.onLiveEvents?.(projected);
+					if (projected.length > 0) {
+						if (event.type === "agent_start") agentStartDelivered = true;
+						await turn.onLiveEvents?.(projected);
+					}
 				},
 				...(modelSelection === undefined ? {} : { modelSelection }),
 			})
@@ -209,10 +214,14 @@ export function createGjcRoutingLiveGatewayRunner(
 							? undefined
 							: formatCanonicalModelId(result.mapping.modelSelection);
 					const pendingGate = latestPendingWorkflowGate(result.events);
-					if (!observedTurnEvent || pendingGate !== null) {
-						const projected = projectTurnEvents(result.events, canonicalModel);
-						if (projected.length > 0) await turn.onLiveEvents?.(projected);
-					}
+					const completionEvents =
+						pendingGate !== null
+							? result.events
+							: observedNativeLifecycle
+								? result.events.filter(event => isTerminalEvent(event.type))
+								: result.events.filter(event => !(agentStartDelivered && event.type === "agent_start"));
+					const projected = projectTurnEvents(completionEvents, canonicalModel);
+					if (projected.length > 0) await turn.onLiveEvents?.(projected);
 					await queue.finish(result.assistantText);
 				})
 				.catch(error => {
@@ -233,6 +242,15 @@ function isSameProject(mapping: SessionMapping | undefined, turn: LiveGatewayRun
 }
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
 	return typeof value === "object" && value !== null;
+}
+function isNativeLifecycleEvent(type: unknown): boolean {
+	return (
+		typeof type === "string" &&
+		["message_update", "tool_execution_start", "tool_execution_update", "tool_execution_end"].includes(type)
+	);
+}
+function isTerminalEvent(type: unknown): boolean {
+	return typeof type === "string" && ["agent_end", "agent_failed", "action_needed"].includes(type);
 }
 class LiveChunkQueue implements AsyncIterable<string> {
 	private readonly items: string[] = [];

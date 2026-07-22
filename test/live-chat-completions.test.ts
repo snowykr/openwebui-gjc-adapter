@@ -125,6 +125,30 @@ describe("live OpenAI-compatible chat completions", () => {
 			},
 		]);
 	});
+	it("does not enable live event delivery for non-stream requests", async () => {
+		const delivered: unknown[] = [];
+		const events = [{ type: "status" as const, data: { description: "Thinking", done: true } }];
+		const result = await handleChatCompletions({
+			request,
+			headers: chatHeaders,
+			projects: [projectWithFolder],
+			owner,
+			projectContextRepository: await demoRepository(),
+			runner: {
+				run(input) {
+					expect(input.onLiveEvents).toBeUndefined();
+					return { content: "done", model: "gjc/anthropic/claude-sonnet-4:low", events };
+				},
+			},
+			eventSink(input) {
+				delivered.push(input);
+			},
+		});
+
+		expect(result.ok).toBe(true);
+		expect(delivered).toHaveLength(1);
+		expect(delivered[0]).toEqual(expect.objectContaining({ events }));
+	});
 
 	it("persists final assistant content to the injected message sink", async () => {
 		const persisted: unknown[] = [];

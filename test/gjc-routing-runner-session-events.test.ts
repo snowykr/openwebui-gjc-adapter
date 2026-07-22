@@ -156,6 +156,50 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 			);
 		}
 	});
+	test("preserves artifact fallback events after observing a terminal frame", async () => {
+		const turnRunner = new FakeGjcTurnRunner();
+		turnRunner.observedEvents = [{ type: "agent_start" }, { type: "agent_end" }];
+		turnRunner.events = [
+			{ type: "agent_start" },
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "thinking_start" } } },
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "thinking_end" } } },
+			{ type: "tool_execution_start", payload: { toolName: "read" } },
+			{ type: "tool_execution_end", payload: { toolName: "read" } },
+			{ type: "agent_end" },
+		];
+		const runner = createGjcRoutingLiveGatewayRunner({
+			turnRunner,
+			mappings: new SessionMappingStore(),
+			modelReaderFactory: staticModelReaderFactory(),
+		});
+		const liveEvents: NonNullable<Awaited<ReturnType<typeof runner.run>>["events"]>[number][] = [];
+		const result = await runner.run({
+			project,
+			prompt: "hello",
+			chatId: "chat-artifact-fallback",
+			messageId: "assistant-artifact-fallback",
+			userMessageId: "user-artifact-fallback",
+			userMessageParentId: null,
+			continued: false,
+			requestedModelId: "gjc",
+			onLiveEvents: events => {
+				liveEvents.push(...events);
+			},
+		});
+		if (result.chunks === undefined) throw new Error("expected live chunks");
+		for await (const _chunk of result.chunks) {
+			// Drain the response so completion events are delivered.
+		}
+
+		expect(liveEvents).toEqual([
+			status("agent_start", false),
+			status("Thinking started", false, "skill_progress"),
+			status("Thinking completed", true, "skill_progress"),
+			status("Tool read started", false, "tool_progress"),
+			status("Tool read finished", true, "tool_progress"),
+			status("agent_end", true),
+		]);
+	});
 	test.each(["delta", "text"] as const)(
 		"streams native text deltas from %s before terminal persistence completes",
 		async field => {
