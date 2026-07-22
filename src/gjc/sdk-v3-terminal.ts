@@ -1,4 +1,9 @@
-import type { PublicSdkGate, PublicSdkTurnCorrelation, PublicSdkTurnOutcome } from "./public-sdk-contract";
+import type {
+	PublicSdkGate,
+	PublicSdkTurnCorrelation,
+	PublicSdkTurnEventObserver,
+	PublicSdkTurnOutcome,
+} from "./public-sdk-contract";
 import type { SdkV3Client } from "./sdk-v3-client";
 import { parseRecord, requiredString, type SdkRecord, SdkV3OperationError } from "./sdk-v3-protocol";
 
@@ -14,19 +19,25 @@ export class SdkTerminalWindow {
 	readonly #sessionId: string;
 	readonly #frames: SdkRecord[] = [];
 	readonly #unsubscribe: () => void;
+	readonly #observer?: PublicSdkTurnEventObserver;
+	#observerChain = Promise.resolve();
+	#observerError: unknown;
+	#acceptedCorrelation: SdkTurnCorrelation | undefined;
 	readonly #waiters = new Set<() => void>();
 	#gateBaseline: ReadonlySet<string> | undefined;
 	#acceptedAt: number | undefined;
 	#activityVersion = 0;
 	readonly #checkedActions = new Set<string>();
 
-	constructor(client: SdkV3Client, sessionId: string) {
+	constructor(client: SdkV3Client, sessionId: string, observer?: PublicSdkTurnEventObserver) {
 		this.#client = client;
 		this.#sessionId = sessionId;
+		this.#observer = observer;
 		this.#unsubscribe = client.onFrame(frame => {
 			if (typeof frame.type !== "string") return;
 			this.#frames.push(frame);
 			this.#activityVersion += 1;
+			this.emitAccepted(frame);
 			for (const wake of this.#waiters) wake();
 			this.#waiters.clear();
 		});
@@ -56,6 +67,27 @@ export class SdkTerminalWindow {
 		if (this.#acceptedAt !== undefined)
 			throw new SdkV3OperationError("invalid_state", "Only one mutation is allowed per terminal attachment");
 		this.#acceptedAt = this.#frames.length;
+		this.#acceptedCorrelation = correlation;
+	}
+	private emitAccepted(frame: SdkRecord): void {
+		if (this.#acceptedCorrelation === undefined || this.#observer === undefined) return;
+		const event = normalizeEvent(frame);
+		if (event === undefined || !matchesObserved(event, this.#acceptedCorrelation)) return;
+		this.#observerChain = this.#observerChain
+			.then(() => this.#observer!(event))
+			.catch(error => {
+				this.#observerError ??= error;
+				for (const wake of this.#waiters) wake();
+				this.#waiters.clear();
+			});
+	}
+	private async flushObserver(): Promise<void> {
+		for (;;) {
+			const chain = this.#observerChain;
+			await chain;
+			if (chain === this.#observerChain) break;
+		}
+		if (this.#observerError !== undefined) throw this.#observerError;
 	}
 
 	async wait(
@@ -67,6 +99,7 @@ export class SdkTerminalWindow {
 			throw new SdkV3OperationError("invalid_state", "Mutation was not accepted");
 		const deadline = Date.now() + timeoutMs;
 		for (;;) {
+			await this.flushObserver();
 			const terminal = this.terminalOutcome(correlation);
 			if (terminal !== undefined) return terminal;
 			const action = this.pendingAction(correlation);
@@ -288,6 +321,19 @@ function matchesAction(frame: SdkRecord, correlation: SdkTurnCorrelation): boole
 		(commandId === undefined && turnId === undefined) ||
 		(commandId === correlation.commandId && turnId === correlation.turnId)
 	);
+}
+function matchesObserved(frame: SdkRecord, correlation: SdkTurnCorrelation): boolean {
+	if (matches(frame, correlation)) return true;
+	if (frame.type === "turn_stream") return matchesSessionOnlyTurnStream(frame, correlation);
+	if (
+		typeof frame.type !== "string" ||
+		!["message_update", "tool_execution_start", "tool_execution_update", "tool_execution_end"].includes(frame.type)
+	)
+		return false;
+	if (frame.sessionId !== undefined && frame.sessionId !== correlation.sessionId) return false;
+	if (frame.commandId !== undefined && frame.commandId !== correlation.commandId) return false;
+	if (frame.turnId !== undefined && frame.turnId !== correlation.turnId) return false;
+	return true;
 }
 function gateId(gate: SdkRecord): string {
 	const value = gate.gate_id ?? gate.gateId ?? gate.id;

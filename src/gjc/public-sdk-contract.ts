@@ -70,6 +70,8 @@ export class PublicSdkClosePreAcknowledgementError extends Error {
 }
 export type PublicSdkLifecycleSuccessorCallback = (successor: PublicSdkSessionAttachment) => Promise<void> | void;
 
+/** A normalized, correlated live event observed while a turn is running. */
+export type PublicSdkTurnEventObserver = (event: Readonly<Record<string, unknown>>) => Promise<void> | void;
 export interface PublicSdkSessionPort {
 	attach(
 		attachment: PublicSdkSessionAttachment,
@@ -90,7 +92,7 @@ export interface PublicSdkSessionPort {
 		idempotencyKey?: string,
 		timeoutMs?: number,
 	): Promise<NormalizedModelSelection>;
-	prompt(text: string, timeoutMs?: number): Promise<PublicSdkTurnOutcome>;
+	prompt(text: string, timeoutMs?: number, observer?: PublicSdkTurnEventObserver): Promise<PublicSdkTurnOutcome>;
 	reply(
 		operation: string,
 		input: Readonly<Record<string, unknown>>,
@@ -98,9 +100,19 @@ export interface PublicSdkSessionPort {
 		timeoutMs?: number,
 	): Promise<unknown>;
 	steer(text: string, idempotencyKey?: string, timeoutMs?: number): Promise<unknown>;
-	followUp(text: string, idempotencyKey?: string, timeoutMs?: number): Promise<PublicSdkTurnOutcome>;
+	followUp(
+		text: string,
+		idempotencyKey?: string,
+		timeoutMs?: number,
+		observer?: PublicSdkTurnEventObserver,
+	): Promise<PublicSdkTurnOutcome>;
 	abort(idempotencyKey?: string, timeoutMs?: number): Promise<unknown>;
-	abortAndPrompt(text: string, idempotencyKey?: string, timeoutMs?: number): Promise<PublicSdkTurnOutcome>;
+	abortAndPrompt(
+		text: string,
+		idempotencyKey?: string,
+		timeoutMs?: number,
+		observer?: PublicSdkTurnEventObserver,
+	): Promise<PublicSdkTurnOutcome>;
 	replyToAction(actionId: string, answer: unknown, idempotencyKey?: string, timeoutMs?: number): Promise<unknown>;
 	planApprove(input: Readonly<Record<string, unknown>>, idempotencyKey?: string, timeoutMs?: number): Promise<unknown>;
 	answerGate(
@@ -108,6 +120,7 @@ export interface PublicSdkSessionPort {
 		answer: unknown,
 		idempotencyKey?: string,
 		timeoutMs?: number,
+		observer?: PublicSdkTurnEventObserver,
 	): Promise<PublicSdkTurnOutcome>;
 	branchCandidates(timeoutMs?: number): Promise<readonly PublicSdkBranchCandidate[]>;
 	branch(

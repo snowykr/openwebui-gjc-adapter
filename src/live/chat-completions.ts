@@ -140,6 +140,7 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 	}
 
 	let runnerResult: LiveGatewayRunnerResult;
+	let liveEventsDelivered = false;
 	try {
 		runnerResult = await input.runner.run({
 			project,
@@ -155,6 +156,21 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 			...(controlFromMetadata(input.request.metadata) === undefined
 				? {}
 				: { control: controlFromMetadata(input.request.metadata) }),
+			...(input.eventSink === undefined
+				? {}
+				: {
+						onLiveEvents: async events => {
+							if (events.length === 0) return;
+							liveEventsDelivered = true;
+							await input.eventSink?.({
+								chatId: headers.chatId,
+								messageId: headers.messageId,
+								ownerUserId: input.owner.ownerUserId,
+								projectId: project.id,
+								events,
+							});
+						},
+					}),
 		});
 	} catch (error) {
 		if (error instanceof LiveGatewayUnavailableError) {
@@ -181,7 +197,7 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 
 	await deliverRunnerEvents({
 		eventSink: input.eventSink,
-		events: runnerResult.events,
+		events: input.request.stream === true && liveEventsDelivered ? undefined : runnerResult.events,
 		chatId: headers.chatId,
 		messageId: headers.messageId,
 		ownerUserId: input.owner.ownerUserId,

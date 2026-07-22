@@ -63,6 +63,32 @@ export async function discoverFreshGjcSessionFile(
 	}
 	return matches[0]!;
 }
+export async function waitForFreshGjcSessionFile(
+	sessionRoot: string,
+	baselinePaths: ReadonlySet<string>,
+	expectedSessionId: string,
+	expectedCwd: string,
+	timeoutMs = 1_000,
+): Promise<LoadedGjcSessionFile> {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		try {
+			return await discoverFreshGjcSessionFile(sessionRoot, baselinePaths, expectedSessionId, expectedCwd);
+		} catch (error) {
+			if (!isMissingFreshTranscript(error) || Date.now() >= deadline) throw error;
+			await new Promise(resolve => setTimeout(resolve, Math.min(25, deadline - Date.now())));
+		}
+	}
+}
+
+function isMissingFreshTranscript(error: unknown): error is GjcSessionLoadError {
+	return (
+		error instanceof GjcSessionLoadError &&
+		error.diagnostics.length === 1 &&
+		error.diagnostics[0]?.code === "corrupt_session_file" &&
+		error.diagnostics[0].message.endsWith("found 0")
+	);
+}
 
 export async function snapshotGjcSessionFiles(sessionRoot: string): Promise<ReadonlySet<string>> {
 	const root = await canonicalGjcSessionRoot(sessionRoot);

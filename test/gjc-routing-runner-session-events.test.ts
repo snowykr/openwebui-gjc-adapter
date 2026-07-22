@@ -13,12 +13,53 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 			{ type: "message_update", payload: { assistantMessageEvent: { type: "thinking_delta", text: secret } } },
 			{
 				type: "message_update",
+				payload: {
+					assistantMessageEvent: {
+						type: "reasoning_summary_start",
+						partial: { thinkingSignature: secret },
+					},
+				},
+			},
+			{
+				type: "message_update",
+				payload: {
+					assistantMessageEvent: {
+						type: "reasoning_summary_delta",
+						delta: "Checking weather",
+						partial: { rawBuffer: secret, thinkingSignature: secret },
+					},
+				},
+			},
+			{
+				type: "message_update",
+				payload: { assistantMessageEvent: { type: "reasoning_summary_end", partial: { secret } } },
+			},
+			{
+				type: "message_update",
 				payload: { assistantMessageEvent: { type: "thinking_end", text: secret, nested: { secret } } },
 			},
 			{ type: "message_update", payload: { assistantMessageEvent: { type: "thinking", text: secret } } },
 			{
 				type: "message_update",
 				payload: { assistantMessageEvent: { type: "tool_call", name: "read", args: { secret } } },
+			},
+			{
+				type: "message_update",
+				payload: { assistantMessageEvent: { type: "toolcall_start", partial: { secret } } },
+			},
+			{
+				type: "message_update",
+				payload: { assistantMessageEvent: { type: "toolcall_delta", delta: secret, partial: { secret } } },
+			},
+			{
+				type: "message_update",
+				payload: {
+					assistantMessageEvent: {
+						type: "toolcall_end",
+						toolCall: { name: "read", arguments: { secret } },
+						partial: { secret },
+					},
+				},
 			},
 			{
 				type: "tool_execution_start",
@@ -55,6 +96,7 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 			modelReaderFactory: staticModelReaderFactory(),
 		});
 
+		const liveEvents: NonNullable<Awaited<ReturnType<typeof runner.run>>["events"]>[number][] = [];
 		const result = await runner.run({
 			project,
 			prompt: "hello",
@@ -64,16 +106,25 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 			userMessageParentId: null,
 			continued: false,
 			requestedModelId: "gjc",
+			onLiveEvents: events => {
+				liveEvents.push(...events);
+			},
 		});
+		let content = "";
+		if (result.chunks !== undefined) for await (const chunk of result.chunks) content += chunk;
+		expect(content).toBe("new:hello");
 
-		const serialized = JSON.stringify(result.events);
+		const serialized = JSON.stringify(liveEvents);
 		expect(serialized).not.toContain(secret);
-		expect(result.events).toEqual([
+		expect(liveEvents).toEqual([
 			status("Thinking started", false, "skill_progress"),
 			status("Thinking in progress", false, "skill_progress"),
+			status("Thinking: Checking weather", false, "skill_progress"),
 			status("Thinking completed", true, "skill_progress"),
 			status("Thinking completed", true, "skill_progress"),
 			status("Tool read started", false, "tool_progress"),
+			status("Tool started", false, "tool_progress"),
+			status("Tool read finished", true, "tool_progress"),
 			status("MCP tool mcp__filesystem__read_file started", false, "mcp_progress"),
 			status("Tool updated", false, "tool_progress"),
 			status("Tool read_file finished", true, "tool_progress"),
@@ -91,9 +142,8 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 			status("Retry fallback succeeded", true),
 			status("TTSR triggered", true),
 			status("Thinking level updated", true),
-			status("Unsupported GJC frame", true),
 		]);
-		for (const event of result.events ?? []) {
+		for (const event of liveEvents) {
 			if (event.type !== "status") continue;
 			expect(event.data.gjc_adapter).toEqual(
 				event.data.description === "Unsupported GJC frame"
@@ -105,6 +155,52 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 						},
 			);
 		}
+	});
+	test("streams native text deltas before terminal persistence completes", async () => {
+		const turnRunner = new FakeGjcTurnRunner();
+		let release!: () => void;
+		turnRunner.completionBarrier = new Promise<void>(resolve => {
+			release = resolve;
+		});
+		turnRunner.events = [
+			{
+				type: "message_update",
+				payload: { assistantMessageEvent: { type: "text_delta", delta: "new:" } },
+			},
+		];
+		const runner = createGjcRoutingLiveGatewayRunner({
+			turnRunner,
+			mappings: new SessionMappingStore(),
+			modelReaderFactory: staticModelReaderFactory(),
+		});
+
+		const result = await runner.run({
+			project,
+			prompt: "hello",
+			chatId: "chat-stream",
+			messageId: "assistant-stream",
+			userMessageId: "user-stream",
+			userMessageParentId: null,
+			continued: false,
+			requestedModelId: "gjc",
+			onLiveEvents: () => undefined,
+		});
+		if (result.chunks === undefined) throw new Error("expected live chunks");
+		if (!(Symbol.asyncIterator in result.chunks)) throw new Error("expected async live chunks");
+		const iterator = result.chunks[Symbol.asyncIterator]();
+
+		expect(await iterator.next()).toEqual({ value: "new:", done: false });
+		let secondSettled = false;
+		const second = iterator.next().then(value => {
+			secondSettled = true;
+			return value;
+		});
+		await Promise.resolve();
+		expect(secondSettled).toBeFalse();
+
+		release();
+		expect(await second).toEqual({ value: "hello", done: false });
+		expect(await iterator.next()).toEqual({ value: undefined, done: true });
 	});
 });
 

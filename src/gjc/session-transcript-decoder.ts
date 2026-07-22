@@ -139,6 +139,11 @@ const entryChecks: Record<string, (value: unknown) => boolean> = {
 			...entryBase,
 			selectedToolNames: isStringArray,
 		}),
+	discovered_builtin_tool_selection: value =>
+		hasExactFields(value, "discovered_builtin_tool_selection", ["id", "parentId", "timestamp", "selectedToolNames"], {
+			...entryBase,
+			selectedToolNames: isStringArray,
+		}),
 	session_init: value =>
 		hasExactFields(value, "session_init", ["id", "parentId", "timestamp", "systemPrompt", "task", "tools"], {
 			...entryBase,

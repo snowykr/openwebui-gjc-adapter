@@ -1,4 +1,9 @@
-import type { PublicSdkGate, PublicSdkSessionAttachment, PublicSdkTurnOutcome } from "./public-sdk-contract";
+import type {
+	PublicSdkGate,
+	PublicSdkSessionAttachment,
+	PublicSdkTurnEventObserver,
+	PublicSdkTurnOutcome,
+} from "./public-sdk-contract";
 import { createPublicSdkDeadline } from "./public-sdk-deadline";
 import type { SdkV3Client } from "./sdk-v3-client";
 import { parseRecord, requiredString, type SdkRecord, SdkV3OperationError } from "./sdk-v3-protocol";
@@ -17,10 +22,11 @@ export async function runTurn(
 	input: SdkRecord,
 	key: string | undefined,
 	timeoutMs: number,
+	observer?: PublicSdkTurnEventObserver,
 ): Promise<PublicSdkTurnOutcome> {
 	const { attachment, client } = context;
 	const deadline = createPublicSdkDeadline(timeoutMs, `${operation} timed out after ${timeoutMs}ms`);
-	const window = new SdkTerminalWindow(client, attachment.sessionId);
+	const window = new SdkTerminalWindow(client, attachment.sessionId, observer);
 	try {
 		await window.captureGateBaseline(deadline.remaining());
 		window.beginMutation();
@@ -50,13 +56,14 @@ export async function runGateTurn(
 	answer: unknown,
 	key: string | undefined,
 	timeoutMs: number,
+	observer?: PublicSdkTurnEventObserver,
 ): Promise<PublicSdkTurnOutcome> {
 	const { attachment, client } = context;
 	if (gate.correlation.sessionId !== attachment.sessionId) {
 		throw new SdkV3OperationError("endpoint_stale", "Workflow gate belongs to another session");
 	}
 	const deadline = createPublicSdkDeadline(timeoutMs, `workflow.gate_answer timed out after ${timeoutMs}ms`);
-	const window = new SdkTerminalWindow(client, attachment.sessionId);
+	const window = new SdkTerminalWindow(client, attachment.sessionId, observer);
 	try {
 		await window.captureGateBaseline(deadline.remaining());
 		window.beginMutation();

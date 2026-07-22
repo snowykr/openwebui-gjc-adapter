@@ -400,6 +400,36 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 			terminal.close();
 		}
 	});
+	test("Given correlation-less 0.11.6 message updates When observing an accepted turn Then they stream live", async () => {
+		const observed: SdkRecord[] = [];
+		const { terminal, emit } = await terminalFixture(event => {
+			observed.push(event);
+		});
+		try {
+			const pending = terminal.wait(correlation, 500);
+			emit({
+				type: "message_update",
+				payload: {
+					type: "message_update",
+					assistantMessageEvent: { type: "text_delta", delta: "live" },
+				},
+			});
+			emit({ type: "agent_end", ...correlation });
+			await pending;
+
+			expect(observed).toEqual([
+				expect.objectContaining({
+					type: "message_update",
+					payload: expect.objectContaining({
+						assistantMessageEvent: { type: "text_delta", delta: "live" },
+					}),
+				}),
+				expect.objectContaining({ type: "agent_end" }),
+			]);
+		} finally {
+			terminal.close();
+		}
+	});
 	test("Given malformed or mismatched 0.11.6 agent_end envelopes When waiting Then they cannot terminate another turn", async () => {
 		const { terminal, emit } = await terminalFixture();
 		try {
@@ -442,7 +472,7 @@ function replyResolutionClient(): {
 }
 const correlation = { sessionId: "session-0116", commandId: "command-0116", turnId: "turn-0116" };
 
-async function terminalFixture(): Promise<{
+async function terminalFixture(observer?: (event: SdkRecord) => void | Promise<void>): Promise<{
 	readonly terminal: SdkTerminalWindow;
 	readonly emit: (frame: SdkRecord) => void;
 }> {
@@ -454,7 +484,7 @@ async function terminalFixture(): Promise<{
 		},
 		queryAll: async () => [],
 	} as unknown as SdkV3Client;
-	const terminal = new SdkTerminalWindow(client, correlation.sessionId);
+	const terminal = new SdkTerminalWindow(client, correlation.sessionId, observer);
 	await terminal.captureGateBaseline(500);
 	terminal.beginMutation();
 	terminal.accept(correlation);

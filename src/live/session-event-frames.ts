@@ -52,6 +52,12 @@ function thinkingFrame(event: GjcTurnEvent): ProjectableAgentFrame | undefined {
 			return skillFrame("Thinking started", "start");
 		case "thinking_delta":
 			return skillFrame("Thinking in progress", "progress");
+		case "reasoning_summary_delta": {
+			const delta = textField(assistant ?? {}, "delta")?.trim();
+			return delta === undefined || delta.length === 0
+				? undefined
+				: skillFrame(`Thinking: ${delta.slice(0, 240)}`, "progress");
+		}
 		case "thinking_end":
 			return skillFrame("Thinking completed", "end");
 		case "thinking":
@@ -61,6 +67,19 @@ function thinkingFrame(event: GjcTurnEvent): ProjectableAgentFrame | undefined {
 				safeToolNameValue(assistant === undefined ? undefined : textField(assistant, "name")),
 				"start",
 			);
+		case "toolcall_start":
+			return toolFrameForName(undefined, "start");
+		case "toolcall_delta":
+		case "reasoning_summary_start":
+		case "reasoning_summary_end":
+			return undefined;
+		case "toolcall_end": {
+			const toolCall = assistant === undefined ? undefined : assistant.toolCall;
+			return toolFrameForName(
+				isRecord(toolCall) ? safeToolNameValue(textField(toolCall, "name")) : undefined,
+				"end",
+			);
+		}
 		default:
 			return undefined;
 	}

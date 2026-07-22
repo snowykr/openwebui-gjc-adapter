@@ -10,6 +10,7 @@ import {
 	GjcSessionLoadError,
 	loadGjcSessionFile,
 	snapshotGjcSessionFiles,
+	waitForFreshGjcSessionFile,
 } from "../src/gjc/session-loader";
 
 const tempDirs: string[] = [];
@@ -158,6 +159,22 @@ describe("fresh GJC session discovery", () => {
 		await writeSessionHeader(path.join(sessionRoot, "successor.jsonl"), "successor", projectCwd);
 
 		await expect(discoverFreshGjcSessionFile(sessionRoot, baseline, "successor", projectCwd)).resolves.toMatchObject({
+			filePath: path.join(sessionRoot, "successor.jsonl"),
+			header: { id: "successor", cwd: projectCwd },
+		});
+	});
+	test("waits for the accepted session transcript to flush", async () => {
+		const sessionRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-discovery-"));
+		tempDirs.push(sessionRoot);
+		const projectCwd = path.join(sessionRoot, "project");
+		const baseline = await snapshotGjcSessionFiles(sessionRoot);
+		const pending = waitForFreshGjcSessionFile(sessionRoot, baseline, "successor", projectCwd, 500);
+
+		setTimeout(() => {
+			void writeSessionHeader(path.join(sessionRoot, "successor.jsonl"), "successor", projectCwd);
+		}, 30);
+
+		await expect(pending).resolves.toMatchObject({
 			filePath: path.join(sessionRoot, "successor.jsonl"),
 			header: { id: "successor", cwd: projectCwd },
 		});

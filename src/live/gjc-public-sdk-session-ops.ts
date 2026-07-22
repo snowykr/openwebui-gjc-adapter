@@ -1,7 +1,7 @@
 import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import { CliLifecycleBackend } from "../gjc/cli-lifecycle-backend";
-import { discoverFreshGjcSessionFile, snapshotGjcSessionFiles } from "../gjc/session-loader";
+import { snapshotGjcSessionFiles, waitForFreshGjcSessionFile } from "../gjc/session-loader";
 import type {
 	GjcContinueSessionInput,
 	GjcLifecycleTransaction,
@@ -29,7 +29,7 @@ import {
 	waitForSdkEndpoint,
 } from "./gjc-routing-endpoints";
 import type { PublicSdkRunnerContext } from "./gjc-routing-lifecycle";
-import { turnResult } from "./gjc-routing-proof";
+import { normalizeObservedSdkRecord, turnResult } from "./gjc-routing-proof";
 import { runLifecycleTestBarrier } from "./gjc-routing-test-barrier";
 import { projectSessionArtifactEvents } from "./gjc-session-artifact-events";
 
@@ -84,9 +84,9 @@ export async function startNewSession<T>(
 					await beforePrompt(address, provisionalProof, lifecycle);
 					provisionalAuthorityPersisted = true;
 					const result = await withMutationPort(context, attachment, lifecycle, port =>
-						prompt(context, port, input.text, input.modelSelection),
+						prompt(context, port, input.text, input.modelSelection, input.observer),
 					);
-					const transcript = await discoverFreshGjcSessionFile(
+					const transcript = await waitForFreshGjcSessionFile(
 						input.sessionRoot,
 						baseline,
 						lifecycleAttachment.sessionId,
@@ -157,7 +157,7 @@ export async function continueSession(
 ): Promise<GjcTurnResult> {
 	const attachment = await ensureAttachment(context, input, input.lifecycle);
 	const result = await withMutationPort(context, attachment, input.lifecycle, port =>
-		prompt(context, port, input.text, input.modelSelection),
+		prompt(context, port, input.text, input.modelSelection, input.observer),
 	);
 	return turnResult(
 		await withSessionArtifactEvents(result.outcome, input.sessionFile, input.text),
@@ -190,7 +190,13 @@ export async function respondWorkflowGate(
 		payload: {},
 	};
 	const outcome = await withMutationPort(context, attachment, input.lifecycle, port =>
-		port.answerGate(gate, input.answer, input.idempotencyKey, context.input.turnTimeoutMs),
+		port.answerGate(
+			gate,
+			input.answer,
+			input.idempotencyKey,
+			context.input.turnTimeoutMs,
+			input.observer === undefined ? undefined : event => input.observer?.(normalizeObservedSdkRecord(event)),
+		),
 	);
 	return turnResult(
 		outcome,
