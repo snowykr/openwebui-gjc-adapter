@@ -206,15 +206,24 @@ async function withSessionArtifactEvents(
 ): Promise<import("../gjc/public-sdk-contract").PublicSdkTurnOutcome> {
 	const artifactEvents = await projectSessionArtifactEvents(sessionFile, promptText);
 	if (artifactEvents.length === 0) return outcome;
+	return mergeSessionArtifactEvents(outcome, artifactEvents);
+}
+
+export function mergeSessionArtifactEvents(
+	outcome: import("../gjc/public-sdk-contract").PublicSdkTurnOutcome,
+	artifactEvents: readonly { readonly type: string; readonly payload?: Readonly<Record<string, unknown>> }[],
+): import("../gjc/public-sdk-contract").PublicSdkTurnOutcome {
+	const projected = artifactEvents.map(event => ({
+		type: event.type,
+		...(event.payload === undefined ? {} : event.payload),
+	}));
+	const terminalIndex = outcome.events.findIndex(event =>
+		["agent_end", "agent_failed", "action_needed"].includes(String(event.type)),
+	);
+	const insertionIndex = terminalIndex === -1 ? outcome.events.length : terminalIndex;
 	return {
 		...outcome,
-		events: [
-			...outcome.events,
-			...artifactEvents.map(event => ({
-				type: event.type,
-				...(event.payload === undefined ? {} : event.payload),
-			})),
-		],
+		events: [...outcome.events.slice(0, insertionIndex), ...projected, ...outcome.events.slice(insertionIndex)],
 	};
 }
 function requireExactProvisionalProof(proof: import("../gjc/session-authority").SessionAttachmentProof): void {

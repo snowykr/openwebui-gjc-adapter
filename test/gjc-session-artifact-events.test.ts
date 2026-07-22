@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { mergeSessionArtifactEvents } from "../src/live/gjc-public-sdk-session-ops";
 import { projectSessionArtifactEvents } from "../src/live/gjc-session-artifact-events";
 
 const prompt = "inspect the repository";
@@ -59,6 +60,24 @@ describe("GJC session artifact event projection", () => {
 		} finally {
 			await fixture.cleanup();
 		}
+	});
+	test("inserts reconstructed lifecycle before the terminal status", () => {
+		const merged = mergeSessionArtifactEvents(
+			{
+				events: [{ type: "turn_stream", phase: "live" }, { type: "agent_end" }],
+			},
+			[
+				{ type: "message_update", payload: { assistantMessageEvent: { type: "thinking_end" } } },
+				{ type: "tool_execution_end", payload: { toolName: "read" } },
+			],
+		);
+
+		expect(merged.events.map(event => event.type)).toEqual([
+			"turn_stream",
+			"message_update",
+			"tool_execution_end",
+			"agent_end",
+		]);
 	});
 	test("fails closed for malformed, unknown, and oversized artifacts", async () => {
 		const fixture = await artifact([
