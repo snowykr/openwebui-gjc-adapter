@@ -25,22 +25,55 @@ Commands:
   probe-ready         Check an installed adapter service readiness
   credentials show adapter-token  Display an installed adapter token
 
+First-install route:
+  managed   Requires rootful Docker with userns-remap disabled, user systemd,
+            and OpenWebUI >=0.10.0; use existing when those Docker prerequisites fail.
+  existing  Uses an externally owned OpenWebUI deployment and provider setup.
+
+Readiness:
+  probe-ready checks adapter/OpenWebUI readiness only. It does not prove GJC
+  provider authentication, usable models, or a successful first turn. Complete
+  GJC provider/model onboarding separately; see route help and README.
+
 Models:
   gjc/<encoded-provider>/<encoded-model>:<thinking>  Canonical GJC model id
   gjc  Input-only alias for the current machine-global default
 `;
 const EXISTING_HELP = `Usage: openwebui-gjc-adapter configure existing [options]
 
+Required existing-route inputs:
+  --openwebui-url URL          Existing OpenWebUI base URL
+  --adapter-ingress-url URL    Adapter URL reachable from OpenWebUI
+  --openwebui-api-token-fd FD  Distinct inherited decimal FD for the admin token
+
+Ownership:
+  Provider connection, custom headers, ingress, and their operation remain
+  manual and externally owned. The adapter validates the supplied OpenWebUI
+  administration token; it does not configure that provider.
+
 GJC runtime location options:
   --gjc-config-dir-name NAME   Set the persisted GJC config directory name
   --gjc-coding-agent-dir PATH  Set the persisted canonical coding-agent directory
+
+FD safety: pass inherited descriptor numbers, never secret values. Keep setup
+descriptors distinct and open for this process.
 
 Precedence: persisted CLI values, adapter-namespaced environment values, then derived defaults.
 Pending recovery values are authoritative for retries.
 `;
 const MANAGED_HELP = `Usage: openwebui-gjc-adapter configure managed [options]
 
+Prerequisites before this command:
+  Rootful Docker, Docker userns-remap disabled, user systemd, and OpenWebUI
+  >=0.10.0. Use configure existing when those Docker prerequisites do not hold.
 Managed GJC runtime locations are fixed; runtime location overrides are rejected.
+Required managed-route inputs:
+  --admin-email-fd FD           Distinct inherited decimal FD for admin email
+  --admin-password-fd FD        Distinct inherited decimal FD for admin password
+
+FD safety: pass two distinct inherited decimal descriptor numbers, never secret
+values. Managed configures only its owned OpenWebUI provider after adapter
+readiness; GJC provider authentication and model onboarding remain GJC-owned.
 `;
 
 type Capture = { value: string };
@@ -125,6 +158,20 @@ describe("CLI module boundaries", () => {
 		]);
 		expect(results[1]?.stdout.match(/--gjc-[a-z-]+/g)).toEqual(["--gjc-config-dir-name", "--gjc-coding-agent-dir"]);
 		expect(results[2]?.stdout).not.toContain("--gjc-");
+		expect(results[0]?.stdout).toContain("probe-ready checks adapter/OpenWebUI readiness only");
+		expect(results[1]?.stdout).toContain("--openwebui-url URL");
+		expect(results[1]?.stdout).toContain("--adapter-ingress-url URL");
+		expect(results[1]?.stdout).toContain("--openwebui-api-token-fd FD");
+		expect(results[2]?.stdout).toContain("Rootful Docker");
+		expect(results[2]?.stdout).toContain("userns-remap disabled");
+		expect(results[2]?.stdout).toContain("Use configure existing when those Docker prerequisites do not hold.");
+		const readme = readFileSync(join(ROOT, "README.md"), "utf8");
+		expect(readme).toContain(
+			"route-specific help for first-install guidance. Route help documents required first-install inputs and prerequisites",
+		);
+		expect(readme).not.toContain("route-specific help for the complete accepted surface");
+		for (const output of results.map(result => result.stdout))
+			expect(output).not.toMatch(/--(?:provider-key|provider-credential|mpreset|profile|reload)\b/);
 	});
 
 	test("pins config outputs diagnostics and validation message order", () => {
