@@ -226,6 +226,8 @@ function normalizeEvent(frame: SdkRecord): SdkRecord | undefined {
 	if (frame.type === "event") {
 		const payload = recordOrUndefined(frame.payload);
 		if (payload === undefined) return undefined;
+		const event = unwrapEmbeddedEvent(payload, payload.event_type);
+		if (event !== undefined) return event;
 		if (payload.type !== "event") return payload;
 		return normalizeSessionEvent(payload);
 	}
@@ -249,7 +251,15 @@ function isPayloadWrappedTerminal(frame: SdkRecord): boolean {
 function normalizeSessionEvent(frame: SdkRecord): SdkRecord | undefined {
 	if (typeof frame.kind !== "string") return undefined;
 	const payload = recordOrUndefined(frame.payload);
-	return payload === undefined ? undefined : { ...payload, type: frame.kind };
+	if (payload === undefined) return undefined;
+	return unwrapEmbeddedEvent(payload, frame.kind) ?? { ...payload, type: frame.kind };
+}
+
+function unwrapEmbeddedEvent(payload: SdkRecord, type: unknown): SdkRecord | undefined {
+	const event = recordOrUndefined(payload.event);
+	if (event === undefined || typeof type !== "string") return undefined;
+	const { event: _event, event_type: _eventType, ...metadata } = payload;
+	return { ...metadata, ...event, type };
 }
 
 function recordOrUndefined(value: unknown): SdkRecord | undefined {

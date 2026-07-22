@@ -356,12 +356,9 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 				"agent_end",
 			]);
 			expect(result.events.filter(event => event.type === "message_update").map(event => event.payload)).toEqual([
-				expect.objectContaining({
-					event_type: "message_update",
-					event: { assistantMessageEvent: { type: "text_delta", text: "visible" } },
-				}),
-				expect.objectContaining({ event: { assistantMessageEvent: { type: "thinking", text: "reasoning" } } }),
-				expect.objectContaining({ event: { assistantMessageEvent: { type: "tool_call", name: "read" } } }),
+				expect.objectContaining({ assistantMessageEvent: { type: "text_delta", text: "visible" } }),
+				expect.objectContaining({ assistantMessageEvent: { type: "thinking", text: "reasoning" } }),
+				expect.objectContaining({ assistantMessageEvent: { type: "tool_call", name: "read" } }),
 			]);
 			expect(result.events.some(event => event.type === "event")).toBeFalse();
 		} finally {
