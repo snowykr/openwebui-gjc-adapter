@@ -9,60 +9,63 @@ describe("SDK v3 client boundaries", () => {
 		["malformed JSON", "{"],
 		["wrong protocol version", JSON.stringify({ type: "server_hello", protocolVersion: 2 })],
 		["error before hello", JSON.stringify({ type: "error", code: "unauthorized", message: "denied" })],
-	])("Given %s before hello When reconnecting Then the released client retries until a hello is accepted", async (_caseName, firstFrame) => {
-		// Given
-		let connections = 0;
-		let firstConnectionClosed = false;
-		let firstSocket: Bun.ServerWebSocket<undefined> | undefined;
-		const server = Bun.serve({
-			port: 0,
-			fetch(request, bunServer) {
-				return bunServer.upgrade(request, { data: undefined })
-					? undefined
-					: new Response("upgrade required", { status: 426 });
-			},
-			websocket: {
-				open(socket) {
-					connections += 1;
-					if (connections === 1) firstSocket = socket;
-					socket.send(
-						connections === 1
-							? firstFrame
-							: JSON.stringify({ type: "server_hello", protocolVersion: 3, connectionId: "valid" }),
-					);
+	])(
+		"Given %s before hello When reconnecting Then the released client retries until a hello is accepted",
+		async (_caseName, firstFrame) => {
+			// Given
+			let connections = 0;
+			let firstConnectionClosed = false;
+			let firstSocket: Bun.ServerWebSocket<undefined> | undefined;
+			const server = Bun.serve({
+				port: 0,
+				fetch(request, bunServer) {
+					return bunServer.upgrade(request, { data: undefined })
+						? undefined
+						: new Response("upgrade required", { status: 426 });
 				},
-				message(socket, message) {
-					const frame = parseFrame(message);
-					socket.send(
-						JSON.stringify({
-							type: "query_response",
-							id: frame.id,
-							ok: true,
-							page: { items: ["reconnected"], complete: true },
-						}),
-					);
+				websocket: {
+					open(socket) {
+						connections += 1;
+						if (connections === 1) firstSocket = socket;
+						socket.send(
+							connections === 1
+								? firstFrame
+								: JSON.stringify({ type: "server_hello", protocolVersion: 3, connectionId: "valid" }),
+						);
+					},
+					message(socket, message) {
+						const frame = parseFrame(message);
+						socket.send(
+							JSON.stringify({
+								type: "query_response",
+								id: frame.id,
+								ok: true,
+								page: { items: ["reconnected"], complete: true },
+							}),
+						);
+					},
+					close(socket) {
+						if (socket === firstSocket) firstConnectionClosed = true;
+					},
 				},
-				close(socket) {
-					if (socket === firstSocket) firstConnectionClosed = true;
-				},
-			},
-		});
-		const client = new SdkV3Client({ url: `ws://127.0.0.1:${server.port}`, token: "test" });
+			});
+			const client = new SdkV3Client({ url: `ws://127.0.0.1:${server.port}`, token: "test" });
 
-		try {
-			// When
-			await client.connect(500);
-			const items = await client.queryAll("models.list/current", {}, 200);
+			try {
+				// When
+				await client.connect(500);
+				const items = await client.queryAll("models.list/current", {}, 200);
 
-			// Then
-			expect(items).toEqual(["reconnected"]);
-			expect(connections).toBe(_caseName === "wrong protocol version" ? 1 : 2);
-			expect(firstConnectionClosed).toBe(_caseName !== "wrong protocol version");
-		} finally {
-			client.detach();
-			server.stop(true);
-		}
-	});
+				// Then
+				expect(items).toEqual(["reconnected"]);
+				expect(connections).toBe(_caseName === "wrong protocol version" ? 1 : 2);
+				expect(firstConnectionClosed).toBe(_caseName !== "wrong protocol version");
+			} finally {
+				client.detach();
+				server.stop(true);
+			}
+		},
+	);
 
 	test("Given a query repeats its continuation cursor When collecting all pages Then it fails after the repeated page", async () => {
 		// Given

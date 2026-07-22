@@ -1556,40 +1556,42 @@ test("retains a generation-bound persisted pane through a live restart and drops
 	}
 });
 
-test.each([
-	"post_mutation_pre_proof",
-	"pre_durable_publication",
-] as const)("rejects stale public SDK work at %s without a durable result", async phase => {
-	const fixture = setupPublicRunnerBarrierFixture(phase);
-	try {
-		await withLifecyclePublication(fixture.runner, fixture.address, lifecycle =>
-			fixture.runner.switchSession({ ...fixture.address, lifecycle }),
-		);
-		const continued = withLifecyclePublication(fixture.runner, fixture.address, async lifecycle => {
-			const result = await fixture.runner.continueSession({
-				...fixture.address,
-				text: phase,
-				userMessageId: phase,
-				rawFrameCursor: 0,
-				eventCursor: 0,
-				operationId: phase,
-				lifecycle,
+test.each(["post_mutation_pre_proof", "pre_durable_publication"] as const)(
+	"rejects stale public SDK work at %s without a durable result",
+	async phase => {
+		const fixture = setupPublicRunnerBarrierFixture(phase);
+		try {
+			await withLifecyclePublication(fixture.runner, fixture.address, lifecycle =>
+				fixture.runner.switchSession({ ...fixture.address, lifecycle }),
+			);
+			const continued = withLifecyclePublication(fixture.runner, fixture.address, async lifecycle => {
+				const result = await fixture.runner.continueSession({
+					...fixture.address,
+					text: phase,
+					userMessageId: phase,
+					rawFrameCursor: 0,
+					eventCursor: 0,
+					operationId: phase,
+					lifecycle,
+				});
+				if (phase === "pre_durable_publication") {
+					if (result.attachment === undefined)
+						throw new Error("expected an attachment proof for durable publication");
+					await lifecycle.publish(result.attachment, () => undefined);
+				}
 			});
-			if (phase === "pre_durable_publication") {
-				if (result.attachment === undefined)
-					throw new Error("expected an attachment proof for durable publication");
-				await lifecycle.publish(result.attachment, () => undefined);
-			}
-		});
-		await expect(continued).rejects.toThrow("endpoint descriptor");
-		expect(fixture.hits).toBe(1);
-		expect(
-			fixture.server.frames.filter(frame => frame.type === "control_request" && frame.operation === "turn.prompt"),
-		).toHaveLength(1);
-	} finally {
-		fixture.dispose();
-	}
-});
+			await expect(continued).rejects.toThrow("endpoint descriptor");
+			expect(fixture.hits).toBe(1);
+			expect(
+				fixture.server.frames.filter(
+					frame => frame.type === "control_request" && frame.operation === "turn.prompt",
+				),
+			).toHaveLength(1);
+		} finally {
+			fixture.dispose();
+		}
+	},
+);
 test("rejects a close commit when its public SDK descriptor changes after proof", async () => {
 	const fixture = setupPublicRunnerBarrierFixture("post_close_proof_pre_commit");
 	try {
@@ -1844,47 +1846,47 @@ test("promotes a delayed acknowledged session.new successor after restart", asyn
 	}
 });
 
-test.each([
-	"duplicate",
-	"descriptor replacement",
-] as const)("does not promote an acknowledged session.new successor after restart on %s", async failure => {
-	const fixture = setupAcknowledgedSessionNewFixture("absent");
-	try {
-		await expect(fixture.runner.run(fixture.turn)).rejects.toThrow();
-		writeFileSync(
-			fixture.successorPath,
-			`${JSON.stringify({
-				type: "session",
-				version: 3,
-				id: "sdk-session-new",
-				timestamp: "2026-01-01T00:00:00.000Z",
-				cwd: fixture.root,
-			})}\n`,
-		);
-		if (failure === "duplicate")
-			writeFileSync(fixture.successorCopyPath, readFileSync(fixture.successorPath, "utf8"));
-		else
+test.each(["duplicate", "descriptor replacement"] as const)(
+	"does not promote an acknowledged session.new successor after restart on %s",
+	async failure => {
+		const fixture = setupAcknowledgedSessionNewFixture("absent");
+		try {
+			await expect(fixture.runner.run(fixture.turn)).rejects.toThrow();
 			writeFileSync(
-				fixture.successorEndpointPath,
-				JSON.stringify({ version: 1, url: fixture.server.url, token: "replaced" }),
+				fixture.successorPath,
+				`${JSON.stringify({
+					type: "session",
+					version: 3,
+					id: "sdk-session-new",
+					timestamp: "2026-01-01T00:00:00.000Z",
+					cwd: fixture.root,
+				})}\n`,
 			);
-		const replay = createGjcRoutingLiveGatewayRunner({
-			turnRunner: createPublicSdkGjcTurnRunner(fixture.runnerInput),
-			mappings: new FileBackedSessionMappingStore(fixture.mappingFile),
-		});
-		await expect(replay.run(fixture.turn)).rejects.toThrow("requires reconciliation");
-		expect(
-			new FileBackedSessionMappingStore(fixture.mappingFile).operation("chat-session-new", "session-new"),
-		).toMatchObject({
-			state: "uncertain",
-			acknowledgedSuccessor: { sessionId: "sdk-session-new" },
-		});
-		expect(fixture.server.frames.filter(frame => frame.operation === "session.new")).toHaveLength(1);
-		expect(fixture.server.frames.some(frame => frame.operation === "session.close")).toBe(false);
-	} finally {
-		fixture.dispose();
-	}
-});
+			if (failure === "duplicate")
+				writeFileSync(fixture.successorCopyPath, readFileSync(fixture.successorPath, "utf8"));
+			else
+				writeFileSync(
+					fixture.successorEndpointPath,
+					JSON.stringify({ version: 1, url: fixture.server.url, token: "replaced" }),
+				);
+			const replay = createGjcRoutingLiveGatewayRunner({
+				turnRunner: createPublicSdkGjcTurnRunner(fixture.runnerInput),
+				mappings: new FileBackedSessionMappingStore(fixture.mappingFile),
+			});
+			await expect(replay.run(fixture.turn)).rejects.toThrow("requires reconciliation");
+			expect(
+				new FileBackedSessionMappingStore(fixture.mappingFile).operation("chat-session-new", "session-new"),
+			).toMatchObject({
+				state: "uncertain",
+				acknowledgedSuccessor: { sessionId: "sdk-session-new" },
+			});
+			expect(fixture.server.frames.filter(frame => frame.operation === "session.new")).toHaveLength(1);
+			expect(fixture.server.frames.some(frame => frame.operation === "session.close")).toBe(false);
+		} finally {
+			fixture.dispose();
+		}
+	},
+);
 
 test("promotes an acknowledged session.new successor only after a unique valid transcript", async () => {
 	const fixture = setupAcknowledgedSessionNewFixture("valid");
@@ -1905,37 +1907,37 @@ test("promotes an acknowledged session.new successor only after a unique valid t
 	}
 });
 
-test.each([
-	"duplicate",
-	"invalid",
-] as const)("retains an acknowledged session.new successor when its transcript is %s", async transcript => {
-	const fixture = setupAcknowledgedSessionNewFixture(transcript);
-	try {
-		await expect(fixture.runner.run(fixture.turn)).rejects.toThrow();
-		const restarted = new FileBackedSessionMappingStore(fixture.mappingFile);
-		expect(restarted.get("chat-session-new")).toMatchObject({ sessionId: "sdk-session-created" });
-		expect(restarted.operation("chat-session-new", "session-new")).toMatchObject({
-			state: "uncertain",
-			acknowledgedSuccessor: { sessionId: "sdk-session-new" },
-		});
-		expect(
-			Object.keys(
-				restarted.operation("chat-session-new", "session-new")?.acknowledgedSuccessor?.attachment ?? {},
-			).sort(),
-		).toEqual([
-			"descriptorPath",
-			"descriptorStat",
-			"expectedCwd",
-			"expectedSessionId",
-			"generation",
-			"payloadDigest",
-		]);
-		expect(fixture.server.frames.some(frame => frame.operation === "session.close")).toBe(false);
-		expect(await Bun.file(fixture.predecessorPath).exists()).toBe(true);
-	} finally {
-		fixture.dispose();
-	}
-});
+test.each(["duplicate", "invalid"] as const)(
+	"retains an acknowledged session.new successor when its transcript is %s",
+	async transcript => {
+		const fixture = setupAcknowledgedSessionNewFixture(transcript);
+		try {
+			await expect(fixture.runner.run(fixture.turn)).rejects.toThrow();
+			const restarted = new FileBackedSessionMappingStore(fixture.mappingFile);
+			expect(restarted.get("chat-session-new")).toMatchObject({ sessionId: "sdk-session-created" });
+			expect(restarted.operation("chat-session-new", "session-new")).toMatchObject({
+				state: "uncertain",
+				acknowledgedSuccessor: { sessionId: "sdk-session-new" },
+			});
+			expect(
+				Object.keys(
+					restarted.operation("chat-session-new", "session-new")?.acknowledgedSuccessor?.attachment ?? {},
+				).sort(),
+			).toEqual([
+				"descriptorPath",
+				"descriptorStat",
+				"expectedCwd",
+				"expectedSessionId",
+				"generation",
+				"payloadDigest",
+			]);
+			expect(fixture.server.frames.some(frame => frame.operation === "session.close")).toBe(false);
+			expect(await Bun.file(fixture.predecessorPath).exists()).toBe(true);
+		} finally {
+			fixture.dispose();
+		}
+	},
+);
 
 function setupAcknowledgedSessionNewFixture(transcript: "absent" | "valid" | "duplicate" | "invalid") {
 	const root = mkdtempSync(join(tmpdir(), "gjc-session-new-ack-"));
