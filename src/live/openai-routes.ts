@@ -196,12 +196,27 @@ export async function handleOpenAIChatCompletionsRequest(
 	}
 	if (!result.ok) return jsonResponse(result.body, { status: result.status });
 	if ("stream" in result) {
-		return new Response(result.stream, {
+		return new Response(asyncIterableBody(result.stream), {
 			status: result.status,
 			headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" },
 		});
 	}
 	return jsonResponse(result.body, { status: result.status });
+}
+
+function asyncIterableBody(source: AsyncIterable<string>): ReadableStream<Uint8Array> {
+	const iterator = source[Symbol.asyncIterator]();
+	const encoder = new TextEncoder();
+	return new ReadableStream<Uint8Array>({
+		async pull(controller) {
+			const next = await iterator.next();
+			if (next.done) controller.close();
+			else controller.enqueue(encoder.encode(next.value));
+		},
+		async cancel() {
+			await iterator.return?.();
+		},
+	});
 }
 
 function modelSelectionErrorResponse(error: unknown): Response {

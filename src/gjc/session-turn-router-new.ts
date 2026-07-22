@@ -41,6 +41,7 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 				parentId: input.parentId,
 				text: input.text,
 				...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
+				...(input.onObservedTurn === undefined ? {} : { observer: input.onObservedTurn }),
 			},
 			async (result, lifecycle) => {
 				const completedSelection =

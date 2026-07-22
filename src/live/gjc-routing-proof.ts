@@ -11,6 +11,14 @@ export type SessionAttachment = Omit<CliLifecycleAttachment, "pane"> & {
 	readonly published?: PublicSdkSessionAttachment;
 };
 
+export function normalizeObservedSdkRecord(event: Readonly<Record<string, unknown>>): GjcTurnEvent {
+	const type = typeof event.type === "string" ? event.type : "";
+	return {
+		type,
+		...(typeof event.id === "string" ? { id: event.id } : {}),
+		payload: event,
+	};
+}
 export function turnResult(
 	outcome: import("../gjc/public-sdk-contract").PublicSdkTurnOutcome,
 	sessionFile: string | undefined,

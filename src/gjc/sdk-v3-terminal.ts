@@ -1,4 +1,9 @@
-import type { PublicSdkGate, PublicSdkTurnCorrelation, PublicSdkTurnOutcome } from "./public-sdk-contract";
+import type {
+	PublicSdkGate,
+	PublicSdkTurnCorrelation,
+	PublicSdkTurnEventObserver,
+	PublicSdkTurnOutcome,
+} from "./public-sdk-contract";
 import type { SdkV3Client } from "./sdk-v3-client";
 import { parseRecord, requiredString, type SdkRecord, SdkV3OperationError } from "./sdk-v3-protocol";
 
@@ -14,19 +19,24 @@ export class SdkTerminalWindow {
 	readonly #sessionId: string;
 	readonly #frames: SdkRecord[] = [];
 	readonly #unsubscribe: () => void;
+	readonly #observer?: PublicSdkTurnEventObserver;
+	#observerChain = Promise.resolve();
+	#acceptedCorrelation: SdkTurnCorrelation | undefined;
 	readonly #waiters = new Set<() => void>();
 	#gateBaseline: ReadonlySet<string> | undefined;
 	#acceptedAt: number | undefined;
 	#activityVersion = 0;
 	readonly #checkedActions = new Set<string>();
 
-	constructor(client: SdkV3Client, sessionId: string) {
+	constructor(client: SdkV3Client, sessionId: string, observer?: PublicSdkTurnEventObserver) {
 		this.#client = client;
 		this.#sessionId = sessionId;
+		this.#observer = observer;
 		this.#unsubscribe = client.onFrame(frame => {
 			if (typeof frame.type !== "string") return;
 			this.#frames.push(frame);
 			this.#activityVersion += 1;
+			this.emitAccepted(frame);
 			for (const wake of this.#waiters) wake();
 			this.#waiters.clear();
 		});
@@ -56,6 +66,20 @@ export class SdkTerminalWindow {
 		if (this.#acceptedAt !== undefined)
 			throw new SdkV3OperationError("invalid_state", "Only one mutation is allowed per terminal attachment");
 		this.#acceptedAt = this.#frames.length;
+		this.#acceptedCorrelation = correlation;
+	}
+	private emitAccepted(frame: SdkRecord): void {
+		if (this.#acceptedCorrelation === undefined || this.#observer === undefined) return;
+		const event = normalizeEvent(frame);
+		if (event === undefined || !matchesObserved(event, this.#acceptedCorrelation)) return;
+		this.#observerChain = this.#observerChain.then(() => this.#observer!(event)).catch(() => undefined);
+	}
+	private async flushObserver(): Promise<void> {
+		for (;;) {
+			const chain = this.#observerChain;
+			await chain;
+			if (chain === this.#observerChain) break;
+		}
 	}
 
 	async wait(
@@ -67,6 +91,7 @@ export class SdkTerminalWindow {
 			throw new SdkV3OperationError("invalid_state", "Mutation was not accepted");
 		const deadline = Date.now() + timeoutMs;
 		for (;;) {
+			await this.flushObserver();
 			const terminal = this.terminalOutcome(correlation);
 			if (terminal !== undefined) return terminal;
 			const action = this.pendingAction(correlation);
@@ -89,7 +114,7 @@ export class SdkTerminalWindow {
 	}
 	private postAcceptEvents(): readonly SdkRecord[] {
 		return this.postAcceptFrames()
-			.map(unwrapEvent)
+			.map(normalizeEvent)
 			.filter((frame): frame is SdkRecord => frame !== undefined);
 	}
 
@@ -157,17 +182,31 @@ export class SdkTerminalWindow {
 		finalizedAssistantText = this.finalizedText(correlation),
 	): SdkTerminalOutcome {
 		return {
-			events: this.postAcceptFrames(),
+			events: this.postAcceptEvents(),
 			...(finalizedAssistantText === undefined ? {} : { finalizedAssistantText }),
 			...(gate === undefined ? {} : { gate }),
 		};
 	}
 
 	private finalizedText(correlation: SdkTurnCorrelation): string | undefined {
-		for (const frame of [...this.postAcceptEvents()].reverse()) {
+		const events = this.postAcceptEvents();
+		for (let index = events.length - 1; index >= 0; index -= 1) {
+			const frame = events[index]!;
+			const hasMatchingLiveStream = events
+				.slice(0, index)
+				.some(
+					previous =>
+						previous.type === "turn_stream" &&
+						previous.phase === "live" &&
+						previous.sessionId === correlation.sessionId &&
+						typeof frame.messageRef === "string" &&
+						frame.messageRef.length > 0 &&
+						previous.messageRef === frame.messageRef,
+				);
 			if (
 				frame.type === "turn_stream" &&
-				matchesTurnStream(frame, correlation) &&
+				(matchesTurnStream(frame, correlation) ||
+					(hasMatchingLiveStream && matchesSessionOnlyTurnStream(frame, correlation))) &&
 				frame.phase === "finalized" &&
 				frame.finalAnswer === true &&
 				typeof frame.text === "string"
@@ -203,19 +242,53 @@ export class SdkTerminalWindow {
 	}
 }
 
-function unwrapEvent(frame: SdkRecord): SdkRecord | undefined {
-	return frame.type === "event"
-		? parseRecord(frame.payload, "event payload")
-		: typeof frame.type === "string" && !frame.type.endsWith("_response")
-			? frame
-			: undefined;
+function normalizeEvent(frame: SdkRecord): SdkRecord | undefined {
+	if (frame.type === "event") {
+		const payload = recordOrUndefined(frame.payload);
+		if (payload === undefined) return undefined;
+		const event = unwrapEmbeddedEvent(payload, payload.event_type);
+		if (event !== undefined) return event;
+		if (payload.type !== "event") return payload;
+		return normalizeSessionEvent(payload);
+	}
+	if (isPayloadWrappedTerminal(frame)) {
+		const payload = recordOrUndefined(frame.payload);
+		return payload?.type === frame.type ? payload : undefined;
+	}
+	return typeof frame.type === "string" && !frame.type.endsWith("_response") ? frame : undefined;
+}
+
+function isPayloadWrappedTerminal(frame: SdkRecord): boolean {
+	return (
+		(frame.type === "turn_stream" ||
+			frame.type === "agent_end" ||
+			frame.type === "agent_failed" ||
+			frame.type === "action_needed") &&
+		"payload" in frame
+	);
+}
+
+function normalizeSessionEvent(frame: SdkRecord): SdkRecord | undefined {
+	if (typeof frame.kind !== "string") return undefined;
+	const payload = recordOrUndefined(frame.payload);
+	if (payload === undefined) return undefined;
+	return unwrapEmbeddedEvent(payload, frame.kind) ?? { ...payload, type: frame.kind };
+}
+
+function unwrapEmbeddedEvent(payload: SdkRecord, type: unknown): SdkRecord | undefined {
+	const event = recordOrUndefined(payload.event);
+	if (event === undefined || typeof type !== "string") return undefined;
+	const { event: _event, event_type: _eventType, ...metadata } = payload;
+	return { ...metadata, ...event, type };
+}
+
+function recordOrUndefined(value: unknown): SdkRecord | undefined {
+	return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as SdkRecord) : undefined;
 }
 function matches(frame: SdkRecord, correlation: SdkTurnCorrelation): boolean {
-	const nested =
-		typeof frame.correlation === "object" && frame.correlation !== null
-			? parseRecord(frame.correlation, "event correlation")
-			: frame;
+	const nested = frame.correlation === undefined ? frame : recordOrUndefined(frame.correlation);
 	return (
+		nested !== undefined &&
 		nested.sessionId === correlation.sessionId &&
 		nested.commandId === correlation.commandId &&
 		nested.turnId === correlation.turnId
@@ -228,6 +301,10 @@ function matchesTurnStream(frame: SdkRecord, correlation: SdkTurnCorrelation): b
 		frame.turnId === correlation.turnId
 	);
 }
+
+function matchesSessionOnlyTurnStream(frame: SdkRecord, correlation: SdkTurnCorrelation): boolean {
+	return frame.sessionId === correlation.sessionId && frame.commandId === undefined && frame.turnId === undefined;
+}
 function matchesAction(frame: SdkRecord, correlation: SdkTurnCorrelation): boolean {
 	if (frame.sessionId !== correlation.sessionId) return false;
 	const commandId = frame.commandId;
@@ -236,6 +313,19 @@ function matchesAction(frame: SdkRecord, correlation: SdkTurnCorrelation): boole
 		(commandId === undefined && turnId === undefined) ||
 		(commandId === correlation.commandId && turnId === correlation.turnId)
 	);
+}
+function matchesObserved(frame: SdkRecord, correlation: SdkTurnCorrelation): boolean {
+	if (matches(frame, correlation)) return true;
+	if (frame.type === "turn_stream") return matchesSessionOnlyTurnStream(frame, correlation);
+	if (
+		typeof frame.type !== "string" ||
+		!["message_update", "tool_execution_start", "tool_execution_update", "tool_execution_end"].includes(frame.type)
+	)
+		return false;
+	if (frame.sessionId !== undefined && frame.sessionId !== correlation.sessionId) return false;
+	if (frame.commandId !== undefined && frame.commandId !== correlation.commandId) return false;
+	if (frame.turnId !== undefined && frame.turnId !== correlation.turnId) return false;
+	return true;
 }
 function gateId(gate: SdkRecord): string {
 	const value = gate.gate_id ?? gate.gateId ?? gate.id;

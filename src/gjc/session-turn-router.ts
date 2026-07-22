@@ -106,6 +106,7 @@ export async function routeGjcTurn(input: RouteGjcTurnInput): Promise<RouteGjcTu
 					recoveryAttachment: existing.attachment,
 					lifecycle,
 					...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
+					...(input.onObservedTurn === undefined ? {} : { observer: input.onObservedTurn }),
 				});
 				const completedSelection =
 					input.modelSelection === undefined ? undefined : normalizeModelSelection(result.modelSelection);

@@ -6,7 +6,8 @@ import { baseChat } from "./openwebui-test-fixtures";
 
 describe("OpenWebUIHttpClient projection writes", () => {
 	test("upserts projection records and posts message events over authenticated HTTP", async () => {
-		const fixture = startRecordingServer();
+		const fixtureOptions: { responseBody?: unknown } = {};
+		const fixture = startRecordingServer(fixtureOptions);
 		const client = new OpenWebUIHttpClient({ baseUrl: fixture.baseUrl, apiToken: "token-1" });
 
 		try {
@@ -27,6 +28,7 @@ describe("OpenWebUIHttpClient projection writes", () => {
 					metadata: { gjc_adapter: { projected_message_id: "entry-1" } },
 				},
 			]);
+			fixtureOptions.responseBody = true;
 			await client.postMessageEvent({
 				chatId: "chat-1",
 				messageId: "message-1",

@@ -38,7 +38,7 @@ Add the required custom headers on the OpenAI connection:
 }
 ```
 
-Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. The adapter and managed image use the published `@gajae-code/coding-agent` and `@gajae-code/natives` `0.11.4` pair. The image runs the published `gjc` executable as the non-root `adapter` user, including `tmux`; it does not build a private broker or apply an upstream source patch. Background task calls such as title generation are no-ops and must not create GJC sessions.
+Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. The adapter and managed image use the published `@gajae-code/ai`, `@gajae-code/bridge-client`, `@gajae-code/coding-agent`, and `@gajae-code/natives` `0.11.6` release. The image runs the published `gjc` executable as the non-root `adapter` user, including `tmux`; it does not build a private broker or apply an upstream source patch. Background task calls such as title generation are no-ops and must not create GJC sessions.
 
 ## CLI first-install configuration
 
@@ -152,3 +152,13 @@ Selection updates the machine-global last-successful-writer-wins default. Operat
 ## Operator notes
 
 Keep the adapter session/project store on persistent storage. Do not give the adapter an allowed root broader than the directories intended for GJC operation. Artifact links are resolved with realpath containment and symlink escapes are rejected.
+## OpenWebUI visual smoke test
+
+With OpenWebUI and the adapter already running, use the focused Chromium smoke test to verify the real UI boundary:
+
+```sh
+GJC_OPENWEBUI_E2E_MODEL='gjc/<provider>/<model>:<thinking-level>' \
+bun scripts/gjc-openwebui-e2e.ts
+```
+
+Set `GJC_OPENWEBUI_E2E_URL`, `GJC_TRUSTED_CHROMIUM_EXECUTABLE`, and OpenWebUI credentials when the local defaults do not apply. The smoke test selects the configured model through the real UI, submits a prompt that requires the `read` tool, and requires visible thinking/tool completion plus a native Socket.IO event. It writes a screenshot to `/tmp/gjc-openwebui-smoke.webp` by default.

@@ -46,8 +46,9 @@ export interface CitationFrame {
 
 export interface UnsupportedFrame {
 	readonly kind: "unsupported";
-	readonly frameType: string;
-	readonly metadata?: Record<string, unknown>;
+	readonly eventType?: string;
+	readonly id?: string | null;
+	readonly textPresent?: boolean;
 }
 
 export interface ProjectedAgentFrame {
@@ -91,13 +92,12 @@ export function projectAgentFrame(frame: ProjectableAgentFrame, sse: OpenAISsePr
 				sseChunks: [],
 				events: [
 					buildOpenWebUIStatusEvent({
-						description: `Unsupported GJC frame: ${boundedText(frame.frameType)}`,
+						description: "Unsupported GJC frame",
 						done: true,
 						hidden: true,
 						gjc_adapter: {
 							diagnostic: "unsupported_frame",
-							frameType: boundedText(frame.frameType),
-							metadata: boundedMetadata(frame.metadata),
+							...unsupportedDiagnosticAdapterMetadata(frame),
 						},
 					}),
 				],
@@ -116,6 +116,18 @@ function progressGjcAdapterMetadata(frame: ProgressFrame): Record<string, unknow
 	};
 }
 
+function unsupportedDiagnosticAdapterMetadata(frame: UnsupportedFrame): Record<string, unknown> {
+	const metadata = unsupportedDiagnosticMetadata(frame);
+	return Object.keys(metadata).length === 0 ? {} : { metadata };
+}
+function unsupportedDiagnosticMetadata(frame: UnsupportedFrame): Record<string, string | boolean | null> {
+	return {
+		...(frame.eventType === undefined ? {} : { eventType: boundedText(frame.eventType) }),
+		...(frame.id === undefined ? {} : { id: frame.id === null ? null : boundedText(frame.id) }),
+		...(frame.textPresent === undefined ? {} : { textPresent: frame.textPresent }),
+	};
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -130,28 +142,6 @@ export function encodeOpenAISseTextChunk(content: string, input: OpenAISseProjec
 	};
 	return `data: ${JSON.stringify(chunk)}\n\n`;
 }
-
 function boundedText(value: string, maxLength = 80): string {
 	return value.length <= maxLength ? value : `${value.slice(0, maxLength - 3)}...`;
-}
-
-function boundedMetadata(metadata: Record<string, unknown> | undefined): Record<string, unknown> {
-	if (metadata === undefined) return {};
-	const bounded: Record<string, unknown> = {};
-	let count = 0;
-	for (const key in metadata) {
-		if (!Object.hasOwn(metadata, key)) continue;
-		if (count >= 8) break;
-		count++;
-		const boundedKey = boundedText(key, 80);
-		const value = metadata[key];
-		if (typeof value === "string") {
-			bounded[boundedKey] = boundedText(value, 120);
-		} else if (typeof value === "number" || typeof value === "boolean" || value === null) {
-			bounded[boundedKey] = value;
-		} else {
-			bounded[boundedKey] = "[complex metadata omitted]";
-		}
-	}
-	return bounded;
 }

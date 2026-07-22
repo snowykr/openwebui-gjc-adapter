@@ -12,7 +12,7 @@ import {
 	withPublicSdkSessionMutationCoordinator,
 } from "../gjc/public-sdk-session-port";
 import { SdkV3OperationError } from "../gjc/sdk-v3-protocol";
-import type { GjcLifecycleTransaction, GjcSessionAddress } from "../gjc/turn-runner";
+import type { GjcLifecycleTransaction, GjcSessionAddress, GjcTurnEventObserver } from "../gjc/turn-runner";
 import {
 	attachmentFor,
 	attachmentKey,
@@ -30,6 +30,7 @@ import {
 	attachmentProof,
 	canRetainColdResumePane,
 	isPositiveSafeInteger,
+	normalizeObservedSdkRecord,
 	type SessionAttachment,
 } from "./gjc-routing-proof";
 import { isModelSelectionApplyFailure } from "./gjc-routing-selection";
@@ -223,6 +224,7 @@ export async function prompt(
 	port: PublicSdkSessionPort,
 	text: string,
 	selection?: NormalizedModelSelection,
+	observer?: GjcTurnEventObserver,
 ): Promise<{ readonly outcome: PublicSdkTurnOutcome; readonly modelSelection?: NormalizedModelSelection }> {
 	let modelSelection = selection;
 	if (selection !== undefined) {
@@ -237,5 +239,12 @@ export async function prompt(
 			throw error;
 		}
 	}
-	return { outcome: await port.prompt(text, context.input.turnTimeoutMs), modelSelection };
+	return {
+		outcome: await port.prompt(
+			text,
+			context.input.turnTimeoutMs,
+			observer === undefined ? undefined : event => observer(normalizeObservedSdkRecord(event)),
+		),
+		modelSelection,
+	};
 }

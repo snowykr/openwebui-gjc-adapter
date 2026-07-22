@@ -12,6 +12,7 @@ import type { SessionAttachmentProof } from "./session-authority";
 import type { AcknowledgedSuccessor } from "./session-authority-types";
 import type { SessionMapping } from "./session-mapping-store";
 
+export type GjcTurnEventObserver = (event: GjcTurnEvent) => Promise<void> | void;
 export type {
 	GjcLifecycleOwner,
 	GjcLifecyclePublicationAddress,
@@ -33,6 +34,7 @@ export interface GjcStartNewSessionInput {
 	readonly parentId?: string;
 	readonly text: string;
 	readonly modelSelection?: NormalizedModelSelection;
+	readonly observer?: GjcTurnEventObserver;
 }
 
 export interface GjcContinueSessionInput extends GjcSessionAddress, GjcLifecycleScoped {
@@ -46,6 +48,7 @@ export interface GjcContinueSessionInput extends GjcSessionAddress, GjcLifecycle
 	readonly eventCursor: number;
 	readonly operationId: string;
 	readonly modelSelection?: NormalizedModelSelection;
+	readonly observer?: GjcTurnEventObserver;
 }
 
 export interface GjcSwitchSessionInput extends GjcSessionAddress, GjcLifecycleScoped {
@@ -61,6 +64,7 @@ export interface GjcSessionStateInput extends GjcSessionAddress, GjcLifecycleSco
 export interface GjcRespondWorkflowGateInput extends GjcSessionAddress, GjcLifecycleScoped {
 	readonly gateId: string;
 	readonly answer: WorkflowGateAnswer;
+	readonly promptText: string;
 	readonly idempotencyKey?: string;
 	readonly userMessageId: string;
 	readonly parentId?: string;
@@ -71,6 +75,7 @@ export interface GjcRespondWorkflowGateInput extends GjcSessionAddress, GjcLifec
 	readonly eventCursor: number;
 	readonly operationId: string;
 	readonly gateCorrelation?: GjcWorkflowGateCorrelation;
+	readonly observer?: GjcTurnEventObserver;
 }
 
 export interface GjcWorkflowGateCorrelation {

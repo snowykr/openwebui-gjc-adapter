@@ -5,7 +5,7 @@ import type {
 	OpenWebUIProjectionRepository,
 } from "./client";
 import type { OpenWebUIMessageEvent } from "./events";
-import { OpenWebUIHttpError } from "./http-errors";
+import { OpenWebUIHttpError, OpenWebUITransportError } from "./http-errors";
 import type { OpenWebUIFileBytes, OpenWebUIFileContent } from "./http-file-types";
 import { replaceOpenWebUIChatMessages } from "./http-message-writer";
 import { parseOpenWebUIChatRecord, parseOpenWebUIFileContent } from "./http-parsers";
@@ -45,6 +45,19 @@ export interface UpdateOpenWebUIMessageContentInput {
 }
 
 const DEFAULT_TIMEOUT_MS = 10_000;
+export class OpenWebUIMessageEventResponseError extends Error {
+	readonly method = "POST";
+	readonly path: string;
+	readonly detail: string;
+
+	constructor(input: { readonly path: string; readonly detail: string }) {
+		super(`OpenWebUI message event POST ${input.path} returned an invalid response: ${input.detail}`);
+		this.name = "OpenWebUIMessageEventResponseError";
+		this.path = input.path;
+		this.detail = input.detail;
+	}
+}
+
 export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 	readonly #transport: OpenWebUITransport;
 
@@ -160,11 +173,27 @@ export class OpenWebUIHttpClient implements OpenWebUIProjectionRepository {
 		await this.#transport.sendJson({ method: "DELETE", path }, { missingStatuses: [404] });
 	}
 	async postMessageEvent(input: PostOpenWebUIMessageEventInput): Promise<void> {
-		await this.#transport.sendJson({
+		const request = {
 			method: "POST",
 			path: openWebUIApiPath(["chats", input.chatId, "messages", input.messageId, "event"]),
 			body: input.event,
-		});
+		} as const;
+		let response: unknown;
+		try {
+			response = await this.#transport.sendJson(request);
+		} catch (error) {
+			if (error instanceof OpenWebUIHttpError || error instanceof OpenWebUITransportError) throw error;
+			throw new OpenWebUIMessageEventResponseError({
+				path: request.path,
+				detail: "response must be valid JSON boolean true",
+			});
+		}
+		if (response !== true) {
+			throw new OpenWebUIMessageEventResponseError({
+				path: request.path,
+				detail: "response must be JSON boolean true",
+			});
+		}
 	}
 	async updateMessageContent(input: UpdateOpenWebUIMessageContentInput): Promise<void> {
 		await this.#transport.sendJson({

@@ -58,15 +58,19 @@ describe("projectAgentFrame", () => {
 
 	test("maps unsupported frames to a bounded hidden diagnostic status event", () => {
 		expect(
-			projectAgentFrame({ kind: "unsupported", frameType: "raw_debug", metadata: { seq: 7 } }, sse).events,
+			projectAgentFrame({ kind: "unsupported", eventType: "raw_debug", id: "frame-1", textPresent: false }, sse)
+				.events,
 		).toEqual([
 			{
 				type: "status",
 				data: {
-					description: "Unsupported GJC frame: raw_debug",
+					description: "Unsupported GJC frame",
 					done: true,
 					hidden: true,
-					gjc_adapter: { diagnostic: "unsupported_frame", frameType: "raw_debug", metadata: { seq: 7 } },
+					gjc_adapter: {
+						diagnostic: "unsupported_frame",
+						metadata: { eventType: "raw_debug", id: "frame-1", textPresent: false },
+					},
 				},
 			},
 		]);
@@ -76,8 +80,9 @@ describe("projectAgentFrame", () => {
 		const projected = projectAgentFrame(
 			{
 				kind: "unsupported",
-				frameType: "x".repeat(500),
-				metadata: { secret: "s".repeat(500), nested: { raw: true } },
+				eventType: "x".repeat(500),
+				id: "i".repeat(500),
+				textPresent: true,
 			},
 			sse,
 		);
@@ -87,10 +92,11 @@ describe("projectAgentFrame", () => {
 		if (event?.type !== "status") throw new Error("expected status event");
 		expect(event.data.hidden).toBe(true);
 		expect(event.data.description.length).toBeLessThanOrEqual(110);
-		expect(String(event.data.gjc_adapter?.frameType).length).toBeLessThanOrEqual(80);
+		expect(String(event.data.gjc_adapter?.frameType)).toBe("undefined");
 		expect(event.data.gjc_adapter?.metadata).toEqual({
-			secret: `${"s".repeat(117)}...`,
-			nested: "[complex metadata omitted]",
+			eventType: `${"x".repeat(77)}...`,
+			id: `${"i".repeat(77)}...`,
+			textPresent: true,
 		});
 	});
 });

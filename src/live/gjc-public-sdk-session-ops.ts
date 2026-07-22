@@ -1,7 +1,7 @@
 import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import { CliLifecycleBackend } from "../gjc/cli-lifecycle-backend";
-import { discoverFreshGjcSessionFile, snapshotGjcSessionFiles } from "../gjc/session-loader";
+import { snapshotGjcSessionFiles, waitForFreshGjcSessionFile } from "../gjc/session-loader";
 import type {
 	GjcContinueSessionInput,
 	GjcLifecycleTransaction,
@@ -29,8 +29,9 @@ import {
 	waitForSdkEndpoint,
 } from "./gjc-routing-endpoints";
 import type { PublicSdkRunnerContext } from "./gjc-routing-lifecycle";
-import { turnResult } from "./gjc-routing-proof";
+import { normalizeObservedSdkRecord, turnResult } from "./gjc-routing-proof";
 import { runLifecycleTestBarrier } from "./gjc-routing-test-barrier";
+import { projectSessionArtifactEvents } from "./gjc-session-artifact-events";
 
 export {
 	currentAttachmentProof,
@@ -83,9 +84,9 @@ export async function startNewSession<T>(
 					await beforePrompt(address, provisionalProof, lifecycle);
 					provisionalAuthorityPersisted = true;
 					const result = await withMutationPort(context, attachment, lifecycle, port =>
-						prompt(context, port, input.text, input.modelSelection),
+						prompt(context, port, input.text, input.modelSelection, input.observer),
 					);
-					const transcript = await discoverFreshGjcSessionFile(
+					const transcript = await waitForFreshGjcSessionFile(
 						input.sessionRoot,
 						baseline,
 						lifecycleAttachment.sessionId,
@@ -106,7 +107,12 @@ export async function startNewSession<T>(
 					return publish(
 						{
 							...addressWithSessionFile,
-							...turnResult(result.outcome, transcript.filePath, result.modelSelection, currentProof),
+							...turnResult(
+								await withSessionArtifactEvents(result.outcome, transcript.filePath, input.text),
+								transcript.filePath,
+								result.modelSelection,
+								currentProof,
+							),
 						},
 						lifecycle,
 					);
@@ -151,10 +157,10 @@ export async function continueSession(
 ): Promise<GjcTurnResult> {
 	const attachment = await ensureAttachment(context, input, input.lifecycle);
 	const result = await withMutationPort(context, attachment, input.lifecycle, port =>
-		prompt(context, port, input.text, input.modelSelection),
+		prompt(context, port, input.text, input.modelSelection, input.observer),
 	);
 	return turnResult(
-		result.outcome,
+		await withSessionArtifactEvents(result.outcome, input.sessionFile, input.text),
 		input.sessionFile,
 		result.modelSelection,
 		await freshAttachmentProof(input.cwd, attachment, input.lifecycle),
@@ -184,14 +190,74 @@ export async function respondWorkflowGate(
 		payload: {},
 	};
 	const outcome = await withMutationPort(context, attachment, input.lifecycle, port =>
-		port.answerGate(gate, input.answer, input.idempotencyKey, context.input.turnTimeoutMs),
+		port.answerGate(
+			gate,
+			input.answer,
+			input.idempotencyKey,
+			context.input.turnTimeoutMs,
+			input.observer === undefined ? undefined : event => input.observer?.(normalizeObservedSdkRecord(event)),
+		),
 	);
 	return turnResult(
-		outcome,
+		await withSessionArtifactEvents(outcome, input.sessionFile, input.promptText),
 		input.sessionFile,
 		undefined,
 		await freshAttachmentProof(input.cwd, attachment, input.lifecycle),
 	);
+}
+async function withSessionArtifactEvents(
+	outcome: import("../gjc/public-sdk-contract").PublicSdkTurnOutcome,
+	sessionFile: string | undefined,
+	promptText: string,
+): Promise<import("../gjc/public-sdk-contract").PublicSdkTurnOutcome> {
+	if (hasNativeLifecycleEvents(outcome)) return outcome;
+	const artifactEvents = await projectSessionArtifactEvents(sessionFile, promptText);
+	if (artifactEvents.length === 0) return outcome;
+	return mergeSessionArtifactEvents(outcome, artifactEvents);
+}
+
+export function mergeSessionArtifactEvents(
+	outcome: import("../gjc/public-sdk-contract").PublicSdkTurnOutcome,
+	artifactEvents: readonly { readonly type: string; readonly payload?: Readonly<Record<string, unknown>> }[],
+): import("../gjc/public-sdk-contract").PublicSdkTurnOutcome {
+	if (hasNativeLifecycleEvents(outcome)) return outcome;
+	const projected = artifactEvents.map(event => ({
+		type: event.type,
+		...(event.payload === undefined ? {} : event.payload),
+	}));
+	const terminalIndex = outcome.events.findIndex(event =>
+		["agent_end", "agent_failed", "action_needed"].includes(String(event.type)),
+	);
+	const insertionIndex = terminalIndex === -1 ? outcome.events.length : terminalIndex;
+	return {
+		...outcome,
+		events: [...outcome.events.slice(0, insertionIndex), ...projected, ...outcome.events.slice(insertionIndex)],
+	};
+}
+function hasNativeLifecycleEvents(outcome: import("../gjc/public-sdk-contract").PublicSdkTurnOutcome): boolean {
+	return outcome.events.some(event => {
+		const type = String(event.type);
+		if (["tool_execution_start", "tool_execution_update", "tool_execution_end"].includes(type)) return true;
+		if (type !== "message_update") return false;
+		const payload = isRecord(event.payload) ? event.payload : event;
+		const assistant = isRecord(payload.assistantMessageEvent) ? payload.assistantMessageEvent : undefined;
+		return (
+			typeof assistant?.type === "string" &&
+			[
+				"thinking_start",
+				"thinking_delta",
+				"reasoning_summary_delta",
+				"thinking_end",
+				"thinking",
+				"tool_call",
+				"toolcall_start",
+				"toolcall_end",
+			].includes(assistant.type)
+		);
+	});
+}
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function requireExactProvisionalProof(proof: import("../gjc/session-authority").SessionAttachmentProof): void {
 	if (

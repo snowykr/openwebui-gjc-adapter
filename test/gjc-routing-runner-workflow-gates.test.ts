@@ -58,6 +58,7 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 			{
 				gateId: "gate-deep-1",
 				answer: { selected: ["JWT"] },
+				promptText: "1",
 				idempotencyKey: "chat-1:user-2",
 				userMessageId: "user-2",
 				gateCorrelation: { commandId: "command-1", turnId: "turn-1", sessionId: "session-1" },
@@ -67,6 +68,80 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 			expectedSessionId: "session-1",
 			expectedCwd: project.cwd,
 		});
+	});
+	test("streams resumed workflow gate events before completion", async () => {
+		const turnRunner = new FakeGjcTurnRunner();
+		const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent);
+		let release!: () => void;
+		turnRunner.completionBarrier = new Promise<void>(resolve => {
+			release = resolve;
+		});
+		turnRunner.gateResponseEvents = [
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "text_delta", text: "workflow " } } },
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "thinking_start" } } },
+			{ type: "agent_end" },
+		];
+		const liveEvents: unknown[] = [];
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings });
+		const result = await runner.run({
+			...replyInput("1"),
+			requestedModelId: "gjc/anthropic/claude-sonnet-4:medium",
+			onLiveEvents: events => {
+				liveEvents.push(...events);
+			},
+		});
+		if (result.chunks === undefined) throw new Error("expected live chunks");
+		if (!(Symbol.asyncIterator in result.chunks)) throw new Error("expected async live chunks");
+		const iterator = result.chunks[Symbol.asyncIterator]();
+
+		expect(await iterator.next()).toEqual({ value: "workflow ", done: false });
+		expect(turnRunner.gateResponses[0]?.observer).toBeDefined();
+		release();
+		expect(await iterator.next()).toEqual({ value: "gate accepted", done: false });
+		expect(await iterator.next()).toEqual({ value: undefined, done: true });
+		expect(liveEvents).toEqual([
+			expect.objectContaining({
+				type: "status",
+				data: expect.objectContaining({ description: "Thinking started", done: false }),
+			}),
+			expect.objectContaining({
+				type: "status",
+				data: expect.objectContaining({ description: "agent_end", done: true }),
+			}),
+		]);
+	});
+	test("delivers workflow gate artifact fallback after terminal-only observation", async () => {
+		const turnRunner = new FakeGjcTurnRunner();
+		const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent);
+		turnRunner.gateObservedEvents = [{ type: "agent_end" }];
+		turnRunner.gateResponseEvents = [
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "thinking_start" } } },
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "thinking_end" } } },
+			{ type: "tool_execution_start", payload: { toolName: "read" } },
+			{ type: "tool_execution_end", payload: { toolName: "read" } },
+			{ type: "agent_end" },
+		];
+		const liveEvents: unknown[] = [];
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings });
+		const result = await runner.run({
+			...replyInput("1"),
+			requestedModelId: "gjc/anthropic/claude-sonnet-4:medium",
+			onLiveEvents: events => {
+				liveEvents.push(...events);
+			},
+		});
+		if (result.chunks === undefined) throw new Error("expected live chunks");
+		for await (const _chunk of result.chunks) {
+			// Drain the response so completion fallback events are delivered.
+		}
+
+		expect(liveEvents).toEqual([
+			expect.objectContaining({ data: expect.objectContaining({ description: "Thinking started" }) }),
+			expect.objectContaining({ data: expect.objectContaining({ description: "Thinking completed" }) }),
+			expect.objectContaining({ data: expect.objectContaining({ description: "Tool read started" }) }),
+			expect.objectContaining({ data: expect.objectContaining({ description: "Tool read finished" }) }),
+			expect.objectContaining({ data: expect.objectContaining({ description: "agent_end" }) }),
+		]);
 	});
 	test("cold-resumes a persisted gate binding and answers its exact session without starting a new turn", async () => {
 		const root = mkdtempSync(join(tmpdir(), "gjc-cold-gate-"));

@@ -1,7 +1,7 @@
 import { ensureSdkSessionFile } from "../gjc/session-file";
 import type { SessionMapping, SessionMappingStore } from "../gjc/session-router";
 import { validateSessionFile } from "../gjc/session-router";
-import type { GjcLifecycleTransaction } from "../gjc/turn-runner";
+import type { GjcLifecycleTransaction, GjcTurnEventObserver } from "../gjc/turn-runner";
 import {
 	answerFromWorkflowGateReply,
 	type PendingWorkflowGate,
@@ -13,7 +13,8 @@ import {
 import type { OutboxStore } from "../state/outbox";
 import { type LiveGatewayRunnerInput, type LiveGatewayRunnerResult, WorkflowGateReplyError } from "./chat-completions";
 import type { GjcSessionTurnRunner } from "./gjc-routing-runner";
-import { ensureProjectionRows } from "./workflow-gate-projection";
+import { formatCanonicalModelId } from "./models";
+import { ensureProjectionRows, projectTurnEvents } from "./workflow-gate-projection";
 import {
 	markWorkflowGateAccepted,
 	workflowGateOperationHash,
@@ -70,6 +71,7 @@ export async function handleWorkflowGateReply(
 	turn: LiveGatewayRunnerInput,
 	preflightMapping: SessionMapping,
 	lifecycle: GjcLifecycleTransaction,
+	observer?: GjcTurnEventObserver,
 ): Promise<LiveGatewayRunnerResult | null> {
 	const mapping = preflightMapping ?? input.mappings.get(turn.chatId);
 	if (mapping === undefined || mapping.projectId !== turn.project.id) return null;
@@ -160,6 +162,7 @@ export async function handleWorkflowGateReply(
 			chatId: mapping.chatId,
 			gateId: pendingGate.gateId,
 			answer: answerResult.answer,
+			promptText: turn.prompt,
 			idempotencyKey: workflowGateResponseIdempotencyKey(turn.chatId, turn.userMessageId),
 			userMessageId: turn.userMessageId,
 			parentId: turn.userMessageParentId ?? undefined,
@@ -170,6 +173,7 @@ export async function handleWorkflowGateReply(
 			eventCursor: mapping.eventCursor,
 			operationId: turn.userMessageId,
 			lifecycle,
+			...(observer === undefined ? {} : { observer }),
 			...(pendingGate.commandId === undefined ||
 			pendingGate.turnId === undefined ||
 			pendingGate.sessionId === undefined
@@ -209,7 +213,13 @@ export async function handleWorkflowGateReply(
 			ensureProjectionRows(input.outbox, published, input.ownerUserId ?? "openwebui-gjc-adapter");
 			return published;
 		});
-		return { content: responseText };
+		const projectedEvents = projectTurnEvents(
+			result.events,
+			mapping.modelSelection === undefined ? undefined : formatCanonicalModelId(mapping.modelSelection),
+		);
+		return projectedEvents.length === 0
+			? { content: responseText }
+			: { content: responseText, events: projectedEvents };
 	} catch (error) {
 		input.mappings.transitionOperation(turn.chatId, turn.userMessageId, "uncertain", operationDetail);
 		throw error;

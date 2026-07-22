@@ -3,6 +3,8 @@ import { withPublicSdkSessionMutationCoordinator } from "../src/gjc/public-sdk-s
 import { waitForReply } from "../src/gjc/public-sdk-turns";
 import type { SdkV3Client } from "../src/gjc/sdk-v3-client";
 import type { SdkRecord } from "../src/gjc/sdk-v3-protocol";
+import { SdkTerminalWindow } from "../src/gjc/sdk-v3-terminal";
+import { turnResult } from "../src/live/gjc-routing-proof";
 import { createSdkTransportFixture, expectSdkRequest } from "./gjc-sdk-v3-fixtures";
 
 describe("latest dev SDK v3 terminal and gate contract", () => {
@@ -307,6 +309,172 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 			await fixture.dispose();
 		}
 	});
+	test("Given 0.11.6 payload-wrapped terminal and session event frames When waiting Then terminal text and presentation events are normalized", async () => {
+		const { terminal, emit } = await terminalFixture();
+		try {
+			const pending = terminal.wait(correlation, 500);
+			emit({
+				type: "turn_stream",
+				payload: {
+					type: "turn_stream",
+					sessionId: correlation.sessionId,
+					phase: "live",
+					messageRef: "message-0116",
+				},
+			});
+			emit({
+				type: "turn_stream",
+				payload: {
+					type: "turn_stream",
+					sessionId: correlation.sessionId,
+					phase: "finalized",
+					text: "exact finalized text",
+					finalAnswer: true,
+					messageRef: "message-0116",
+				},
+			});
+			for (const assistantMessageEvent of [
+				{ type: "text_delta", text: "visible" },
+				{ type: "thinking", text: "reasoning" },
+				{ type: "tool_call", name: "read" },
+			]) {
+				emit({
+					type: "event",
+					payload: {
+						type: "event",
+						kind: "message_update",
+						payload: {
+							event_type: "message_update",
+							event: { assistantMessageEvent },
+							commandId: correlation.commandId,
+							turnId: correlation.turnId,
+							sessionId: correlation.sessionId,
+						},
+					},
+				});
+			}
+			emit({ type: "agent_end", payload: { type: "agent_end", ...correlation } });
+			const outcome = await pending;
+			const result = turnResult(outcome, undefined);
+
+			expect(outcome.finalizedAssistantText).toBe("exact finalized text");
+			expect(outcome.events.map(event => event.type)).toEqual([
+				"turn_stream",
+				"turn_stream",
+				"message_update",
+				"message_update",
+				"message_update",
+				"agent_end",
+			]);
+			expect(result.events.filter(event => event.type === "message_update").map(event => event.payload)).toEqual([
+				expect.objectContaining({ assistantMessageEvent: { type: "text_delta", text: "visible" } }),
+				expect.objectContaining({ assistantMessageEvent: { type: "thinking", text: "reasoning" } }),
+				expect.objectContaining({ assistantMessageEvent: { type: "tool_call", name: "read" } }),
+			]);
+			expect(result.events.some(event => event.type === "event")).toBeFalse();
+		} finally {
+			terminal.close();
+		}
+	});
+	test("Given reference-less session streams from different turns When the current turn ends Then stale final text is rejected", async () => {
+		const { terminal, emit } = await terminalFixture();
+		try {
+			const pending = terminal.wait(correlation, 500);
+			emit({ type: "turn_stream", sessionId: correlation.sessionId, phase: "live" });
+			emit({
+				type: "turn_stream",
+				sessionId: correlation.sessionId,
+				phase: "finalized",
+				finalAnswer: true,
+				text: "stale assistant text",
+			});
+			emit({
+				type: "message_update",
+				...correlation,
+				assistantMessageEvent: { type: "text_delta", text: "current activity" },
+			});
+			emit({ type: "agent_end", ...correlation });
+
+			expect((await pending).finalizedAssistantText).toBeUndefined();
+		} finally {
+			terminal.close();
+		}
+	});
+	test("Given correlation-less 0.11.6 message updates When observing an accepted turn Then they stream live", async () => {
+		const observed: SdkRecord[] = [];
+		const { terminal, emit } = await terminalFixture(event => {
+			observed.push(event);
+		});
+		try {
+			const pending = terminal.wait(correlation, 500);
+			emit({
+				type: "message_update",
+				payload: {
+					type: "message_update",
+					assistantMessageEvent: { type: "text_delta", delta: "live" },
+				},
+			});
+			emit({ type: "agent_end", ...correlation });
+			await pending;
+
+			expect(observed).toEqual([
+				expect.objectContaining({
+					type: "message_update",
+					payload: expect.objectContaining({
+						assistantMessageEvent: { type: "text_delta", delta: "live" },
+					}),
+				}),
+				expect.objectContaining({ type: "agent_end" }),
+			]);
+		} finally {
+			terminal.close();
+		}
+	});
+	test("Given live event delivery failure When the accepted turn completes Then terminal success is preserved", async () => {
+		const { terminal, emit } = await terminalFixture(() => {
+			throw new Error("event endpoint unavailable");
+		});
+		try {
+			const pending = terminal.wait(correlation, 500);
+			emit({
+				type: "message_update",
+				payload: {
+					type: "message_update",
+					assistantMessageEvent: { type: "thinking_start" },
+				},
+			});
+			emit({ type: "agent_end", ...correlation });
+
+			await expect(pending).resolves.toMatchObject({
+				events: expect.arrayContaining([expect.objectContaining({ type: "agent_end" })]),
+			});
+		} finally {
+			terminal.close();
+		}
+	});
+	test("Given malformed or mismatched 0.11.6 agent_end envelopes When waiting Then they cannot terminate another turn", async () => {
+		const { terminal, emit } = await terminalFixture();
+		try {
+			let settled = false;
+			const pending = terminal.wait(correlation, 500).then(outcome => {
+				settled = true;
+				return outcome;
+			});
+			emit({ type: "agent_end", payload: { type: "agent_end", ...correlation, turnId: "other-turn" } });
+			emit({ type: "agent_end", payload: { type: "not_agent_end", ...correlation } });
+			await Promise.resolve();
+			expect(settled).toBeFalse();
+
+			emit({ type: "agent_end", payload: { type: "agent_end", ...correlation } });
+			await expect(pending).resolves.toMatchObject({
+				events: expect.arrayContaining([
+					expect.objectContaining({ type: "agent_end", turnId: correlation.turnId }),
+				]),
+			});
+		} finally {
+			terminal.close();
+		}
+	});
 });
 
 function replyResolutionClient(): {
@@ -322,5 +490,30 @@ function replyResolutionClient(): {
 			},
 		} as unknown as SdkV3Client,
 		listeners,
+	};
+}
+const correlation = { sessionId: "session-0116", commandId: "command-0116", turnId: "turn-0116" };
+
+async function terminalFixture(observer?: (event: SdkRecord) => void | Promise<void>): Promise<{
+	readonly terminal: SdkTerminalWindow;
+	readonly emit: (frame: SdkRecord) => void;
+}> {
+	const listeners = new Set<(frame: SdkRecord) => void>();
+	const client = {
+		onFrame(listener: (frame: SdkRecord) => void) {
+			listeners.add(listener);
+			return () => listeners.delete(listener);
+		},
+		queryAll: async () => [],
+	} as unknown as SdkV3Client;
+	const terminal = new SdkTerminalWindow(client, correlation.sessionId, observer);
+	await terminal.captureGateBaseline(500);
+	terminal.beginMutation();
+	terminal.accept(correlation);
+	return {
+		terminal,
+		emit: frame => {
+			for (const listener of listeners) listener(frame);
+		},
 	};
 }

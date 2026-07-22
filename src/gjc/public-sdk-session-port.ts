@@ -7,6 +7,7 @@ import type {
 	PublicSdkSessionCoordinatorOwner,
 	PublicSdkSessionPort,
 	PublicSdkSessionState,
+	PublicSdkTurnEventObserver,
 	PublicSdkTurnOutcome,
 } from "./public-sdk-contract";
 
@@ -93,21 +94,35 @@ export class PublicSdkSessionClient implements PublicSdkSessionPort {
 	): Promise<NormalizedModelSelection> {
 		return this.coordinated(() => setThinking(this.actionHost(), thinkingLevel, key, timeoutMs));
 	}
-	prompt(text: string, timeoutMs = 60_000): Promise<PublicSdkTurnOutcome> {
-		return this.coordinated(() => runTurn(this.turnContext(), "turn.prompt", { text }, undefined, timeoutMs));
+	prompt(text: string, timeoutMs = 60_000, observer?: PublicSdkTurnEventObserver): Promise<PublicSdkTurnOutcome> {
+		return this.coordinated(() =>
+			runTurn(this.turnContext(), "turn.prompt", { text }, undefined, timeoutMs, observer),
+		);
 	}
 	steer(text: string, key?: string, timeoutMs?: number): Promise<unknown> {
 		return this.reply("turn.steer", { text }, key, timeoutMs);
 	}
-	followUp(text: string, key?: string, timeoutMs?: number): Promise<PublicSdkTurnOutcome> {
-		return this.coordinated(() => runTurn(this.turnContext(), "turn.follow_up", { text }, key, timeoutMs ?? 60_000));
+	followUp(
+		text: string,
+		key?: string,
+		timeoutMs?: number,
+		observer?: PublicSdkTurnEventObserver,
+	): Promise<PublicSdkTurnOutcome> {
+		return this.coordinated(() =>
+			runTurn(this.turnContext(), "turn.follow_up", { text }, key, timeoutMs ?? 60_000, observer),
+		);
 	}
 	abort(key?: string, timeoutMs?: number): Promise<unknown> {
 		return this.reply("turn.abort", {}, key, timeoutMs);
 	}
-	abortAndPrompt(text: string, key?: string, timeoutMs?: number): Promise<PublicSdkTurnOutcome> {
+	abortAndPrompt(
+		text: string,
+		key?: string,
+		timeoutMs?: number,
+		observer?: PublicSdkTurnEventObserver,
+	): Promise<PublicSdkTurnOutcome> {
 		return this.coordinated(() =>
-			runTurn(this.turnContext(), "turn.abort_and_prompt", { text }, key, timeoutMs ?? 60_000),
+			runTurn(this.turnContext(), "turn.abort_and_prompt", { text }, key, timeoutMs ?? 60_000, observer),
 		);
 	}
 	replyToAction(id: string, answer: unknown, key?: string, timeoutMs?: number): Promise<unknown> {
@@ -124,8 +139,14 @@ export class PublicSdkSessionClient implements PublicSdkSessionPort {
 			),
 		);
 	}
-	answerGate(gate: PublicSdkGate, answer: unknown, key?: string, timeoutMs = 60_000): Promise<PublicSdkTurnOutcome> {
-		return this.coordinated(() => runGateTurn(this.turnContext(), gate, answer, key, timeoutMs));
+	answerGate(
+		gate: PublicSdkGate,
+		answer: unknown,
+		key?: string,
+		timeoutMs = 60_000,
+		observer?: PublicSdkTurnEventObserver,
+	): Promise<PublicSdkTurnOutcome> {
+		return this.coordinated(() => runGateTurn(this.turnContext(), gate, answer, key, timeoutMs, observer));
 	}
 
 	branch(

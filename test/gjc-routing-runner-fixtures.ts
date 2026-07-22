@@ -28,9 +28,13 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 		eventCursor: 3,
 	};
 	events: GjcTurnResult["events"] = [{ type: "assistant", text: "assistant from gjc" }];
+	observedEvents?: GjcTurnResult["events"];
 	gateResponseEvents: GjcTurnResult["events"] = [{ type: "assistant", text: "workflow gate accepted" }];
+	gateObservedEvents?: GjcTurnResult["events"];
 	startModelSelection?: NormalizedModelSelection;
 	continueModelSelection?: NormalizedModelSelection;
+	completionBarrier?: Promise<void>;
+	completionError?: Error;
 
 	async startNewSession<T>(
 		input: GjcStartNewSessionInput,
@@ -40,6 +44,9 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 		) => Promise<T>,
 	): Promise<T> {
 		this.starts.push(input);
+		for (const event of this.observedEvents ?? this.events) await input.observer?.(event);
+		await this.completionBarrier;
+		if (this.completionError !== undefined) throw this.completionError;
 		const result = {
 			cwd: input.cwd,
 			sessionRoot: input.sessionRoot,
@@ -64,6 +71,9 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 
 	async continueSession(input: GjcContinueSessionInput): Promise<GjcTurnResult> {
 		this.continues.push(input);
+		for (const event of this.observedEvents ?? this.events) await input.observer?.(event);
+		await this.completionBarrier;
+		if (this.completionError !== undefined) throw this.completionError;
 		return {
 			text: `continued:${input.text}`,
 			events: this.events,
@@ -98,6 +108,9 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 
 	async respondWorkflowGate(input: GjcRespondWorkflowGateInput): Promise<GjcTurnResult> {
 		this.gateResponses.push(input);
+		for (const event of this.gateObservedEvents ?? this.gateResponseEvents) await input.observer?.(event);
+		await this.completionBarrier;
+		if (this.completionError !== undefined) throw this.completionError;
 		return {
 			text: "workflow gate accepted",
 			events: this.gateResponseEvents,

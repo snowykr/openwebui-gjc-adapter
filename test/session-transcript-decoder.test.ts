@@ -79,6 +79,15 @@ describe("session transcript entry decoder", () => {
 			}),
 		).toBeDefined();
 	});
+	test("accepts GJC 0.11.6 discovered builtin tool selections", () => {
+		expect(
+			decodeSessionEntry({
+				type: "discovered_builtin_tool_selection",
+				...entryBase,
+				selectedToolNames: ["web_search", "task"],
+			}),
+		).toBeDefined();
+	});
 
 	test.each([
 		["arbitrary values", [{ unexpected: true }]],

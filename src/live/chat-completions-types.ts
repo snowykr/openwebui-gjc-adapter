@@ -36,6 +36,7 @@ export interface LiveGatewayRunnerInput {
 	/** Message lineage supplied by OpenWebUI for the regenerated message. */
 	readonly messageMetadata?: Readonly<Record<string, unknown>>;
 	readonly control?: OpenWebUIControl;
+	readonly onLiveEvents?: (events: readonly OpenWebUIMessageEvent[]) => Promise<void> | void;
 }
 
 export type LiveGatewayRunnerResult =
