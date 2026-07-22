@@ -32,7 +32,7 @@ export function projectTurnEvents(
 			created: 0,
 			model: canonicalModel,
 		}).events;
-		projected.push(...frameEvents.map(event => bindEventModel(event, canonicalModel)));
+		projected.push(...frameEvents);
 	}
 	return projected;
 }
@@ -194,21 +194,16 @@ function turnEventToProjectableFrame(event: GjcTurnEvent): ProjectableAgentFrame
 	if (event.type.includes("skill") || event.type.includes("workflow")) return progressFrame("skill_progress", event);
 	if (event.type.includes("tool")) return progressFrame("tool_progress", event);
 	if (event.type.includes("agent")) return progressFrame("subagent_progress", event);
+	if (event.type === "message_start") {
+		return {
+			kind: "unsupported",
+			eventType: boundedText(event.type),
+			id: boundedNullableText(event.id ?? null),
+			textPresent: event.text !== undefined,
+		};
+	}
 	return {
 		kind: "unsupported",
-		frameType: boundedText(event.type),
-		metadata: { id: boundedNullableText(event.id ?? null), textPresent: event.text !== undefined },
-	};
-}
-
-function bindEventModel(event: OpenWebUIMessageEvent, canonicalModel: string): OpenWebUIMessageEvent {
-	if (event.type !== "status") return event;
-	return {
-		...event,
-		data: {
-			...event.data,
-			gjc_adapter: { ...(event.data.gjc_adapter ?? {}), model: canonicalModel },
-		},
 	};
 }
 

@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { closeTmux, exitAndObservePostCloseFailure } from "../scripts/gjc-release-compat-lifecycle";
 
 const ROOT = join(import.meta.dir, "..");
-const GJC_VERSION = "0.11.4";
+const GJC_VERSION = "0.11.6";
 const BUN_IMAGE_DIGEST = "sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4";
 const PYTHON_IMAGE_DIGEST = "sha256:8a7e7cc04fd3e2bd787f7f24e22d5d119aa590d429b50c95dfe12b3abe52f48b";
 
@@ -23,12 +23,17 @@ function releaseRoute(event: "repository_dispatch" | "schedule" | "workflow_disp
 }
 
 describe("GJC SDK runtime provenance", () => {
-	test("pins the published coding-agent and natives runtime to the same exact release", async () => {
+	test("pins all published GJC runtime packages to the current exact release", async () => {
 		const manifest = await Bun.file(join(ROOT, "package.json")).json();
 		const dependencies = Reflect.get(manifest, "dependencies");
 
-		expect(Reflect.get(dependencies, "@gajae-code/coding-agent")).toBe(GJC_VERSION);
-		expect(Reflect.get(dependencies, "@gajae-code/natives")).toBe(GJC_VERSION);
+		for (const packageName of [
+			"@gajae-code/ai",
+			"@gajae-code/bridge-client",
+			"@gajae-code/coding-agent",
+			"@gajae-code/natives",
+		])
+			expect(Reflect.get(dependencies, packageName)).toBe(GJC_VERSION);
 		expect(Reflect.get(manifest, "patchedDependencies")).toBeUndefined();
 		expect(Reflect.get(manifest, "files")).not.toContain("patches");
 	});
@@ -73,25 +78,25 @@ describe("GJC SDK runtime provenance", () => {
 
 		for (const fixture of [
 			{
-				version: "0.11.4",
-				nativesVersion: "0.11.4",
+				version: "0.11.6",
+				nativesVersion: "0.11.6",
 				tag: "",
-				expected: { version: "0.11.4", nativesVersion: "0.11.4", tag: "v0.11.4" },
+				expected: { version: "0.11.6", nativesVersion: "0.11.6", tag: "v0.11.6" },
 			},
 			{
-				version: "v0.11.4",
-				nativesVersion: "v0.11.4",
-				tag: "v0.11.4",
-				expected: { version: "0.11.4", nativesVersion: "0.11.4", tag: "v0.11.4" },
+				version: "v0.11.6",
+				nativesVersion: "v0.11.6",
+				tag: "v0.11.6",
+				expected: { version: "0.11.6", nativesVersion: "0.11.6", tag: "v0.11.6" },
 			},
 		])
 			expect(normalizeRelease(fixture.version, fixture.nativesVersion, fixture.tag)).toEqual(fixture.expected);
-		expect(() => normalizeRelease("0.11.4", "0.11.2", "v0.11.4")).toThrow();
-		expect(() => normalizeRelease("0.11.4", "0.11.4", "v0.11.2")).toThrow();
+		expect(() => normalizeRelease("0.11.6", "0.11.2", "v0.11.6")).toThrow();
+		expect(() => normalizeRelease("0.11.6", "0.11.6", "v0.11.2")).toThrow();
 		for (const fixture of [
 			{ event: "schedule" as const, version: "", route: "fixed" },
 			{ event: "workflow_dispatch" as const, version: "", route: "fixed" },
-			{ event: "workflow_dispatch" as const, version: "v0.11.4", route: "dispatched-manual" },
+			{ event: "workflow_dispatch" as const, version: "v0.11.6", route: "dispatched-manual" },
 			{ event: "repository_dispatch" as const, version: "", route: "dispatched-repository" },
 		])
 			expect(releaseRoute(fixture.event, fixture.version)).toBe(fixture.route);
@@ -262,9 +267,9 @@ describe("GJC SDK runtime provenance", () => {
 			sessionFile: undefined,
 		});
 		expect(startupArguments("0.11.1")).not.toContain("--thinking");
-		expect(startupArguments("0.11.4")).toEqual(["--model", "compat-local/hermetic-model", "--thinking", "off"]);
+		expect(startupArguments("0.11.6")).toEqual(["--model", "compat-local/hermetic-model", "--thinking", "off"]);
 		expect(parseReleasedCliVersion("gjc/0.11.1\n")).toBe("0.11.1");
-		expect(parseReleasedCliVersion("0.11.4\n")).toBe("0.11.4");
+		expect(parseReleasedCliVersion("0.11.6\n")).toBe("0.11.6");
 		expect(() => parseReleasedCliVersion("gjc/0.11.1 extra")).toThrow("invalid version");
 		expect(runner).toContain("const match = /^(?:gjc\\/)?(\\d+\\.\\d+\\.\\d+)$/.exec(output);");
 		expect(runner).toContain('await run(command, ["--version"])');

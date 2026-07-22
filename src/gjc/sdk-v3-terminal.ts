@@ -89,7 +89,7 @@ export class SdkTerminalWindow {
 	}
 	private postAcceptEvents(): readonly SdkRecord[] {
 		return this.postAcceptFrames()
-			.map(unwrapEvent)
+			.map(normalizeEvent)
 			.filter((frame): frame is SdkRecord => frame !== undefined);
 	}
 
@@ -157,17 +157,36 @@ export class SdkTerminalWindow {
 		finalizedAssistantText = this.finalizedText(correlation),
 	): SdkTerminalOutcome {
 		return {
-			events: this.postAcceptFrames(),
+			events: this.postAcceptEvents(),
 			...(finalizedAssistantText === undefined ? {} : { finalizedAssistantText }),
 			...(gate === undefined ? {} : { gate }),
 		};
 	}
 
 	private finalizedText(correlation: SdkTurnCorrelation): string | undefined {
-		for (const frame of [...this.postAcceptEvents()].reverse()) {
+		const events = this.postAcceptEvents();
+		const hasCorrelatedActivity = events.some(
+			frame =>
+				(frame.type === "message_update" || frame.type === "message_end") &&
+				frame.commandId === correlation.commandId &&
+				frame.turnId === correlation.turnId,
+		);
+		for (let index = events.length - 1; index >= 0; index -= 1) {
+			const frame = events[index]!;
+			const hasMatchingLiveStream = events
+				.slice(0, index)
+				.some(
+					previous =>
+						previous.type === "turn_stream" &&
+						previous.phase === "live" &&
+						previous.sessionId === correlation.sessionId &&
+						previous.messageRef === frame.messageRef,
+				);
 			if (
 				frame.type === "turn_stream" &&
-				matchesTurnStream(frame, correlation) &&
+				(matchesTurnStream(frame, correlation) ||
+					((hasCorrelatedActivity || hasMatchingLiveStream) &&
+						matchesSessionOnlyTurnStream(frame, correlation))) &&
 				frame.phase === "finalized" &&
 				frame.finalAnswer === true &&
 				typeof frame.text === "string"
@@ -203,19 +222,43 @@ export class SdkTerminalWindow {
 	}
 }
 
-function unwrapEvent(frame: SdkRecord): SdkRecord | undefined {
-	return frame.type === "event"
-		? parseRecord(frame.payload, "event payload")
-		: typeof frame.type === "string" && !frame.type.endsWith("_response")
-			? frame
-			: undefined;
+function normalizeEvent(frame: SdkRecord): SdkRecord | undefined {
+	if (frame.type === "event") {
+		const payload = recordOrUndefined(frame.payload);
+		if (payload === undefined) return undefined;
+		if (payload.type !== "event") return payload;
+		return normalizeSessionEvent(payload);
+	}
+	if (isPayloadWrappedTerminal(frame)) {
+		const payload = recordOrUndefined(frame.payload);
+		return payload?.type === frame.type ? payload : undefined;
+	}
+	return typeof frame.type === "string" && !frame.type.endsWith("_response") ? frame : undefined;
+}
+
+function isPayloadWrappedTerminal(frame: SdkRecord): boolean {
+	return (
+		(frame.type === "turn_stream" ||
+			frame.type === "agent_end" ||
+			frame.type === "agent_failed" ||
+			frame.type === "action_needed") &&
+		"payload" in frame
+	);
+}
+
+function normalizeSessionEvent(frame: SdkRecord): SdkRecord | undefined {
+	if (typeof frame.kind !== "string") return undefined;
+	const payload = recordOrUndefined(frame.payload);
+	return payload === undefined ? undefined : { ...payload, type: frame.kind };
+}
+
+function recordOrUndefined(value: unknown): SdkRecord | undefined {
+	return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as SdkRecord) : undefined;
 }
 function matches(frame: SdkRecord, correlation: SdkTurnCorrelation): boolean {
-	const nested =
-		typeof frame.correlation === "object" && frame.correlation !== null
-			? parseRecord(frame.correlation, "event correlation")
-			: frame;
+	const nested = frame.correlation === undefined ? frame : recordOrUndefined(frame.correlation);
 	return (
+		nested !== undefined &&
 		nested.sessionId === correlation.sessionId &&
 		nested.commandId === correlation.commandId &&
 		nested.turnId === correlation.turnId
@@ -227,6 +270,10 @@ function matchesTurnStream(frame: SdkRecord, correlation: SdkTurnCorrelation): b
 		frame.commandId === correlation.commandId &&
 		frame.turnId === correlation.turnId
 	);
+}
+
+function matchesSessionOnlyTurnStream(frame: SdkRecord, correlation: SdkTurnCorrelation): boolean {
+	return frame.sessionId === correlation.sessionId && frame.commandId === undefined && frame.turnId === undefined;
 }
 function matchesAction(frame: SdkRecord, correlation: SdkTurnCorrelation): boolean {
 	if (frame.sessionId !== correlation.sessionId) return false;

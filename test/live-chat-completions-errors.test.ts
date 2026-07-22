@@ -49,15 +49,37 @@ describe("live OpenAI-compatible chat completion errors", () => {
 		const chunks: string[] = [];
 		for await (const chunk of result.stream) chunks.push(chunk);
 
-		expect(chunks).toHaveLength(3);
-		expect(chunks[0]).toStartWith("data: ");
-		expect(chunks[0]).toEndWith("\n\n");
-		expect(JSON.parse(chunks[0]?.slice(6).trim() ?? "{}")).toMatchObject({
-			object: "chat.completion.chunk",
-			model: "gjc/anthropic/claude-sonnet-4:low",
-			choices: [{ delta: { role: "assistant", content: "hello" }, finish_reason: null }],
-		});
-		expect(chunks[2]).toBe("data: [DONE]\n\n");
+		expect(chunks).toEqual([
+			`data: ${JSON.stringify({
+				id: "chatcmpl-stream",
+				object: "chat.completion.chunk",
+				created: 1_783_468_800,
+				model: "gjc/anthropic/claude-sonnet-4:low",
+				choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+			})}\n\n`,
+			`data: ${JSON.stringify({
+				id: "chatcmpl-stream",
+				object: "chat.completion.chunk",
+				created: 1_783_468_800,
+				model: "gjc/anthropic/claude-sonnet-4:low",
+				choices: [{ index: 0, delta: { content: "hello" }, finish_reason: null }],
+			})}\n\n`,
+			`data: ${JSON.stringify({
+				id: "chatcmpl-stream",
+				object: "chat.completion.chunk",
+				created: 1_783_468_800,
+				model: "gjc/anthropic/claude-sonnet-4:low",
+				choices: [{ index: 0, delta: { content: " world" }, finish_reason: null }],
+			})}\n\n`,
+			`data: ${JSON.stringify({
+				id: "chatcmpl-stream",
+				object: "chat.completion.chunk",
+				created: 1_783_468_800,
+				model: "gjc/anthropic/claude-sonnet-4:low",
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+			})}\n\n`,
+			"data: [DONE]\n\n",
+		]);
 	});
 
 	it("fails closed before sinks when the runner omits canonical model metadata", async () => {

@@ -103,7 +103,6 @@ describe("createGjcRoutingLiveGatewayRunner event projection", () => {
 						gjc_adapter: {
 							frameKind: "subagent_progress",
 							phase: "progress",
-							model: "gjc/anthropic/claude-sonnet-4:low",
 							metadata: { eventType: "agent_start", id: "agent-1" },
 						},
 					},
@@ -156,7 +155,7 @@ describe("createGjcRoutingLiveGatewayRunner event projection", () => {
 				data: expect.objectContaining({
 					hidden: true,
 					gjc_adapter: expect.objectContaining({
-						metadata: { id: "message-1", textPresent: true },
+						metadata: { eventType: "message_start", id: "message-1", textPresent: true },
 					}),
 				}),
 			}),

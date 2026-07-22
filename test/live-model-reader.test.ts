@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { GjcRuntimeLocations } from "../src/contracts";
 import type { PublicSdkSessionAttachment, PublicSdkSessionPort } from "../src/gjc/public-sdk-contract";
 import {
@@ -6,6 +9,7 @@ import {
 	ModelReaderUnavailableError,
 	registerTemporaryModelAttachment,
 } from "../src/live/model-reader";
+import { startSdkFixtureServer } from "./gjc-sdk-v3-fixtures";
 
 describe("createModelReaderFactory", () => {
 	test("attaches a fresh public SDK port for each reader and detaches on stop", async () => {
@@ -57,6 +61,30 @@ describe("createModelReaderFactory", () => {
 
 		await expect(factory()).rejects.toThrow("attachment rejected");
 		expect(port.calls).toEqual(["attach", "detach"]);
+	});
+	test("uses the published descriptor as the default attachment authority", async () => {
+		const root = mkdtempSync(join(tmpdir(), "gjc-model-reader-"));
+		const workspace = join(root, "reader");
+		const sessionId = "sdk-session-created";
+		const server = startSdkFixtureServer("model_catalog", workspace);
+		const descriptor = join(workspace, ".gjc", "state", "sdk", `${sessionId}.json`);
+		mkdirSync(join(workspace, ".gjc", "state", "sdk"), { recursive: true });
+		writeFileSync(descriptor, JSON.stringify({ sessionId, url: server.url, token: server.token }));
+		try {
+			const reader = await createModelReaderFactory({
+				cliPath: "/opt/gjc",
+				runtimeLocations: {
+					...runtimeLocations,
+					readerWorkspace: workspace,
+					readerSessionRoot: join(workspace, ".gjc", "sessions"),
+				},
+			})();
+			expect(await reader.getAvailableModels()).toHaveLength(2);
+			await reader.stop();
+		} finally {
+			server.stop();
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	test("does not fall back to another transport when no public attachment resolver is configured", async () => {

@@ -14,16 +14,29 @@ export async function* encodeChatCompletionSse(input: {
 	readonly model: string;
 	readonly chunks: AsyncIterable<string> | Iterable<string>;
 }): AsyncIterable<string> {
+	const base = {
+		id: input.id,
+		object: "chat.completion.chunk" as const,
+		created: input.created,
+		model: input.model,
+	};
+	const initial: OpenAIChatCompletionChunk = {
+		...base,
+		choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+	};
+	yield `data: ${JSON.stringify(initial)}\n\n`;
 	for await (const content of input.chunks) {
 		const chunk: OpenAIChatCompletionChunk = {
-			id: input.id,
-			object: "chat.completion.chunk",
-			created: input.created,
-			model: input.model,
-			choices: [{ index: 0, delta: { role: "assistant", content }, finish_reason: null }],
+			...base,
+			choices: [{ index: 0, delta: { content }, finish_reason: null }],
 		};
 		yield `data: ${JSON.stringify(chunk)}\n\n`;
 	}
+	const terminal: OpenAIChatCompletionChunk = {
+		...base,
+		choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+	};
+	yield `data: ${JSON.stringify(terminal)}\n\n`;
 	yield "data: [DONE]\n\n";
 }
 

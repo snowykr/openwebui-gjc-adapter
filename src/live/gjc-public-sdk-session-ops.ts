@@ -31,6 +31,7 @@ import {
 import type { PublicSdkRunnerContext } from "./gjc-routing-lifecycle";
 import { turnResult } from "./gjc-routing-proof";
 import { runLifecycleTestBarrier } from "./gjc-routing-test-barrier";
+import { projectSessionArtifactEvents } from "./gjc-session-artifact-events";
 
 export {
 	currentAttachmentProof,
@@ -106,7 +107,12 @@ export async function startNewSession<T>(
 					return publish(
 						{
 							...addressWithSessionFile,
-							...turnResult(result.outcome, transcript.filePath, result.modelSelection, currentProof),
+							...turnResult(
+								await withSessionArtifactEvents(result.outcome, transcript.filePath, input.text),
+								transcript.filePath,
+								result.modelSelection,
+								currentProof,
+							),
 						},
 						lifecycle,
 					);
@@ -154,7 +160,7 @@ export async function continueSession(
 		prompt(context, port, input.text, input.modelSelection),
 	);
 	return turnResult(
-		result.outcome,
+		await withSessionArtifactEvents(result.outcome, input.sessionFile, input.text),
 		input.sessionFile,
 		result.modelSelection,
 		await freshAttachmentProof(input.cwd, attachment, input.lifecycle),
@@ -192,6 +198,24 @@ export async function respondWorkflowGate(
 		undefined,
 		await freshAttachmentProof(input.cwd, attachment, input.lifecycle),
 	);
+}
+async function withSessionArtifactEvents(
+	outcome: import("../gjc/public-sdk-contract").PublicSdkTurnOutcome,
+	sessionFile: string | undefined,
+	promptText: string,
+): Promise<import("../gjc/public-sdk-contract").PublicSdkTurnOutcome> {
+	const artifactEvents = await projectSessionArtifactEvents(sessionFile, promptText);
+	if (artifactEvents.length === 0) return outcome;
+	return {
+		...outcome,
+		events: [
+			...outcome.events,
+			...artifactEvents.map(event => ({
+				type: event.type,
+				...(event.payload === undefined ? {} : event.payload),
+			})),
+		],
+	};
 }
 function requireExactProvisionalProof(proof: import("../gjc/session-authority").SessionAttachmentProof): void {
 	if (

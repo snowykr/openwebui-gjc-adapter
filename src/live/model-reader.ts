@@ -1,5 +1,6 @@
 import { listSdkSessionEndpoints } from "@gajae-code/coding-agent/sdk";
 import type { GjcRuntimeLocations } from "../contracts";
+import { attachmentFromPublishedSdkEndpoint } from "../gjc/public-sdk-attachment";
 import type { PublicSdkSessionAttachment, PublicSdkSessionPort } from "../gjc/public-sdk-contract";
 import { PublicSdkSessionClient } from "../gjc/public-sdk-session-port";
 
@@ -68,11 +69,7 @@ async function resolvePublicSdkAttachment(runtimeLocations: GjcRuntimeLocations)
 	const { endpoints } = await listSdkSessionEndpoints(runtimeLocations.readerWorkspace);
 	const endpoint = [...endpoints].sort((left, right) => left.sessionId.localeCompare(right.sessionId))[0];
 	if (endpoint === undefined) throw new ModelReaderUnavailableError();
-	return {
-		sessionId: endpoint.sessionId,
-		cwd: runtimeLocations.readerWorkspace,
-		endpoint: { url: endpoint.url, token: endpoint.token },
-	};
+	return attachmentFromPublishedSdkEndpoint(runtimeLocations.readerWorkspace, endpoint.sessionId, endpoint);
 }
 
 class PublicSdkModelReader implements ModelReader {

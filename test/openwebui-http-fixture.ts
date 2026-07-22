@@ -47,7 +47,7 @@ export function startRecordingServer(options: RecordingServerOptions = {}) {
 			}
 			const binaryResponse = options.binaryResponses?.find(response => response.path === url.pathname);
 			if (request.method === "GET" && binaryResponse !== undefined) {
-				return new Response(binaryResponse.body, {
+				return new Response(new Blob([binaryResponse.body as BlobPart]), {
 					status: binaryResponse.status ?? 200,
 					headers: { "content-type": binaryResponse.contentType },
 				});

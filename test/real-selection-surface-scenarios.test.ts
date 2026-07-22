@@ -78,7 +78,7 @@ describe("real canonical model selection surfaces", () => {
 			});
 			expect(await harness.chat(LOW_MODEL_ID, { id: "stream", stream: true })).toMatchObject({
 				status: 200,
-				sseModels: [LOW_MODEL_ID],
+				sseModels: [LOW_MODEL_ID, LOW_MODEL_ID, LOW_MODEL_ID],
 			});
 			const beforeBackground = await harness.effects();
 			expect(await harness.chat("gjc", { id: "background", task: "title" })).toMatchObject({
