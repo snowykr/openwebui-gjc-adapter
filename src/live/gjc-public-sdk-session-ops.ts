@@ -235,11 +235,29 @@ export function mergeSessionArtifactEvents(
 	};
 }
 function hasNativeLifecycleEvents(outcome: import("../gjc/public-sdk-contract").PublicSdkTurnOutcome): boolean {
-	return outcome.events.some(event =>
-		["message_update", "tool_execution_start", "tool_execution_update", "tool_execution_end"].includes(
-			String(event.type),
-		),
-	);
+	return outcome.events.some(event => {
+		const type = String(event.type);
+		if (["tool_execution_start", "tool_execution_update", "tool_execution_end"].includes(type)) return true;
+		if (type !== "message_update") return false;
+		const payload = isRecord(event.payload) ? event.payload : event;
+		const assistant = isRecord(payload.assistantMessageEvent) ? payload.assistantMessageEvent : undefined;
+		return (
+			typeof assistant?.type === "string" &&
+			[
+				"thinking_start",
+				"thinking_delta",
+				"reasoning_summary_delta",
+				"thinking_end",
+				"thinking",
+				"tool_call",
+				"toolcall_start",
+				"toolcall_end",
+			].includes(assistant.type)
+		);
+	});
+}
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function requireExactProvisionalProof(proof: import("../gjc/session-authority").SessionAttachmentProof): void {
 	if (

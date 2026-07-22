@@ -98,6 +98,28 @@ describe("GJC session artifact event projection", () => {
 			]),
 		).toBe(outcome);
 	});
+	test("keeps artifact lifecycle for text-only native updates", () => {
+		const outcome = {
+			events: [
+				{
+					type: "message_update",
+					payload: { assistantMessageEvent: { type: "text_delta", delta: "live text" } },
+				},
+				{ type: "agent_end" },
+			],
+		};
+		const merged = mergeSessionArtifactEvents(outcome, [
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "thinking_end" } } },
+			{ type: "tool_execution_start", payload: { toolName: "read" } },
+		]);
+
+		expect(merged.events.map(event => event.type)).toEqual([
+			"message_update",
+			"message_update",
+			"tool_execution_start",
+			"agent_end",
+		]);
+	});
 	test("fails closed for malformed, unknown, and oversized artifacts", async () => {
 		const fixture = await artifact([
 			user(prompt),
