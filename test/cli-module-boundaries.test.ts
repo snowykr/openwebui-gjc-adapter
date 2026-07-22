@@ -26,9 +26,10 @@ Commands:
   credentials show adapter-token  Display an installed adapter token
 
 First-install route:
-  managed   Requires rootful Docker with userns-remap disabled, user systemd,
-            and OpenWebUI >=0.10.0; use existing when those Docker prerequisites fail.
-  existing  Uses an externally owned OpenWebUI deployment and provider setup.
+  Shared: managed and existing both require user systemd and OpenWebUI >=0.10.0.
+  managed   Requires rootful Docker with userns-remap disabled.
+  existing  Uses an externally owned OpenWebUI deployment and provider setup;
+            choose it for rootless Docker or Docker userns-remap incompatibilities.
 
 Readiness:
   probe-ready checks adapter/OpenWebUI readiness only. It does not prove GJC
@@ -41,6 +42,10 @@ Models:
 `;
 const EXISTING_HELP = `Usage: openwebui-gjc-adapter configure existing [options]
 
+Prerequisites before this command:
+  Shared by managed and existing: user systemd and OpenWebUI >=0.10.0.
+  For rootless Docker or Docker userns-remap incompatibilities, choose existing
+  instead of managed; shared prerequisites still apply.
 Required existing-route inputs:
   --openwebui-url URL          Existing OpenWebUI base URL
   --adapter-ingress-url URL    Adapter URL reachable from OpenWebUI
@@ -64,8 +69,10 @@ Pending recovery values are authoritative for retries.
 const MANAGED_HELP = `Usage: openwebui-gjc-adapter configure managed [options]
 
 Prerequisites before this command:
-  Rootful Docker, Docker userns-remap disabled, user systemd, and OpenWebUI
-  >=0.10.0. Use configure existing when those Docker prerequisites do not hold.
+  Shared by managed and existing: user systemd and OpenWebUI >=0.10.0.
+  Managed additionally requires rootful Docker with Docker userns-remap disabled.
+  Use configure existing for rootless Docker or Docker userns-remap
+  incompatibilities only; shared prerequisites still apply.
 Managed GJC runtime locations are fixed; runtime location overrides are rejected.
 Required managed-route inputs:
   --admin-email-fd FD           Distinct inherited decimal FD for admin email
@@ -160,15 +167,44 @@ describe("CLI module boundaries", () => {
 		expect(results[2]?.stdout).not.toContain("--gjc-");
 		expect(results[0]?.stdout).toContain("probe-ready checks adapter/OpenWebUI readiness only");
 		expect(results[1]?.stdout).toContain("--openwebui-url URL");
+		expect(results[1]?.stdout).toContain(
+			"Shared by managed and existing: user systemd and OpenWebUI >=0.10.0.",
+		);
+		expect(results[1]?.stdout).toContain(
+			"For rootless Docker or Docker userns-remap incompatibilities, choose existing",
+		);
+		expect(results[1]?.stdout).toContain("shared prerequisites still apply.");
+		expect(results[1]?.stdout).not.toContain("Docker prerequisites do not hold");
 		expect(results[1]?.stdout).toContain("--adapter-ingress-url URL");
 		expect(results[1]?.stdout).toContain("--openwebui-api-token-fd FD");
-		expect(results[2]?.stdout).toContain("Rootful Docker");
+		expect(results[2]?.stdout).toContain("rootful Docker");
 		expect(results[2]?.stdout).toContain("userns-remap disabled");
-		expect(results[2]?.stdout).toContain("Use configure existing when those Docker prerequisites do not hold.");
+		expect(results[0]?.stdout).toContain(
+			"Shared: managed and existing both require user systemd and OpenWebUI >=0.10.0.",
+		);
+		expect(results[0]?.stdout).toContain(
+			"rootless Docker or Docker userns-remap incompatibilities.",
+		);
+		expect(results[2]?.stdout).toContain(
+			"Shared by managed and existing: user systemd and OpenWebUI >=0.10.0.",
+		);
+		expect(results[2]?.stdout).toContain(
+			"Use configure existing for rootless Docker or Docker userns-remap",
+		);
+		expect(results[2]?.stdout).not.toContain("those Docker prerequisites");
+		expect(results[0]?.stdout).not.toContain("when those Docker prerequisites");
+		expect(results[2]?.stdout).not.toContain("user systemd or OpenWebUI");
 		const readme = readFileSync(join(ROOT, "README.md"), "utf8");
 		expect(readme).toContain(
 			"route-specific help for first-install guidance. Route help documents required first-install inputs and prerequisites",
 		);
+		expect(readme).toContain(
+			"Both CLI-managed routes require user systemd and OpenWebUI >=0.10.0;",
+		);
+		expect(readme).toContain("existing mode is not a fallback for missing shared prerequisites.");
+		expect(readme).toContain("Choose existing mode for rootless or userns-remapped Docker");
+		expect(readme).not.toContain("Any managed Docker prerequisite does not hold");
+		expect(readme).not.toContain("use existing when those Docker prerequisites fail");
 		expect(readme).not.toContain("route-specific help for the complete accepted surface");
 		for (const output of results.map(result => result.stdout))
 			expect(output).not.toMatch(/--(?:provider-key|provider-credential|mpreset|profile|reload)\b/);

@@ -46,10 +46,10 @@ Choose the route before running a command:
 
 | Route | Choose it when | Ownership |
 | --- | --- | --- |
-| `managed` | Rootful Docker is available, Docker userns-remap is disabled, user systemd is available, and OpenWebUI is >=0.10.0 | GJC owns the generated OpenWebUI deployment and configures its owned provider after adapter readiness |
-| `existing` | Any managed Docker prerequisite does not hold, or OpenWebUI is already externally operated | OpenWebUI, provider connection, custom headers, ingress, and their operation remain external |
+| `managed` | Rootful Docker is available and Docker userns-remap is disabled; both CLI-managed routes require user systemd and OpenWebUI >=0.10.0 | GJC owns the generated OpenWebUI deployment and configures its owned provider after adapter readiness |
+| `existing` | Rootless Docker or Docker userns-remap incompatibility, or an externally operated OpenWebUI deployment that meets the shared requirements | OpenWebUI, provider connection, custom headers, ingress, and their operation remain external |
 
-Do not attempt managed mode on rootless or userns-remapped Docker; use existing mode instead. These commands configure a deployment; this README does not claim to run or verify a real deployment. Run the packaged binary (or replace it with `bun src/cli.ts` from a checkout). Run `openwebui-gjc-adapter --help` and the route-specific help for first-install guidance. Route help documents required first-install inputs and prerequisites; it is not an authoritative complete reference for every accepted operational or recovery flag.
+Both CLI-managed routes require user systemd and OpenWebUI >=0.10.0; existing mode is not a fallback for missing shared prerequisites. Choose existing mode for rootless or userns-remapped Docker, or for an externally operated OpenWebUI deployment that meets those shared requirements. These commands configure a deployment; this README does not claim to run or verify a real deployment. Run the packaged binary (or replace it with `bun src/cli.ts` from a checkout). Run `openwebui-gjc-adapter --help` and the route-specific help for first-install guidance. Route help documents required first-install inputs and prerequisites; it is not an authoritative complete reference for every accepted operational or recovery flag.
 
 ### Managed route
 
