@@ -43,6 +43,14 @@ Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. T
 ## CLI first-install configuration
 
 The CLI supports two first-install paths. These commands configure a deployment; this README does not claim to run or verify a real Docker deployment.
+Run the packaged binary (or replace it with `bun src/cli.ts` from a checkout):
+
+```sh
+openwebui-gjc-adapter configure managed
+openwebui-gjc-adapter configure existing
+```
+
+Run `openwebui-gjc-adapter --help` for the installed service, readiness probe, and credential commands and each configuration command's options.
 
 ### Managed default path
 
@@ -145,6 +153,9 @@ Selection updates the machine-global last-successful-writer-wins default. Operat
 - The live gateway uses `/v1/models` and `/v1/chat/completions`.
 - The package entrypoint wires chat completions through the released public SDK session surface and stores OpenWebUI chat-to-GJC session mappings in a file-backed store under `GJC_OPENWEBUI_SESSION_ROOT`.
 - The adapter consumes correlated public SDK session events and correlates prompt completion by command and turn identity. Delivered session events are bounded OpenWebUI message events covering available lifecycle, tool/MCP, subagent, todo, goal, notice, retry, compaction, and workflow progress.
+- Streaming responses forward native GJC reasoning and assistant text deltas as they arrive. Lifecycle/progress events are delivered concurrently; OpenWebUI delivery failures are best-effort and do not invalidate a turn already accepted by GJC.
+- A turn failure is surfaced before a successful stream is exposed when no activity has started. After streaming starts, terminal failure is propagated through the stream. Completion is accepted only from the correlated final for the referenced session.
+- Native terminal events retain their observed order. Transcript-derived lifecycle events are used only for recovery when native delivery is unavailable, preventing duplicate lifecycle and artifact projections.
 - Raw tool arguments/results and secret-looking text are not emitted directly; the adapter preserves bounded labels, counts, phases, and status descriptions for display.
 - Workflow gates are rendered as assistant-visible pending-gate text. A matching user reply is validated against the persisted gate schema and resumed through the public SDK session; replies that do not match the stored project, session, message lineage, or gate correlation fail closed.
 - Regenerate/branch requires matching persisted owner, project, session, and message lineage authority. Missing, conflicting, or ambiguous authority is rejected without fork, replay, or fallback.
