@@ -117,7 +117,7 @@ export function createGjcRoutingLiveGatewayRunner(
 						resolveActivity();
 					};
 					const observer = async (event: import("../gjc/turn-runner").GjcTurnEvent) => {
-						markActivityStarted();
+						if (event.type !== "agent_failed") markActivityStarted();
 						const payload = isRecord(event.payload) ? event.payload : undefined;
 						const assistant =
 							payload !== undefined && isRecord(payload.assistantMessageEvent)
@@ -225,7 +225,7 @@ export function createGjcRoutingLiveGatewayRunner(
 				afterPublish: routed =>
 					ensureProjectionRows(input.outbox, routed.mapping, input.ownerUserId ?? "openwebui-gjc-adapter"),
 				onObservedTurn: async event => {
-					markActivityStarted();
+					if (event.type !== "agent_failed") markActivityStarted();
 					if (isNativeLifecycleEvent(event.type)) observedNativeLifecycle = true;
 					if (isTerminalEvent(event.type)) return;
 					const payload = isRecord(event.payload) ? event.payload : undefined;

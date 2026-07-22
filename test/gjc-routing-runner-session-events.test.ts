@@ -156,6 +156,34 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 			);
 		}
 	});
+	test("rejects before opening a stream when the first observed frame is agent_failed", async () => {
+		const turnRunner = new FakeGjcTurnRunner();
+		turnRunner.observedEvents = [{ type: "agent_failed" }];
+		turnRunner.completionError = new Error("GJC prompt failed");
+		const liveEvents: unknown[] = [];
+		const runner = createGjcRoutingLiveGatewayRunner({
+			turnRunner,
+			mappings: new SessionMappingStore(),
+			modelReaderFactory: staticModelReaderFactory(),
+		});
+
+		await expect(
+			runner.run({
+				project,
+				prompt: "hello",
+				chatId: "chat-failed",
+				messageId: "assistant-failed",
+				userMessageId: "user-failed",
+				userMessageParentId: null,
+				continued: false,
+				requestedModelId: "gjc",
+				onLiveEvents: events => {
+					liveEvents.push(...events);
+				},
+			}),
+		).rejects.toThrow("GJC prompt failed");
+		expect(liveEvents).toEqual([]);
+	});
 	test("preserves artifact fallback events after observing a terminal frame", async () => {
 		const turnRunner = new FakeGjcTurnRunner();
 		turnRunner.observedEvents = [{ type: "agent_start" }, { type: "agent_end" }];
