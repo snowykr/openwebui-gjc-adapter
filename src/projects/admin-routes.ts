@@ -87,7 +87,7 @@ export async function handleProjectAdminChatCompletion(
 	}
 	if (parsedHeaders.isBackgroundTask) {
 		try {
-			return await canonicalAdminResponse("", request.model, modelReaderFactory);
+			return await canonicalAdminResponse("", request.model, request.reasoning_effort, modelReaderFactory);
 		} catch (error) {
 			if (error instanceof ModelSelectionError) return modelSelectionErrorResult(error);
 			failureSink?.(error);
@@ -98,7 +98,7 @@ export async function handleProjectAdminChatCompletion(
 	if (command === undefined) return errorResult("A project command is required.", "invalid_project_command", 400);
 	try {
 		const content = await executeProjectCommand(service, command);
-		return await canonicalAdminResponse(content, request.model, modelReaderFactory);
+		return await canonicalAdminResponse(content, request.model, request.reasoning_effort, modelReaderFactory);
 	} catch (error) {
 		if (error instanceof ProjectLinkError) return projectLinkErrorResult(error);
 		if (error instanceof ModelSelectionError) return modelSelectionErrorResult(error);
@@ -110,22 +110,29 @@ export async function handleProjectAdminChatCompletion(
 export function isProjectAdminChatCompletionRequest(request: OpenAIChatCompletionRequest): boolean {
 	const command = latestUserText(request);
 	const model = classifyGjcModelId(request.model);
-	return (model.kind === "alias" || model.kind === "canonical") && (command?.startsWith("/gjc project ") ?? false);
+	return (
+		(model.kind === "alias" || model.kind === "base" || model.kind === "canonical") &&
+		(command?.startsWith("/gjc project ") ?? false)
+	);
 }
 
 async function canonicalAdminResponse(
 	content: string,
 	requestedModelId: string,
+	reasoningEffort: string | undefined,
 	modelReaderFactory?: ModelReaderFactory,
 ): Promise<ProjectAdminRouteResult> {
 	if (modelReaderFactory === undefined) {
 		throw modelSelectionError(
-			classifyGjcModelId(requestedModelId).kind === "canonical"
+			classifyGjcModelId(requestedModelId).kind === "canonical" ||
+				classifyGjcModelId(requestedModelId).kind === "base"
 				? "model_selection_not_available"
 				: "model_selection_default_read_failed",
 		);
 	}
-	const model = formatCanonicalModelId(await createModelSelectionPolicy(modelReaderFactory).resolve(requestedModelId));
+	const model = formatCanonicalModelId(
+		await createModelSelectionPolicy(modelReaderFactory).resolve(requestedModelId, reasoningEffort),
+	);
 	return { status: 200, body: chatResponse(content, model) };
 }
 

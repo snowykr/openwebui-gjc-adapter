@@ -25,6 +25,12 @@ export function parseChatCompletionRequest(value: unknown): ChatCompletionReques
 		model: value.model,
 		messages: messages.value,
 	};
+	if (value.reasoning_effort !== undefined) {
+		if (typeof value.reasoning_effort !== "string") {
+			return invalidChatCompletionRequest("Request reasoning_effort must be a string when provided.");
+		}
+		request = { ...request, reasoning_effort: value.reasoning_effort };
+	}
 	if (value.metadata !== undefined) {
 		if (!isRecord(value.metadata)) return invalidChatCompletionRequest("Request metadata must be a JSON object.");
 		request = { ...request, metadata: parseMetadata(value.metadata) };
