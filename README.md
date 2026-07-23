@@ -69,7 +69,7 @@ The managed deployment uses rootful Docker, userns-remap disabled, user systemd,
 
 ### Existing route
 
-Existing setup requires the OpenWebUI URL, an adapter ingress URL reachable from OpenWebUI, one inherited decimal FD for the OpenWebUI administrator token, and an allowed source parent for project links. Set `--project-root` to the operator-owned parent containing linkable projects (for example, `/home/me/src`); linked paths must be inside that configured root. The configuring user must be able to read and search each project directory. An existing session root must be readable, writable, and searchable; for a prospective root such as the default per-project session root (`<cwd>/.gjc/sessions`), its nearest existing ancestor must be writable and searchable. These permissions are checked before project registration.
+Existing setup requires the OpenWebUI URL, an adapter ingress URL reachable from OpenWebUI, one inherited decimal FD for the OpenWebUI administrator token, and an allowed source parent for project links. Set `--project-root` to the operator-owned parent containing linkable projects (for example, `/home/me/src`); linked paths must be inside that configured root. The configuring user must be able to read and search each project directory. An existing session root needs read/write/search access; a prospective root such as the default per-project session root (`<cwd>/.gjc/sessions`) needs write/search access on its nearest existing ancestor. These permissions are checked before project registration.
 
 ```sh
 exec 3<"$OPENWEBUI_API_TOKEN_FILE"

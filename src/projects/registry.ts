@@ -130,8 +130,11 @@ async function assertProjectDirectoryAccess(cwd: string): Promise<void> {
 		const stats = await fs.stat(cwd);
 		if (!stats.isDirectory()) throw new Error("not a directory");
 		await fs.access(cwd, constants.R_OK | constants.X_OK);
-	} catch {
-		throw new ProjectPathAccessError(`Project directory is not readable/searchable: ${cwd}`);
+	} catch (error) {
+		if (isPermissionDenied(error) || isNotFoundError(error) || isNotDirectoryError(error)) {
+			throw new ProjectPathAccessError(`Project directory is not readable/searchable: ${cwd}`, error);
+		}
+		throw error;
 	}
 }
 
@@ -140,7 +143,14 @@ async function assertSessionRootWritable(sessionRoot: string): Promise<void> {
 		await assertDirectoryAccess(sessionRoot, constants.R_OK | constants.W_OK | constants.X_OK);
 		return;
 	} catch (error) {
-		if (!isNotFoundError(error)) throw sessionRootAccessError(sessionRoot);
+		if (isNotFoundError(error)) {
+			// A prospective session root is valid when its nearest existing ancestor
+			// is writable and searchable; continue with the ancestor walk below.
+		} else if (isPermissionDenied(error) || isNotDirectoryError(error)) {
+			throw sessionRootAccessError(sessionRoot, error);
+		} else {
+			throw error;
+		}
 	}
 
 	let ancestor = path.dirname(sessionRoot);
@@ -149,10 +159,16 @@ async function assertSessionRootWritable(sessionRoot: string): Promise<void> {
 			await assertDirectoryAccess(ancestor, constants.W_OK | constants.X_OK);
 			return;
 		} catch (error) {
-			if (!isNotFoundError(error)) throw sessionRootAccessError(sessionRoot);
-			const parent = path.dirname(ancestor);
-			if (parent === ancestor) break;
-			ancestor = parent;
+			if (isNotFoundError(error)) {
+				const parent = path.dirname(ancestor);
+				if (parent === ancestor) break;
+				ancestor = parent;
+				continue;
+			}
+			if (isPermissionDenied(error) || isNotDirectoryError(error)) {
+				throw sessionRootAccessError(sessionRoot, error);
+			}
+			throw error;
 		}
 	}
 
@@ -165,16 +181,24 @@ async function assertDirectoryAccess(directory: string, mode: number): Promise<v
 	await fs.access(directory, mode);
 }
 
-function sessionRootAccessError(sessionRoot: string): Error {
-	return new ProjectPathAccessError(`Session root is not readable/writable/searchable: ${sessionRoot}`);
+function sessionRootAccessError(sessionRoot: string, cause?: unknown): Error {
+	return new ProjectPathAccessError(`Session root is not readable/writable/searchable: ${sessionRoot}`, cause);
 }
 
 function isNotFoundError(error: unknown): boolean {
-	return error instanceof Error && "code" in error && error.code === "ENOENT";
+	return isNodeFsError(error, "ENOENT");
+}
+
+function isNotDirectoryError(error: unknown): boolean {
+	return isNodeFsError(error, "ENOTDIR") || (error instanceof Error && error.message === "not a directory");
 }
 
 function isPermissionDenied(error: unknown): boolean {
-	return error instanceof Error && "code" in error && (error.code === "EACCES" || error.code === "EPERM");
+	return isNodeFsError(error, "EACCES") || isNodeFsError(error, "EPERM");
+}
+
+function isNodeFsError(error: unknown, code: string): boolean {
+	return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
 
 function findAllowedRoot(cwd: string, allowedRoots: readonly AllowedRoot[]): string {

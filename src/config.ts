@@ -1,4 +1,4 @@
-import { DEFAULT_TURN_TIMEOUT_MS } from "./config-env";
+import { resolveTurnTimeoutMs } from "./config-env";
 import {
 	DEFAULT_EXISTING_PROJECT_ROOT,
 	defaultConfigPath,
@@ -9,7 +9,7 @@ import {
 import { resolveGjcRuntimeLocations } from "./configure/runtime-locations";
 import type { GjcRuntimeLocations } from "./contracts";
 
-export { DEFAULT_TURN_TIMEOUT_MS, loadAdapterConfig } from "./config-env";
+export { DEFAULT_TURN_TIMEOUT_MS, loadAdapterConfig, resolveTurnTimeoutMs } from "./config-env";
 
 export {
 	GjcRuntimeLocationError,
@@ -121,7 +121,7 @@ export function loadInstalledAdapterConfig(
 		gjcConfigDirName: runtimeLocations.childEnvironment.GJC_CONFIG_DIR,
 		gjcCodingAgentDir: runtimeLocations.agentDir,
 		runtimeLocations,
-		turnTimeoutMs: DEFAULT_TURN_TIMEOUT_MS,
+		turnTimeoutMs: resolveTurnTimeoutMs(env),
 		sessionRoot: managed ? "/run/gjc-session" : `${projectRoot}/.gjc/sessions`,
 		allowedProjectRoots: managed ? [projectRoot, "/run/gjc-session"] : [projectRoot],
 		projects: [

@@ -54,7 +54,8 @@ Required existing-route inputs:
 Project link locations:
   --project-root PATH          Allowed parent for linkable project directories
   Project directories must be readable/searchable. Existing session roots need
-  read/write/search access; prospective roots need a writable/searchable parent.
+  read/write/search access; prospective roots need write/search access on the
+  nearest existing ancestor.
 
 Ownership:
   Provider connection, custom headers, ingress, and their operation remain
@@ -183,7 +184,8 @@ describe("CLI module boundaries", () => {
 		expect(results[1]?.stdout).toContain("--project-root PATH");
 		expect(results[1]?.stdout).toContain("Project directories must be readable/searchable");
 		expect(results[1]?.stdout).toContain("Existing session roots need");
-		expect(results[1]?.stdout).toContain("prospective roots need a writable/searchable parent");
+		expect(results[1]?.stdout).toContain("prospective roots need write/search access");
+		expect(results[1]?.stdout).toContain("nearest existing ancestor");
 		expect(results[2]?.stdout).toContain("rootful Docker");
 		expect(results[2]?.stdout).toContain("userns-remap disabled");
 		expect(results[0]?.stdout).toContain(
@@ -207,8 +209,8 @@ describe("CLI module boundaries", () => {
 		expect(readme).toContain("linked paths must be inside that configured root");
 		expect(readme).toContain("default per-project session root (`<cwd>/.gjc/sessions`)");
 		expect(readme).toContain("permissions are checked before project registration");
-		expect(readme).toContain("existing session root must be readable, writable, and searchable");
-		expect(readme).toContain("nearest existing ancestor must be writable and searchable");
+		expect(readme).toContain("An existing session root needs read/write/search access");
+		expect(readme).toContain("needs write/search access on its nearest existing ancestor");
 		expect(readme).not.toContain("Any managed Docker prerequisite does not hold");
 		expect(readme).not.toContain("use existing when those Docker prerequisites fail");
 		expect(readme).not.toContain("route-specific help for the complete accepted surface");

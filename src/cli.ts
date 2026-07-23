@@ -51,7 +51,8 @@ Required existing-route inputs:
 Project link locations:
   --project-root PATH          Allowed parent for linkable project directories
   Project directories must be readable/searchable. Existing session roots need
-  read/write/search access; prospective roots need a writable/searchable parent.
+  read/write/search access; prospective roots need write/search access on the
+  nearest existing ancestor.
 
 Ownership:
   Provider connection, custom headers, ingress, and their operation remain
