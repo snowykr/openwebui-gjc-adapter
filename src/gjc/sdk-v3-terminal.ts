@@ -134,11 +134,18 @@ export class SdkTerminalWindow {
 	}
 
 	private terminalOutcome(correlation: SdkTurnCorrelation): SdkTerminalOutcome | undefined {
-		const failed = this.postAcceptEvents().find(
-			frame => frame.type === "agent_failed" && matches(frame, correlation),
-		);
+		const events = this.postAcceptEvents();
+		const failed = events.find(frame => frame.type === "agent_failed" && matches(frame, correlation));
 		if (failed !== undefined) throw new SdkV3OperationError("prompt_failed", failureMessage(failed));
-		return this.postAcceptEvents().some(frame => frame.type === "agent_end" && matches(frame, correlation))
+		const startIndex = events.findIndex(frame => frame.type === "agent_start" && matches(frame, correlation));
+		if (startIndex >= 0) {
+			const assistantFailure = events
+				.slice(startIndex + 1)
+				.map(assistantFailureMessage)
+				.find(Boolean);
+			if (assistantFailure !== undefined) throw new SdkV3OperationError("prompt_failed", assistantFailure);
+		}
+		return events.some(frame => frame.type === "agent_end" && matches(frame, correlation))
 			? this.outcome(correlation)
 			: undefined;
 	}
@@ -337,4 +344,14 @@ function failureMessage(frame: SdkRecord): string {
 	return typeof frame.error === "object" && frame.error !== null
 		? requiredString(parseRecord(frame.error, "agent_failed.error"), "message", "agent_failed.error")
 		: "SDK prompt failed";
+}
+function assistantFailureMessage(frame: SdkRecord): string | undefined {
+	if (frame.type !== "message_end") return undefined;
+	const message = recordOrUndefined(frame.message);
+	if (message?.role !== "assistant" || message.stopReason !== "error") return undefined;
+	if (typeof message.errorMessage === "string" && message.errorMessage.length > 0) return message.errorMessage;
+	const transportFailure = recordOrUndefined(message.transportFailure);
+	return typeof transportFailure?.providerCode === "string" && transportFailure.providerCode.length > 0
+		? `Provider transport failed (${transportFailure.providerCode})`
+		: "Provider transport failed";
 }

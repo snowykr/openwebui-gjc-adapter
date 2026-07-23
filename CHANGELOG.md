@@ -32,3 +32,4 @@
 - Replaced interactive-only `/model` role guidance with the verified natural-language persistent-configuration flow and clarified that role updates need neither an adapter restart nor a new GJC session.
 - Added fail-fast project-link permission validation for project directories and existing/prospective session roots, with client-correct errors before registration or OpenWebUI folder projection.
 - Made installed `serve --config` honor and validate `GJC_OPENWEBUI_TURN_TIMEOUT_MS` instead of always forcing the 180-second default.
+- Rejected accepted SDK turns whose terminal assistant message reports a provider transport error, including usage-limit failures, instead of persisting and returning an empty successful response.
