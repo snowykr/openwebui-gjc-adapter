@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
+import { constants } from "node:fs";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type AllowedRoot, assertPathInsideAllowedRoots } from "../security/paths";
+import { ProjectPathAccessError } from "./project-admission";
 
 export interface RegisteredProject {
 	readonly id: string;
@@ -73,11 +76,19 @@ export async function registerProjectDirectory(
 	allowedRoots: readonly AllowedRoot[],
 	now: Date = new Date(),
 ): Promise<RegisteredProject> {
-	const cwd = await assertPathInsideAllowedRoots(input.cwd, allowedRoots);
-	const sessionRoot = await assertPathInsideAllowedRoots(
-		input.sessionRoot ?? path.join(cwd, ".gjc", "sessions"),
+	const cwd = await canonicalProjectPath(
+		input.cwd,
 		allowedRoots,
+		`Project directory is not readable/searchable: ${path.resolve(input.cwd)}`,
 	);
+	const requestedSessionRoot = input.sessionRoot ?? path.join(cwd, ".gjc", "sessions");
+	const sessionRoot = await canonicalProjectPath(
+		requestedSessionRoot,
+		allowedRoots,
+		`Session root is not readable/writable/searchable: ${path.resolve(requestedSessionRoot)}`,
+	);
+	await assertProjectDirectoryAccess(cwd);
+	await assertSessionRootWritable(sessionRoot);
 	const id = createProjectId(input.name ?? cwd);
 	const allowedRoot = findAllowedRoot(cwd, allowedRoots);
 
@@ -100,6 +111,70 @@ export function buildProjectFolderMetadata(project: RegisteredProject): ProjectF
 			projectName: project.name,
 		},
 	};
+}
+async function canonicalProjectPath(
+	targetPath: string,
+	allowedRoots: readonly AllowedRoot[],
+	permissionMessage: string,
+): Promise<string> {
+	try {
+		return await assertPathInsideAllowedRoots(targetPath, allowedRoots);
+	} catch (error) {
+		if (isPermissionDenied(error)) throw new ProjectPathAccessError(permissionMessage, error);
+		throw error;
+	}
+}
+
+async function assertProjectDirectoryAccess(cwd: string): Promise<void> {
+	try {
+		const stats = await fs.stat(cwd);
+		if (!stats.isDirectory()) throw new Error("not a directory");
+		await fs.access(cwd, constants.R_OK | constants.X_OK);
+	} catch {
+		throw new ProjectPathAccessError(`Project directory is not readable/searchable: ${cwd}`);
+	}
+}
+
+async function assertSessionRootWritable(sessionRoot: string): Promise<void> {
+	try {
+		await assertDirectoryAccess(sessionRoot, constants.R_OK | constants.W_OK | constants.X_OK);
+		return;
+	} catch (error) {
+		if (!isNotFoundError(error)) throw sessionRootAccessError(sessionRoot);
+	}
+
+	let ancestor = path.dirname(sessionRoot);
+	while (true) {
+		try {
+			await assertDirectoryAccess(ancestor, constants.W_OK | constants.X_OK);
+			return;
+		} catch (error) {
+			if (!isNotFoundError(error)) throw sessionRootAccessError(sessionRoot);
+			const parent = path.dirname(ancestor);
+			if (parent === ancestor) break;
+			ancestor = parent;
+		}
+	}
+
+	throw sessionRootAccessError(sessionRoot);
+}
+
+async function assertDirectoryAccess(directory: string, mode: number): Promise<void> {
+	const stats = await fs.stat(directory);
+	if (!stats.isDirectory()) throw new Error("not a directory");
+	await fs.access(directory, mode);
+}
+
+function sessionRootAccessError(sessionRoot: string): Error {
+	return new ProjectPathAccessError(`Session root is not readable/writable/searchable: ${sessionRoot}`);
+}
+
+function isNotFoundError(error: unknown): boolean {
+	return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+
+function isPermissionDenied(error: unknown): boolean {
+	return error instanceof Error && "code" in error && (error.code === "EACCES" || error.code === "EPERM");
 }
 
 function findAllowedRoot(cwd: string, allowedRoots: readonly AllowedRoot[]): string {

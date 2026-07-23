@@ -30,3 +30,4 @@
 - Made existing-mode units launch and runtime configuration consume the packaged GJC executable with a usable Bun search path, accepted the explicitly supplied derived default agent directory, and kept fresh preflight rollback from stopping an absent unit.
 - Reset session authority history and retired displaced provisional operations when an OpenWebUI chat moves to a different project so the new project mapping remains restart-valid and late old-project work cannot regain authority.
 - Replaced interactive-only `/model` role guidance with the verified natural-language persistent-configuration flow and clarified that role updates need neither an adapter restart nor a new GJC session.
+- Added fail-fast project-link permission validation for project directories and existing/prospective session roots, with client-correct errors before registration or OpenWebUI folder projection.

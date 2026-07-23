@@ -51,6 +51,11 @@ Required existing-route inputs:
   --adapter-ingress-url URL    Adapter URL reachable from OpenWebUI
   --openwebui-api-token-fd FD  Distinct inherited decimal FD for the admin token
 
+Project link locations:
+  --project-root PATH          Allowed parent for linkable project directories
+  Project directories must be readable/searchable. Existing session roots need
+  read/write/search access; prospective roots need a writable/searchable parent.
+
 Ownership:
   Provider connection, custom headers, ingress, and their operation remain
   manual and externally owned. The adapter validates the supplied OpenWebUI
@@ -175,6 +180,10 @@ describe("CLI module boundaries", () => {
 		expect(results[1]?.stdout).not.toContain("Docker prerequisites do not hold");
 		expect(results[1]?.stdout).toContain("--adapter-ingress-url URL");
 		expect(results[1]?.stdout).toContain("--openwebui-api-token-fd FD");
+		expect(results[1]?.stdout).toContain("--project-root PATH");
+		expect(results[1]?.stdout).toContain("Project directories must be readable/searchable");
+		expect(results[1]?.stdout).toContain("Existing session roots need");
+		expect(results[1]?.stdout).toContain("prospective roots need a writable/searchable parent");
 		expect(results[2]?.stdout).toContain("rootful Docker");
 		expect(results[2]?.stdout).toContain("userns-remap disabled");
 		expect(results[0]?.stdout).toContain(
@@ -187,12 +196,19 @@ describe("CLI module boundaries", () => {
 		expect(results[0]?.stdout).not.toContain("when those Docker prerequisites");
 		expect(results[2]?.stdout).not.toContain("user systemd or OpenWebUI");
 		const readme = readFileSync(join(ROOT, "README.md"), "utf8");
+		expect(readme).toContain("`--project-root`");
+		expect(readme).toContain("`/home/me/src`");
 		expect(readme).toContain(
 			"route-specific help for first-install guidance. Route help documents required first-install inputs and prerequisites",
 		);
 		expect(readme).toContain("Both CLI-managed routes require user systemd and OpenWebUI >=0.10.0;");
 		expect(readme).toContain("existing mode is not a fallback for missing shared prerequisites.");
 		expect(readme).toContain("Choose existing mode for rootless or userns-remapped Docker");
+		expect(readme).toContain("linked paths must be inside that configured root");
+		expect(readme).toContain("default per-project session root (`<cwd>/.gjc/sessions`)");
+		expect(readme).toContain("permissions are checked before project registration");
+		expect(readme).toContain("existing session root must be readable, writable, and searchable");
+		expect(readme).toContain("nearest existing ancestor must be writable and searchable");
 		expect(readme).not.toContain("Any managed Docker prerequisite does not hold");
 		expect(readme).not.toContain("use existing when those Docker prerequisites fail");
 		expect(readme).not.toContain("route-specific help for the complete accepted surface");

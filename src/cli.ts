@@ -48,6 +48,11 @@ Required existing-route inputs:
   --adapter-ingress-url URL    Adapter URL reachable from OpenWebUI
   --openwebui-api-token-fd FD  Distinct inherited decimal FD for the admin token
 
+Project link locations:
+  --project-root PATH          Allowed parent for linkable project directories
+  Project directories must be readable/searchable. Existing session roots need
+  read/write/search access; prospective roots need a writable/searchable parent.
+
 Ownership:
   Provider connection, custom headers, ingress, and their operation remain
   manual and externally owned. The adapter validates the supplied OpenWebUI
