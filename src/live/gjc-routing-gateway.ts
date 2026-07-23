@@ -58,11 +58,15 @@ export function createGjcRoutingLiveGatewayRunner(
 			await input.turnRunner.stop?.();
 		},
 		async run(turn: LiveGatewayRunnerInput): Promise<GjcRoutingLiveGatewayRunnerResult> {
+			let existing = input.mappings.get(turn.chatId);
+			if (existing !== undefined && existing.projectId !== turn.project.id) {
+				input.mappings.reassignProjectAuthority(turn.chatId, existing.projectId, turn.project.id);
+				existing = undefined;
+			}
 			const replayedOperation = await replayRoutingOperation(input, turn);
 			if (replayedOperation !== null) return replayedOperation;
 
 			const requestedModelId = turn.requestedModelId ?? input.requestedModelId?.(turn);
-			const existing = input.mappings.get(turn.chatId);
 			if (
 				requestedModelId !== undefined &&
 				isSameProject(existing, turn) &&

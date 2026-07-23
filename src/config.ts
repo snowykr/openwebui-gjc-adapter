@@ -93,13 +93,18 @@ export function buildStartupDiagnostics(config: AdapterConfig): StartupDiagnosti
 		messages,
 	};
 }
-export function loadInstalledAdapterConfig(path?: string): ResolvedAdapterConfig {
+export function loadInstalledAdapterConfig(
+	path?: string,
+	env: Readonly<Record<string, string | undefined>> = process.env,
+): ResolvedAdapterConfig {
 	const installed = readInstalledConfig(path);
 	const managed = installed.mode === "managed";
 	const projectRoot = managed ? "/workspace" : (installed.projectRoot ?? DEFAULT_EXISTING_PROJECT_ROOT);
 	const runtimeLocations = resolveGjcRuntimeLocations(
 		managed ? { mode: "managed" } : { mode: "existing", installedConfig: installed },
 	);
+	const gjcCommand = (env.GJC_OPENWEBUI_GJC_COMMAND ?? "gjc").trim();
+	if (gjcCommand.length === 0) throw new Error("GJC_OPENWEBUI_GJC_COMMAND must be a non-empty string");
 	return Object.freeze({
 		bindHost: installed.bindHost,
 		bindPort: installed.bindPort,
@@ -112,7 +117,7 @@ export function loadInstalledAdapterConfig(path?: string): ResolvedAdapterConfig
 		installationId: installed.installationId,
 		ownerUserId: installed.ownerUserId,
 		statePath: managed ? "/var/lib/gjc" : ".gjc/openwebui-adapter",
-		gjcCommand: "gjc",
+		gjcCommand,
 		gjcConfigDirName: runtimeLocations.childEnvironment.GJC_CONFIG_DIR,
 		gjcCodingAgentDir: runtimeLocations.agentDir,
 		runtimeLocations,

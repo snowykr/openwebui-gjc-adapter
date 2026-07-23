@@ -56,6 +56,96 @@ function fileHarness(): StoreHarness {
 }
 
 describe("session mapping store authority conformance", () => {
+	describe("project reassignment", () => {
+		for (const createHarness of [memoryHarness, fileHarness]) {
+			test(createHarness.name, () => {
+				const harness = createHarness();
+				try {
+					const source = mapping();
+					harness.store.set(source);
+					harness.store.beginOperation(source.chatId, {
+						id: "completed-operation",
+						kind: "prompt",
+						detail: "hash",
+					});
+					harness.store.transitionOperation(source.chatId, "completed-operation", "complete", "hash", {
+						kind: "turn",
+						assistantText: "done",
+						events: [],
+						mapping: {
+							chatId: source.chatId,
+							projectId: source.projectId,
+							sessionId: source.sessionId,
+							rawFrameCursor: source.rawFrameCursor,
+							eventCursor: source.eventCursor,
+							operationId: "completed-operation",
+						},
+					});
+					const displacedOperation = {
+						chatId: source.chatId,
+						projectId: source.projectId,
+						id: "displaced-operation",
+						ingressId: "displaced-ingress",
+						kind: "create" as const,
+						detail: "request",
+					};
+					harness.store.reserveProvisionalOperation(displacedOperation);
+					harness.store.reassignProjectAuthority(source.chatId, source.projectId, "project-2");
+					expect(harness.store.get(source.chatId)).toBeUndefined();
+					expect(() => harness.store.publishProvisionalOperation(displacedOperation, source)).toThrow(
+						"reconciliation",
+					);
+					expect(() =>
+						harness.store.reserveProvisionalOperation({
+							...displacedOperation,
+							id: "stale-after-reassignment",
+							ingressId: "stale-after-reassignment",
+						}),
+					).toThrow("assigned to another project");
+					expect(() => harness.store.upsert(source)).toThrow("assigned to another project");
+					harness.store.upsert({
+						...source,
+						projectId: "project-2",
+						sessionId: "session-2",
+						operationId: "project-2-operation",
+						attachment: {
+							...source.attachment!,
+							expectedSessionId: "session-2",
+						},
+					});
+					expect(() =>
+						harness.store.reserveProvisionalOperation({
+							...displacedOperation,
+							id: "stale-after-new-publication",
+							ingressId: "stale-after-new-publication",
+						}),
+					).toThrow("assigned to another project");
+					expect(() => harness.store.upsert(source)).toThrow("assigned to another project");
+
+					expect(harness.recover().get(source.chatId)).toMatchObject({
+						projectId: "project-2",
+						sessionId: "session-2",
+						operationId: "project-2-operation",
+					});
+					const recovered = harness.recover();
+					expect(recovered.provisionalOperation(source.chatId, displacedOperation.ingressId)).toBeUndefined();
+					expect(() => recovered.publishProvisionalOperation(displacedOperation, source)).toThrow(
+						"reconciliation",
+					);
+					expect(() =>
+						recovered.reserveProvisionalOperation({
+							...displacedOperation,
+							id: "stale-after-recovery",
+							ingressId: "stale-after-recovery",
+						}),
+					).toThrow("assigned to another project");
+					expect(() => recovered.upsert(source)).toThrow("assigned to another project");
+				} finally {
+					harness.cleanup();
+				}
+			});
+		}
+	});
 	for (const createHarness of [memoryHarness, fileHarness]) {
 		test(createHarness.name, () => {
 			const harness = createHarness();

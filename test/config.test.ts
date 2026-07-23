@@ -186,6 +186,12 @@ describe("adapter config contracts", () => {
 			expect(existing.sessionRoot).toBe(join(DEFAULT_EXISTING_PROJECT_ROOT, ".gjc", "sessions"));
 			expect(existing.allowedProjectRoots).toEqual([DEFAULT_EXISTING_PROJECT_ROOT]);
 			expect(existing.gjcCommand).toBe("gjc");
+			expect(loadInstalledAdapterConfig(file, { GJC_OPENWEBUI_GJC_COMMAND: "/opt/gjc/bin/gjc" }).gjcCommand).toBe(
+				"/opt/gjc/bin/gjc",
+			);
+			expect(() => loadInstalledAdapterConfig(file, { GJC_OPENWEBUI_GJC_COMMAND: " " })).toThrow(
+				"GJC_OPENWEBUI_GJC_COMMAND must be a non-empty string",
+			);
 			expect(existing.ownerUserId).toBe("owner-test");
 		} finally {
 			rmSync(directory, { recursive: true, force: true });

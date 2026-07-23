@@ -117,6 +117,11 @@ export function stageDeploymentArtifacts(input: StageInput): void {
 			workingDirectory: artifacts.directory,
 			name: "openwebui-gjc-adapter-existing",
 			adapterCommand: [process.execPath, join(artifacts.sourceRoot, "cli.ts"), "serve", "--config", artifacts.path],
+			gjcCommand: join(dirname(artifacts.sourceRoot), "node_modules", ".bin", "gjc"),
+			executableSearchPath: [
+				dirname(process.execPath),
+				process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+			].join(":"),
 			runtimeLocations,
 		}),
 		{ mode: 0o600 },

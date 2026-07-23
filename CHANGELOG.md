@@ -27,3 +27,6 @@
 - Unwrapped nested SDK event payloads, projected GJC message-event variants, avoided duplicate artifact lifecycle events, and isolated best-effort OpenWebUI progress delivery failures from accepted GJC turns.
 - Failed closed on malformed or ambiguous session, project, model, regenerate/branch, workflow-gate, and close authority instead of replaying, killing, or selecting a fallback.
 - Persisted successor session authority before SDK rebinding, honored configured session roots, closed pre-ack lifecycle leaks, and aligned server timeout handling with the turn budget.
+- Made existing-mode units launch and runtime configuration consume the packaged GJC executable with a usable Bun search path, accepted the explicitly supplied derived default agent directory, and kept fresh preflight rollback from stopping an absent unit.
+- Reset session authority history and retired displaced provisional operations when an OpenWebUI chat moves to a different project so the new project mapping remains restart-valid and late old-project work cannot regain authority.
+- Replaced interactive-only `/model` role guidance with the verified natural-language persistent-configuration flow and clarified that role updates need neither an adapter restart nor a new GJC session.

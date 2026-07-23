@@ -26,6 +26,9 @@ export class SessionAuthority {
 	upsert(input: SessionAuthorityInput): SessionAuthorityRecord {
 		return this.#journal.store(input);
 	}
+	reassignProject(chatId: string, currentProjectId: string, nextProjectId: string): boolean {
+		return this.#journal.reassignProject(chatId, currentProjectId, nextProjectId);
+	}
 	provisionalOperation(chatId: string, ingressId: string): ProvisionalSessionOperation | undefined {
 		const operation = this.#journal.provisional.get(provisionalKey(chatId, ingressId));
 		return operation === undefined ? undefined : copyProvisionalOperation(operation);

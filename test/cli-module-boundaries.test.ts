@@ -199,6 +199,9 @@ describe("CLI module boundaries", () => {
 		expect(readme).toContain(
 			"`/v1/models` emits canonical ids; OpenWebUI picker values may add one `<connection-id>.` prefix, which the adapter removes before validation.",
 		);
+		expect(readme).toContain("GJC applies the requested `task.agentModelOverrides`");
+		expect(readme).toContain("No adapter restart or new GJC session is required for these role changes");
+		expect(readme).not.toContain("/model <target>");
 		for (const output of results.map(result => result.stdout))
 			expect(output).not.toMatch(/--(?:provider-key|provider-credential|mpreset|profile|reload)\b/);
 	});

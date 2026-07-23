@@ -122,15 +122,22 @@ export function isAuthorityDocumentRelationallyValid(
 	const chatIds = new Set<string>();
 	const identities = new Map<string, string>();
 	const provisionalIdentities = new Set<string>();
+	const projectsByChatId = new Map<string, string>();
 	for (const mapping of mappings) {
 		if (chatIds.has(mapping.chatId)) return false;
 		chatIds.add(mapping.chatId);
+		projectsByChatId.set(mapping.chatId, mapping.projectId);
 		if (!hasUniqueJournalIdentities(mapping) || !hasConsistentOperationResults(mapping)) return false;
 		for (const operation of mapping.journal)
 			for (const identifier of operationIdentifiers(operation))
 				identities.set(`${mapping.chatId}\u0000${identifier}`, operationIdentity(operation));
 	}
 	for (const operation of provisionalOperations) {
+		if (
+			projectsByChatId.get(operation.chatId) !== undefined &&
+			projectsByChatId.get(operation.chatId) !== operation.projectId
+		)
+			return false;
 		const identity = operationIdentity(operation);
 		for (const identifier of operationIdentifiers(operation)) {
 			const key = `${operation.chatId}\u0000${identifier}`,

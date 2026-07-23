@@ -115,17 +115,22 @@ An unavailable or empty catalog, noncanonical model id, or provider-auth failure
 
 The OpenWebUI picker maps to GJC `DEFAULT`: selection is persisted as the shared agent-domain default and promoted in the currently attached session. It is not profile/preset selection, profile activation, or an all-role assignment. The adapter UI does not support selecting or activating GJC model profiles, forwarding profile options, configuration patching, or runtime reload. The bare `gjc` alias is input-only; `/v1/models` emits canonical ids.
 
-GJC 0.11.6 may still activate an already-persisted `modelProfile.default` when a new GJC process starts. That startup behavior is GJC-owned and does not mean the adapter can select a profile. To assign roles, instruct GJC in its session:
+GJC 0.11.6 may still activate an already-persisted `modelProfile.default` when a new GJC process starts. That startup behavior is GJC-owned and does not mean the adapter can select a profile.
+
+To change role models, tell GJC what to persist in a normal OpenWebUI message. For example:
 
 ```text
-/model <target> <provider>/<model>[:effort]
-/model roles
+Set EXECUTOR to <provider>/<model>:<effort>,
+PLANNER to <provider>/<model>:<effort>,
+CRITIC to <provider>/<model>:<effort>, and
+ARCHITECT to <provider>/<model>:<effort>.
+Use the supported persistent GJC configuration, do not change DEFAULT or any
+model profile, then read back and report all saved role assignments.
 ```
-For example, tell GJC: “Set EXECUTOR to `<provider>/<model>:<effort>`, PLANNER to `<provider>/<model>:<effort>`, CRITIC to `<provider>/<model>:<effort>`, and ARCHITECT to `<provider>/<model>:<effort>`, then show `/model roles`.” GJC applies those role assignments; the adapter does not add a separate preset UI.
 
-Use `<target>` as `DEFAULT`, `EXECUTOR`, `ARCHITECT`, `PLANNER`, or `CRITIC`; `/model roles` verifies the current assignments. Inspect first: issuing a direct `/model` assignment while an active profile is loaded materializes its role assignments and clears the persisted `modelProfile.default`. Do this only when that consequence is intended.
+OpenWebUI messages are SDK prompts, not interactive GJC CLI input, so do not rely on typing `/model ...` or `/model roles` into the chat. GJC applies the requested `task.agentModelOverrides`; the adapter does not add a separate preset UI.
 
-Role/default settings persist in the shared agent domain. Later task-agent launches in the instructed live session resolve the changed override; already-running or in-flight agents do not switch. Other already-live GJC processes retain their loaded state; an update is not promised. To load changed startup profile/default state conservatively, start a new GJC process/session in the same effective runtime. Restarting the adapter alone is not a GJC reload.
+No adapter restart or new GJC session is required for these role changes in the instructed live session. Later task-agent launches resolve the saved override, while already-running or in-flight agents do not switch. Other already-live GJC processes are not guaranteed to reload shared settings. Starting a new GJC process/session is only the conservative boundary for loading changed startup profile/default state; restarting the adapter alone is not a GJC reload. If `modelProfile.default` is configured, ask GJC to explain the profile conflict before changing it because a new process can apply that profile's assignments.
 
 ### Safety and recovery
 

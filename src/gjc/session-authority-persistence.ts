@@ -63,6 +63,9 @@ export class FileSessionAuthority extends SessionAuthority {
 	override upsert(input: SessionAuthorityInput): SessionAuthorityRecord {
 		return this.mutate(() => super.upsert(input));
 	}
+	override reassignProject(chatId: string, currentProjectId: string, nextProjectId: string): boolean {
+		return this.mutate(() => super.reassignProject(chatId, currentProjectId, nextProjectId));
+	}
 	override recordAcknowledgedSuccessor(
 		chatId: string,
 		operationId: string,

@@ -34,9 +34,36 @@ export class SessionAuthorityJournal {
 	readonly provisional = new Map<string, ProvisionalSessionOperation>();
 	store(input: SessionAuthorityInput): SessionAuthorityRecord {
 		const existing = this.records.get(input.chatId);
+		if (existing !== undefined && existing.projectId !== input.projectId)
+			throw new Error(`Session authority for chat ${input.chatId} is assigned to another project.`);
+		const conflictingProject = [...this.provisional.values()].find(
+			operation => operation.chatId === input.chatId && operation.projectId !== input.projectId,
+		);
+		if (conflictingProject !== undefined)
+			throw new Error(`Session authority for chat ${input.chatId} is assigned to another project.`);
+		const projectClaimId = JSON.stringify(["project-claim", input.chatId, input.projectId]);
+		this.provisional.delete(provisionalKey(input.chatId, projectClaimId));
 		const next = existing === undefined ? createAuthorityIdentity(input) : updateAuthorityIdentity(input, existing);
 		this.records.set(next.chatId, next);
 		return copy(next);
+	}
+	reassignProject(chatId: string, currentProjectId: string, nextProjectId: string): boolean {
+		const existing = this.records.get(chatId);
+		if (existing === undefined || existing.projectId !== currentProjectId) return false;
+		this.records.delete(chatId);
+		for (const [key, operation] of this.provisional) if (operation.chatId === chatId) this.provisional.delete(key);
+		const claimId = JSON.stringify(["project-claim", chatId, nextProjectId]);
+		this.provisional.set(provisionalKey(chatId, claimId), {
+			chatId,
+			projectId: nextProjectId,
+			id: claimId,
+			ingressId: claimId,
+			kind: "create",
+			state: "pending",
+			startedAt: new Date().toISOString(),
+			detail: "project reassignment claim",
+		});
+		return true;
 	}
 	require(chatId: string): SessionAuthorityRecord {
 		const record = this.records.get(chatId);
@@ -47,6 +74,14 @@ export class SessionAuthorityJournal {
 		operation: Omit<ProvisionalSessionOperation, "state" | "startedAt" | "completedAt">,
 	): ProvisionalSessionOperation {
 		const ingressId = operation.ingressId ?? operation.id;
+		const assignedProject = this.records.get(operation.chatId)?.projectId;
+		if (assignedProject !== undefined && assignedProject !== operation.projectId)
+			throw new Error(`Session authority for chat ${operation.chatId} is assigned to another project.`);
+		const conflictingProject = [...this.provisional.values()].find(
+			candidate => candidate.chatId === operation.chatId && candidate.projectId !== operation.projectId,
+		);
+		if (conflictingProject !== undefined)
+			throw new Error(`Session authority for chat ${operation.chatId} is assigned to another project.`);
 		const key = provisionalKey(operation.chatId, ingressId),
 			prior = this.provisional.get(key);
 		if (prior !== undefined) {

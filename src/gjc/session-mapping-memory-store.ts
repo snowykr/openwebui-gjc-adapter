@@ -23,6 +23,9 @@ export class SessionMappingStore {
 	upsert(mapping: SessionMapping): SessionMapping {
 		return mappingFromRecord(this.authority.upsert(copySessionMapping(mapping)));
 	}
+	reassignProjectAuthority(chatId: string, currentProjectId: string, nextProjectId: string): void {
+		this.authority.reassignProject(chatId, currentProjectId, nextProjectId);
+	}
 	entries(): readonly SessionMapping[] {
 		return this.authority.entries().map(mappingFromRecord);
 	}
