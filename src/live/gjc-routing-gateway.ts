@@ -59,10 +59,37 @@ export function createGjcRoutingLiveGatewayRunner(
 		},
 		async run(turn: LiveGatewayRunnerInput): Promise<GjcRoutingLiveGatewayRunnerResult> {
 			let existing = input.mappings.get(turn.chatId);
-			if (existing !== undefined && existing.projectId !== turn.project.id) {
-				input.mappings.reassignProjectAuthority(turn.chatId, existing.projectId, turn.project.id);
-				existing = undefined;
-			}
+			const priorProvisional = input.mappings.provisionalOperation(turn.chatId, turn.userMessageId);
+			if (
+				priorProvisional !== undefined &&
+				(priorProvisional.projectId !== turn.project.id ||
+					(existing !== undefined && existing.projectId !== priorProvisional.projectId))
+			)
+				throw new Error(`GJC operation ${turn.userMessageId} is not authorized for project ${turn.project.id}.`);
+			const priorAuthority = input.mappings.operationAuthority(turn.chatId, turn.userMessageId);
+			if (
+				priorAuthority !== undefined &&
+				("retiredAt" in priorAuthority || priorAuthority.projectId !== turn.project.id)
+			)
+				throw new Error(`GJC operation ${turn.userMessageId} is not authorized for project ${turn.project.id}.`);
+			const reassignmentSource =
+				existing !== undefined && existing.projectId !== turn.project.id ? existing.projectId : undefined;
+			if (reassignmentSource !== undefined) existing = undefined;
+			let reassignmentStarted = false;
+			const beginReassignment = () => {
+				if (reassignmentSource === undefined || reassignmentStarted) return;
+				input.mappings.beginProjectReassignment(turn.chatId, reassignmentSource, turn.project.id);
+				reassignmentStarted = true;
+			};
+			const rollbackReassignment = () => {
+				if (reassignmentSource === undefined || !reassignmentStarted) return;
+				try {
+					input.mappings.rollbackProjectReassignment(turn.chatId, reassignmentSource);
+				} catch {
+					// Exact target publication may already have committed the destination authority.
+				}
+				reassignmentStarted = false;
+			};
 			const replayedOperation = await replayRoutingOperation(input, turn);
 			if (replayedOperation !== null) return replayedOperation;
 
@@ -173,6 +200,7 @@ export function createGjcRoutingLiveGatewayRunner(
 			const modelSelection =
 				requestedModelId === undefined ? undefined : await resolveNormalSelection(input, turn, requestedModelId);
 
+			if (turn.onLiveEvents === undefined) beginReassignment();
 			if (turn.onLiveEvents === undefined) {
 				let result: RouteGjcTurnResult;
 				try {
@@ -192,7 +220,9 @@ export function createGjcRoutingLiveGatewayRunner(
 							ensureProjectionRows(input.outbox, routed.mapping, input.ownerUserId ?? "openwebui-gjc-adapter"),
 						...(modelSelection === undefined ? {} : { modelSelection }),
 					});
+					reassignmentStarted = false;
 				} catch (error) {
+					rollbackReassignment();
 					if (isModelSelectionApplyFailure(error)) throw modelSelectionError("model_selection_apply_failed");
 					throw error;
 				}
@@ -208,6 +238,7 @@ export function createGjcRoutingLiveGatewayRunner(
 						: { content: result.assistantText };
 				return withCanonicalModel(response, result.mapping.modelSelection);
 			}
+			beginReassignment();
 			const queue = new LiveChunkQueue();
 			let activityStarted = false;
 			let observedNativeLifecycle = false;
@@ -273,6 +304,7 @@ export function createGjcRoutingLiveGatewayRunner(
 				...(modelSelection === undefined ? {} : { modelSelection }),
 			})
 				.then(async result => {
+					reassignmentStarted = false;
 					markActivityStarted();
 					const canonicalModel =
 						result.mapping.modelSelection === undefined
@@ -290,6 +322,7 @@ export function createGjcRoutingLiveGatewayRunner(
 					await queue.finish(result.assistantText);
 				})
 				.catch(error => {
+					rollbackReassignment();
 					const mappedError = isModelSelectionApplyFailure(error)
 						? modelSelectionError("model_selection_apply_failed")
 						: error;

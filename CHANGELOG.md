@@ -28,7 +28,7 @@
 - Failed closed on malformed or ambiguous session, project, model, regenerate/branch, workflow-gate, and close authority instead of replaying, killing, or selecting a fallback.
 - Persisted successor session authority before SDK rebinding, honored configured session roots, closed pre-ack lifecycle leaks, and aligned server timeout handling with the turn budget.
 - Made existing-mode units launch and runtime configuration consume the packaged GJC executable with a usable Bun search path, accepted the explicitly supplied derived default agent directory, and kept fresh preflight rollback from stopping an absent unit.
-- Reset session authority history and retired displaced provisional operations when an OpenWebUI chat moves to a different project so the new project mapping remains restart-valid and late old-project work cannot regain authority.
+- Made OpenWebUI chat project reassignment a durable two-phase authority transition: failed destination turns retain the source mapping, successful commits preserve retired operation tombstones, and stale source retries fail closed before destination runner effects, including after restart.
 - Replaced interactive-only `/model` role guidance with the verified natural-language persistent-configuration flow and clarified that role updates need neither an adapter restart nor a new GJC session.
 - Added fail-fast project-link permission validation for project directories and existing/prospective session roots, with client-correct errors before registration or OpenWebUI folder projection.
 - Made installed `serve --config` honor and validate `GJC_OPENWEBUI_TURN_TIMEOUT_MS` instead of always forcing the 180-second default.

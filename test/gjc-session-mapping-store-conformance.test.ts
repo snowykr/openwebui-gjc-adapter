@@ -58,7 +58,7 @@ function fileHarness(): StoreHarness {
 describe("session mapping store authority conformance", () => {
 	describe("project reassignment", () => {
 		for (const createHarness of [memoryHarness, fileHarness]) {
-			test(createHarness.name, () => {
+			test(`${createHarness.name} commits only the exact target and retains source operation authority`, () => {
 				const harness = createHarness();
 				try {
 					const source = mapping();
@@ -81,65 +81,99 @@ describe("session mapping store authority conformance", () => {
 							operationId: "completed-operation",
 						},
 					});
-					const displacedOperation = {
+					const targetOperation = {
 						chatId: source.chatId,
-						projectId: source.projectId,
-						id: "displaced-operation",
-						ingressId: "displaced-ingress",
+						projectId: "project-2",
+						id: "project-2-operation",
+						ingressId: "project-2-operation",
 						kind: "create" as const,
-						detail: "request",
+						detail: "project-2-request",
 					};
-					harness.store.reserveProvisionalOperation(displacedOperation);
-					harness.store.reassignProjectAuthority(source.chatId, source.projectId, "project-2");
-					expect(harness.store.get(source.chatId)).toBeUndefined();
-					expect(() => harness.store.publishProvisionalOperation(displacedOperation, source)).toThrow(
-						"reconciliation",
-					);
-					expect(() =>
-						harness.store.reserveProvisionalOperation({
-							...displacedOperation,
-							id: "stale-after-reassignment",
-							ingressId: "stale-after-reassignment",
-						}),
-					).toThrow("assigned to another project");
-					expect(() => harness.store.upsert(source)).toThrow("assigned to another project");
-					harness.store.upsert({
+					harness.store.beginProjectReassignment(source.chatId, source.projectId, "project-2", {
+						id: targetOperation.id,
+						ingressId: targetOperation.ingressId,
+						kind: targetOperation.kind,
+						detail: targetOperation.detail,
+					});
+					expect(harness.store.get(source.chatId)).toMatchObject({
+						projectId: source.projectId,
+						sessionId: source.sessionId,
+					});
+					harness.store.reserveProvisionalOperation(targetOperation);
+					harness.store.publishProvisionalOperation(targetOperation, {
 						...source,
 						projectId: "project-2",
 						sessionId: "session-2",
-						operationId: "project-2-operation",
+						operationId: targetOperation.id,
 						attachment: {
 							...source.attachment!,
 							expectedSessionId: "session-2",
 						},
 					});
-					expect(() =>
-						harness.store.reserveProvisionalOperation({
-							...displacedOperation,
-							id: "stale-after-new-publication",
-							ingressId: "stale-after-new-publication",
-						}),
-					).toThrow("assigned to another project");
-					expect(() => harness.store.upsert(source)).toThrow("assigned to another project");
 
-					expect(harness.recover().get(source.chatId)).toMatchObject({
+					expect(harness.store.get(source.chatId)).toMatchObject({
 						projectId: "project-2",
 						sessionId: "session-2",
-						operationId: "project-2-operation",
 					});
-					const recovered = harness.recover();
-					expect(recovered.provisionalOperation(source.chatId, displacedOperation.ingressId)).toBeUndefined();
-					expect(() => recovered.publishProvisionalOperation(displacedOperation, source)).toThrow(
-						"reconciliation",
-					);
+					expect(harness.store.operation(source.chatId, "completed-operation")).toMatchObject({
+						state: "complete",
+						result: { mapping: { projectId: source.projectId } },
+					});
+					expect(harness.store.operationAuthority(source.chatId, "completed-operation")).toMatchObject({
+						projectId: source.projectId,
+						retiredAt: expect.any(String),
+					});
 					expect(() =>
-						recovered.reserveProvisionalOperation({
-							...displacedOperation,
-							id: "stale-after-recovery",
-							ingressId: "stale-after-recovery",
+						harness.store.assertOperationProject(source.chatId, "project-2", "completed-operation"),
+					).toThrow("not authorized");
+
+					const recovered = harness.recover();
+					expect(recovered.get(source.chatId)).toMatchObject({
+						projectId: "project-2",
+						sessionId: "session-2",
+					});
+					expect(recovered.operationAuthority(source.chatId, "completed-operation")).toMatchObject({
+						projectId: source.projectId,
+						retiredAt: expect.any(String),
+					});
+				} finally {
+					harness.cleanup();
+				}
+			});
+
+			test(`${createHarness.name} rolls an interrupted target back without deleting source authority`, () => {
+				const harness = createHarness();
+				try {
+					const source = mapping();
+					const targetOperation = {
+						chatId: source.chatId,
+						projectId: "project-2",
+						id: "project-2-operation",
+						ingressId: "project-2-operation",
+						kind: "create" as const,
+						detail: "project-2-request",
+					};
+					harness.store.set(source);
+					harness.store.beginProjectReassignment(source.chatId, source.projectId, "project-2");
+					harness.store.reserveProvisionalOperation(targetOperation);
+
+					const recovered = harness.recover();
+					expect(recovered.get(source.chatId)).toMatchObject({
+						projectId: source.projectId,
+						sessionId: source.sessionId,
+					});
+					expect(recovered.provisionalOperation(source.chatId, targetOperation.ingressId)).toMatchObject({
+						projectId: "project-2",
+						state: "uncertain",
+					});
+					expect(() =>
+						recovered.publishProvisionalOperation(targetOperation, {
+							...source,
+							projectId: "project-2",
+							sessionId: "session-2",
+							operationId: targetOperation.id,
 						}),
-					).toThrow("assigned to another project");
-					expect(() => recovered.upsert(source)).toThrow("assigned to another project");
+					).toThrow();
 				} finally {
 					harness.cleanup();
 				}

@@ -5,7 +5,12 @@ import {
 	type SessionOperationResult,
 	type SessionOperationState,
 } from "./session-authority";
-import type { AcknowledgedSuccessor } from "./session-authority-types";
+import type {
+	AcknowledgedSuccessor,
+	SessionAuthorityRecord,
+	SessionAuthorityTargetIdentity,
+	SessionAuthorityTombstone,
+} from "./session-authority-types";
 import { copySessionMapping } from "./session-mapping-copy";
 import type { SessionMapping } from "./session-mapping-store";
 import { operationResult } from "./session-operation-codec";
@@ -23,16 +28,34 @@ export class SessionMappingStore {
 	upsert(mapping: SessionMapping): SessionMapping {
 		return mappingFromRecord(this.authority.upsert(copySessionMapping(mapping)));
 	}
+	beginProjectReassignment(
+		chatId: string,
+		currentProjectId: string,
+		nextProjectId: string,
+		target?: SessionAuthorityTargetIdentity,
+	): void {
+		this.authority.beginProjectReassignment(chatId, currentProjectId, nextProjectId, target);
+	}
+	rollbackProjectReassignment(chatId: string, currentProjectId: string): void {
+		this.authority.rollbackProjectReassignment(chatId, currentProjectId);
+	}
 	reassignProjectAuthority(chatId: string, currentProjectId: string, nextProjectId: string): void {
-		this.authority.reassignProject(chatId, currentProjectId, nextProjectId);
+		this.beginProjectReassignment(chatId, currentProjectId, nextProjectId);
 	}
 	entries(): readonly SessionMapping[] {
 		return this.authority.entries().map(mappingFromRecord);
 	}
 	operation(chatId: string, operationId: string): SessionOperation | undefined {
-		return this.authority
-			.get(chatId)
-			?.journal.find(operation => operation.id === operationId || operation.ingressId === operationId);
+		return this.authority.lookupOperation(chatId, operationId);
+	}
+	operationAuthority(
+		chatId: string,
+		operationId: string,
+	): SessionAuthorityRecord | SessionAuthorityTombstone | undefined {
+		return this.authority.lookupOperationAuthority(chatId, operationId);
+	}
+	assertOperationProject(chatId: string, projectId: string, operationId: string): void {
+		this.authority.assertOperationProject(chatId, projectId, operationId);
 	}
 	beginOperation(chatId: string, operation: Omit<SessionOperation, "state" | "startedAt" | "completedAt">): void {
 		this.authority.beginOperation(chatId, operation);
@@ -108,6 +131,7 @@ function mappingFromRecord({
 	header: _header,
 	observations: _observations,
 	journal: _journal,
+	reassignment: _reassignment,
 	...mapping
 }: import("./session-authority").SessionAuthorityRecord): SessionMapping {
 	return copySessionMapping(mapping);

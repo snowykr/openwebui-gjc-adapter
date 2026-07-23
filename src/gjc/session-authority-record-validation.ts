@@ -6,7 +6,11 @@ import {
 	isNormalizedModelSelection,
 	isOperation,
 } from "./session-authority-operation-validation";
-import type { ProvisionalSessionOperation, SessionAuthorityRecord } from "./session-authority-types";
+import type {
+	ProvisionalSessionOperation,
+	SessionAuthorityRecord,
+	SessionAuthorityTombstone,
+} from "./session-authority-types";
 import { SESSION_AUTHORITY_VERSION } from "./session-authority-types";
 import {
 	hasOnlyKeys,
@@ -38,6 +42,7 @@ export function isV2Record(value: unknown): value is SessionAuthorityRecord {
 			"observations",
 			"attachment",
 			"journal",
+			"reassignment",
 		]) ||
 		value.version !== SESSION_AUTHORITY_VERSION
 	)
@@ -71,7 +76,9 @@ export function isV2Record(value: unknown): value is SessionAuthorityRecord {
 		(value.modelSelection === undefined || isNormalizedModelSelection(value.modelSelection)) &&
 		(value.attachment === undefined ||
 			(isAttachmentProof(value.attachment) && value.attachment.expectedSessionId === value.sessionId)) &&
-		value.journal.every(isOperation)
+		value.journal.every(isOperation) &&
+		(value.reassignment === undefined ||
+			isReassignment(value.reassignment, { chatId: value.chatId as string, projectId: value.projectId as string }))
 	);
 }
 
@@ -130,14 +137,41 @@ export function isAuthorityDocumentRelationallyValid(
 		if (!hasUniqueJournalIdentities(mapping) || !hasConsistentOperationResults(mapping)) return false;
 		for (const operation of mapping.journal)
 			for (const identifier of operationIdentifiers(operation))
-				identities.set(`${mapping.chatId}\u0000${identifier}`, operationIdentity(operation));
+				if (!addIdentity(identities, mapping.chatId, identifier, operationIdentity(operation))) return false;
+		let tombstone = mapping.reassignment?.sourceTombstone;
+		while (tombstone !== undefined) {
+			if (tombstone.chatId !== mapping.chatId || tombstone.projectId === mapping.projectId) return false;
+			if (!hasUniqueTombstoneIdentities(tombstone) || !hasConsistentTombstoneResults(tombstone)) return false;
+			for (const operation of tombstone.journal)
+				for (const identifier of operationIdentifiers(operation))
+					if (!addIdentity(identities, mapping.chatId, identifier, operationIdentity(operation))) return false;
+			tombstone = tombstone.prior;
+		}
 	}
 	for (const operation of provisionalOperations) {
-		if (
-			projectsByChatId.get(operation.chatId) !== undefined &&
-			projectsByChatId.get(operation.chatId) !== operation.projectId
-		)
-			return false;
+		const mapping = mappings.find(candidate => candidate.chatId === operation.chatId);
+		const activeProject = projectsByChatId.get(operation.chatId);
+		const reassignment = mapping?.reassignment;
+		if (activeProject !== undefined && activeProject !== operation.projectId) {
+			const matchesReassignmentTarget =
+				reassignment !== undefined &&
+				(reassignment.state === "pending" || reassignment.state === "rolled_back") &&
+				reassignment.targetProjectId === operation.projectId &&
+				reassignment.target !== undefined &&
+				sameTargetIdentity(operation, reassignment.target);
+			const isRetiredSourceEvidence =
+				operation.state === "complete" &&
+				mapping !== undefined &&
+				tombstoneChainContainsProject(mapping.reassignment?.sourceTombstone, operation.projectId);
+			if (
+				(!matchesReassignmentTarget && !isRetiredSourceEvidence) ||
+				(matchesReassignmentTarget &&
+					reassignment.state === "rolled_back" &&
+					operation.state !== "uncertain" &&
+					operation.state !== "conflict")
+			)
+				return false;
+		}
 		const identity = operationIdentity(operation);
 		for (const identifier of operationIdentifiers(operation)) {
 			const key = `${operation.chatId}\u0000${identifier}`,
@@ -179,4 +213,156 @@ function hasConsistentOperationResults(mapping: SessionAuthorityRecord): boolean
 				(correlation.operationId === undefined || correlation.operationId === operation.id))
 		);
 	});
+}
+function isReassignment(value: unknown, record: Pick<SessionAuthorityRecord, "chatId" | "projectId">): boolean {
+	if (
+		!isRecord(value) ||
+		!hasOnlyKeys(value, [
+			"state",
+			"sourceProjectId",
+			"targetProjectId",
+			"startedAt",
+			"completedAt",
+			"target",
+			"sourceTombstone",
+			"priorTombstone",
+		]) ||
+		(value.state !== "pending" && value.state !== "rolled_back" && value.state !== "committed") ||
+		!isNonEmptyString(value.sourceProjectId) ||
+		!isNonEmptyString(value.targetProjectId) ||
+		(value.state === "committed"
+			? value.targetProjectId !== record.projectId
+			: value.sourceProjectId !== record.projectId) ||
+		value.sourceProjectId === value.targetProjectId ||
+		!isTimestamp(value.startedAt)
+	)
+		return false;
+	if (value.completedAt !== undefined && !isTimestamp(value.completedAt)) return false;
+	if (value.target !== undefined && !isTargetIdentity(value.target)) return false;
+	if (value.priorTombstone !== undefined && !isTombstone(value.priorTombstone)) return false;
+	if (value.state === "pending" && value.sourceTombstone !== undefined) return false;
+	if (value.state === "committed" && !isTombstone(value.sourceTombstone)) return false;
+	if (value.sourceTombstone !== undefined) {
+		if (
+			!isTombstone(value.sourceTombstone) ||
+			value.sourceTombstone.chatId !== record.chatId ||
+			value.sourceTombstone.projectId !== value.sourceProjectId
+		)
+			return false;
+	}
+	return true;
+}
+
+function isTargetIdentity(value: unknown): boolean {
+	return (
+		isRecord(value) &&
+		hasOnlyKeys(value, ["id", "ingressId", "kind", "detail"]) &&
+		isNonEmptyString(value.id) &&
+		(value.ingressId === undefined || isNonEmptyString(value.ingressId)) &&
+		typeof value.kind === "string" &&
+		["create", "resume", "close", "prompt", "reply", "gate", "branch", "model", "thinking"].includes(value.kind) &&
+		(value.detail === undefined || typeof value.detail === "string")
+	);
+}
+
+function isTombstone(value: unknown): value is SessionAuthorityTombstone {
+	if (
+		!isRecord(value) ||
+		!hasOnlyKeys(value, [
+			"version",
+			"chatId",
+			"projectId",
+			"sessionId",
+			"createdAt",
+			"header",
+			"sessionFile",
+			"activeLeaf",
+			"rawFrameCursor",
+			"eventCursor",
+			"operationId",
+			"assistantText",
+			"events",
+			"modelSelection",
+			"observations",
+			"attachment",
+			"journal",
+			"retiredAt",
+			"prior",
+		]) ||
+		value.version !== SESSION_AUTHORITY_VERSION ||
+		![value.chatId, value.projectId, value.sessionId, value.createdAt, value.operationId, value.retiredAt].every(
+			isNonEmptyString,
+		) ||
+		!isTimestamp(value.createdAt) ||
+		!isTimestamp(value.retiredAt) ||
+		!hasOnlyKeys(value.header, ["chatId", "projectId", "sessionId"]) ||
+		value.header.chatId !== value.chatId ||
+		value.header.projectId !== value.projectId ||
+		value.header.sessionId !== value.sessionId ||
+		!isNonnegativeSafeInteger(value.rawFrameCursor) ||
+		!isNonnegativeSafeInteger(value.eventCursor) ||
+		!Array.isArray(value.journal) ||
+		(value.sessionFile !== undefined && (!isNonEmptyString(value.sessionFile) || !isAbsolute(value.sessionFile))) ||
+		(value.activeLeaf !== undefined && !isNonEmptyString(value.activeLeaf)) ||
+		(value.assistantText !== undefined && typeof value.assistantText !== "string") ||
+		(value.events !== undefined && (!Array.isArray(value.events) || !value.events.every(isEvent))) ||
+		(value.observations !== undefined && (!isRecord(value.observations) || !isJsonValue(value.observations))) ||
+		(value.modelSelection !== undefined && !isNormalizedModelSelection(value.modelSelection)) ||
+		(value.attachment !== undefined &&
+			(!isAttachmentProof(value.attachment) || value.attachment.expectedSessionId !== value.sessionId)) ||
+		!value.journal.every(isOperation) ||
+		(value.prior !== undefined && !isTombstone(value.prior))
+	)
+		return false;
+	return true;
+}
+
+function addIdentity(identities: Map<string, string>, chatId: string, identifier: string, identity: string): boolean {
+	const key = `${chatId}\u0000${identifier}`;
+	const prior = identities.get(key);
+	if (prior !== undefined && prior !== identity) return false;
+	if (prior === identity) return false;
+	identities.set(key, identity);
+	return true;
+}
+
+function sameTargetIdentity(
+	operation: Pick<ProvisionalSessionOperation, "id" | "ingressId" | "kind" | "detail">,
+	target: { readonly id: string; readonly ingressId?: string; readonly kind: string; readonly detail?: string },
+): boolean {
+	return (
+		operationIdentity(operation) === JSON.stringify([target.id, target.ingressId ?? target.id]) &&
+		operation.kind === target.kind &&
+		operation.detail === target.detail
+	);
+}
+
+function hasUniqueTombstoneIdentities(tombstone: SessionAuthorityTombstone): boolean {
+	const identifiers = new Set<string>();
+	for (const operation of tombstone.journal)
+		for (const identifier of operationIdentifiers(operation)) {
+			if (identifiers.has(identifier)) return false;
+			identifiers.add(identifier);
+		}
+	return true;
+}
+
+function hasConsistentTombstoneResults(tombstone: SessionAuthorityTombstone): boolean {
+	return tombstone.journal.every(operation => {
+		if (operation.result === undefined) return true;
+		const resultMapping = operation.result.mapping;
+		return (
+			resultMapping.chatId === tombstone.chatId &&
+			resultMapping.projectId === tombstone.projectId &&
+			resultMapping.operationId === operation.id
+		);
+	});
+}
+function tombstoneChainContainsProject(tombstone: SessionAuthorityTombstone | undefined, projectId: string): boolean {
+	let current = tombstone;
+	while (current !== undefined) {
+		if (current.projectId === projectId) return true;
+		current = current.prior;
+	}
+	return false;
 }
