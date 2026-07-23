@@ -196,6 +196,9 @@ describe("CLI module boundaries", () => {
 		expect(readme).not.toContain("Any managed Docker prerequisite does not hold");
 		expect(readme).not.toContain("use existing when those Docker prerequisites fail");
 		expect(readme).not.toContain("route-specific help for the complete accepted surface");
+		expect(readme).toContain(
+			"`/v1/models` emits canonical ids; OpenWebUI picker values may add one `<connection-id>.` prefix, which the adapter removes before validation.",
+		);
 		for (const output of results.map(result => result.stdout))
 			expect(output).not.toMatch(/--(?:provider-key|provider-credential|mpreset|profile|reload)\b/);
 	});

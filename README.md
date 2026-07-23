@@ -96,7 +96,7 @@ Treat route configuration and model availability as separate stages:
 
 1. Run `openwebui-gjc-adapter probe-ready`. This verifies adapter/OpenWebUI readiness, including the adapter's OpenWebUI access; it does not verify GJC provider credentials, a usable model catalog, or a successful GJC turn.
 2. Complete provider authentication through GJC in the effective runtime. Do not add provider credentials to `configure`.
-3. Verify that `/v1/models` and the OpenWebUI picker return one or more canonical ids such as `gjc/<encoded-provider>/<encoded-model>:<thinking>`, then select one and complete a first turn.
+3. Verify that `/v1/models` returns one or more canonical ids such as `gjc/<encoded-provider>/<encoded-model>:<thinking>`, then select one in OpenWebUI and complete a first turn. `/v1/models` emits canonical ids; OpenWebUI picker values may add one `<connection-id>.` prefix, which the adapter removes before validation.
 4. Link/select a project chat after the selected model completes successfully.
 
 For managed mode, the generated Compose adapter service uses the configuring process's rendered numeric UID:GID, while retaining effective `HOME=/var/lib/gjc/home`, GJC config `/var/lib/gjc/home/.gjc`, and agent state `/var/lib/gjc/home/.gjc/agent`; these persist in the managed state mount. After the generated Compose file is available, use the installed GJC executable in that container:
