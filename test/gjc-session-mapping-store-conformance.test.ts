@@ -56,6 +56,130 @@ function fileHarness(): StoreHarness {
 }
 
 describe("session mapping store authority conformance", () => {
+	describe("project reassignment", () => {
+		for (const createHarness of [memoryHarness, fileHarness]) {
+			test(`${createHarness.name} commits only the exact target and retains source operation authority`, () => {
+				const harness = createHarness();
+				try {
+					const source = mapping();
+					harness.store.set(source);
+					harness.store.beginOperation(source.chatId, {
+						id: "completed-operation",
+						kind: "prompt",
+						detail: "hash",
+					});
+					harness.store.transitionOperation(source.chatId, "completed-operation", "complete", "hash", {
+						kind: "turn",
+						assistantText: "done",
+						events: [],
+						mapping: {
+							chatId: source.chatId,
+							projectId: source.projectId,
+							sessionId: source.sessionId,
+							rawFrameCursor: source.rawFrameCursor,
+							eventCursor: source.eventCursor,
+							operationId: "completed-operation",
+						},
+					});
+					const targetOperation = {
+						chatId: source.chatId,
+						projectId: "project-2",
+						id: "project-2-operation",
+						ingressId: "project-2-operation",
+						kind: "create" as const,
+						detail: "project-2-request",
+					};
+					harness.store.beginProjectReassignment(source.chatId, source.projectId, "project-2", {
+						id: targetOperation.id,
+						ingressId: targetOperation.ingressId,
+						kind: targetOperation.kind,
+						detail: targetOperation.detail,
+					});
+					expect(harness.store.get(source.chatId)).toMatchObject({
+						projectId: source.projectId,
+						sessionId: source.sessionId,
+					});
+					harness.store.reserveProvisionalOperation(targetOperation);
+					harness.store.publishProvisionalOperation(targetOperation, {
+						...source,
+						projectId: "project-2",
+						sessionId: "session-2",
+						operationId: targetOperation.id,
+						attachment: {
+							...source.attachment!,
+							expectedSessionId: "session-2",
+						},
+					});
+
+					expect(harness.store.get(source.chatId)).toMatchObject({
+						projectId: "project-2",
+						sessionId: "session-2",
+					});
+					expect(harness.store.operation(source.chatId, "completed-operation")).toMatchObject({
+						state: "complete",
+						result: { mapping: { projectId: source.projectId } },
+					});
+					expect(harness.store.operationAuthority(source.chatId, "completed-operation")).toMatchObject({
+						projectId: source.projectId,
+						retiredAt: expect.any(String),
+					});
+					expect(() =>
+						harness.store.assertOperationProject(source.chatId, "project-2", "completed-operation"),
+					).toThrow("not authorized");
+
+					const recovered = harness.recover();
+					expect(recovered.get(source.chatId)).toMatchObject({
+						projectId: "project-2",
+						sessionId: "session-2",
+					});
+					expect(recovered.operationAuthority(source.chatId, "completed-operation")).toMatchObject({
+						projectId: source.projectId,
+						retiredAt: expect.any(String),
+					});
+				} finally {
+					harness.cleanup();
+				}
+			});
+
+			test(`${createHarness.name} rolls an interrupted target back without deleting source authority`, () => {
+				const harness = createHarness();
+				try {
+					const source = mapping();
+					const targetOperation = {
+						chatId: source.chatId,
+						projectId: "project-2",
+						id: "project-2-operation",
+						ingressId: "project-2-operation",
+						kind: "create" as const,
+						detail: "project-2-request",
+					};
+					harness.store.set(source);
+					harness.store.beginProjectReassignment(source.chatId, source.projectId, "project-2");
+					harness.store.reserveProvisionalOperation(targetOperation);
+
+					const recovered = harness.recover();
+					expect(recovered.get(source.chatId)).toMatchObject({
+						projectId: source.projectId,
+						sessionId: source.sessionId,
+					});
+					expect(recovered.provisionalOperation(source.chatId, targetOperation.ingressId)).toMatchObject({
+						projectId: "project-2",
+						state: "uncertain",
+					});
+					expect(() =>
+						recovered.publishProvisionalOperation(targetOperation, {
+							...source,
+							projectId: "project-2",
+							sessionId: "session-2",
+							operationId: targetOperation.id,
+						}),
+					).toThrow();
+				} finally {
+					harness.cleanup();
+				}
+			});
+		}
+	});
 	for (const createHarness of [memoryHarness, fileHarness]) {
 		test(createHarness.name, () => {
 			const harness = createHarness();

@@ -168,6 +168,7 @@ describe("adapter config contracts", () => {
 		try {
 			writeInstalledConfig({ ...base, mode: "managed" }, file);
 			const managed = loadInstalledAdapterConfig(file);
+			expect(managed.turnTimeoutMs).toBe(180_000);
 			expect(managed).toMatchObject({
 				statePath: "/var/lib/gjc",
 				sessionRoot: "/run/gjc-session",
@@ -175,6 +176,15 @@ describe("adapter config contracts", () => {
 				adapterApiToken: "adapter",
 				gjcCommand: "gjc",
 			});
+			expect(loadInstalledAdapterConfig(file, { GJC_OPENWEBUI_TURN_TIMEOUT_MS: "300000" }).turnTimeoutMs).toBe(
+				300_000,
+			);
+			expect(() => loadInstalledAdapterConfig(file, { GJC_OPENWEBUI_TURN_TIMEOUT_MS: "0" })).toThrow(
+				"GJC_OPENWEBUI_TURN_TIMEOUT_MS must be a positive integer",
+			);
+			expect(() => loadInstalledAdapterConfig(file, { GJC_OPENWEBUI_TURN_TIMEOUT_MS: "12.5" })).toThrow(
+				"GJC_OPENWEBUI_TURN_TIMEOUT_MS must be a positive integer",
+			);
 			expect(Object.isFrozen(managed)).toBe(true);
 			expect(Object.keys(managed)).toEqual(
 				expect.arrayContaining(["gjcConfigDirName", "gjcCodingAgentDir", "runtimeLocations"]),
@@ -186,6 +196,12 @@ describe("adapter config contracts", () => {
 			expect(existing.sessionRoot).toBe(join(DEFAULT_EXISTING_PROJECT_ROOT, ".gjc", "sessions"));
 			expect(existing.allowedProjectRoots).toEqual([DEFAULT_EXISTING_PROJECT_ROOT]);
 			expect(existing.gjcCommand).toBe("gjc");
+			expect(loadInstalledAdapterConfig(file, { GJC_OPENWEBUI_GJC_COMMAND: "/opt/gjc/bin/gjc" }).gjcCommand).toBe(
+				"/opt/gjc/bin/gjc",
+			);
+			expect(() => loadInstalledAdapterConfig(file, { GJC_OPENWEBUI_GJC_COMMAND: " " })).toThrow(
+				"GJC_OPENWEBUI_GJC_COMMAND must be a non-empty string",
+			);
 			expect(existing.ownerUserId).toBe("owner-test");
 		} finally {
 			rmSync(directory, { recursive: true, force: true });

@@ -42,39 +42,100 @@ Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. T
 
 ## CLI first-install configuration
 
-The CLI supports two first-install paths. These commands configure a deployment; this README does not claim to run or verify a real Docker deployment.
-Run the packaged binary (or replace it with `bun src/cli.ts` from a checkout):
+Choose the route before running a command:
+
+| Route | Choose it when | Ownership |
+| --- | --- | --- |
+| `managed` | Rootful Docker is available and Docker userns-remap is disabled; both CLI-managed routes require user systemd and OpenWebUI >=0.10.0 | GJC owns the generated OpenWebUI deployment and configures its owned provider after adapter readiness |
+| `existing` | Rootless Docker or Docker userns-remap incompatibility, or an externally operated OpenWebUI deployment that meets the shared requirements | OpenWebUI, provider connection, custom headers, ingress, and their operation remain external |
+
+Both CLI-managed routes require user systemd and OpenWebUI >=0.10.0; existing mode is not a fallback for missing shared prerequisites. Choose existing mode for rootless or userns-remapped Docker, or for an externally operated OpenWebUI deployment that meets those shared requirements. These commands configure a deployment; this README does not claim to run or verify a real deployment. Run the packaged binary (or replace it with `bun src/cli.ts` from a checkout). Run `openwebui-gjc-adapter --help` and the route-specific help for first-install guidance. Route help documents required first-install inputs and prerequisites; it is not an authoritative complete reference for every accepted operational or recovery flag.
+
+### Managed route
+
+Managed setup requires two distinct inherited decimal file descriptors for the setup-only admin email and password. Open the files in the invoking shell; never put credential values in argv, environment, generated configuration, logs, or examples:
 
 ```sh
-openwebui-gjc-adapter configure managed
-openwebui-gjc-adapter configure existing
+exec 3<"$ADMIN_EMAIL_FILE"
+exec 4<"$ADMIN_PASSWORD_FILE"
+openwebui-gjc-adapter configure managed \
+  --admin-email-fd 3 \
+  --admin-password-fd 4
+exec 3<&-
+exec 4<&-
 ```
 
-Run `openwebui-gjc-adapter --help` for the installed service, readiness probe, and credential commands and each configuration command's options.
+The managed deployment uses rootful Docker, userns-remap disabled, user systemd, OpenWebUI >=0.10.0, a loopback-only UI, and a private adapter network. It configures only its strictly owned OpenWebUI provider after the adapter is ready. GJC provider authentication and model onboarding remain GJC-owned. The managed path does not automate Tailscale, tunnels, public ingress, or other exposure outside the loopback-safe boundary.
 
-### Managed default path
+### Existing route
 
-Use `configure managed` for a new, CLI-managed installation. It targets Docker with OpenWebUI v0.10.0, binds the OpenWebUI UI to loopback only, and places the adapter on a private Docker network. Credentials are passed by file descriptor rather than written into generated configuration. The command verifies that the configured OpenWebUI provider is strictly owned by the installation before accepting it.
+Existing setup requires the OpenWebUI URL, an adapter ingress URL reachable from OpenWebUI, one inherited decimal FD for the OpenWebUI administrator token, and an allowed source parent for project links. Set `--project-root` to the operator-owned parent containing linkable projects (for example, `/home/me/src`); linked paths must be inside that configured root. The configuring user must be able to read and search each project directory. An existing session root needs read/write/search access; a prospective root such as the default per-project session root (`<cwd>/.gjc/sessions`) needs write/search access on its nearest existing ancestor. These permissions are checked before project registration.
 
-The managed path intentionally does not automate Tailscale, tunnels, public ingress, or other exposure outside the loopback-safe boundary. Publish the UI separately only after reviewing the network and authentication model.
+```sh
+exec 3<"$OPENWEBUI_API_TOKEN_FILE"
+openwebui-gjc-adapter configure existing \
+  --openwebui-url "https://openwebui.example" \
+  --adapter-ingress-url "http://adapter.example:8765" \
+  --openwebui-api-token-fd 3 \
+  --project-root "/home/me/src"
+exec 3<&-
+```
 
-### Existing path
-
-Use `configure existing` for an existing OpenWebUI deployment. It validates the supplied OpenWebUI admin token, but does not mutate externally managed provider or ingress configuration. Configure the OpenAI-compatible provider manually with:
+The adapter validates the supplied OpenWebUI administration token but does not mutate an externally owned provider or ingress. Configure the OpenAI-compatible provider, its custom headers, and its operation manually:
 
 ```env
-OPENAI_API_BASE_URL=http://127.0.0.1:8765/v1
+OPENAI_API_BASE_URL=http://adapter.example:8765/v1
 OPENAI_API_KEY=<adapter-openai-key>
 ENABLE_OPENAI_API=True
 ```
 
-OpenWebUI requests may use the input-only `gjc` alias or a canonical model id from `/v1/models`. Add the custom headers shown in [OpenWebUI setup](#openwebui-setup). The placeholders in those headers are required for the adapter to associate requests with the OpenWebUI chat, messages, user, and task.
+Add the custom headers shown in [OpenWebUI setup](#openwebui-setup). The adapter ingress URL must be reachable from the OpenWebUI process, not merely from the operator's shell.
+
+### Readiness and first usable model
+
+Treat route configuration and model availability as separate stages:
+
+1. Run `openwebui-gjc-adapter probe-ready`. This verifies adapter/OpenWebUI readiness, including the adapter's OpenWebUI access; it does not verify GJC provider credentials, a usable model catalog, or a successful GJC turn.
+2. Complete provider authentication through GJC in the effective runtime. Do not add provider credentials to `configure`.
+3. Verify that `/v1/models` returns one or more canonical ids such as `gjc/<encoded-provider>/<encoded-model>:<thinking>`, then select one in OpenWebUI and complete a first turn. `/v1/models` emits canonical ids; OpenWebUI picker values may add one `<connection-id>.` prefix, which the adapter removes before validation.
+4. Link/select a project chat after the selected model completes successfully.
+
+For managed mode, the generated Compose adapter service uses the configuring process's rendered numeric UID:GID, while retaining effective `HOME=/var/lib/gjc/home`, GJC config `/var/lib/gjc/home/.gjc`, and agent state `/var/lib/gjc/home/.gjc/agent`; these persist in the managed state mount. After the generated Compose file is available, use the installed GJC executable in that container:
+
+```sh
+CONFIG_PATH=/path/to/openwebui-gjc-adapter/config.json
+docker compose -f "${CONFIG_PATH}.compose.yml" -p openwebui-gjc-adapter \
+  exec -it adapter /opt/openwebui-gjc-adapter/node_modules/.bin/gjc /login
+```
+
+For existing mode, perform GJC's supported onboarding (for example, `gjc /login`) under the same user as the generated user-systemd service and with the exact effective `HOME`, `GJC_CONFIG_DIR`, and `GJC_CODING_AGENT_DIR` from that unit. Inspect the generated `.service` file and run against its values; ambient host GJC variables are not equivalent and must not silently select another runtime.
+
+An unavailable or empty catalog, noncanonical model id, or provider-auth failure on the first turn is GJC provider/model onboarding recovery. Correct that effective runtime and retry the onboarding/check; do not rerun configuration merely because `probe-ready` succeeded. The CLI may reset or disclose an adapter token only with a controlling TTY, so a token is not accidentally written to redirected output or unattended logs.
+
+### Model selection, profiles, and roles
+
+The OpenWebUI picker maps to GJC `DEFAULT`: selection is persisted as the shared agent-domain default and promoted in the currently attached session. It is not profile/preset selection, profile activation, or an all-role assignment. The adapter UI does not support selecting or activating GJC model profiles, forwarding profile options, configuration patching, or runtime reload. The bare `gjc` alias is input-only; `/v1/models` emits canonical ids.
+
+GJC 0.11.6 may still activate an already-persisted `modelProfile.default` when a new GJC process starts. That startup behavior is GJC-owned and does not mean the adapter can select a profile.
+
+To change role models, tell GJC what to persist in a normal OpenWebUI message. For example:
+
+```text
+Set EXECUTOR to <provider>/<model>:<effort>,
+PLANNER to <provider>/<model>:<effort>,
+CRITIC to <provider>/<model>:<effort>, and
+ARCHITECT to <provider>/<model>:<effort>.
+Use the supported persistent GJC configuration, do not change DEFAULT or any
+model profile, then read back and report all saved role assignments.
+```
+
+OpenWebUI messages are SDK prompts, not interactive GJC CLI input, so do not rely on typing `/model ...` or `/model roles` into the chat. GJC applies the requested `task.agentModelOverrides`; the adapter does not add a separate preset UI.
+
+No adapter restart or new GJC session is required for these role changes in the instructed live session. Later task-agent launches resolve the saved override, while already-running or in-flight agents do not switch. Other already-live GJC processes are not guaranteed to reload shared settings. Starting a new GJC process/session is only the conservative boundary for loading changed startup profile/default state; restarting the adapter alone is not a GJC reload. If `modelProfile.default` is configured, ask GJC to explain the profile conflict before changing it because a new process can apply that profile's assignments.
 
 ### Safety and recovery
 
-The CLI uses a readiness probe before reporting configuration as ready. It may reset or disclose an admin token only when it has a controlling TTY, so a token is not accidentally written to redirected output or unattended logs. If readiness or verification fails, correct the reported local configuration or credentials and rerun the relevant command; do not treat a partially configured deployment as ready.
-
-Both paths preserve the loopback-safe boundary: the UI is not exposed by the CLI, and the adapter remains on its private network where applicable.
+Both paths preserve the loopback-safe boundary: the UI is not exposed by the CLI, and the adapter remains on its private network where applicable. If route configuration fails, correct the reported local configuration or setup credentials and rerun the relevant route command. If provider/model verification fails, recover GJC onboarding in the effective runtime instead.
 
 ### GJC runtime locations and recovery
 

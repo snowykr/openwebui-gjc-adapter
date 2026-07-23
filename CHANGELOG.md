@@ -18,6 +18,7 @@
 - Made GJC session JSONL, artifacts, and correlated SDK finals authoritative while preserving OpenWebUI rows as projections and user-owned fields during reprojection.
 - Separated project identity from model identity and made the bare `gjc` model an input-only alias; emitted model ids are canonical normalized tuples.
 - Made runtime path resolution deterministic and isolated from ambient `GJC_CONFIG_DIR`, `PI_CONFIG_DIR`, and `GJC_CODING_AGENT_DIR`.
+- Clarified managed Docker feasibility prerequisites and existing-route ownership, separated adapter/OpenWebUI readiness from GJC provider/model availability, and documented picker-to-`DEFAULT`, profile, and role-assignment semantics without adding runtime controls.
 
 ### Fixed
 
@@ -26,3 +27,9 @@
 - Unwrapped nested SDK event payloads, projected GJC message-event variants, avoided duplicate artifact lifecycle events, and isolated best-effort OpenWebUI progress delivery failures from accepted GJC turns.
 - Failed closed on malformed or ambiguous session, project, model, regenerate/branch, workflow-gate, and close authority instead of replaying, killing, or selecting a fallback.
 - Persisted successor session authority before SDK rebinding, honored configured session roots, closed pre-ack lifecycle leaks, and aligned server timeout handling with the turn budget.
+- Made existing-mode units launch and runtime configuration consume the packaged GJC executable with a usable Bun search path, accepted the explicitly supplied derived default agent directory, and kept fresh preflight rollback from stopping an absent unit.
+- Made OpenWebUI chat project reassignment a durable two-phase authority transition: failed destination turns retain the source mapping, successful commits preserve retired operation tombstones, and stale source retries fail closed before destination runner effects, including after restart.
+- Replaced interactive-only `/model` role guidance with the verified natural-language persistent-configuration flow and clarified that role updates need neither an adapter restart nor a new GJC session.
+- Added fail-fast project-link permission validation for project directories and existing/prospective session roots, with client-correct errors before registration or OpenWebUI folder projection.
+- Made installed `serve --config` honor and validate `GJC_OPENWEBUI_TURN_TIMEOUT_MS` instead of always forcing the 180-second default.
+- Rejected accepted SDK turns whose terminal assistant message reports a provider transport error, including usage-limit failures, instead of persisting and returning an empty successful response.

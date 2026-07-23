@@ -2,6 +2,7 @@ import type {
 	AcknowledgedSuccessor,
 	ProvisionalSessionOperation,
 	SessionAuthorityRecord,
+	SessionAuthorityTombstone,
 	SessionOperation,
 	SessionOperationResult,
 } from "./session-authority-types";
@@ -47,6 +48,20 @@ export function copy(record: SessionAuthorityRecord): SessionAuthorityRecord {
 			? {}
 			: { attachment: { ...record.attachment, descriptorStat: { ...record.attachment.descriptorStat } } }),
 		journal: record.journal.map(copyOperation),
+		...(record.reassignment === undefined
+			? {}
+			: {
+					reassignment: {
+						...record.reassignment,
+						...(record.reassignment.target === undefined ? {} : { target: { ...record.reassignment.target } }),
+						...(record.reassignment.sourceTombstone === undefined
+							? {}
+							: { sourceTombstone: copyTombstone(record.reassignment.sourceTombstone) }),
+						...(record.reassignment.priorTombstone === undefined
+							? {}
+							: { priorTombstone: copyTombstone(record.reassignment.priorTombstone) }),
+					},
+				}),
 	};
 }
 export function copyOperation(operation: SessionOperation): SessionOperation {
@@ -77,5 +92,20 @@ export function copyAcknowledgedSuccessor(successor: AcknowledgedSuccessor): Ack
 	return {
 		...successor,
 		attachment: { ...successor.attachment, descriptorStat: { ...successor.attachment.descriptorStat } },
+	};
+}
+
+export function copyTombstone(tombstone: SessionAuthorityTombstone): SessionAuthorityTombstone {
+	return {
+		...tombstone,
+		header: { ...tombstone.header },
+		events: tombstone.events === undefined ? undefined : copyEvents(tombstone.events),
+		...(tombstone.modelSelection === undefined ? {} : { modelSelection: { ...tombstone.modelSelection } }),
+		observations: tombstone.observations === undefined ? undefined : structuredClone(tombstone.observations),
+		...(tombstone.attachment === undefined
+			? {}
+			: { attachment: { ...tombstone.attachment, descriptorStat: { ...tombstone.attachment.descriptorStat } } }),
+		journal: tombstone.journal.map(copyOperation),
+		...(tombstone.prior === undefined ? {} : { prior: copyTombstone(tombstone.prior) }),
 	};
 }

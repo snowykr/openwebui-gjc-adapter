@@ -89,6 +89,51 @@ export interface SessionOperation {
 	readonly result?: SessionOperationResult;
 	readonly acknowledgedSuccessor?: AcknowledgedSuccessor;
 }
+export type SessionProjectReassignmentState = "pending" | "rolled_back" | "committed";
+export type ProjectReassignmentState = SessionProjectReassignmentState;
+
+export interface SessionAuthorityTargetIdentity {
+	readonly id: string;
+	readonly ingressId?: string;
+	readonly kind: SessionOperationKind;
+	readonly detail?: string;
+}
+
+export interface SessionAuthorityTombstone {
+	readonly version: typeof SESSION_AUTHORITY_VERSION;
+	readonly chatId: string;
+	readonly projectId: string;
+	readonly sessionId: string;
+	readonly createdAt: string;
+	readonly header: Readonly<{ chatId: string; projectId: string; sessionId: string }>;
+	readonly sessionFile?: string;
+	readonly activeLeaf?: string;
+	readonly rawFrameCursor: number;
+	readonly eventCursor: number;
+	readonly operationId: string;
+	readonly assistantText?: string;
+	readonly events?: readonly GjcTurnEvent[];
+	readonly modelSelection?: NormalizedModelSelection;
+	readonly observations?: Readonly<Record<string, unknown>>;
+	readonly attachment?: SessionAttachmentProof;
+	readonly journal: readonly SessionOperation[];
+	readonly retiredAt: string;
+	readonly prior?: SessionAuthorityTombstone;
+}
+
+export interface SessionAuthorityReassignment {
+	readonly state: SessionProjectReassignmentState;
+	readonly sourceProjectId: string;
+	readonly targetProjectId: string;
+	readonly startedAt: string;
+	readonly completedAt?: string;
+	readonly target?: SessionAuthorityTargetIdentity;
+	/** Set only after commit; it is the durable source identity fence and evidence. */
+	readonly sourceTombstone?: SessionAuthorityTombstone;
+	readonly priorTombstone?: SessionAuthorityTombstone;
+}
+
+/** A mapping's reassignment marker is intentionally optional for v2 documents. */
 
 export interface ProvisionalSessionOperation extends SessionOperation {
 	readonly chatId: string;
@@ -117,6 +162,7 @@ export interface SessionAuthorityRecord {
 	readonly observations?: Readonly<Record<string, unknown>>;
 	readonly attachment?: SessionAttachmentProof;
 	readonly journal: readonly SessionOperation[];
+	readonly reassignment?: SessionAuthorityReassignment;
 }
 
 export type SessionAuthorityInput = Omit<SessionAuthorityRecord, "version" | "createdAt" | "header" | "journal"> &

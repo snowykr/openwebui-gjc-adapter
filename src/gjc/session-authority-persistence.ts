@@ -19,6 +19,7 @@ import type {
 	ProvisionalSessionOperation,
 	SessionAuthorityInput,
 	SessionAuthorityRecord,
+	SessionAuthorityTargetIdentity,
 	SessionOperation,
 	SessionOperationResult,
 	SessionOperationState,
@@ -47,7 +48,11 @@ export class FileSessionAuthority extends SessionAuthority {
 			if (!existsSync(this.filePath)) return;
 			this.load();
 			if (
-				this.entries().some(record => record.journal.some(operation => operation.state === "pending")) ||
+				this.entries().some(
+					record =>
+						record.reassignment?.state === "pending" ||
+						record.journal.some(operation => operation.state === "pending"),
+				) ||
 				this.provisionalEntries().some(operation => operation.state === "pending")
 			) {
 				super.reconcileRestart();
@@ -62,6 +67,20 @@ export class FileSessionAuthority extends SessionAuthority {
 	}
 	override upsert(input: SessionAuthorityInput): SessionAuthorityRecord {
 		return this.mutate(() => super.upsert(input));
+	}
+	override reassignProject(chatId: string, currentProjectId: string, nextProjectId: string): boolean {
+		return this.mutate(() => super.reassignProject(chatId, currentProjectId, nextProjectId));
+	}
+	override beginProjectReassignment(
+		chatId: string,
+		currentProjectId: string,
+		nextProjectId: string,
+		target?: SessionAuthorityTargetIdentity,
+	): SessionAuthorityRecord {
+		return this.mutate(() => super.beginProjectReassignment(chatId, currentProjectId, nextProjectId, target));
+	}
+	override rollbackProjectReassignment(chatId: string, currentProjectId: string): SessionAuthorityRecord {
+		return this.mutate(() => super.rollbackProjectReassignment(chatId, currentProjectId));
 	}
 	override recordAcknowledgedSuccessor(
 		chatId: string,
@@ -166,7 +185,11 @@ export class FileSessionAuthority extends SessionAuthority {
 	protected persist(): void {
 		const mappings = this.entries();
 		const provisionalOperations = this.provisionalEntries();
-		if (!mappings.every(isV2Record) || !provisionalOperations.every(isProvisionalOperation))
+		if (
+			!mappings.every(isV2Record) ||
+			!provisionalOperations.every(isProvisionalOperation) ||
+			!isAuthorityDocumentRelationallyValid(mappings, provisionalOperations)
+		)
 			throw new Error("Refusing to persist an invalid v2 session authority.");
 		mkdirSync(dirname(this.filePath), { recursive: true });
 		const temporary = `${this.filePath}.tmp-${process.pid}-${Date.now()}`;

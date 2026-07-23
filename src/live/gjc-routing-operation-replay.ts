@@ -23,6 +23,16 @@ export async function replayRoutingOperation(
 	turn: LiveGatewayRunnerInput,
 ): Promise<(LiveGatewayRunnerResult & { readonly model?: string }) | null> {
 	const priorOperation = input.mappings.operation(turn.chatId, turn.userMessageId);
+	const priorAuthority =
+		priorOperation === undefined ? undefined : input.mappings.operationAuthority(turn.chatId, turn.userMessageId);
+	if (
+		priorOperation !== undefined &&
+		(priorAuthority === undefined ||
+			"retiredAt" in priorAuthority ||
+			priorAuthority.projectId !== turn.project.id ||
+			(priorOperation.result !== undefined && priorOperation.result.mapping.projectId !== turn.project.id))
+	)
+		throw new Error(`GJC operation ${turn.userMessageId} is not authorized for project ${turn.project.id}.`);
 	if (turn.control !== undefined && priorOperation?.state === "complete") {
 		const result = priorOperation.result;
 		if (

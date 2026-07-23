@@ -11,6 +11,7 @@ import type {
 } from "../src/openwebui/client";
 import * as projectLinkServiceModule from "../src/projects/link-service";
 import { ProjectLinkService } from "../src/projects/link-service";
+import { isProjectPathValidationError, ProjectPathAccessError } from "../src/projects/project-admission";
 import { SqliteProjectRegistrationStore } from "../src/projects/registration-store";
 import * as pathsModule from "../src/security/paths";
 import { resolveAllowedRoots } from "../src/security/paths";
@@ -41,6 +42,10 @@ describe("project link registration failure handling", () => {
 			code: "invalid_project_link",
 			message: "Project paths must not overlap protected GJC runtime paths.",
 		});
+	});
+	test("classifies project access failures as invalid link input", () => {
+		expect(isProjectPathValidationError(new ProjectPathAccessError("Project directory access denied"))).toBe(true);
+		expect(isProjectPathValidationError(new ProjectPathAccessError("Session root access denied"))).toBe(true);
 	});
 
 	test("detects overlap symmetrically while allowing a sibling", () => {

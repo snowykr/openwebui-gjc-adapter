@@ -44,6 +44,142 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		const second = new FileBackedSessionMappingStore(filePath);
 		expect(second.get("chat-1")).toEqual(first.get("chat-1"));
 	});
+	test("restores source authority after a failed destination turn and restart", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-reassignment-failure-"));
+		const filePath = join(directory, "mappings.json");
+		const projectB = { ...project, id: "project-b", cwd: "/workspace/project-b" };
+		try {
+			const mappings = new FileBackedSessionMappingStore(filePath);
+			mappings.set({
+				chatId: "chat-reassignment-failure",
+				projectId: project.id,
+				sessionId: "session-a",
+				sessionFile: "/workspace/project/.gjc/sessions/session-a.jsonl",
+				operationId: "operation-a",
+				rawFrameCursor: 1,
+				eventCursor: 1,
+			});
+			const failingRunner = new FakeGjcTurnRunner();
+			failingRunner.completionError = new Error("destination start failed");
+			const gateway = createGjcRoutingLiveGatewayRunner({ turnRunner: failingRunner, mappings });
+			await expect(
+				gateway.run({
+					project: projectB,
+					prompt: "move to B",
+					chatId: "chat-reassignment-failure",
+					messageId: "assistant-b",
+					userMessageId: "operation-b",
+					userMessageParentId: "operation-a",
+					continued: true,
+				}),
+			).rejects.toThrow("destination start failed");
+
+			const restarted = new FileBackedSessionMappingStore(filePath);
+			expect(restarted.get("chat-reassignment-failure")).toMatchObject({
+				projectId: project.id,
+				sessionId: "session-a",
+			});
+			expect(restarted.provisionalOperation("chat-reassignment-failure", "operation-b")).toMatchObject({
+				projectId: projectB.id,
+				state: "uncertain",
+			});
+			const retryRunner = new FakeGjcTurnRunner();
+			await expect(
+				createGjcRoutingLiveGatewayRunner({ turnRunner: retryRunner, mappings: restarted }).run({
+					project: projectB,
+					prompt: "retry move",
+					chatId: "chat-reassignment-failure",
+					messageId: "assistant-b-retry",
+					userMessageId: "operation-b",
+					userMessageParentId: "operation-a",
+					continued: true,
+				}),
+			).rejects.toThrow();
+			expect(retryRunner.starts).toHaveLength(0);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	test("retains retired source identity fences after destination commit and restart", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-reassignment-commit-"));
+		const filePath = join(directory, "mappings.json");
+		const projectB = { ...project, id: "project-b", cwd: "/workspace/project-b" };
+		try {
+			const mappings = new FileBackedSessionMappingStore(filePath);
+			mappings.set({
+				chatId: "chat-reassignment-commit",
+				projectId: project.id,
+				sessionId: "session-a",
+				sessionFile: "/workspace/project/.gjc/sessions/session-a.jsonl",
+				operationId: "operation-a",
+				rawFrameCursor: 1,
+				eventCursor: 1,
+			});
+			mappings.beginOperation("chat-reassignment-commit", {
+				id: "stale-operation-a",
+				kind: "prompt",
+				detail: "source request",
+			});
+			mappings.transitionOperation("chat-reassignment-commit", "stale-operation-a", "complete", "source request", {
+				kind: "turn",
+				assistantText: "source result",
+				events: [],
+				mapping: {
+					chatId: "chat-reassignment-commit",
+					projectId: project.id,
+					sessionId: "session-a",
+					rawFrameCursor: 1,
+					eventCursor: 1,
+					operationId: "stale-operation-a",
+				},
+			});
+			mappings.reserveProvisionalOperation({
+				chatId: "chat-reassignment-commit",
+				projectId: project.id,
+				id: "stale-provisional-a",
+				ingressId: "stale-provisional-ingress-a",
+				kind: "create",
+				detail: "source provisional",
+			});
+			mappings.transitionProvisionalOperation("chat-reassignment-commit", "stale-provisional-ingress-a", "complete");
+			await createGjcRoutingLiveGatewayRunner({
+				turnRunner: new FakeGjcTurnRunner(),
+				mappings,
+			}).run({
+				project: projectB,
+				prompt: "move to B",
+				chatId: "chat-reassignment-commit",
+				messageId: "assistant-b",
+				userMessageId: "operation-b",
+				userMessageParentId: "operation-a",
+				continued: true,
+			});
+
+			const restarted = new FileBackedSessionMappingStore(filePath);
+			const retryRunner = new FakeGjcTurnRunner();
+			const gateway = createGjcRoutingLiveGatewayRunner({ turnRunner: retryRunner, mappings: restarted });
+			for (const staleOperationId of ["stale-operation-a", "stale-provisional-a"])
+				for (const retryProject of [projectB, project])
+					await expect(
+						gateway.run({
+							project: retryProject,
+							prompt: "stale source retry",
+							chatId: "chat-reassignment-commit",
+							messageId: `assistant-${staleOperationId}-${retryProject.id}`,
+							userMessageId: staleOperationId,
+							userMessageParentId: null,
+							continued: false,
+						}),
+					).rejects.toThrow("not authorized");
+			expect(restarted.get("chat-reassignment-commit")?.projectId).toBe(projectB.id);
+			expect(retryRunner.starts).toHaveLength(0);
+			expect(retryRunner.switches).toHaveLength(0);
+			expect(retryRunner.continues).toHaveLength(0);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
 	test("isolates nested authority events and observations from insert and read mutations", () => {
 		withFileStore((_store, filePath) => {
 			const input = {

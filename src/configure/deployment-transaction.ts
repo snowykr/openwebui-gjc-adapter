@@ -233,8 +233,10 @@ export async function rollbackDeploymentTransaction(input: RollbackInput): Promi
 	if (tx === undefined) return [];
 	const errors: Error[] = [];
 	const bootstrapBeforeRollback = captureBootstrap(input.path);
-	attempt(errors, () => input.controller.stop(input.attemptedMode));
-	attempt(errors, () => input.controller.disable(input.attemptedMode));
+	if (existsSync(input.artifacts.unitFile)) {
+		attempt(errors, () => input.controller.stop(input.attemptedMode));
+		attempt(errors, () => input.controller.disable(input.attemptedMode));
+	}
 	if (tx.previous !== undefined)
 		attempt(errors, () =>
 			rollbackDeploymentArtifacts({ snapshots: tx.snapshots, restore: restoreDurableDeploymentSnapshot }),

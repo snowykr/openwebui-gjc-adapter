@@ -13,8 +13,23 @@ export function reconcileSessionAuthority(
 				? { ...operation, state: "uncertain" as const, detail: operation.detail ?? "restart before completion" }
 				: operation,
 		);
-		if (!journal.some((operation, index) => operation !== record.journal[index])) continue;
-		const next = { ...record, journal };
+		const reassignment =
+			record.reassignment?.state === "pending"
+				? {
+						...record.reassignment,
+						state: "rolled_back" as const,
+						completedAt: new Date().toISOString(),
+					}
+				: record.reassignment;
+		const changed =
+			journal.some((operation, index) => operation !== record.journal[index]) ||
+			reassignment !== record.reassignment;
+		if (!changed) continue;
+		const next = {
+			...record,
+			journal,
+			...(reassignment === undefined ? {} : { reassignment }),
+		};
 		records.set(record.chatId, next);
 		reconciled.push(copy(next));
 	}

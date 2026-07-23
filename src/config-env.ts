@@ -8,6 +8,14 @@ const DEFAULT_STATE_PATH = ".gjc/openwebui-adapter";
 const DEFAULT_GJC_COMMAND = "gjc";
 export const DEFAULT_TURN_TIMEOUT_MS = 180_000;
 
+export function resolveTurnTimeoutMs(env: Readonly<Record<string, string | undefined>>): number {
+	return parsePositiveInteger(
+		env.GJC_OPENWEBUI_TURN_TIMEOUT_MS,
+		DEFAULT_TURN_TIMEOUT_MS,
+		"GJC_OPENWEBUI_TURN_TIMEOUT_MS",
+	);
+}
+
 function requireNonEmptyString(value: string | undefined, fallback: string, name: string): string {
 	const candidate = value ?? fallback;
 	const trimmed = candidate.trim();
@@ -118,11 +126,7 @@ export function loadAdapterConfig(env: Record<string, string | undefined> = proc
 		gjcConfigDirName: runtimeLocations.childEnvironment.GJC_CONFIG_DIR,
 		gjcCodingAgentDir: runtimeLocations.agentDir,
 		runtimeLocations,
-		turnTimeoutMs: parsePositiveInteger(
-			env.GJC_OPENWEBUI_TURN_TIMEOUT_MS,
-			DEFAULT_TURN_TIMEOUT_MS,
-			"GJC_OPENWEBUI_TURN_TIMEOUT_MS",
-		),
+		turnTimeoutMs: resolveTurnTimeoutMs(env),
 		sessionRoot: requireNonEmptyString(env.GJC_OPENWEBUI_SESSION_ROOT, process.cwd(), "GJC_OPENWEBUI_SESSION_ROOT"),
 		allowedProjectRoots: parseAllowedProjectRoots(env.GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS, process.cwd()),
 		...(artifactBaseUrl === undefined

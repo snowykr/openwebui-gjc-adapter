@@ -8,6 +8,8 @@ export interface SystemdComposeUnitInput {
 	readonly description?: string;
 	readonly adapterCommand?: readonly string[];
 	readonly runtimeLocations?: GjcRuntimeLocations;
+	readonly gjcCommand?: string;
+	readonly executableSearchPath?: string;
 }
 export interface ResolvedSystemdComposeUnitInput extends SystemdComposeUnitInput {
 	readonly runtimeLocations: GjcRuntimeLocations;
@@ -41,7 +43,12 @@ export function renderExistingSystemdUnit(input: Omit<SystemdComposeUnitInput, "
 export function renderResolvedExistingSystemdUnit(input: Omit<ResolvedSystemdComposeUnitInput, "composeFile">): string {
 	if (input.runtimeLocations === undefined) throw new TypeError("resolved runtime locations are required");
 	const command = input.adapterCommand ?? ["/usr/bin/bun", "run", "src/cli.ts", "serve"];
-	const environment = `${Object.entries(input.runtimeLocations.childEnvironment)
+	const childEnvironment = {
+		...input.runtimeLocations.childEnvironment,
+		...(input.gjcCommand === undefined ? {} : { GJC_OPENWEBUI_GJC_COMMAND: input.gjcCommand }),
+		...(input.executableSearchPath === undefined ? {} : { PATH: input.executableSearchPath }),
+	};
+	const environment = `${Object.entries(childEnvironment)
 		.map(([key, value]) => `Environment=${escapeEnvironmentValue(`${key}=${value}`)}`)
 		.join("\n")}\nUnsetEnvironment=PI_CONFIG_DIR\n`;
 	return renderHostUnit(

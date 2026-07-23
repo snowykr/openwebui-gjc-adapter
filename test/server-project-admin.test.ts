@@ -22,6 +22,8 @@ import { CANONICAL_MODEL_IDS, LOW_MODEL_ID, staticModelReaderFactory } from "./m
 import { messageEntry, writeSessionFile } from "./session-sync-fixtures";
 
 const tempDirs: string[] = [];
+const supportsPermissionDeniedPathTest =
+	process.platform !== "win32" && process.getuid?.() !== undefined && process.getuid() !== 0;
 
 afterEach(async () => {
 	for (const tempDir of tempDirs.splice(0)) {
@@ -658,6 +660,41 @@ describe("project admin routes", () => {
 		expect(response.status).toBe(400);
 		expect(await response.json()).toMatchObject({ error: { code: "invalid_project_link" } });
 	});
+	test.skipIf(!supportsPermissionDeniedPathTest)(
+		"maps canonicalization permission denial to invalid project input",
+		async () => {
+			const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-admin-permission-"));
+			const lockedParent = path.join(workspace, "locked");
+			const projectDirectory = path.join(lockedParent, "project");
+			tempDirs.push(workspace);
+			await fs.mkdir(projectDirectory, { recursive: true });
+			const service = await createProjectService(workspace);
+			const handler = createAdapterRequestHandler({
+				routes: {
+					projects: [],
+					projectProvider: () => service.listLinkedProjects(),
+					projectLinkService: service,
+					owner,
+					runner: fixedRunner("unused"),
+					adapterApiToken: "adapter-token",
+					requireAdapterApiToken: true,
+				},
+			});
+
+			await fs.chmod(lockedParent, 0o000);
+			try {
+				const response = await handler(
+					jsonRequest("http://adapter.test/admin/projects/link", { cwd: projectDirectory }),
+				);
+				expect(response.status).toBe(400);
+				expect(await response.json()).toMatchObject({
+					error: { code: "invalid_project_link" },
+				});
+			} finally {
+				await fs.chmod(lockedParent, 0o755);
+			}
+		},
+	);
 
 	test("rejects malformed optional link fields with a client error", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-admin-"));
