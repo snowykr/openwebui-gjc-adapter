@@ -303,6 +303,24 @@ describe("GJC idle session reaper", () => {
 		expect(harness.closeCalls).toHaveLength(2);
 		await harness.reaper.stop();
 	});
+	test("does not reuse an unbound legacy completed close", async () => {
+		const harness = createHarness();
+		harness.mappings.recordClose("legacy-close", "complete");
+		const legacy = harness.mappings.operationRecords.get("legacy-close")!;
+		harness.mappings.operationRecords.set("legacy-close", {
+			...legacy,
+			result: {
+				...legacy.result!,
+				correlation: { closeStatus: "closed" },
+			},
+		});
+
+		harness.clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
+		await flush();
+
+		expect(harness.closeCalls).toHaveLength(1);
+		await harness.reaper.stop();
+	});
 	test("retries a non-closed idle close with a new deterministic authority ingress", async () => {
 		let attempts = 0;
 		let harness!: ReturnType<typeof createHarness>;

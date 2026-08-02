@@ -81,7 +81,7 @@ function replayPriorClose(
 		throw new Error(`GJC close ${input.ingressId} conflicts with a different ingress payload.`);
 	if (state === "complete") {
 		input.afterPublish?.(input.mapping);
-		return replayCloseOperation(input.ingressId, result);
+		return replayCloseOperation(input.ingressId, result, input.mapping.operationId);
 	}
 	if (state === "pending") throw new Error(`GJC close ${input.ingressId} is pending and cannot be replayed.`);
 	throw new Error(`GJC close ${input.ingressId} requires reconciliation.`);

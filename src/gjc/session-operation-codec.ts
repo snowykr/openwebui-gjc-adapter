@@ -164,8 +164,13 @@ export function updateAuthorityIdentity(
 export function replayCloseOperation(
 	operationId: string,
 	result: SessionOperationResult | undefined,
+	mappingOperationId: string,
 ): { readonly status: "closed" } {
-	if (result?.kind !== "close" || result.correlation?.closeStatus !== "closed")
+	if (
+		result?.kind !== "close" ||
+		result.correlation?.closeStatus !== "closed" ||
+		result.correlation.mappingOperationId !== mappingOperationId
+	)
 		throw new Error(`GJC close ${operationId} completed without a valid immutable result binding.`);
 	return { status: "closed" };
 }

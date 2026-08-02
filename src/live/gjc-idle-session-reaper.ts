@@ -454,7 +454,8 @@ class IdleSessionReaper {
 			return persisted.filter(
 				operation =>
 					operation.kind === "close" &&
-					(closeOperationIndex(operation, prefix) >= 0 || operationResultMatchesMapping(operation, mapping)),
+					(operationResultMatchesMapping(operation, mapping) ||
+						(operation.state !== "complete" && closeOperationIndex(operation, prefix) >= 0)),
 			);
 		const operations: SessionOperation[] = [];
 		const maxAttempt = state?.closeAttempt ?? 0;
