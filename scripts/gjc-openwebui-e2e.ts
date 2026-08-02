@@ -78,15 +78,21 @@ function gitOutput(args: readonly string[]): Buffer {
 	return Buffer.from(result.stdout);
 }
 
-function currentSourceHash(): string {
+function currentSourceState(): { readonly hash: string; readonly head: string; readonly indexTree: string } {
 	const untracked = gitOutput(["ls-files", "--others", "--exclude-standard", "-z"]);
 	if (untracked.length > 0) throw new Error("Cannot record a source hash with untracked files");
-	return sourceHashFromGitState({
-		head: gitOutput(["rev-parse", "HEAD"]).toString("utf8").trim(),
-		indexTree: gitOutput(["write-tree"]).toString("utf8").trim(),
-		stagedDiff: gitOutput(["diff", "--cached", "--binary"]).toString("base64"),
-		unstagedDiff: gitOutput(["diff", "--binary"]).toString("base64"),
-	});
+	const head = gitOutput(["rev-parse", "HEAD"]).toString("utf8").trim();
+	const indexTree = gitOutput(["write-tree"]).toString("utf8").trim();
+	return {
+		hash: sourceHashFromGitState({
+			head,
+			indexTree,
+			stagedDiff: gitOutput(["diff", "--cached", "--binary"]).toString("base64"),
+			unstagedDiff: gitOutput(["diff", "--binary"]).toString("base64"),
+		}),
+		head,
+		indexTree,
+	};
 }
 
 function browserExecutable(): string {
@@ -277,8 +283,9 @@ export async function runVisualSmoke(): Promise<void> {
 			throw new Error(`OpenWebUI version mismatch: expected ${expectedVersion}, received ${observedVersion}`);
 		if (transcriptPath && (!expectedVersion || !sourceHash || !expectedModelLabel))
 			throw new Error("Hash-bound transcript requires expected OpenWebUI version, source hash, and model label");
-		if (sourceHash && currentSourceHash() !== sourceHash)
-			throw new Error(`Source hash mismatch: expected ${sourceHash}, received ${currentSourceHash()}`);
+		const currentSource = sourceHash === undefined ? undefined : currentSourceState();
+		if (sourceHash && currentSource?.hash !== sourceHash)
+			throw new Error(`Source hash mismatch: expected ${sourceHash}, received ${currentSource?.hash}`);
 		const selectedModelOption = await selectModel(page, model, expectedModelLabel);
 		actions.push({
 			type: "select-model",
@@ -345,6 +352,8 @@ export async function runVisualSmoke(): Promise<void> {
 						expectedResponseText,
 						expectedModelLabel,
 						sourceHash,
+						sourceCommit: currentSource?.head,
+						sourceIndexTree: currentSource?.indexTree,
 						socketEventFramesAfterSubmit: socketFrames.length,
 						chatCompletionModelsAfterSubmit: completionRequestModels,
 						chatCompletionResponseBodiesAfterSubmit: completionResponseBodies.length,
