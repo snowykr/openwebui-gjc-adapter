@@ -58,11 +58,50 @@ export function createGjcRoutingLiveGatewayRunner(
 			await input.turnRunner.stop?.();
 		},
 		async run(turn: LiveGatewayRunnerInput): Promise<GjcRoutingLiveGatewayRunnerResult> {
+			let existing = input.mappings.get(turn.chatId);
+			const priorProvisional = input.mappings.provisionalOperation(turn.chatId, turn.userMessageId);
+			if (
+				priorProvisional !== undefined &&
+				(priorProvisional.projectId !== turn.project.id ||
+					(existing !== undefined && existing.projectId !== priorProvisional.projectId))
+			)
+				throw new Error(`GJC operation ${turn.userMessageId} is not authorized for project ${turn.project.id}.`);
+			const priorAuthority = input.mappings.operationAuthority(turn.chatId, turn.userMessageId);
+			if (
+				priorAuthority !== undefined &&
+				("retiredAt" in priorAuthority || priorAuthority.projectId !== turn.project.id)
+			)
+				throw new Error(`GJC operation ${turn.userMessageId} is not authorized for project ${turn.project.id}.`);
+			const reassignmentSource =
+				existing !== undefined && existing.projectId !== turn.project.id ? existing.projectId : undefined;
+			if (reassignmentSource !== undefined) existing = undefined;
+			let reassignmentStarted = false;
+			const beginReassignment = () => {
+				if (reassignmentSource === undefined || reassignmentStarted) return;
+				input.mappings.beginProjectReassignment(turn.chatId, reassignmentSource, turn.project.id);
+				reassignmentStarted = true;
+			};
+			const rollbackReassignment = (cause: unknown) => {
+				if (reassignmentSource === undefined || !reassignmentStarted) return;
+				try {
+					input.mappings.rollbackProjectReassignment(turn.chatId, reassignmentSource);
+				} catch (rollbackError) {
+					const committed = input.mappings.get(turn.chatId);
+					if (committed?.projectId === turn.project.id) {
+						reassignmentStarted = false;
+						return;
+					}
+					throw new AggregateError(
+						[cause, rollbackError],
+						`Failed to roll back project reassignment for chat ${turn.chatId}.`,
+					);
+				}
+				reassignmentStarted = false;
+			};
 			const replayedOperation = await replayRoutingOperation(input, turn);
 			if (replayedOperation !== null) return replayedOperation;
 
 			const requestedModelId = turn.requestedModelId ?? input.requestedModelId?.(turn);
-			const existing = input.mappings.get(turn.chatId);
 			if (
 				requestedModelId !== undefined &&
 				isSameProject(existing, turn) &&
@@ -169,6 +208,7 @@ export function createGjcRoutingLiveGatewayRunner(
 			const modelSelection =
 				requestedModelId === undefined ? undefined : await resolveNormalSelection(input, turn, requestedModelId);
 
+			if (turn.onLiveEvents === undefined) beginReassignment();
 			if (turn.onLiveEvents === undefined) {
 				let result: RouteGjcTurnResult;
 				try {
@@ -188,7 +228,9 @@ export function createGjcRoutingLiveGatewayRunner(
 							ensureProjectionRows(input.outbox, routed.mapping, input.ownerUserId ?? "openwebui-gjc-adapter"),
 						...(modelSelection === undefined ? {} : { modelSelection }),
 					});
+					reassignmentStarted = false;
 				} catch (error) {
+					rollbackReassignment(error);
 					if (isModelSelectionApplyFailure(error)) throw modelSelectionError("model_selection_apply_failed");
 					throw error;
 				}
@@ -204,6 +246,7 @@ export function createGjcRoutingLiveGatewayRunner(
 						: { content: result.assistantText };
 				return withCanonicalModel(response, result.mapping.modelSelection);
 			}
+			beginReassignment();
 			const queue = new LiveChunkQueue();
 			let activityStarted = false;
 			let observedNativeLifecycle = false;
@@ -269,6 +312,7 @@ export function createGjcRoutingLiveGatewayRunner(
 				...(modelSelection === undefined ? {} : { modelSelection }),
 			})
 				.then(async result => {
+					reassignmentStarted = false;
 					markActivityStarted();
 					const canonicalModel =
 						result.mapping.modelSelection === undefined
@@ -286,9 +330,14 @@ export function createGjcRoutingLiveGatewayRunner(
 					await queue.finish(result.assistantText);
 				})
 				.catch(error => {
-					const mappedError = isModelSelectionApplyFailure(error)
+					let mappedError: unknown = isModelSelectionApplyFailure(error)
 						? modelSelectionError("model_selection_apply_failed")
 						: error;
+					try {
+						rollbackReassignment(mappedError);
+					} catch (rollbackError) {
+						mappedError = rollbackError;
+					}
 					if (!activityStarted) rejectActivity(mappedError);
 					queue.fail(mappedError);
 				});

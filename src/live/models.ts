@@ -10,20 +10,44 @@ export type GjcModelIdClassification =
 
 const RFC3986_EXTRA = /[!'()*]/g;
 const HEX_ESCAPE = /%[0-9a-fA-F]{2}/;
-const CONTROL_OR_WHITESPACE = /[\p{Cc}\p{White_Space}]/u;
+const CONTROL_WHITESPACE_FORMAT_OR_SURROGATE = /[\p{Cc}\p{Cf}\p{White_Space}\uD800-\uDFFF]/u;
 const textEncoder = new TextEncoder();
 const OPENWEBUI_CONNECTION_PREFIX = /^([A-Za-z0-9_-]+)\.(gjc\/.+)$/;
 
+function displayProviderName(provider: string): string {
+	return provider === "openai-codex" ? "codex" : provider;
+}
 export function buildModelList(input: readonly unknown[] = []): OpenAIModelListResponse {
-	const selections = input.flatMap(decodeNormalizedSelection);
+	const entries = input.flatMap(decodeNormalizedSelection).map(selection => ({
+		selection,
+		id: formatCanonicalModelId(selection),
+		name: formatModelDisplayName(selection),
+	}));
+	const nameCounts = new Map<string, number>();
+	for (const entry of entries) nameCounts.set(entry.name, (nameCounts.get(entry.name) ?? 0) + 1);
+	const emittedNames = new Set<string>();
 	return {
 		object: "list",
-		data: selections.map(selection => ({
-			id: formatCanonicalModelId(selection),
-			object: "model",
-			created: 1783468800,
-			owned_by: "gjc",
-		})),
+		data: entries.map(entry => {
+			let name =
+				(nameCounts.get(entry.name) ?? 0) > 1 && entry.selection.provider !== "openai-codex"
+					? entry.id
+					: entry.name;
+			if (emittedNames.has(name)) name = entry.id;
+			let suffix = 2;
+			while (emittedNames.has(name)) {
+				name = `${entry.id} (${suffix})`;
+				suffix += 1;
+			}
+			emittedNames.add(name);
+			return {
+				id: entry.id,
+				name,
+				object: "model" as const,
+				created: 1783468800,
+				owned_by: "gjc",
+			};
+		}),
 	};
 }
 
@@ -49,6 +73,11 @@ export function formatCanonicalModelId(selection: NormalizedModelSelection): str
 	const provider = encodeComponent(selection.provider);
 	const modelId = encodeComponent(selection.modelId);
 	return `gjc/${provider}/${modelId}:${selection.thinkingLevel}`;
+}
+export function formatModelDisplayName(selection: NormalizedModelSelection): string {
+	if (!isSafeProvider(selection.provider) || !isSafeComponent(selection.modelId))
+		throw new TypeError("Invalid GJC model selection");
+	return `${displayProviderName(selection.provider)}/${selection.modelId}:${selection.thinkingLevel}`;
 }
 
 export function parseCanonicalModelId(value: unknown): NormalizedModelSelection | null {
@@ -151,7 +180,7 @@ function decodeCanonicalComponent(value: string): string | null {
 function isSafeComponent(value: string): boolean {
 	return (
 		value.length > 0 &&
-		!CONTROL_OR_WHITESPACE.test(value) &&
+		!CONTROL_WHITESPACE_FORMAT_OR_SURROGATE.test(value) &&
 		!HEX_ESCAPE.test(value) &&
 		!value.split("/").some(segment => segment === "." || segment === "..")
 	);

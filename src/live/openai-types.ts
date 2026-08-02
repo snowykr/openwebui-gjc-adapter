@@ -57,6 +57,7 @@ export interface OpenAIModelEntry {
 	readonly object: "model";
 	readonly created: number;
 	readonly owned_by: string;
+	readonly name?: string;
 }
 
 export interface OpenAIModelListResponse {

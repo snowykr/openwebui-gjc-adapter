@@ -173,6 +173,15 @@ describe("readiness behavior", () => {
 			).rejects.toThrow("configDomain must be a canonical existing writable directory");
 			expect(existsSync(join(target, "agent"))).toBe(false);
 			mkdirSync(join(home, ".gjc"));
+			const derivedAgent = join(home, ".gjc", "agent");
+			mkdirSync(derivedAgent);
+			await expect(
+				resolveRuntimeLocations({
+					mode: "existing",
+					serviceHome: home,
+					installedConfig: { gjcCodingAgentDir: derivedAgent },
+				}),
+			).resolves.toMatchObject({ agentDir: derivedAgent });
 			await expect(
 				resolveRuntimeLocations({
 					mode: "existing",

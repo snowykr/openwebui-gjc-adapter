@@ -376,6 +376,55 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 			terminal.close();
 		}
 	});
+	test("Given an accepted assistant transport failure When agent_end follows Then the turn fails closed", async () => {
+		const { terminal, emit } = await terminalFixture();
+		try {
+			const pending = terminal.wait(correlation, 500);
+			emit({ type: "agent_start", ...correlation });
+			emit({
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [],
+					stopReason: "error",
+					errorMessage: "The usage limit has been reached",
+					transportFailure: { kind: "transport", providerCode: "usage_limit_reached" },
+				},
+			});
+			emit({ type: "agent_end", ...correlation });
+
+			await expect(pending).rejects.toMatchObject({
+				code: "prompt_failed",
+				message: "The usage limit has been reached",
+			});
+		} finally {
+			terminal.close();
+		}
+	});
+	test("Given a foreign assistant failure after the active agent starts When the active agent ends Then the turn succeeds", async () => {
+		const { terminal, emit } = await terminalFixture();
+		try {
+			const pending = terminal.wait(correlation, 500);
+			emit({ type: "agent_start", ...correlation });
+			emit({
+				type: "message_end",
+				sessionId: correlation.sessionId,
+				commandId: "foreign-command",
+				turnId: "foreign-turn",
+				message: {
+					role: "assistant",
+					content: [],
+					stopReason: "error",
+					errorMessage: "foreign provider failure",
+				},
+			});
+			emit({ type: "agent_end", ...correlation });
+
+			await expect(pending).resolves.toBeDefined();
+		} finally {
+			terminal.close();
+		}
+	});
 	test("Given reference-less session streams from different turns When the current turn ends Then stale final text is rejected", async () => {
 		const { terminal, emit } = await terminalFixture();
 		try {

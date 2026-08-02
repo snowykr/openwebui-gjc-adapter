@@ -105,6 +105,79 @@ describe("project registry primitives", () => {
 			"outside allowed artifact roots",
 		);
 	});
+	test("classifies canonicalization permission denial before registration", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-project-canonical-access-"));
+		const lockedParent = path.join(workspace, "locked");
+		const projectDirectory = path.join(lockedParent, "project");
+		await fs.mkdir(projectDirectory, { recursive: true });
+		const allowedRoots = await resolveAllowedRoots([workspace]);
+
+		await fs.chmod(lockedParent, 0o000);
+		try {
+			await expect(registerProjectDirectory({ cwd: projectDirectory }, allowedRoots)).rejects.toThrow(
+				"Project directory is not readable/searchable",
+			);
+		} finally {
+			await fs.chmod(lockedParent, 0o755);
+			await fs.rm(workspace, { recursive: true, force: true });
+		}
+	});
+	test("rejects an unwritable default session root before registration", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-default-session-access-"));
+		const projectDirectory = path.join(workspace, "project");
+		await fs.mkdir(projectDirectory);
+		const allowedRoots = await resolveAllowedRoots([workspace]);
+
+		await fs.chmod(projectDirectory, 0o555);
+		try {
+			await expect(registerProjectDirectory({ cwd: projectDirectory }, allowedRoots)).rejects.toThrow(
+				"Session root is not readable/writable/searchable",
+			);
+		} finally {
+			await fs.chmod(projectDirectory, 0o755);
+			await fs.rm(workspace, { recursive: true, force: true });
+		}
+	});
+
+	test("allows a read-only project with a separate writable session root", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-separate-session-access-"));
+		const projectDirectory = path.join(workspace, "project");
+		const sessionDirectory = path.join(workspace, "sessions");
+		await fs.mkdir(projectDirectory);
+		await fs.mkdir(sessionDirectory);
+		const allowedRoots = await resolveAllowedRoots([workspace]);
+
+		await fs.chmod(projectDirectory, 0o555);
+		try {
+			const registered = await registerProjectDirectory(
+				{ cwd: projectDirectory, sessionRoot: sessionDirectory },
+				allowedRoots,
+			);
+			expect(registered.cwd).toBe(await fs.realpath(projectDirectory));
+			expect(registered.sessionRoot).toBe(await fs.realpath(sessionDirectory));
+		} finally {
+			await fs.chmod(projectDirectory, 0o755);
+			await fs.rm(workspace, { recursive: true, force: true });
+		}
+	});
+	test("rejects an existing session root that cannot be enumerated", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-session-read-access-"));
+		const projectDirectory = path.join(workspace, "project");
+		const sessionDirectory = path.join(workspace, "sessions");
+		await fs.mkdir(projectDirectory);
+		await fs.mkdir(sessionDirectory);
+		const allowedRoots = await resolveAllowedRoots([workspace]);
+
+		await fs.chmod(sessionDirectory, 0o333);
+		try {
+			await expect(
+				registerProjectDirectory({ cwd: projectDirectory, sessionRoot: sessionDirectory }, allowedRoots),
+			).rejects.toThrow("Session root is not readable/writable/searchable");
+		} finally {
+			await fs.chmod(sessionDirectory, 0o755);
+			await fs.rm(workspace, { recursive: true, force: true });
+		}
+	});
 
 	test("builds OpenWebUI folder metadata projection", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-project-metadata-"));

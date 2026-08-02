@@ -56,6 +56,266 @@ function fileHarness(): StoreHarness {
 }
 
 describe("session mapping store authority conformance", () => {
+	describe("project reassignment", () => {
+		for (const createHarness of [memoryHarness, fileHarness]) {
+			test(`${createHarness.name} commits only the exact target and retains source operation authority`, () => {
+				const harness = createHarness();
+				try {
+					const source = mapping();
+					harness.store.set(source);
+					harness.store.beginOperation(source.chatId, {
+						id: "completed-operation",
+						kind: "prompt",
+						detail: "hash",
+					});
+					harness.store.transitionOperation(source.chatId, "completed-operation", "complete", "hash", {
+						kind: "turn",
+						assistantText: "done",
+						events: [],
+						mapping: {
+							chatId: source.chatId,
+							projectId: source.projectId,
+							sessionId: source.sessionId,
+							rawFrameCursor: source.rawFrameCursor,
+							eventCursor: source.eventCursor,
+							operationId: "completed-operation",
+						},
+					});
+					const targetOperation = {
+						chatId: source.chatId,
+						projectId: "project-2",
+						id: "project-2-operation",
+						ingressId: "project-2-operation",
+						kind: "create" as const,
+						detail: "project-2-request",
+					};
+					harness.store.beginProjectReassignment(source.chatId, source.projectId, "project-2", {
+						id: targetOperation.id,
+						ingressId: targetOperation.ingressId,
+						kind: targetOperation.kind,
+						detail: targetOperation.detail,
+					});
+					expect(harness.store.get(source.chatId)).toMatchObject({
+						projectId: source.projectId,
+						sessionId: source.sessionId,
+					});
+					harness.store.reserveProvisionalOperation(targetOperation);
+					harness.store.publishProvisionalOperation(targetOperation, {
+						...source,
+						projectId: "project-2",
+						sessionId: "session-2",
+						operationId: targetOperation.id,
+						attachment: {
+							...source.attachment!,
+							expectedSessionId: "session-2",
+						},
+					});
+
+					expect(harness.store.get(source.chatId)).toMatchObject({
+						projectId: "project-2",
+						sessionId: "session-2",
+					});
+					expect(() => harness.store.set(harness.store.get(source.chatId)!)).not.toThrow();
+					expect(harness.store.operation(source.chatId, "completed-operation")).toMatchObject({
+						state: "complete",
+						result: { mapping: { projectId: source.projectId } },
+					});
+					expect(harness.store.operationAuthority(source.chatId, "completed-operation")).toMatchObject({
+						projectId: source.projectId,
+						retiredAt: expect.any(String),
+					});
+					expect(() =>
+						harness.store.assertOperationProject(source.chatId, "project-2", "completed-operation"),
+					).toThrow("not authorized");
+
+					const recovered = harness.recover();
+					expect(recovered.get(source.chatId)).toMatchObject({
+						projectId: "project-2",
+						sessionId: "session-2",
+					});
+					expect(recovered.operationAuthority(source.chatId, "completed-operation")).toMatchObject({
+						projectId: source.projectId,
+						retiredAt: expect.any(String),
+					});
+				} finally {
+					harness.cleanup();
+				}
+			});
+			test(`${createHarness.name} retains older source tombstones after retrying a rolled-back reassignment`, () => {
+				const harness = createHarness();
+				try {
+					const source = mapping();
+					harness.store.set(source);
+					harness.store.beginOperation(source.chatId, {
+						id: "operation-a",
+						kind: "prompt",
+						detail: "source request",
+					});
+					harness.store.transitionOperation(source.chatId, "operation-a", "complete", "source request", {
+						kind: "turn",
+						assistantText: "source result",
+						events: [],
+						mapping: {
+							chatId: source.chatId,
+							projectId: source.projectId,
+							sessionId: source.sessionId,
+							rawFrameCursor: source.rawFrameCursor,
+							eventCursor: source.eventCursor,
+							operationId: "operation-a",
+						},
+					});
+
+					const targetB = {
+						chatId: source.chatId,
+						projectId: "project-2",
+						id: "operation-b",
+						ingressId: "operation-b",
+						kind: "create" as const,
+						detail: "move to B",
+					};
+					harness.store.beginProjectReassignment(source.chatId, source.projectId, targetB.projectId, {
+						id: targetB.id,
+						ingressId: targetB.ingressId,
+						kind: targetB.kind,
+						detail: targetB.detail,
+					});
+					harness.store.reserveProvisionalOperation(targetB);
+					harness.store.publishProvisionalOperation(targetB, {
+						...source,
+						projectId: targetB.projectId,
+						sessionId: "session-b",
+						operationId: targetB.id,
+						attachment: {
+							...source.attachment!,
+							expectedSessionId: "session-b",
+						},
+					});
+
+					harness.store.beginProjectReassignment(source.chatId, targetB.projectId, "project-3");
+					harness.store.rollbackProjectReassignment(source.chatId, targetB.projectId);
+					expect(harness.store.operationAuthority(source.chatId, "operation-a")).toMatchObject({
+						projectId: source.projectId,
+						retiredAt: expect.any(String),
+					});
+					expect(() =>
+						harness.store.set({
+							...harness.store.get(source.chatId)!,
+							operationId: "project-2-follow-up",
+						}),
+					).not.toThrow();
+
+					const targetC = {
+						chatId: source.chatId,
+						projectId: "project-3",
+						id: "operation-c",
+						ingressId: "operation-c",
+						kind: "create" as const,
+						detail: "retry move to C",
+					};
+					harness.store.beginProjectReassignment(source.chatId, targetB.projectId, targetC.projectId, {
+						id: targetC.id,
+						ingressId: targetC.ingressId,
+						kind: targetC.kind,
+						detail: targetC.detail,
+					});
+					harness.store.reserveProvisionalOperation(targetC);
+					harness.store.publishProvisionalOperation(targetC, {
+						...source,
+						projectId: targetC.projectId,
+						sessionId: "session-c",
+						operationId: targetC.id,
+						attachment: {
+							...source.attachment!,
+							expectedSessionId: "session-c",
+						},
+					});
+
+					expect(harness.store.operationAuthority(source.chatId, "operation-a")).toMatchObject({
+						projectId: source.projectId,
+						retiredAt: expect.any(String),
+					});
+					expect(harness.recover().operationAuthority(source.chatId, "operation-a")).toMatchObject({
+						projectId: source.projectId,
+						retiredAt: expect.any(String),
+					});
+				} finally {
+					harness.cleanup();
+				}
+			});
+
+			test(`${createHarness.name} rejects reassignment while a source operation is in flight`, () => {
+				const harness = createHarness();
+				try {
+					const source = mapping();
+					harness.store.set(source);
+					harness.store.beginOperation(source.chatId, {
+						id: "in-flight-source-operation",
+						kind: "prompt",
+						detail: "source request",
+					});
+					expect(() =>
+						harness.store.beginProjectReassignment(source.chatId, source.projectId, "project-2"),
+					).toThrow("in-flight-source-operation requires reconciliation");
+				} finally {
+					harness.cleanup();
+				}
+			});
+			test(`${createHarness.name} rejects a source operation after reassignment begins`, () => {
+				const harness = createHarness();
+				try {
+					const source = mapping();
+					harness.store.set(source);
+					harness.store.beginProjectReassignment(source.chatId, source.projectId, "project-2");
+					expect(() =>
+						harness.store.beginOperation(source.chatId, {
+							id: "late-source-operation",
+							kind: "prompt",
+							detail: "source request",
+						}),
+					).toThrow("pending project reassignment");
+				} finally {
+					harness.cleanup();
+				}
+			});
+			test(`${createHarness.name} rolls an interrupted target back without deleting source authority`, () => {
+				const harness = createHarness();
+				try {
+					const source = mapping();
+					const targetOperation = {
+						chatId: source.chatId,
+						projectId: "project-2",
+						id: "project-2-operation",
+						ingressId: "project-2-operation",
+						kind: "create" as const,
+						detail: "project-2-request",
+					};
+					harness.store.set(source);
+					harness.store.beginProjectReassignment(source.chatId, source.projectId, "project-2");
+					harness.store.reserveProvisionalOperation(targetOperation);
+
+					const recovered = harness.recover();
+					expect(recovered.get(source.chatId)).toMatchObject({
+						projectId: source.projectId,
+						sessionId: source.sessionId,
+					});
+					expect(recovered.provisionalOperation(source.chatId, targetOperation.ingressId)).toMatchObject({
+						projectId: "project-2",
+						state: "uncertain",
+					});
+					expect(() =>
+						recovered.publishProvisionalOperation(targetOperation, {
+							...source,
+							projectId: "project-2",
+							sessionId: "session-2",
+							operationId: targetOperation.id,
+						}),
+					).toThrow();
+				} finally {
+					harness.cleanup();
+				}
+			});
+		}
+	});
 	for (const createHarness of [memoryHarness, fileHarness]) {
 		test(createHarness.name, () => {
 			const harness = createHarness();
@@ -183,6 +443,94 @@ describe("session mapping store authority conformance", () => {
 				harness.cleanup();
 			}
 		});
+	}
+});
+test("file rejects an invalid retained prior tombstone during a pending reassignment", () => {
+	const directory = mkdtempSync(join(tmpdir(), "gjc-mapping-prior-tombstone-"));
+	const filePath = join(directory, "authority.json");
+	try {
+		const store = new FileBackedSessionMappingStore(filePath);
+		const source = mapping();
+		const target = {
+			chatId: source.chatId,
+			projectId: "project-2",
+			id: "operation-b",
+			ingressId: "operation-b",
+			kind: "create" as const,
+			detail: "move to B",
+		};
+		store.set(source);
+		store.beginProjectReassignment(source.chatId, source.projectId, target.projectId, {
+			id: target.id,
+			ingressId: target.ingressId,
+			kind: target.kind,
+			detail: target.detail,
+		});
+		store.reserveProvisionalOperation(target);
+		store.publishProvisionalOperation(target, {
+			...source,
+			projectId: target.projectId,
+			sessionId: "session-b",
+			operationId: target.id,
+			attachment: { ...source.attachment!, expectedSessionId: "session-b" },
+		});
+		store.beginProjectReassignment(source.chatId, target.projectId, "project-3");
+
+		const document = JSON.parse(readFileSync(filePath, "utf8"));
+		document.mappings[0].reassignment.priorTombstone.chatId = "other-chat";
+		writeFileSync(filePath, JSON.stringify(document));
+
+		expect(() => new FileBackedSessionMappingStore(filePath)).toThrow("not a valid v2 authority");
+	} finally {
+		rmSync(directory, { recursive: true, force: true });
+	}
+});
+test("file accepts reassignment back to a prior project", () => {
+	const directory = mkdtempSync(join(tmpdir(), "gjc-mapping-return-project-"));
+	const filePath = join(directory, "authority.json");
+	try {
+		const store = new FileBackedSessionMappingStore(filePath);
+		const source = mapping();
+		const move = (projectId: string, id: string, sessionId: string) => {
+			const target = {
+				chatId: source.chatId,
+				projectId,
+				id,
+				ingressId: id,
+				kind: "create" as const,
+				detail: `move to ${projectId}`,
+			};
+			const active = store.get(source.chatId)!;
+			store.beginProjectReassignment(source.chatId, active.projectId, target.projectId, {
+				id: target.id,
+				ingressId: target.ingressId,
+				kind: target.kind,
+				detail: target.detail,
+			});
+			store.reserveProvisionalOperation(target);
+			store.publishProvisionalOperation(target, {
+				...active,
+				projectId: target.projectId,
+				sessionId,
+				operationId: target.id,
+				attachment: { ...active.attachment!, expectedSessionId: sessionId },
+			});
+		};
+
+		store.set(source);
+		move("project-2", "operation-b", "session-b");
+		move(source.projectId, "operation-return", "session-return");
+
+		expect(store.get(source.chatId)).toMatchObject({
+			projectId: source.projectId,
+			sessionId: "session-return",
+		});
+		expect(new FileBackedSessionMappingStore(filePath).get(source.chatId)).toMatchObject({
+			projectId: source.projectId,
+			sessionId: "session-return",
+		});
+	} finally {
+		rmSync(directory, { recursive: true, force: true });
 	}
 });
 test("file rejects persisted journal/provisional cross-field collisions in either order", () => {

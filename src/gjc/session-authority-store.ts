@@ -5,6 +5,8 @@ import type {
 	ProvisionalSessionOperation,
 	SessionAuthorityInput,
 	SessionAuthorityRecord,
+	SessionAuthorityTargetIdentity,
+	SessionAuthorityTombstone,
 	SessionOperation,
 	SessionOperationResult,
 	SessionOperationState,
@@ -26,8 +28,57 @@ export class SessionAuthority {
 	upsert(input: SessionAuthorityInput): SessionAuthorityRecord {
 		return this.#journal.store(input);
 	}
+	reassignProject(chatId: string, currentProjectId: string, nextProjectId: string): boolean {
+		return this.#journal.reassignProject(chatId, currentProjectId, nextProjectId);
+	}
+	beginProjectReassignment(
+		chatId: string,
+		currentProjectId: string,
+		nextProjectId: string,
+		target?: SessionAuthorityTargetIdentity,
+	): SessionAuthorityRecord {
+		return this.#journal.beginProjectReassignment(chatId, currentProjectId, nextProjectId, target);
+	}
+	rollbackProjectReassignment(chatId: string, currentProjectId: string): SessionAuthorityRecord {
+		return this.#journal.rollbackProjectReassignment(chatId, currentProjectId);
+	}
+	beginReassignment(
+		chatId: string,
+		currentProjectId: string,
+		nextProjectId: string,
+		target?: SessionAuthorityTargetIdentity,
+	): SessionAuthorityRecord {
+		return this.#journal.beginReassignment(chatId, currentProjectId, nextProjectId, target);
+	}
+	rollbackReassignment(chatId: string, currentProjectId: string): SessionAuthorityRecord {
+		return this.#journal.rollbackReassignment(chatId, currentProjectId);
+	}
+	lookupOperation(chatId: string, operationId: string): SessionOperation | undefined {
+		return this.#journal.lookupOperation(chatId, operationId);
+	}
+	lookupOperationAuthority(
+		chatId: string,
+		operationId: string,
+	): SessionAuthorityRecord | SessionAuthorityTombstone | undefined {
+		return this.#journal.lookupOperationAuthority(chatId, operationId);
+	}
+	assertOperationProject(chatId: string, projectId: string, operationId: string): void {
+		this.#journal.assertOperationProject(chatId, projectId, operationId);
+	}
+	assertOperationIdentity(
+		chatId: string,
+		projectId: string,
+		operation: Pick<SessionOperation, "id" | "ingressId">,
+	): void {
+		this.#journal.assertOperationIdentity(chatId, projectId, operation);
+	}
 	provisionalOperation(chatId: string, ingressId: string): ProvisionalSessionOperation | undefined {
-		const operation = this.#journal.provisional.get(provisionalKey(chatId, ingressId));
+		const operation =
+			this.#journal.provisional.get(provisionalKey(chatId, ingressId)) ??
+			[...this.#journal.provisional.values()].find(
+				candidate =>
+					candidate.chatId === chatId && (candidate.id === ingressId || candidate.ingressId === ingressId),
+			);
 		return operation === undefined ? undefined : copyProvisionalOperation(operation);
 	}
 	reserveProvisionalOperation(

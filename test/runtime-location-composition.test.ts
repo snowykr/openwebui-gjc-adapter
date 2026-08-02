@@ -148,6 +148,24 @@ describe("runtime location composition", () => {
 		expect(unit).toContain("UnsetEnvironment=PI_CONFIG_DIR");
 		expect(compose).not.toContain("PI_CONFIG_DIR");
 	});
+	test("uses OpenWebUI v0.11.0 for managed deployments unless explicitly overridden", () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-managed-openwebui-image-")));
+		const paths = artifacts(root);
+		const previousImage = process.env.GJC_OPENWEBUI_IMAGE;
+		try {
+			delete process.env.GJC_OPENWEBUI_IMAGE;
+			stage(paths);
+			expect(readFileSync(paths.composeFile, "utf8")).toContain("ghcr.io/open-webui/open-webui:v0.11.0");
+
+			process.env.GJC_OPENWEBUI_IMAGE = "registry.example/openwebui:verified";
+			stage(paths);
+			expect(readFileSync(paths.composeFile, "utf8")).toContain("registry.example/openwebui:verified");
+		} finally {
+			if (previousImage === undefined) delete process.env.GJC_OPENWEBUI_IMAGE;
+			else process.env.GJC_OPENWEBUI_IMAGE = previousImage;
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
 
 	test("stages the managed neutral reader workspace before catalog requests", () => {
 		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-managed-reader-workspace-")));

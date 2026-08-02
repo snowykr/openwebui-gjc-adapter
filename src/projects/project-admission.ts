@@ -14,6 +14,13 @@ export class ProjectLinkError extends Error {
 		this.code = code;
 	}
 }
+export class ProjectPathAccessError extends Error {
+	readonly name = "ProjectPathAccessError";
+
+	constructor(message: string, cause?: unknown) {
+		super(message, { cause });
+	}
+}
 
 export async function assertProjectsAdmitted(
 	projects: readonly RegisteredProject[],
@@ -52,10 +59,11 @@ export function sanitizeProjectInput(
 
 export function isProjectPathValidationError(error: unknown): error is Error {
 	return (
-		error instanceof Error &&
-		(error.message.includes("outside allowed artifact roots") ||
-			error.message.includes("No allowed artifact roots configured") ||
-			error.message.includes("No existing parent found for path"))
+		error instanceof ProjectPathAccessError ||
+		(error instanceof Error &&
+			(error.message.includes("outside allowed artifact roots") ||
+				error.message.includes("No allowed artifact roots configured") ||
+				error.message.includes("No existing parent found for path")))
 	);
 }
 

@@ -56,7 +56,7 @@ describe("real canonical model selection scenarios", () => {
 				selection: initial.coordinator.selection,
 				setterAttempts: initial.coordinator.setterAttempts,
 				promptCount: initial.coordinator.promptCount,
-				catalogReads: initial.coordinator.catalogReads + 3,
+				catalogReads: initial.coordinator.catalogReads + 4,
 				stateReads: initial.coordinator.stateReads + 3,
 			});
 			expect(afterReadErrors.projectLookups).toBe(initial.projectLookups + 2);

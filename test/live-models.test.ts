@@ -62,6 +62,8 @@ describe("canonical GJC model codec", () => {
 			"gjc/provider/..:off",
 			"gjc/provider/model%0Aname:off",
 			"gjc/provider/model%E2%80%83name:off",
+			"gjc/provider/model%E2%80%AEname:off",
+			"gjc/provider/model%ED%A0%80name:off",
 		];
 
 		// When
@@ -147,6 +149,14 @@ describe("atomic GJC catalog decoder", () => {
 			"provider slash",
 			{ provider: "provider/sub", id: "model", reasoning: false, thinking: { validLevels: ["off"] } },
 		],
+		[
+			"format-control provider",
+			{ provider: "provider\u202E", id: "model", reasoning: false, thinking: { validLevels: ["off"] } },
+		],
+		[
+			"lone-surrogate model",
+			{ provider: "provider", id: "model\uD800", reasoning: false, thinking: { validLevels: ["off"] } },
+		],
 	] as const)("rejects %s atomically after a valid Q10 row", (_name, invalid) => {
 		// Given
 		const decode = exportedFunction("decodeStrictModelCatalog");
@@ -202,7 +212,72 @@ describe("atomic GJC catalog decoder", () => {
 		// Then
 		expect(response).toEqual({
 			object: "list",
-			data: [{ id: "gjc/p/m:off", object: "model", created: 1783468800, owned_by: "gjc" }],
+			data: [{ id: "gjc/p/m:off", name: "p/m:off", object: "model", created: 1783468800, owned_by: "gjc" }],
 		});
+	});
+	test("uses distinct display labels for OpenAI Codex and a literal Codex provider", () => {
+		const build = exportedFunction("buildModelList");
+
+		expect(
+			build([
+				{ provider: "openai-codex", modelId: "gpt-5", thinkingLevel: "off" },
+				{ provider: "codex", modelId: "gpt-5", thinkingLevel: "off" },
+				{ provider: "codex-provider", modelId: "gpt-5", thinkingLevel: "off" },
+				{ provider: "gjc", modelId: "codex/gpt-5", thinkingLevel: "off" },
+				{ provider: "constructor", modelId: "m", thinkingLevel: "off" },
+			]),
+		).toEqual({
+			object: "list",
+			data: [
+				{
+					id: "gjc/openai-codex/gpt-5:off",
+					name: "codex/gpt-5:off",
+					object: "model",
+					created: 1783468800,
+					owned_by: "gjc",
+				},
+				{
+					id: "gjc/codex/gpt-5:off",
+					name: "gjc/codex/gpt-5:off",
+					object: "model",
+					created: 1783468800,
+					owned_by: "gjc",
+				},
+				{
+					id: "gjc/codex-provider/gpt-5:off",
+					name: "codex-provider/gpt-5:off",
+					object: "model",
+					created: 1783468800,
+					owned_by: "gjc",
+				},
+				{
+					id: "gjc/gjc/codex%2Fgpt-5:off",
+					name: "gjc/gjc/codex%2Fgpt-5:off",
+					object: "model",
+					created: 1783468800,
+					owned_by: "gjc",
+				},
+				{
+					id: "gjc/constructor/m:off",
+					name: "constructor/m:off",
+					object: "model",
+					created: 1783468800,
+					owned_by: "gjc",
+				},
+			],
+		});
+	});
+	test("only aliases the exact OpenAI Codex provider", () => {
+		const formatDisplayName = exportedFunction("formatModelDisplayName");
+
+		expect(formatDisplayName({ provider: "openai-codex", modelId: "gpt-5", thinkingLevel: "off" })).toBe(
+			"codex/gpt-5:off",
+		);
+		expect(formatDisplayName({ provider: "openai-codex-proxy", modelId: "gpt-5", thinkingLevel: "off" })).toBe(
+			"openai-codex-proxy/gpt-5:off",
+		);
+		expect(formatDisplayName({ provider: "OpenAI-Codex", modelId: "gpt-5", thinkingLevel: "off" })).toBe(
+			"OpenAI-Codex/gpt-5:off",
+		);
 	});
 });

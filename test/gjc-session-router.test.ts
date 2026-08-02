@@ -244,6 +244,10 @@ describe("routeGjcTurn", () => {
 			),
 		).rejects.toBeInstanceOf(SessionFileBoundaryError);
 		expect(runner.switches).toHaveLength(0);
+		expect(mappings.operation("chat-1", "message-2")).toMatchObject({
+			id: "message-2",
+			state: "uncertain",
+		});
 	});
 
 	test("keeps one mapping and does not rerun duplicate operations", async () => {

@@ -218,19 +218,11 @@ export interface OpenWebUIPromptHintsPayload {
 	readonly suggestions: readonly OpenWebUIPromptSuggestion[];
 }
 
-/** Adapter-owned suggestions are deliberately version-scoped and contain no credentials. */
-export const GJC_PROMPT_HINTS_PAYLOAD: OpenWebUIPromptHintsPayload = {
-	suggestions: [
-		{
-			title: ["GJC"],
-			content: "Use the GJC coding agent to work on this project.",
-		},
-	],
+/** Legacy adapter-owned suggestion to remove without changing foreign OpenWebUI suggestions. */
+export const GJC_LEGACY_PROMPT_SUGGESTION: OpenWebUIPromptSuggestion = {
+	title: ["GJC"],
+	content: "Use the GJC coding agent to work on this project.",
 };
-
-export function promptHintsPayloadMatches(value: unknown): boolean {
-	return JSON.stringify(value) === JSON.stringify(GJC_PROMPT_HINTS_PAYLOAD);
-}
 
 export function promptHintsFromConfig(value: unknown): unknown {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
@@ -238,17 +230,15 @@ export function promptHintsFromConfig(value: unknown): unknown {
 	return Object.hasOwn(config, "default_prompt_suggestions") ? config.default_prompt_suggestions : [];
 }
 
-export function mergePromptHints(existing: unknown): OpenWebUIPromptHintsPayload | undefined {
+export function removeLegacyPromptHint(existing: unknown): OpenWebUIPromptHintsPayload | undefined {
 	if (!Array.isArray(existing)) return undefined;
 	const suggestions = existing.filter(isPromptSuggestion);
 	if (suggestions.length !== existing.length) return undefined;
-	const ownedTitle = GJC_PROMPT_HINTS_PAYLOAD.suggestions[0]?.title;
-	const replacement = GJC_PROMPT_HINTS_PAYLOAD.suggestions[0];
-	const ownedIndex = suggestions.findIndex(
-		suggestion => JSON.stringify(suggestion.title) === JSON.stringify(ownedTitle),
-	);
-	if (ownedIndex === -1) return { suggestions: [...suggestions, replacement] };
-	return { suggestions: suggestions.map((suggestion, index) => (index === ownedIndex ? replacement : suggestion)) };
+	return {
+		suggestions: suggestions.filter(
+			suggestion => JSON.stringify(suggestion) !== JSON.stringify(GJC_LEGACY_PROMPT_SUGGESTION),
+		),
+	};
 }
 
 function isPromptSuggestion(value: unknown): value is OpenWebUIPromptSuggestion {

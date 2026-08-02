@@ -6,6 +6,7 @@ import { PublicSdkSessionClient } from "../gjc/public-sdk-session-port";
 
 export interface ModelReader {
 	getAvailableModels(): Promise<readonly unknown[]>;
+	getActiveProviders(): Promise<readonly unknown[]>;
 	getState(): Promise<unknown>;
 	/** Detaches the SDK transport only; it never closes a remote session. */
 	stop(): void | Promise<void>;
@@ -80,6 +81,9 @@ class PublicSdkModelReader implements ModelReader {
 
 	getAvailableModels(): Promise<readonly unknown[]> {
 		return this.port.getAvailableModels();
+	}
+	getActiveProviders(): Promise<readonly unknown[]> {
+		return this.port.getActiveProviders();
 	}
 
 	getState(): Promise<unknown> {

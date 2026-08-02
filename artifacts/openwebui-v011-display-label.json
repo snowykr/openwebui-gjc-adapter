@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "surface": "web",
+  "tool": "puppeteer-core",
+  "targetUrl": "http://127.0.0.1:8080",
+  "observedVersion": "0.11.0",
+  "expectedVersion": "0.11.0",
+  "model": "gjc/openai-codex/gpt-5.6-luna:low",
+  "expectedResponseText": "openwebui-gjc-adapter",
+  "expectedModelLabel": "codex/gpt-5.6-luna:low",
+  "sourceHash": "sha256:d86c14a69148468a236eb12db8136792220c67400ba54740445b514fe994bb58",
+  "sourceCommit": "99f95786ae5857156cc7f854018dd1af3a71f040",
+  "sourceIndexTree": "3871a84448e0112862098c3adec05a7bb4967fb0",
+  "chatId": "83206008-4070-4b91-8453-abc90b511ed0",
+  "socketEventFramesAfterSubmit": 26,
+  "socketEventFramesForSubmittedChat": 25,
+  "chatCompletionModelsAfterSubmit": [
+    "gjc/openai-codex/gpt-5.6-luna:low"
+  ],
+  "chatCompletionResponseStatusesAfterSubmit": [
+    200
+  ],
+  "currentAssistantText": "openwebui-gjc-adapter",
+  "selectedModelOption": {
+    "value": "gjc/openai-codex/gpt-5.6-luna:low",
+    "label": "codex/gpt-5.6-luna:low"
+  },
+  "toolReadFinishedCount": 4,
+  "actions": [
+    {
+      "type": "goto",
+      "timestamp": "2026-08-02T16:32:41.292Z",
+      "url": "http://127.0.0.1:8080/auth"
+    },
+    {
+      "type": "select-model",
+      "timestamp": "2026-08-02T16:32:55.319Z",
+      "selector": "button[role=\"option\"]",
+      "value": "gjc/openai-codex/gpt-5.6-luna:low",
+      "label": "codex/gpt-5.6-luna:low"
+    },
+    {
+      "type": "fill",
+      "timestamp": "2026-08-02T16:32:55.389Z",
+      "selector": "#chat-input"
+    },
+    {
+      "type": "press",
+      "timestamp": "2026-08-02T16:32:55.624Z",
+      "selector": "#chat-input"
+    }
+  ],
+  "assertions": [
+    {
+      "timestamp": "2026-08-02T16:33:17.937Z",
+      "selector": "body, button[role=option], /api/chat/completions",
+      "status": "passed",
+      "description": "Selected codex/gpt-5.6-luna:low with canonical value gjc/openai-codex/gpt-5.6-luna:low; submitted gjc/openai-codex/gpt-5.6-luna:low; rendered and received openwebui-gjc-adapter, Tool read finished, and a Socket.IO event."
+    }
+  ]
+}

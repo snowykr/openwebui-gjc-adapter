@@ -247,6 +247,128 @@ describe("createGjcRoutingLiveGatewayRunner", () => {
 		await expect(runner.run(turn)).rejects.toThrow("requires reconciliation");
 		expect(turnRunner.calls).toBe(1);
 	});
+	test("keeps source authority when the first destination turn fails", async () => {
+		const mappings = new SessionMappingStore();
+		const turnRunner = new FakeGjcTurnRunner();
+		const projectB = { ...project, id: "project-b", cwd: "/workspace/project-b" };
+		mappings.set({
+			chatId: "chat-reassign-failure",
+			projectId: project.id,
+			sessionId: "session-a",
+			sessionFile: "/workspace/project/.gjc/sessions/session-a.jsonl",
+			operationId: "operation-a",
+			rawFrameCursor: 1,
+			eventCursor: 1,
+		});
+		turnRunner.completionError = new Error("destination start failed");
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings });
+
+		await expect(
+			runner.run({
+				project: projectB,
+				prompt: "move to B",
+				chatId: "chat-reassign-failure",
+				messageId: "assistant-b",
+				userMessageId: "operation-b",
+				userMessageParentId: "operation-a",
+				continued: true,
+			}),
+		).rejects.toThrow("destination start failed");
+
+		expect(mappings.get("chat-reassign-failure")).toMatchObject({
+			projectId: project.id,
+			sessionId: "session-a",
+		});
+		expect(mappings.provisionalOperation("chat-reassign-failure", "operation-b")).toMatchObject({
+			projectId: projectB.id,
+			state: "uncertain",
+		});
+		expect(turnRunner.starts).toHaveLength(1);
+		turnRunner.completionError = undefined;
+		await expect(
+			runner.run({
+				project,
+				prompt: "continue in A",
+				chatId: "chat-reassign-failure",
+				messageId: "assistant-a-2",
+				userMessageId: "operation-a-2",
+				userMessageParentId: "operation-a",
+				continued: true,
+			}),
+		).resolves.toMatchObject({ content: "continued:continue in A" });
+		expect(turnRunner.continues).toHaveLength(1);
+		expect(mappings.get("chat-reassign-failure")?.projectId).toBe(project.id);
+	});
+
+	test("rejects retired source operations before destination or source runner effects", async () => {
+		const mappings = new SessionMappingStore();
+		const turnRunner = new FakeGjcTurnRunner();
+		const projectB = { ...project, id: "project-b", cwd: "/workspace/project-b" };
+		mappings.set({
+			chatId: "chat-reassign-stale",
+			projectId: project.id,
+			sessionId: "session-a",
+			sessionFile: "/workspace/project/.gjc/sessions/session-a.jsonl",
+			operationId: "operation-a",
+			rawFrameCursor: 1,
+			eventCursor: 1,
+		});
+		mappings.beginOperation("chat-reassign-stale", {
+			id: "stale-operation-a",
+			kind: "prompt",
+			detail: "source request",
+		});
+		mappings.transitionOperation("chat-reassign-stale", "stale-operation-a", "complete", "source request", {
+			kind: "turn",
+			assistantText: "source result",
+			events: [],
+			mapping: {
+				chatId: "chat-reassign-stale",
+				projectId: project.id,
+				sessionId: "session-a",
+				rawFrameCursor: 1,
+				eventCursor: 1,
+				operationId: "stale-operation-a",
+			},
+		});
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings });
+		await runner.run({
+			project: projectB,
+			prompt: "move to B",
+			chatId: "chat-reassign-stale",
+			messageId: "assistant-b",
+			userMessageId: "operation-b",
+			userMessageParentId: "operation-a",
+			continued: true,
+		});
+		const effectsBeforeRetries = {
+			starts: turnRunner.starts.length,
+			switches: turnRunner.switches.length,
+			continues: turnRunner.continues.length,
+			states: turnRunner.states.length,
+		};
+
+		for (const retryProject of [projectB, project]) {
+			await expect(
+				runner.run({
+					project: retryProject,
+					prompt: "stale source retry",
+					chatId: "chat-reassign-stale",
+					messageId: `assistant-stale-${retryProject.id}`,
+					userMessageId: "stale-operation-a",
+					userMessageParentId: null,
+					continued: false,
+				}),
+			).rejects.toThrow("not authorized");
+		}
+		expect(mappings.get("chat-reassign-stale")?.projectId).toBe(projectB.id);
+		expect({
+			starts: turnRunner.starts.length,
+			switches: turnRunner.switches.length,
+			continues: turnRunner.continues.length,
+			states: turnRunner.states.length,
+		}).toEqual(effectsBeforeRetries);
+	});
 });
 
 class SdkSessionRootTurnRunner extends FakeGjcTurnRunner {

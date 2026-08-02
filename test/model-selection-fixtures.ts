@@ -61,6 +61,12 @@ export function staticModelReaderFactory(
 			transcript.push("catalog");
 			return MODEL_DESCRIPTORS;
 		},
+		async getActiveProviders(): Promise<readonly unknown[]> {
+			return [
+				{ provider: "anthropic", connectionKind: "credential" },
+				{ provider: "openai", connectionKind: "credential" },
+			];
+		},
 		async getState(): Promise<unknown> {
 			transcript.push("state");
 			return state;

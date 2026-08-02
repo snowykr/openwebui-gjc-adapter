@@ -18,6 +18,7 @@ import { buildInstalledAdapterServerOptions, runCli } from "../src/cli";
 import type { AdapterConfig } from "../src/config";
 import { type BootstrapState, INITIAL_BOOTSTRAP_STATE, parseBootstrapState } from "../src/configure/bootstrap-state";
 import { openSecretFile } from "../src/configure/credentials";
+import { rollbackDeploymentTransaction } from "../src/configure/deployment-transaction";
 import { CliUsageError, parseCliArguments } from "../src/configure/grammar";
 import { configureOpenWebUI } from "../src/configure/openwebui-setup";
 import { runPhaseAwareDeployment } from "../src/configure/orchestrator";
@@ -31,6 +32,50 @@ import {
 import { renderExistingSystemdUnit } from "../src/configure/systemd";
 import type { AdapterServerOptions } from "../src/server";
 
+test("fresh rollback does not stop an absent controller unit", async () => {
+	const t = tempPath();
+	try {
+		let stopped = false;
+		let disabled = false;
+		const errors = await rollbackDeploymentTransaction({
+			transaction: {
+				snapshots: [],
+				priorMode: "existing",
+				controllers: { enabled: false, active: false },
+			},
+			attemptedMode: "existing",
+			path: t.config,
+			artifacts: {
+				path: t.config,
+				directory: t.directory,
+				composeFile: `${t.config}.compose.yml`,
+				unitFile: `${t.config}.service`,
+				userUnitDirectory: join(t.directory, "systemd"),
+				sourceRoot: join(t.directory, "src"),
+			},
+			controller: {
+				stop: () => {
+					stopped = true;
+				},
+				disable: () => {
+					disabled = true;
+				},
+				reload: () => {},
+				restore: () => {},
+			},
+			checkpoint: undefined,
+			writeCheckpoint: async () => {},
+			pendingBeforeRollback: undefined,
+			finishDurableRollback: () => {},
+		});
+
+		expect(errors).toEqual([]);
+		expect(stopped).toBe(false);
+		expect(disabled).toBe(false);
+	} finally {
+		t.cleanup();
+	}
+});
 function tempPath(): { directory: string; config: string; cleanup: () => void } {
 	const directory = mkdtempSync(join(tmpdir(), "gjc-configure-cli-"));
 	return {
@@ -300,6 +345,10 @@ describe("configure CLI grammar and acknowledgements", () => {
 			expect(unit).toContain(
 				`ExecStart=${process.execPath} ${join(sourceRoot, "src", "cli.ts")} serve --config ${t.config}`,
 			);
+			expect(unit).toContain(
+				`Environment=GJC_OPENWEBUI_GJC_COMMAND=${join(sourceRoot, "node_modules", ".bin", "gjc")}`,
+			);
+			expect(unit).toContain(`Environment=PATH=${dirname(process.execPath)}:`);
 		} finally {
 			globalThis.fetch = originalFetch;
 			for (const [name, value] of Object.entries(originalEnvironment)) {

@@ -82,6 +82,16 @@ export function startRealSelectionSdkServer(coordinatorUrl: string): RealSelecti
 					sessionSelections.get(socket.data.sessionId) ??
 					selectionFromRecord(await fetchRecord(`${coordinatorUrl}/state`));
 				items = payload.models.map(item => currentModelRow(item, selection));
+			} else if (query === "providers.list/active") {
+				const payload = await fetchRecord(`${coordinatorUrl}/catalog`);
+				if (!Array.isArray(payload.models)) throw new TypeError("catalog query failed");
+				items = [
+					...new Set(
+						payload.models.flatMap(model =>
+							isRecord(model) && typeof model.provider === "string" ? [model.provider] : [],
+						),
+					),
+				].map(provider => ({ provider, connectionKind: "credential" }));
 			} else if (query === "session.metadata") {
 				items = [{ sessionId: socket.data.sessionId, cwd: socket.data.cwd, kind: "saved" }];
 			} else if (query === "config.list/get") {

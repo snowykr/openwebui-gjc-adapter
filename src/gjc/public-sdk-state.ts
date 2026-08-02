@@ -29,6 +29,9 @@ export async function readSessionState(
 export async function readAvailableModels(client: SdkV3Client, timeoutMs?: number): Promise<readonly unknown[]> {
 	return ensureCapabilityCatalog(await client.queryAll("models.list/current", {}, timeoutMs));
 }
+export async function readActiveProviders(client: SdkV3Client, timeoutMs?: number): Promise<readonly unknown[]> {
+	return client.queryAll("providers.list/active", {}, timeoutMs);
+}
 
 export async function readBranchCandidates(
 	client: SdkV3Client,

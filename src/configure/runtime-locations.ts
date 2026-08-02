@@ -127,7 +127,11 @@ export function resolveGjcRuntimeLocations(input: ResolveGjcRuntimeLocationsInpu
 			if (error instanceof Error) throw new GjcRuntimeLocationError(error.message);
 			throw error;
 		}
-		if ([configDomain, readerWorkspace, readerSessionRoot].some(path => overlaps(agentDir, path)))
+		const derivedAgentDir = join(configDomain, "agent");
+		if (
+			agentDir !== derivedAgentDir &&
+			[configDomain, readerWorkspace, readerSessionRoot].some(path => overlaps(agentDir, path))
+		)
 			throw new GjcRuntimeLocationError("gjcCodingAgentDir must not overlap derived GJC runtime locations");
 	}
 	const resolvedConfigDomain = provisionDerivedDirectory(configDomain, "configDomain");
