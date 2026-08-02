@@ -35,6 +35,35 @@ export function isOpenWebUiEventFrame(payload: string): boolean {
 	const event = parseSocketIoFrame(payload);
 	return Array.isArray(event) && event[0] === "events";
 }
+export function acceptedChatId(response: Readonly<{ status: number; body: string }>): string | undefined {
+	if (response.status < 200 || response.status >= 300) return undefined;
+	try {
+		const value: unknown = JSON.parse(response.body);
+		if (
+			!value ||
+			typeof value !== "object" ||
+			!("status" in value) ||
+			value.status !== true ||
+			!("chat_id" in value) ||
+			typeof value.chat_id !== "string" ||
+			value.chat_id.length === 0 ||
+			!("task_ids" in value) ||
+			!Array.isArray(value.task_ids) ||
+			value.task_ids.length === 0 ||
+			!value.task_ids.every(taskId => typeof taskId === "string" && taskId.length > 0)
+		)
+			return undefined;
+		return value.chat_id;
+	} catch {
+		return undefined;
+	}
+}
+export function isOpenWebUiEventFrameForChat(payload: string, chatId: string): boolean {
+	const event = parseSocketIoFrame(payload);
+	if (!Array.isArray(event) || event[0] !== "events") return false;
+	const detail = event[1];
+	return detail !== null && typeof detail === "object" && "chat_id" in detail && detail.chat_id === chatId;
+}
 export function modelSearchTerm(selectedModel: string): string {
 	const separator = selectedModel.lastIndexOf("/");
 	const thinkingLevel = selectedModel.lastIndexOf(":");
@@ -50,22 +79,21 @@ export function assertVisualEvidence(input: {
 	readonly text: string;
 	readonly socketFrames: readonly string[];
 	readonly completionResponses: readonly { readonly status: number; readonly body: string }[];
+	readonly chatId: string;
+	readonly currentAssistantText: string;
 	readonly expectedResponseText: string;
 	readonly previousToolReadFinishedCount: number;
 	readonly toolReadFinishedCount: number;
 }): void {
 	if (input.text.includes("Server Connection Error")) throw new Error("OpenWebUI reported a server connection error");
-	if (
-		!input.completionResponses.some(
-			response =>
-				response.status >= 200 && response.status < 300 && response.body.includes(input.expectedResponseText),
-		)
-	)
-		throw new Error(`OpenWebUI did not return the expected response: ${input.expectedResponseText}`);
+	if (!input.completionResponses.some(response => acceptedChatId(response) === input.chatId))
+		throw new Error("OpenWebUI did not accept the submitted chat request");
+	if (!input.currentAssistantText.includes(input.expectedResponseText))
+		throw new Error(`OpenWebUI did not render the expected response: ${input.expectedResponseText}`);
 	if (input.toolReadFinishedCount <= input.previousToolReadFinishedCount)
 		throw new Error("OpenWebUI did not render Tool read finished for the submitted turn");
-	if (!input.socketFrames.some(isOpenWebUiEventFrame))
-		throw new Error("OpenWebUI did not emit a post-submit events Socket.IO frame");
+	if (!input.socketFrames.some(frame => isOpenWebUiEventFrameForChat(frame, input.chatId)))
+		throw new Error("OpenWebUI did not emit a post-submit events Socket.IO frame for the submitted chat");
 }
 export function sourceHashFromGitState(input: {
 	readonly head: string;
@@ -219,6 +247,29 @@ async function selectModel(
 	await new Promise(resolve => setTimeout(resolve, 1_000));
 	return selectedOption;
 }
+async function waitForCurrentAssistantText(page: Page, chatId: string, expectedResponseText: string): Promise<string> {
+	const result = await page.waitForFunction(
+		async ({ chatId, expectedResponseText }) => {
+			const response = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}`);
+			if (!response.ok) return null;
+			const value: unknown = await response.json();
+			const isRecord = (candidate: unknown): candidate is Record<string, unknown> =>
+				candidate !== null && typeof candidate === "object";
+			if (!isRecord(value) || !isRecord(value.chat) || !isRecord(value.chat.history)) return null;
+			const { history } = value.chat;
+			if (typeof history.currentId !== "string" || !isRecord(history.messages)) return null;
+			const message = history.messages[history.currentId];
+			if (!isRecord(message) || message.role !== "assistant" || typeof message.content !== "string") return null;
+			return message.content.includes(expectedResponseText) ? message.content : null;
+		},
+		{ timeout: timeoutMs },
+		{ chatId, expectedResponseText },
+	);
+	const text: unknown = await result.jsonValue();
+	if (typeof text !== "string")
+		throw new Error("OpenWebUI did not return an assistant message for the submitted chat");
+	return text;
+}
 
 export async function runVisualSmoke(): Promise<void> {
 	if (!model) throw new Error("GJC_OPENWEBUI_E2E_MODEL is required");
@@ -330,7 +381,6 @@ export async function runVisualSmoke(): Promise<void> {
 		actions.push({ type: "press", timestamp: new Date().toISOString(), selector: "#chat-input" });
 		await completionResponse;
 		captureSubmittedRequest = false;
-		captureSocketFrames = false;
 		if (
 			completionRequestModels.length === 0 ||
 			completionRequestModels.some(requestedModel => !matchesModelOption(requestedModel, model))
@@ -338,17 +388,23 @@ export async function runVisualSmoke(): Promise<void> {
 			throw new Error(
 				`OpenWebUI did not submit only the canonical model ID or one connection-prefixed form: ${model}`,
 			);
+		const chatId = completionResponses.map(acceptedChatId).find((value): value is string => value !== undefined);
+		if (chatId === undefined) throw new Error("OpenWebUI did not accept the submitted chat request");
+		const currentAssistantText = await waitForCurrentAssistantText(page, chatId, expectedResponseText);
 		await page.waitForFunction(
 			previousCount => document.body.innerText.split("Tool read finished").length - 1 > previousCount,
 			{ timeout: timeoutMs },
 			previousToolReadFinishedCount,
 		);
+		captureSocketFrames = false;
 		const text = await page.evaluate(() => document.body.innerText);
 		const toolReadFinishedCount = text.split("Tool read finished").length - 1;
 		assertVisualEvidence({
 			text,
 			socketFrames,
 			completionResponses,
+			chatId,
+			currentAssistantText,
 			expectedResponseText,
 			previousToolReadFinishedCount,
 			toolReadFinishedCount,
@@ -377,9 +433,14 @@ export async function runVisualSmoke(): Promise<void> {
 						sourceHash,
 						sourceCommit: currentSource?.head,
 						sourceIndexTree: currentSource?.indexTree,
+						chatId,
 						socketEventFramesAfterSubmit: socketFrames.length,
+						socketEventFramesForSubmittedChat: socketFrames.filter(frame =>
+							isOpenWebUiEventFrameForChat(frame, chatId),
+						).length,
 						chatCompletionModelsAfterSubmit: completionRequestModels,
 						chatCompletionResponseStatusesAfterSubmit: completionResponses.map(response => response.status),
+						currentAssistantText,
 						selectedModelOption,
 						actions,
 						assertions: [

@@ -1,7 +1,9 @@
 import { expect, test } from "bun:test";
 import {
+	acceptedChatId,
 	assertVisualEvidence,
 	isOpenWebUiEventFrame,
+	isOpenWebUiEventFrameForChat,
 	matchesModelOption,
 	modelSearchTerm,
 	parseSocketIoFrame,
@@ -14,6 +16,8 @@ test("parses and identifies v0.11 Socket.IO events frames", () => {
 	expect(parseSocketIoFrame("2probe")).toBeUndefined();
 	expect(isOpenWebUiEventFrame('42["events",{"ok":true}]')).toBe(true);
 	expect(isOpenWebUiEventFrame('42["chat-events",{"ok":true}]')).toBe(false);
+	expect(isOpenWebUiEventFrameForChat('42["events",{"chat_id":"chat-1"}]', "chat-1")).toBe(true);
+	expect(isOpenWebUiEventFrameForChat('42["events",{"chat_id":"chat-2"}]', "chat-1")).toBe(false);
 });
 test("accepts exactly one OpenWebUI connection prefix", () => {
 	const model = "gjc/openai-codex/gpt-5.6-luna:low";
@@ -44,35 +48,43 @@ test("binds browser evidence to the committed tree and both tracked diff states"
 });
 
 test("requires current-turn completion, tool status, and Socket.IO evidence", () => {
+	const acceptedResponse = { status: 200, body: '{"status":true,"task_ids":["task-1"],"chat_id":"chat-1"}' };
+	expect(acceptedChatId(acceptedResponse)).toBe("chat-1");
+	expect(acceptedChatId({ status: 200, body: '{"status":true,"task_ids":[],"chat_id":"chat-1"}' })).toBeUndefined();
 	const evidence = {
 		text: "Tool read finished",
-		socketFrames: ['42["events",{"status":"complete"}]'],
-		completionResponses: [{ status: 200, body: "data: openwebui-gjc-adapter" }],
+		socketFrames: ['42["events",{"chat_id":"chat-1","status":"complete"}]'],
+		completionResponses: [acceptedResponse],
+		chatId: "chat-1",
+		currentAssistantText: "openwebui-gjc-adapter",
 		expectedResponseText: "openwebui-gjc-adapter",
 		previousToolReadFinishedCount: 0,
 		toolReadFinishedCount: 1,
 	};
 	expect(() => assertVisualEvidence(evidence)).not.toThrow();
-	expect(() =>
-		assertVisualEvidence({ ...evidence, completionResponses: [{ status: 500, body: "openwebui-gjc-adapter" }] }),
-	).toThrow("expected response");
-	expect(() => assertVisualEvidence({ ...evidence, completionResponses: [{ status: 200, body: "" }] })).toThrow(
+	expect(() => assertVisualEvidence({ ...evidence, completionResponses: [{ status: 500, body: "{}" }] })).toThrow(
+		"did not accept",
+	);
+	expect(() => assertVisualEvidence({ ...evidence, currentAssistantText: "previous response" })).toThrow(
 		"expected response",
 	);
 	expect(() => assertVisualEvidence({ ...evidence, toolReadFinishedCount: 0 })).toThrow("submitted turn");
-	expect(() => assertVisualEvidence({ ...evidence, socketFrames: [] })).toThrow("post-submit");
+	expect(() => assertVisualEvidence({ ...evidence, socketFrames: ['42["events",{"chat_id":"other"}]'] })).toThrow(
+		"submitted chat",
+	);
 	expect(() => assertVisualEvidence({ ...evidence, text: "Server Connection Error" })).toThrow("connection error");
 });
-
-test("does not accept status labels from an earlier turn", () => {
+test("does not accept an earlier turn's matching text", () => {
 	expect(() =>
 		assertVisualEvidence({
 			text: "Tool read finished\nopenwebui-gjc-adapter",
-			socketFrames: ['42["events",{"status":"complete"}]'],
-			completionResponses: [{ status: 500, body: "request failed" }],
+			socketFrames: ['42["events",{"chat_id":"chat-1"}]'],
+			completionResponses: [{ status: 200, body: '{"status":true,"task_ids":["task-1"],"chat_id":"chat-1"}' }],
+			chatId: "chat-1",
+			currentAssistantText: "request failed",
 			expectedResponseText: "openwebui-gjc-adapter",
 			previousToolReadFinishedCount: 1,
-			toolReadFinishedCount: 1,
+			toolReadFinishedCount: 2,
 		}),
 	).toThrow("expected response");
 });
