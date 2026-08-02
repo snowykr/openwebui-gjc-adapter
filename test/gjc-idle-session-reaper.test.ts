@@ -1,8 +1,15 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { buildAdapterServerOptions } from "../src/adapter-server-options";
 import type { SessionAttachmentProof, SessionOperation } from "../src/gjc/session-authority";
 import type { SessionMapping } from "../src/gjc/session-router";
 import type { LiveGatewayRunner, LiveGatewayRunnerInput } from "../src/live/chat-completions";
 import { createGjcIdleSessionReaper, DEFAULT_IDLE_SESSION_TIMEOUT_MS } from "../src/live/gjc-idle-session-reaper";
+import type { GjcSessionTurnRunner } from "../src/live/gjc-routing-runner";
+import type { OpenWebUIProjectionRepository } from "../src/openwebui/client";
+import { FakeGjcTurnRunner } from "./cli-fixtures";
 
 const project = {
 	id: "project-1",
@@ -14,7 +21,7 @@ const project = {
 
 class MappingFixture {
 	mapping: SessionMapping = createMapping("turn-1");
-	readonly operations = new Map<string, SessionOperation>([["turn-1", completedOperation("turn-1", 0)]]);
+	readonly operationRecords = new Map<string, SessionOperation>([["turn-1", completedOperation("turn-1", 0)]]);
 	get(chatId: string): SessionMapping | undefined {
 		return chatId === this.mapping.chatId ? this.mapping : undefined;
 	}
@@ -22,11 +29,25 @@ class MappingFixture {
 		return [this.mapping];
 	}
 	operation(_chatId: string, operationId: string): SessionOperation | undefined {
-		return this.operations.get(operationId);
+		return this.operationRecords.get(operationId);
+	}
+	operations(_chatId: string): readonly SessionOperation[] {
+		return [...this.operationRecords.values()];
+	}
+	recordClose(ingressId: string, state: SessionOperation["state"]): void {
+		this.operationRecords.set(ingressId, {
+			id: ingressId,
+			kind: "close",
+			state,
+			ingressId,
+			startedAt: new Date(0).toISOString(),
+			...(state === "complete" ? { completedAt: new Date(0).toISOString() } : {}),
+			detail: ingressId,
+		});
 	}
 	publish(operationId: string, completedAt = 0): void {
 		this.mapping = createMapping(operationId);
-		this.operations.set(operationId, completedOperation(operationId, completedAt));
+		this.operationRecords.set(operationId, completedOperation(operationId, completedAt));
 	}
 }
 
@@ -109,6 +130,11 @@ function completedOperation(id: string, completedAt: number): SessionOperation {
 function createHarness(
 	options: {
 		readonly run?: (input: LiveGatewayRunnerInput) => Promise<{ readonly content: string; readonly model: string }>;
+		readonly close?: (
+			mapping: SessionMapping,
+			ingress: { readonly ingressId: string; readonly ingressHash: string },
+		) => Promise<import("../src/gjc/session-router").SessionCloseResult>;
+		readonly stop?: () => void | Promise<void>;
 	} = {},
 ) {
 	const clock = new ManualTimers();
@@ -117,14 +143,14 @@ function createHarness(
 	const discarded: string[] = [];
 	const base: LiveGatewayRunner = {
 		run: options.run ?? (async () => ({ content: "done", model: "gjc" })),
-		stop: () => {},
+		stop: options.stop ?? (() => {}),
 	};
 	const reaper = createGjcIdleSessionReaper({
 		runner: base,
 		mappings,
 		closeSession: async (mapping, ingress) => {
 			closeCalls.push({ mapping, ingressId: ingress.ingressId });
-			return { status: "closed" };
+			return options.close === undefined ? { status: "closed" } : await options.close(mapping, ingress);
 		},
 		now: () => clock.now,
 		setTimeout: (handler, timeoutMs) =>
@@ -197,6 +223,50 @@ describe("GJC idle session reaper", () => {
 		expect(harness.closeCalls).toHaveLength(1);
 		await harness.reaper.stop();
 	});
+	test("retries a non-closed idle close with a new deterministic authority ingress", async () => {
+		let attempts = 0;
+		let harness!: ReturnType<typeof createHarness>;
+		harness = createHarness({
+			close: async (_mapping, ingress) => {
+				attempts += 1;
+				harness.mappings.recordClose(ingress.ingressId, attempts === 1 ? "conflict" : "complete");
+				return attempts === 1 ? { status: "unavailable", message: "endpoint unavailable" } : { status: "closed" };
+			},
+		});
+		await harness.reaper.runner.run(createInput());
+		harness.clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
+		await flush();
+		harness.clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
+		await flush();
+		expect(attempts).toBe(2);
+		expect(harness.closeCalls[0]?.ingressId).not.toBe(harness.closeCalls[1]?.ingressId);
+		expect(harness.closeCalls[1]?.ingressId).toContain(":retry:1");
+		await harness.reaper.stop();
+	});
+
+	test("stop waits for an in-flight idle close before stopping the base runner", async () => {
+		let releaseClose!: () => void;
+		let baseStopped = false;
+		const harness = createHarness({
+			stop: () => {
+				baseStopped = true;
+			},
+			close: () =>
+				new Promise(resolve => {
+					releaseClose = () => resolve({ status: "closed" });
+				}),
+		});
+		await harness.reaper.runner.run(createInput());
+		harness.clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
+		await flush();
+		expect(harness.closeCalls).toHaveLength(1);
+		const stopping = harness.reaper.stop();
+		await flush();
+		expect(baseStopped).toBe(false);
+		releaseClose();
+		await stopping;
+		expect(baseStopped).toBe(true);
+	});
 
 	test("retains the mapping after close so the next turn can resume it", async () => {
 		const harness = createHarness();
@@ -237,4 +307,49 @@ describe("GJC idle session reaper", () => {
 		expect(clock.count()).toBe(0);
 		expect(stopped).toBe(1);
 	});
+});
+test("adapter initialization failure stops the constructed reaper", async () => {
+	const root = await mkdtemp(join(tmpdir(), "gjc-idle-reaper-init-"));
+	const failure = new Error("projection startup failure");
+	let stopCalls = 0;
+	const turnRunner = new FakeGjcTurnRunner() as GjcSessionTurnRunner;
+	turnRunner.stop = () => {
+		stopCalls += 1;
+	};
+	const projectionRepository: OpenWebUIProjectionRepository = {
+		async upsertFolder() {
+			throw failure;
+		},
+		async upsertChat(record) {
+			return record;
+		},
+		async replaceChatMessages(_ownerUserId, _chatId, messages) {
+			return messages;
+		},
+		async getChat() {
+			return undefined;
+		},
+	};
+	try {
+		await expect(
+			buildAdapterServerOptions(
+				{
+					mode: "existing",
+					bindHost: "127.0.0.1",
+					bindPort: 8765,
+					openWebUIBaseUrl: "http://127.0.0.1:3000",
+					allowedProjectRoots: [root],
+					projects: [{ cwd: root, name: "demo" }],
+					statePath: join(root, "state"),
+					sessionRoot: join(root, "sessions"),
+					gjcCommand: "/bin/true",
+					turnTimeoutMs: 60_000,
+				},
+				{ turnRunner, projectionRepository },
+			),
+		).rejects.toThrow(failure);
+		expect(stopCalls).toBe(1);
+	} finally {
+		await rm(root, { force: true, recursive: true });
+	}
 });

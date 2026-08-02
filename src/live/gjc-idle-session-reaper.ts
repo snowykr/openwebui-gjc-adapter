@@ -9,7 +9,9 @@ import type { LiveGatewayRunner, LiveGatewayRunnerInput, LiveGatewayRunnerResult
 
 export const DEFAULT_IDLE_SESSION_TIMEOUT_MS = 600_000;
 
-type MappingStore = Pick<import("../gjc/session-router").SessionMappingStore, "get" | "entries" | "operation">;
+type MappingStore = Pick<import("../gjc/session-router").SessionMappingStore, "get" | "entries" | "operation"> & {
+	readonly operations?: (chatId: string) => readonly SessionOperation[];
+};
 type SessionCloser = (mapping: SessionMapping, ingress: SessionCloseIngress) => Promise<SessionCloseResult>;
 type IdleTimer = ReturnType<typeof setTimeout>;
 type TimerFactory = (handler: () => void, timeoutMs: number) => IdleTimer;
@@ -56,6 +58,7 @@ class IdleSessionReaper {
 	#timer: IdleTimer | undefined;
 	#stopped = false;
 	#baseStopped = false;
+	#inFlightIdleCloses = new Set<Promise<void>>();
 
 	constructor(private readonly input: CreateGjcIdleSessionReaperInput) {
 		const timeoutMs = input.idleTimeoutMs ?? DEFAULT_IDLE_SESSION_TIMEOUT_MS;
@@ -76,6 +79,9 @@ class IdleSessionReaper {
 				this.#clearTimeout(this.#timer);
 				this.#timer = undefined;
 			}
+		}
+		while (this.#inFlightIdleCloses.size > 0) {
+			await Promise.allSettled([...this.#inFlightIdleCloses]);
 		}
 		if (this.#baseStopped) return;
 		this.#baseStopped = true;
@@ -196,6 +202,7 @@ class IdleSessionReaper {
 			lastActivityAt: this.#now(),
 			active: 0,
 			closed: false,
+			closeAttempt: 0,
 			closeQueued: false,
 			closeInFlight: false,
 			gate: new SerialGate(),
@@ -214,6 +221,7 @@ class IdleSessionReaper {
 		}
 		state.mapping = current;
 		state.generation = generation;
+		state.closeAttempt = 0;
 		state.closed = false;
 		state.lastActivityAt = this.#now();
 	}
@@ -226,9 +234,8 @@ class IdleSessionReaper {
 	private refreshMappings(): void {
 		for (const mapping of this.input.mappings.entries()) {
 			if (!hasOwnedPaneAttachment(mapping.attachment)) continue;
-			const idleClose = this.input.mappings.operation(mapping.chatId, closeIngressId(mapping.operationId, mapping));
-			if (idleClose?.kind === "close" && idleClose.state !== "complete") continue;
-			const alreadyClosed = idleClose?.kind === "close" && idleClose.state === "complete";
+			const closeOperations = this.closeOperations(mapping);
+			const alreadyClosed = closeOperations.some(operation => operation.state === "complete");
 			const operation = this.input.mappings.operation(mapping.chatId, mapping.operationId);
 			if (operation !== undefined && operation.state !== "complete") continue;
 			const completedAt = operationCompletedAt(operation);
@@ -242,6 +249,7 @@ class IdleSessionReaper {
 					generation,
 					lastActivityAt: completedAt,
 					active: 0,
+					closeAttempt: 0,
 					closed: alreadyClosed,
 					closeQueued: false,
 					closeInFlight: false,
@@ -255,6 +263,7 @@ class IdleSessionReaper {
 			) {
 				state.mapping = mapping;
 				state.generation = generation;
+				state.closeAttempt = 0;
 				state.lastActivityAt = completedAt;
 				state.closed = alreadyClosed;
 			}
@@ -305,9 +314,17 @@ class IdleSessionReaper {
 			)
 				continue;
 			state.closeQueued = true;
-			void this.attemptClose(state);
+			this.trackIdleClose(state);
 		}
 		this.schedule();
+	}
+	private trackIdleClose(state: ChatState): void {
+		const close = this.attemptClose(state);
+		this.#inFlightIdleCloses.add(close);
+		void close.then(
+			() => this.#inFlightIdleCloses.delete(close),
+			() => this.#inFlightIdleCloses.delete(close),
+		);
 	}
 
 	private async attemptClose(state: ChatState): Promise<void> {
@@ -329,10 +346,20 @@ class IdleSessionReaper {
 				state.closed = true;
 				return;
 			}
-			const idleClose = this.input.mappings.operation(current.chatId, closeIngressId(current.operationId, current));
-			if (idleClose?.kind === "close") {
-				if (idleClose.state === "complete") state.closed = true;
-				else state.lastActivityAt = this.#now();
+			const pendingOperation = this.input.mappings
+				.operations?.(current.chatId)
+				?.find(operation => operation.state === "pending");
+			if (pendingOperation !== undefined) {
+				state.lastActivityAt = this.#now();
+				return;
+			}
+			const closeOperations = this.closeOperations(current, state);
+			if (closeOperations.some(operation => operation.state === "complete")) {
+				state.closed = true;
+				return;
+			}
+			if (closeOperations.some(operation => operation.state === "pending")) {
+				state.lastActivityAt = this.#now();
 				return;
 			}
 			const operation = this.input.mappings.operation(current.chatId, current.operationId);
@@ -343,8 +370,8 @@ class IdleSessionReaper {
 			if (state.lastActivityAt + this.#timeoutMs > this.#now()) return;
 			state.closeInFlight = true;
 			try {
-				const ingressId = closeIngressId(current.operationId, current);
-				const result = await this.input.closeSession(current, { ingressId, ingressHash: ingressId });
+				const ingress = this.nextCloseIngress(current, state);
+				const result = await this.input.closeSession(current, ingress);
 				if (result.status !== "closed") {
 					state.lastActivityAt = this.#now();
 					return;
@@ -365,13 +392,54 @@ class IdleSessionReaper {
 		}
 	}
 
+	private closeOperations(mapping: SessionMapping, state?: ChatState): readonly SessionOperation[] {
+		const prefix = closeIngressId(mapping.operationId, mapping);
+		const persisted = this.input.mappings.operations?.(mapping.chatId);
+		if (persisted !== undefined)
+			return persisted.filter(
+				operation => operation.kind === "close" && closeOperationIndex(operation, prefix) >= 0,
+			);
+		const operations: SessionOperation[] = [];
+		const maxAttempt = state?.closeAttempt ?? 0;
+		for (let attempt = 0; attempt <= maxAttempt; attempt++) {
+			const ingressId = closeIngressIdForAttempt(prefix, attempt);
+			const operation = this.input.mappings.operation(mapping.chatId, ingressId);
+			if (operation !== undefined && operation.kind === "close") operations.push(operation);
+		}
+		return operations;
+	}
+
+	private nextCloseIngress(mapping: SessionMapping, state: ChatState): SessionCloseIngress {
+		const prefix = closeIngressId(mapping.operationId, mapping);
+		const operations = this.closeOperations(mapping, state);
+		const nextAttempt = Math.max(
+			state.closeAttempt,
+			...operations.map(operation => closeOperationIndex(operation, prefix) + 1),
+		);
+		state.closeAttempt = nextAttempt + 1;
+		const ingressId = closeIngressIdForAttempt(prefix, nextAttempt);
+		return { ingressId, ingressHash: ingressId };
+	}
 	private adoptCurrentMapping(state: ChatState, mapping: SessionMapping): void {
 		state.mapping = mapping;
 		state.generation = mappingGeneration(mapping);
+		state.closeAttempt = 0;
 		state.closed = false;
 		const operation = this.input.mappings.operation(mapping.chatId, mapping.operationId);
 		state.lastActivityAt = operationCompletedAt(operation) ?? this.#now();
 	}
+}
+function closeIngressIdForAttempt(prefix: string, attempt: number): string {
+	return attempt === 0 ? prefix : `${prefix}:retry:${attempt}`;
+}
+
+function closeOperationIndex(operation: SessionOperation, prefix: string): number {
+	const id = operation.ingressId ?? operation.id;
+	if (id === prefix) return 0;
+	const retryPrefix = `${prefix}:retry:`;
+	if (!id.startsWith(retryPrefix)) return -1;
+	const attempt = Number(id.slice(retryPrefix.length));
+	return Number.isInteger(attempt) && attempt > 0 ? attempt : -1;
 }
 
 interface ChatState {
@@ -382,6 +450,7 @@ interface ChatState {
 	lastActivityAt: number;
 	active: number;
 	closed: boolean;
+	closeAttempt: number;
 	closeQueued: boolean;
 	closeInFlight: boolean;
 }

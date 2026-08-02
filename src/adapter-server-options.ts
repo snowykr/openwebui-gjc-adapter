@@ -92,6 +92,7 @@ export async function buildResolvedAdapterServerOptions(
 	const internalStore = dependencies.projectRegistrationStore === undefined;
 	const databasePath = path.join(config.statePath, "adapter-state.sqlite");
 	let projectStore: SqliteProjectRegistrationStore | undefined;
+	let idleSessionReaper: ReturnType<typeof createGjcIdleSessionReaper> | undefined;
 	try {
 		if (internalStore)
 			await preflightProjectRegistrationDatabase(databasePath, config.runtimeLocations.protectedProjectPaths);
@@ -142,20 +143,19 @@ export async function buildResolvedAdapterServerOptions(
 			modelReaderFactory,
 			...(outbox === undefined ? {} : { outbox }),
 		});
-		const idleSessionReaper =
-			closeSession === undefined
-				? undefined
-				: createGjcIdleSessionReaper({
-						runner: routingRunner,
-						mappings,
-						closeSession,
-						...(turnRunner.discardSessionAttachment === undefined
-							? {}
-							: {
-									discardSessionAttachment: (cwd, sessionId) =>
-										turnRunner.discardSessionAttachment?.(cwd, sessionId),
-								}),
-					});
+		if (closeSession !== undefined) {
+			idleSessionReaper = createGjcIdleSessionReaper({
+				runner: routingRunner,
+				mappings,
+				closeSession,
+				...(turnRunner.discardSessionAttachment === undefined
+					? {}
+					: {
+							discardSessionAttachment: (cwd, sessionId) =>
+								turnRunner.discardSessionAttachment?.(cwd, sessionId),
+						}),
+			});
+		}
 		const runner = idleSessionReaper?.runner ?? routingRunner;
 		const closeSessionForRoutes = idleSessionReaper?.closeSession ?? closeSession;
 		const projectLinkService = new ProjectLinkService({
@@ -221,19 +221,25 @@ export async function buildResolvedAdapterServerOptions(
 		completed = true;
 		return options;
 	} catch (error) {
-		if (!internalStore || projectStore === undefined) throw error;
+		let startupError: unknown = error;
+		try {
+			await idleSessionReaper?.stop();
+		} catch (stopError) {
+			startupError = new AggregateError([startupError, stopError], "Adapter initialization cleanup failed");
+		}
+		if (!internalStore || projectStore === undefined) throw startupError;
 		try {
 			projectStore.close();
 		} catch (closeError) {
-			if (error instanceof Error) {
+			if (startupError instanceof Error) {
 				const cause =
-					error.cause === undefined
+					startupError.cause === undefined
 						? closeError
-						: new AggregateError([error.cause, closeError], "Startup failure cleanup failed");
-				Reflect.defineProperty(error, "cause", { value: cause });
+						: new AggregateError([startupError.cause, closeError], "Startup failure cleanup failed");
+				Reflect.defineProperty(startupError, "cause", { value: cause });
 			}
 		}
-		throw error;
+		throw startupError;
 	} finally {
 		if (!completed) await lock.release();
 	}

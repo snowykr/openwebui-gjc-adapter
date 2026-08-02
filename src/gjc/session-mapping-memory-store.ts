@@ -48,6 +48,9 @@ export class SessionMappingStore {
 	operation(chatId: string, operationId: string): SessionOperation | undefined {
 		return this.authority.lookupOperation(chatId, operationId);
 	}
+	operations(chatId: string): readonly SessionOperation[] {
+		return this.authority.get(chatId)?.journal ?? [];
+	}
 	operationAuthority(
 		chatId: string,
 		operationId: string,
