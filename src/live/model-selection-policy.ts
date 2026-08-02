@@ -1,4 +1,5 @@
 import type { NormalizedModelSelection } from "../contracts";
+import { SdkV3OperationError } from "../gjc/sdk-v3-protocol";
 import { normalizeModelSelection } from "../gjc/session-router";
 import type { ModelReader, ModelReaderFactory } from "./model-reader";
 import { ModelSelectionError, modelSelectionError } from "./model-selection-errors";
@@ -17,12 +18,16 @@ export function createModelSelectionPolicy(createReader: ModelReaderFactory): Mo
 				createReader,
 				async reader => {
 					const rawCatalog = await reader.getAvailableModels();
-					const activeProviders = activeProviderIds(await reader.getActiveProviders());
 					const catalog = decodeStrictModelCatalog(rawCatalog);
+					const activeProviders = await availableProviderIds(reader, catalog);
 					if (catalog !== null)
-						return buildModelList(catalog.filter(selection => activeProviders.has(selection.provider)));
+						return buildModelList(
+							activeProviders === undefined
+								? catalog
+								: catalog.filter(selection => activeProviders.has(selection.provider)),
+						);
 					const current = currentSelection(rawCatalog, await reader.getState());
-					if (current === undefined || !activeProviders.has(current.provider))
+					if (current === undefined || (activeProviders !== undefined && !activeProviders.has(current.provider)))
 						throw modelSelectionError("model_catalog_unavailable");
 					return buildModelList([current]);
 				},
@@ -55,12 +60,12 @@ async function resolveAlias(createReader: ModelReaderFactory): Promise<Normalize
 		createReader,
 		async reader => {
 			const rawCatalog = await reader.getAvailableModels();
-			const activeProviders = activeProviderIds(await reader.getActiveProviders());
 			const catalog = decodeStrictModelCatalog(rawCatalog);
+			const activeProviders = await availableProviderIds(reader, catalog);
 			const selection = selectionFromState(await reader.getState());
 			const usable =
 				selection !== undefined &&
-				activeProviders.has(selection.provider) &&
+				(activeProviders === undefined || activeProviders.has(selection.provider)) &&
 				(catalog === null
 					? isAuthoritativeCurrent(rawCatalog, selection)
 					: catalog.some(candidate => sameSelection(candidate, selection)));
@@ -81,16 +86,20 @@ async function resolveCanonical(
 		createReader,
 		async reader => {
 			const rawCatalog = await reader.getAvailableModels();
-			const activeProviders = activeProviderIds(await reader.getActiveProviders());
 			const catalog = decodeStrictModelCatalog(rawCatalog);
+			const activeProviders = await availableProviderIds(reader, catalog);
 			if (catalog === null) {
 				const current = currentSelection(rawCatalog, await reader.getState());
-				if (current !== undefined && activeProviders.has(current.provider) && sameSelection(current, selection))
+				if (
+					current !== undefined &&
+					(activeProviders === undefined || activeProviders.has(current.provider)) &&
+					sameSelection(current, selection)
+				)
 					return selection;
 				throw modelSelectionError("model_catalog_unavailable");
 			}
 			if (
-				!activeProviders.has(selection.provider) ||
+				(activeProviders !== undefined && !activeProviders.has(selection.provider)) ||
 				!catalog.some(candidate => sameSelection(candidate, selection))
 			) {
 				throw modelSelectionError("model_selection_not_available");
@@ -101,6 +110,18 @@ async function resolveCanonical(
 	);
 }
 
+async function availableProviderIds(
+	reader: ModelReader,
+	catalog: readonly NormalizedModelSelection[] | null,
+): Promise<ReadonlySet<string> | undefined> {
+	try {
+		return activeProviderIds(await reader.getActiveProviders());
+	} catch (error) {
+		if (catalog !== null && error instanceof SdkV3OperationError && error.code === "operation_not_session_owned")
+			return undefined;
+		throw error;
+	}
+}
 function activeProviderIds(input: readonly unknown[]): ReadonlySet<string> {
 	const providers = new Set<string>();
 	for (const descriptor of input) {
