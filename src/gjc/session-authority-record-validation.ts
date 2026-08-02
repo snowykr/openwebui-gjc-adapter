@@ -138,14 +138,16 @@ export function isAuthorityDocumentRelationallyValid(
 		for (const operation of mapping.journal)
 			for (const identifier of operationIdentifiers(operation))
 				if (!addIdentity(identities, mapping.chatId, identifier, operationIdentity(operation))) return false;
-		let tombstone = mapping.reassignment?.sourceTombstone;
-		while (tombstone !== undefined) {
-			if (tombstone.chatId !== mapping.chatId || tombstone.projectId === mapping.projectId) return false;
-			if (!hasUniqueTombstoneIdentities(tombstone) || !hasConsistentTombstoneResults(tombstone)) return false;
-			for (const operation of tombstone.journal)
-				for (const identifier of operationIdentifiers(operation))
-					if (!addIdentity(identities, mapping.chatId, identifier, operationIdentity(operation))) return false;
-			tombstone = tombstone.prior;
+		for (const root of reassignmentTombstoneRoots(mapping.reassignment)) {
+			let tombstone: SessionAuthorityTombstone | undefined = root;
+			while (tombstone !== undefined) {
+				if (tombstone.chatId !== mapping.chatId || tombstone.projectId === mapping.projectId) return false;
+				if (!hasUniqueTombstoneIdentities(tombstone) || !hasConsistentTombstoneResults(tombstone)) return false;
+				for (const operation of tombstone.journal)
+					for (const identifier of operationIdentifiers(operation))
+						if (!addIdentity(identities, mapping.chatId, identifier, operationIdentity(operation))) return false;
+				tombstone = tombstone.prior;
+			}
 		}
 	}
 	for (const operation of provisionalOperations) {
@@ -357,6 +359,14 @@ function hasConsistentTombstoneResults(tombstone: SessionAuthorityTombstone): bo
 			resultMapping.operationId === operation.id
 		);
 	});
+}
+function reassignmentTombstoneRoots(
+	reassignment: SessionAuthorityRecord["reassignment"] | undefined,
+): readonly SessionAuthorityTombstone[] {
+	const sourceTombstone = reassignment?.sourceTombstone;
+	if (sourceTombstone !== undefined) return [sourceTombstone];
+	const priorTombstone = reassignment?.priorTombstone;
+	return priorTombstone === undefined ? [] : [priorTombstone];
 }
 function reassignmentTombstoneChainContainsProject(
 	reassignment: SessionAuthorityRecord["reassignment"] | undefined,

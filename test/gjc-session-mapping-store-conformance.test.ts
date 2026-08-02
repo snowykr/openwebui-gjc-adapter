@@ -445,6 +445,46 @@ describe("session mapping store authority conformance", () => {
 		});
 	}
 });
+test("file rejects an invalid retained prior tombstone during a pending reassignment", () => {
+	const directory = mkdtempSync(join(tmpdir(), "gjc-mapping-prior-tombstone-"));
+	const filePath = join(directory, "authority.json");
+	try {
+		const store = new FileBackedSessionMappingStore(filePath);
+		const source = mapping();
+		const target = {
+			chatId: source.chatId,
+			projectId: "project-2",
+			id: "operation-b",
+			ingressId: "operation-b",
+			kind: "create" as const,
+			detail: "move to B",
+		};
+		store.set(source);
+		store.beginProjectReassignment(source.chatId, source.projectId, target.projectId, {
+			id: target.id,
+			ingressId: target.ingressId,
+			kind: target.kind,
+			detail: target.detail,
+		});
+		store.reserveProvisionalOperation(target);
+		store.publishProvisionalOperation(target, {
+			...source,
+			projectId: target.projectId,
+			sessionId: "session-b",
+			operationId: target.id,
+			attachment: { ...source.attachment!, expectedSessionId: "session-b" },
+		});
+		store.beginProjectReassignment(source.chatId, target.projectId, "project-3");
+
+		const document = JSON.parse(readFileSync(filePath, "utf8"));
+		document.mappings[0].reassignment.priorTombstone.chatId = "other-chat";
+		writeFileSync(filePath, JSON.stringify(document));
+
+		expect(() => new FileBackedSessionMappingStore(filePath)).toThrow("not a valid v2 authority");
+	} finally {
+		rmSync(directory, { recursive: true, force: true });
+	}
+});
 test("file rejects persisted journal/provisional cross-field collisions in either order", () => {
 	for (const operation of [
 		{ id: "other-provisional-id", ingressId: "initial-operation" },
