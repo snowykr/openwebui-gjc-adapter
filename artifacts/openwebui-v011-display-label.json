@@ -8,12 +8,12 @@
   "model": "gjc/openai-codex/gpt-5.6-luna:low",
   "expectedResponseText": "openwebui-gjc-adapter",
   "expectedModelLabel": "codex/gpt-5.6-luna:low",
-  "sourceHash": "sha256:8fa4f4b008f0d1de84778eaf01fa70e864a8b6fab46ac14bb4f60346878d0b28",
-  "sourceCommit": "a711c3a8b5b00b563c4cef5092b6fa3c2704bcc3",
-  "sourceIndexTree": "93544c7e30dc36ae2cd59e4d93d59a3343809c33",
-  "chatId": "d6209e1d-b07a-480d-93b5-ef86bbfe96cf",
-  "socketEventFramesAfterSubmit": 26,
-  "socketEventFramesForSubmittedChat": 25,
+  "sourceHash": "sha256:49ce4b58cae790c8137504f19f96b855bcade2feb58801dce8dcbf8127e1a630",
+  "sourceCommit": "fc2a8938c8d75039519d6970b87e3e936ceebda6",
+  "sourceIndexTree": "e1bd347afd6b43782b71706b9faf6e839ae24a6d",
+  "chatId": "ff98c0bd-5e50-42c4-8fa5-95b7e603492c",
+  "socketEventFramesAfterSubmit": 27,
+  "socketEventFramesForSubmittedChat": 26,
   "chatCompletionModelsAfterSubmit": [
     "gjc/openai-codex/gpt-5.6-luna:low"
   ],
@@ -29,30 +29,30 @@
   "actions": [
     {
       "type": "goto",
-      "timestamp": "2026-08-02T15:58:03.838Z",
+      "timestamp": "2026-08-02T16:09:17.769Z",
       "url": "http://127.0.0.1:8080/auth"
     },
     {
       "type": "select-model",
-      "timestamp": "2026-08-02T15:58:17.623Z",
+      "timestamp": "2026-08-02T16:09:31.420Z",
       "selector": "button[role=\"option\"]",
       "value": "gjc/openai-codex/gpt-5.6-luna:low",
       "label": "codex/gpt-5.6-luna:low"
     },
     {
       "type": "fill",
-      "timestamp": "2026-08-02T15:58:17.684Z",
+      "timestamp": "2026-08-02T16:09:31.485Z",
       "selector": "#chat-input"
     },
     {
       "type": "press",
-      "timestamp": "2026-08-02T15:58:17.955Z",
+      "timestamp": "2026-08-02T16:09:31.772Z",
       "selector": "#chat-input"
     }
   ],
   "assertions": [
     {
-      "timestamp": "2026-08-02T15:58:41.067Z",
+      "timestamp": "2026-08-02T16:09:57.255Z",
       "selector": "body, button[role=option], /api/chat/completions",
       "status": "passed",
       "description": "Selected codex/gpt-5.6-luna:low with canonical value gjc/openai-codex/gpt-5.6-luna:low; submitted gjc/openai-codex/gpt-5.6-luna:low; rendered and received openwebui-gjc-adapter, Tool read finished, and a Socket.IO event."
