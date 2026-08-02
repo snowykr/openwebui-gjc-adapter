@@ -280,6 +280,29 @@ describe("GJC idle session reaper", () => {
 		expect(harness.closeCalls).toHaveLength(2);
 		await harness.reaper.stop();
 	});
+	test("explicit close does not reuse a reaped close after control activity", async () => {
+		let harness!: ReturnType<typeof createHarness>;
+		harness = createHarness({
+			close: async (_mapping, ingress) => {
+				harness.mappings.recordClose(ingress.ingressId, "complete");
+				return { status: "closed" };
+			},
+		});
+		await harness.reaper.runner.run(createInput());
+		harness.clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
+		await flush();
+		expect(harness.closeCalls).toHaveLength(1);
+
+		await harness.reaper.runner.run({ ...createInput(), control: { operation: "abort" } });
+		const result = await harness.reaper.closeSession(harness.mappings.mapping, {
+			ingressId: "explicit-close-after-control",
+			ingressHash: "explicit-close-after-control",
+		});
+
+		expect(result).toEqual({ status: "closed" });
+		expect(harness.closeCalls).toHaveLength(2);
+		await harness.reaper.stop();
+	});
 	test("retries a non-closed idle close with a new deterministic authority ingress", async () => {
 		let attempts = 0;
 		let harness!: ReturnType<typeof createHarness>;

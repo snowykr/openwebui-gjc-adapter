@@ -98,7 +98,10 @@ class IdleSessionReaper {
 				throw new Error(`GJC close mapping for chat ${mapping.chatId} is stale.`);
 			const generation = mappingGeneration(current);
 			if (state.generation === generation && state.closed) return { status: "closed" };
-			if (this.closeOperations(current, state).some(operation => operation.state === "complete")) {
+			if (
+				!state.rearmAfterActivity &&
+				this.closeOperations(current, state).some(operation => operation.state === "complete")
+			) {
 				state.mapping = current;
 				state.generation = generation;
 				state.rearmAfterActivity = false;
