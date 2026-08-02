@@ -373,13 +373,15 @@ describe("Bun transport configuration", () => {
 				},
 			});
 			const stopping = handle.stop();
+			const concurrentStopping = handle.stop();
+			expect(concurrentStopping).toBe(stopping);
 			await Promise.resolve();
 			await Promise.resolve();
 			expect(events).toEqual(["server-start", "runner-start"]);
 			expect(events).not.toContain("lock");
 			releaseRunner();
 			releaseServer();
-			await stopping;
+			await Promise.all([stopping, concurrentStopping]);
 			expect(events).toEqual(["server-start", "runner-start", "runner-end", "server-end", "lock"]);
 		} finally {
 			release.mockRestore();
@@ -506,6 +508,53 @@ describe("Bun transport configuration", () => {
 		}
 	});
 
+	test("aggregates startup and cleanup failures, including lock release", async () => {
+		const runtimeRoot = await mkdtemp(join(tmpdir(), "openwebui-gjc-adapter-server-"));
+		const startupFailure = new Error("serve initialization failed");
+		const runnerFailure = new Error("runner cleanup failed");
+		const cleanupFailure = new Error("owned cleanup failed");
+		const releaseFailure = new Error("lock release failed");
+		const serve = spyOn(Bun, "serve").mockImplementation(() => {
+			throw startupFailure;
+		});
+		const lock = await RuntimeSingletonLock.acquire(runtimeRoot);
+		const release = spyOn(lock, "release").mockRejectedValue(releaseFailure);
+		let stopCalls = 0;
+		try {
+			const failure = await startAdapterServer({
+				host: "127.0.0.1",
+				port: 0,
+				runtimeRoot,
+				runtimeLock: lock,
+				turnTimeoutMs: 180_000,
+				routes: {
+					projects: [project],
+					owner,
+					runner: {
+						run: () => ({ content: "unused", model: LOW_MODEL_ID }),
+						stop: () => {
+							stopCalls += 1;
+							throw runnerFailure;
+						},
+					},
+				},
+				shutdownCleanup: () => {
+					throw cleanupFailure;
+				},
+			}).then(
+				() => undefined,
+				error => error,
+			);
+			expect(failure).toBeInstanceOf(AggregateError);
+			if (!(failure instanceof AggregateError)) throw new TypeError("expected aggregate startup cleanup failure");
+			expect(failure.errors).toEqual([startupFailure, runnerFailure, cleanupFailure, releaseFailure]);
+			expect(stopCalls).toBe(1);
+		} finally {
+			release.mockRestore();
+			serve.mockRestore();
+			await rm(runtimeRoot, { force: true, recursive: true });
+		}
+	});
 	test("rejects invalid turn timeout values before serving", async () => {
 		const runtimeRoot = await mkdtemp(join(tmpdir(), "openwebui-gjc-adapter-server-"));
 		const serve = spyOn(Bun, "serve");

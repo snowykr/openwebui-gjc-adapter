@@ -88,7 +88,6 @@ export async function buildResolvedAdapterServerOptions(
 	assertResolvedAdapterConfig(config);
 	await mkdir(config.statePath, { recursive: true });
 	const lock = await RuntimeSingletonLock.acquire(config.statePath);
-	let completed = false;
 	const internalStore = dependencies.projectRegistrationStore === undefined;
 	const databasePath = path.join(config.statePath, "adapter-state.sqlite");
 	let projectStore: SqliteProjectRegistrationStore | undefined;
@@ -224,7 +223,6 @@ export async function buildResolvedAdapterServerOptions(
 			},
 			...(shutdownCleanup === undefined ? {} : { shutdownCleanup }),
 		};
-		completed = true;
 		return options;
 	} catch (error) {
 		let startupError: unknown = error;
@@ -233,22 +231,31 @@ export async function buildResolvedAdapterServerOptions(
 		} catch (stopError) {
 			startupError = new AggregateError([startupError, stopError], "Adapter initialization cleanup failed");
 		}
-		if (!internalStore || projectStore === undefined) throw startupError;
-		try {
-			projectStore.close();
-		} catch (closeError) {
-			if (startupError instanceof Error) {
-				const cause =
-					startupError.cause === undefined
-						? closeError
-						: new AggregateError([startupError.cause, closeError], "Startup failure cleanup failed");
-				Reflect.defineProperty(startupError, "cause", { value: cause });
+		if (internalStore && projectStore !== undefined) {
+			try {
+				projectStore.close();
+			} catch (closeError) {
+				startupError = appendStartupCleanupError(startupError, closeError);
 			}
 		}
+		try {
+			await lock.release();
+		} catch (releaseError) {
+			startupError = appendStartupCleanupError(startupError, releaseError);
+		}
 		throw startupError;
-	} finally {
-		if (!completed) await lock.release();
 	}
+}
+
+function appendStartupCleanupError(startupError: unknown, cleanupError: unknown): unknown {
+	if (!(startupError instanceof Error))
+		return new AggregateError([startupError, cleanupError], "Startup failure cleanup failed");
+	const cause =
+		startupError.cause === undefined
+			? cleanupError
+			: new AggregateError([startupError.cause, cleanupError], "Startup failure cleanup failed");
+	if (Reflect.defineProperty(startupError, "cause", { value: cause })) return startupError;
+	return new AggregateError([startupError, cleanupError], "Startup failure cleanup failed");
 }
 
 export { resolveAdapterConfig };
