@@ -82,7 +82,6 @@ export function assertVisualEvidence(input: {
 	readonly chatId: string;
 	readonly currentAssistantText: string;
 	readonly expectedResponseText: string;
-	readonly previousToolReadFinishedCount: number;
 	readonly toolReadFinishedCount: number;
 }): void {
 	if (input.text.includes("Server Connection Error")) throw new Error("OpenWebUI reported a server connection error");
@@ -90,8 +89,8 @@ export function assertVisualEvidence(input: {
 		throw new Error("OpenWebUI did not accept the submitted chat request");
 	if (!input.currentAssistantText.includes(input.expectedResponseText))
 		throw new Error(`OpenWebUI did not render the expected response: ${input.expectedResponseText}`);
-	if (input.toolReadFinishedCount <= input.previousToolReadFinishedCount)
-		throw new Error("OpenWebUI did not render Tool read finished for the submitted turn");
+	if (input.toolReadFinishedCount === 0)
+		throw new Error("OpenWebUI did not record Tool read finished for the submitted turn");
 	if (!input.socketFrames.some(frame => isOpenWebUiEventFrameForChat(frame, input.chatId)))
 		throw new Error("OpenWebUI did not emit a post-submit events Socket.IO frame for the submitted chat");
 }
@@ -247,7 +246,11 @@ async function selectModel(
 	await new Promise(resolve => setTimeout(resolve, 1_000));
 	return selectedOption;
 }
-async function waitForCurrentAssistantText(page: Page, chatId: string, expectedResponseText: string): Promise<string> {
+async function waitForCurrentAssistantText(
+	page: Page,
+	chatId: string,
+	expectedResponseText: string,
+): Promise<{ readonly text: string; readonly toolReadFinishedCount: number }> {
 	const result = await page.waitForFunction(
 		async ({ chatId, expectedResponseText }) => {
 			const response = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}`);
@@ -260,15 +263,29 @@ async function waitForCurrentAssistantText(page: Page, chatId: string, expectedR
 			if (typeof history.currentId !== "string" || !isRecord(history.messages)) return null;
 			const message = history.messages[history.currentId];
 			if (!isRecord(message) || message.role !== "assistant" || typeof message.content !== "string") return null;
-			return message.content.includes(expectedResponseText) ? message.content : null;
+			const statusHistory = Array.isArray(message.statusHistory) ? message.statusHistory : [];
+			const toolReadFinishedCount = statusHistory.filter(
+				status => isRecord(status) && status.description === "Tool read finished",
+			).length;
+			return message.content.includes(expectedResponseText)
+				? { text: message.content, toolReadFinishedCount }
+				: null;
 		},
 		{ timeout: timeoutMs },
 		{ chatId, expectedResponseText },
 	);
-	const text: unknown = await result.jsonValue();
-	if (typeof text !== "string")
+	const assistant: unknown = await result.jsonValue();
+	if (
+		typeof assistant !== "object" ||
+		assistant === null ||
+		typeof Reflect.get(assistant, "text") !== "string" ||
+		typeof Reflect.get(assistant, "toolReadFinishedCount") !== "number"
+	)
 		throw new Error("OpenWebUI did not return an assistant message for the submitted chat");
-	return text;
+	return {
+		text: Reflect.get(assistant, "text") as string,
+		toolReadFinishedCount: Reflect.get(assistant, "toolReadFinishedCount") as number,
+	};
 }
 
 export async function runVisualSmoke(): Promise<void> {
@@ -356,9 +373,6 @@ export async function runVisualSmoke(): Promise<void> {
 			"Use the read tool on package.json, then reply with the package name. Do not skip the tool call.";
 		const expectedResponseText = process.env.GJC_OPENWEBUI_E2E_EXPECTED_TEXT ?? "openwebui-gjc-adapter";
 		if (!expectedResponseText.trim()) throw new Error("GJC_OPENWEBUI_E2E_EXPECTED_TEXT must be non-empty");
-		const previousToolReadFinishedCount = await page.evaluate(
-			() => document.body.innerText.split("Tool read finished").length - 1,
-		);
 		await page.locator("#chat-input").fill(prompt);
 		actions.push({ type: "fill", timestamp: new Date().toISOString(), selector: "#chat-input" });
 		await page.focus("#chat-input");
@@ -390,24 +404,17 @@ export async function runVisualSmoke(): Promise<void> {
 			);
 		const chatId = completionResponses.map(acceptedChatId).find((value): value is string => value !== undefined);
 		if (chatId === undefined) throw new Error("OpenWebUI did not accept the submitted chat request");
-		const currentAssistantText = await waitForCurrentAssistantText(page, chatId, expectedResponseText);
-		await page.waitForFunction(
-			previousCount => document.body.innerText.split("Tool read finished").length - 1 > previousCount,
-			{ timeout: timeoutMs },
-			previousToolReadFinishedCount,
-		);
+		const assistant = await waitForCurrentAssistantText(page, chatId, expectedResponseText);
 		captureSocketFrames = false;
 		const text = await page.evaluate(() => document.body.innerText);
-		const toolReadFinishedCount = text.split("Tool read finished").length - 1;
 		assertVisualEvidence({
 			text,
 			socketFrames,
 			completionResponses,
 			chatId,
-			currentAssistantText,
+			currentAssistantText: assistant.text,
 			expectedResponseText,
-			previousToolReadFinishedCount,
-			toolReadFinishedCount,
+			toolReadFinishedCount: assistant.toolReadFinishedCount,
 		});
 		await mkdir(dirname(screenshotPath), { recursive: true });
 		await page.screenshot({
@@ -440,8 +447,9 @@ export async function runVisualSmoke(): Promise<void> {
 						).length,
 						chatCompletionModelsAfterSubmit: completionRequestModels,
 						chatCompletionResponseStatusesAfterSubmit: completionResponses.map(response => response.status),
-						currentAssistantText,
+						currentAssistantText: assistant.text,
 						selectedModelOption,
+						toolReadFinishedCount: assistant.toolReadFinishedCount,
 						actions,
 						assertions: [
 							{

@@ -58,7 +58,6 @@ test("requires current-turn completion, tool status, and Socket.IO evidence", ()
 		chatId: "chat-1",
 		currentAssistantText: "openwebui-gjc-adapter",
 		expectedResponseText: "openwebui-gjc-adapter",
-		previousToolReadFinishedCount: 0,
 		toolReadFinishedCount: 1,
 	};
 	expect(() => assertVisualEvidence(evidence)).not.toThrow();
@@ -68,7 +67,7 @@ test("requires current-turn completion, tool status, and Socket.IO evidence", ()
 	expect(() => assertVisualEvidence({ ...evidence, currentAssistantText: "previous response" })).toThrow(
 		"expected response",
 	);
-	expect(() => assertVisualEvidence({ ...evidence, toolReadFinishedCount: 0 })).toThrow("submitted turn");
+	expect(() => assertVisualEvidence({ ...evidence, toolReadFinishedCount: 0 })).toThrow("record Tool read finished");
 	expect(() => assertVisualEvidence({ ...evidence, socketFrames: ['42["events",{"chat_id":"other"}]'] })).toThrow(
 		"submitted chat",
 	);
@@ -83,7 +82,6 @@ test("does not accept an earlier turn's matching text", () => {
 			chatId: "chat-1",
 			currentAssistantText: "request failed",
 			expectedResponseText: "openwebui-gjc-adapter",
-			previousToolReadFinishedCount: 1,
 			toolReadFinishedCount: 2,
 		}),
 	).toThrow("expected response");
