@@ -43,8 +43,7 @@ export class SessionAuthorityJournal {
 			if (operation.chatId !== input.chatId || operation.projectId === input.projectId) return false;
 			const reassignment = existing?.reassignment;
 			const isRetiredCompletedOperation =
-				operation.state === "complete" &&
-				tombstoneChainContainsProject(reassignment?.sourceTombstone, operation.projectId);
+				operation.state === "complete" && tombstoneChainContainsProject(reassignment, operation.projectId);
 			if (isRetiredCompletedOperation) return false;
 			return !(
 				reassignment?.state === "rolled_back" &&
@@ -75,9 +74,11 @@ export class SessionAuthorityJournal {
 		const unresolvedTarget = [...this.provisional.values()].find(
 			operation => operation.chatId === chatId && operation.state !== "complete",
 		);
-		if (unresolvedTarget !== undefined)
+		const unresolvedSource = existing.journal.find(operation => operation.state !== "complete");
+		const unresolvedOperation = unresolvedTarget ?? unresolvedSource;
+		if (unresolvedOperation !== undefined)
 			throw new Error(
-				`Session operation ${unresolvedTarget.ingressId ?? unresolvedTarget.id} requires reconciliation.`,
+				`Session operation ${unresolvedOperation.ingressId ?? unresolvedOperation.id} requires reconciliation.`,
 			);
 		const prior = existing.reassignment;
 		const retainedPriorTombstone =
@@ -167,14 +168,17 @@ export class SessionAuthorityJournal {
 			operation => operation.id === operationId || operation.ingressId === operationId,
 		);
 		if (active !== undefined) return copyOperation(active);
-		let tombstone = record.reassignment?.sourceTombstone;
-		while (tombstone !== undefined) {
-			const retired = tombstone.journal.find(
-				operation => operation.id === operationId || operation.ingressId === operationId,
-			);
-			if (retired !== undefined) return copyOperation(retired);
-			tombstone = tombstone.prior;
-		}
+		for (const root of reassignmentTombstoneRoots(record.reassignment))
+			for (
+				let tombstone: SessionAuthorityTombstone | undefined = root;
+				tombstone !== undefined;
+				tombstone = tombstone.prior
+			) {
+				const retired = tombstone.journal.find(
+					operation => operation.id === operationId || operation.ingressId === operationId,
+				);
+				if (retired !== undefined) return copyOperation(retired);
+			}
 		return undefined;
 	}
 	lookupOperationAuthority(
@@ -185,12 +189,16 @@ export class SessionAuthorityJournal {
 		if (record === undefined) return undefined;
 		if (record.journal.some(operation => operation.id === operationId || operation.ingressId === operationId))
 			return copy(record);
-		let tombstone = record.reassignment?.sourceTombstone;
-		while (tombstone !== undefined) {
-			if (tombstone.journal.some(operation => operation.id === operationId || operation.ingressId === operationId))
-				return copyTombstone(tombstone);
-			tombstone = tombstone.prior;
-		}
+		for (const root of reassignmentTombstoneRoots(record.reassignment))
+			for (
+				let tombstone: SessionAuthorityTombstone | undefined = root;
+				tombstone !== undefined;
+				tombstone = tombstone.prior
+			)
+				if (
+					tombstone.journal.some(operation => operation.id === operationId || operation.ingressId === operationId)
+				)
+					return copyTombstone(tombstone);
 		return undefined;
 	}
 	assertOperationProject(chatId: string, projectId: string, operationId: string): void {
@@ -456,18 +464,34 @@ export class SessionAuthorityJournal {
 function journalFor(record: SessionAuthorityRecord | undefined): readonly SessionOperation[] {
 	if (record === undefined) return [];
 	const journal = [...record.journal];
-	let tombstone = record.reassignment?.sourceTombstone;
-	while (tombstone !== undefined) {
-		journal.push(...tombstone.journal);
-		tombstone = tombstone.prior;
-	}
+	for (const root of reassignmentTombstoneRoots(record.reassignment))
+		for (
+			let tombstone: SessionAuthorityTombstone | undefined = root;
+			tombstone !== undefined;
+			tombstone = tombstone.prior
+		)
+			journal.push(...tombstone.journal);
 	return journal;
 }
-function tombstoneChainContainsProject(tombstone: SessionAuthorityTombstone | undefined, projectId: string): boolean {
-	while (tombstone !== undefined) {
-		if (tombstone.projectId === projectId) return true;
-		tombstone = tombstone.prior;
-	}
+function reassignmentTombstoneRoots(
+	reassignment: SessionAuthorityRecord["reassignment"] | undefined,
+): readonly SessionAuthorityTombstone[] {
+	const sourceTombstone = reassignment?.sourceTombstone;
+	if (sourceTombstone !== undefined) return [sourceTombstone];
+	const priorTombstone = reassignment?.priorTombstone;
+	return priorTombstone === undefined ? [] : [priorTombstone];
+}
+function tombstoneChainContainsProject(
+	reassignment: SessionAuthorityRecord["reassignment"] | undefined,
+	projectId: string,
+): boolean {
+	for (const root of reassignmentTombstoneRoots(reassignment))
+		for (
+			let tombstone: SessionAuthorityTombstone | undefined = root;
+			tombstone !== undefined;
+			tombstone = tombstone.prior
+		)
+			if (tombstone.projectId === projectId) return true;
 	return false;
 }
 

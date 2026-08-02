@@ -193,6 +193,16 @@ describe("session mapping store authority conformance", () => {
 
 					harness.store.beginProjectReassignment(source.chatId, targetB.projectId, "project-3");
 					harness.store.rollbackProjectReassignment(source.chatId, targetB.projectId);
+					expect(harness.store.operationAuthority(source.chatId, "operation-a")).toMatchObject({
+						projectId: source.projectId,
+						retiredAt: expect.any(String),
+					});
+					expect(() =>
+						harness.store.set({
+							...harness.store.get(source.chatId)!,
+							operationId: "project-2-follow-up",
+						}),
+					).not.toThrow();
 
 					const targetC = {
 						chatId: source.chatId,
@@ -233,6 +243,23 @@ describe("session mapping store authority conformance", () => {
 				}
 			});
 
+			test(`${createHarness.name} rejects reassignment while a source operation is in flight`, () => {
+				const harness = createHarness();
+				try {
+					const source = mapping();
+					harness.store.set(source);
+					harness.store.beginOperation(source.chatId, {
+						id: "in-flight-source-operation",
+						kind: "prompt",
+						detail: "source request",
+					});
+					expect(() =>
+						harness.store.beginProjectReassignment(source.chatId, source.projectId, "project-2"),
+					).toThrow("in-flight-source-operation requires reconciliation");
+				} finally {
+					harness.cleanup();
+				}
+			});
 			test(`${createHarness.name} rolls an interrupted target back without deleting source authority`, () => {
 				const harness = createHarness();
 				try {

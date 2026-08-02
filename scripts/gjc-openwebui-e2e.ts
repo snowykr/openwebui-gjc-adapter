@@ -26,7 +26,10 @@ export function parseSocketIoFrame(payload: string): unknown | undefined {
 	}
 }
 export function matchesModelOption(optionValue: string | undefined, selectedModel: string): boolean {
-	return optionValue === selectedModel || optionValue?.endsWith(`.${selectedModel}`) === true;
+	if (optionValue === selectedModel) return true;
+	const suffix = `.${selectedModel}`;
+	if (optionValue === undefined || !optionValue.endsWith(suffix)) return false;
+	return /^[A-Za-z0-9_-]+$/.test(optionValue.slice(0, -suffix.length));
 }
 export function isOpenWebUiEventFrame(payload: string): boolean {
 	const event = parseSocketIoFrame(payload);
@@ -46,20 +49,21 @@ export function modelSearchTerm(selectedModel: string): string {
 export function assertVisualEvidence(input: {
 	readonly text: string;
 	readonly socketFrames: readonly string[];
-	readonly expectedResponseText?: string;
-	readonly previousText?: string;
+	readonly completionResponses: readonly { readonly status: number; readonly body: string }[];
+	readonly expectedResponseText: string;
+	readonly previousToolReadFinishedCount: number;
+	readonly toolReadFinishedCount: number;
 }): void {
 	if (input.text.includes("Server Connection Error")) throw new Error("OpenWebUI reported a server connection error");
-	if (input.previousText !== undefined && input.text === input.previousText)
-		throw new Error("OpenWebUI did not render a new turn");
-	if (input.expectedResponseText) {
-		const expectedResponseText = input.expectedResponseText;
-		if (!input.text.includes(expectedResponseText))
-			throw new Error(`OpenWebUI did not render the expected response: ${expectedResponseText}`);
-		if (!input.text.includes("Tool read finished")) throw new Error("OpenWebUI did not render Tool read finished");
-	} else
-		for (const expected of ["Thinking completed", "Tool read started", "Tool read finished"])
-			if (!input.text.includes(expected)) throw new Error(`OpenWebUI did not render ${expected}`);
+	if (
+		!input.completionResponses.some(
+			response =>
+				response.status >= 200 && response.status < 300 && response.body.includes(input.expectedResponseText),
+		)
+	)
+		throw new Error(`OpenWebUI did not return the expected response: ${input.expectedResponseText}`);
+	if (input.toolReadFinishedCount <= input.previousToolReadFinishedCount)
+		throw new Error("OpenWebUI did not render Tool read finished for the submitted turn");
 	if (!input.socketFrames.some(isOpenWebUiEventFrame))
 		throw new Error("OpenWebUI did not emit a post-submit events Socket.IO frame");
 }
@@ -162,20 +166,25 @@ async function selectModel(
 	if (modelSearchSelector) await page.locator(modelSearchSelector).fill(modelSearchTerm(selectedModel));
 	await page.waitForFunction(
 		value =>
-			Array.from(document.querySelectorAll<HTMLButtonElement>('button[role="option"]')).some(
-				option => value === option.dataset.value || option.dataset.value?.endsWith(`.${value}`),
-			),
+			Array.from(document.querySelectorAll<HTMLButtonElement>('button[role="option"]')).some(option => {
+				if (value === option.dataset.value) return true;
+				const suffix = `.${value}`;
+				if (!option.dataset.value?.endsWith(suffix)) return false;
+				return /^[A-Za-z0-9_-]+$/.test(option.dataset.value.slice(0, -suffix.length));
+			}),
 		{ timeout: timeoutMs },
 		selectedModel,
 	);
 	if (expectedLabel)
 		await page.waitForFunction(
 			({ label, value }) =>
-				Array.from(document.querySelectorAll<HTMLButtonElement>('button[role="option"]')).some(
-					option =>
-						(value === option.dataset.value || option.dataset.value?.endsWith(`.${value}`)) &&
-						option.textContent?.includes(label) === true,
-				),
+				Array.from(document.querySelectorAll<HTMLButtonElement>('button[role="option"]')).some(option => {
+					if (option.textContent?.includes(label) !== true) return false;
+					if (value === option.dataset.value) return true;
+					const suffix = `.${value}`;
+					if (!option.dataset.value?.endsWith(suffix)) return false;
+					return /^[A-Za-z0-9_-]+$/.test(option.dataset.value.slice(0, -suffix.length));
+				}),
 			{ timeout: timeoutMs },
 			{ label: expectedLabel, value: selectedModel },
 		);
@@ -226,40 +235,37 @@ export async function runVisualSmoke(): Promise<void> {
 		const cdp = await page.createCDPSession();
 		const socketFrames: string[] = [];
 		const completionRequestModels: string[] = [];
-		const completionResponseBodies: string[] = [];
-		const completionResponseReads: Promise<void>[] = [];
+		const completionResponses: Array<{ status: number; body: string }> = [];
+		const submittedCompletionRequests = new WeakSet<object>();
+		let captureSubmittedRequest = false;
+		let captureSocketFrames = false;
+		let resolveCompletionResponse: (() => void) | undefined;
 		await cdp.send("Network.enable");
-		cdp.on("Network.webSocketFrameReceived", event => socketFrames.push(event.response.payloadData));
+		cdp.on("Network.webSocketFrameReceived", event => {
+			if (captureSocketFrames) socketFrames.push(event.response.payloadData);
+		});
 		page.on("request", request => {
-			if (!new URL(request.url()).pathname.endsWith("/api/chat/completions")) return;
+			if (!new URL(request.url()).pathname.endsWith("/api/chat/completions") || !captureSubmittedRequest) return;
+			submittedCompletionRequests.add(request);
 			try {
 				const body: unknown = JSON.parse(request.postData() ?? "");
 				if (body && typeof body === "object" && "model" in body && typeof body.model === "string")
 					completionRequestModels.push(body.model);
 			} catch {
-				// The live request is still observable through the response contract below.
+				// The response status and body remain the authoritative result evidence.
 			}
 		});
 		page.on("response", response => {
-			if (new URL(response.url()).pathname.endsWith("/api/chat/completions")) {
-				const read = response
-					.text()
-					.then(body => {
-						completionResponseBodies.push(body);
-					})
-					.catch(() => undefined);
-				completionResponseReads.push(read);
-			}
-			if (!response.url().includes("/socket.io/")) return;
-			const read = response.text().catch(() => "");
-			completionResponseReads.push(
-				read.then(payload => {
-					for (const packet of payload.split("\u001e")) {
-						const offset = packet.indexOf("42[");
-						if (offset >= 0) socketFrames.push(packet.slice(offset));
-					}
-				}),
-			);
+			if (
+				!new URL(response.url()).pathname.endsWith("/api/chat/completions") ||
+				!submittedCompletionRequests.has(response.request())
+			)
+				return;
+			void response
+				.text()
+				.then(body => completionResponses.push({ status: response.status(), body }))
+				.catch(() => completionResponses.push({ status: response.status(), body: "" }))
+				.finally(() => resolveCompletionResponse?.());
 		});
 		const actions: Array<Record<string, string>> = [];
 		await login(page);
@@ -299,25 +305,32 @@ export async function runVisualSmoke(): Promise<void> {
 			"Use the read tool on package.json, then reply with the package name. Do not skip the tool call.";
 		const expectedResponseText = process.env.GJC_OPENWEBUI_E2E_EXPECTED_TEXT ?? "openwebui-gjc-adapter";
 		if (!expectedResponseText.trim()) throw new Error("GJC_OPENWEBUI_E2E_EXPECTED_TEXT must be non-empty");
-		const previousText = await page.evaluate(() => document.body.innerText);
+		const previousToolReadFinishedCount = await page.evaluate(
+			() => document.body.innerText.split("Tool read finished").length - 1,
+		);
 		await page.locator("#chat-input").fill(prompt);
 		actions.push({ type: "fill", timestamp: new Date().toISOString(), selector: "#chat-input" });
 		await page.focus("#chat-input");
 		socketFrames.length = 0;
 		completionRequestModels.length = 0;
-		completionResponseBodies.length = 0;
-		completionResponseReads.length = 0;
+		completionResponses.length = 0;
+		captureSubmittedRequest = true;
+		captureSocketFrames = true;
+		const completionResponse = new Promise<void>((resolve, reject) => {
+			const timer = setTimeout(
+				() => reject(new Error("OpenWebUI did not complete the submitted chat request")),
+				timeoutMs,
+			);
+			resolveCompletionResponse = () => {
+				clearTimeout(timer);
+				resolve();
+			};
+		});
 		await page.keyboard.press("Enter");
 		actions.push({ type: "press", timestamp: new Date().toISOString(), selector: "#chat-input" });
-		await page.waitForFunction(
-			({ expected, previous }) =>
-				!document.body.innerText.includes("Server Connection Error") &&
-				document.body.innerText !== previous &&
-				document.body.innerText.includes(expected),
-			{ timeout: timeoutMs },
-			{ expected: expectedResponseText, previous: previousText },
-		);
-		await Promise.allSettled(completionResponseReads);
+		await completionResponse;
+		captureSubmittedRequest = false;
+		captureSocketFrames = false;
 		if (
 			completionRequestModels.length === 0 ||
 			completionRequestModels.some(requestedModel => !matchesModelOption(requestedModel, model))
@@ -325,12 +338,20 @@ export async function runVisualSmoke(): Promise<void> {
 			throw new Error(
 				`OpenWebUI did not submit only the canonical model ID or one connection-prefixed form: ${model}`,
 			);
+		await page.waitForFunction(
+			previousCount => document.body.innerText.split("Tool read finished").length - 1 > previousCount,
+			{ timeout: timeoutMs },
+			previousToolReadFinishedCount,
+		);
 		const text = await page.evaluate(() => document.body.innerText);
+		const toolReadFinishedCount = text.split("Tool read finished").length - 1;
 		assertVisualEvidence({
 			text,
 			socketFrames,
+			completionResponses,
 			expectedResponseText,
-			previousText,
+			previousToolReadFinishedCount,
+			toolReadFinishedCount,
 		});
 		await mkdir(dirname(screenshotPath), { recursive: true });
 		await page.screenshot({
@@ -358,7 +379,7 @@ export async function runVisualSmoke(): Promise<void> {
 						sourceIndexTree: currentSource?.indexTree,
 						socketEventFramesAfterSubmit: socketFrames.length,
 						chatCompletionModelsAfterSubmit: completionRequestModels,
-						chatCompletionResponseBodiesAfterSubmit: completionResponseBodies.length,
+						chatCompletionResponseStatusesAfterSubmit: completionResponses.map(response => response.status),
 						selectedModelOption,
 						actions,
 						assertions: [
