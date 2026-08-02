@@ -481,6 +481,9 @@ function selectedReader() {
 				},
 			];
 		},
+		async getActiveProviders() {
+			return [{ provider: "anthropic", connectionKind: "credential" }];
+		},
 		async getState() {
 			return {};
 		},

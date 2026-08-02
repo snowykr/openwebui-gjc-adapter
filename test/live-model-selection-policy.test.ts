@@ -81,6 +81,36 @@ describe("createModelSelectionPolicy", () => {
 		expect((await policy.listModels()).data.map(model => model.id)).toEqual([...CANONICAL_MODEL_IDS]);
 		expect(transcript).toEqual(["catalog", "stop"]);
 	});
+	test("advertises and accepts only models whose GJC provider is active", async () => {
+		const catalog = [
+			{
+				provider: "anthropic",
+				id: "claude-sonnet-4",
+				reasoning: true,
+				thinking: { validLevels: ["off", "low"] },
+			},
+			{
+				provider: "openai",
+				id: "gpt-5",
+				reasoning: false,
+				thinking: { validLevels: ["off"] },
+			},
+		];
+		const policy = createModelSelectionPolicy(
+			readerFactory(catalog, {}, [{ provider: "openai", connectionKind: "credential" }]),
+		);
+
+		expect((await policy.listModels()).data.map(model => model.id)).toEqual(["gjc/openai/gpt-5:off"]);
+		await expect(policy.resolve("gjc/anthropic/claude-sonnet-4:low")).rejects.toMatchObject({
+			code: "model_selection_not_available",
+			status: 404,
+		});
+		expect(await policy.resolve("gjc/openai/gpt-5:off")).toEqual({
+			provider: "openai",
+			modelId: "gpt-5",
+			thinkingLevel: "off",
+		});
+	});
 
 	test("resolves alias through state and canonical directly through catalog", async () => {
 		const aliasTranscript: string[] = [];
@@ -233,10 +263,17 @@ describe("createModelSelectionPolicy", () => {
 	});
 });
 
-function readerFactory(catalog: readonly unknown[], state: unknown = {}): ModelReaderFactory {
+function readerFactory(
+	catalog: readonly unknown[],
+	state: unknown = {},
+	activeProviders = providersFor(catalog),
+): ModelReaderFactory {
 	return async () => ({
 		async getAvailableModels() {
 			return catalog;
+		},
+		async getActiveProviders() {
+			return activeProviders;
 		},
 		async getState() {
 			if (state instanceof Error) throw state;
@@ -246,10 +283,17 @@ function readerFactory(catalog: readonly unknown[], state: unknown = {}): ModelR
 	});
 }
 
-function failingStopReaderFactory(catalog: readonly unknown[], state: unknown = {}): ModelReaderFactory {
+function failingStopReaderFactory(
+	catalog: readonly unknown[],
+	state: unknown = {},
+	activeProviders = providersFor(catalog),
+): ModelReaderFactory {
 	return async () => ({
 		async getAvailableModels() {
 			return catalog;
+		},
+		async getActiveProviders() {
+			return activeProviders;
 		},
 		async getState() {
 			if (state instanceof Error) throw state;
@@ -259,4 +303,17 @@ function failingStopReaderFactory(catalog: readonly unknown[], state: unknown = 
 			throw new Error("reader cleanup failed");
 		},
 	});
+}
+function providersFor(catalog: readonly unknown[]): readonly unknown[] {
+	return [
+		...new Set(
+			catalog.flatMap(descriptor =>
+				typeof descriptor === "object" &&
+				descriptor !== null &&
+				typeof Reflect.get(descriptor, "provider") === "string"
+					? [Reflect.get(descriptor, "provider") as string]
+					: [],
+			),
+		),
+	].map(provider => ({ provider, connectionKind: "credential" }));
 }

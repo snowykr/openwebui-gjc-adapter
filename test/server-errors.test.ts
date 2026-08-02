@@ -36,6 +36,9 @@ describe("createAdapterRequestHandler chat completion errors", () => {
 					async getAvailableModels() {
 						return [];
 					},
+					async getActiveProviders() {
+						return [];
+					},
 					async getState() {
 						return {};
 					},

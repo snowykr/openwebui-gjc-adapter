@@ -38,7 +38,7 @@ Add the required custom headers on the OpenAI connection:
 }
 ```
 
-Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. The adapter and managed image use the published `@gajae-code/ai`, `@gajae-code/bridge-client`, `@gajae-code/coding-agent`, and `@gajae-code/natives` `0.11.6` release. The image runs the published `gjc` executable as the non-root `adapter` user, including `tmux`; it does not build a private broker or apply an upstream source patch. Background task calls such as title generation are no-ops and must not create GJC sessions.
+Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. The adapter and managed image use the published `@gajae-code/ai`, `@gajae-code/bridge-client`, `@gajae-code/coding-agent`, and `@gajae-code/natives` `0.12.8` release. The image runs the published `gjc` executable as the non-root `adapter` user, including `tmux`; it does not build a private broker or apply an upstream source patch. Background task calls such as title generation are no-ops and must not create GJC sessions.
 
 ## CLI first-install configuration
 
@@ -65,7 +65,7 @@ exec 3<&-
 exec 4<&-
 ```
 
-The managed deployment uses rootful Docker, userns-remap disabled, user systemd, OpenWebUI >=0.10.0, a loopback-only UI, and a private adapter network. It configures only its strictly owned OpenWebUI provider after the adapter is ready. GJC provider authentication and model onboarding remain GJC-owned. The managed path does not automate Tailscale, tunnels, public ingress, or other exposure outside the loopback-safe boundary.
+The managed deployment uses OpenWebUI v0.11.0 by default (while accepting existing deployments on OpenWebUI >=0.10.0), rootful Docker, userns-remap disabled, user systemd, a loopback-only UI, and a private adapter network. It configures only its strictly owned OpenWebUI provider after the adapter is ready. GJC provider authentication and model onboarding remain GJC-owned. The managed path does not automate Tailscale, tunnels, public ingress, or other exposure outside the loopback-safe boundary.
 
 ### Existing route
 
@@ -97,7 +97,7 @@ Treat route configuration and model availability as separate stages:
 
 1. Run `openwebui-gjc-adapter probe-ready`. This verifies adapter/OpenWebUI readiness, including the adapter's OpenWebUI access; it does not verify GJC provider credentials, a usable model catalog, or a successful GJC turn.
 2. Complete provider authentication through GJC in the effective runtime. Do not add provider credentials to `configure`.
-3. Verify that `/v1/models` returns one or more canonical ids such as `gjc/<encoded-provider>/<encoded-model>:<thinking>`, then select one in OpenWebUI and complete a first turn. `/v1/models` emits canonical ids; OpenWebUI picker values may add one `<connection-id>.` prefix, which the adapter removes before validation.
+3. Verify that `/v1/models` returns one or more canonical routing ids such as `gjc/<encoded-provider>/<encoded-model>:<thinking>`, then select one in OpenWebUI and complete a first turn. The OpenWebUI-visible `name` is display-only: `openai-codex` models are shortened to `codex/<model>:<thinking>`, while their `id` remains canonical for routing. `/v1/models` emits only models from GJC providers with an active credential or credentialless connection; it fails closed when the SDK cannot resolve that active-provider catalog. OpenWebUI picker values may add one `<connection-id>.` prefix, which the adapter removes before validation.
 4. Link/select a project chat after the selected model completes successfully.
 
 For managed mode, the generated Compose adapter service uses the configuring process's rendered numeric UID:GID, while retaining effective `HOME=/var/lib/gjc/home`, GJC config `/var/lib/gjc/home/.gjc`, and agent state `/var/lib/gjc/home/.gjc/agent`; these persist in the managed state mount. After the generated Compose file is available, use the installed GJC executable in that container:
@@ -114,9 +114,9 @@ An unavailable or empty catalog, noncanonical model id, or provider-auth failure
 
 ### Model selection, profiles, and roles
 
-The OpenWebUI picker maps to GJC `DEFAULT`: selection is persisted as the shared agent-domain default and promoted in the currently attached session. It is not profile/preset selection, profile activation, or an all-role assignment. The adapter UI does not support selecting or activating GJC model profiles, forwarding profile options, configuration patching, or runtime reload. The bare `gjc` alias is input-only; `/v1/models` emits canonical ids.
+The OpenWebUI picker maps to GJC `DEFAULT`: selection is persisted as the shared agent-domain default and promoted in the currently attached session. It is not profile/preset selection, profile activation, or an all-role assignment. The adapter UI does not support selecting or activating GJC model profiles, forwarding profile options, configuration patching, or runtime reload. The bare `gjc` alias is input-only; `/v1/models` emits canonical routing ids and display-only names.
 
-GJC 0.11.6 may still activate an already-persisted `modelProfile.default` when a new GJC process starts. That startup behavior is GJC-owned and does not mean the adapter can select a profile.
+GJC 0.12.8 may still activate an already-persisted `modelProfile.default` when a new GJC process starts. That startup behavior is GJC-owned and does not mean the adapter can select a profile.
 
 To change role models, tell GJC what to persist in a normal OpenWebUI message. For example:
 
@@ -178,7 +178,7 @@ Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. T
 | CLI lifecycle | Published `gjc` CLI | Only create, cold JSONL resume, readiness, and close of an exactly proven owned pane. It never supplies turns, models, events, gates, or an endpoint. |
 | Transport detach | Local transport only | Detach is not `session.close` and never terminates a remote session. |
 | Session close | Published `gjc` CLI `/exit` | For an exact persisted descriptor plus receipt-owned tmux pane/PID/tag, the adapter sends `/exit` first and requires endpoint disappearance and absence of the original pane PID. It never invokes released public `session.close` to terminate an owned CLI lifecycle. Missing pane proof fails closed without a kill or fallback. |
-| Regenerate/branch | Persisted owner, project, session, and message lineage | Any missing, conflicting, or ambiguous authority fails closed; the adapter does not fork or replay the operation. |
+| Regenerate/branch | Persisted owner, project, session, and message lineage | Direct adapter controls require matching persisted lineage; the stock OpenWebUI v0.11 regenerate/fork UI does not forward its request metadata to an OpenAI-compatible provider, so the adapter never infers a branch from that UI action. Missing, conflicting, or ambiguous authority is rejected without fork, replay, or fallback. |
 The same exact-proof close applies to admin close and adapter-created temporary catalog sessions. Logical SDK attachment eviction occurs only after physical close proof; there is no destructive fallback after `/exit`.
 
 The adapter does not use private daemon, global broker, private protocol, or GJC database interfaces.
@@ -204,7 +204,7 @@ Deleting an adapter-created project folder in the OpenWebUI sidebar is treated a
 
 ## Runtime contract
 
-Canonical model ids use `gjc/<encoded-provider>/<encoded-model>:<thinking>`. Provider and model components use uppercase RFC 3986 percent-encoding; each component must decode exactly once and re-encode to the same bytes. Providers containing `/` are rejected because upstream `model.set` uses the first slash as its provider/model boundary, while model ids may contain `/`, `:`, and Unicode and are encoded normally. The bare `gjc` alias is accepted only as input and is never emitted. Catalog, JSON, SSE, workflow, event, and persisted mapping output use the normalized tuple returned by GJC.
+Canonical routing model ids use `gjc/<encoded-provider>/<encoded-model>:<thinking>`. Provider and model components use uppercase RFC 3986 percent-encoding; each component must decode exactly once and re-encode to the same bytes. Providers containing `/` are rejected because upstream `model.set` uses the first slash as its provider/model boundary, while model ids may contain `/`, `:`, and Unicode and are encoded normally. The bare `gjc` alias is accepted only as input and is never emitted. The optional OpenAI-compatible model `name` is display-only; exact provider `openai-codex` is shown as `codex/<model>:<thinking>`, but no request path accepts that label as model authority. Catalog, JSON, SSE, workflow, event, and persisted mapping output use the normalized tuple returned by GJC.
 
 Selection updates the machine-global last-successful-writer-wins default. Operations are serialized per stable client, but the adapter does not provide global request ordering or a distributed ordering guarantee. The adapter invokes the setter once and does not retry, compensate, or roll it back. It also does not roll back an already committed project link or unlink if the later model-selection read needed for the response fails.
 
@@ -219,7 +219,7 @@ Selection updates the machine-global last-successful-writer-wins default. Operat
 - Native terminal events retain their observed order. Transcript-derived lifecycle events are used only for recovery when native delivery is unavailable, preventing duplicate lifecycle and artifact projections.
 - Raw tool arguments/results and secret-looking text are not emitted directly; the adapter preserves bounded labels, counts, phases, and status descriptions for display.
 - Workflow gates are rendered as assistant-visible pending-gate text. A matching user reply is validated against the persisted gate schema and resumed through the public SDK session; replies that do not match the stored project, session, message lineage, or gate correlation fail closed.
-- Regenerate/branch requires matching persisted owner, project, session, and message lineage authority. Missing, conflicting, or ambiguous authority is rejected without fork, replay, or fallback.
+- Direct adapter branch controls require matching persisted owner, project, session, and message lineage. OpenWebUI v0.11's stock regenerate/fork UI does not forward its request metadata to OpenAI-compatible providers, so the adapter never infers a branch from that UI action. Missing, conflicting, or ambiguous authority is rejected without fork, replay, or fallback.
 
 ## Operator notes
 
@@ -230,7 +230,9 @@ With OpenWebUI and the adapter already running, use the focused Chromium smoke t
 
 ```sh
 GJC_OPENWEBUI_E2E_MODEL='gjc/<provider>/<model>:<thinking-level>' \
+GJC_OPENWEBUI_E2E_PROMPT='Use the read tool on /absolute/path/to/package.json, then reply with the package name. Do not skip the tool call.' \
+GJC_OPENWEBUI_E2E_EXPECTED_TEXT='your-package-name' \
 bun scripts/gjc-openwebui-e2e.ts
 ```
 
-Set `GJC_OPENWEBUI_E2E_URL`, `GJC_TRUSTED_CHROMIUM_EXECUTABLE`, and OpenWebUI credentials when the local defaults do not apply. The smoke test selects the configured model through the real UI, submits a prompt that requires the `read` tool, and requires visible thinking/tool completion plus a native Socket.IO event. It writes a screenshot to `/tmp/gjc-openwebui-smoke.webp` by default.
+Use an absolute readable fixture path: a new chat without a mapped project runs in the neutral reader workspace, so a relative `package.json` is not the repository you launched the smoke command from. Set `GJC_OPENWEBUI_E2E_URL`, `GJC_TRUSTED_CHROMIUM_EXECUTABLE`, and OpenWebUI credentials when the local defaults do not apply. Set `GJC_OPENWEBUI_E2E_EXPECTED_VERSION` to require an exact target release, and `GJC_OPENWEBUI_E2E_SOURCE_HASH` to bind a saved transcript to a frozen source revision. The smoke test dismisses the v0.11 release-notes dialog, selects the configured model through the real UI, requires a newly rendered expected response and a post-submit native Socket.IO event, and writes a screenshot to `/tmp/gjc-openwebui-smoke.webp` by default. Set `GJC_OPENWEBUI_E2E_TRANSCRIPT` to persist the validated browser automation transcript.

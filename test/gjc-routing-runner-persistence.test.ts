@@ -2330,6 +2330,9 @@ function neutralReader(transcript: string[]) {
 				},
 			];
 		},
+		async getActiveProviders() {
+			return [{ provider: "anthropic", connectionKind: "credential" }];
+		},
 		async getState() {
 			transcript.push("state");
 			return { model: { provider: "anthropic", id: "claude-sonnet-4" }, thinkingLevel: "low" };

@@ -38,7 +38,46 @@ describe("createAdapterRequestHandler", () => {
 		expect(response.status).toBe(200);
 		expect(await response.json()).toEqual({
 			object: "list",
-			data: CANONICAL_MODEL_IDS.map(id => ({ id, object: "model", created: 1783468800, owned_by: "gjc" })),
+			data: CANONICAL_MODEL_IDS.map(id => ({
+				id,
+				name: id.slice("gjc/".length),
+				object: "model",
+				created: 1783468800,
+				owned_by: "gjc",
+			})),
+		});
+	});
+	test("advertises the Codex display name without changing its canonical model ID", async () => {
+		const handler = createAdapterRequestHandler({
+			routes: {
+				projects: [project],
+				owner,
+				runner: fixedRunner("unused"),
+				modelReaderFactory: codexModelReaderFactory,
+			},
+		});
+
+		const response = await handler(new Request("http://adapter.test/v1/models"));
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({
+			object: "list",
+			data: [
+				{
+					id: "gjc/openai-codex/gpt-5.6-luna:off",
+					name: "codex/gpt-5.6-luna:off",
+					object: "model",
+					created: 1783468800,
+					owned_by: "gjc",
+				},
+				{
+					id: "gjc/openai-codex/gpt-5.6-luna:low",
+					name: "codex/gpt-5.6-luna:low",
+					object: "model",
+					created: 1783468800,
+					owned_by: "gjc",
+				},
+			],
 		});
 	});
 
@@ -108,9 +147,20 @@ describe("createAdapterRequestHandler", () => {
 		expect(provider.status).toBe(200);
 	});
 
-	test("routes chat completions to optional route dependencies", async () => {
+	test("routes a canonical Codex ID without using its display name as authority", async () => {
+		let receivedModelId: string | undefined;
 		const handler = createAdapterRequestHandler({
-			routes: { projects: [project], owner, runner: fixedRunner("handled"), modelReaderFactory },
+			routes: {
+				projects: [project],
+				owner,
+				runner: {
+					run: input => {
+						receivedModelId = input.requestedModelId;
+						return { content: "handled", model: input.requestedModelId };
+					},
+				},
+				modelReaderFactory,
+			},
 		});
 
 		const response = await handler(
@@ -124,7 +174,10 @@ describe("createAdapterRequestHandler", () => {
 					"X-OpenWebUI-User-Message-Parent-Id": "",
 					"X-OpenWebUI-User-Id": "owner-1",
 				},
-				body: JSON.stringify({ model: "gjc", messages: [{ role: "user", content: "hello" }] }),
+				body: JSON.stringify({
+					model: "gjc/openai-codex/gpt-5.6-luna:low",
+					messages: [{ role: "user", content: "hello" }],
+				}),
 			}),
 		);
 
@@ -134,6 +187,45 @@ describe("createAdapterRequestHandler", () => {
 			object: "chat.completion",
 			choices: [{ message: { role: "assistant", content: "handled" } }],
 		});
+		expect(receivedModelId).toBe("gjc/openai-codex/gpt-5.6-luna:low");
+	});
+	test("rejects a Codex display label as a model authority", async () => {
+		let runnerCalls = 0;
+		const handler = createAdapterRequestHandler({
+			routes: {
+				projects: [project],
+				owner,
+				runner: {
+					run: () => {
+						runnerCalls += 1;
+						return { content: "unexpected", model: "gjc/openai-codex/gpt-5.6-luna:low" };
+					},
+				},
+				modelReaderFactory,
+			},
+		});
+
+		const response = await handler(
+			new Request("http://adapter.test/v1/chat/completions", {
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					"X-OpenWebUI-Chat-Id": "chat-1",
+					"X-OpenWebUI-Message-Id": "assistant-1",
+					"X-OpenWebUI-User-Message-Id": "user-1",
+					"X-OpenWebUI-User-Message-Parent-Id": "",
+					"X-OpenWebUI-User-Id": "owner-1",
+				},
+				body: JSON.stringify({
+					model: "codex/gpt-5.6-luna:low",
+					messages: [{ role: "user", content: "hello" }],
+				}),
+			}),
+		);
+
+		expect(response.status).toBe(404);
+		expect(await response.json()).toMatchObject({ error: { code: "model_not_found" } });
+		expect(runnerCalls).toBe(0);
 	});
 	test("keeps malformed JSON errors and streaming responses on the current chat route", async () => {
 		const handler = createAdapterRequestHandler({
@@ -294,3 +386,22 @@ function fixedRunner(content: string): LiveGatewayRunner {
 }
 
 const modelReaderFactory = staticModelReaderFactory();
+const codexModelReaderFactory = async () => ({
+	async getAvailableModels() {
+		return [
+			{
+				provider: "openai-codex",
+				id: "gpt-5.6-luna",
+				reasoning: true,
+				thinking: { validLevels: ["off", "low"] },
+			},
+		];
+	},
+	async getActiveProviders() {
+		return [{ provider: "openai-codex", connectionKind: "credential" }];
+	},
+	async getState() {
+		return { model: { provider: "openai-codex", id: "gpt-5.6-luna" }, thinkingLevel: "low" };
+	},
+	stop() {},
+});

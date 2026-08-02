@@ -117,6 +117,9 @@ class FakePublicSessionPort implements PublicSdkSessionPort {
 	async getAvailableModels(): Promise<readonly unknown[]> {
 		return [];
 	}
+	async getActiveProviders(): Promise<readonly unknown[]> {
+		return [];
+	}
 	async branchCandidates() {
 		return [];
 	}

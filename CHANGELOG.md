@@ -13,12 +13,14 @@
 
 ### Changed
 
-- Updated the runtime to the published GJC `0.11.6` packages and SDK v3 hybrid lifecycle backend. Session attachment, turns, selection, gates, and events use the public SDK; the published CLI is limited to lifecycle creation, cold resume, readiness, and proof-bound close.
+- Updated the runtime to the published GJC `0.12.8` packages and SDK v3 hybrid lifecycle backend. `/v1/models` now intersects the GJC model catalog with the SDK's active-provider catalog, so OpenWebUI is shown only models from currently connected providers. Session attachment, turns, selection, gates, and events use the public SDK; the published CLI is limited to lifecycle creation, cold resume, readiness, and proof-bound close.
 - Streamed assistant reasoning/text and lifecycle events while a turn is running instead of waiting for transcript completion. Workflow-gate continuations use the same streaming path.
 - Made GJC session JSONL, artifacts, and correlated SDK finals authoritative while preserving OpenWebUI rows as projections and user-owned fields during reprojection.
 - Separated project identity from model identity and made the bare `gjc` model an input-only alias; emitted model ids are canonical normalized tuples.
 - Made runtime path resolution deterministic and isolated from ambient `GJC_CONFIG_DIR`, `PI_CONFIG_DIR`, and `GJC_CODING_AGENT_DIR`.
 - Clarified managed Docker feasibility prerequisites and existing-route ownership, separated adapter/OpenWebUI readiness from GJC provider/model availability, and documented picker-to-`DEFAULT`, profile, and role-assignment semantics without adding runtime controls.
+- Updated the managed deployment default from OpenWebUI v0.10.0 to v0.11.0 while retaining the v0.10.0 minimum for existing deployments and the explicit `GJC_OPENWEBUI_IMAGE` override.
+- Documented that OpenWebUI v0.11's stock regenerate/fork UI cannot carry adapter branch-control metadata to an OpenAI-compatible provider; direct branch controls remain fail-closed rather than inferred.
 
 ### Fixed
 

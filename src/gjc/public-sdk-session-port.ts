@@ -25,7 +25,7 @@ export { withPublicSdkSessionMutationCoordinator } from "./public-sdk-coordinato
 
 import { createSessionLifecycle, discoverLifecycleSuccessor } from "./public-sdk-lifecycle";
 import { closeSession, type PublicSdkActionHost, reply, setModel, setThinking } from "./public-sdk-session-actions";
-import { readAvailableModels, readBranchCandidates, readSessionState } from "./public-sdk-state";
+import { readActiveProviders, readAvailableModels, readBranchCandidates, readSessionState } from "./public-sdk-state";
 import { runGateTurn, runTurn } from "./public-sdk-turns";
 import { SdkV3Client } from "./sdk-v3-client";
 import { type SdkRecord, SdkV3OperationError } from "./sdk-v3-protocol";
@@ -80,6 +80,9 @@ export class PublicSdkSessionClient implements PublicSdkSessionPort {
 	}
 	getAvailableModels(timeoutMs?: number): Promise<readonly unknown[]> {
 		return this.authority(timeoutMs, client => readAvailableModels(client, timeoutMs));
+	}
+	getActiveProviders(timeoutMs?: number): Promise<readonly unknown[]> {
+		return this.authority(timeoutMs, client => readActiveProviders(client, timeoutMs));
 	}
 	branchCandidates(timeoutMs?: number) {
 		return this.authority(timeoutMs, client => readBranchCandidates(client, timeoutMs));

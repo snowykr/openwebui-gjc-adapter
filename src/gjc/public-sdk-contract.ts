@@ -82,6 +82,7 @@ export interface PublicSdkSessionPort {
 	detach(): void;
 	getState(timeoutMs?: number): Promise<PublicSdkSessionState>;
 	getAvailableModels(timeoutMs?: number): Promise<readonly unknown[]>;
+	getActiveProviders(timeoutMs?: number): Promise<readonly unknown[]>;
 	setModel(
 		selection: NormalizedModelSelection,
 		idempotencyKey?: string,

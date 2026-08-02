@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { closeTmux, exitAndObservePostCloseFailure } from "../scripts/gjc-release-compat-lifecycle";
 
 const ROOT = join(import.meta.dir, "..");
-const GJC_VERSION = "0.11.6";
+const GJC_VERSION = "0.12.8";
 const BUN_IMAGE_DIGEST = "sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4";
 const PYTHON_IMAGE_DIGEST = "sha256:8a7e7cc04fd3e2bd787f7f24e22d5d119aa590d429b50c95dfe12b3abe52f48b";
 
@@ -248,10 +248,11 @@ describe("GJC SDK runtime provenance", () => {
 			sessionId: /(?:^|\n)\s*(?:ID|Session ID)\s*:\s*([^\s]+)\s*$/im.exec(output)?.[1],
 			sessionFile: /(?:^|\n)\s*File\s*:\s*(\S(?:.*\S)?)\s*$/im.exec(output)?.[1],
 		});
-		const startupArguments = (version: string) =>
-			version === "0.11.1"
-				? ["--model", "compat-local/hermetic-model"]
-				: ["--model", "compat-local/hermetic-model", "--thinking", "off"];
+		const startupArguments = (version: string) => {
+			const arguments_ = ["--model", "compat-local/hermetic-model"];
+			const supportsOffThinkingFlag = version.startsWith("0.11.") && version !== "0.11.1";
+			return supportsOffThinkingFlag ? [...arguments_, "--thinking", "off"] : arguments_;
+		};
 		const parseReleasedCliVersion = (output: string) => {
 			const match = /^(?:gjc\/)?(\d+\.\d+\.\d+)$/.exec(output.trim());
 			if (match === null) throw new Error("invalid version");
@@ -268,12 +269,13 @@ describe("GJC SDK runtime provenance", () => {
 		});
 		expect(startupArguments("0.11.1")).not.toContain("--thinking");
 		expect(startupArguments("0.11.6")).toEqual(["--model", "compat-local/hermetic-model", "--thinking", "off"]);
+		expect(startupArguments("0.12.7")).toEqual(["--model", "compat-local/hermetic-model"]);
 		expect(parseReleasedCliVersion("gjc/0.11.1\n")).toBe("0.11.1");
 		expect(parseReleasedCliVersion("0.11.6\n")).toBe("0.11.6");
 		expect(() => parseReleasedCliVersion("gjc/0.11.1 extra")).toThrow("invalid version");
 		expect(runner).toContain("const match = /^(?:gjc\\/)?(\\d+\\.\\d+\\.\\d+)$/.exec(output);");
 		expect(runner).toContain('await run(command, ["--version"])');
-		expect(runner).toContain('version === "0.11.1" ? arguments_ : [...arguments_, "--thinking", "off"]');
+		expect(runner).toContain('const supportsOffThinkingFlag = version.startsWith("0.11.") && version !== "0.11.1"');
 		expect(runtime).toContain('output.includes("Sessions dashboard")');
 		expect(runtime).toContain(
 			'output.includes("Session Info") && bootstrap.sessionId !== undefined && bootstrap.sessionFile !== undefined',

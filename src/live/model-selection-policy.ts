@@ -17,10 +17,13 @@ export function createModelSelectionPolicy(createReader: ModelReaderFactory): Mo
 				createReader,
 				async reader => {
 					const rawCatalog = await reader.getAvailableModels();
+					const activeProviders = activeProviderIds(await reader.getActiveProviders());
 					const catalog = decodeStrictModelCatalog(rawCatalog);
-					if (catalog !== null) return buildModelList(catalog);
+					if (catalog !== null)
+						return buildModelList(catalog.filter(selection => activeProviders.has(selection.provider)));
 					const current = currentSelection(rawCatalog, await reader.getState());
-					if (current === undefined) throw modelSelectionError("model_catalog_unavailable");
+					if (current === undefined || !activeProviders.has(current.provider))
+						throw modelSelectionError("model_catalog_unavailable");
 					return buildModelList([current]);
 				},
 				error => (isCatalogError(error) ? error : modelSelectionError("model_catalog_unavailable")),
@@ -52,10 +55,12 @@ async function resolveAlias(createReader: ModelReaderFactory): Promise<Normalize
 		createReader,
 		async reader => {
 			const rawCatalog = await reader.getAvailableModels();
+			const activeProviders = activeProviderIds(await reader.getActiveProviders());
 			const catalog = decodeStrictModelCatalog(rawCatalog);
 			const selection = selectionFromState(await reader.getState());
 			const usable =
 				selection !== undefined &&
+				activeProviders.has(selection.provider) &&
 				(catalog === null
 					? isAuthoritativeCurrent(rawCatalog, selection)
 					: catalog.some(candidate => sameSelection(candidate, selection)));
@@ -76,13 +81,18 @@ async function resolveCanonical(
 		createReader,
 		async reader => {
 			const rawCatalog = await reader.getAvailableModels();
+			const activeProviders = activeProviderIds(await reader.getActiveProviders());
 			const catalog = decodeStrictModelCatalog(rawCatalog);
 			if (catalog === null) {
 				const current = currentSelection(rawCatalog, await reader.getState());
-				if (current !== undefined && sameSelection(current, selection)) return selection;
+				if (current !== undefined && activeProviders.has(current.provider) && sameSelection(current, selection))
+					return selection;
 				throw modelSelectionError("model_catalog_unavailable");
 			}
-			if (!catalog.some(candidate => sameSelection(candidate, selection))) {
+			if (
+				!activeProviders.has(selection.provider) ||
+				!catalog.some(candidate => sameSelection(candidate, selection))
+			) {
 				throw modelSelectionError("model_selection_not_available");
 			}
 			return selection;
@@ -91,6 +101,24 @@ async function resolveCanonical(
 	);
 }
 
+function activeProviderIds(input: readonly unknown[]): ReadonlySet<string> {
+	const providers = new Set<string>();
+	for (const descriptor of input) {
+		if (typeof descriptor !== "object" || descriptor === null)
+			throw new TypeError("GJC active-provider catalog contains an invalid descriptor");
+		const provider = Reflect.get(descriptor, "provider");
+		const connectionKind = Reflect.get(descriptor, "connectionKind");
+		if (
+			typeof provider !== "string" ||
+			provider.length === 0 ||
+			(connectionKind !== "credential" && connectionKind !== "credentialless")
+		) {
+			throw new TypeError("GJC active-provider catalog contains an invalid descriptor");
+		}
+		providers.add(provider);
+	}
+	return providers;
+}
 async function withReader<T>(
 	createReader: ModelReaderFactory,
 	operation: (reader: ModelReader) => Promise<T>,

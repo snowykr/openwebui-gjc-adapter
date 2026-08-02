@@ -81,7 +81,7 @@ export function stageDeploymentArtifacts(input: StageInput): void {
 				typeof process.getgid === "function" ? process.getgid() : 1000,
 			);
 		const compose = renderResolvedManagedCompose({
-			openWebUIImage: process.env.GJC_OPENWEBUI_IMAGE ?? "ghcr.io/open-webui/open-webui:v0.10.0",
+			openWebUIImage: process.env.GJC_OPENWEBUI_IMAGE ?? "ghcr.io/open-webui/open-webui:v0.11.0",
 			adapterImage: process.env.GJC_ADAPTER_IMAGE ?? "openwebui-gjc-adapter:local",
 			openWebUIPort: input.uiPort,
 			configDirectory: artifacts.directory,

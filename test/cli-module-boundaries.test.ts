@@ -215,7 +215,7 @@ describe("CLI module boundaries", () => {
 		expect(readme).not.toContain("use existing when those Docker prerequisites fail");
 		expect(readme).not.toContain("route-specific help for the complete accepted surface");
 		expect(readme).toContain(
-			"`/v1/models` emits canonical ids; OpenWebUI picker values may add one `<connection-id>.` prefix, which the adapter removes before validation.",
+			"`/v1/models` emits only models from GJC providers with an active credential or credentialless connection; it fails closed when the SDK cannot resolve that active-provider catalog. OpenWebUI picker values may add one `<connection-id>.` prefix, which the adapter removes before validation.",
 		);
 		expect(readme).toContain("GJC applies the requested `task.agentModelOverrides`");
 		expect(readme).toContain("No adapter restart or new GJC session is required for these role changes");

@@ -135,6 +135,9 @@ describe("project admin routes", () => {
 				async getAvailableModels() {
 					return unexpectedSessionPortCall("getAvailableModels");
 				},
+				async getActiveProviders() {
+					return unexpectedSessionPortCall("getActiveProviders");
+				},
 				async setModel() {
 					return unexpectedSessionPortCall("setModel");
 				},
@@ -258,6 +261,9 @@ describe("project admin routes", () => {
 					},
 					async getAvailableModels() {
 						return unexpectedSessionPortCall("getAvailableModels");
+					},
+					async getActiveProviders() {
+						return unexpectedSessionPortCall("getActiveProviders");
 					},
 					async setModel() {
 						return unexpectedSessionPortCall("setModel");
@@ -385,6 +391,9 @@ describe("project admin routes", () => {
 				},
 				async getAvailableModels() {
 					return unexpectedSessionPortCall("getAvailableModels");
+				},
+				async getActiveProviders() {
+					return unexpectedSessionPortCall("getActiveProviders");
 				},
 				async setModel() {
 					return unexpectedSessionPortCall("setModel");
@@ -521,6 +530,9 @@ describe("project admin routes", () => {
 				},
 				async getAvailableModels() {
 					return unexpectedSessionPortCall("getAvailableModels");
+				},
+				async getActiveProviders() {
+					return unexpectedSessionPortCall("getActiveProviders");
 				},
 				async setModel() {
 					return unexpectedSessionPortCall("setModel");

@@ -206,7 +206,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 function startupArguments(version: string): readonly string[] {
 	const arguments_ = ["--model", "compat-local/hermetic-model"];
-	return version === "0.11.1" ? arguments_ : [...arguments_, "--thinking", "off"];
+	const supportsOffThinkingFlag = version.startsWith("0.11.") && version !== "0.11.1";
+	return supportsOffThinkingFlag ? [...arguments_, "--thinking", "off"] : arguments_;
 }
 async function releasedCliVersion(command: string): Promise<string> {
 	const output = (await run(command, ["--version"])).trim();

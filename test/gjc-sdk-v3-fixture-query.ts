@@ -87,23 +87,30 @@ export function handleQuery(
 								currentThinkingLevel: "high",
 							},
 						]
-				: query === "session.last_assistant"
-					? [gateAnswered ? "continued assistant" : "fixture assistant"]
-					: query === "session.metadata"
+				: query === "providers.list/active"
+					? scenario === "model_catalog"
 						? [
-								{
-									sessionId: activeSessionId,
-									cwd: activeSessionCwd,
-									kind: "saved",
-								},
+								{ provider: "anthropic", connectionKind: "credential" },
+								{ provider: "openai", connectionKind: "credential" },
 							]
-						: query === "config.list/get"
+						: [{ provider: "future", connectionKind: "credential" }]
+					: query === "session.last_assistant"
+						? [gateAnswered ? "continued assistant" : "fixture assistant"]
+						: query === "session.metadata"
 							? [
-									scenario === "model_catalog"
-										? { model: "anthropic/claude-sonnet-4", thinking: "low" }
-										: { model: "future/capable", thinking: "high" },
+									{
+										sessionId: activeSessionId,
+										cwd: activeSessionCwd,
+										kind: "saved",
+									},
 								]
-							: [];
+							: query === "config.list/get"
+								? [
+										scenario === "model_catalog"
+											? { model: "anthropic/claude-sonnet-4", thinking: "low" }
+											: { model: "future/capable", thinking: "high" },
+									]
+								: [];
 	if (query === "workflow.gates.list" && scenario === "terminal_during_gate_query" && promptStarted) {
 		socket.send(
 			JSON.stringify({
