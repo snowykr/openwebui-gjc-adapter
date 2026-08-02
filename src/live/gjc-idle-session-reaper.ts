@@ -96,6 +96,15 @@ class IdleSessionReaper {
 			const current = this.input.mappings.get(mapping.chatId);
 			if (current === undefined || mappingGeneration(current) !== mappingGeneration(mapping))
 				throw new Error(`GJC close mapping for chat ${mapping.chatId} is stale.`);
+			const generation = mappingGeneration(current);
+			if (state.generation === generation && state.closed) return { status: "closed" };
+			if (this.closeOperations(current, state).some(operation => operation.state === "complete")) {
+				state.mapping = current;
+				state.generation = generation;
+				state.rearmAfterActivity = false;
+				state.closed = true;
+				return { status: "closed" };
+			}
 			state.closeInFlight = true;
 			const result = await this.input.closeSession(current, ingress);
 			if (result.status === "closed") {
@@ -103,7 +112,7 @@ class IdleSessionReaper {
 				if (proof?.expectedCwd !== undefined)
 					this.input.discardSessionAttachment?.(proof.expectedCwd, current.sessionId);
 				state.mapping = current;
-				state.generation = mappingGeneration(current);
+				state.generation = generation;
 				state.closed = true;
 			} else {
 				state.lastActivityAt = this.#now();
