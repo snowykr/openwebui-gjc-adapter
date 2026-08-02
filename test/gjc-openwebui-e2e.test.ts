@@ -5,6 +5,7 @@ import {
 	matchesModelOption,
 	modelSearchTerm,
 	parseSocketIoFrame,
+	sourceHashFromGitState,
 } from "../scripts/gjc-openwebui-e2e";
 
 test("parses and identifies v0.11 Socket.IO events frames", () => {
@@ -25,6 +26,19 @@ test("searches v0.11 model picker by the model name instead of the canonical ide
 	expect(modelSearchTerm("gjc/openai-codex/gpt-5.6-luna:low")).toBe("gpt-5.6-luna");
 	expect(modelSearchTerm("gjc/openai-codex/gpt%2F5:off")).toBe("gpt/5");
 	expect(modelSearchTerm("invalid-model")).toBe("invalid-model");
+});
+test("binds browser evidence to the committed tree and both tracked diff states", () => {
+	const clean = {
+		head: "commit-a",
+		indexTree: "tree-a",
+		stagedDiff: "",
+		unstagedDiff: "",
+	};
+
+	expect(sourceHashFromGitState(clean)).not.toBe(sourceHashFromGitState({ ...clean, head: "commit-b" }));
+	expect(sourceHashFromGitState(clean)).not.toBe(sourceHashFromGitState({ ...clean, indexTree: "tree-b" }));
+	expect(sourceHashFromGitState(clean)).not.toBe(sourceHashFromGitState({ ...clean, stagedDiff: "staged" }));
+	expect(sourceHashFromGitState(clean)).not.toBe(sourceHashFromGitState({ ...clean, unstagedDiff: "unstaged" }));
 });
 
 test("requires a visible response and Socket.IO evidence for redesigned OpenWebUI", () => {

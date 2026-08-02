@@ -63,10 +63,30 @@ export function assertVisualEvidence(input: {
 	if (!input.socketFrames.some(isOpenWebUiEventFrame))
 		throw new Error("OpenWebUI did not emit a post-submit events Socket.IO frame");
 }
-function currentSourceHash(): string {
-	const result = spawnSync("git", ["diff", "--binary"], { cwd: process.cwd(), encoding: "buffer" });
+export function sourceHashFromGitState(input: {
+	readonly head: string;
+	readonly indexTree: string;
+	readonly stagedDiff: string;
+	readonly unstagedDiff: string;
+}): string {
+	return `sha256:${createHash("sha256").update(JSON.stringify(input)).digest("hex")}`;
+}
+
+function gitOutput(args: readonly string[]): Buffer {
+	const result = spawnSync("git", args, { cwd: process.cwd(), encoding: "buffer" });
 	if (result.error || result.status !== 0) throw new Error("Unable to calculate the current source hash");
-	return `sha256:${createHash("sha256").update(result.stdout).digest("hex")}`;
+	return Buffer.from(result.stdout);
+}
+
+function currentSourceHash(): string {
+	const untracked = gitOutput(["ls-files", "--others", "--exclude-standard", "-z"]);
+	if (untracked.length > 0) throw new Error("Cannot record a source hash with untracked files");
+	return sourceHashFromGitState({
+		head: gitOutput(["rev-parse", "HEAD"]).toString("utf8").trim(),
+		indexTree: gitOutput(["write-tree"]).toString("utf8").trim(),
+		stagedDiff: gitOutput(["diff", "--cached", "--binary"]).toString("base64"),
+		unstagedDiff: gitOutput(["diff", "--binary"]).toString("base64"),
+	});
 }
 
 function browserExecutable(): string {

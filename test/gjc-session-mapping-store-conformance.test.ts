@@ -140,6 +140,97 @@ describe("session mapping store authority conformance", () => {
 					harness.cleanup();
 				}
 			});
+			test(`${createHarness.name} retains older source tombstones after retrying a rolled-back reassignment`, () => {
+				const harness = createHarness();
+				try {
+					const source = mapping();
+					harness.store.set(source);
+					harness.store.beginOperation(source.chatId, {
+						id: "operation-a",
+						kind: "prompt",
+						detail: "source request",
+					});
+					harness.store.transitionOperation(source.chatId, "operation-a", "complete", "source request", {
+						kind: "turn",
+						assistantText: "source result",
+						events: [],
+						mapping: {
+							chatId: source.chatId,
+							projectId: source.projectId,
+							sessionId: source.sessionId,
+							rawFrameCursor: source.rawFrameCursor,
+							eventCursor: source.eventCursor,
+							operationId: "operation-a",
+						},
+					});
+
+					const targetB = {
+						chatId: source.chatId,
+						projectId: "project-2",
+						id: "operation-b",
+						ingressId: "operation-b",
+						kind: "create" as const,
+						detail: "move to B",
+					};
+					harness.store.beginProjectReassignment(source.chatId, source.projectId, targetB.projectId, {
+						id: targetB.id,
+						ingressId: targetB.ingressId,
+						kind: targetB.kind,
+						detail: targetB.detail,
+					});
+					harness.store.reserveProvisionalOperation(targetB);
+					harness.store.publishProvisionalOperation(targetB, {
+						...source,
+						projectId: targetB.projectId,
+						sessionId: "session-b",
+						operationId: targetB.id,
+						attachment: {
+							...source.attachment!,
+							expectedSessionId: "session-b",
+						},
+					});
+
+					harness.store.beginProjectReassignment(source.chatId, targetB.projectId, "project-3");
+					harness.store.rollbackProjectReassignment(source.chatId, targetB.projectId);
+
+					const targetC = {
+						chatId: source.chatId,
+						projectId: "project-3",
+						id: "operation-c",
+						ingressId: "operation-c",
+						kind: "create" as const,
+						detail: "retry move to C",
+					};
+					harness.store.beginProjectReassignment(source.chatId, targetB.projectId, targetC.projectId, {
+						id: targetC.id,
+						ingressId: targetC.ingressId,
+						kind: targetC.kind,
+						detail: targetC.detail,
+					});
+					harness.store.reserveProvisionalOperation(targetC);
+					harness.store.publishProvisionalOperation(targetC, {
+						...source,
+						projectId: targetC.projectId,
+						sessionId: "session-c",
+						operationId: targetC.id,
+						attachment: {
+							...source.attachment!,
+							expectedSessionId: "session-c",
+						},
+					});
+
+					expect(harness.store.operationAuthority(source.chatId, "operation-a")).toMatchObject({
+						projectId: source.projectId,
+						retiredAt: expect.any(String),
+					});
+					expect(harness.recover().operationAuthority(source.chatId, "operation-a")).toMatchObject({
+						projectId: source.projectId,
+						retiredAt: expect.any(String),
+					});
+				} finally {
+					harness.cleanup();
+				}
+			});
 
 			test(`${createHarness.name} rolls an interrupted target back without deleting source authority`, () => {
 				const harness = createHarness();

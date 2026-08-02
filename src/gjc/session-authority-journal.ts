@@ -76,6 +76,12 @@ export class SessionAuthorityJournal {
 				`Session operation ${unresolvedTarget.ingressId ?? unresolvedTarget.id} requires reconciliation.`,
 			);
 		const prior = existing.reassignment;
+		const retainedPriorTombstone =
+			prior?.state === "committed"
+				? prior.sourceTombstone
+				: prior?.state === "rolled_back"
+					? prior.priorTombstone
+					: undefined;
 		if (
 			prior !== undefined &&
 			prior.state === "pending" &&
@@ -91,9 +97,7 @@ export class SessionAuthorityJournal {
 				targetProjectId: nextProjectId,
 				startedAt: new Date().toISOString(),
 				...(target === undefined ? {} : { target: { ...target } }),
-				...(prior?.state === "committed" && prior.sourceTombstone !== undefined
-					? { priorTombstone: copyTombstone(prior.sourceTombstone) }
-					: {}),
+				...(retainedPriorTombstone === undefined ? {} : { priorTombstone: copyTombstone(retainedPriorTombstone) }),
 			},
 		};
 		this.records.set(chatId, next);

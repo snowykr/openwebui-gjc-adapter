@@ -141,6 +141,7 @@ export class SdkTerminalWindow {
 		if (startIndex >= 0) {
 			const assistantFailure = events
 				.slice(startIndex + 1)
+				.filter(frame => matchesAssistantFailure(frame, correlation))
 				.map(assistantFailureMessage)
 				.find(Boolean);
 			if (assistantFailure !== undefined) throw new SdkV3OperationError("prompt_failed", assistantFailure);
@@ -301,6 +302,15 @@ function matches(frame: SdkRecord, correlation: SdkTurnCorrelation): boolean {
 		nested.turnId === correlation.turnId
 	);
 }
+function matchesAssistantFailure(frame: SdkRecord, correlation: SdkTurnCorrelation): boolean {
+	if (frame.type !== "message_end") return true;
+	const nested = frame.correlation === undefined ? undefined : recordOrUndefined(frame.correlation);
+	const candidate = nested ?? frame;
+	const hasCorrelation =
+		candidate.sessionId !== undefined || candidate.commandId !== undefined || candidate.turnId !== undefined;
+	return !hasCorrelation || matches(frame, correlation);
+}
+
 function matchesTurnStream(frame: SdkRecord, correlation: SdkTurnCorrelation): boolean {
 	return (
 		frame.sessionId === correlation.sessionId &&
