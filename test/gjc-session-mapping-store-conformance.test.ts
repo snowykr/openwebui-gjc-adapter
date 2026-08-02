@@ -260,6 +260,23 @@ describe("session mapping store authority conformance", () => {
 					harness.cleanup();
 				}
 			});
+			test(`${createHarness.name} rejects a source operation after reassignment begins`, () => {
+				const harness = createHarness();
+				try {
+					const source = mapping();
+					harness.store.set(source);
+					harness.store.beginProjectReassignment(source.chatId, source.projectId, "project-2");
+					expect(() =>
+						harness.store.beginOperation(source.chatId, {
+							id: "late-source-operation",
+							kind: "prompt",
+							detail: "source request",
+						}),
+					).toThrow("pending project reassignment");
+				} finally {
+					harness.cleanup();
+				}
+			});
 			test(`${createHarness.name} rolls an interrupted target back without deleting source authority`, () => {
 				const harness = createHarness();
 				try {

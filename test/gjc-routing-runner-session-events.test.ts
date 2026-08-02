@@ -277,6 +277,47 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 			expect(await iterator.next()).toEqual({ value: undefined, done: true });
 		},
 	);
+	test("fails a streaming reassignment when rollback persistence fails", async () => {
+		class RollbackFailingMappings extends SessionMappingStore {
+			override rollbackProjectReassignment(): void {
+				throw new Error("rollback persistence failed");
+			}
+		}
+
+		const mappings = new RollbackFailingMappings();
+		mappings.set({
+			chatId: "chat-stream-rollback",
+			projectId: project.id,
+			sessionId: "session-a",
+			sessionFile: "/workspace/project/.gjc/sessions/session-a.jsonl",
+			operationId: "operation-a",
+			rawFrameCursor: 1,
+			eventCursor: 1,
+		});
+		const turnRunner = new FakeGjcTurnRunner();
+		turnRunner.observedEvents = [{ type: "assistant", text: "starting" }];
+		turnRunner.completionError = new Error("destination failed");
+		const result = await createGjcRoutingLiveGatewayRunner({
+			turnRunner,
+			mappings,
+			modelReaderFactory: staticModelReaderFactory(),
+		}).run({
+			project: { ...project, id: "project-b", cwd: "/workspace/project-b" },
+			prompt: "move to B",
+			chatId: "chat-stream-rollback",
+			messageId: "assistant-b",
+			userMessageId: "operation-b",
+			userMessageParentId: "operation-a",
+			continued: true,
+			requestedModelId: "gjc",
+			onLiveEvents: () => undefined,
+		});
+		if (result.chunks === undefined || !(Symbol.asyncIterator in result.chunks))
+			throw new Error("expected live chunks");
+		await expect(result.chunks[Symbol.asyncIterator]().next()).rejects.toThrow(
+			"Failed to roll back project reassignment for chat chat-stream-rollback.",
+		);
+	});
 });
 
 function status(description: string, done?: boolean, frameKind?: string) {

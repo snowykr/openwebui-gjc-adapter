@@ -375,6 +375,8 @@ export class SessionAuthorityJournal {
 				);
 			return copy(record);
 		}
+		if (record.reassignment?.state === "pending")
+			throw new Error(`Session authority for chat ${chatId} has a pending project reassignment.`);
 		assertBeginableIdentity(operation, [...this.provisional.values()]);
 		const next = {
 			...record,

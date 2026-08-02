@@ -330,10 +330,14 @@ export function createGjcRoutingLiveGatewayRunner(
 					await queue.finish(result.assistantText);
 				})
 				.catch(error => {
-					rollbackReassignment(error);
-					const mappedError = isModelSelectionApplyFailure(error)
+					let mappedError: unknown = isModelSelectionApplyFailure(error)
 						? modelSelectionError("model_selection_apply_failed")
 						: error;
+					try {
+						rollbackReassignment(mappedError);
+					} catch (rollbackError) {
+						mappedError = rollbackError;
+					}
 					if (!activityStarted) rejectActivity(mappedError);
 					queue.fail(mappedError);
 				});
