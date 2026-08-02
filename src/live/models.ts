@@ -14,15 +14,19 @@ const CONTROL_WHITESPACE_FORMAT_OR_SURROGATE = /[\p{Cc}\p{Cf}\p{White_Space}\uD8
 const textEncoder = new TextEncoder();
 const OPENWEBUI_CONNECTION_PREFIX = /^([A-Za-z0-9_-]+)\.(gjc\/.+)$/;
 
+const HIDDEN_MODEL_SELECTIONS = new Set(["openai-codex\u0000codex-auto-review"]);
 function displayProviderName(provider: string): string {
 	return provider === "openai-codex" ? "codex" : provider;
 }
 export function buildModelList(input: readonly unknown[] = []): OpenAIModelListResponse {
-	const entries = input.flatMap(decodeNormalizedSelection).map(selection => ({
-		selection,
-		id: formatCanonicalModelId(selection),
-		name: formatModelDisplayName(selection),
-	}));
+	const entries = input
+		.flatMap(decodeNormalizedSelection)
+		.filter(selection => !isHiddenFromModelPicker(selection))
+		.map(selection => ({
+			selection,
+			id: formatCanonicalModelId(selection),
+			name: formatModelDisplayName(selection),
+		}));
 	const nameCounts = new Map<string, number>();
 	for (const entry of entries) nameCounts.set(entry.name, (nameCounts.get(entry.name) ?? 0) + 1);
 	const emittedNames = new Set<string>();
@@ -68,6 +72,9 @@ function decodeNormalizedSelection(input: unknown): readonly NormalizedModelSele
 	return [{ provider, modelId, thinkingLevel }];
 }
 
+function isHiddenFromModelPicker(selection: NormalizedModelSelection): boolean {
+	return HIDDEN_MODEL_SELECTIONS.has(`${selection.provider}\u0000${selection.modelId}`);
+}
 export function formatCanonicalModelId(selection: NormalizedModelSelection): string {
 	if (!isSafeProvider(selection.provider)) throw new TypeError("Invalid GJC model provider");
 	const provider = encodeComponent(selection.provider);

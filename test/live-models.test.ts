@@ -215,6 +215,19 @@ describe("atomic GJC catalog decoder", () => {
 			data: [{ id: "gjc/p/m:off", name: "p/m:off", object: "model", created: 1783468800, owned_by: "gjc" }],
 		});
 	});
+	test("hides OpenAI Codex auto-review entries from the picker", () => {
+		const build = exportedFunction("buildModelList");
+
+		expect(
+			build([
+				{ provider: "openai-codex", modelId: "codex-auto-review", thinkingLevel: "off" },
+				{ provider: "openai-codex", modelId: "codex-auto-review", thinkingLevel: "low" },
+				{ provider: "openai-codex", modelId: "gpt-5.6-luna", thinkingLevel: "low" },
+			]),
+		).toMatchObject({
+			data: [{ id: "gjc/openai-codex/gpt-5.6-luna:low", name: "codex/gpt-5.6-luna:low" }],
+		});
+	});
 	test("uses distinct display labels for OpenAI Codex and a literal Codex provider", () => {
 		const build = exportedFunction("buildModelList");
 
