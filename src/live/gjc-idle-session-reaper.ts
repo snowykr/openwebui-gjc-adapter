@@ -477,7 +477,14 @@ class IdleSessionReaper {
 }
 function operationResultMatchesMapping(operation: SessionOperation, mapping: SessionMapping): boolean {
 	const resultMapping = operation.result?.mapping;
-	return resultMapping !== undefined && mappingGeneration(resultMapping) === mappingGeneration(mapping);
+	return (
+		resultMapping !== undefined &&
+		resultMapping.chatId === mapping.chatId &&
+		resultMapping.projectId === mapping.projectId &&
+		resultMapping.sessionId === mapping.sessionId &&
+		resultMapping.sessionFile === mapping.sessionFile &&
+		JSON.stringify(resultMapping.attachment) === JSON.stringify(mapping.attachment)
+	);
 }
 function closeIngressIdForAttempt(prefix: string, attempt: number): string {
 	return attempt === 0 ? prefix : `${prefix}:retry:${attempt}`;

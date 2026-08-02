@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { buildAdapterServerOptions } from "../src/adapter-server-options";
 import type { SessionAttachmentProof, SessionOperation } from "../src/gjc/session-authority";
 import type { SessionMapping } from "../src/gjc/session-router";
+import { SessionMappingStore } from "../src/gjc/session-router";
 import type { LiveGatewayRunner, LiveGatewayRunnerInput } from "../src/live/chat-completions";
 import { createGjcIdleSessionReaper, DEFAULT_IDLE_SESSION_TIMEOUT_MS } from "../src/live/gjc-idle-session-reaper";
 import type { GjcSessionTurnRunner } from "../src/live/gjc-routing-runner";
@@ -350,6 +351,41 @@ describe("GJC idle session reaper", () => {
 		});
 		expect(clock.count()).toBe(0);
 		clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS * 2);
+		await flush();
+		expect(closeCalls).toBe(0);
+		await reaper.stop();
+	});
+	test("matches a persisted production close result without requiring its close ingress operation ID", async () => {
+		const clock = new ManualTimers();
+		clock.now = Date.now();
+		const mappings = new SessionMappingStore();
+		const retained = createMapping("turn-1");
+		mappings.set(retained);
+		const closeIngressId = "manual-close-operation";
+		mappings.beginOperation("chat-1", {
+			id: closeIngressId,
+			kind: "close",
+			ingressId: closeIngressId,
+			detail: "manual-close-hash",
+		});
+		mappings.completeOperationWithMapping("chat-1", closeIngressId, "manual-close-hash", retained, "close");
+		const persistedClose = mappings.operation("chat-1", closeIngressId);
+		expect(persistedClose?.result?.mapping.operationId).toBe(closeIngressId);
+		expect(mappings.get("chat-1")?.operationId).toBe(retained.operationId);
+		let closeCalls = 0;
+		const reaper = createGjcIdleSessionReaper({
+			runner: { run: async () => ({ content: "done", model: "gjc" }) },
+			mappings,
+			closeSession: async () => {
+				closeCalls += 1;
+				return { status: "closed" };
+			},
+			now: () => clock.now,
+			setTimeout: (handler, timeoutMs) =>
+				clock.setTimeout(handler, timeoutMs) as unknown as ReturnType<typeof setTimeout>,
+			clearTimeout: timer => clock.clearTimeout(timer as unknown as number),
+		});
+		clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
 		await flush();
 		expect(closeCalls).toBe(0);
 		await reaper.stop();
