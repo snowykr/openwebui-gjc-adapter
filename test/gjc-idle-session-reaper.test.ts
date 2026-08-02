@@ -6,7 +6,7 @@ import { buildAdapterServerOptions } from "../src/adapter-server-options";
 import type { SessionAttachmentProof, SessionOperation } from "../src/gjc/session-authority";
 import type { SessionMapping } from "../src/gjc/session-router";
 import { SessionMappingStore } from "../src/gjc/session-router";
-import type { LiveGatewayRunner, LiveGatewayRunnerInput } from "../src/live/chat-completions";
+import type { LiveGatewayRunner, LiveGatewayRunnerInput, LiveGatewayRunnerResult } from "../src/live/chat-completions";
 import { createGjcIdleSessionReaper, DEFAULT_IDLE_SESSION_TIMEOUT_MS } from "../src/live/gjc-idle-session-reaper";
 import type { GjcSessionTurnRunner } from "../src/live/gjc-routing-runner";
 import type { OpenWebUIProjectionRepository } from "../src/openwebui/client";
@@ -151,7 +151,7 @@ function completedOperation(id: string, completedAt: number): SessionOperation {
 
 function createHarness(
 	options: {
-		readonly run?: (input: LiveGatewayRunnerInput) => Promise<{ readonly content: string; readonly model: string }>;
+		readonly run?: (input: LiveGatewayRunnerInput) => Promise<LiveGatewayRunnerResult>;
 		readonly close?: (
 			mapping: SessionMapping,
 			ingress: { readonly ingressId: string; readonly ingressHash: string },
@@ -706,6 +706,23 @@ describe("GJC idle session reaper", () => {
 		await second;
 		expect(calls).toBe(2);
 		await reaper.stop();
+	});
+	test("releases the gate when a stream iterator cannot be created", async () => {
+		const harness = createHarness({
+			run: async () => ({
+				chunks: {
+					[Symbol.asyncIterator]() {
+						throw new Error("iterator construction failed");
+					},
+				},
+				model: "gjc",
+			}),
+		});
+		await expect(harness.reaper.runner.run(createInput())).rejects.toThrow("iterator construction failed");
+		await expect(harness.reaper.runner.run({ ...createInput(), userMessageId: "turn-2" })).rejects.toThrow(
+			"iterator construction failed",
+		);
+		await harness.reaper.stop();
 	});
 });
 test("adapter initialization failure stops the constructed reaper", async () => {

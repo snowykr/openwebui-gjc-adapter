@@ -132,6 +132,28 @@ describe("live OpenAI-compatible chat completion errors", () => {
 		});
 		expect(effects).toEqual([]);
 	});
+	it("abandons a stream before returning an invalid-model response", async () => {
+		let abandoned = 0;
+		const result = await handleChatCompletions({
+			request: { ...request, stream: true },
+			headers: chatHeaders,
+			projects: [project],
+			owner,
+			runner: {
+				run: () => ({
+					chunks: (async function* () {
+						yield "must-not-escape";
+					})(),
+					abandon: async () => {
+						abandoned += 1;
+					},
+					model: "gjc",
+				}),
+			},
+		});
+		expect(result).toMatchObject({ ok: false, status: 503 });
+		expect(abandoned).toBe(1);
+	});
 
 	it.each(["gjc", "gjc/noncanonical"])("fails closed before sinks for runner model %s", async model => {
 		const effects: string[] = [];

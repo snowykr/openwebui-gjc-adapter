@@ -154,12 +154,12 @@ class IdleSessionReaper {
 			const result = await this.input.runner.run(turn);
 			const outcome: RunOutcome = turn.control === undefined ? "turn" : "control";
 			if (result.chunks !== undefined) {
-				handedOff = true;
 				const chunks = this.consumeChunks(
 					result.chunks,
 					() => finalize(outcome),
 					() => finalize("failure"),
 				);
+				handedOff = true;
 				return { ...result, chunks, abandon: () => chunks.abandon() };
 			}
 			finalize(outcome);
@@ -562,7 +562,7 @@ class TrackedChunks implements AsyncIterable<string> {
 	}
 
 	private async read(): Promise<IteratorResult<string>> {
-		const next = Promise.resolve(this.#iterator.next());
+		const next = Promise.resolve().then(() => this.#iterator.next());
 		this.#nextInFlight = next;
 		try {
 			const result = await next;

@@ -187,6 +187,7 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 	}
 	const resultModel = runnerResult.model;
 	if (resultModel === undefined || classifyGjcModelId(resultModel).kind !== "canonical") {
+		await abandonRunnerResult(runnerResult);
 		return errorResult(
 			503,
 			"server_error",
@@ -194,30 +195,42 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 			"GJC live runner returned an invalid model selection.",
 		);
 	}
+	try {
+		await deliverRunnerEvents({
+			eventSink: input.eventSink,
+			events: input.request.stream === true && liveEventsDelivered ? undefined : runnerResult.events,
+			chatId: headers.chatId,
+			messageId: headers.messageId,
+			ownerUserId: input.owner.ownerUserId,
+			projectId: project.id,
+		});
 
-	await deliverRunnerEvents({
-		eventSink: input.eventSink,
-		events: input.request.stream === true && liveEventsDelivered ? undefined : runnerResult.events,
-		chatId: headers.chatId,
-		messageId: headers.messageId,
-		ownerUserId: input.owner.ownerUserId,
-		projectId: project.id,
-	});
-
-	return deliverChatCompletion({
-		stream: input.request.stream === true,
-		runnerResult,
-		id,
-		created,
-		model: resultModel,
-		messageSink: input.messageSink,
-		chatId: headers.chatId,
-		messageId: headers.messageId,
-		ownerUserId: input.owner.ownerUserId,
-		projectId: project.id,
-	});
+		return await deliverChatCompletion({
+			stream: input.request.stream === true,
+			runnerResult,
+			id,
+			created,
+			model: resultModel,
+			messageSink: input.messageSink,
+			chatId: headers.chatId,
+			messageId: headers.messageId,
+			ownerUserId: input.owner.ownerUserId,
+			projectId: project.id,
+		});
+	} catch (error) {
+		await abandonRunnerResult(runnerResult);
+		throw error;
+	}
 }
 
+async function abandonRunnerResult(result: LiveGatewayRunnerResult): Promise<void> {
+	if (!("abandon" in result)) return;
+	try {
+		await result.abandon?.();
+	} catch {
+		// Preserve the original request failure while the stream owner finalizes itself.
+	}
+}
 function selectionErrorResult(error: ModelSelectionError): LiveChatCompletionsResult {
 	return errorResult(error.status, error.type, error.code, error.message);
 }
