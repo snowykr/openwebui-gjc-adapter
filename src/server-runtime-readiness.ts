@@ -1,9 +1,9 @@
 import type { AdapterReadinessOptions } from "./health";
 import {
-	mergePromptHints,
 	OPENWEBUI_CONFIG_ENDPOINT,
 	OPENWEBUI_PROMPT_HINTS_ENDPOINT,
 	promptHintsFromConfig,
+	removeLegacyPromptHint,
 } from "./openwebui/prompt-hints";
 
 export interface AdapterRuntimeConfig {
@@ -20,7 +20,7 @@ export interface AdapterRuntimeConfig {
 	readonly initialize?: () => Promise<void>;
 }
 
-/** Validates the persisted token and reconciles config-suggestion hints without exposing credentials. */
+/** Validates the persisted token and removes the obsolete adapter-owned suggestion without exposing credentials. */
 export async function initializeRuntimeReadiness(runtime: AdapterRuntimeConfig): Promise<AdapterReadinessOptions> {
 	if (!runtime.openWebUIApiToken?.trim())
 		return {
@@ -107,7 +107,8 @@ async function initializeRuntimeReadinessAttempt(
 		} catch {
 			config = undefined;
 		}
-		const payload = mergePromptHints(promptHintsFromConfig(config));
+		const existingSuggestions = promptHintsFromConfig(config);
+		const payload = removeLegacyPromptHint(existingSuggestions);
 		if (payload === undefined)
 			return {
 				...fallback,
@@ -115,7 +116,12 @@ async function initializeRuntimeReadinessAttempt(
 				promptHintsSeeded: false,
 				reason: "OpenWebUI prompt-hint read was invalid",
 			};
-
+		if (JSON.stringify(existingSuggestions) === JSON.stringify(payload.suggestions))
+			return {
+				...fallback,
+				openWebUIAuthenticated: true,
+				promptHintsSeeded: true,
+			};
 		const seedResponse = await fetch(`${baseUrl}${OPENWEBUI_PROMPT_HINTS_ENDPOINT}`, {
 			method: "POST",
 			headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
@@ -127,7 +133,7 @@ async function initializeRuntimeReadinessAttempt(
 				...fallback,
 				openWebUIAuthenticated: true,
 				promptHintsSeeded: false,
-				reason: "OpenWebUI prompt-hint seed was not verified",
+				reason: "OpenWebUI prompt-hint removal was not verified",
 			};
 		let readback: unknown;
 		try {
@@ -135,19 +141,19 @@ async function initializeRuntimeReadinessAttempt(
 		} catch {
 			readback = undefined;
 		}
-		const seeded = JSON.stringify(readback) === JSON.stringify(payload.suggestions);
+		const reconciled = JSON.stringify(readback) === JSON.stringify(payload.suggestions);
 		return {
 			...fallback,
 			openWebUIAuthenticated: true,
-			promptHintsSeeded: seeded,
-			...(seeded ? {} : { reason: "OpenWebUI prompt-hint readback did not match the merged seed" }),
+			promptHintsSeeded: reconciled,
+			...(reconciled ? {} : { reason: "OpenWebUI prompt-hint readback did not match the removal" }),
 		};
 	} catch {
 		return {
 			...fallback,
 			openWebUIAuthenticated: false,
 			promptHintsSeeded: false,
-			reason: "OpenWebUI authentication or prompt-hint probe failed",
+			reason: "OpenWebUI authentication or prompt-hint removal failed",
 		};
 	} finally {
 		clearTimeout(timeout);
