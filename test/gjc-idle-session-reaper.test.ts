@@ -50,6 +50,7 @@ class MappingFixture {
 							assistantText: "",
 							events: [],
 							mapping: this.mapping,
+							correlation: { closeStatus: "closed", mappingOperationId: this.mapping.operationId },
 						},
 					}
 				: {}),
@@ -258,6 +259,27 @@ describe("GJC idle session reaper", () => {
 		expect(harness.closeCalls).toHaveLength(1);
 		await harness.reaper.stop();
 	});
+	test("does not let a prior close suppress idle cleanup for a new mapping generation", async () => {
+		let harness!: ReturnType<typeof createHarness>;
+		harness = createHarness({
+			close: async (_mapping, ingress) => {
+				harness.mappings.recordClose(ingress.ingressId, "complete");
+				return { status: "closed" };
+			},
+		});
+		await harness.reaper.runner.run(createInput());
+		harness.clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
+		await flush();
+		expect(harness.closeCalls).toHaveLength(1);
+
+		harness.mappings.publish("turn-2", harness.clock.now);
+		await harness.reaper.runner.run({ ...createInput(), userMessageId: "turn-2" });
+		harness.clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
+		await flush();
+
+		expect(harness.closeCalls).toHaveLength(2);
+		await harness.reaper.stop();
+	});
 	test("retries a non-closed idle close with a new deterministic authority ingress", async () => {
 		let attempts = 0;
 		let harness!: ReturnType<typeof createHarness>;
@@ -369,7 +391,7 @@ describe("GJC idle session reaper", () => {
 		expect(closeCalls).toBe(0);
 		await reaper.stop();
 	});
-	test("matches a persisted production close result without requiring its close ingress operation ID", async () => {
+	test("matches a persisted production close result for the retained mapping generation", async () => {
 		const clock = new ManualTimers();
 		clock.now = Date.now();
 		const mappings = new SessionMappingStore();
@@ -385,6 +407,7 @@ describe("GJC idle session reaper", () => {
 		mappings.completeOperationWithMapping("chat-1", closeIngressId, "manual-close-hash", retained, "close");
 		const persistedClose = mappings.operation("chat-1", closeIngressId);
 		expect(persistedClose?.result?.mapping.operationId).toBe(closeIngressId);
+		expect(persistedClose?.result?.correlation?.mappingOperationId).toBe(retained.operationId);
 		expect(mappings.get("chat-1")?.operationId).toBe(retained.operationId);
 		let closeCalls = 0;
 		const reaper = createGjcIdleSessionReaper({

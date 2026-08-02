@@ -485,9 +485,11 @@ class IdleSessionReaper {
 	}
 }
 function operationResultMatchesMapping(operation: SessionOperation, mapping: SessionMapping): boolean {
-	const resultMapping = operation.result?.mapping;
+	const result = operation.result;
+	const resultMapping = result?.mapping;
 	return (
 		resultMapping !== undefined &&
+		result?.correlation?.mappingOperationId === mapping.operationId &&
 		resultMapping.chatId === mapping.chatId &&
 		resultMapping.projectId === mapping.projectId &&
 		resultMapping.sessionId === mapping.sessionId &&

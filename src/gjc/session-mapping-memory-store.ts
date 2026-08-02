@@ -87,13 +87,21 @@ export class SessionMappingStore {
 		mapping: SessionMapping,
 		kind: "turn" | "control" | "close",
 	): SessionMapping {
+		const result = operationResult(kind, { ...mapping, operationId });
+		const resultWithCloseGeneration =
+			kind === "close"
+				? {
+						...result,
+						correlation: { ...result.correlation, mappingOperationId: mapping.operationId },
+					}
+				: result;
 		return mappingFromRecord(
 			this.authority.completeOperationWithMapping(
 				chatId,
 				operationId,
 				detail,
 				copySessionMapping(mapping),
-				operationResult(kind, { ...mapping, operationId }),
+				resultWithCloseGeneration,
 			),
 		);
 	}

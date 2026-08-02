@@ -190,6 +190,11 @@ export async function buildResolvedAdapterServerOptions(
 		const eventSink = dependencies.eventSink ?? buildOpenWebUIEventSink(openWebUIClient);
 		const messageSink = dependencies.messageSink ?? buildOpenWebUIMessageSink(openWebUIClient);
 		const fileContextResolver = buildOpenWebUIFileContextResolver(openWebUIClient);
+		const shutdownCleanup = internalStore
+			? () => {
+					projectStore?.close();
+				}
+			: undefined;
 		const options = {
 			host: config.bindHost,
 			port: config.bindPort,
@@ -217,6 +222,7 @@ export async function buildResolvedAdapterServerOptions(
 				...(messageSink === undefined ? {} : { messageSink }),
 				...(fileContextResolver === undefined ? {} : { fileContextResolver }),
 			},
+			...(shutdownCleanup === undefined ? {} : { shutdownCleanup }),
 		};
 		completed = true;
 		return options;

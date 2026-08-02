@@ -14,6 +14,7 @@ export interface AdapterServerOptions {
 	port: number;
 	runtimeRoot: string;
 	runtimeLock: RuntimeSingletonLock;
+	shutdownCleanup?: () => void | Promise<void>;
 	checks?: readonly AdapterHealthCheck[];
 	readiness?: AdapterReadinessOptions;
 	runtime?: AdapterRuntimeConfig;
@@ -51,6 +52,11 @@ export async function startAdapterServer(options: AdapterServerOptions): Promise
 					.filter((result): result is PromiseRejectedResult => result.status === "rejected")
 					.map(result => result.reason);
 				try {
+					await options.shutdownCleanup?.();
+				} catch (error) {
+					failures.push(error);
+				}
+				try {
 					await lock.release();
 				} catch (error) {
 					failures.push(error);
@@ -64,6 +70,11 @@ export async function startAdapterServer(options: AdapterServerOptions): Promise
 			await options.routes?.runner.stop?.();
 		} catch (stopError) {
 			startupError = new AggregateError([startupError, stopError], "Server initialization cleanup failed");
+		}
+		try {
+			await options.shutdownCleanup?.();
+		} catch (cleanupError) {
+			startupError = new AggregateError([startupError, cleanupError], "Server initialization cleanup failed");
 		}
 		try {
 			await lock.release();
