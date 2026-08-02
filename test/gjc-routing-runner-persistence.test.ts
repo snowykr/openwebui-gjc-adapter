@@ -215,6 +215,24 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			});
 		});
 	});
+	test("persists short reassignment aliases", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-reassignment-alias-"));
+		const filePath = join(directory, "authority.json");
+		try {
+			const authority = new FileSessionAuthority(filePath);
+			authority.set(mappingInput(mediumSelection));
+			authority.beginReassignment("chat-1", project.id, "project-b");
+			expect(readFileSync(filePath, "utf8")).toContain('"state": "pending"');
+
+			authority.rollbackReassignment("chat-1", project.id);
+			expect(new FileSessionAuthority(filePath).get("chat-1")?.reassignment).toMatchObject({
+				state: "rolled_back",
+				targetProjectId: "project-b",
+			});
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
 	test("reloads under the mutation lock so two stores retain both interleaved writes", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-interleave-")), "mappings.json");
 		const first = new FileSessionAuthority(filePath);

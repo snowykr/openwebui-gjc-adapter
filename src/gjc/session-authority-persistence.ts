@@ -82,6 +82,17 @@ export class FileSessionAuthority extends SessionAuthority {
 	override rollbackProjectReassignment(chatId: string, currentProjectId: string): SessionAuthorityRecord {
 		return this.mutate(() => super.rollbackProjectReassignment(chatId, currentProjectId));
 	}
+	override beginReassignment(
+		chatId: string,
+		currentProjectId: string,
+		nextProjectId: string,
+		target?: SessionAuthorityTargetIdentity,
+	): SessionAuthorityRecord {
+		return this.mutate(() => super.beginReassignment(chatId, currentProjectId, nextProjectId, target));
+	}
+	override rollbackReassignment(chatId: string, currentProjectId: string): SessionAuthorityRecord {
+		return this.mutate(() => super.rollbackReassignment(chatId, currentProjectId));
+	}
 	override recordAcknowledgedSuccessor(
 		chatId: string,
 		operationId: string,

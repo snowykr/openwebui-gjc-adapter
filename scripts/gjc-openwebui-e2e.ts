@@ -320,9 +320,11 @@ export async function runVisualSmoke(): Promise<void> {
 		await Promise.allSettled(completionResponseReads);
 		if (
 			completionRequestModels.length === 0 ||
-			completionRequestModels.some(requestedModel => requestedModel !== model)
+			completionRequestModels.some(requestedModel => !matchesModelOption(requestedModel, model))
 		)
-			throw new Error(`OpenWebUI did not submit only the canonical model ID: ${model}`);
+			throw new Error(
+				`OpenWebUI did not submit only the canonical model ID or one connection-prefixed form: ${model}`,
+			);
 		const text = await page.evaluate(() => document.body.innerText);
 		assertVisualEvidence({
 			text,

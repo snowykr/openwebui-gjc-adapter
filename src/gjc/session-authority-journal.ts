@@ -42,6 +42,10 @@ export class SessionAuthorityJournal {
 		const conflictingProject = [...this.provisional.values()].find(operation => {
 			if (operation.chatId !== input.chatId || operation.projectId === input.projectId) return false;
 			const reassignment = existing?.reassignment;
+			const isRetiredCompletedOperation =
+				operation.state === "complete" &&
+				tombstoneChainContainsProject(reassignment?.sourceTombstone, operation.projectId);
+			if (isRetiredCompletedOperation) return false;
 			return !(
 				reassignment?.state === "rolled_back" &&
 				reassignment.targetProjectId === operation.projectId &&
@@ -458,6 +462,13 @@ function journalFor(record: SessionAuthorityRecord | undefined): readonly Sessio
 		tombstone = tombstone.prior;
 	}
 	return journal;
+}
+function tombstoneChainContainsProject(tombstone: SessionAuthorityTombstone | undefined, projectId: string): boolean {
+	while (tombstone !== undefined) {
+		if (tombstone.projectId === projectId) return true;
+		tombstone = tombstone.prior;
+	}
+	return false;
 }
 
 function targetIdentity(

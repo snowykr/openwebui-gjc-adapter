@@ -115,6 +115,7 @@ describe("session mapping store authority conformance", () => {
 						projectId: "project-2",
 						sessionId: "session-2",
 					});
+					expect(() => harness.store.set(harness.store.get(source.chatId)!)).not.toThrow();
 					expect(harness.store.operation(source.chatId, "completed-operation")).toMatchObject({
 						state: "complete",
 						result: { mapping: { projectId: source.projectId } },

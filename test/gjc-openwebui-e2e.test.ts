@@ -22,6 +22,9 @@ test("accepts OpenWebUI connection-prefixed model picker values", () => {
 		false,
 	);
 });
+test("accepts one connection prefix for submitted completion models", () => {
+	expect(matchesModelOption("0.gjc/openai-codex/gpt-5.6-luna:low", "gjc/openai-codex/gpt-5.6-luna:low")).toBe(true);
+});
 test("searches v0.11 model picker by the model name instead of the canonical identifier punctuation", () => {
 	expect(modelSearchTerm("gjc/openai-codex/gpt-5.6-luna:low")).toBe("gpt-5.6-luna");
 	expect(modelSearchTerm("gjc/openai-codex/gpt%2F5:off")).toBe("gpt/5");
