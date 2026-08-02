@@ -297,6 +297,41 @@ describe("configure CLI grammar and acknowledgements", () => {
 			t.cleanup();
 		}
 	});
+	test("cleans the base runtime before rejecting incomplete installed credentials", async () => {
+		const t = tempPath();
+		const originalFetch = globalThis.fetch;
+		const base = {
+			bindHost: "127.0.0.1",
+			bindPort: 8765,
+			adapterApiToken: "adapter-token",
+			readinessToken: "readiness-token",
+			mode: "existing" as const,
+			installationId: "installation-1",
+			openWebUIBaseUrl: "http://openwebui.test",
+			statePath: t.directory,
+			gjcCommand: "gjc",
+			turnTimeoutMs: 1_000,
+			sessionRoot: t.directory,
+			allowedProjectRoots: [t.directory],
+			projects: [],
+		} satisfies AdapterConfig;
+		try {
+			globalThis.fetch = (async () => {
+				throw new Error("OpenWebUI is still starting");
+			}) as unknown as typeof fetch;
+			await expect(buildInstalledAdapterServerOptions(base)).rejects.toThrow(
+				"installed adapter configuration is missing runtime credentials or mode",
+			);
+
+			const options = await buildInstalledAdapterServerOptions({ ...base, adapterToken: "adapter-token" });
+			await options.routes?.runner.stop?.();
+			await options.shutdownCleanup?.();
+			await options.runtimeLock.release();
+		} finally {
+			globalThis.fetch = originalFetch;
+			t.cleanup();
+		}
+	});
 	test("generates the existing-mode systemd unit through production deployment", async () => {
 		const t = tempPath();
 		const originalEnvironment = {

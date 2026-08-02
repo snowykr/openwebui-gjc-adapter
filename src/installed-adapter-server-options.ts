@@ -51,7 +51,23 @@ export async function buildResolvedInstalledAdapterServerOptions(
 			},
 		};
 	} catch (error) {
-		await options.runtimeLock.release();
+		const failures: unknown[] = [error];
+		try {
+			await options.routes?.runner.stop?.();
+		} catch (stopError) {
+			failures.push(stopError);
+		}
+		try {
+			await options.shutdownCleanup?.();
+		} catch (cleanupError) {
+			failures.push(cleanupError);
+		}
+		try {
+			await options.runtimeLock.release();
+		} catch (releaseError) {
+			failures.push(releaseError);
+		}
+		if (failures.length > 1) throw new AggregateError(failures, "Installed adapter initialization cleanup failed");
 		throw error;
 	}
 }
