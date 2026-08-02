@@ -53,8 +53,18 @@ export async function startAdapterServer(options: AdapterServerOptions): Promise
 			},
 		};
 	} catch (error) {
-		await lock.release();
-		throw error;
+		let startupError: unknown = error;
+		try {
+			await options.routes?.runner.stop?.();
+		} catch (stopError) {
+			startupError = new AggregateError([startupError, stopError], "Server initialization cleanup failed");
+		}
+		try {
+			await lock.release();
+		} catch (releaseError) {
+			startupError = new AggregateError([startupError, releaseError], "Server initialization cleanup failed");
+		}
+		throw startupError;
 	}
 }
 function idleTimeoutSeconds(turnTimeoutMs: number): number {

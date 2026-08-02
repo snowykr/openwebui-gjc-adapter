@@ -244,6 +244,28 @@ describe("GJC idle session reaper", () => {
 		await harness.reaper.stop();
 	});
 
+	test("retries an uncertain idle close without rewriting the prior authority operation", async () => {
+		let attempts = 0;
+		let harness!: ReturnType<typeof createHarness>;
+		harness = createHarness({
+			close: async (_mapping, ingress) => {
+				attempts += 1;
+				harness.mappings.recordClose(ingress.ingressId, attempts === 1 ? "uncertain" : "complete");
+				return attempts === 1
+					? { status: "uncertain", message: "close acknowledgement uncertain" }
+					: { status: "closed" };
+			},
+		});
+		await harness.reaper.runner.run(createInput());
+		harness.clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
+		await flush();
+		harness.clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
+		await flush();
+		expect(attempts).toBe(2);
+		expect(harness.closeCalls[1]?.ingressId).toContain(":retry:1");
+		await harness.reaper.stop();
+	});
+
 	test("stop waits for an in-flight idle close before stopping the base runner", async () => {
 		let releaseClose!: () => void;
 		let baseStopped = false;

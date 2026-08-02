@@ -346,6 +346,41 @@ describe("Bun transport configuration", () => {
 			await rm(runtimeRoot, { force: true, recursive: true });
 		}
 	});
+	test("stops the route runner and releases the lock when Bun.serve initialization fails", async () => {
+		const runtimeRoot = await mkdtemp(join(tmpdir(), "openwebui-gjc-adapter-server-"));
+		const failure = new Error("serve initialization failed");
+		const serve = spyOn(Bun, "serve").mockImplementation(() => {
+			throw failure;
+		});
+		let stopCalls = 0;
+		try {
+			await expect(
+				startAdapterServer({
+					host: "127.0.0.1",
+					port: 0,
+					runtimeRoot,
+					runtimeLock: await RuntimeSingletonLock.acquire(runtimeRoot),
+					turnTimeoutMs: 180_000,
+					routes: {
+						projects: [project],
+						owner,
+						runner: {
+							run: () => ({ content: "unused", model: LOW_MODEL_ID }),
+							stop: () => {
+								stopCalls += 1;
+							},
+						},
+					},
+				}),
+			).rejects.toThrow(failure);
+			expect(stopCalls).toBe(1);
+			const reacquired = await RuntimeSingletonLock.acquire(runtimeRoot);
+			await reacquired.release();
+		} finally {
+			serve.mockRestore();
+			await rm(runtimeRoot, { force: true, recursive: true });
+		}
+	});
 
 	test("rejects invalid turn timeout values before serving", async () => {
 		const runtimeRoot = await mkdtemp(join(tmpdir(), "openwebui-gjc-adapter-server-"));
