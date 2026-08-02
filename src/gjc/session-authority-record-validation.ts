@@ -162,7 +162,7 @@ export function isAuthorityDocumentRelationallyValid(
 			const isRetiredSourceEvidence =
 				operation.state === "complete" &&
 				mapping !== undefined &&
-				tombstoneChainContainsProject(mapping.reassignment?.sourceTombstone, operation.projectId);
+				reassignmentTombstoneChainContainsProject(mapping.reassignment, operation.projectId);
 			if (
 				(!matchesReassignmentTarget && !isRetiredSourceEvidence) ||
 				(matchesReassignmentTarget &&
@@ -358,11 +358,13 @@ function hasConsistentTombstoneResults(tombstone: SessionAuthorityTombstone): bo
 		);
 	});
 }
-function tombstoneChainContainsProject(tombstone: SessionAuthorityTombstone | undefined, projectId: string): boolean {
-	let current = tombstone;
-	while (current !== undefined) {
-		if (current.projectId === projectId) return true;
-		current = current.prior;
-	}
+function reassignmentTombstoneChainContainsProject(
+	reassignment: SessionAuthorityRecord["reassignment"] | undefined,
+	projectId: string,
+): boolean {
+	const roots = [reassignment?.sourceTombstone, reassignment?.priorTombstone];
+	for (const root of roots)
+		for (let current = root; current !== undefined; current = current.prior)
+			if (current.projectId === projectId) return true;
 	return false;
 }

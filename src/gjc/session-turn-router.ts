@@ -62,12 +62,19 @@ export async function routeGjcTurn(input: RouteGjcTurnInput): Promise<RouteGjcTu
 		getProjectSessionRoot(input.project),
 		input.runner.resolveSessionRoot,
 	);
-	const existingSessionFile = await ensureSdkSessionFile(
-		input.project,
-		existing.sessionFile,
-		sessionRoot,
-		existing.sessionId,
-	);
+	const operation = beginDurableOperation(input);
+	let existingSessionFile: string | undefined;
+	try {
+		existingSessionFile = await ensureSdkSessionFile(
+			input.project,
+			existing.sessionFile,
+			sessionRoot,
+			existing.sessionId,
+		);
+	} catch (error) {
+		input.mappings.transitionOperation(input.chatId, operation.key, "uncertain", operation.hash);
+		throw error;
+	}
 	const address = {
 		cwd: input.project.cwd,
 		sessionRoot,
@@ -79,7 +86,6 @@ export async function routeGjcTurn(input: RouteGjcTurnInput): Promise<RouteGjcTu
 		input.runner,
 		{ ...address, sessionFile: existingSessionFile, recoveryAttachment: existing.attachment },
 		async lifecycle => {
-			const operation = beginDurableOperation(input);
 			try {
 				await input.runner.switchSession({
 					...address,
