@@ -100,6 +100,39 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			rmSync(directory, { recursive: true, force: true });
 		}
 	});
+	test("surfaces a reassignment rollback persistence failure", async () => {
+		class RollbackFailingMappings extends SessionMappingStore {
+			override rollbackProjectReassignment(): void {
+				throw new Error("rollback persistence failed");
+			}
+		}
+
+		const mappings = new RollbackFailingMappings();
+		const projectB = { ...project, id: "project-b", cwd: "/workspace/project-b" };
+		mappings.set({
+			chatId: "chat-rollback-failure",
+			projectId: project.id,
+			sessionId: "session-a",
+			sessionFile: "/workspace/project/.gjc/sessions/session-a.jsonl",
+			operationId: "operation-a",
+			rawFrameCursor: 1,
+			eventCursor: 1,
+		});
+		const runner = new FakeGjcTurnRunner();
+		runner.completionError = new Error("destination start failed");
+
+		await expect(
+			createGjcRoutingLiveGatewayRunner({ turnRunner: runner, mappings }).run({
+				project: projectB,
+				prompt: "move to B",
+				chatId: "chat-rollback-failure",
+				messageId: "assistant-b",
+				userMessageId: "operation-b",
+				userMessageParentId: "operation-a",
+				continued: true,
+			}),
+		).rejects.toThrow("Failed to roll back project reassignment for chat chat-rollback-failure.");
+	});
 
 	test("retains retired source identity fences after destination commit and restart", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "gjc-reassignment-commit-"));

@@ -81,12 +81,20 @@ export function createGjcRoutingLiveGatewayRunner(
 				input.mappings.beginProjectReassignment(turn.chatId, reassignmentSource, turn.project.id);
 				reassignmentStarted = true;
 			};
-			const rollbackReassignment = () => {
+			const rollbackReassignment = (cause: unknown) => {
 				if (reassignmentSource === undefined || !reassignmentStarted) return;
 				try {
 					input.mappings.rollbackProjectReassignment(turn.chatId, reassignmentSource);
-				} catch {
-					// Exact target publication may already have committed the destination authority.
+				} catch (rollbackError) {
+					const committed = input.mappings.get(turn.chatId);
+					if (committed?.projectId === turn.project.id) {
+						reassignmentStarted = false;
+						return;
+					}
+					throw new AggregateError(
+						[cause, rollbackError],
+						`Failed to roll back project reassignment for chat ${turn.chatId}.`,
+					);
 				}
 				reassignmentStarted = false;
 			};
@@ -222,7 +230,7 @@ export function createGjcRoutingLiveGatewayRunner(
 					});
 					reassignmentStarted = false;
 				} catch (error) {
-					rollbackReassignment();
+					rollbackReassignment(error);
 					if (isModelSelectionApplyFailure(error)) throw modelSelectionError("model_selection_apply_failed");
 					throw error;
 				}
@@ -322,7 +330,7 @@ export function createGjcRoutingLiveGatewayRunner(
 					await queue.finish(result.assistantText);
 				})
 				.catch(error => {
-					rollbackReassignment();
+					rollbackReassignment(error);
 					const mappedError = isModelSelectionApplyFailure(error)
 						? modelSelectionError("model_selection_apply_failed")
 						: error;
