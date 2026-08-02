@@ -280,7 +280,7 @@ describe("GJC idle session reaper", () => {
 		expect(harness.closeCalls).toHaveLength(2);
 		await harness.reaper.stop();
 	});
-	test("explicit close does not reuse a reaped close after control activity", async () => {
+	test("explicit close regenerates a repeated ingress after control activity", async () => {
 		let harness!: ReturnType<typeof createHarness>;
 		harness = createHarness({
 			close: async (_mapping, ingress) => {
@@ -291,24 +291,28 @@ describe("GJC idle session reaper", () => {
 		await harness.reaper.runner.run(createInput());
 		harness.clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
 		await flush();
-		expect(harness.closeCalls).toHaveLength(1);
+		const firstIngress = harness.closeCalls[0]!.ingressId;
 
 		await harness.reaper.runner.run({ ...createInput(), control: { operation: "abort" } });
 		const result = await harness.reaper.closeSession(harness.mappings.mapping, {
-			ingressId: "explicit-close-after-control",
-			ingressHash: "explicit-close-after-control",
+			ingressId: firstIngress,
+			ingressHash: firstIngress,
 		});
 
 		expect(result).toEqual({ status: "closed" });
 		expect(harness.closeCalls).toHaveLength(2);
+		expect(harness.closeCalls[1]!.ingressId).not.toBe(firstIngress);
+		expect(harness.closeCalls[1]!.ingressId).toContain(":rearmed:");
 		await harness.reaper.stop();
 	});
-	test("does not reuse an unbound legacy completed close", async () => {
+	test("recognizes a legacy completed close bound to the current mapping generation", async () => {
 		const harness = createHarness();
 		harness.mappings.recordClose("legacy-close", "complete");
 		const legacy = harness.mappings.operationRecords.get("legacy-close")!;
 		harness.mappings.operationRecords.set("legacy-close", {
 			...legacy,
+			startedAt: new Date(1).toISOString(),
+			completedAt: new Date(1).toISOString(),
 			result: {
 				...legacy.result!,
 				correlation: { closeStatus: "closed" },
@@ -316,6 +320,27 @@ describe("GJC idle session reaper", () => {
 		});
 
 		harness.clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
+		await flush();
+
+		expect(harness.closeCalls).toHaveLength(0);
+		await harness.reaper.stop();
+	});
+	test("does not reuse a legacy close after the mapping generation advances", async () => {
+		const harness = createHarness();
+		harness.mappings.recordClose("legacy-close", "complete");
+		const legacy = harness.mappings.operationRecords.get("legacy-close")!;
+		harness.mappings.operationRecords.set("legacy-close", {
+			...legacy,
+			startedAt: new Date(1).toISOString(),
+			completedAt: new Date(1).toISOString(),
+			result: {
+				...legacy.result!,
+				correlation: { closeStatus: "closed" },
+			},
+		});
+		harness.mappings.publish("turn-2", 2);
+		await harness.reaper.runner.run({ ...createInput(), userMessageId: "turn-2" });
+		harness.clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS + 2);
 		await flush();
 
 		expect(harness.closeCalls).toHaveLength(1);
@@ -638,6 +663,42 @@ describe("GJC idle session reaper", () => {
 		expect(calls).toBe(1);
 		releaseDrain();
 		await cancelled;
+		await second;
+		expect(calls).toBe(2);
+		await reaper.stop();
+	});
+	test("releases the chat gate when a handed-off stream is never read", async () => {
+		const clock = new ManualTimers();
+		const mappings = new MappingFixture();
+		let calls = 0;
+		let releaseSource!: () => void;
+		const sourceDone = new Promise<void>(resolve => {
+			releaseSource = resolve;
+		});
+		const source = (async function* () {
+			await sourceDone;
+			yield "late";
+		})();
+		const reaper = createGjcIdleSessionReaper({
+			runner: {
+				run: async () => {
+					calls += 1;
+					return { chunks: source, model: "gjc" };
+				},
+			},
+			mappings,
+			closeSession: async () => ({ status: "closed" }),
+			now: () => clock.now,
+			setTimeout: (handler, timeoutMs) =>
+				clock.setTimeout(handler, timeoutMs) as unknown as ReturnType<typeof setTimeout>,
+			clearTimeout: timer => clock.clearTimeout(timer as unknown as number),
+		});
+
+		await reaper.runner.run(createInput());
+		const second = reaper.runner.run({ ...createInput(), userMessageId: "turn-2" });
+		await flush();
+		expect(calls).toBe(1);
+		releaseSource();
 		await second;
 		expect(calls).toBe(2);
 		await reaper.stop();

@@ -250,11 +250,21 @@ export async function buildResolvedAdapterServerOptions(
 function appendStartupCleanupError(startupError: unknown, cleanupError: unknown): unknown {
 	if (!(startupError instanceof Error))
 		return new AggregateError([startupError, cleanupError], "Startup failure cleanup failed");
-	const cause =
+	const causes =
 		startupError.cause === undefined
-			? cleanupError
-			: new AggregateError([startupError.cause, cleanupError], "Startup failure cleanup failed");
-	if (Reflect.defineProperty(startupError, "cause", { value: cause })) return startupError;
+			? [cleanupError]
+			: startupError.cause instanceof AggregateError
+				? [...startupError.cause.errors, cleanupError]
+				: [startupError.cause, cleanupError];
+	const cause = causes.length === 1 ? causes[0] : new AggregateError(causes, "Startup failure cleanup failed");
+	if (
+		Reflect.defineProperty(startupError, "cause", {
+			value: cause,
+			configurable: true,
+			writable: true,
+		})
+	)
+		return startupError;
 	return new AggregateError([startupError, cleanupError], "Startup failure cleanup failed");
 }
 

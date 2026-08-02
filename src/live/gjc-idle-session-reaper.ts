@@ -109,7 +109,8 @@ class IdleSessionReaper {
 				return { status: "closed" };
 			}
 			state.closeInFlight = true;
-			const result = await this.input.closeSession(current, ingress);
+			const closeIngress = this.rearmedCloseIngress(current, ingress, state);
+			const result = await this.input.closeSession(current, closeIngress);
 			if (result.status === "closed") {
 				const proof = current.attachment;
 				if (proof?.expectedCwd !== undefined)
@@ -176,46 +177,7 @@ class IdleSessionReaper {
 		onComplete: () => void,
 		onFailure: () => void,
 	): AsyncIterable<string> {
-		return this.consumeChunksGenerator(source, onComplete, onFailure);
-	}
-
-	private async *consumeChunksGenerator(
-		source: AsyncIterable<string> | Iterable<string>,
-		onComplete: () => void,
-		onFailure: () => void,
-	): AsyncGenerator<string> {
-		let settled = false;
-		const fail = () => {
-			if (settled) return;
-			settled = true;
-			onFailure();
-		};
-		try {
-			for await (const chunk of source) yield chunk;
-			if (!settled) {
-				settled = true;
-				onComplete();
-			}
-		} catch (error) {
-			fail();
-			throw error;
-		} finally {
-			if (!settled) {
-				await this.drainCancelledChunks(source);
-				fail();
-			}
-		}
-	}
-
-	private async drainCancelledChunks(source: AsyncIterable<string> | Iterable<string>): Promise<void> {
-		try {
-			for await (const _chunk of source) {
-				// Drain the underlying live queue after a client cancellation so its turn
-				// remains serialized until the runner has actually finished.
-			}
-		} catch {
-			// A failed underlying stream still releases the turn gate after draining.
-		}
+		return new TrackedChunks(source, onComplete, onFailure);
 	}
 
 	private stateFor(chatId: string): ChatState {
@@ -450,13 +412,15 @@ class IdleSessionReaper {
 	private closeOperations(mapping: SessionMapping, state?: ChatState): readonly SessionOperation[] {
 		const prefix = closeIngressId(mapping.operationId, mapping);
 		const persisted = this.input.mappings.operations?.(mapping.chatId);
-		if (persisted !== undefined)
+		if (persisted !== undefined) {
+			const currentOperation = this.input.mappings.operation(mapping.chatId, mapping.operationId);
 			return persisted.filter(
 				operation =>
 					operation.kind === "close" &&
-					(operationResultMatchesMapping(operation, mapping) ||
+					(operationResultMatchesMapping(operation, mapping, currentOperation) ||
 						(operation.state !== "complete" && closeOperationIndex(operation, prefix) >= 0)),
 			);
+		}
 		const operations: SessionOperation[] = [];
 		const maxAttempt = state?.closeAttempt ?? 0;
 		for (let attempt = 0; attempt <= maxAttempt; attempt++) {
@@ -478,6 +442,19 @@ class IdleSessionReaper {
 		const ingressId = closeIngressIdForAttempt(prefix, nextAttempt);
 		return { ingressId, ingressHash: ingressId };
 	}
+	private rearmedCloseIngress(
+		mapping: SessionMapping,
+		ingress: SessionCloseIngress,
+		state: ChatState,
+	): SessionCloseIngress {
+		const prior = this.input.mappings.operation(mapping.chatId, ingress.ingressId);
+		if (!state.rearmAfterActivity || prior?.kind !== "close" || prior.state !== "complete") return ingress;
+		const rearmKey = `${mapping.operationId}:${state.lastActivityAt}`;
+		return {
+			ingressId: `${ingress.ingressId}:rearmed:${rearmKey}`,
+			ingressHash: `${ingress.ingressHash}:rearmed:${rearmKey}`,
+		};
+	}
 	private adoptCurrentMapping(state: ChatState, mapping: SessionMapping): void {
 		state.rearmAfterActivity = false;
 		state.mapping = mapping;
@@ -488,18 +465,26 @@ class IdleSessionReaper {
 		state.lastActivityAt = operationCompletedAt(operation) ?? this.#now();
 	}
 }
-function operationResultMatchesMapping(operation: SessionOperation, mapping: SessionMapping): boolean {
+function operationResultMatchesMapping(
+	operation: SessionOperation,
+	mapping: SessionMapping,
+	currentOperation: SessionOperation | undefined,
+): boolean {
 	const result = operation.result;
 	const resultMapping = result?.mapping;
-	return (
+	const matchesIdentity =
 		resultMapping !== undefined &&
-		result?.correlation?.mappingOperationId === mapping.operationId &&
 		resultMapping.chatId === mapping.chatId &&
 		resultMapping.projectId === mapping.projectId &&
 		resultMapping.sessionId === mapping.sessionId &&
 		resultMapping.sessionFile === mapping.sessionFile &&
-		JSON.stringify(resultMapping.attachment) === JSON.stringify(mapping.attachment)
-	);
+		JSON.stringify(resultMapping.attachment) === JSON.stringify(mapping.attachment);
+	if (!matchesIdentity) return false;
+	if (result?.correlation?.mappingOperationId !== undefined)
+		return result.correlation.mappingOperationId === mapping.operationId;
+	const mappingCompletedAt = operationCompletedAt(currentOperation);
+	const closeActivityAt = operationActivityAt(operation);
+	return mappingCompletedAt !== undefined && closeActivityAt !== undefined && closeActivityAt > mappingCompletedAt;
 }
 function closeIngressIdForAttempt(prefix: string, attempt: number): string {
 	return attempt === 0 ? prefix : `${prefix}:retry:${attempt}`;
@@ -528,6 +513,56 @@ interface ChatState {
 	closeInFlight: boolean;
 }
 
+class TrackedChunks implements AsyncIterable<string> {
+	readonly #chunks: string[] = [];
+	readonly #waiters: Array<() => void> = [];
+	#finished = false;
+	#error: unknown;
+
+	constructor(
+		source: AsyncIterable<string> | Iterable<string>,
+		private readonly onComplete: () => void,
+		private readonly onFailure: () => void,
+	) {
+		void this.pump(source);
+	}
+
+	async *[Symbol.asyncIterator](): AsyncGenerator<string> {
+		let index = 0;
+		for (;;) {
+			if (index < this.#chunks.length) {
+				yield this.#chunks[index]!;
+				index += 1;
+				continue;
+			}
+			if (this.#finished) {
+				if (this.#error !== undefined) throw this.#error;
+				return;
+			}
+			await new Promise<void>(resolve => this.#waiters.push(resolve));
+		}
+	}
+
+	private async pump(source: AsyncIterable<string> | Iterable<string>): Promise<void> {
+		try {
+			for await (const chunk of source) {
+				this.#chunks.push(chunk);
+				this.notify();
+			}
+			this.onComplete();
+		} catch (error) {
+			this.#error = error;
+			this.onFailure();
+		} finally {
+			this.#finished = true;
+			this.notify();
+		}
+	}
+
+	private notify(): void {
+		for (const resolve of this.#waiters.splice(0)) resolve();
+	}
+}
 class SerialGate {
 	#tail = Promise.resolve();
 	async acquire(): Promise<() => void> {
