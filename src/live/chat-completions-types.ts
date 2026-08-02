@@ -49,6 +49,8 @@ export type LiveGatewayRunnerResult =
 	| {
 			readonly content?: undefined;
 			readonly chunks: AsyncIterable<string> | Iterable<string>;
+			/** Releases a stream that the HTTP response abandoned before reading chunks. */
+			readonly abandon?: () => Promise<void>;
 			readonly events?: readonly OpenWebUIMessageEvent[];
 			readonly model?: string;
 	  };

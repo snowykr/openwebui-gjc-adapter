@@ -155,14 +155,12 @@ class IdleSessionReaper {
 			const outcome: RunOutcome = turn.control === undefined ? "turn" : "control";
 			if (result.chunks !== undefined) {
 				handedOff = true;
-				return {
-					...result,
-					chunks: this.consumeChunks(
-						result.chunks,
-						() => finalize(outcome),
-						() => finalize("failure"),
-					),
-				};
+				const chunks = this.consumeChunks(
+					result.chunks,
+					() => finalize(outcome),
+					() => finalize("failure"),
+				);
+				return { ...result, chunks, abandon: () => chunks.abandon() };
 			}
 			finalize(outcome);
 			return result;
@@ -176,7 +174,7 @@ class IdleSessionReaper {
 		source: AsyncIterable<string> | Iterable<string>,
 		onComplete: () => void,
 		onFailure: () => void,
-	): AsyncIterable<string> {
+	): TrackedChunks {
 		return new TrackedChunks(source, onComplete, onFailure);
 	}
 
@@ -514,54 +512,87 @@ interface ChatState {
 }
 
 class TrackedChunks implements AsyncIterable<string> {
-	readonly #chunks: string[] = [];
-	readonly #waiters: Array<() => void> = [];
+	readonly #iterator: AsyncIterator<string> | Iterator<string>;
 	#finished = false;
 	#error: unknown;
+	#draining: Promise<void> | undefined;
+	#nextInFlight: Promise<IteratorResult<string>> | undefined;
 
 	constructor(
 		source: AsyncIterable<string> | Iterable<string>,
 		private readonly onComplete: () => void,
 		private readonly onFailure: () => void,
 	) {
-		void this.pump(source);
+		this.#iterator = chunkIterator(source);
 	}
 
-	async *[Symbol.asyncIterator](): AsyncGenerator<string> {
-		let index = 0;
-		for (;;) {
-			if (index < this.#chunks.length) {
-				yield this.#chunks[index]!;
-				index += 1;
-				continue;
-			}
-			if (this.#finished) {
-				if (this.#error !== undefined) throw this.#error;
-				return;
-			}
-			await new Promise<void>(resolve => this.#waiters.push(resolve));
+	[Symbol.asyncIterator](): AsyncIterator<string> {
+		return {
+			next: () => this.next(),
+			return: async () => {
+				await this.abandon();
+				return { value: undefined, done: true };
+			},
+		};
+	}
+
+	async abandon(): Promise<void> {
+		if (this.#finished) return;
+		if (this.#draining !== undefined) return await this.#draining;
+		const drain = this.drain();
+		this.#draining = drain;
+		await drain;
+	}
+
+	private async next(): Promise<IteratorResult<string>> {
+		if (this.#finished) {
+			if (this.#error !== undefined) throw this.#error;
+			return { value: undefined, done: true };
 		}
+		return await this.read();
 	}
 
-	private async pump(source: AsyncIterable<string> | Iterable<string>): Promise<void> {
+	private async drain(): Promise<void> {
 		try {
-			for await (const chunk of source) {
-				this.#chunks.push(chunk);
-				this.notify();
-			}
-			this.onComplete();
-		} catch (error) {
-			this.#error = error;
-			this.onFailure();
-		} finally {
-			this.#finished = true;
-			this.notify();
+			await this.#nextInFlight;
+			while (!this.#finished) await this.read();
+		} catch {
+			// read() already records the stream failure and releases the chat gate.
 		}
 	}
 
-	private notify(): void {
-		for (const resolve of this.#waiters.splice(0)) resolve();
+	private async read(): Promise<IteratorResult<string>> {
+		const next = Promise.resolve(this.#iterator.next());
+		this.#nextInFlight = next;
+		try {
+			const result = await next;
+			if (result.done) this.complete();
+			return result;
+		} catch (error) {
+			this.fail(error);
+			throw error;
+		} finally {
+			if (this.#nextInFlight === next) this.#nextInFlight = undefined;
+		}
 	}
+
+	private complete(): void {
+		if (this.#finished) return;
+		this.#finished = true;
+		this.onComplete();
+	}
+
+	private fail(error: unknown): void {
+		if (this.#finished) return;
+		this.#finished = true;
+		this.#error = error;
+		this.onFailure();
+	}
+}
+
+function chunkIterator(source: AsyncIterable<string> | Iterable<string>): AsyncIterator<string> | Iterator<string> {
+	if (Symbol.asyncIterator in source) return source[Symbol.asyncIterator]();
+	return source[Symbol.iterator]();
 }
 class SerialGate {
 	#tail = Promise.resolve();

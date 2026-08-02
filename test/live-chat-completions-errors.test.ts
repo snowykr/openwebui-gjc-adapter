@@ -81,6 +81,34 @@ describe("live OpenAI-compatible chat completion errors", () => {
 			"data: [DONE]\n\n",
 		]);
 	});
+	it("abandons an unconsumed runner stream when the SSE response closes after its role frame", async () => {
+		let abandoned = 0;
+		const result = await handleChatCompletions({
+			request: { ...request, stream: true },
+			headers: chatHeaders,
+			projects: [project],
+			owner,
+			runner: {
+				run: () => ({
+					chunks: (async function* () {
+						yield "never-read";
+					})(),
+					abandon: async () => {
+						abandoned += 1;
+					},
+					model: "gjc/anthropic/claude-sonnet-4:low",
+				}),
+			},
+			now: new Date("2026-07-08T00:00:00.000Z"),
+			idFactory: () => "chatcmpl-stream-cancelled",
+		});
+
+		if (!("stream" in result)) throw new Error("expected stream result");
+		const iterator = result.stream[Symbol.asyncIterator]();
+		await iterator.next();
+		await iterator.return?.();
+		expect(abandoned).toBe(1);
+	});
 
 	it("fails closed before sinks when the runner omits canonical model metadata", async () => {
 		const effects: string[] = [];

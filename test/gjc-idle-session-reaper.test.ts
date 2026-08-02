@@ -694,11 +694,15 @@ describe("GJC idle session reaper", () => {
 			clearTimeout: timer => clock.clearTimeout(timer as unknown as number),
 		});
 
-		await reaper.runner.run(createInput());
+		const first = await reaper.runner.run(createInput());
+		if (first.chunks === undefined || first.abandon === undefined)
+			throw new Error("Expected streamed runner result.");
+		const abandoned = first.abandon();
 		const second = reaper.runner.run({ ...createInput(), userMessageId: "turn-2" });
 		await flush();
 		expect(calls).toBe(1);
 		releaseSource();
+		await abandoned;
 		await second;
 		expect(calls).toBe(2);
 		await reaper.stop();

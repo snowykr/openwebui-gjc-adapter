@@ -13,6 +13,7 @@ export async function* encodeChatCompletionSse(input: {
 	readonly created: number;
 	readonly model: string;
 	readonly chunks: AsyncIterable<string> | Iterable<string>;
+	readonly onAbandon?: () => Promise<void>;
 }): AsyncIterable<string> {
 	const base = {
 		id: input.id,
@@ -24,20 +25,24 @@ export async function* encodeChatCompletionSse(input: {
 		...base,
 		choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
 	};
-	yield `data: ${JSON.stringify(initial)}\n\n`;
-	for await (const content of input.chunks) {
-		const chunk: OpenAIChatCompletionChunk = {
+	try {
+		yield `data: ${JSON.stringify(initial)}\n\n`;
+		for await (const content of input.chunks) {
+			const chunk: OpenAIChatCompletionChunk = {
+				...base,
+				choices: [{ index: 0, delta: { content }, finish_reason: null }],
+			};
+			yield `data: ${JSON.stringify(chunk)}\n\n`;
+		}
+		const terminal: OpenAIChatCompletionChunk = {
 			...base,
-			choices: [{ index: 0, delta: { content }, finish_reason: null }],
+			choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
 		};
-		yield `data: ${JSON.stringify(chunk)}\n\n`;
+		yield `data: ${JSON.stringify(terminal)}\n\n`;
+		yield "data: [DONE]\n\n";
+	} finally {
+		await input.onAbandon?.();
 	}
-	const terminal: OpenAIChatCompletionChunk = {
-		...base,
-		choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-	};
-	yield `data: ${JSON.stringify(terminal)}\n\n`;
-	yield "data: [DONE]\n\n";
 }
 
 export function buildCompletion(input: {
