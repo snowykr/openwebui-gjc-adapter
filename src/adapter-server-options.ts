@@ -15,6 +15,7 @@ import { type AdapterConfig, loadAdapterConfig, type ResolvedAdapterConfig } fro
 import { FileBackedSessionMappingStore, type SessionMapping, type SessionMappingStore } from "./gjc/session-router";
 import type { GjcCloseReceipt } from "./gjc/turn-runner";
 import type { LiveGatewayEventSink, LiveGatewayMessageSink } from "./live/chat-completions";
+import { createGjcIdleSessionReaper } from "./live/gjc-idle-session-reaper";
 import {
 	createGjcRoutingLiveGatewayRunner,
 	createPublicSdkGjcTurnRunner,
@@ -134,6 +135,29 @@ export async function buildResolvedAdapterServerOptions(
 				sessionPortFactory: dependencies.sessionPortFactory,
 			});
 		const closeSession = createAdapterSessionCloser(config, cliPath, { ...dependencies, turnRunner }, mappings);
+		const routingRunner = createGjcRoutingLiveGatewayRunner({
+			turnRunner,
+			mappings,
+			ownerUserId: owner.ownerUserId,
+			modelReaderFactory,
+			...(outbox === undefined ? {} : { outbox }),
+		});
+		const idleSessionReaper =
+			closeSession === undefined
+				? undefined
+				: createGjcIdleSessionReaper({
+						runner: routingRunner,
+						mappings,
+						closeSession,
+						...(turnRunner.discardSessionAttachment === undefined
+							? {}
+							: {
+									discardSessionAttachment: (cwd, sessionId) =>
+										turnRunner.discardSessionAttachment?.(cwd, sessionId),
+								}),
+					});
+		const runner = idleSessionReaper?.runner ?? routingRunner;
+		const closeSessionForRoutes = idleSessionReaper?.closeSession ?? closeSession;
 		const projectLinkService = new ProjectLinkService({
 			allowedRoots,
 			store: projectStore,
@@ -142,7 +166,7 @@ export async function buildResolvedAdapterServerOptions(
 			mappings,
 			protectedPaths: config.runtimeLocations.protectedProjectPaths,
 			runtimeLocations: config.runtimeLocations,
-			...(closeSession === undefined ? {} : { closeSession }),
+			...(closeSessionForRoutes === undefined ? {} : { closeSession: closeSessionForRoutes }),
 		});
 		const previouslyLinkedProjectIds = new Set(projectLinkService.listLinkedProjects().map(project => project.id));
 		await projectLinkService.seedConfiguredProjects(projects);
@@ -182,16 +206,10 @@ export async function buildResolvedAdapterServerOptions(
 				projectLinkService,
 				...(projectionRepository === undefined ? {} : { projectContextRepository: projectionRepository }),
 				owner,
-				runner: createGjcRoutingLiveGatewayRunner({
-					turnRunner,
-					mappings,
-					ownerUserId: owner.ownerUserId,
-					modelReaderFactory,
-					...(outbox === undefined ? {} : { outbox }),
-				}),
+				runner,
 				modelReaderFactory,
 				mappings,
-				closeSession,
+				closeSession: closeSessionForRoutes,
 				neutralWorkspace: config.runtimeLocations.readerWorkspace,
 				requireAdapterApiToken: true,
 				...(config.adapterApiToken === undefined ? {} : { adapterApiToken: config.adapterApiToken }),
