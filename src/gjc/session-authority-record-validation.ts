@@ -141,7 +141,7 @@ export function isAuthorityDocumentRelationallyValid(
 		for (const root of reassignmentTombstoneRoots(mapping.reassignment)) {
 			let tombstone: SessionAuthorityTombstone | undefined = root;
 			while (tombstone !== undefined) {
-				if (tombstone.chatId !== mapping.chatId || tombstone.projectId === mapping.projectId) return false;
+				if (tombstone.chatId !== mapping.chatId) return false;
 				if (!hasUniqueTombstoneIdentities(tombstone) || !hasConsistentTombstoneResults(tombstone)) return false;
 				for (const operation of tombstone.journal)
 					for (const identifier of operationIdentifiers(operation))

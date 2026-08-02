@@ -485,6 +485,54 @@ test("file rejects an invalid retained prior tombstone during a pending reassign
 		rmSync(directory, { recursive: true, force: true });
 	}
 });
+test("file accepts reassignment back to a prior project", () => {
+	const directory = mkdtempSync(join(tmpdir(), "gjc-mapping-return-project-"));
+	const filePath = join(directory, "authority.json");
+	try {
+		const store = new FileBackedSessionMappingStore(filePath);
+		const source = mapping();
+		const move = (projectId: string, id: string, sessionId: string) => {
+			const target = {
+				chatId: source.chatId,
+				projectId,
+				id,
+				ingressId: id,
+				kind: "create" as const,
+				detail: `move to ${projectId}`,
+			};
+			const active = store.get(source.chatId)!;
+			store.beginProjectReassignment(source.chatId, active.projectId, target.projectId, {
+				id: target.id,
+				ingressId: target.ingressId,
+				kind: target.kind,
+				detail: target.detail,
+			});
+			store.reserveProvisionalOperation(target);
+			store.publishProvisionalOperation(target, {
+				...active,
+				projectId: target.projectId,
+				sessionId,
+				operationId: target.id,
+				attachment: { ...active.attachment!, expectedSessionId: sessionId },
+			});
+		};
+
+		store.set(source);
+		move("project-2", "operation-b", "session-b");
+		move(source.projectId, "operation-return", "session-return");
+
+		expect(store.get(source.chatId)).toMatchObject({
+			projectId: source.projectId,
+			sessionId: "session-return",
+		});
+		expect(new FileBackedSessionMappingStore(filePath).get(source.chatId)).toMatchObject({
+			projectId: source.projectId,
+			sessionId: "session-return",
+		});
+	} finally {
+		rmSync(directory, { recursive: true, force: true });
+	}
+});
 test("file rejects persisted journal/provisional cross-field collisions in either order", () => {
 	for (const operation of [
 		{ id: "other-provisional-id", ingressId: "initial-operation" },
