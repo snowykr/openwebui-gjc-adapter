@@ -43,17 +43,13 @@ export async function startAdapterServer(options: AdapterServerOptions): Promise
 		return {
 			url: server.url.toString(),
 			async stop(): Promise<void> {
-				const failures: unknown[] = [];
-				try {
-					await server.stop();
-				} catch (error) {
-					failures.push(error);
-				}
-				try {
-					await options.routes?.runner.stop?.();
-				} catch (error) {
-					failures.push(error);
-				}
+				const shutdowns = await Promise.allSettled([
+					Promise.resolve().then(() => server.stop()),
+					Promise.resolve().then(() => options.routes?.runner.stop?.()),
+				]);
+				const failures = shutdowns
+					.filter((result): result is PromiseRejectedResult => result.status === "rejected")
+					.map(result => result.reason);
 				try {
 					await lock.release();
 				} catch (error) {

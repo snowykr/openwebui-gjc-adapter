@@ -255,24 +255,29 @@ class IdleSessionReaper {
 	private refreshMappings(): void {
 		for (const mapping of this.input.mappings.entries()) {
 			if (!hasOwnedPaneAttachment(mapping.attachment)) continue;
+			const operations = this.input.mappings.operations?.(mapping.chatId);
 			const closeOperations = this.closeOperations(mapping);
 			const alreadyClosed = closeOperations.some(operation => operation.state === "complete");
-			const operation = this.input.mappings.operation(mapping.chatId, mapping.operationId);
-			if (operation !== undefined && operation.state !== "complete") continue;
-			const completedAt = operationCompletedAt(operation);
-			if (completedAt === undefined) continue;
+			const lastCloseAt = latestCompletedAt(closeOperations);
+			const currentOperation = this.input.mappings.operation(mapping.chatId, mapping.operationId);
+			const activityAt = mappingActivityAt(
+				mapping,
+				operations ?? (currentOperation === undefined ? [] : [currentOperation]),
+			);
+			if (activityAt === undefined) continue;
 			const generation = mappingGeneration(mapping);
+			const rearmAfterActivity = alreadyClosed && (lastCloseAt === undefined || activityAt > lastCloseAt);
 			const state = this.#states.get(mapping.chatId);
 			if (state === undefined) {
 				this.#states.set(mapping.chatId, {
 					chatId: mapping.chatId,
 					mapping,
 					generation,
-					lastActivityAt: completedAt,
+					lastActivityAt: activityAt,
 					active: 0,
 					closeAttempt: 0,
-					rearmAfterActivity: false,
-					closed: alreadyClosed,
+					rearmAfterActivity,
+					closed: alreadyClosed && !rearmAfterActivity,
 					closeQueued: false,
 					closeInFlight: false,
 					gate: new SerialGate(),
@@ -286,9 +291,23 @@ class IdleSessionReaper {
 				state.mapping = mapping;
 				state.generation = generation;
 				state.closeAttempt = 0;
-				state.rearmAfterActivity = false;
-				state.lastActivityAt = completedAt;
-				state.closed = alreadyClosed;
+				state.rearmAfterActivity = rearmAfterActivity;
+				state.lastActivityAt = activityAt;
+				state.closed = alreadyClosed && !rearmAfterActivity;
+				continue;
+			}
+			if (
+				state.generation === generation &&
+				activityAt > state.lastActivityAt &&
+				state.active === 0 &&
+				!state.closeQueued &&
+				!state.closeInFlight
+			) {
+				state.lastActivityAt = activityAt;
+				if (rearmAfterActivity) {
+					state.rearmAfterActivity = true;
+					state.closed = false;
+				}
 			}
 		}
 	}
@@ -514,6 +533,52 @@ function operationCompletedAt(
 	return Number.isFinite(timestamp) ? timestamp : undefined;
 }
 
+function latestCompletedAt(operations: readonly SessionOperation[]): number | undefined {
+	let latest: number | undefined;
+	for (const operation of operations) {
+		const completedAt = operationCompletedAt(operation);
+		if (completedAt !== undefined && (latest === undefined || completedAt > latest)) latest = completedAt;
+	}
+	return latest;
+}
+
+function mappingActivityAt(mapping: SessionMapping, operations: readonly SessionOperation[]): number | undefined {
+	const generation = mappingGeneration(mapping);
+	const current = operations.find(
+		operation => operation.id === mapping.operationId || operation.ingressId === mapping.operationId,
+	);
+	const baseline = operationActivityAt(current) ?? Number.NEGATIVE_INFINITY;
+	let latest = baseline === Number.NEGATIVE_INFINITY ? undefined : baseline;
+	for (const operation of operations) {
+		if (operation.kind === "close") continue;
+		const operationAt = operationActivityAt(operation);
+		if (operationAt === undefined) continue;
+		const resultMapping = operation.result?.mapping;
+		const sameGeneration = resultMapping === undefined || mappingGeneration(resultMapping) === generation;
+		const isCurrent = operation.id === mapping.operationId || operation.ingressId === mapping.operationId;
+		const hasSameGenerationResult = resultMapping !== undefined && sameGeneration;
+		const isReconciliation = ["pending", "uncertain", "conflict"].includes(operation.state);
+		if (!sameGeneration || (!isCurrent && !hasSameGenerationResult && (!isReconciliation || operationAt < baseline)))
+			continue;
+		if (latest === undefined || operationAt > latest) latest = operationAt;
+	}
+	return latest;
+}
+
+function operationActivityAt(
+	operation: Pick<SessionOperation, "startedAt" | "completedAt"> | undefined,
+): number | undefined {
+	if (operation === undefined) return undefined;
+	const completedAt = parseTimestamp(operation.completedAt);
+	if (completedAt !== undefined) return completedAt;
+	return parseTimestamp(operation.startedAt);
+}
+
+function parseTimestamp(value: string | undefined): number | undefined {
+	if (value === undefined) return undefined;
+	const timestamp = Date.parse(value);
+	return Number.isFinite(timestamp) ? timestamp : undefined;
+}
 function mappingGeneration(mapping: SessionMapping): string {
 	return JSON.stringify([
 		mapping.chatId,

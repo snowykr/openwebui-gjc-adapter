@@ -324,15 +324,25 @@ describe("Bun transport configuration", () => {
 			await rm(runtimeRoot, { force: true, recursive: true });
 		}
 	});
-	test("stops the route runner before releasing the lock during normal shutdown", async () => {
+	test("starts server and runner shutdown concurrently, then releases the lock", async () => {
 		const runtimeRoot = await mkdtemp(join(tmpdir(), "openwebui-gjc-adapter-server-"));
 		const events: string[] = [];
+		let releaseServer!: () => void;
+		let releaseRunner!: () => void;
+		const serverReady = new Promise<void>(resolve => {
+			releaseServer = resolve;
+		});
+		const runnerReady = new Promise<void>(resolve => {
+			releaseRunner = resolve;
+		});
 		const serve = spyOn(Bun, "serve").mockImplementation(
 			() =>
 				({
 					url: new URL("http://adapter.test/"),
 					stop: async () => {
-						events.push("server");
+						events.push("server-start");
+						await serverReady;
+						events.push("server-end");
 					},
 				}) as never,
 		);
@@ -355,13 +365,22 @@ describe("Bun transport configuration", () => {
 					runner: {
 						run: () => ({ content: "unused", model: LOW_MODEL_ID }),
 						stop: async () => {
-							events.push("runner");
+							events.push("runner-start");
+							await runnerReady;
+							events.push("runner-end");
 						},
 					},
 				},
 			});
-			await handle.stop();
-			expect(events).toEqual(["server", "runner", "lock"]);
+			const stopping = handle.stop();
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(events).toEqual(["server-start", "runner-start"]);
+			expect(events).not.toContain("lock");
+			releaseRunner();
+			releaseServer();
+			await stopping;
+			expect(events).toEqual(["server-start", "runner-start", "runner-end", "server-end", "lock"]);
 		} finally {
 			release.mockRestore();
 			serve.mockRestore();

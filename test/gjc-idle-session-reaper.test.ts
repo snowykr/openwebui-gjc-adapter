@@ -55,6 +55,16 @@ class MappingFixture {
 			detail: ingressId,
 		});
 	}
+	recordActivity(id: string, state: SessionOperation["state"], startedAt: number): void {
+		this.operationRecords.set(id, {
+			id,
+			kind: "prompt",
+			state,
+			ingressId: id,
+			startedAt: new Date(startedAt).toISOString(),
+			detail: `activity:${id}`,
+		});
+	}
 	publish(operationId: string, completedAt = 0): void {
 		this.mapping = createMapping(operationId);
 		this.operationRecords.set(operationId, completedOperation(operationId, completedAt));
@@ -339,6 +349,55 @@ describe("GJC idle session reaper", () => {
 			clearTimeout: timer => clock.clearTimeout(timer as unknown as number),
 		});
 		expect(clock.count()).toBe(0);
+		clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS * 2);
+		await flush();
+		expect(closeCalls).toBe(0);
+		await reaper.stop();
+	});
+	test("restart activity uses a newer uncertain journal operation for the current mapping generation", async () => {
+		const clock = new ManualTimers();
+		clock.now = 1_000;
+		const mappings = new MappingFixture();
+		mappings.recordActivity("turn-interrupted", "uncertain", 500);
+		const closeCalls: string[] = [];
+		const reaper = createGjcIdleSessionReaper({
+			runner: { run: async () => ({ content: "done", model: "gjc" }) },
+			mappings,
+			closeSession: async (_mapping, ingress) => {
+				closeCalls.push(ingress.ingressId);
+				return { status: "closed" };
+			},
+			now: () => clock.now,
+			setTimeout: (handler, timeoutMs) =>
+				clock.setTimeout(handler, timeoutMs) as unknown as ReturnType<typeof setTimeout>,
+			clearTimeout: timer => clock.clearTimeout(timer as unknown as number),
+		});
+		clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS - 1_000);
+		await flush();
+		expect(closeCalls).toHaveLength(0);
+		clock.advance(500);
+		await flush();
+		expect(closeCalls).toHaveLength(1);
+		await reaper.stop();
+	});
+	test("restart pending journal activity remains a no-close guard", async () => {
+		const clock = new ManualTimers();
+		clock.now = 1_000;
+		const mappings = new MappingFixture();
+		mappings.recordActivity("turn-pending", "pending", 500);
+		let closeCalls = 0;
+		const reaper = createGjcIdleSessionReaper({
+			runner: { run: async () => ({ content: "done", model: "gjc" }) },
+			mappings,
+			closeSession: async () => {
+				closeCalls += 1;
+				return { status: "closed" };
+			},
+			now: () => clock.now,
+			setTimeout: (handler, timeoutMs) =>
+				clock.setTimeout(handler, timeoutMs) as unknown as ReturnType<typeof setTimeout>,
+			clearTimeout: timer => clock.clearTimeout(timer as unknown as number),
+		});
 		clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS * 2);
 		await flush();
 		expect(closeCalls).toBe(0);
