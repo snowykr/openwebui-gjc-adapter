@@ -324,6 +324,50 @@ describe("Bun transport configuration", () => {
 			await rm(runtimeRoot, { force: true, recursive: true });
 		}
 	});
+	test("stops the route runner before releasing the lock during normal shutdown", async () => {
+		const runtimeRoot = await mkdtemp(join(tmpdir(), "openwebui-gjc-adapter-server-"));
+		const events: string[] = [];
+		const serve = spyOn(Bun, "serve").mockImplementation(
+			() =>
+				({
+					url: new URL("http://adapter.test/"),
+					stop: async () => {
+						events.push("server");
+					},
+				}) as never,
+		);
+		const lock = await RuntimeSingletonLock.acquire(runtimeRoot);
+		const originalRelease = lock.release.bind(lock);
+		const release = spyOn(lock, "release").mockImplementation(async () => {
+			events.push("lock");
+			await originalRelease();
+		});
+		try {
+			const handle = await startAdapterServer({
+				host: "127.0.0.1",
+				port: 0,
+				runtimeRoot,
+				runtimeLock: lock,
+				turnTimeoutMs: 180_000,
+				routes: {
+					projects: [project],
+					owner,
+					runner: {
+						run: () => ({ content: "unused", model: LOW_MODEL_ID }),
+						stop: async () => {
+							events.push("runner");
+						},
+					},
+				},
+			});
+			await handle.stop();
+			expect(events).toEqual(["server", "runner", "lock"]);
+		} finally {
+			release.mockRestore();
+			serve.mockRestore();
+			await rm(runtimeRoot, { force: true, recursive: true });
+		}
+	});
 	test("rounds configured turn timeouts up, with headroom, and disables idle timeout above Bun's limit", async () => {
 		const runtimeRoot = await mkdtemp(join(tmpdir(), "openwebui-gjc-adapter-server-"));
 		const serve = spyOn(Bun, "serve");

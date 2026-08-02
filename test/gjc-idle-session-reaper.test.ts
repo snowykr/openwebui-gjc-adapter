@@ -41,7 +41,17 @@ class MappingFixture {
 			state,
 			ingressId,
 			startedAt: new Date(0).toISOString(),
-			...(state === "complete" ? { completedAt: new Date(0).toISOString() } : {}),
+			...(state === "complete"
+				? {
+						completedAt: new Date(0).toISOString(),
+						result: {
+							kind: "close" as const,
+							assistantText: "",
+							events: [],
+							mapping: this.mapping,
+						},
+					}
+				: {}),
 			detail: ingressId,
 		});
 	}
@@ -265,6 +275,75 @@ describe("GJC idle session reaper", () => {
 		expect(harness.closeCalls[1]?.ingressId).toContain(":retry:1");
 		await harness.reaper.stop();
 	});
+	test("rearms idle cleanup after a control completes on a closed generation", async () => {
+		let harness!: ReturnType<typeof createHarness>;
+		harness = createHarness({
+			close: async (_mapping, ingress) => {
+				harness.mappings.recordClose(ingress.ingressId, "complete");
+				return { status: "closed" };
+			},
+		});
+		await harness.reaper.runner.run(createInput());
+		harness.clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
+		await flush();
+		expect(harness.closeCalls).toHaveLength(1);
+		await harness.reaper.runner.run({ ...createInput(), control: { operation: "abort" } });
+		harness.clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
+		await flush();
+		expect(harness.closeCalls).toHaveLength(2);
+		expect(harness.closeCalls[1]?.ingressId).toContain(":retry:1");
+		await harness.reaper.stop();
+	});
+
+	test("rearms idle cleanup after a failed cold-resume attempt", async () => {
+		let runCalls = 0;
+		let harness!: ReturnType<typeof createHarness>;
+		harness = createHarness({
+			run: async () => {
+				runCalls += 1;
+				if (runCalls === 2) throw new Error("cold resume failed");
+				return { content: "done", model: "gjc" };
+			},
+			close: async (_mapping, ingress) => {
+				harness.mappings.recordClose(ingress.ingressId, "complete");
+				return { status: "closed" };
+			},
+		});
+		await harness.reaper.runner.run(createInput());
+		harness.clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
+		await flush();
+		await expect(harness.reaper.runner.run({ ...createInput(), userMessageId: "turn-2" })).rejects.toThrow(
+			"cold resume failed",
+		);
+		harness.clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
+		await flush();
+		expect(harness.closeCalls).toHaveLength(2);
+		expect(harness.closeCalls[1]?.ingressId).toContain(":retry:1");
+		await harness.reaper.stop();
+	});
+	test("recognizes an explicit completed close after reaper restart", async () => {
+		const clock = new ManualTimers();
+		const mappings = new MappingFixture();
+		mappings.recordClose("manual-close-operation", "complete");
+		let closeCalls = 0;
+		const reaper = createGjcIdleSessionReaper({
+			runner: { run: async () => ({ content: "done", model: "gjc" }) },
+			mappings,
+			closeSession: async () => {
+				closeCalls += 1;
+				return { status: "closed" };
+			},
+			now: () => clock.now,
+			setTimeout: (handler, timeoutMs) =>
+				clock.setTimeout(handler, timeoutMs) as unknown as ReturnType<typeof setTimeout>,
+			clearTimeout: timer => clock.clearTimeout(timer as unknown as number),
+		});
+		expect(clock.count()).toBe(0);
+		clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS * 2);
+		await flush();
+		expect(closeCalls).toBe(0);
+		await reaper.stop();
+	});
 
 	test("stop waits for an in-flight idle close before stopping the base runner", async () => {
 		let releaseClose!: () => void;
@@ -328,6 +407,61 @@ describe("GJC idle session reaper", () => {
 		await runner.stop();
 		expect(clock.count()).toBe(0);
 		expect(stopped).toBe(1);
+	});
+	test("holds the chat gate while a canceled stream drains its underlying source", async () => {
+		const clock = new ManualTimers();
+		const mappings = new MappingFixture();
+		let calls = 0;
+		let first = true;
+		let releaseDrain!: () => void;
+		const drainReady = new Promise<void>(resolve => {
+			releaseDrain = resolve;
+		});
+		const sourceIterator: AsyncIterator<string> & AsyncIterable<string> = {
+			async next() {
+				if (first) {
+					first = false;
+					return { value: "first", done: false };
+				}
+				await drainReady;
+				return { value: undefined, done: true };
+			},
+			async return() {
+				return { value: undefined, done: true };
+			},
+			[Symbol.asyncIterator]() {
+				return this;
+			},
+		};
+		const reaper = createGjcIdleSessionReaper({
+			runner: {
+				run: async () => {
+					calls += 1;
+					return { chunks: sourceIterator, model: "gjc" };
+				},
+			},
+			mappings,
+			closeSession: async () => ({ status: "closed" }),
+			now: () => clock.now,
+			setTimeout: (handler, timeoutMs) =>
+				clock.setTimeout(handler, timeoutMs) as unknown as ReturnType<typeof setTimeout>,
+			clearTimeout: timer => clock.clearTimeout(timer as unknown as number),
+		});
+		const firstResult = await reaper.runner.run(createInput());
+		const iterator = (firstResult.chunks as AsyncIterable<string>)[Symbol.asyncIterator]();
+		await iterator.next();
+		const cancelled = (
+			iterator as AsyncIterator<string> & { return?: () => Promise<IteratorResult<string>> }
+		).return?.();
+		await flush();
+		const second = reaper.runner.run({ ...createInput(), userMessageId: "turn-2" });
+		await flush();
+		expect(calls).toBe(1);
+		releaseDrain();
+		await cancelled;
+		await second;
+		expect(calls).toBe(2);
+		await reaper.stop();
 	});
 });
 test("adapter initialization failure stops the constructed reaper", async () => {

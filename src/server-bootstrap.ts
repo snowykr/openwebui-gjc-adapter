@@ -43,13 +43,23 @@ export async function startAdapterServer(options: AdapterServerOptions): Promise
 		return {
 			url: server.url.toString(),
 			async stop(): Promise<void> {
-				const results = await Promise.allSettled([server.stop(), options.routes?.runner.stop?.(), lock.release()]);
-				const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
-				if (failures.length > 0)
-					throw new AggregateError(
-						failures.map(result => result.reason),
-						"Server cleanup failed",
-					);
+				const failures: unknown[] = [];
+				try {
+					await server.stop();
+				} catch (error) {
+					failures.push(error);
+				}
+				try {
+					await options.routes?.runner.stop?.();
+				} catch (error) {
+					failures.push(error);
+				}
+				try {
+					await lock.release();
+				} catch (error) {
+					failures.push(error);
+				}
+				if (failures.length > 0) throw new AggregateError(failures, "Server cleanup failed");
 			},
 		};
 	} catch (error) {

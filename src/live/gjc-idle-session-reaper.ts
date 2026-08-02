@@ -131,8 +131,8 @@ class IdleSessionReaper {
 			if (finalized) return;
 			finalized = true;
 			state.active -= 1;
-			if (outcome === "turn") this.markTurnCompleted(state);
-			else if (outcome === "failure") this.deferAfterFailure(state);
+			if (outcome === "turn" || outcome === "control") this.markTurnCompleted(state);
+			else this.deferAfterFailure(state);
 			release?.();
 			this.schedule();
 		};
@@ -188,7 +188,21 @@ class IdleSessionReaper {
 			fail();
 			throw error;
 		} finally {
-			fail();
+			if (!settled) {
+				await this.drainCancelledChunks(source);
+				fail();
+			}
+		}
+	}
+
+	private async drainCancelledChunks(source: AsyncIterable<string> | Iterable<string>): Promise<void> {
+		try {
+			for await (const _chunk of source) {
+				// Drain the underlying live queue after a client cancellation so its turn
+				// remains serialized until the runner has actually finished.
+			}
+		} catch {
+			// A failed underlying stream still releases the turn gate after draining.
 		}
 	}
 
@@ -202,6 +216,7 @@ class IdleSessionReaper {
 			lastActivityAt: this.#now(),
 			active: 0,
 			closed: false,
+			rearmAfterActivity: false,
 			closeAttempt: 0,
 			closeQueued: false,
 			closeInFlight: false,
@@ -215,19 +230,25 @@ class IdleSessionReaper {
 		const current = this.input.mappings.get(state.chatId);
 		if (current === undefined) return;
 		const generation = mappingGeneration(current);
-		if (state.closed && state.generation === generation) {
-			state.mapping = current;
-			return;
-		}
+		const rearm = state.closed && state.generation === generation;
 		state.mapping = current;
 		state.generation = generation;
-		state.closeAttempt = 0;
+		state.rearmAfterActivity = rearm;
+		if (!rearm) state.closeAttempt = 0;
 		state.closed = false;
 		state.lastActivityAt = this.#now();
 	}
 
 	private deferAfterFailure(state: ChatState): void {
-		if (state.closed) return;
+		const current = this.input.mappings.get(state.chatId);
+		if (current === undefined) return;
+		const generation = mappingGeneration(current);
+		const rearm = state.closed && state.generation === generation;
+		state.mapping = current;
+		state.generation = generation;
+		state.rearmAfterActivity = rearm;
+		if (!rearm) state.closeAttempt = 0;
+		state.closed = false;
 		state.lastActivityAt = this.#now();
 	}
 
@@ -250,6 +271,7 @@ class IdleSessionReaper {
 					lastActivityAt: completedAt,
 					active: 0,
 					closeAttempt: 0,
+					rearmAfterActivity: false,
 					closed: alreadyClosed,
 					closeQueued: false,
 					closeInFlight: false,
@@ -264,6 +286,7 @@ class IdleSessionReaper {
 				state.mapping = mapping;
 				state.generation = generation;
 				state.closeAttempt = 0;
+				state.rearmAfterActivity = false;
 				state.lastActivityAt = completedAt;
 				state.closed = alreadyClosed;
 			}
@@ -354,7 +377,7 @@ class IdleSessionReaper {
 				return;
 			}
 			const closeOperations = this.closeOperations(current, state);
-			if (closeOperations.some(operation => operation.state === "complete")) {
+			if (closeOperations.some(operation => operation.state === "complete") && !state.rearmAfterActivity) {
 				state.closed = true;
 				return;
 			}
@@ -380,6 +403,7 @@ class IdleSessionReaper {
 				if (proof?.expectedCwd !== undefined)
 					this.input.discardSessionAttachment?.(proof.expectedCwd, current.sessionId);
 				state.closed = true;
+				state.rearmAfterActivity = false;
 				state.mapping = current;
 			} catch {
 				state.lastActivityAt = this.#now();
@@ -397,7 +421,9 @@ class IdleSessionReaper {
 		const persisted = this.input.mappings.operations?.(mapping.chatId);
 		if (persisted !== undefined)
 			return persisted.filter(
-				operation => operation.kind === "close" && closeOperationIndex(operation, prefix) >= 0,
+				operation =>
+					operation.kind === "close" &&
+					(closeOperationIndex(operation, prefix) >= 0 || operationResultMatchesMapping(operation, mapping)),
 			);
 		const operations: SessionOperation[] = [];
 		const maxAttempt = state?.closeAttempt ?? 0;
@@ -421,6 +447,7 @@ class IdleSessionReaper {
 		return { ingressId, ingressHash: ingressId };
 	}
 	private adoptCurrentMapping(state: ChatState, mapping: SessionMapping): void {
+		state.rearmAfterActivity = false;
 		state.mapping = mapping;
 		state.generation = mappingGeneration(mapping);
 		state.closeAttempt = 0;
@@ -428,6 +455,10 @@ class IdleSessionReaper {
 		const operation = this.input.mappings.operation(mapping.chatId, mapping.operationId);
 		state.lastActivityAt = operationCompletedAt(operation) ?? this.#now();
 	}
+}
+function operationResultMatchesMapping(operation: SessionOperation, mapping: SessionMapping): boolean {
+	const resultMapping = operation.result?.mapping;
+	return resultMapping !== undefined && mappingGeneration(resultMapping) === mappingGeneration(mapping);
 }
 function closeIngressIdForAttempt(prefix: string, attempt: number): string {
 	return attempt === 0 ? prefix : `${prefix}:retry:${attempt}`;
@@ -451,6 +482,7 @@ interface ChatState {
 	active: number;
 	closed: boolean;
 	closeAttempt: number;
+	rearmAfterActivity: boolean;
 	closeQueued: boolean;
 	closeInFlight: boolean;
 }
