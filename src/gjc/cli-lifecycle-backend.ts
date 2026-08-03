@@ -1,3 +1,4 @@
+import { realpath } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { createCliLifecycleBackendRuntime } from "./cli-lifecycle-backend-runtime";
 import {
@@ -94,7 +95,7 @@ export class CliLifecycleBackend {
 		try {
 			resume = openAbsoluteRegularSessionFile(input.existingSessionPath);
 			initial = await loadGjcSessionFile(resume.canonicalPath);
-			if (initial.header.cwd !== canonicalCwd)
+			if (!(await cwdMatchesCanonicalIdentity(initial.header.cwd, canonicalCwd)))
 				throw new Error("CLI /session identity does not match canonical resumed JSONL header");
 		} catch (error) {
 			resume?.close();
@@ -109,7 +110,7 @@ export class CliLifecycleBackend {
 				if (
 					opened.value.sessionId === initial.header.id &&
 					final.header.id === initial.header.id &&
-					final.header.cwd === canonicalCwd
+					(await cwdMatchesCanonicalIdentity(final.header.cwd, canonicalCwd))
 				)
 					return {
 						status: "closed",
@@ -169,5 +170,16 @@ export class CliLifecycleBackend {
 		attachment: CliLifecycleAttachment,
 	): Promise<CliLifecycleResult<undefined>> {
 		return this.#runtime.fallbackBeforeCloseAcknowledgement(attachment);
+	}
+}
+async function cwdMatchesCanonicalIdentity(headerCwd: string, canonicalCwd: string): Promise<boolean> {
+	try {
+		const [resolvedHeaderCwd, resolvedCanonicalCwd] = await Promise.all([
+			realpath(headerCwd),
+			realpath(canonicalCwd),
+		]);
+		return resolvedHeaderCwd === resolvedCanonicalCwd;
+	} catch {
+		return false;
 	}
 }

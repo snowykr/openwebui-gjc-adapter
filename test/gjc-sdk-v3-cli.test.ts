@@ -147,6 +147,25 @@ describe("endpoint-less CLI lifecycle boundary", () => {
 				`'env' '/opt/gjc' '--resume' '${sessionPath}' '--session-dir' '${sessionRoot}'`,
 			);
 		}));
+	test("accepts an equivalent symlink cwd recorded by a historical transcript", async () =>
+		withSessionRoot(async sessionRoot => {
+			const projectCwd = join(sessionRoot, "project");
+			const aliasCwd = join(sessionRoot, "project-alias");
+			const sessionPath = join(sessionRoot, "session-1.jsonl");
+			await mkdir(projectCwd);
+			await symlink(projectCwd, aliasCwd);
+			await writeFile(sessionPath, sessionJsonl("session-1", aliasCwd));
+			const backend = new CliLifecycleBackend({
+				cliPath: "/opt/gjc",
+				cwd: projectCwd,
+				tmux: new FakeTmuxRunner(projectCwd),
+			});
+
+			await expect(backend.coldResume({ existingSessionPath: sessionPath })).resolves.toMatchObject({
+				status: "closed",
+				value: { sessionId: "session-1", cwd: projectCwd },
+			});
+		}));
 	test("rejects a canonical resume whose JSONL header cwd differs from the configured cwd", async () =>
 		withSessionRoot(async sessionRoot => {
 			const sessionPath = join(sessionRoot, "session-1.jsonl");
