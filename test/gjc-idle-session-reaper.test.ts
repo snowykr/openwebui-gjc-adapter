@@ -1075,6 +1075,24 @@ describe("GJC idle session reaper", () => {
 		expect(chunks).toEqual(["o", "k"]);
 		await harness.reaper.stop();
 	});
+	test("wraps callable async chunk iterables", async () => {
+		const chunks = Object.assign(() => undefined, {
+			async *[Symbol.asyncIterator]() {
+				yield "ok";
+			},
+		});
+		const harness = createHarness({
+			run: async () => ({ chunks, model: "gjc" }),
+		});
+		const result = await harness.reaper.runner.run(createInput());
+		if (result.chunks === undefined) throw new Error("Expected streamed runner result.");
+
+		const received: string[] = [];
+		for await (const chunk of result.chunks) received.push(chunk);
+
+		expect(received).toEqual(["ok"]);
+		await harness.reaper.stop();
+	});
 	test("releases the chat gate when a handed-off stream is never read", async () => {
 		const clock = new ManualTimers();
 		const mappings = new MappingFixture();

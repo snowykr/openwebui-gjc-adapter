@@ -749,7 +749,11 @@ class TrackedChunks implements AsyncIterable<string> {
 }
 
 function chunkIterator(source: AsyncIterable<string> | Iterable<string>): AsyncIterator<string> | Iterator<string> {
-	if (typeof source === "object" && source !== null && Symbol.asyncIterator in source)
+	if (
+		source !== null &&
+		(typeof source === "object" || typeof source === "function") &&
+		Symbol.asyncIterator in source
+	)
 		return source[Symbol.asyncIterator]();
 	return source[Symbol.iterator]();
 }
