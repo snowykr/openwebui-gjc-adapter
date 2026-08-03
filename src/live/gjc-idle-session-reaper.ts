@@ -569,8 +569,12 @@ function hasPendingManualClose(
 	operations: readonly SessionOperation[],
 	currentOperation: SessionOperation | undefined,
 ): boolean {
-	if (currentOperation === undefined) return false;
 	const prefix = closeIngressId(mapping.operationId, mapping);
+	if (currentOperation === undefined)
+		return operations.some(
+			operation =>
+				operation.kind === "close" && operation.state !== "complete" && !isReaperCloseOperation(operation, prefix),
+		);
 	return operations.some(
 		operation =>
 			operation.kind === "close" &&

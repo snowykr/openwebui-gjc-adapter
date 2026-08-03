@@ -222,8 +222,32 @@ describe("GJC idle session reaper", () => {
 
 		clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
 		await flush();
-
 		expect(closeCalls).toBe(1);
+		await reaper.stop();
+	});
+	test("skips a retained mapping with an unresolved manual close and no baseline operation", async () => {
+		const clock = new ManualTimers();
+		const mappings = new MappingFixture();
+		mappings.operationRecords.clear();
+		mappings.recordClose("manual-close", "uncertain");
+		let closeCalls = 0;
+		const reaper = createGjcIdleSessionReaper({
+			runner: { run: async () => ({ content: "done", model: "gjc" }) },
+			mappings,
+			closeSession: async () => {
+				closeCalls += 1;
+				return { status: "closed" };
+			},
+			now: () => clock.now,
+			setTimeout: (handler, timeoutMs) =>
+				clock.setTimeout(handler, timeoutMs) as unknown as ReturnType<typeof setTimeout>,
+			clearTimeout: timer => clock.clearTimeout(timer as unknown as number),
+		});
+
+		clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
+		await flush();
+
+		expect(closeCalls).toBe(0);
 		await reaper.stop();
 	});
 
