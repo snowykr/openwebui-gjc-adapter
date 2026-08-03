@@ -2,6 +2,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { closeIngressId } from "../src/gjc/session-router";
 import type { LiveGatewayRunner } from "../src/live/chat-completions";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import type { RegisteredProject } from "../src/projects/registry";
@@ -299,6 +300,7 @@ describe("createAdapterRequestHandler", () => {
 		expect(await response.json()).toEqual({ status: "closed", operationId: "close-operation-1" });
 		expect(ingressIds).toHaveLength(1);
 		expect(ingressIds[0]).not.toContain("adapter-token");
+		expect(ingressIds[0]).toBe(closeIngressId("http:close-operation-1", mapping));
 	});
 });
 describe("Bun transport configuration", () => {

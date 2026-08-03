@@ -82,7 +82,7 @@ export async function handleOpenAIChatCloseRequest(
 		);
 	}
 	try {
-		const ingressId = closeIngressId(operationId, mapping);
+		const ingressId = closeIngressId(`http:${operationId}`, mapping);
 		const result = await routes.closeSession(mapping, { ingressId, ingressHash: ingressId });
 		return jsonResponse(
 			{ ...result, operationId },
