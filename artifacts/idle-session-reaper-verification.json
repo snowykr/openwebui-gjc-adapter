@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "reviewedHead": "2368116b580450babf43412041bd5b6d22c99606",
+  "baseRef": "origin/main",
+  "localVerification": {
+    "focused": {
+      "command": "bun test test/server.test.ts test/gjc-session-router.test.ts",
+      "result": "42 pass, 0 fail"
+    },
+    "typeAndFormat": {
+      "command": "bun run check",
+      "result": "passed"
+    },
+    "full": {
+      "command": "bun test",
+      "result": "846 pass, 0 fail, 4378 expect() calls"
+    }
+  },
+  "github": {
+    "pullRequest": 33,
+    "url": "https://github.com/snowykr/openwebui-gjc-adapter/pull/33",
+    "checks": ["Check", "Test", "Supply chain (probationary)", "Package consumer (probationary)", "GitGuardian Security Checks"],
+    "result": "all successful",
+    "unresolvedReviewThreads": 0,
+    "monitor": "bg_14"
+  },
+  "scope": "PR-only; no production deployment performed."
+}
