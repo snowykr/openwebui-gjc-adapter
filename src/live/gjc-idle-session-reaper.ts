@@ -319,11 +319,12 @@ class IdleSessionReaper {
 			const closeOperations = this.closeOperations(mapping);
 			const manualClosePending = hasPendingManualClose(mapping, journal, currentOperation);
 			const alreadyClosed = closeOperations.some(operation => operation.state === "complete");
-			const activityAt = mappingActivityAt(mapping, journal);
-			if (activityAt === undefined) continue;
 			const generation = mappingGeneration(mapping);
-			const rearmAfterActivity = activityFollowsCompletedClose(mapping, journal, closeOperations);
 			const state = this.#states.get(mapping.chatId);
+			const activityAt =
+				mappingActivityAt(mapping, journal) ??
+				(state?.generation === generation ? state.lastActivityAt : this.#now());
+			const rearmAfterActivity = activityFollowsCompletedClose(mapping, journal, closeOperations);
 			if (state === undefined) {
 				this.#states.set(mapping.chatId, {
 					chatId: mapping.chatId,
@@ -748,7 +749,8 @@ class TrackedChunks implements AsyncIterable<string> {
 }
 
 function chunkIterator(source: AsyncIterable<string> | Iterable<string>): AsyncIterator<string> | Iterator<string> {
-	if (Symbol.asyncIterator in source) return source[Symbol.asyncIterator]();
+	if (typeof source === "object" && source !== null && Symbol.asyncIterator in source)
+		return source[Symbol.asyncIterator]();
 	return source[Symbol.iterator]();
 }
 class SerialGate {

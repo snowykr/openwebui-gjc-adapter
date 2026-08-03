@@ -202,6 +202,30 @@ describe("GJC idle session reaper", () => {
 		expect(harness.closeCalls).toHaveLength(1);
 		await harness.reaper.stop();
 	});
+	test("schedules a retained owned mapping with an empty journal conservatively", async () => {
+		const clock = new ManualTimers();
+		const mappings = new MappingFixture();
+		mappings.operationRecords.clear();
+		let closeCalls = 0;
+		const reaper = createGjcIdleSessionReaper({
+			runner: { run: async () => ({ content: "done", model: "gjc" }) },
+			mappings,
+			closeSession: async () => {
+				closeCalls += 1;
+				return { status: "closed" };
+			},
+			now: () => clock.now,
+			setTimeout: (handler, timeoutMs) =>
+				clock.setTimeout(handler, timeoutMs) as unknown as ReturnType<typeof setTimeout>,
+			clearTimeout: timer => clock.clearTimeout(timer as unknown as number),
+		});
+
+		clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
+		await flush();
+
+		expect(closeCalls).toBe(1);
+		await reaper.stop();
+	});
 
 	test("an active turn prevents an idle close race", async () => {
 		let complete!: () => void;
@@ -1037,6 +1061,19 @@ describe("GJC idle session reaper", () => {
 
 		expect(sourceAbandoned).toBe(true);
 		await reaper.stop();
+	});
+	test("wraps primitive string chunk iterables", async () => {
+		const harness = createHarness({
+			run: async () => ({ chunks: "ok", model: "gjc" }),
+		});
+		const result = await harness.reaper.runner.run(createInput());
+		if (result.chunks === undefined) throw new Error("Expected streamed runner result.");
+
+		const chunks: string[] = [];
+		for await (const chunk of result.chunks) chunks.push(chunk);
+
+		expect(chunks).toEqual(["o", "k"]);
+		await harness.reaper.stop();
 	});
 	test("releases the chat gate when a handed-off stream is never read", async () => {
 		const clock = new ManualTimers();
