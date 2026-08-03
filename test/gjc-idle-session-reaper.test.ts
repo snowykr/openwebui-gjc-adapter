@@ -274,6 +274,33 @@ describe("GJC idle session reaper", () => {
 		expect(harness.closeCalls).toHaveLength(1);
 		await harness.reaper.stop();
 	});
+	test("does not acknowledge endpoint-only mappings as idle-closed", async () => {
+		const harness = createHarness({
+			close: async () => ({ status: "uncertain", message: "owned pane proof is unavailable" }),
+		});
+		harness.mappings.mapping = {
+			...harness.mappings.mapping,
+			attachment: {
+				...harness.mappings.mapping.attachment!,
+				tmuxSocket: undefined,
+				tmuxPane: undefined,
+				tmuxPanePid: undefined,
+				tmuxOwnershipTag: undefined,
+			},
+		};
+		await harness.reaper.runner.run(createInput());
+		harness.clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
+		await flush();
+
+		expect(harness.closeCalls).toHaveLength(0);
+		const result = await harness.reaper.closeSession(harness.mappings.mapping, {
+			ingressId: "endpoint-only-close",
+			ingressHash: "endpoint-only-close",
+		});
+		expect(result).toMatchObject({ status: "uncertain" });
+		expect(harness.closeCalls).toHaveLength(1);
+		await harness.reaper.stop();
+	});
 	test("same-process explicit close reuses a successful idle close", async () => {
 		const harness = createHarness();
 		await harness.reaper.runner.run(createInput());

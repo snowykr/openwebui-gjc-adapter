@@ -236,6 +236,7 @@ class IdleSessionReaper {
 			lastActivityAt: this.#now(),
 			active: 0,
 			closed: false,
+			idleIneligible: false,
 			rearmAfterActivity: false,
 			closeAttempt: 0,
 			rearmAttempt: 0,
@@ -260,6 +261,7 @@ class IdleSessionReaper {
 			state.rearmAttempt = 0;
 		}
 		state.closed = false;
+		state.idleIneligible = false;
 		state.lastActivityAt = this.#now();
 	}
 
@@ -276,6 +278,7 @@ class IdleSessionReaper {
 			state.rearmAttempt = 0;
 		}
 		state.closed = false;
+		state.idleIneligible = false;
 		state.lastActivityAt = this.#now();
 	}
 
@@ -305,6 +308,7 @@ class IdleSessionReaper {
 					generation,
 					lastActivityAt: activityAt,
 					active: 0,
+					idleIneligible: false,
 					closeAttempt: 0,
 					rearmAttempt: 0,
 					rearmAfterActivity,
@@ -324,6 +328,7 @@ class IdleSessionReaper {
 				state.closeAttempt = 0;
 				state.rearmAttempt = 0;
 				state.rearmAfterActivity = rearmAfterActivity;
+				state.idleIneligible = false;
 				state.lastActivityAt = activityAt;
 				state.closed = alreadyClosed && !rearmAfterActivity;
 				continue;
@@ -356,6 +361,7 @@ class IdleSessionReaper {
 			if (
 				state.mapping === undefined ||
 				state.closed ||
+				state.idleIneligible ||
 				state.active > 0 ||
 				state.closeQueued ||
 				state.closeInFlight
@@ -381,6 +387,7 @@ class IdleSessionReaper {
 			if (
 				state.mapping === undefined ||
 				state.closed ||
+				state.idleIneligible ||
 				state.active > 0 ||
 				state.closeQueued ||
 				state.closeInFlight ||
@@ -405,7 +412,7 @@ class IdleSessionReaper {
 		const release = await state.gate.acquire();
 		try {
 			state.closeQueued = false;
-			if (this.#stopped || state.closed || state.active > 0) return;
+			if (this.#stopped || state.closed || state.idleIneligible || state.active > 0) return;
 			const current = this.input.mappings.get(state.chatId);
 			if (current === undefined) {
 				state.closed = true;
@@ -417,7 +424,7 @@ class IdleSessionReaper {
 				return;
 			}
 			if (!hasOwnedPaneAttachment(current.attachment)) {
-				state.closed = true;
+				state.idleIneligible = true;
 				return;
 			}
 			const pendingOperation = this.input.mappings
@@ -522,6 +529,7 @@ class IdleSessionReaper {
 	}
 	private adoptCurrentMapping(state: ChatState, mapping: SessionMapping): void {
 		state.rearmAfterActivity = false;
+		state.idleIneligible = false;
 		state.mapping = mapping;
 		state.generation = mappingGeneration(mapping);
 		state.closeAttempt = 0;
@@ -594,6 +602,7 @@ interface ChatState {
 	lastActivityAt: number;
 	active: number;
 	closed: boolean;
+	idleIneligible: boolean;
 	closeAttempt: number;
 	rearmAfterActivity: boolean;
 	rearmAttempt: number;
