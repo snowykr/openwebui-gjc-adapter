@@ -29,34 +29,46 @@ export function encodeChatCompletionSse(input: {
 		...base,
 		choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
 	};
+	let completed = false;
 	let abandonment: Promise<void> | undefined;
 	const abandon = (): Promise<void> => {
-		if (abandonment === undefined) abandonment = input.onAbandon?.() ?? Promise.resolve();
+		if (completed) return Promise.resolve();
+		if (abandonment === undefined) abandonment = Promise.resolve().then(() => input.onAbandon?.());
 		return abandonment;
+	};
+	const stream = async function* (): AsyncGenerator<string> {
+		try {
+			yield `data: ${JSON.stringify(initial)}\n\n`;
+			for await (const content of input.chunks) {
+				const chunk: OpenAIChatCompletionChunk = {
+					...base,
+					choices: [{ index: 0, delta: { content }, finish_reason: null }],
+				};
+				yield `data: ${JSON.stringify(chunk)}\n\n`;
+			}
+			const terminal: OpenAIChatCompletionChunk = {
+				...base,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+			};
+			yield `data: ${JSON.stringify(terminal)}\n\n`;
+			completed = true;
+			yield "data: [DONE]\n\n";
+		} finally {
+			if (!completed) void abandon().catch(() => {});
+		}
 	};
 	return {
 		abandon,
-		async *[Symbol.asyncIterator](): AsyncGenerator<string> {
-			let completed = false;
-			try {
-				yield `data: ${JSON.stringify(initial)}\n\n`;
-				for await (const content of input.chunks) {
-					const chunk: OpenAIChatCompletionChunk = {
-						...base,
-						choices: [{ index: 0, delta: { content }, finish_reason: null }],
-					};
-					yield `data: ${JSON.stringify(chunk)}\n\n`;
-				}
-				const terminal: OpenAIChatCompletionChunk = {
-					...base,
-					choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-				};
-				yield `data: ${JSON.stringify(terminal)}\n\n`;
-				completed = true;
-				yield "data: [DONE]\n\n";
-			} finally {
-				if (!completed) void abandon().catch(() => {});
-			}
+		[Symbol.asyncIterator](): AsyncIterator<string> {
+			const iterator = stream();
+			return {
+				next: value => iterator.next(value),
+				return: async value => {
+					void abandon().catch(() => {});
+					return iterator.return(value);
+				},
+				throw: error => iterator.throw(error),
+			};
 		},
 	};
 }

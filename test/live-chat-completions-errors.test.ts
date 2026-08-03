@@ -127,6 +127,20 @@ describe("live OpenAI-compatible chat completion errors", () => {
 		await body.cancel();
 		expect(abandoned).toBe(1);
 	});
+	it("abandons a direct SSE iterator before its first next", async () => {
+		let abandoned = 0;
+		const stream = encodeChatCompletionSse({
+			id: "chatcmpl-direct-unstarted-cancel",
+			created: 1_783_468_800,
+			model: "gjc/anthropic/claude-sonnet-4:low",
+			chunks: ["never-read"],
+			onAbandon: async () => {
+				abandoned += 1;
+			},
+		});
+		await stream[Symbol.asyncIterator]().return?.();
+		expect(abandoned).toBe(1);
+	});
 
 	it("fails closed before sinks when the runner omits canonical model metadata", async () => {
 		const effects: string[] = [];
