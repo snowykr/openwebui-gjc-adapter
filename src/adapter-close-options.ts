@@ -45,6 +45,7 @@ export function createAdapterSessionCloser(
 					mappings,
 					ingressId: ingress.ingressId,
 					ingressHash: ingress.ingressHash,
+					legacyIngress: ingress.legacyIngress,
 					lifecycle,
 					close: receipt => closeWithOwnedPaneProof(mapping, receipt),
 				}),

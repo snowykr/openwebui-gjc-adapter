@@ -2,7 +2,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { closeIngressId } from "../src/gjc/session-router";
+import { closeIngressId, legacyCloseIngressId, type SessionCloseIngress } from "../src/gjc/session-router";
 import type { LiveGatewayRunner } from "../src/live/chat-completions";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import type { RegisteredProject } from "../src/projects/registry";
@@ -273,7 +273,7 @@ describe("createAdapterRequestHandler", () => {
 			eventCursor: 0,
 			operationId: "turn-1",
 		};
-		const ingressIds: string[] = [];
+		const ingresses: SessionCloseIngress[] = [];
 		const handler = createAdapterRequestHandler({
 			routes: {
 				projects: [project],
@@ -283,7 +283,7 @@ describe("createAdapterRequestHandler", () => {
 				requireAdapterApiToken: true,
 				mappings: { get: chatId => (chatId === mapping.chatId ? mapping : undefined) },
 				closeSession: async (_mapping, ingress) => {
-					ingressIds.push(ingress.ingressId);
+					ingresses.push(ingress);
 					return { status: "closed" };
 				},
 			},
@@ -298,9 +298,13 @@ describe("createAdapterRequestHandler", () => {
 
 		expect(response.status).toBe(200);
 		expect(await response.json()).toEqual({ status: "closed", operationId: "close-operation-1" });
-		expect(ingressIds).toHaveLength(1);
-		expect(ingressIds[0]).not.toContain("adapter-token");
-		expect(ingressIds[0]).toBe(closeIngressId("http:close-operation-1", mapping));
+		expect(ingresses).toHaveLength(1);
+		expect(ingresses[0]?.ingressId).not.toContain("adapter-token");
+		expect(ingresses[0]?.ingressId).toBe(closeIngressId("http:close-operation-1", mapping));
+		expect(ingresses[0]?.legacyIngress).toEqual({
+			ingressId: legacyCloseIngressId("close-operation-1", mapping),
+			ingressHash: legacyCloseIngressId("close-operation-1", mapping),
+		});
 	});
 });
 describe("Bun transport configuration", () => {
