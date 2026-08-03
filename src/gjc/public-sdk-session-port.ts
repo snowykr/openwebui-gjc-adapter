@@ -116,7 +116,10 @@ export class PublicSdkSessionClient implements PublicSdkSessionPort {
 		);
 	}
 	abort(key?: string, timeoutMs?: number): Promise<unknown> {
-		return this.reply("turn.abort", {}, key, timeoutMs);
+		// C04 turn.abort is owner-scoped upstream. It must bypass the prompt's
+		// serialized mutation lane so the owning connection can abort its active
+		// prompt instead of waiting for that prompt to settle.
+		return this.authority(timeoutMs, client => client.control("turn.abort", {}, timeoutMs, key));
 	}
 	abortAndPrompt(
 		text: string,

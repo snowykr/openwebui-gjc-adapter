@@ -3,9 +3,10 @@ import { validateSessionFile } from "./session-file";
 import { hashTurnIngress, normalizeModelSelection } from "./session-operation-codec";
 import { resolveEffectiveGjcSessionRoot } from "./session-root";
 import type { RouteGjcTurnInput, RouteGjcTurnResult } from "./session-turn-router-contract";
-import { getProjectSessionRoot } from "./turn-runner";
+import { GjcTurnCancelledError, getProjectSessionRoot } from "./turn-runner";
 
 export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<RouteGjcTurnResult> {
+	throwIfAborted(input.signal);
 	const operation = provisionalOperation(input);
 	const reserved = input.mappings.reserveProvisionalOperation(operation);
 	if (reserved.state !== "pending") {
@@ -31,6 +32,7 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 			);
 	};
 	try {
+		throwIfAborted(input.signal);
 		return await input.runner.startNewSession(
 			{
 				cwd: input.project.cwd,
@@ -42,8 +44,11 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 				text: input.text,
 				...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
 				...(input.onObservedTurn === undefined ? {} : { observer: input.onObservedTurn }),
+				...(input.signal === undefined ? {} : { signal: input.signal }),
+				...(input.principalId === undefined ? {} : { principalId: input.principalId }),
 			},
 			async (result, lifecycle) => {
+				throwIfAborted(input.signal);
 				const completedSelection =
 					input.modelSelection === undefined ? undefined : normalizeModelSelection(result.modelSelection);
 				if (input.modelSelection !== undefined && completedSelection === undefined)
@@ -52,6 +57,7 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 					throw new Error("New GJC session did not return a validated current attachment.");
 				const assistantText = input.projectAssistantText?.(result) ?? result.text;
 				const mapping = await lifecycle.publish(result.attachment, () => {
+					throwIfAborted(input.signal);
 					const published = input.mappings.publishProvisionalOperation(operation, {
 						chatId: input.chatId,
 						projectId: input.project.id,
@@ -86,6 +92,10 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 		markUncertain();
 		throw error;
 	}
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) throw new GjcTurnCancelledError();
 }
 function provisionalOperation(
 	input: RouteGjcTurnInput,

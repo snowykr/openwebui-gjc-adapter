@@ -86,6 +86,34 @@ describe("OpenWebUI message event responses", () => {
 			server.stop(true);
 		}
 	});
+	test("aborts an active completion when the OpenWebUI request is cancelled", async () => {
+		let markStarted: () => void = () => {};
+		const started = new Promise<void>(resolve => {
+			markStarted = resolve;
+		});
+		const handler = createAdapterRequestHandler({
+			routes: {
+				projects: [project],
+				owner,
+				runner: {
+					run: input =>
+						new Promise((_resolve, reject) => {
+							markStarted();
+							input.signal?.addEventListener("abort", () => reject(new Error("cancelled")), { once: true });
+						}),
+				},
+			},
+		});
+		const controller = new AbortController();
+		const response = handler(
+			chatRequest({ model: "gjc", messages: [{ role: "user", content: "hello" }] }, { signal: controller.signal }),
+		);
+
+		await started;
+		controller.abort();
+
+		expect((await response).status).toBe(499);
+	});
 });
 
 const project: RegisteredProject = {
@@ -101,7 +129,7 @@ const owner: OpenWebUIOwnerContext = {
 	singleOwnerLocalMode: false,
 };
 
-function chatRequest(body: unknown): Request {
+function chatRequest(body: unknown, init: { readonly signal?: AbortSignal } = {}): Request {
 	return new Request("http://adapter.test/v1/chat/completions", {
 		method: "POST",
 		headers: {
@@ -113,6 +141,7 @@ function chatRequest(body: unknown): Request {
 			"X-OpenWebUI-User-Id": "owner-1",
 		},
 		body: JSON.stringify(body),
+		...init,
 	});
 }
 function sseFrames(body: string): unknown[] {

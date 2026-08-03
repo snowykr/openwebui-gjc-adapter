@@ -479,14 +479,14 @@ describe("endpoint-less CLI lifecycle boundary", () => {
 		}));
 });
 describe("installed released CLI parser", () => {
-	test("advertises resume and session directory argv without a provider prompt", async () => {
+	test("advertises a supported resume and session directory argv without a provider prompt", async () => {
 		const cli = Bun.which("gjc");
 		if (cli === null) return;
 		const child = Bun.spawn([cli, "--help"], { stdout: "pipe", stderr: "pipe" });
 		const [stdout, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
 
 		expect(exitCode).toBe(0);
-		expect(stdout).toContain("--resume=<value>");
+		expect(stdout).toMatch(/--resume(?:=<value>|\[=<value>\])/);
 		expect(stdout).toContain("--session-dir=<value>");
 	});
 });

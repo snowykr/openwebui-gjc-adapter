@@ -4,9 +4,10 @@ import { validateSessionFile } from "./session-file";
 import { discoverFreshGjcSessionFile } from "./session-loader";
 import { resolveEffectiveGjcSessionRoot } from "./session-root";
 import type { RouteGjcTurnInput, RouteGjcTurnResult } from "./session-turn-router-contract";
-import { getProjectSessionRoot } from "./turn-runner";
+import { GjcTurnCancelledError, getProjectSessionRoot } from "./turn-runner";
 
 export async function recoverInitialMappedSession(input: RouteGjcTurnInput, hash: string): Promise<RouteGjcTurnResult> {
+	throwIfAborted(input.signal);
 	const operation = input.mappings.provisionalOperation(input.chatId, input.userMessageId);
 	if (operation?.detail !== hash && input.modelSelection === undefined)
 		throw new Error(`GJC operation ${input.userMessageId} conflicts with a different ingress payload.`);
@@ -24,6 +25,7 @@ export async function recoverInitialMappedSession(input: RouteGjcTurnInput, hash
 			operation.sessionId,
 			resolve(input.project.cwd),
 		);
+		throwIfAborted(input.signal);
 		const result = transcriptResult(transcript.entries, input.text);
 		if (result === undefined || input.runner.withLifecyclePublication === undefined)
 			throw new Error(`GJC operation ${input.userMessageId} requires reconciliation.`);
@@ -38,6 +40,7 @@ export async function recoverInitialMappedSession(input: RouteGjcTurnInput, hash
 				recoveryAttachment: operation.attachment,
 			},
 			async lifecycle => {
+				throwIfAborted(input.signal);
 				const state = await input.runner.getState({
 					cwd: input.project.cwd,
 					sessionRoot,
@@ -48,6 +51,7 @@ export async function recoverInitialMappedSession(input: RouteGjcTurnInput, hash
 					recoveryAttachment: operation.attachment,
 					lifecycle,
 				});
+				throwIfAborted(input.signal);
 				if (!current(state.attachment, operation.sessionId, input.project.cwd))
 					throw new Error(`GJC operation ${input.userMessageId} requires reconciliation.`);
 				const assistantText =
@@ -61,6 +65,7 @@ export async function recoverInitialMappedSession(input: RouteGjcTurnInput, hash
 						attachment: state.attachment,
 					}) ?? result.text;
 				const mapping = await lifecycle.publish(state.attachment, () => {
+					throwIfAborted(input.signal);
 					input.mappings.transitionProvisionalOperation(input.chatId, input.userMessageId, "pending");
 					const published = input.mappings.publishProvisionalOperation(
 						{
@@ -106,6 +111,10 @@ export async function recoverInitialMappedSession(input: RouteGjcTurnInput, hash
 		}
 		throw new Error(`GJC operation ${input.userMessageId} requires reconciliation.`, { cause });
 	}
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) throw new GjcTurnCancelledError();
 }
 
 function recoverable(

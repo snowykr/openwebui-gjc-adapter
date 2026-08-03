@@ -12,6 +12,7 @@ import type {
 	GjcSwitchSessionInput,
 	GjcTurnResult,
 } from "../gjc/turn-runner";
+import { GjcTurnCancelledError } from "../gjc/turn-runner";
 import {
 	currentAttachmentProof,
 	ensureAttachment,
@@ -33,6 +34,13 @@ import { normalizeObservedSdkRecord, turnResult } from "./gjc-routing-proof";
 import { runLifecycleTestBarrier } from "./gjc-routing-test-barrier";
 import { projectSessionArtifactEvents } from "./gjc-session-artifact-events";
 
+export type OwnedAbortRegistration = (
+	address: GjcSessionAddress,
+	principalId: string | undefined,
+	operationId: string,
+	abort: () => Promise<unknown>,
+) => { readonly unregister: () => void; readonly cancelled: boolean };
+
 export {
 	currentAttachmentProof,
 	ensureAttachment,
@@ -52,7 +60,9 @@ export async function startNewSession<T>(
 		lifecycle: GjcLifecycleTransaction,
 	) => Promise<void>,
 	onFailure?: (lifecycle: GjcLifecycleTransaction, error: unknown) => Promise<void>,
+	registerOwnedAbort?: OwnedAbortRegistration,
 ): Promise<T> {
+	throwIfAborted(input.signal);
 	await mkdir(input.sessionRoot, { recursive: true });
 	const baseline = await snapshotGjcSessionFiles(input.sessionRoot);
 	const backend = new CliLifecycleBackend({
@@ -60,18 +70,23 @@ export async function startNewSession<T>(
 		cwd: input.cwd,
 		childEnvironment: context.input.runtimeLocations.childEnvironment,
 	});
-	const lifecycleAttachment = requireLifecycleAttachment(
-		await backend.createEphemeral({ sessionRoot: input.sessionRoot }),
-	);
+	let lifecycleAttachment: ReturnType<typeof requireLifecycleAttachment> | undefined;
 	let provisionalAuthorityPersisted = false;
+	let promptStarted = false;
 	try {
+		const createdAttachment = requireLifecycleAttachment(
+			await backend.createEphemeral({ sessionRoot: input.sessionRoot }),
+		);
+		lifecycleAttachment = createdAttachment;
+		throwIfAborted(input.signal);
 		const address = {
-			...addressFor(input, lifecycleAttachment.sessionId),
+			...addressFor(input, createdAttachment.sessionId),
 		};
-		const initialPublished = await waitForSdkEndpoint(input.cwd, lifecycleAttachment.sessionId);
+		const initialPublished = await waitForSdkEndpoint(input.cwd, createdAttachment.sessionId);
+		throwIfAborted(input.signal);
 		await runLifecycleTestBarrier(context.input.testBarrierHook, "post_cli_pre_bind", initialPublished);
 		const published = await requireCurrentPublishedSdkEndpoint(input.cwd, initialPublished);
-		const attachment = attachmentFor(address, { ...lifecycleAttachment, published });
+		const attachment = attachmentFor(address, { ...createdAttachment, published });
 		context.attachments.set(attachmentKey(address), attachment);
 		const { withLifecycle } = await import("./gjc-public-sdk-close");
 		return await withLifecycle(
@@ -83,18 +98,40 @@ export async function startNewSession<T>(
 					requireExactProvisionalProof(provisionalProof);
 					await beforePrompt(address, provisionalProof, lifecycle);
 					provisionalAuthorityPersisted = true;
-					const result = await withMutationPort(context, attachment, lifecycle, port =>
-						prompt(context, port, input.text, input.modelSelection, input.observer),
-					);
+					const result = await withMutationPort(context, attachment, lifecycle, async port => {
+						let rejectCancelled!: (error: Error) => void;
+						const cancelled = new Promise<never>((_resolve, reject) => {
+							rejectCancelled = reject;
+						});
+						const registration = registerOwnedAbort?.(
+							address,
+							input.principalId,
+							input.userMessageId,
+							async () => {
+								rejectCancelled(new GjcTurnCancelledError());
+								return await port.abort(undefined, context.input.turnTimeoutMs);
+							},
+						);
+						try {
+							throwIfAborted(input.signal, registration?.cancelled);
+							promptStarted = true;
+							return await Promise.race([
+								prompt(context, port, input.text, input.modelSelection, input.observer),
+								cancelled,
+							]);
+						} finally {
+							registration?.unregister();
+						}
+					});
 					const transcript = await waitForFreshGjcSessionFile(
 						input.sessionRoot,
 						baseline,
-						lifecycleAttachment.sessionId,
+						createdAttachment.sessionId,
 						resolve(input.cwd),
 					);
 					const addressWithSessionFile = { ...address, sessionFile: transcript.filePath };
 					const durableAttachment = attachmentFor(addressWithSessionFile, {
-						...lifecycleAttachment,
+						...createdAttachment,
 						sessionPath: transcript.filePath,
 						published: await requireCurrentPublishedSdkEndpoint(input.cwd, attachment.published!),
 					});
@@ -124,7 +161,8 @@ export async function startNewSession<T>(
 			false,
 		);
 	} catch (error) {
-		if (provisionalAuthorityPersisted) throw error;
+		if (lifecycleAttachment === undefined) throw error;
+		if (provisionalAuthorityPersisted && promptStarted) throw error;
 		context.attachments.delete(attachmentKey(addressFor(input, lifecycleAttachment.sessionId)));
 		try {
 			const fallback = await backend.fallbackBeforeCloseAcknowledgement(lifecycleAttachment);
@@ -154,11 +192,30 @@ export async function getState(context: PublicSdkRunnerContext, input: GjcSessio
 export async function continueSession(
 	context: PublicSdkRunnerContext,
 	input: GjcContinueSessionInput,
+	registerOwnedAbort?: OwnedAbortRegistration,
 ): Promise<GjcTurnResult> {
+	throwIfAborted(input.signal);
 	const attachment = await ensureAttachment(context, input, input.lifecycle);
-	const result = await withMutationPort(context, attachment, input.lifecycle, port =>
-		prompt(context, port, input.text, input.modelSelection, input.observer),
-	);
+	throwIfAborted(input.signal);
+	const result = await withMutationPort(context, attachment, input.lifecycle, async port => {
+		let rejectCancelled!: (error: Error) => void;
+		const cancelled = new Promise<never>((_resolve, reject) => {
+			rejectCancelled = reject;
+		});
+		const registration = registerOwnedAbort?.(input, input.principalId, input.operationId, async () => {
+			rejectCancelled(new GjcTurnCancelledError());
+			return await port.abort(undefined, context.input.turnTimeoutMs);
+		});
+		try {
+			throwIfAborted(input.signal, registration?.cancelled);
+			return await Promise.race([
+				prompt(context, port, input.text, input.modelSelection, input.observer),
+				cancelled,
+			]);
+		} finally {
+			registration?.unregister();
+		}
+	});
 	return turnResult(
 		await withSessionArtifactEvents(result.outcome, input.sessionFile, input.text),
 		input.sessionFile,
@@ -178,8 +235,11 @@ export async function getAvailableModels(
 export async function respondWorkflowGate(
 	context: PublicSdkRunnerContext,
 	input: import("../gjc/turn-runner").GjcRespondWorkflowGateInput,
+	registerOwnedAbort?: OwnedAbortRegistration,
 ): Promise<GjcTurnResult> {
+	throwIfAborted(input.signal);
 	const attachment = await ensureAttachment(context, input, input.lifecycle);
+	throwIfAborted(input.signal);
 	const gate = {
 		gateId: input.gateId,
 		correlation: input.gateCorrelation ?? {
@@ -189,21 +249,41 @@ export async function respondWorkflowGate(
 		},
 		payload: {},
 	};
-	const outcome = await withMutationPort(context, attachment, input.lifecycle, port =>
-		port.answerGate(
-			gate,
-			input.answer,
-			input.idempotencyKey,
-			context.input.turnTimeoutMs,
-			input.observer === undefined ? undefined : event => input.observer?.(normalizeObservedSdkRecord(event)),
-		),
-	);
+	const outcome = await withMutationPort(context, attachment, input.lifecycle, async port => {
+		let rejectCancelled!: (error: Error) => void;
+		const cancelled = new Promise<never>((_resolve, reject) => {
+			rejectCancelled = reject;
+		});
+		const registration = registerOwnedAbort?.(input, input.principalId, input.operationId, async () => {
+			rejectCancelled(new GjcTurnCancelledError());
+			return await port.abort(input.idempotencyKey, context.input.turnTimeoutMs);
+		});
+		try {
+			throwIfAborted(input.signal, registration?.cancelled);
+			return await Promise.race([
+				port.answerGate(
+					gate,
+					input.answer,
+					input.idempotencyKey,
+					context.input.turnTimeoutMs,
+					input.observer === undefined ? undefined : event => input.observer?.(normalizeObservedSdkRecord(event)),
+				),
+				cancelled,
+			]);
+		} finally {
+			registration?.unregister();
+		}
+	});
 	return turnResult(
 		await withSessionArtifactEvents(outcome, input.sessionFile, input.promptText),
 		input.sessionFile,
 		undefined,
 		await freshAttachmentProof(input.cwd, attachment, input.lifecycle),
 	);
+}
+
+function throwIfAborted(signal: AbortSignal | undefined, cancelled = false): void {
+	if (cancelled || signal?.aborted) throw new GjcTurnCancelledError();
 }
 async function withSessionArtifactEvents(
 	outcome: import("../gjc/public-sdk-contract").PublicSdkTurnOutcome,

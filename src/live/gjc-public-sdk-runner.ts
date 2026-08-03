@@ -2,6 +2,7 @@ import type { GjcRuntimeLocations } from "../contracts";
 import type { PublicSdkSessionPort } from "../gjc/public-sdk-contract";
 import type { routeGjcTurn, SessionMapping } from "../gjc/session-router";
 import type {
+	GjcCancelTurnInput,
 	GjcContinueSessionInput,
 	GjcControlResult,
 	GjcLifecycleTransaction,
@@ -20,6 +21,7 @@ import {
 	continueSession,
 	getAvailableModels,
 	getState,
+	type OwnedAbortRegistration,
 	respondWorkflowGate,
 	startNewSession,
 	switchSession,
@@ -47,9 +49,39 @@ export function createPublicSdkGjcTurnRunner(input: CreatePublicSdkGjcTurnRunner
 
 class PublicSdkGjcTurnRunner implements GjcTurnRunner {
 	readonly #context: PublicSdkRunnerContext;
+	readonly #ownedAborters = new Map<
+		string,
+		{ readonly sessionId: string; readonly operationId: string; readonly abort: () => Promise<unknown> }
+	>();
+	readonly #cancelledOperations = new Set<string>();
 
 	constructor(input: CreatePublicSdkGjcTurnRunnerInput) {
 		this.#context = createPublicSdkRunnerContext(input);
+	}
+
+	async cancelTurn(input: GjcCancelTurnInput): Promise<void> {
+		const key = this.abortKey(input.principalId, input.projectId, input.chatId);
+		if (input.operationId === undefined) return;
+		const operationKey = this.operationKey(key, input.operationId);
+		const active = this.#ownedAborters.get(operationKey);
+		if (active !== undefined && input.sessionId !== undefined && input.sessionId !== active.sessionId) return;
+		if (active === undefined) {
+			this.#cancelledOperations.add(operationKey);
+			return;
+		}
+		try {
+			await active.abort();
+		} catch {
+			// HTTP disconnect cancellation is best-effort; the request signal still
+			// prevents the late turn result from being durably published.
+		}
+	}
+
+	clearTurnCancellation(input: GjcCancelTurnInput): void {
+		if (input.operationId === undefined) return;
+		this.#cancelledOperations.delete(
+			this.operationKey(this.abortKey(input.principalId, input.projectId, input.chatId), input.operationId),
+		);
 	}
 
 	discardSessionAttachment(cwd: string, sessionId: string): void {
@@ -76,7 +108,7 @@ class PublicSdkGjcTurnRunner implements GjcTurnRunner {
 		beforePrompt: Parameters<GjcTurnRunner["startNewSession"]>[2],
 		onFailure?: Parameters<GjcTurnRunner["startNewSession"]>[3],
 	): Promise<T> {
-		return startNewSession(this.#context, input, publish, beforePrompt, onFailure);
+		return startNewSession(this.#context, input, publish, beforePrompt, onFailure, this.registerOwnedAbort);
 	}
 
 	switchSession(input: GjcSwitchSessionInput): Promise<void> {
@@ -92,10 +124,10 @@ class PublicSdkGjcTurnRunner implements GjcTurnRunner {
 	}
 
 	respondWorkflowGate(input: import("../gjc/turn-runner").GjcRespondWorkflowGateInput): Promise<GjcTurnResult> {
-		return respondWorkflowGate(this.#context, input);
+		return respondWorkflowGate(this.#context, input, this.registerOwnedAbort);
 	}
 	continueSession(input: GjcContinueSessionInput): Promise<GjcTurnResult> {
-		return continueSession(this.#context, input);
+		return continueSession(this.#context, input, this.registerOwnedAbort);
 	}
 
 	runControl(
@@ -104,6 +136,30 @@ class PublicSdkGjcTurnRunner implements GjcTurnRunner {
 		lifecycle: GjcLifecycleTransaction,
 		onAcknowledgedSuccessor?: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[3],
 	): Promise<GjcControlResult> {
-		return runControl(this.#context, input, mapping, lifecycle, onAcknowledgedSuccessor);
+		return runControl(this.#context, input, mapping, lifecycle, onAcknowledgedSuccessor, this.registerOwnedAbort);
+	}
+
+	readonly registerOwnedAbort: OwnedAbortRegistration = (address, principalId, operationId, abort) => {
+		const operationKey = this.operationKey(
+			this.abortKey(principalId, address.projectId, address.chatId),
+			operationId,
+		);
+		const cancelled = this.#cancelledOperations.delete(operationKey);
+		const active = { sessionId: address.sessionId, operationId, abort };
+		this.#ownedAborters.set(operationKey, active);
+		return {
+			cancelled,
+			unregister: () => {
+				if (this.#ownedAborters.get(operationKey) === active) this.#ownedAborters.delete(operationKey);
+			},
+		};
+	};
+
+	private abortKey(principalId: string | undefined, projectId: string, chatId: string): string {
+		return JSON.stringify([principalId ?? null, projectId, chatId]);
+	}
+
+	private operationKey(abortKey: string, operationId: string): string {
+		return `${abortKey}:${operationId}`;
 	}
 }

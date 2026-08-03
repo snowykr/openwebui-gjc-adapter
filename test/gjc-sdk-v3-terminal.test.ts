@@ -309,6 +309,26 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 			await fixture.dispose();
 		}
 	});
+	test("Given an active prompt When its owning port aborts Then C04 bypasses the prompt mutation lane", async () => {
+		const fixture = createSdkTransportFixture("controls");
+		try {
+			await fixture.attach();
+			const pendingPrompt = fixture.port.prompt("long-running", 500);
+			await Bun.sleep(10);
+			await expect(
+				Promise.race([
+					fixture.port.abort("owned-abort", 500),
+					Bun.sleep(100).then(() => {
+						throw new Error("C04 abort was queued behind the active prompt");
+					}),
+				]),
+			).resolves.toMatchObject({ status: "accepted" });
+			expectSdkRequest(fixture.server.frames, "control_request", "turn.abort");
+			await expect(pendingPrompt).rejects.toMatchObject({ code: "timeout" });
+		} finally {
+			await fixture.dispose();
+		}
+	});
 	test("Given 0.11.6 payload-wrapped terminal and session event frames When waiting Then terminal text and presentation events are normalized", async () => {
 		const { terminal, emit } = await terminalFixture();
 		try {

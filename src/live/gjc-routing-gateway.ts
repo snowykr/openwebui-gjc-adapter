@@ -258,6 +258,7 @@ export function createGjcRoutingLiveGatewayRunner(
 						},
 						afterPublish: routed =>
 							ensureProjectionRows(input.outbox, routed.mapping, projectionOwnerUserId, principalId),
+						...(turn.signal === undefined ? {} : { signal: turn.signal }),
 						...(modelSelection === undefined ? {} : { modelSelection }),
 					});
 					reassignmentStarted = false;
@@ -310,6 +311,7 @@ export function createGjcRoutingLiveGatewayRunner(
 				},
 				afterPublish: routed =>
 					ensureProjectionRows(input.outbox, routed.mapping, projectionOwnerUserId, principalId),
+				...(turn.signal === undefined ? {} : { signal: turn.signal }),
 				onObservedTurn: async event => {
 					if (event.type !== "agent_failed") markActivityStarted();
 					if (isNativeLifecycleEvent(event.type)) observedNativeLifecycle = true;

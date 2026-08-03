@@ -260,6 +260,7 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 							liveEventsDelivered = true;
 						},
 					}),
+			...(input.signal === undefined ? {} : { signal: input.signal }),
 		});
 		await assertWorkspaceLease(leaseAdmission);
 
