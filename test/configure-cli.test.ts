@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildInstalledAdapterServerOptions, runCli } from "../src/cli";
+import { cleanupUnstartedAdapter } from "../src/cli-startup-cleanup";
 import type { AdapterConfig } from "../src/config";
 import { type BootstrapState, INITIAL_BOOTSTRAP_STATE, parseBootstrapState } from "../src/configure/bootstrap-state";
 import { openSecretFile } from "../src/configure/credentials";
@@ -253,6 +254,18 @@ describe("configure CLI grammar and acknowledgements", () => {
 			globalThis.fetch = originalFetch;
 			t.cleanup();
 		}
+	});
+	test("cleans configured server resources when its starter rejects", async () => {
+		const events: string[] = [];
+		const options = {
+			routes: { runner: { stop: async () => events.push("runner") } },
+			shutdownCleanup: async () => events.push("cleanup"),
+			runtimeLock: { release: async () => events.push("lock") },
+		} as unknown as AdapterServerOptions;
+		await expect(cleanupUnstartedAdapter(options, new Error("configured starter failed"))).rejects.toThrow(
+			"configured starter failed",
+		);
+		expect(events).toEqual(["runner", "cleanup", "lock"]);
 	});
 	test("builds installed server options without contacting a temporarily unavailable OpenWebUI", async () => {
 		const t = tempPath();
