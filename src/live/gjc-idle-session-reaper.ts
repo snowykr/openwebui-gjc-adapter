@@ -248,7 +248,6 @@ class IdleSessionReaper {
 			const operations = this.input.mappings.operations?.(mapping.chatId);
 			const closeOperations = this.closeOperations(mapping);
 			const alreadyClosed = closeOperations.some(operation => operation.state === "complete");
-			const lastCloseAt = latestCompletedAt(closeOperations);
 			const currentOperation = this.input.mappings.operation(mapping.chatId, mapping.operationId);
 			const activityAt = mappingActivityAt(
 				mapping,
@@ -256,7 +255,11 @@ class IdleSessionReaper {
 			);
 			if (activityAt === undefined) continue;
 			const generation = mappingGeneration(mapping);
-			const rearmAfterActivity = alreadyClosed && (lastCloseAt === undefined || activityAt > lastCloseAt);
+			const rearmAfterActivity = activityFollowsCompletedClose(
+				mapping,
+				operations ?? (currentOperation === undefined ? [] : [currentOperation]),
+				closeOperations,
+			);
 			const state = this.#states.get(mapping.chatId);
 			if (state === undefined) {
 				this.#states.set(mapping.chatId, {
@@ -681,26 +684,64 @@ function latestCompletedAt(operations: readonly SessionOperation[]): number | un
 }
 
 function mappingActivityAt(mapping: SessionMapping, operations: readonly SessionOperation[]): number | undefined {
+	const activities = mappingActivityOperations(mapping, operations);
+	let latest: number | undefined;
+	for (const operation of activities) {
+		const operationAt = operationActivityAt(operation);
+		if (operationAt !== undefined && (latest === undefined || operationAt > latest)) latest = operationAt;
+	}
+	return latest;
+}
+
+function activityFollowsCompletedClose(
+	mapping: SessionMapping,
+	operations: readonly SessionOperation[],
+	closeOperations: readonly SessionOperation[],
+): boolean {
+	const lastCloseAt = latestCompletedAt(closeOperations);
+	const activityAt = mappingActivityAt(mapping, operations);
+	if (lastCloseAt === undefined || activityAt === undefined) return false;
+	if (activityAt !== lastCloseAt) return activityAt > lastCloseAt;
+	const closeIds = new Set(
+		closeOperations
+			.filter(operation => operation.state === "complete" && operationCompletedAt(operation) === lastCloseAt)
+			.map(operation => operation.id),
+	);
+	const activityIds = new Set(
+		mappingActivityOperations(mapping, operations)
+			.filter(operation => operationActivityAt(operation) === activityAt)
+			.map(operation => operation.id),
+	);
+	const lastCloseIndex = operations.reduce(latestIndexForOperationIds(closeIds), Number.NEGATIVE_INFINITY);
+	const lastActivityIndex = operations.reduce(latestIndexForOperationIds(activityIds), Number.NEGATIVE_INFINITY);
+	return lastActivityIndex > lastCloseIndex;
+}
+
+function latestIndexForOperationIds(ids: ReadonlySet<string>) {
+	return (latest: number, operation: SessionOperation, index: number): number =>
+		ids.has(operation.id) ? index : latest;
+}
+
+function mappingActivityOperations(
+	mapping: SessionMapping,
+	operations: readonly SessionOperation[],
+): readonly SessionOperation[] {
 	const generation = mappingGeneration(mapping);
 	const current = operations.find(
 		operation => operation.id === mapping.operationId || operation.ingressId === mapping.operationId,
 	);
 	const baseline = operationActivityAt(current) ?? Number.NEGATIVE_INFINITY;
-	let latest = baseline === Number.NEGATIVE_INFINITY ? undefined : baseline;
-	for (const operation of operations) {
-		if (operation.kind === "close") continue;
+	return operations.filter(operation => {
+		if (operation.kind === "close") return false;
 		const operationAt = operationActivityAt(operation);
-		if (operationAt === undefined) continue;
+		if (operationAt === undefined) return false;
 		const resultMapping = operation.result?.mapping;
 		const sameGeneration = resultMapping === undefined || mappingGeneration(resultMapping) === generation;
 		const isCurrent = operation.id === mapping.operationId || operation.ingressId === mapping.operationId;
 		const hasSameGenerationResult = resultMapping !== undefined && sameGeneration;
 		const isReconciliation = ["pending", "uncertain", "conflict"].includes(operation.state);
-		if (!sameGeneration || (!isCurrent && !hasSameGenerationResult && (!isReconciliation || operationAt < baseline)))
-			continue;
-		if (latest === undefined || operationAt > latest) latest = operationAt;
-	}
-	return latest;
+		return sameGeneration && (isCurrent || hasSameGenerationResult || (isReconciliation && operationAt >= baseline));
+	});
 }
 
 function operationActivityAt(

@@ -566,6 +566,30 @@ describe("GJC idle session reaper", () => {
 		expect(closeCalls).toHaveLength(1);
 		await reaper.stop();
 	});
+	test("rearms a retained close when later uncertain activity shares its timestamp", async () => {
+		const clock = new ManualTimers();
+		clock.now = DEFAULT_IDLE_SESSION_TIMEOUT_MS;
+		const mappings = new MappingFixture();
+		mappings.recordClose("manual-close", "complete");
+		mappings.recordActivity("turn-interrupted", "uncertain", 0);
+		let closeCalls = 0;
+		const reaper = createGjcIdleSessionReaper({
+			runner: { run: async () => ({ content: "done", model: "gjc" }) },
+			mappings,
+			closeSession: async () => {
+				closeCalls += 1;
+				return { status: "closed" };
+			},
+			now: () => clock.now,
+			setTimeout: (handler, timeoutMs) =>
+				clock.setTimeout(handler, timeoutMs) as unknown as ReturnType<typeof setTimeout>,
+			clearTimeout: timer => clock.clearTimeout(timer as unknown as number),
+		});
+		clock.advance(0);
+		await flush();
+		expect(closeCalls).toBe(1);
+		await reaper.stop();
+	});
 	test("restart pending journal activity remains a no-close guard", async () => {
 		const clock = new ManualTimers();
 		clock.now = 1_000;
