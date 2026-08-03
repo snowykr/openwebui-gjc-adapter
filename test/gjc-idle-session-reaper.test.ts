@@ -818,6 +818,58 @@ describe("GJC idle session reaper", () => {
 		expect(calls).toBe(2);
 		await reaper.stop();
 	});
+	test("starts source abandonment and stream draining together", async () => {
+		const clock = new ManualTimers();
+		const mappings = new MappingFixture();
+		let first = true;
+		let sourceAbandoned = false;
+		let resolveDrainStarted!: () => void;
+		const drainStarted = new Promise<void>(resolve => {
+			resolveDrainStarted = resolve;
+		});
+		const source: AsyncIterable<string> = {
+			[Symbol.asyncIterator]() {
+				return {
+					async next() {
+						if (first) {
+							first = false;
+							return { value: "first", done: false };
+						}
+						resolveDrainStarted();
+						return { value: undefined, done: true };
+					},
+				};
+			},
+		};
+		const reaper = createGjcIdleSessionReaper({
+			runner: {
+				run: async () => ({
+					chunks: source,
+					abandon: async () => {
+						await drainStarted;
+						sourceAbandoned = true;
+					},
+					model: "gjc",
+				}),
+			},
+			mappings,
+			closeSession: async () => ({ status: "closed" }),
+			now: () => clock.now,
+			setTimeout: (handler, timeoutMs) =>
+				clock.setTimeout(handler, timeoutMs) as unknown as ReturnType<typeof setTimeout>,
+			clearTimeout: timer => clock.clearTimeout(timer as unknown as number),
+		});
+		const result = await reaper.runner.run(createInput());
+		if (result.chunks === undefined || result.abandon === undefined)
+			throw new Error("Expected streamed runner result.");
+		const iterator = (result.chunks as AsyncIterable<string>)[Symbol.asyncIterator]();
+		await iterator.next();
+
+		await result.abandon();
+
+		expect(sourceAbandoned).toBe(true);
+		await reaper.stop();
+	});
 	test("releases the chat gate when a handed-off stream is never read", async () => {
 		const clock = new ManualTimers();
 		const mappings = new MappingFixture();

@@ -684,6 +684,50 @@ describe("routeGjcSessionClose", () => {
 			rmSync(directory, { recursive: true, force: true });
 		}
 	});
+	test("replays a legacy completed close when its result proves the current mapping generation", async () => {
+		const mappings = closeMappings();
+		const mapping = mappings.get("chat-1")!;
+		recordLegacyClose(mappings, mapping);
+		let calls = 0;
+
+		const result = await routeGjcSessionClose({
+			mapping,
+			mappings,
+			ingressId: "legacy-close",
+			ingressHash: "legacy-close-hash",
+			lifecycle: closeLifecycle(mapping),
+			close: async (_receipt: GjcCloseReceipt) => {
+				calls += 1;
+				return { status: "closed" };
+			},
+		});
+
+		expect(result).toEqual({ status: "closed" });
+		expect(calls).toBe(0);
+	});
+	test("rejects a legacy completed close after the mapping generation advances", async () => {
+		const mappings = closeMappings();
+		const mapping = mappings.get("chat-1")!;
+		recordLegacyClose(mappings, mapping);
+		mappings.upsert({ ...mapping, operationId: "message-2" });
+		const current = mappings.get("chat-1")!;
+		let calls = 0;
+
+		await expect(
+			routeGjcSessionClose({
+				mapping: current,
+				mappings,
+				ingressId: "legacy-close",
+				ingressHash: "legacy-close-hash",
+				lifecycle: closeLifecycle(current),
+				close: async (_receipt: GjcCloseReceipt) => {
+					calls += 1;
+					return { status: "closed" };
+				},
+			}),
+		).rejects.toThrow("valid immutable result binding.");
+		expect(calls).toBe(0);
+	});
 	test("returns uncertain without invoking close for an endpoint-only mapping", async () => {
 		const mappings = closeMappings();
 		const mapping = mappings.get("chat-1")!;
@@ -802,6 +846,21 @@ function closeMappings(): SessionMappingStore {
 		},
 	});
 	return mappings;
+}
+function recordLegacyClose(mappings: SessionMappingStore, mapping: SessionMapping): void {
+	mappings.beginOperation("chat-1", {
+		id: "legacy-close",
+		kind: "close",
+		ingressId: "legacy-close",
+		detail: "legacy-close-hash",
+	});
+	mappings.transitionOperation("chat-1", "legacy-close", "complete", "legacy-close-hash", {
+		kind: "close",
+		assistantText: "",
+		events: [],
+		mapping: { ...mapping, operationId: "legacy-close" },
+		correlation: { closeStatus: "closed" },
+	});
 }
 
 function closeLifecycle(

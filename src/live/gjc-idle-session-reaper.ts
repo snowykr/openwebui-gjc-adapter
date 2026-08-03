@@ -182,17 +182,11 @@ class IdleSessionReaper {
 				const abandon = (): Promise<void> => {
 					if (abandonment === undefined)
 						abandonment = (async () => {
-							const failures: unknown[] = [];
-							try {
-								await sourceAbandon?.();
-							} catch (error) {
-								failures.push(error);
-							}
-							try {
-								await chunks.abandon();
-							} catch (error) {
-								failures.push(error);
-							}
+							const source = Promise.resolve().then(() => sourceAbandon?.());
+							const drain = chunks.abandon();
+							const failures = (await Promise.allSettled([source, drain])).flatMap(result =>
+								result.status === "rejected" ? [result.reason] : [],
+							);
 							if (failures.length === 1) throw failures[0];
 							if (failures.length > 1) throw new AggregateError(failures, "GJC stream abandonment failed");
 						})();

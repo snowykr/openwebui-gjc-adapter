@@ -170,11 +170,14 @@ export function replayCloseOperation(
 	operationId: string,
 	result: SessionOperationResult | undefined,
 	mappingOperationId: string,
+	legacyMappingCompatible = false,
 ): { readonly status: "closed" } {
+	const resultMappingOperationId = result?.correlation?.mappingOperationId;
 	if (
 		result?.kind !== "close" ||
 		result.correlation?.closeStatus !== "closed" ||
-		result.correlation.mappingOperationId !== mappingOperationId
+		(resultMappingOperationId !== mappingOperationId &&
+			!(resultMappingOperationId === undefined && legacyMappingCompatible))
 	)
 		throw new Error(`GJC close ${operationId} completed without a valid immutable result binding.`);
 	return { status: "closed" };
