@@ -127,6 +127,31 @@ describe("live OpenAI-compatible chat completion errors", () => {
 		await body.cancel();
 		expect(abandoned).toBe(1);
 	});
+	it("waits for runner abandonment before completing SSE body cancellation", async () => {
+		let release!: () => void;
+		let abandoned = false;
+		const body = asyncIterableBody(
+			encodeChatCompletionSse({
+				id: "chatcmpl-cancel-awaits-abandon",
+				created: 1_783_468_800,
+				model: "gjc/anthropic/claude-sonnet-4:low",
+				chunks: ["never-read"],
+				onAbandon: async () =>
+					await new Promise<void>(resolve => {
+						release = () => {
+							abandoned = true;
+							resolve();
+						};
+					}),
+			}),
+		);
+		const cancellation = body.cancel();
+		await Promise.resolve();
+		expect(abandoned).toBe(false);
+		release();
+		await cancellation;
+		expect(abandoned).toBe(true);
+	});
 	it("abandons a direct SSE iterator before its first next", async () => {
 		let abandoned = 0;
 		const stream = encodeChatCompletionSse({

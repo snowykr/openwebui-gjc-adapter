@@ -207,13 +207,14 @@ export async function handleOpenAIChatCompletionsRequest(
 export function asyncIterableBody(source: AsyncIterable<string>): ReadableStream<Uint8Array> {
 	const iterator = source[Symbol.asyncIterator]();
 	const encoder = new TextEncoder();
-	const abandon = async () => {
-		if (!("abandon" in source)) return;
-		const callback = (source as { abandon?: () => Promise<void> }).abandon;
-		void callback?.().catch(() => {});
+	const abandon = (): Promise<void> => {
+		if (!("abandon" in source)) return Promise.resolve();
+		return (source as { abandon?: () => Promise<void> }).abandon?.() ?? Promise.resolve();
 	};
-	const closeIterator = async () => {
-		await abandon();
+	const closeIterator = async (awaitAbandon: boolean) => {
+		const abandoned = abandon();
+		if (awaitAbandon) await abandoned;
+		else void abandoned.catch(() => {});
 		await iterator.return?.();
 	};
 	return new ReadableStream<Uint8Array>({
@@ -223,12 +224,12 @@ export function asyncIterableBody(source: AsyncIterable<string>): ReadableStream
 				if (next.done) controller.close();
 				else controller.enqueue(encoder.encode(next.value));
 			} catch (error) {
-				await closeIterator();
+				await closeIterator(false);
 				controller.error(error);
 			}
 		},
 		async cancel() {
-			await closeIterator();
+			await closeIterator(true);
 		},
 	});
 }
