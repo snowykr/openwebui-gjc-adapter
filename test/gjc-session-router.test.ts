@@ -3,9 +3,11 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { NormalizedModelSelection } from "../src/contracts";
+import { SessionAuthority } from "../src/gjc/session-authority";
 import {
 	closeIngressId,
 	FileBackedSessionMappingStore,
+	legacyCloseIngressId,
 	type RouteGjcTurnInput,
 	routeGjcSessionClose,
 	routeGjcTurn,
@@ -625,6 +627,15 @@ describe("routeGjcSessionClose", () => {
 		expect(closeIngressId("operation-1", { ...mapping, sessionId: "session-2" })).not.toBe(
 			closeIngressId("operation-1", mapping),
 		);
+		expect(
+			closeIngressId("operation-1", { ...mapping, sessionFile: "/workspace/project/.gjc/sessions/other.jsonl" }),
+		).not.toBe(closeIngressId("operation-1", mapping));
+		expect(
+			closeIngressId("operation-1", {
+				...mapping,
+				attachment: { ...mapping.attachment!, generation: mapping.attachment!.generation + 1 },
+			}),
+		).not.toBe(closeIngressId("operation-1", mapping));
 	});
 	test("replays a close after restart without repeating its remote effect", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "gjc-close-journal-"));
@@ -674,6 +685,137 @@ describe("routeGjcSessionClose", () => {
 		} finally {
 			rmSync(directory, { recursive: true, force: true });
 		}
+	});
+	test("replays a pre-upgrade close under the legacy ingress identity", async () => {
+		const mappings = closeMappings();
+		const mapping = mappings.get("chat-1")!;
+		const legacyIngressId = legacyCloseIngressId("operation-1", mapping);
+		let calls = 0;
+		const legacyInput = {
+			mapping,
+			mappings,
+			ingressId: legacyIngressId,
+			ingressHash: legacyIngressId,
+			lifecycle: closeLifecycle(mapping),
+			close: async (_receipt: GjcCloseReceipt) => {
+				calls += 1;
+				return { status: "closed" } as const;
+			},
+		};
+
+		await routeGjcSessionClose(legacyInput);
+		const currentMapping = mappings.get("chat-1")!;
+		const currentIngressId = closeIngressId("operation-1", currentMapping);
+		expect(currentIngressId).not.toBe(legacyIngressId);
+
+		const replay = await routeGjcSessionClose({
+			...legacyInput,
+			mapping: currentMapping,
+			ingressId: currentIngressId,
+			ingressHash: currentIngressId,
+			legacyIngress: { ingressId: legacyIngressId, ingressHash: legacyIngressId },
+		});
+
+		expect(replay).toEqual({ status: "closed" });
+		expect(calls).toBe(1);
+	});
+	test("replays a legacy completed close when its result proves the current mapping generation", async () => {
+		const mappings = closeMappings();
+		const mapping = mappings.get("chat-1")!;
+		recordLegacyClose(mappings, mapping);
+		let calls = 0;
+
+		const result = await routeGjcSessionClose({
+			mapping,
+			mappings,
+			ingressId: "legacy-close",
+			ingressHash: "legacy-close-hash",
+			lifecycle: closeLifecycle(mapping),
+			close: async (_receipt: GjcCloseReceipt) => {
+				calls += 1;
+				return { status: "closed" };
+			},
+		});
+
+		expect(result).toEqual({ status: "closed" });
+		expect(calls).toBe(0);
+	});
+	test("uses timestamps before journal order for delayed legacy closes", async () => {
+		const mapping = closeMappings().get("chat-1")!;
+		const currentAt = "2026-07-20T00:00:00.000Z";
+		const oldAt = "2026-07-19T00:00:00.000Z";
+		const authority = new SessionAuthority();
+		authority.set({
+			...mapping,
+			createdAt: currentAt,
+			journal: [
+				{
+					id: mapping.operationId,
+					kind: "prompt",
+					state: "complete",
+					ingressId: mapping.operationId,
+					startedAt: currentAt,
+					completedAt: currentAt,
+				},
+				{
+					id: "legacy-close",
+					kind: "close",
+					state: "complete",
+					ingressId: "legacy-close",
+					startedAt: oldAt,
+					completedAt: oldAt,
+					detail: "legacy-close-hash",
+					result: {
+						kind: "close",
+						assistantText: "",
+						events: [],
+						mapping: { ...mapping, operationId: "legacy-close" },
+						correlation: { closeStatus: "closed" },
+					},
+				},
+			],
+		});
+		const mappings = new SessionMappingStore(authority);
+		const current = mappings.get("chat-1")!;
+		let calls = 0;
+
+		await expect(
+			routeGjcSessionClose({
+				mapping: current,
+				mappings,
+				ingressId: "legacy-close",
+				ingressHash: "legacy-close-hash",
+				lifecycle: closeLifecycle(current),
+				close: async (_receipt: GjcCloseReceipt) => {
+					calls += 1;
+					return { status: "closed" };
+				},
+			}),
+		).rejects.toThrow("valid immutable result binding.");
+		expect(calls).toBe(0);
+	});
+	test("rejects a legacy completed close after the mapping generation advances", async () => {
+		const mappings = closeMappings();
+		const mapping = mappings.get("chat-1")!;
+		recordLegacyClose(mappings, mapping);
+		mappings.upsert({ ...mapping, operationId: "message-2" });
+		const current = mappings.get("chat-1")!;
+		let calls = 0;
+
+		await expect(
+			routeGjcSessionClose({
+				mapping: current,
+				mappings,
+				ingressId: "legacy-close",
+				ingressHash: "legacy-close-hash",
+				lifecycle: closeLifecycle(current),
+				close: async (_receipt: GjcCloseReceipt) => {
+					calls += 1;
+					return { status: "closed" };
+				},
+			}),
+		).rejects.toThrow("valid immutable result binding.");
+		expect(calls).toBe(0);
 	});
 	test("returns uncertain without invoking close for an endpoint-only mapping", async () => {
 		const mappings = closeMappings();
@@ -793,6 +935,21 @@ function closeMappings(): SessionMappingStore {
 		},
 	});
 	return mappings;
+}
+function recordLegacyClose(mappings: SessionMappingStore, mapping: SessionMapping): void {
+	mappings.beginOperation("chat-1", {
+		id: "legacy-close",
+		kind: "close",
+		ingressId: "legacy-close",
+		detail: "legacy-close-hash",
+	});
+	mappings.transitionOperation("chat-1", "legacy-close", "complete", "legacy-close-hash", {
+		kind: "close",
+		assistantText: "",
+		events: [],
+		mapping: { ...mapping, operationId: "legacy-close" },
+		correlation: { closeStatus: "closed" },
+	});
 }
 
 function closeLifecycle(

@@ -1,4 +1,5 @@
 import { startAdapterServiceFromEnv } from "./adapter-server-options";
+import { cleanupUnstartedAdapter } from "./cli-startup-cleanup";
 import { type CliDependencies, runInstalledCli } from "./configure/installed-cli";
 import { buildResolvedInstalledAdapterServerOptions } from "./installed-adapter-server-options";
 import { type AdapterServerHandle, type AdapterServerOptions, startAdapterServer } from "./server";
@@ -123,8 +124,7 @@ export async function runCli(
 							try {
 								return await startConfiguredServer(options);
 							} catch (error) {
-								await options.runtimeLock.release();
-								throw error;
+								return await cleanupUnstartedAdapter(options, error);
 							}
 						}
 					: async config => startAdapterServer(await buildResolvedInstalledAdapterServerOptions(config))),

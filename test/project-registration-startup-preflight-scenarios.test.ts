@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { buildAdapterServerOptionsFromEnv as buildOptions } from "../src/adapter-server-options";
 import { ProjectLinkError as LinkError } from "../src/projects/link-service";
 import { SqliteProjectRegistrationStore as RegistrationStore } from "../src/projects/registration-store";
+import { RuntimeSingletonLock } from "../src/runtime-singleton-lock";
 import { startAdapterServer } from "../src/server";
 import { reserveTcpPort } from "./cli-fixtures";
 import * as fixture from "./project-registration-startup-preflight-fixtures";
@@ -92,6 +93,30 @@ test("lifecycle aggregates an existing startup cause with an internal store clos
 	expect(close).toHaveBeenCalledTimes(1);
 	for (const mock of [realpath, close]) mock.mockRestore();
 	expect(await fixture.openFileDescriptors(context.databasePath)).toEqual([]);
+});
+test("lifecycle aggregates internal cleanup and lock-release failures without replacing startup", async () => {
+	const context = await makeContext("internal-close-and-release-failures");
+	const missing = path.join(context.root, "missing");
+	const primary = new Error("primary realpath failure");
+	const secondary = new Error("secondary close failure");
+	const releaseFailure = new Error("lock release failure");
+	const originalRealpath = fs.realpath;
+	const realpath = spyOn(fs, "realpath");
+	for (let index = 0; index < 5; index += 1) realpath.mockImplementationOnce(originalRealpath);
+	realpath.mockRejectedValueOnce(primary);
+	const originalClose = RegistrationStore.prototype.close;
+	const close = spyOn(RegistrationStore.prototype, "close").mockImplementation(closeAfter(originalClose, secondary));
+	const release = spyOn(RuntimeSingletonLock.prototype, "release").mockRejectedValue(releaseFailure);
+	try {
+		await expect(buildOptions(runtimeEnv(context.root, missing))).rejects.toBe(primary);
+		expect(primary.cause).toBeInstanceOf(AggregateError);
+		if (!(primary.cause instanceof AggregateError)) throw new TypeError("expected aggregate startup cleanup cause");
+		expect(primary.cause.errors).toEqual([secondary, releaseFailure]);
+		expect(close).toHaveBeenCalledTimes(1);
+		expect(release).toHaveBeenCalledTimes(1);
+	} finally {
+		for (const mock of [realpath, close, release]) mock.mockRestore();
+	}
 });
 test("lifecycle preserves the startup error when the internal store closes successfully", async () => {
 	// Given: a deterministic startup failure and a normal internal store close.

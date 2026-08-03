@@ -45,6 +45,24 @@ export function closeIngressId(operationId: string, mapping: SessionOperationMap
 				projectId: mapping.projectId,
 				chatId: mapping.chatId,
 				sessionId: mapping.sessionId,
+				sessionFile: mapping.sessionFile,
+				activeLeaf: mapping.activeLeaf,
+				rawFrameCursor: mapping.rawFrameCursor,
+				eventCursor: mapping.eventCursor,
+				attachment: mapping.attachment,
+			}),
+		)
+		.digest("hex")}`;
+}
+export function legacyCloseIngressId(operationId: string, mapping: SessionOperationMapping): string {
+	return `close:${createHash("sha256")
+		.update(
+			JSON.stringify({
+				kind: "close",
+				operationId,
+				projectId: mapping.projectId,
+				chatId: mapping.chatId,
+				sessionId: mapping.sessionId,
 			}),
 		)
 		.digest("hex")}`;
@@ -164,8 +182,16 @@ export function updateAuthorityIdentity(
 export function replayCloseOperation(
 	operationId: string,
 	result: SessionOperationResult | undefined,
+	mappingOperationId: string,
+	legacyMappingCompatible = false,
 ): { readonly status: "closed" } {
-	if (result?.kind !== "close" || result.correlation?.closeStatus !== "closed")
+	const resultMappingOperationId = result?.correlation?.mappingOperationId;
+	if (
+		result?.kind !== "close" ||
+		result.correlation?.closeStatus !== "closed" ||
+		(resultMappingOperationId !== mappingOperationId &&
+			!(resultMappingOperationId === undefined && legacyMappingCompatible))
+	)
 		throw new Error(`GJC close ${operationId} completed without a valid immutable result binding.`);
 	return { status: "closed" };
 }

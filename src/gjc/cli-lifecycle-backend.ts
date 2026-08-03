@@ -1,3 +1,4 @@
+import { realpath } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { createCliLifecycleBackendRuntime } from "./cli-lifecycle-backend-runtime";
 import {
@@ -88,11 +89,14 @@ export class CliLifecycleBackend {
 	}
 
 	async coldResume(input: CliColdResumeInput): Promise<CliLifecycleResult<CliLifecycleAttachment>> {
+		const canonicalCwd = resolve(this.options.cwd);
 		let resume: ReturnType<typeof openAbsoluteRegularSessionFile> | undefined;
 		let initial: LoadedGjcSessionFile;
 		try {
 			resume = openAbsoluteRegularSessionFile(input.existingSessionPath);
 			initial = await loadGjcSessionFile(resume.canonicalPath);
+			if (!(await cwdMatchesCanonicalIdentity(initial.header.cwd, canonicalCwd)))
+				throw new Error("CLI /session identity does not match canonical resumed JSONL header");
 		} catch (error) {
 			resume?.close();
 			return unavailable(error, "cannot open canonical session JSONL");
@@ -103,12 +107,16 @@ export class CliLifecycleBackend {
 			try {
 				const final = await loadGjcSessionFile(resume.canonicalPath);
 				revalidateOpenedRegularSessionFile(resume);
-				if (opened.value.sessionId === initial.header.id && final.header.id === initial.header.id)
+				if (
+					opened.value.sessionId === initial.header.id &&
+					final.header.id === initial.header.id &&
+					(await cwdMatchesCanonicalIdentity(final.header.cwd, canonicalCwd))
+				)
 					return {
 						status: "closed",
 						value: {
 							...opened.value,
-							cwd: resolve(this.options.cwd),
+							cwd: canonicalCwd,
 							sessionRoot: dirname(resume.canonicalPath),
 							sessionPath: resume.canonicalPath,
 						},
@@ -162,5 +170,16 @@ export class CliLifecycleBackend {
 		attachment: CliLifecycleAttachment,
 	): Promise<CliLifecycleResult<undefined>> {
 		return this.#runtime.fallbackBeforeCloseAcknowledgement(attachment);
+	}
+}
+async function cwdMatchesCanonicalIdentity(headerCwd: string, canonicalCwd: string): Promise<boolean> {
+	try {
+		const [resolvedHeaderCwd, resolvedCanonicalCwd] = await Promise.all([
+			realpath(headerCwd),
+			realpath(canonicalCwd),
+		]);
+		return resolvedHeaderCwd === resolvedCanonicalCwd;
+	} catch {
+		return false;
 	}
 }

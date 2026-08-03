@@ -48,6 +48,9 @@ export class SessionMappingStore {
 	operation(chatId: string, operationId: string): SessionOperation | undefined {
 		return this.authority.lookupOperation(chatId, operationId);
 	}
+	operations(chatId: string): readonly SessionOperation[] {
+		return this.authority.get(chatId)?.journal ?? [];
+	}
 	operationAuthority(
 		chatId: string,
 		operationId: string,
@@ -84,13 +87,21 @@ export class SessionMappingStore {
 		mapping: SessionMapping,
 		kind: "turn" | "control" | "close",
 	): SessionMapping {
+		const result = operationResult(kind, { ...mapping, operationId });
+		const resultWithCloseGeneration =
+			kind === "close"
+				? {
+						...result,
+						correlation: { ...result.correlation, mappingOperationId: mapping.operationId },
+					}
+				: result;
 		return mappingFromRecord(
 			this.authority.completeOperationWithMapping(
 				chatId,
 				operationId,
 				detail,
 				copySessionMapping(mapping),
-				operationResult(kind, { ...mapping, operationId }),
+				resultWithCloseGeneration,
 			),
 		);
 	}

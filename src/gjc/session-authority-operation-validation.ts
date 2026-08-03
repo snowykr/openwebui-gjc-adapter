@@ -214,7 +214,9 @@ function isOperationResult(value: unknown): value is SessionOperationResult {
 	return value.kind === "close"
 		? isRecord(value.correlation) &&
 				value.correlation.closeStatus === "closed" &&
-				Object.keys(value.correlation).every(key => key === "closeStatus")
+				(value.correlation.mappingOperationId === undefined ||
+					isNonEmptyString(value.correlation.mappingOperationId)) &&
+				Object.keys(value.correlation).every(key => key === "closeStatus" || key === "mappingOperationId")
 		: value.correlation === undefined ||
 				(isRecord(value.correlation) && Object.values(value.correlation).every(isNonEmptyString));
 }

@@ -2,6 +2,8 @@ import type { GjcRuntimeLocations } from "../contracts";
 import type { GjcSessionStorageLocations } from "../gjc/session-root";
 import {
 	closeIngressId,
+	legacyCloseIngressId,
+	type SessionCloseIngress,
 	type SessionCloseResult,
 	type SessionMapping,
 	type SessionMappingStore,
@@ -28,7 +30,7 @@ export type { SessionCloseResult } from "../gjc/session-router";
 
 export type ProjectSessionCloser = (
 	mapping: SessionMapping,
-	ingress: Readonly<{ ingressId: string; ingressHash: string }>,
+	ingress: SessionCloseIngress,
 ) => Promise<SessionCloseResult>;
 
 export interface ProjectLinkServiceOptions {
@@ -207,6 +209,10 @@ export class ProjectLinkService {
 							result: await this.#closeSession!(mapping, {
 								ingressId: closeIngressId(`project-unlink:${projectId}`, mapping),
 								ingressHash: `project-unlink:${projectId}`,
+								legacyIngress: {
+									ingressId: legacyCloseIngressId(`project-unlink:${projectId}`, mapping),
+									ingressHash: `project-unlink:${projectId}`,
+								},
 							}),
 						};
 					} catch (error) {

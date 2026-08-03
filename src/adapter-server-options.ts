@@ -15,6 +15,7 @@ import { type AdapterConfig, loadAdapterConfig, type ResolvedAdapterConfig } fro
 import { FileBackedSessionMappingStore, type SessionMapping, type SessionMappingStore } from "./gjc/session-router";
 import type { GjcCloseReceipt } from "./gjc/turn-runner";
 import type { LiveGatewayEventSink, LiveGatewayMessageSink } from "./live/chat-completions";
+import { createGjcIdleSessionReaper } from "./live/gjc-idle-session-reaper";
 import {
 	createGjcRoutingLiveGatewayRunner,
 	createPublicSdkGjcTurnRunner,
@@ -87,10 +88,11 @@ export async function buildResolvedAdapterServerOptions(
 	assertResolvedAdapterConfig(config);
 	await mkdir(config.statePath, { recursive: true });
 	const lock = await RuntimeSingletonLock.acquire(config.statePath);
-	let completed = false;
 	const internalStore = dependencies.projectRegistrationStore === undefined;
 	const databasePath = path.join(config.statePath, "adapter-state.sqlite");
 	let projectStore: SqliteProjectRegistrationStore | undefined;
+	let idleSessionReaper: ReturnType<typeof createGjcIdleSessionReaper> | undefined;
+	let routingRunner: ReturnType<typeof createGjcRoutingLiveGatewayRunner> | undefined;
 	try {
 		if (internalStore)
 			await preflightProjectRegistrationDatabase(databasePath, config.runtimeLocations.protectedProjectPaths);
@@ -134,6 +136,29 @@ export async function buildResolvedAdapterServerOptions(
 				sessionPortFactory: dependencies.sessionPortFactory,
 			});
 		const closeSession = createAdapterSessionCloser(config, cliPath, { ...dependencies, turnRunner }, mappings);
+		const baseRoutingRunner = createGjcRoutingLiveGatewayRunner({
+			turnRunner,
+			mappings,
+			ownerUserId: owner.ownerUserId,
+			modelReaderFactory,
+			...(outbox === undefined ? {} : { outbox }),
+		});
+		routingRunner = baseRoutingRunner;
+		if (closeSession !== undefined) {
+			idleSessionReaper = createGjcIdleSessionReaper({
+				runner: baseRoutingRunner,
+				mappings,
+				closeSession,
+				...(turnRunner.discardSessionAttachment === undefined
+					? {}
+					: {
+							discardSessionAttachment: (cwd, sessionId) =>
+								turnRunner.discardSessionAttachment?.(cwd, sessionId),
+						}),
+			});
+		}
+		const runner = idleSessionReaper?.runner ?? baseRoutingRunner;
+		const closeSessionForRoutes = idleSessionReaper?.closeSession ?? closeSession;
 		const projectLinkService = new ProjectLinkService({
 			allowedRoots,
 			store: projectStore,
@@ -142,7 +167,7 @@ export async function buildResolvedAdapterServerOptions(
 			mappings,
 			protectedPaths: config.runtimeLocations.protectedProjectPaths,
 			runtimeLocations: config.runtimeLocations,
-			...(closeSession === undefined ? {} : { closeSession }),
+			...(closeSessionForRoutes === undefined ? {} : { closeSession: closeSessionForRoutes }),
 		});
 		const previouslyLinkedProjectIds = new Set(projectLinkService.listLinkedProjects().map(project => project.id));
 		await projectLinkService.seedConfiguredProjects(projects);
@@ -166,6 +191,11 @@ export async function buildResolvedAdapterServerOptions(
 		const eventSink = dependencies.eventSink ?? buildOpenWebUIEventSink(openWebUIClient);
 		const messageSink = dependencies.messageSink ?? buildOpenWebUIMessageSink(openWebUIClient);
 		const fileContextResolver = buildOpenWebUIFileContextResolver(openWebUIClient);
+		const shutdownCleanup = internalStore
+			? () => {
+					projectStore?.close();
+				}
+			: undefined;
 		const options = {
 			host: config.bindHost,
 			port: config.bindPort,
@@ -182,16 +212,10 @@ export async function buildResolvedAdapterServerOptions(
 				projectLinkService,
 				...(projectionRepository === undefined ? {} : { projectContextRepository: projectionRepository }),
 				owner,
-				runner: createGjcRoutingLiveGatewayRunner({
-					turnRunner,
-					mappings,
-					ownerUserId: owner.ownerUserId,
-					modelReaderFactory,
-					...(outbox === undefined ? {} : { outbox }),
-				}),
+				runner,
 				modelReaderFactory,
 				mappings,
-				closeSession,
+				closeSession: closeSessionForRoutes,
 				neutralWorkspace: config.runtimeLocations.readerWorkspace,
 				requireAdapterApiToken: true,
 				...(config.adapterApiToken === undefined ? {} : { adapterApiToken: config.adapterApiToken }),
@@ -199,26 +223,51 @@ export async function buildResolvedAdapterServerOptions(
 				...(messageSink === undefined ? {} : { messageSink }),
 				...(fileContextResolver === undefined ? {} : { fileContextResolver }),
 			},
+			...(shutdownCleanup === undefined ? {} : { shutdownCleanup }),
 		};
-		completed = true;
 		return options;
 	} catch (error) {
-		if (!internalStore || projectStore === undefined) throw error;
+		let startupError: unknown = error;
 		try {
-			projectStore.close();
-		} catch (closeError) {
-			if (error instanceof Error) {
-				const cause =
-					error.cause === undefined
-						? closeError
-						: new AggregateError([error.cause, closeError], "Startup failure cleanup failed");
-				Reflect.defineProperty(error, "cause", { value: cause });
+			await (idleSessionReaper?.stop() ?? routingRunner?.stop?.());
+		} catch (stopError) {
+			startupError = new AggregateError([startupError, stopError], "Adapter initialization cleanup failed");
+		}
+		if (internalStore && projectStore !== undefined) {
+			try {
+				projectStore.close();
+			} catch (closeError) {
+				startupError = appendStartupCleanupError(startupError, closeError);
 			}
 		}
-		throw error;
-	} finally {
-		if (!completed) await lock.release();
+		try {
+			await lock.release();
+		} catch (releaseError) {
+			startupError = appendStartupCleanupError(startupError, releaseError);
+		}
+		throw startupError;
 	}
+}
+
+function appendStartupCleanupError(startupError: unknown, cleanupError: unknown): unknown {
+	if (!(startupError instanceof Error))
+		return new AggregateError([startupError, cleanupError], "Startup failure cleanup failed");
+	const causes =
+		startupError.cause === undefined
+			? [cleanupError]
+			: startupError.cause instanceof AggregateError
+				? [...startupError.cause.errors, cleanupError]
+				: [startupError.cause, cleanupError];
+	const cause = causes.length === 1 ? causes[0] : new AggregateError(causes, "Startup failure cleanup failed");
+	if (
+		Reflect.defineProperty(startupError, "cause", {
+			value: cause,
+			configurable: true,
+			writable: true,
+		})
+	)
+		return startupError;
+	return new AggregateError([startupError, cleanupError], "Startup failure cleanup failed");
 }
 
 export { resolveAdapterConfig };

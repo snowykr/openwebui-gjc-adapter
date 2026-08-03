@@ -1,5 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { handleChatCompletions, LiveGatewayUnavailableError } from "../src/live/chat-completions";
+import { encodeChatCompletionSse } from "../src/live/chat-response-format";
+import { asyncIterableBody } from "../src/live/openai-routes";
 import type { OpenAIChatCompletionRequest } from "../src/live/openai-types";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import type { RegisteredProject } from "../src/projects/registry";
@@ -81,6 +83,89 @@ describe("live OpenAI-compatible chat completion errors", () => {
 			"data: [DONE]\n\n",
 		]);
 	});
+	it("abandons an unconsumed runner stream when the SSE response closes after its role frame", async () => {
+		let abandoned = 0;
+		const result = await handleChatCompletions({
+			request: { ...request, stream: true },
+			headers: chatHeaders,
+			projects: [project],
+			owner,
+			runner: {
+				run: () => ({
+					chunks: (async function* () {
+						yield "never-read";
+					})(),
+					abandon: async () => {
+						abandoned += 1;
+					},
+					model: "gjc/anthropic/claude-sonnet-4:low",
+				}),
+			},
+			now: new Date("2026-07-08T00:00:00.000Z"),
+			idFactory: () => "chatcmpl-stream-cancelled",
+		});
+
+		if (!("stream" in result)) throw new Error("expected stream result");
+		const iterator = result.stream[Symbol.asyncIterator]();
+		await iterator.next();
+		await iterator.return?.();
+		expect(abandoned).toBe(1);
+	});
+	it("abandons an unconsumed SSE body before its first pull", async () => {
+		let abandoned = 0;
+		const body = asyncIterableBody(
+			encodeChatCompletionSse({
+				id: "chatcmpl-unstarted-cancel",
+				created: 1_783_468_800,
+				model: "gjc/anthropic/claude-sonnet-4:low",
+				chunks: ["never-read"],
+				onAbandon: async () => {
+					abandoned += 1;
+				},
+			}),
+		);
+		await body.cancel();
+		expect(abandoned).toBe(1);
+	});
+	it("waits for runner abandonment before completing SSE body cancellation", async () => {
+		let release!: () => void;
+		let abandoned = false;
+		const body = asyncIterableBody(
+			encodeChatCompletionSse({
+				id: "chatcmpl-cancel-awaits-abandon",
+				created: 1_783_468_800,
+				model: "gjc/anthropic/claude-sonnet-4:low",
+				chunks: ["never-read"],
+				onAbandon: async () =>
+					await new Promise<void>(resolve => {
+						release = () => {
+							abandoned = true;
+							resolve();
+						};
+					}),
+			}),
+		);
+		const cancellation = body.cancel();
+		await Promise.resolve();
+		expect(abandoned).toBe(false);
+		release();
+		await cancellation;
+		expect(abandoned).toBe(true);
+	});
+	it("abandons a direct SSE iterator before its first next", async () => {
+		let abandoned = 0;
+		const stream = encodeChatCompletionSse({
+			id: "chatcmpl-direct-unstarted-cancel",
+			created: 1_783_468_800,
+			model: "gjc/anthropic/claude-sonnet-4:low",
+			chunks: ["never-read"],
+			onAbandon: async () => {
+				abandoned += 1;
+			},
+		});
+		await stream[Symbol.asyncIterator]().return?.();
+		expect(abandoned).toBe(1);
+	});
 
 	it("fails closed before sinks when the runner omits canonical model metadata", async () => {
 		const effects: string[] = [];
@@ -103,6 +188,61 @@ describe("live OpenAI-compatible chat completion errors", () => {
 			body: { error: { code: "live_runner_error", type: "server_error" } },
 		});
 		expect(effects).toEqual([]);
+	});
+	it("abandons a stream before returning an invalid-model response", async () => {
+		let abandoned = 0;
+		const result = await handleChatCompletions({
+			request: { ...request, stream: true },
+			headers: chatHeaders,
+			projects: [project],
+			owner,
+			runner: {
+				run: () => ({
+					chunks: (async function* () {
+						yield "must-not-escape";
+					})(),
+					abandon: async () => {
+						abandoned += 1;
+					},
+					model: "gjc",
+				}),
+			},
+		});
+		expect(result).toMatchObject({ ok: false, status: 503 });
+		expect(abandoned).toBe(1);
+	});
+	it("waits for invalid-model stream abandonment before returning", async () => {
+		let release!: () => void;
+		let abandonmentStarted!: () => void;
+		const started = new Promise<void>(resolve => {
+			abandonmentStarted = resolve;
+		});
+		let settled = false;
+		const pending = handleChatCompletions({
+			request: { ...request, stream: true },
+			headers: chatHeaders,
+			projects: [project],
+			owner,
+			runner: {
+				run: () => ({
+					chunks: ["must-not-escape"],
+					abandon: async () => {
+						abandonmentStarted();
+						await new Promise<void>(resolve => {
+							release = resolve;
+						});
+					},
+					model: "gjc",
+				}),
+			},
+		}).then(result => {
+			settled = true;
+			return result;
+		});
+		await started;
+		expect(settled).toBe(false);
+		release();
+		await expect(pending).resolves.toMatchObject({ ok: false, status: 503 });
 	});
 
 	it.each(["gjc", "gjc/noncanonical"])("fails closed before sinks for runner model %s", async model => {

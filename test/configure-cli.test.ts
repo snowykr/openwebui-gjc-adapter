@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildInstalledAdapterServerOptions, runCli } from "../src/cli";
+import { cleanupUnstartedAdapter } from "../src/cli-startup-cleanup";
 import type { AdapterConfig } from "../src/config";
 import { type BootstrapState, INITIAL_BOOTSTRAP_STATE, parseBootstrapState } from "../src/configure/bootstrap-state";
 import { openSecretFile } from "../src/configure/credentials";
@@ -254,6 +255,18 @@ describe("configure CLI grammar and acknowledgements", () => {
 			t.cleanup();
 		}
 	});
+	test("cleans configured server resources when its starter rejects", async () => {
+		const events: string[] = [];
+		const options = {
+			routes: { runner: { stop: async () => events.push("runner") } },
+			shutdownCleanup: async () => events.push("cleanup"),
+			runtimeLock: { release: async () => events.push("lock") },
+		} as unknown as AdapterServerOptions;
+		await expect(cleanupUnstartedAdapter(options, new Error("configured starter failed"))).rejects.toThrow(
+			"configured starter failed",
+		);
+		expect(events).toEqual(["runner", "cleanup", "lock"]);
+	});
 	test("builds installed server options without contacting a temporarily unavailable OpenWebUI", async () => {
 		const t = tempPath();
 		const originalFetch = globalThis.fetch;
@@ -292,6 +305,41 @@ describe("configure CLI grammar and acknowledgements", () => {
 				openWebUIApiToken: "openwebui-api-token",
 			});
 			expect(options.runtime?.initialize).toBeFunction();
+		} finally {
+			globalThis.fetch = originalFetch;
+			t.cleanup();
+		}
+	});
+	test("cleans the base runtime before rejecting incomplete installed credentials", async () => {
+		const t = tempPath();
+		const originalFetch = globalThis.fetch;
+		const base = {
+			bindHost: "127.0.0.1",
+			bindPort: 8765,
+			adapterApiToken: "adapter-token",
+			readinessToken: "readiness-token",
+			mode: "existing" as const,
+			installationId: "installation-1",
+			openWebUIBaseUrl: "http://openwebui.test",
+			statePath: t.directory,
+			gjcCommand: "gjc",
+			turnTimeoutMs: 1_000,
+			sessionRoot: t.directory,
+			allowedProjectRoots: [t.directory],
+			projects: [],
+		} satisfies AdapterConfig;
+		try {
+			globalThis.fetch = (async () => {
+				throw new Error("OpenWebUI is still starting");
+			}) as unknown as typeof fetch;
+			await expect(buildInstalledAdapterServerOptions(base)).rejects.toThrow(
+				"installed adapter configuration is missing runtime credentials or mode",
+			);
+
+			const options = await buildInstalledAdapterServerOptions({ ...base, adapterToken: "adapter-token" });
+			await options.routes?.runner.stop?.();
+			await options.shutdownCleanup?.();
+			await options.runtimeLock.release();
 		} finally {
 			globalThis.fetch = originalFetch;
 			t.cleanup();

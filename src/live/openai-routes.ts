@@ -1,4 +1,5 @@
-import { closeIngressId, type SessionCloseIngress, type SessionMapping } from "../gjc/session-router";
+import type { SessionCloseIngress, SessionMapping } from "../gjc/session-router";
+import { closeIngressId, legacyCloseIngressId } from "../gjc/session-router";
 import type { OpenWebUIOwnerContext } from "../openwebui/auth";
 import type { OpenWebUIProjectionRepository } from "../openwebui/client";
 import {
@@ -82,8 +83,13 @@ export async function handleOpenAIChatCloseRequest(
 		);
 	}
 	try {
-		const ingressId = closeIngressId(operationId, mapping);
-		const result = await routes.closeSession(mapping, { ingressId, ingressHash: ingressId });
+		const ingressId = closeIngressId(`http:${operationId}`, mapping);
+		const legacyIngressId = legacyCloseIngressId(operationId, mapping);
+		const result = await routes.closeSession(mapping, {
+			ingressId,
+			ingressHash: ingressId,
+			legacyIngress: { ingressId: legacyIngressId, ingressHash: legacyIngressId },
+		});
 		return jsonResponse(
 			{ ...result, operationId },
 			{
@@ -204,17 +210,32 @@ export async function handleOpenAIChatCompletionsRequest(
 	return jsonResponse(result.body, { status: result.status });
 }
 
-function asyncIterableBody(source: AsyncIterable<string>): ReadableStream<Uint8Array> {
+export function asyncIterableBody(source: AsyncIterable<string>): ReadableStream<Uint8Array> {
 	const iterator = source[Symbol.asyncIterator]();
 	const encoder = new TextEncoder();
+	const abandon = (): Promise<void> => {
+		if (!("abandon" in source)) return Promise.resolve();
+		return (source as { abandon?: () => Promise<void> }).abandon?.() ?? Promise.resolve();
+	};
+	const closeIterator = async (awaitAbandon: boolean) => {
+		const abandoned = abandon();
+		if (awaitAbandon) await abandoned;
+		else void abandoned.catch(() => {});
+		await iterator.return?.();
+	};
 	return new ReadableStream<Uint8Array>({
 		async pull(controller) {
-			const next = await iterator.next();
-			if (next.done) controller.close();
-			else controller.enqueue(encoder.encode(next.value));
+			try {
+				const next = await iterator.next();
+				if (next.done) controller.close();
+				else controller.enqueue(encoder.encode(next.value));
+			} catch (error) {
+				await closeIterator(false);
+				controller.error(error);
+			}
 		},
 		async cancel() {
-			await iterator.return?.();
+			await closeIterator(true);
 		},
 	});
 }

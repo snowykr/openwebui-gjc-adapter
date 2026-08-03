@@ -8,6 +8,7 @@ export { SessionFileBoundaryError, validateSessionFile } from "./session-file";
 export { FileBackedSessionMappingStore, type SessionMapping, SessionMappingStore } from "./session-mapping-store";
 export {
 	closeIngressId,
+	legacyCloseIngressId,
 	normalizeModelSelection,
 	operationResult,
 	replayCloseOperation,

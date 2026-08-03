@@ -17,6 +17,7 @@ export async function deliverChatCompletion(input: {
 	const { runnerResult } = input;
 	if (input.stream) {
 		const chunks = runnerResult.chunks ?? [runnerResult.content];
+		const onAbandon = "abandon" in runnerResult ? runnerResult.abandon : undefined;
 		return {
 			ok: true,
 			status: 200,
@@ -32,6 +33,7 @@ export async function deliverChatCompletion(input: {
 					ownerUserId: input.ownerUserId,
 					projectId: input.projectId,
 				}),
+				onAbandon,
 			}),
 		};
 	}
