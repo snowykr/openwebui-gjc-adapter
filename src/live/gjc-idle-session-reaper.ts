@@ -97,17 +97,6 @@ class IdleSessionReaper {
 			if (current === undefined || mappingGeneration(current) !== mappingGeneration(mapping))
 				throw new Error(`GJC close mapping for chat ${mapping.chatId} is stale.`);
 			const generation = mappingGeneration(current);
-			if (state.generation === generation && state.closed) return { status: "closed" };
-			if (
-				!state.rearmAfterActivity &&
-				this.closeOperations(current, state).some(operation => operation.state === "complete")
-			) {
-				state.mapping = current;
-				state.generation = generation;
-				state.rearmAfterActivity = false;
-				state.closed = true;
-				return { status: "closed" };
-			}
 			const pendingOperation = this.input.mappings
 				.operations?.(current.chatId)
 				?.find(operation => operation.state === "pending");
@@ -119,6 +108,17 @@ class IdleSessionReaper {
 					status: "unavailable",
 					message: "GJC close is deferred until the current session operation completes.",
 				};
+			if (state.generation === generation && state.closed) return { status: "closed" };
+			if (
+				!state.rearmAfterActivity &&
+				this.closeOperations(current, state).some(operation => operation.state === "complete")
+			) {
+				state.mapping = current;
+				state.generation = generation;
+				state.rearmAfterActivity = false;
+				state.closed = true;
+				return { status: "closed" };
+			}
 			state.closeInFlight = true;
 			const closeIngress = this.rearmedCloseIngress(current, ingress, state);
 			const result = await this.input.closeSession(current, closeIngress);

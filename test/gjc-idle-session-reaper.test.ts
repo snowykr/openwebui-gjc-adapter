@@ -257,6 +257,23 @@ describe("GJC idle session reaper", () => {
 		expect(harness.closeCalls).toHaveLength(0);
 		await harness.reaper.stop();
 	});
+	test("does not report a closed session while later work is pending", async () => {
+		const harness = createHarness();
+		await harness.reaper.runner.run(createInput());
+		harness.clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
+		await flush();
+		expect(harness.closeCalls).toHaveLength(1);
+
+		harness.mappings.recordActivity("pending-after-close", "pending", harness.clock.now);
+		const result = await harness.reaper.closeSession(harness.mappings.mapping, {
+			ingressId: "explicit-close-after-pending",
+			ingressHash: "explicit-close-after-pending",
+		});
+
+		expect(result).toMatchObject({ status: "unavailable" });
+		expect(harness.closeCalls).toHaveLength(1);
+		await harness.reaper.stop();
+	});
 	test("same-process explicit close reuses a successful idle close", async () => {
 		const harness = createHarness();
 		await harness.reaper.runner.run(createInput());
