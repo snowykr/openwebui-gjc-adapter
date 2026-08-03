@@ -92,6 +92,7 @@ export async function buildResolvedAdapterServerOptions(
 	const databasePath = path.join(config.statePath, "adapter-state.sqlite");
 	let projectStore: SqliteProjectRegistrationStore | undefined;
 	let idleSessionReaper: ReturnType<typeof createGjcIdleSessionReaper> | undefined;
+	let routingRunner: ReturnType<typeof createGjcRoutingLiveGatewayRunner> | undefined;
 	try {
 		if (internalStore)
 			await preflightProjectRegistrationDatabase(databasePath, config.runtimeLocations.protectedProjectPaths);
@@ -135,16 +136,17 @@ export async function buildResolvedAdapterServerOptions(
 				sessionPortFactory: dependencies.sessionPortFactory,
 			});
 		const closeSession = createAdapterSessionCloser(config, cliPath, { ...dependencies, turnRunner }, mappings);
-		const routingRunner = createGjcRoutingLiveGatewayRunner({
+		const baseRoutingRunner = createGjcRoutingLiveGatewayRunner({
 			turnRunner,
 			mappings,
 			ownerUserId: owner.ownerUserId,
 			modelReaderFactory,
 			...(outbox === undefined ? {} : { outbox }),
 		});
+		routingRunner = baseRoutingRunner;
 		if (closeSession !== undefined) {
 			idleSessionReaper = createGjcIdleSessionReaper({
-				runner: routingRunner,
+				runner: baseRoutingRunner,
 				mappings,
 				closeSession,
 				...(turnRunner.discardSessionAttachment === undefined
@@ -155,7 +157,7 @@ export async function buildResolvedAdapterServerOptions(
 						}),
 			});
 		}
-		const runner = idleSessionReaper?.runner ?? routingRunner;
+		const runner = idleSessionReaper?.runner ?? baseRoutingRunner;
 		const closeSessionForRoutes = idleSessionReaper?.closeSession ?? closeSession;
 		const projectLinkService = new ProjectLinkService({
 			allowedRoots,
@@ -227,7 +229,7 @@ export async function buildResolvedAdapterServerOptions(
 	} catch (error) {
 		let startupError: unknown = error;
 		try {
-			await idleSessionReaper?.stop();
+			await (idleSessionReaper?.stop() ?? routingRunner?.stop?.());
 		} catch (stopError) {
 			startupError = new AggregateError([startupError, stopError], "Adapter initialization cleanup failed");
 		}

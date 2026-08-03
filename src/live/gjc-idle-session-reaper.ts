@@ -60,6 +60,7 @@ class IdleSessionReaper {
 	#baseStopped = false;
 	#inFlightIdleCloses = new Set<Promise<void>>();
 	#inFlightNonIdleWork = new Set<Promise<void>>();
+	#handedOffStreams = new Set<() => Promise<void>>();
 
 	constructor(private readonly input: CreateGjcIdleSessionReaperInput) {
 		const timeoutMs = input.idleTimeoutMs ?? DEFAULT_IDLE_SESSION_TIMEOUT_MS;
@@ -81,8 +82,13 @@ class IdleSessionReaper {
 				this.#timer = undefined;
 			}
 		}
-		while (this.#inFlightIdleCloses.size > 0 || this.#inFlightNonIdleWork.size > 0) {
-			await Promise.allSettled([...this.#inFlightIdleCloses, ...this.#inFlightNonIdleWork]);
+		while (
+			this.#inFlightIdleCloses.size > 0 ||
+			this.#inFlightNonIdleWork.size > 0 ||
+			this.#handedOffStreams.size > 0
+		) {
+			const abandonment = [...this.#handedOffStreams].map(stream => Promise.resolve().then(stream));
+			await Promise.allSettled([...this.#inFlightIdleCloses, ...this.#inFlightNonIdleWork, ...abandonment]);
 		}
 		if (this.#baseStopped) return;
 		this.#baseStopped = true;
@@ -94,11 +100,16 @@ class IdleSessionReaper {
 		const settleWork = this.trackNonIdleWork();
 		state.active += 1;
 		let release: (() => void) | undefined;
+		let closeAttempted = false;
+		let attemptedMapping: SessionMapping | undefined;
+		let attemptedIngressId: string | undefined;
 		try {
 			release = await state.gate.acquire();
+			if (this.#stopped) throw new Error("GJC idle session reaper is stopped.");
 			const current = this.input.mappings.get(mapping.chatId);
 			if (current === undefined || mappingGeneration(current) !== mappingGeneration(mapping))
 				throw new Error(`GJC close mapping for chat ${mapping.chatId} is stale.`);
+			attemptedMapping = current;
 			const generation = mappingGeneration(current);
 			const pendingOperation = this.input.mappings
 				.operations?.(current.chatId)
@@ -124,6 +135,8 @@ class IdleSessionReaper {
 			}
 			state.closeInFlight = true;
 			const closeIngress = this.rearmedCloseIngress(current, ingress, state);
+			closeAttempted = true;
+			attemptedIngressId = closeIngress.ingressId;
 			const result = await this.input.closeSession(current, closeIngress);
 			if (result.status === "closed") {
 				const proof = current.attachment;
@@ -133,10 +146,17 @@ class IdleSessionReaper {
 				state.generation = generation;
 				state.closed = true;
 			} else {
+				state.idleIneligible = state.idleIneligible || !isReaperCloseIngress(current, closeIngress.ingressId);
 				state.lastActivityAt = this.#now();
 			}
 			return result;
 		} catch (error) {
+			if (
+				closeAttempted &&
+				attemptedMapping !== undefined &&
+				!isReaperCloseIngress(attemptedMapping, attemptedIngressId ?? ingress.ingressId)
+			)
+				state.idleIneligible = true;
 			state.lastActivityAt = this.#now();
 			throw error;
 		} finally {
@@ -157,10 +177,12 @@ class IdleSessionReaper {
 		let release: (() => void) | undefined;
 		let handedOff = false;
 		let finalized = false;
+		let streamAbandonment: (() => Promise<void>) | undefined;
 		const finalize = (outcome: RunOutcome) => {
 			if (finalized) return;
 			finalized = true;
 			state.active -= 1;
+			if (streamAbandonment !== undefined) this.#handedOffStreams.delete(streamAbandonment);
 			if (outcome === "turn" || outcome === "control") this.markTurnCompleted(state);
 			else this.deferAfterFailure(state);
 			release?.();
@@ -169,6 +191,7 @@ class IdleSessionReaper {
 		};
 		try {
 			release = await state.gate.acquire();
+			if (this.#stopped) throw new Error("GJC idle session reaper is stopped.");
 			const result = await this.input.runner.run(turn);
 			const outcome: RunOutcome = turn.control === undefined ? "turn" : "control";
 			if (result.chunks !== undefined) {
@@ -192,6 +215,8 @@ class IdleSessionReaper {
 						})();
 					return abandonment;
 				};
+				streamAbandonment = abandon;
+				this.#handedOffStreams.add(abandon);
 				const wrapped = { ...result, chunks, abandon };
 				handedOff = true;
 				return wrapped;
@@ -286,20 +311,15 @@ class IdleSessionReaper {
 		for (const mapping of this.input.mappings.entries()) {
 			if (!hasOwnedPaneAttachment(mapping.attachment)) continue;
 			const operations = this.input.mappings.operations?.(mapping.chatId);
-			const closeOperations = this.closeOperations(mapping);
-			const alreadyClosed = closeOperations.some(operation => operation.state === "complete");
 			const currentOperation = this.input.mappings.operation(mapping.chatId, mapping.operationId);
-			const activityAt = mappingActivityAt(
-				mapping,
-				operations ?? (currentOperation === undefined ? [] : [currentOperation]),
-			);
+			const journal = operations ?? (currentOperation === undefined ? [] : [currentOperation]);
+			const closeOperations = this.closeOperations(mapping);
+			const manualClosePending = hasPendingManualClose(mapping, journal, currentOperation);
+			const alreadyClosed = closeOperations.some(operation => operation.state === "complete");
+			const activityAt = mappingActivityAt(mapping, journal);
 			if (activityAt === undefined) continue;
 			const generation = mappingGeneration(mapping);
-			const rearmAfterActivity = activityFollowsCompletedClose(
-				mapping,
-				operations ?? (currentOperation === undefined ? [] : [currentOperation]),
-				closeOperations,
-			);
+			const rearmAfterActivity = activityFollowsCompletedClose(mapping, journal, closeOperations);
 			const state = this.#states.get(mapping.chatId);
 			if (state === undefined) {
 				this.#states.set(mapping.chatId, {
@@ -308,7 +328,7 @@ class IdleSessionReaper {
 					generation,
 					lastActivityAt: activityAt,
 					active: 0,
-					idleIneligible: false,
+					idleIneligible: manualClosePending,
 					closeAttempt: 0,
 					rearmAttempt: 0,
 					rearmAfterActivity,
@@ -328,11 +348,12 @@ class IdleSessionReaper {
 				state.closeAttempt = 0;
 				state.rearmAttempt = 0;
 				state.rearmAfterActivity = rearmAfterActivity;
-				state.idleIneligible = false;
+				state.idleIneligible = manualClosePending;
 				state.lastActivityAt = activityAt;
 				state.closed = alreadyClosed && !rearmAfterActivity;
 				continue;
 			}
+			if (state.generation === generation && manualClosePending) state.idleIneligible = true;
 			if (
 				state.generation === generation &&
 				activityAt > state.lastActivityAt &&
@@ -539,6 +560,45 @@ class IdleSessionReaper {
 		state.lastActivityAt = operationCompletedAt(operation) ?? this.#now();
 	}
 }
+function hasPendingManualClose(
+	mapping: SessionMapping,
+	operations: readonly SessionOperation[],
+	currentOperation: SessionOperation | undefined,
+): boolean {
+	if (currentOperation === undefined) return false;
+	const prefix = closeIngressId(mapping.operationId, mapping);
+	return operations.some(
+		operation =>
+			operation.kind === "close" &&
+			operation.state !== "complete" &&
+			!isReaperCloseOperation(operation, prefix) &&
+			operationFollowsMapping(operation, currentOperation, operations),
+	);
+}
+function isReaperCloseOperation(operation: SessionOperation, prefix: string): boolean {
+	return closeOperationIndex(operation, prefix) >= 0;
+}
+function isReaperCloseIngress(mapping: SessionMapping, ingressId: string): boolean {
+	const prefix = closeIngressId(mapping.operationId, mapping);
+	if (ingressId === prefix) return true;
+	const retryPrefix = `${prefix}:retry:`;
+	if (!ingressId.startsWith(retryPrefix)) return false;
+	const attempt = Number(ingressId.slice(retryPrefix.length));
+	return Number.isInteger(attempt) && attempt > 0;
+}
+function operationFollowsMapping(
+	operation: SessionOperation,
+	currentOperation: SessionOperation | undefined,
+	persistedOperations: readonly SessionOperation[],
+): boolean {
+	const mappingActivityAt = operationActivityAt(currentOperation);
+	const operationAt = operationActivityAt(operation);
+	if (mappingActivityAt === undefined || operationAt === undefined) return false;
+	if (operationAt !== mappingActivityAt) return operationAt > mappingActivityAt;
+	const currentIndex = operationIndex(persistedOperations, currentOperation);
+	const operationIndexAt = operationIndex(persistedOperations, operation);
+	return currentIndex !== undefined && operationIndexAt !== undefined && operationIndexAt > currentIndex;
+}
 function operationResultMatchesMapping(
 	operation: SessionOperation,
 	mapping: SessionMapping,
@@ -557,12 +617,7 @@ function operationResultMatchesMapping(
 	if (!matchesIdentity) return false;
 	if (result?.correlation?.mappingOperationId !== undefined)
 		return result.correlation.mappingOperationId === mapping.operationId;
-	const currentIndex = operationIndex(persisted, currentOperation);
-	const closeIndex = operationIndex(persisted, operation);
-	if (currentIndex !== undefined && closeIndex !== undefined) return closeIndex > currentIndex;
-	const mappingCompletedAt = operationCompletedAt(currentOperation);
-	const closeActivityAt = operationActivityAt(operation);
-	return mappingCompletedAt !== undefined && closeActivityAt !== undefined && closeActivityAt > mappingCompletedAt;
+	return operationFollowsMapping(operation, currentOperation, persisted);
 }
 function operationIndex(
 	operations: readonly SessionOperation[],

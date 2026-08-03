@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { NormalizedModelSelection } from "../src/contracts";
+import { SessionAuthority } from "../src/gjc/session-authority";
 import {
 	closeIngressId,
 	FileBackedSessionMappingStore,
@@ -703,6 +704,60 @@ describe("routeGjcSessionClose", () => {
 		});
 
 		expect(result).toEqual({ status: "closed" });
+		expect(calls).toBe(0);
+	});
+	test("uses timestamps before journal order for delayed legacy closes", async () => {
+		const mapping = closeMappings().get("chat-1")!;
+		const currentAt = "2026-07-20T00:00:00.000Z";
+		const oldAt = "2026-07-19T00:00:00.000Z";
+		const authority = new SessionAuthority();
+		authority.set({
+			...mapping,
+			createdAt: currentAt,
+			journal: [
+				{
+					id: mapping.operationId,
+					kind: "prompt",
+					state: "complete",
+					ingressId: mapping.operationId,
+					startedAt: currentAt,
+					completedAt: currentAt,
+				},
+				{
+					id: "legacy-close",
+					kind: "close",
+					state: "complete",
+					ingressId: "legacy-close",
+					startedAt: oldAt,
+					completedAt: oldAt,
+					detail: "legacy-close-hash",
+					result: {
+						kind: "close",
+						assistantText: "",
+						events: [],
+						mapping: { ...mapping, operationId: "legacy-close" },
+						correlation: { closeStatus: "closed" },
+					},
+				},
+			],
+		});
+		const mappings = new SessionMappingStore(authority);
+		const current = mappings.get("chat-1")!;
+		let calls = 0;
+
+		await expect(
+			routeGjcSessionClose({
+				mapping: current,
+				mappings,
+				ingressId: "legacy-close",
+				ingressHash: "legacy-close-hash",
+				lifecycle: closeLifecycle(current),
+				close: async (_receipt: GjcCloseReceipt) => {
+					calls += 1;
+					return { status: "closed" };
+				},
+			}),
+		).rejects.toThrow("valid immutable result binding.");
 		expect(calls).toBe(0);
 	});
 	test("rejects a legacy completed close after the mapping generation advances", async () => {

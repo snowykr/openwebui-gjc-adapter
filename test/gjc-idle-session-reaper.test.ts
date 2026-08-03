@@ -410,6 +410,28 @@ describe("GJC idle session reaper", () => {
 		expect(harness.closeCalls).toHaveLength(0);
 		await harness.reaper.stop();
 	});
+	test("uses timestamps before journal order for a delayed legacy close after a newer turn", async () => {
+		const harness = createHarness();
+		harness.clock.now = 100;
+		harness.mappings.publish("turn-2", 100);
+		await harness.reaper.runner.run({ ...createInput(), userMessageId: "turn-2" });
+		harness.mappings.recordClose("legacy-close", "complete");
+		const legacy = harness.mappings.operationRecords.get("legacy-close")!;
+		harness.mappings.operationRecords.set("legacy-close", {
+			...legacy,
+			startedAt: new Date(0).toISOString(),
+			completedAt: new Date(0).toISOString(),
+			result: {
+				...legacy.result!,
+				correlation: { closeStatus: "closed" },
+			},
+		});
+		harness.clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
+		await flush();
+
+		expect(harness.closeCalls).toHaveLength(1);
+		await harness.reaper.stop();
+	});
 	test("does not reuse a legacy close after the mapping generation advances", async () => {
 		const harness = createHarness();
 		harness.mappings.recordClose("legacy-close", "complete");
@@ -542,6 +564,42 @@ describe("GJC idle session reaper", () => {
 		expect(closeCalls).toBe(0);
 		await reaper.stop();
 	});
+	test("does not reap a retained mapping after a manual uncertain close across restart", async () => {
+		const clock = new ManualTimers();
+		clock.now = Date.now();
+		const mappings = new SessionMappingStore();
+		const retained = createMapping("turn-1");
+		mappings.set(retained);
+		mappings.beginOperation("chat-1", {
+			id: "manual-close-operation",
+			kind: "close",
+			ingressId: "manual-close-operation",
+			detail: "manual-close-hash",
+		});
+		mappings.transitionOperation("chat-1", "manual-close-operation", "uncertain", "manual-close-hash");
+		let closeCalls = 0;
+		const createReaper = () =>
+			createGjcIdleSessionReaper({
+				runner: { run: async () => ({ content: "done", model: "gjc" }) },
+				mappings,
+				closeSession: async () => {
+					closeCalls += 1;
+					return { status: "closed" };
+				},
+				now: () => clock.now,
+				setTimeout: (handler, timeoutMs) =>
+					clock.setTimeout(handler, timeoutMs) as unknown as ReturnType<typeof setTimeout>,
+				clearTimeout: timer => clock.clearTimeout(timer as unknown as number),
+			});
+		const reaper = createReaper();
+		await reaper.stop();
+		const restarted = createReaper();
+		clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS * 2);
+		await flush();
+
+		expect(closeCalls).toBe(0);
+		await restarted.stop();
+	});
 	test("matches a persisted production close result for the retained mapping generation", async () => {
 		const clock = new ManualTimers();
 		clock.now = Date.now();
@@ -670,6 +728,40 @@ describe("GJC idle session reaper", () => {
 		).rejects.toThrow("stopped");
 		await stopping;
 	});
+	test("stop prevents queued work from invoking the base runner or closer", async () => {
+		let releaseFirst!: () => void;
+		const firstDone = new Promise<void>(resolve => {
+			releaseFirst = resolve;
+		});
+		let runCalls = 0;
+		const harness = createHarness({
+			run: async () => {
+				runCalls += 1;
+				await firstDone;
+				return { content: "done", model: "gjc" };
+			},
+		});
+		const first = harness.reaper.runner.run(createInput());
+		await flush();
+		const queuedRun = Promise.resolve(harness.reaper.runner.run({ ...createInput(), userMessageId: "turn-2" }));
+		void queuedRun.catch(() => {});
+		const queuedClose = harness.reaper.closeSession(harness.mappings.mapping, {
+			ingressId: "manual-close",
+			ingressHash: "manual-close",
+		});
+		void queuedClose.catch(() => {});
+		await flush();
+		const stopping = harness.reaper.stop();
+		await flush();
+
+		expect(runCalls).toBe(1);
+		expect(harness.closeCalls).toHaveLength(0);
+		releaseFirst();
+		await first;
+		await expect(queuedRun).rejects.toThrow("stopped");
+		await expect(queuedClose).rejects.toThrow("stopped");
+		await stopping;
+	});
 
 	test("stop waits for an active streamed run to finish before stopping the base runner", async () => {
 		let releaseSource!: () => void;
@@ -697,6 +789,33 @@ describe("GJC idle session reaper", () => {
 		releaseSource();
 		await iterator.next();
 		await stopping;
+		expect(baseStopped).toBe(true);
+	});
+	test("stop abandons an unconsumed finite stream before stopping the base runner", async () => {
+		let sourceAbandoned = 0;
+		let baseStopped = false;
+		const source = (async function* () {
+			yield "first";
+			yield "last";
+		})();
+		const harness = createHarness({
+			run: async () => ({
+				chunks: source,
+				abandon: async () => {
+					sourceAbandoned += 1;
+				},
+				model: "gjc",
+			}),
+			stop: () => {
+				baseStopped = true;
+			},
+		});
+		const result = await harness.reaper.runner.run(createInput());
+		if (result.chunks === undefined) throw new Error("Expected streamed runner result.");
+
+		await harness.reaper.stop();
+
+		expect(sourceAbandoned).toBe(1);
 		expect(baseStopped).toBe(true);
 	});
 
@@ -969,6 +1088,52 @@ test("adapter initialization failure stops the constructed reaper", async () => 
 	const failure = new Error("projection startup failure");
 	let stopCalls = 0;
 	const turnRunner = new FakeGjcTurnRunner() as GjcSessionTurnRunner;
+	turnRunner.stop = () => {
+		stopCalls += 1;
+	};
+	const projectionRepository: OpenWebUIProjectionRepository = {
+		async upsertFolder() {
+			throw failure;
+		},
+		async upsertChat(record) {
+			return record;
+		},
+		async replaceChatMessages(_ownerUserId, _chatId, messages) {
+			return messages;
+		},
+		async getChat() {
+			return undefined;
+		},
+	};
+	try {
+		await expect(
+			buildAdapterServerOptions(
+				{
+					mode: "existing",
+					bindHost: "127.0.0.1",
+					bindPort: 8765,
+					openWebUIBaseUrl: "http://127.0.0.1:3000",
+					allowedProjectRoots: [root],
+					projects: [{ cwd: root, name: "demo" }],
+					statePath: join(root, "state"),
+					sessionRoot: join(root, "sessions"),
+					gjcCommand: "/bin/true",
+					turnTimeoutMs: 60_000,
+				},
+				{ turnRunner, projectionRepository },
+			),
+		).rejects.toThrow(failure);
+		expect(stopCalls).toBe(1);
+	} finally {
+		await rm(root, { force: true, recursive: true });
+	}
+});
+test("adapter initialization failure without close support stops the base routing runner", async () => {
+	const root = await mkdtemp(join(tmpdir(), "gjc-idle-reaper-no-close-init-"));
+	const failure = new Error("projection startup failure");
+	let stopCalls = 0;
+	const turnRunner = new FakeGjcTurnRunner() as GjcSessionTurnRunner;
+	Object.defineProperty(turnRunner, "withLifecycleClosePreflight", { value: undefined });
 	turnRunner.stop = () => {
 		stopCalls += 1;
 	};

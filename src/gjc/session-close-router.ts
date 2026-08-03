@@ -107,12 +107,20 @@ function legacyCloseMappingCompatible(
 		JSON.stringify(resultMapping.attachment) !== JSON.stringify(mapping.attachment)
 	)
 		return false;
-	const currentIndex = operationIndex(persistedOperations, currentOperation);
-	const closeIndex = operationIndex(persistedOperations, closeOperation);
-	if (currentIndex !== undefined && closeIndex !== undefined) return closeIndex > currentIndex;
+	return operationFollowsMapping(closeOperation, currentOperation, persistedOperations);
+}
+function operationFollowsMapping(
+	operation: SessionOperation,
+	currentOperation: SessionOperation | undefined,
+	persistedOperations: readonly SessionOperation[],
+): boolean {
 	const mappingActivityAt = operationActivityAt(currentOperation);
-	const closeActivityAt = operationActivityAt(closeOperation);
-	return mappingActivityAt !== undefined && closeActivityAt !== undefined && closeActivityAt > mappingActivityAt;
+	const operationAt = operationActivityAt(operation);
+	if (mappingActivityAt === undefined || operationAt === undefined) return false;
+	if (operationAt !== mappingActivityAt) return operationAt > mappingActivityAt;
+	const currentIndex = operationIndex(persistedOperations, currentOperation);
+	const operationIndexAt = operationIndex(persistedOperations, operation);
+	return currentIndex !== undefined && operationIndexAt !== undefined && operationIndexAt > currentIndex;
 }
 
 function operationIndex(
