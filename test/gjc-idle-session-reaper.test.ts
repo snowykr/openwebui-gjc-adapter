@@ -736,6 +736,7 @@ describe("GJC idle session reaper", () => {
 		const clock = new ManualTimers();
 		const mappings = new MappingFixture();
 		let calls = 0;
+		let sourceAbandoned = 0;
 		let releaseSource!: () => void;
 		const sourceDone = new Promise<void>(resolve => {
 			releaseSource = resolve;
@@ -748,7 +749,13 @@ describe("GJC idle session reaper", () => {
 			runner: {
 				run: async () => {
 					calls += 1;
-					return { chunks: source, model: "gjc" };
+					return {
+						chunks: source,
+						abandon: async () => {
+							sourceAbandoned += 1;
+						},
+						model: "gjc",
+					};
 				},
 			},
 			mappings,
@@ -766,6 +773,7 @@ describe("GJC idle session reaper", () => {
 		const second = reaper.runner.run({ ...createInput(), userMessageId: "turn-2" });
 		await flush();
 		expect(calls).toBe(1);
+		expect(sourceAbandoned).toBe(1);
 		releaseSource();
 		await abandoned;
 		await second;
