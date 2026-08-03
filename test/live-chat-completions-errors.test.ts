@@ -211,6 +211,39 @@ describe("live OpenAI-compatible chat completion errors", () => {
 		expect(result).toMatchObject({ ok: false, status: 503 });
 		expect(abandoned).toBe(1);
 	});
+	it("waits for invalid-model stream abandonment before returning", async () => {
+		let release!: () => void;
+		let abandonmentStarted!: () => void;
+		const started = new Promise<void>(resolve => {
+			abandonmentStarted = resolve;
+		});
+		let settled = false;
+		const pending = handleChatCompletions({
+			request: { ...request, stream: true },
+			headers: chatHeaders,
+			projects: [project],
+			owner,
+			runner: {
+				run: () => ({
+					chunks: ["must-not-escape"],
+					abandon: async () => {
+						abandonmentStarted();
+						await new Promise<void>(resolve => {
+							release = resolve;
+						});
+					},
+					model: "gjc",
+				}),
+			},
+		}).then(result => {
+			settled = true;
+			return result;
+		});
+		await started;
+		expect(settled).toBe(false);
+		release();
+		await expect(pending).resolves.toMatchObject({ ok: false, status: 503 });
+	});
 
 	it.each(["gjc", "gjc/noncanonical"])("fails closed before sinks for runner model %s", async model => {
 		const effects: string[] = [];
