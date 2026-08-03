@@ -435,7 +435,7 @@ class IdleSessionReaper {
 			return persisted.filter(
 				operation =>
 					operation.kind === "close" &&
-					(operationResultMatchesMapping(operation, mapping, currentOperation) ||
+					(operationResultMatchesMapping(operation, mapping, currentOperation, persisted) ||
 						(operation.state !== "complete" && closeOperationIndex(operation, prefix) >= 0)),
 			);
 		}
@@ -495,6 +495,7 @@ function operationResultMatchesMapping(
 	operation: SessionOperation,
 	mapping: SessionMapping,
 	currentOperation: SessionOperation | undefined,
+	persisted: readonly SessionOperation[],
 ): boolean {
 	const result = operation.result;
 	const resultMapping = result?.mapping;
@@ -508,9 +509,23 @@ function operationResultMatchesMapping(
 	if (!matchesIdentity) return false;
 	if (result?.correlation?.mappingOperationId !== undefined)
 		return result.correlation.mappingOperationId === mapping.operationId;
+	const currentIndex = operationIndex(persisted, currentOperation);
+	const closeIndex = operationIndex(persisted, operation);
+	if (currentIndex !== undefined && closeIndex !== undefined) return closeIndex > currentIndex;
 	const mappingCompletedAt = operationCompletedAt(currentOperation);
 	const closeActivityAt = operationActivityAt(operation);
 	return mappingCompletedAt !== undefined && closeActivityAt !== undefined && closeActivityAt > mappingCompletedAt;
+}
+function operationIndex(
+	operations: readonly SessionOperation[],
+	target: SessionOperation | undefined,
+): number | undefined {
+	if (target === undefined) return undefined;
+	const index = operations.findIndex(
+		operation =>
+			operation.id === target.id || (operation.ingressId !== undefined && operation.ingressId === target.ingressId),
+	);
+	return index < 0 ? undefined : index;
 }
 function closeIngressIdForAttempt(prefix: string, attempt: number): string {
 	return attempt === 0 ? prefix : `${prefix}:retry:${attempt}`;

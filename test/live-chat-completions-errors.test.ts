@@ -1,5 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { handleChatCompletions, LiveGatewayUnavailableError } from "../src/live/chat-completions";
+import { encodeChatCompletionSse } from "../src/live/chat-response-format";
+import { asyncIterableBody } from "../src/live/openai-routes";
 import type { OpenAIChatCompletionRequest } from "../src/live/openai-types";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import type { RegisteredProject } from "../src/projects/registry";
@@ -107,6 +109,22 @@ describe("live OpenAI-compatible chat completion errors", () => {
 		const iterator = result.stream[Symbol.asyncIterator]();
 		await iterator.next();
 		await iterator.return?.();
+		expect(abandoned).toBe(1);
+	});
+	it("abandons an unconsumed SSE body before its first pull", async () => {
+		let abandoned = 0;
+		const body = asyncIterableBody(
+			encodeChatCompletionSse({
+				id: "chatcmpl-unstarted-cancel",
+				created: 1_783_468_800,
+				model: "gjc/anthropic/claude-sonnet-4:low",
+				chunks: ["never-read"],
+				onAbandon: async () => {
+					abandoned += 1;
+				},
+			}),
+		);
+		await body.cancel();
 		expect(abandoned).toBe(1);
 	});
 

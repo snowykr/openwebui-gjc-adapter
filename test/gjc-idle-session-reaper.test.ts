@@ -352,8 +352,8 @@ describe("GJC idle session reaper", () => {
 		const legacy = harness.mappings.operationRecords.get("legacy-close")!;
 		harness.mappings.operationRecords.set("legacy-close", {
 			...legacy,
-			startedAt: new Date(1).toISOString(),
-			completedAt: new Date(1).toISOString(),
+			startedAt: new Date(0).toISOString(),
+			completedAt: new Date(0).toISOString(),
 			result: {
 				...legacy.result!,
 				correlation: { closeStatus: "closed" },
