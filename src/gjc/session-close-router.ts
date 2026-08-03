@@ -11,6 +11,7 @@ export type SessionCloseResult =
 export interface SessionCloseIngress {
 	readonly ingressId: string;
 	readonly ingressHash: string;
+	readonly legacyIngress?: SessionCloseIngress;
 }
 
 export interface RouteGjcSessionCloseInput extends SessionCloseIngress {
@@ -22,8 +23,18 @@ export interface RouteGjcSessionCloseInput extends SessionCloseIngress {
 }
 
 export async function routeGjcSessionClose(input: RouteGjcSessionCloseInput): Promise<SessionCloseResult> {
-	const prior = input.mappings.operation(input.mapping.chatId, input.ingressId);
-	if (prior !== undefined) return replayPriorClose(input, prior);
+	const prior =
+		input.mappings.operation(input.mapping.chatId, input.ingressId) ??
+		(input.legacyIngress === undefined
+			? undefined
+			: input.mappings.operation(input.mapping.chatId, input.legacyIngress.ingressId));
+	if (prior !== undefined) {
+		const replayInput =
+			input.legacyIngress !== undefined && prior.id === input.legacyIngress.ingressId
+				? { ...input, ...input.legacyIngress }
+				: input;
+		return replayPriorClose(replayInput, prior);
+	}
 	input.mappings.beginOperation(input.mapping.chatId, {
 		id: input.ingressId,
 		kind: "close",

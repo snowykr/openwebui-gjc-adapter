@@ -1,4 +1,5 @@
-import { closeIngressId, type SessionCloseIngress, type SessionMapping } from "../gjc/session-router";
+import type { SessionCloseIngress, SessionMapping } from "../gjc/session-router";
+import { closeIngressId, legacyCloseIngressId } from "../gjc/session-router";
 import type { OpenWebUIOwnerContext } from "../openwebui/auth";
 import type { OpenWebUIProjectionRepository } from "../openwebui/client";
 import {
@@ -83,7 +84,12 @@ export async function handleOpenAIChatCloseRequest(
 	}
 	try {
 		const ingressId = closeIngressId(`http:${operationId}`, mapping);
-		const result = await routes.closeSession(mapping, { ingressId, ingressHash: ingressId });
+		const legacyIngressId = legacyCloseIngressId(operationId, mapping);
+		const result = await routes.closeSession(mapping, {
+			ingressId,
+			ingressHash: ingressId,
+			legacyIngress: { ingressId: legacyIngressId, ingressHash: legacyIngressId },
+		});
 		return jsonResponse(
 			{ ...result, operationId },
 			{

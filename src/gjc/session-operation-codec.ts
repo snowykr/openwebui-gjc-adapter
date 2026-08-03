@@ -54,6 +54,19 @@ export function closeIngressId(operationId: string, mapping: SessionOperationMap
 		)
 		.digest("hex")}`;
 }
+export function legacyCloseIngressId(operationId: string, mapping: SessionOperationMapping): string {
+	return `close:${createHash("sha256")
+		.update(
+			JSON.stringify({
+				kind: "close",
+				operationId,
+				projectId: mapping.projectId,
+				chatId: mapping.chatId,
+				sessionId: mapping.sessionId,
+			}),
+		)
+		.digest("hex")}`;
+}
 
 export function operationResult(
 	kind: "turn" | "control" | "close",

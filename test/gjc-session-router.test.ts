@@ -7,6 +7,7 @@ import { SessionAuthority } from "../src/gjc/session-authority";
 import {
 	closeIngressId,
 	FileBackedSessionMappingStore,
+	legacyCloseIngressId,
 	type RouteGjcTurnInput,
 	routeGjcSessionClose,
 	routeGjcTurn,
@@ -684,6 +685,39 @@ describe("routeGjcSessionClose", () => {
 		} finally {
 			rmSync(directory, { recursive: true, force: true });
 		}
+	});
+	test("replays a pre-upgrade close under the legacy ingress identity", async () => {
+		const mappings = closeMappings();
+		const mapping = mappings.get("chat-1")!;
+		const legacyIngressId = legacyCloseIngressId("operation-1", mapping);
+		let calls = 0;
+		const legacyInput = {
+			mapping,
+			mappings,
+			ingressId: legacyIngressId,
+			ingressHash: legacyIngressId,
+			lifecycle: closeLifecycle(mapping),
+			close: async (_receipt: GjcCloseReceipt) => {
+				calls += 1;
+				return { status: "closed" } as const;
+			},
+		};
+
+		await routeGjcSessionClose(legacyInput);
+		const currentMapping = mappings.get("chat-1")!;
+		const currentIngressId = closeIngressId("operation-1", currentMapping);
+		expect(currentIngressId).not.toBe(legacyIngressId);
+
+		const replay = await routeGjcSessionClose({
+			...legacyInput,
+			mapping: currentMapping,
+			ingressId: currentIngressId,
+			ingressHash: currentIngressId,
+			legacyIngress: { ingressId: legacyIngressId, ingressHash: legacyIngressId },
+		});
+
+		expect(replay).toEqual({ status: "closed" });
+		expect(calls).toBe(1);
 	});
 	test("replays a legacy completed close when its result proves the current mapping generation", async () => {
 		const mappings = closeMappings();
