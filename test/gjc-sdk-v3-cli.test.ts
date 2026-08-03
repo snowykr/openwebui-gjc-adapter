@@ -147,6 +147,38 @@ describe("endpoint-less CLI lifecycle boundary", () => {
 				`'env' '/opt/gjc' '--resume' '${sessionPath}' '--session-dir' '${sessionRoot}'`,
 			);
 		}));
+	test("rejects a canonical resume whose JSONL header cwd differs from the configured cwd", async () =>
+		withSessionRoot(async sessionRoot => {
+			const sessionPath = join(sessionRoot, "session-1.jsonl");
+			const foreignCwd = join(sessionRoot, "foreign-workspace");
+			await writeFile(sessionPath, sessionJsonl("session-1", foreignCwd));
+			const tmux = new FakeTmuxRunner(sessionRoot);
+			const backend = new CliLifecycleBackend({ cliPath: "/opt/gjc", cwd: sessionRoot, tmux });
+
+			await expect(backend.coldResume({ existingSessionPath: sessionPath })).resolves.toMatchObject({
+				status: "unavailable",
+				message: "CLI /session identity does not match canonical resumed JSONL header",
+			});
+			expect(tmux.calls).toEqual([]);
+		}));
+	test("rejects a same-session-ID JSONL rewrite with a different cwd during launch", async () =>
+		withSessionRoot(async sessionRoot => {
+			const sessionPath = join(sessionRoot, "session-1.jsonl");
+			const foreignCwd = join(sessionRoot, "foreign-workspace");
+			await writeFile(sessionPath, sessionJsonl("session-1", sessionRoot));
+			const backend = new CliLifecycleBackend({
+				cliPath: "/opt/gjc",
+				cwd: sessionRoot,
+				tmux: new FakeTmuxRunner(sessionRoot, async () => {
+					await writeFile(sessionPath, sessionJsonl("session-1", foreignCwd));
+				}),
+			});
+
+			await expect(backend.coldResume({ existingSessionPath: sessionPath })).resolves.toMatchObject({
+				status: "uncertain",
+				message: "CLI /session identity does not match canonical resumed JSONL header",
+			});
+		}));
 	test("rejects a resume path replaced by rename after its descriptor is opened", async () =>
 		withSessionRoot(async sessionRoot => {
 			const sessionPath = join(sessionRoot, "session-1.jsonl");

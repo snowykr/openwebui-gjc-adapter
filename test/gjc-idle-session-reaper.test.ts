@@ -631,6 +631,74 @@ describe("GJC idle session reaper", () => {
 		await reaper.stop();
 	});
 
+	test("stop rejects new runs and external closes", async () => {
+		const harness = createHarness();
+		const stopping = harness.reaper.stop();
+		await expect(harness.reaper.runner.run(createInput())).rejects.toThrow("stopped");
+		await expect(
+			harness.reaper.closeSession(harness.mappings.mapping, {
+				ingressId: "manual-close",
+				ingressHash: "manual-close",
+			}),
+		).rejects.toThrow("stopped");
+		await stopping;
+	});
+
+	test("stop waits for an active streamed run to finish before stopping the base runner", async () => {
+		let releaseSource!: () => void;
+		let baseStopped = false;
+		const sourceDone = new Promise<void>(resolve => {
+			releaseSource = resolve;
+		});
+		const source = (async function* () {
+			yield "chunk";
+			await sourceDone;
+		})();
+		const harness = createHarness({
+			stop: () => {
+				baseStopped = true;
+			},
+			run: async () => ({ chunks: source, model: "gjc" }),
+		});
+		const result = await harness.reaper.runner.run(createInput());
+		if (result.chunks === undefined) throw new Error("Expected streamed runner result.");
+		const iterator = (result.chunks as AsyncIterable<string>)[Symbol.asyncIterator]();
+		await iterator.next();
+		const stopping = harness.reaper.stop();
+		await flush();
+		expect(baseStopped).toBe(false);
+		releaseSource();
+		await iterator.next();
+		await stopping;
+		expect(baseStopped).toBe(true);
+	});
+
+	test("stop waits for an active external close before stopping the base runner", async () => {
+		let releaseClose!: () => void;
+		let baseStopped = false;
+		const harness = createHarness({
+			stop: () => {
+				baseStopped = true;
+			},
+			close: () =>
+				new Promise(resolve => {
+					releaseClose = () => resolve({ status: "closed" });
+				}),
+		});
+		const pendingClose = harness.reaper.closeSession(harness.mappings.mapping, {
+			ingressId: "manual-close",
+			ingressHash: "manual-close",
+		});
+		await flush();
+		expect(harness.closeCalls).toHaveLength(1);
+		const stopping = harness.reaper.stop();
+		await flush();
+		expect(baseStopped).toBe(false);
+		releaseClose();
+		await pendingClose;
+		await stopping;
+		expect(baseStopped).toBe(true);
+	});
 	test("stop waits for an in-flight idle close before stopping the base runner", async () => {
 		let releaseClose!: () => void;
 		let baseStopped = false;
@@ -745,7 +813,8 @@ describe("GJC idle session reaper", () => {
 		expect(calls).toBe(1);
 		releaseDrain();
 		await cancelled;
-		await second;
+		const secondResult = await second;
+		if (secondResult.chunks !== undefined) await secondResult.abandon?.();
 		expect(calls).toBe(2);
 		await reaper.stop();
 	});
@@ -793,7 +862,8 @@ describe("GJC idle session reaper", () => {
 		expect(sourceAbandoned).toBe(1);
 		releaseSource();
 		await abandoned;
-		await second;
+		const secondResult = await second;
+		if (secondResult.chunks !== undefined) await secondResult.abandon?.();
 		expect(calls).toBe(2);
 		await reaper.stop();
 	});

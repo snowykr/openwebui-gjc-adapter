@@ -88,11 +88,14 @@ export class CliLifecycleBackend {
 	}
 
 	async coldResume(input: CliColdResumeInput): Promise<CliLifecycleResult<CliLifecycleAttachment>> {
+		const canonicalCwd = resolve(this.options.cwd);
 		let resume: ReturnType<typeof openAbsoluteRegularSessionFile> | undefined;
 		let initial: LoadedGjcSessionFile;
 		try {
 			resume = openAbsoluteRegularSessionFile(input.existingSessionPath);
 			initial = await loadGjcSessionFile(resume.canonicalPath);
+			if (initial.header.cwd !== canonicalCwd)
+				throw new Error("CLI /session identity does not match canonical resumed JSONL header");
 		} catch (error) {
 			resume?.close();
 			return unavailable(error, "cannot open canonical session JSONL");
@@ -103,12 +106,16 @@ export class CliLifecycleBackend {
 			try {
 				const final = await loadGjcSessionFile(resume.canonicalPath);
 				revalidateOpenedRegularSessionFile(resume);
-				if (opened.value.sessionId === initial.header.id && final.header.id === initial.header.id)
+				if (
+					opened.value.sessionId === initial.header.id &&
+					final.header.id === initial.header.id &&
+					final.header.cwd === canonicalCwd
+				)
 					return {
 						status: "closed",
 						value: {
 							...opened.value,
-							cwd: resolve(this.options.cwd),
+							cwd: canonicalCwd,
 							sessionRoot: dirname(resume.canonicalPath),
 							sessionPath: resume.canonicalPath,
 						},

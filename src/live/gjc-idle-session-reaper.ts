@@ -59,6 +59,7 @@ class IdleSessionReaper {
 	#stopped = false;
 	#baseStopped = false;
 	#inFlightIdleCloses = new Set<Promise<void>>();
+	#inFlightNonIdleWork = new Set<Promise<void>>();
 
 	constructor(private readonly input: CreateGjcIdleSessionReaperInput) {
 		const timeoutMs = input.idleTimeoutMs ?? DEFAULT_IDLE_SESSION_TIMEOUT_MS;
@@ -80,15 +81,17 @@ class IdleSessionReaper {
 				this.#timer = undefined;
 			}
 		}
-		while (this.#inFlightIdleCloses.size > 0) {
-			await Promise.allSettled([...this.#inFlightIdleCloses]);
+		while (this.#inFlightIdleCloses.size > 0 || this.#inFlightNonIdleWork.size > 0) {
+			await Promise.allSettled([...this.#inFlightIdleCloses, ...this.#inFlightNonIdleWork]);
 		}
 		if (this.#baseStopped) return;
 		this.#baseStopped = true;
 		await this.input.runner.stop?.();
 	}
 	private async closeExternal(mapping: SessionMapping, ingress: SessionCloseIngress): Promise<SessionCloseResult> {
+		if (this.#stopped) throw new Error("GJC idle session reaper is stopped.");
 		const state = this.stateFor(mapping.chatId);
+		const settleWork = this.trackNonIdleWork();
 		state.active += 1;
 		let release: (() => void) | undefined;
 		try {
@@ -141,11 +144,14 @@ class IdleSessionReaper {
 			state.active -= 1;
 			release?.();
 			this.schedule();
+			settleWork();
 		}
 	}
 
 	private async run(turn: LiveGatewayRunnerInput): Promise<LiveGatewayRunnerResult> {
+		if (this.#stopped) throw new Error("GJC idle session reaper is stopped.");
 		const state = this.stateFor(turn.chatId);
+		const settleWork = this.trackNonIdleWork();
 		state.active += 1;
 		this.schedule();
 		let release: (() => void) | undefined;
@@ -159,6 +165,7 @@ class IdleSessionReaper {
 			else this.deferAfterFailure(state);
 			release?.();
 			this.schedule();
+			settleWork();
 		};
 		try {
 			release = await state.gate.acquire();
@@ -191,8 +198,9 @@ class IdleSessionReaper {
 						})();
 					return abandonment;
 				};
+				const wrapped = { ...result, chunks, abandon };
 				handedOff = true;
-				return { ...result, chunks, abandon };
+				return wrapped;
 			}
 			finalize(outcome);
 			return result;
@@ -208,6 +216,20 @@ class IdleSessionReaper {
 		onFailure: () => void,
 	): TrackedChunks {
 		return new TrackedChunks(source, onComplete, onFailure);
+	}
+	private trackNonIdleWork(): () => void {
+		let resolve!: () => void;
+		let settled = false;
+		const work = new Promise<void>(completion => {
+			resolve = completion;
+		});
+		this.#inFlightNonIdleWork.add(work);
+		return () => {
+			if (settled) return;
+			settled = true;
+			this.#inFlightNonIdleWork.delete(work);
+			resolve();
+		};
 	}
 
 	private stateFor(chatId: string): ChatState {
