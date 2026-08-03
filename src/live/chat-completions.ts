@@ -187,7 +187,7 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 	}
 	const resultModel = runnerResult.model;
 	if (resultModel === undefined || classifyGjcModelId(resultModel).kind !== "canonical") {
-		await abandonRunnerResult(runnerResult);
+		void abandonRunnerResult(runnerResult);
 		return errorResult(
 			503,
 			"server_error",
@@ -218,18 +218,16 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 			projectId: project.id,
 		});
 	} catch (error) {
-		await abandonRunnerResult(runnerResult);
+		void abandonRunnerResult(runnerResult);
 		throw error;
 	}
 }
 
-async function abandonRunnerResult(result: LiveGatewayRunnerResult): Promise<void> {
-	if (!("abandon" in result)) return;
-	try {
-		await result.abandon?.();
-	} catch {
+function abandonRunnerResult(result: LiveGatewayRunnerResult): Promise<void> | undefined {
+	if (!("abandon" in result) || result.abandon === undefined) return undefined;
+	return result.abandon().catch(() => {
 		// Preserve the original request failure while the stream owner finalizes itself.
-	}
+	});
 }
 function selectionErrorResult(error: ModelSelectionError): LiveChatCompletionsResult {
 	return errorResult(error.status, error.type, error.code, error.message);

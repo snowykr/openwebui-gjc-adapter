@@ -25,6 +25,7 @@ export async function* encodeChatCompletionSse(input: {
 		...base,
 		choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
 	};
+	let completed = false;
 	try {
 		yield `data: ${JSON.stringify(initial)}\n\n`;
 		for await (const content of input.chunks) {
@@ -39,9 +40,10 @@ export async function* encodeChatCompletionSse(input: {
 			choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
 		};
 		yield `data: ${JSON.stringify(terminal)}\n\n`;
+		completed = true;
 		yield "data: [DONE]\n\n";
 	} finally {
-		await input.onAbandon?.();
+		if (!completed && input.onAbandon !== undefined) void input.onAbandon().catch(() => {});
 	}
 }
 

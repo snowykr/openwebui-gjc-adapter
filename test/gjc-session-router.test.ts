@@ -625,6 +625,15 @@ describe("routeGjcSessionClose", () => {
 		expect(closeIngressId("operation-1", { ...mapping, sessionId: "session-2" })).not.toBe(
 			closeIngressId("operation-1", mapping),
 		);
+		expect(
+			closeIngressId("operation-1", { ...mapping, sessionFile: "/workspace/project/.gjc/sessions/other.jsonl" }),
+		).not.toBe(closeIngressId("operation-1", mapping));
+		expect(
+			closeIngressId("operation-1", {
+				...mapping,
+				attachment: { ...mapping.attachment!, generation: mapping.attachment!.generation + 1 },
+			}),
+		).not.toBe(closeIngressId("operation-1", mapping));
 	});
 	test("replays a close after restart without repeating its remote effect", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "gjc-close-journal-"));

@@ -207,14 +207,25 @@ export async function handleOpenAIChatCompletionsRequest(
 function asyncIterableBody(source: AsyncIterable<string>): ReadableStream<Uint8Array> {
 	const iterator = source[Symbol.asyncIterator]();
 	const encoder = new TextEncoder();
+	const closeIterator = async () => {
+		await iterator.return?.();
+	};
 	return new ReadableStream<Uint8Array>({
 		async pull(controller) {
-			const next = await iterator.next();
-			if (next.done) controller.close();
-			else controller.enqueue(encoder.encode(next.value));
+			try {
+				const next = await iterator.next();
+				if (next.done) controller.close();
+				else controller.enqueue(encoder.encode(next.value));
+			} catch (error) {
+				try {
+					await closeIterator();
+				} finally {
+					controller.error(error);
+				}
+			}
 		},
 		async cancel() {
-			await iterator.return?.();
+			await closeIterator();
 		},
 	});
 }

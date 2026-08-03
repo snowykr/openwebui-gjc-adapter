@@ -245,6 +245,18 @@ describe("GJC idle session reaper", () => {
 		expect(harness.closeCalls).toHaveLength(1);
 		await harness.reaper.stop();
 	});
+	test("does not close while a persisted session operation is pending", async () => {
+		const harness = createHarness();
+		harness.mappings.recordActivity("pending-turn", "pending", harness.clock.now);
+		const result = await harness.reaper.closeSession(harness.mappings.mapping, {
+			ingressId: "manual-close",
+			ingressHash: "manual-close",
+		});
+
+		expect(result).toMatchObject({ status: "unavailable" });
+		expect(harness.closeCalls).toHaveLength(0);
+		await harness.reaper.stop();
+	});
 	test("same-process explicit close reuses a successful idle close", async () => {
 		const harness = createHarness();
 		await harness.reaper.runner.run(createInput());
@@ -303,6 +315,35 @@ describe("GJC idle session reaper", () => {
 		expect(harness.closeCalls).toHaveLength(2);
 		expect(harness.closeCalls[1]!.ingressId).not.toBe(firstIngress);
 		expect(harness.closeCalls[1]!.ingressId).toContain(":rearmed:");
+		await harness.reaper.stop();
+	});
+	test("allocates distinct rearmed close ingress IDs across same-millisecond activity cycles", async () => {
+		let harness!: ReturnType<typeof createHarness>;
+		harness = createHarness({
+			close: async (_mapping, ingress) => {
+				harness.mappings.recordClose(ingress.ingressId, "complete");
+				return { status: "closed" };
+			},
+		});
+		await harness.reaper.runner.run(createInput());
+		harness.clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
+		await flush();
+		const originalIngress = harness.closeCalls[0]!.ingressId;
+
+		await harness.reaper.runner.run({ ...createInput(), control: { operation: "abort" } });
+		await harness.reaper.closeSession(harness.mappings.mapping, {
+			ingressId: originalIngress,
+			ingressHash: originalIngress,
+		});
+		await harness.reaper.runner.run({ ...createInput(), control: { operation: "abort" } });
+		await harness.reaper.closeSession(harness.mappings.mapping, {
+			ingressId: originalIngress,
+			ingressHash: originalIngress,
+		});
+
+		expect(harness.closeCalls).toHaveLength(3);
+		expect(harness.closeCalls[1]!.ingressId).toContain(":rearmed:turn-1:1");
+		expect(harness.closeCalls[2]!.ingressId).toContain(":rearmed:turn-1:2");
 		await harness.reaper.stop();
 	});
 	test("recognizes a legacy completed close bound to the current mapping generation", async () => {

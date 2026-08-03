@@ -45,6 +45,11 @@ export function closeIngressId(operationId: string, mapping: SessionOperationMap
 				projectId: mapping.projectId,
 				chatId: mapping.chatId,
 				sessionId: mapping.sessionId,
+				sessionFile: mapping.sessionFile,
+				activeLeaf: mapping.activeLeaf,
+				rawFrameCursor: mapping.rawFrameCursor,
+				eventCursor: mapping.eventCursor,
+				attachment: mapping.attachment,
 			}),
 		)
 		.digest("hex")}`;

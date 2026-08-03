@@ -108,6 +108,17 @@ class IdleSessionReaper {
 				state.closed = true;
 				return { status: "closed" };
 			}
+			const pendingOperation = this.input.mappings
+				.operations?.(current.chatId)
+				?.find(operation => operation.state === "pending");
+			if (pendingOperation !== undefined)
+				return { status: "unavailable", message: "GJC close is deferred while a session operation is pending." };
+			const currentOperation = this.input.mappings.operation(current.chatId, current.operationId);
+			if (currentOperation !== undefined && currentOperation.state !== "complete")
+				return {
+					status: "unavailable",
+					message: "GJC close is deferred until the current session operation completes.",
+				};
 			state.closeInFlight = true;
 			const closeIngress = this.rearmedCloseIngress(current, ingress, state);
 			const result = await this.input.closeSession(current, closeIngress);
@@ -190,6 +201,7 @@ class IdleSessionReaper {
 			closed: false,
 			rearmAfterActivity: false,
 			closeAttempt: 0,
+			rearmAttempt: 0,
 			closeQueued: false,
 			closeInFlight: false,
 			gate: new SerialGate(),
@@ -202,11 +214,14 @@ class IdleSessionReaper {
 		const current = this.input.mappings.get(state.chatId);
 		if (current === undefined) return;
 		const generation = mappingGeneration(current);
-		const rearm = state.closed && state.generation === generation;
+		const rearm = state.rearmAfterActivity || (state.closed && state.generation === generation);
 		state.mapping = current;
 		state.generation = generation;
 		state.rearmAfterActivity = rearm;
-		if (!rearm) state.closeAttempt = 0;
+		if (!rearm) {
+			state.closeAttempt = 0;
+			state.rearmAttempt = 0;
+		}
 		state.closed = false;
 		state.lastActivityAt = this.#now();
 	}
@@ -215,11 +230,14 @@ class IdleSessionReaper {
 		const current = this.input.mappings.get(state.chatId);
 		if (current === undefined) return;
 		const generation = mappingGeneration(current);
-		const rearm = state.closed && state.generation === generation;
+		const rearm = state.rearmAfterActivity || (state.closed && state.generation === generation);
 		state.mapping = current;
 		state.generation = generation;
 		state.rearmAfterActivity = rearm;
-		if (!rearm) state.closeAttempt = 0;
+		if (!rearm) {
+			state.closeAttempt = 0;
+			state.rearmAttempt = 0;
+		}
 		state.closed = false;
 		state.lastActivityAt = this.#now();
 	}
@@ -248,6 +266,7 @@ class IdleSessionReaper {
 					lastActivityAt: activityAt,
 					active: 0,
 					closeAttempt: 0,
+					rearmAttempt: 0,
 					rearmAfterActivity,
 					closed: alreadyClosed && !rearmAfterActivity,
 					closeQueued: false,
@@ -263,6 +282,7 @@ class IdleSessionReaper {
 				state.mapping = mapping;
 				state.generation = generation;
 				state.closeAttempt = 0;
+				state.rearmAttempt = 0;
 				state.rearmAfterActivity = rearmAfterActivity;
 				state.lastActivityAt = activityAt;
 				state.closed = alreadyClosed && !rearmAfterActivity;
@@ -447,7 +467,14 @@ class IdleSessionReaper {
 	): SessionCloseIngress {
 		const prior = this.input.mappings.operation(mapping.chatId, ingress.ingressId);
 		if (!state.rearmAfterActivity || prior?.kind !== "close" || prior.state !== "complete") return ingress;
-		const rearmKey = `${mapping.operationId}:${state.lastActivityAt}`;
+		const prefix = `${ingress.ingressId}:rearmed:${mapping.operationId}:`;
+		const attempts = this.input.mappings
+			.operations?.(mapping.chatId)
+			?.map(operation => rearmedIngressAttempt(operation, prefix))
+			.filter((attempt): attempt is number => attempt !== undefined);
+		const attempt = attempts === undefined ? state.rearmAttempt + 1 : Math.max(0, ...attempts) + 1;
+		state.rearmAttempt = attempt;
+		const rearmKey = `${mapping.operationId}:${attempt}`;
 		return {
 			ingressId: `${ingress.ingressId}:rearmed:${rearmKey}`,
 			ingressHash: `${ingress.ingressHash}:rearmed:${rearmKey}`,
@@ -458,6 +485,7 @@ class IdleSessionReaper {
 		state.mapping = mapping;
 		state.generation = mappingGeneration(mapping);
 		state.closeAttempt = 0;
+		state.rearmAttempt = 0;
 		state.closed = false;
 		const operation = this.input.mappings.operation(mapping.chatId, mapping.operationId);
 		state.lastActivityAt = operationCompletedAt(operation) ?? this.#now();
@@ -496,6 +524,12 @@ function closeOperationIndex(operation: SessionOperation, prefix: string): numbe
 	const attempt = Number(id.slice(retryPrefix.length));
 	return Number.isInteger(attempt) && attempt > 0 ? attempt : -1;
 }
+function rearmedIngressAttempt(operation: SessionOperation, prefix: string): number | undefined {
+	const ingressId = operation.ingressId ?? operation.id;
+	if (!ingressId.startsWith(prefix)) return undefined;
+	const attempt = Number(ingressId.slice(prefix.length));
+	return Number.isInteger(attempt) && attempt > 0 ? attempt : undefined;
+}
 
 interface ChatState {
 	readonly chatId: string;
@@ -507,6 +541,7 @@ interface ChatState {
 	closed: boolean;
 	closeAttempt: number;
 	rearmAfterActivity: boolean;
+	rearmAttempt: number;
 	closeQueued: boolean;
 	closeInFlight: boolean;
 }
