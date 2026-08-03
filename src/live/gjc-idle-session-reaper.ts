@@ -58,6 +58,7 @@ class IdleSessionReaper {
 	#timer: IdleTimer | undefined;
 	#stopped = false;
 	#baseStopped = false;
+	#stopPromise: Promise<void> | undefined;
 	#inFlightIdleCloses = new Set<Promise<void>>();
 	#inFlightNonIdleWork = new Set<Promise<void>>();
 	#handedOffStreams = new Set<() => Promise<void>>();
@@ -74,13 +75,15 @@ class IdleSessionReaper {
 		this.schedule();
 	}
 
-	async stop(): Promise<void> {
-		if (!this.#stopped) {
-			this.#stopped = true;
-			if (this.#timer !== undefined) {
-				this.#clearTimeout(this.#timer);
-				this.#timer = undefined;
-			}
+	stop(): Promise<void> {
+		if (this.#stopPromise === undefined) this.#stopPromise = this.stopInternal();
+		return this.#stopPromise;
+	}
+	private async stopInternal(): Promise<void> {
+		this.#stopped = true;
+		if (this.#timer !== undefined) {
+			this.#clearTimeout(this.#timer);
+			this.#timer = undefined;
 		}
 		while (
 			this.#inFlightIdleCloses.size > 0 ||

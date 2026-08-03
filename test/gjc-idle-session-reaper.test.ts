@@ -908,6 +908,28 @@ describe("GJC idle session reaper", () => {
 		expect(clock.count()).toBe(0);
 		expect(stopped).toBe(1);
 	});
+	test("shares the pending shutdown with concurrent stop callers", async () => {
+		let releaseStop!: () => void;
+		const stopPending = new Promise<void>(resolve => {
+			releaseStop = resolve;
+		});
+		let baseStops = 0;
+		const harness = createHarness({
+			stop: async () => {
+				baseStops += 1;
+				await stopPending;
+			},
+		});
+
+		const first = harness.reaper.stop();
+		await flush();
+		const second = harness.reaper.stop();
+
+		expect(second).toBe(first);
+		expect(baseStops).toBe(1);
+		releaseStop();
+		await Promise.all([first, second]);
+	});
 	test("holds the chat gate while a canceled stream drains its underlying source", async () => {
 		const clock = new ManualTimers();
 		const mappings = new MappingFixture();
