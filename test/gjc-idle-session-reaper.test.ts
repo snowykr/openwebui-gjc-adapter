@@ -418,13 +418,9 @@ describe("GJC idle session reaper", () => {
 			const principalId = "normal-1";
 			const safeKey = "a".repeat(64);
 			const mappingByChat = new Map<string, SessionMapping>([
-				["chat-1", { ...createMapping("turn-1"), chatId: "chat-1", principalId }],
 				["chat-2", { ...createMapping("turn-2"), chatId: "chat-2", principalId }],
 			]);
-			const operationByChat = new Map<string, SessionOperation>([
-				["chat-1", completedOperation("turn-1", 0)],
-				["chat-2", completedOperation("turn-2", 0)],
-			]);
+			const operationByChat = new Map<string, SessionOperation>([["chat-2", completedOperation("turn-2", 0)]]);
 			const mappings = {
 				entries: () => [...mappingByChat.values()],
 				getScoped: ({ principalId: owner, chatId }: { principalId: string; chatId: string }) =>
