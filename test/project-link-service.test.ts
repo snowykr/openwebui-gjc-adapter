@@ -164,6 +164,80 @@ describe("project link registration", () => {
 			title: "Existing Session",
 		});
 	});
+	test("admin unlink closes only configured-admin mappings when a normal principal collides on project and chat IDs", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-link-scope-"));
+		tempDirs.push(workspace);
+		const projectDirectory = path.join(workspace, "Admin Project");
+		await fs.mkdir(projectDirectory);
+		const mappings = new SessionMappingStore();
+		const closed: string[] = [];
+		const projectId = "admin-project";
+		const sharedChat = "shared-chat";
+		mappings.setScoped(
+			{ principalId: "owner-1", chatId: sharedChat },
+			{
+				chatId: sharedChat,
+				principalId: "owner-1",
+				projectId,
+				sessionId: "admin-session",
+				rawFrameCursor: 1,
+				eventCursor: 1,
+				operationId: "admin-operation",
+			},
+		);
+		mappings.setScoped(
+			{ principalId: "normal-user", chatId: sharedChat },
+			{
+				chatId: sharedChat,
+				principalId: "normal-user",
+				projectId,
+				sessionId: "normal-session",
+				rawFrameCursor: 1,
+				eventCursor: 1,
+				operationId: "normal-operation",
+			},
+		);
+		mappings.set({
+			chatId: "legacy-admin-chat",
+			principalId: "owner-1",
+			projectId,
+			sessionId: "legacy-admin-session",
+			rawFrameCursor: 1,
+			eventCursor: 1,
+			operationId: "legacy-admin-operation",
+		});
+		mappings.set({
+			chatId: "legacy-unscoped-chat",
+			projectId,
+			sessionId: "legacy-unscoped-session",
+			rawFrameCursor: 1,
+			eventCursor: 1,
+			operationId: "legacy-unscoped-operation",
+		});
+		const service = new ProjectLinkService({
+			allowedRoots: await resolveAllowedRoots([workspace]),
+			store: new SqliteProjectRegistrationStore(":memory:"),
+			ownerUserId: "owner-1",
+			mappings,
+			closeSession: async mapping => {
+				closed.push(`${mapping.principalId ?? "legacy"}:${mapping.chatId}`);
+				return { status: "closed" };
+			},
+			protectedPaths: protectedPathsFor(workspace),
+		});
+
+		await service.linkProject({ cwd: projectDirectory, name: "Admin Project" });
+		await service.unlinkProject(projectId);
+
+		expect(closed.sort()).toEqual(
+			["owner-1:shared-chat", "owner-1:legacy-admin-chat", "legacy:legacy-unscoped-chat"].sort(),
+		);
+		expect(mappings.getScoped({ principalId: "normal-user", chatId: sharedChat })).toMatchObject({
+			principalId: "normal-user",
+			projectId,
+			sessionId: "normal-session",
+		});
+	});
 
 	test("reconciles OpenWebUI folder deletion as an unlink without deleting local history", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-link-reconcile-"));

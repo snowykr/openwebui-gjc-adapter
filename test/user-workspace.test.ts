@@ -18,6 +18,30 @@ async function processStartTicks(pid = process.pid): Promise<string> {
 	return startTicks;
 }
 
+async function withoutProcessUid<T>(operation: () => Promise<T>): Promise<T> {
+	const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+	Object.defineProperty(process, "getuid", { configurable: true, value: undefined });
+	try {
+		return await operation();
+	} finally {
+		if (descriptor === undefined) Reflect.deleteProperty(process, "getuid");
+		else Object.defineProperty(process, "getuid", descriptor);
+	}
+}
+
+async function withForeignProcessUid<T>(operation: () => Promise<T>): Promise<T> {
+	const currentUid = process.getuid?.();
+	if (currentUid === undefined) return operation();
+	const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+	Object.defineProperty(process, "getuid", { configurable: true, value: () => currentUid + 1 });
+	try {
+		return await operation();
+	} finally {
+		if (descriptor === undefined) Reflect.deleteProperty(process, "getuid");
+		else Object.defineProperty(process, "getuid", descriptor);
+	}
+}
+
 describe("durable user workspaces", () => {
 	test("derives a stable safe key without putting the raw user ID in the path", async () => {
 		const stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-workspace-key-"));
@@ -203,5 +227,23 @@ describe("durable user workspaces", () => {
 			/regular|symlink/i,
 		);
 		expect((await fs.lstat(symlinkPath)).isSymbolicLink()).toBe(true);
+	});
+	test("acquires a fresh workspace when the UID API is unavailable", async () => {
+		const stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-workspace-portable-"));
+		await withoutProcessUid(async () => {
+			const workspace = await createUserWorkspaceRegistry({ stateRoot }).open("portable-user");
+			expect(workspace.userId).toBe("portable-user");
+		});
+	});
+
+	test("denies a registry lock owned by a foreign POSIX UID", async () => {
+		if (process.platform === "win32" || typeof process.getuid !== "function") return;
+		const stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-workspace-foreign-"));
+		await expect(
+			withForeignProcessUid(() => createUserWorkspaceRegistry({ stateRoot }).open("foreign-uid-user")),
+		).rejects.toThrow(/foreign ownership/i);
+		await expect(fs.lstat(path.join(stateRoot, ".workspace-registry.lock"))).rejects.toMatchObject({
+			code: "ENOENT",
+		});
 	});
 });

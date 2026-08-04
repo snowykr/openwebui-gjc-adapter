@@ -17,8 +17,10 @@ import type {
 } from "../src/gjc/turn-runner";
 import type { LiveGatewayRunnerInput } from "../src/live/chat-completions";
 import { createGjcRoutingLiveGatewayRunner, createPublicSdkGjcTurnRunner } from "../src/live/gjc-routing-runner";
+import { synthesizeProjectionRows } from "../src/live/workflow-gate-projection";
 import { buildSessionMappingPayloadHash } from "../src/live/workflow-gate-turns";
 import { InMemoryOutboxStore } from "../src/state/outbox";
+import { attachmentProof } from "./gjc-lifecycle-fixtures";
 import { FakeGjcTurnRunner, project } from "./gjc-routing-runner-fixtures";
 import type { SdkFixtureScenario, SdkFixtureServer } from "./gjc-sdk-v3-fixture-types";
 import { expectSdkRequest, startSdkFixtureServer } from "./gjc-sdk-v3-fixtures";
@@ -1146,7 +1148,144 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		expect(outbox.get("user-1")?.payloadHash).toBe(sessionMappingPayloadHash);
 		expect(outbox.get("user-1:event")?.payloadHash).toBe(eventPayloadHash);
 	});
+	test("uses the authenticated principal for scoped projection rows and synthesized replay", async () => {
+		const outbox = new InMemoryOutboxStore();
+		const mappings = new SessionMappingStore();
+		const runner = createGjcRoutingLiveGatewayRunner({
+			turnRunner: new FakeGjcTurnRunner(),
+			mappings,
+			outbox,
+			ownerUserId: "admin-1",
+		});
 
+		await runner.run({
+			project,
+			prompt: "normal turn",
+			chatId: "normal-chat",
+			messageId: "normal-assistant",
+			userMessageId: "normal-user-message",
+			userMessageParentId: null,
+			continued: false,
+			ownerUserId: "normal-1",
+		});
+
+		expect(outbox.listPending()).toMatchObject([
+			{ operationId: "normal-user-message", principalId: "normal-1", ownerUserId: "normal-1" },
+			{ operationId: "normal-user-message:event", principalId: "normal-1", ownerUserId: "normal-1" },
+		]);
+		synthesizeProjectionRows(outbox, mappings, "admin-1", "admin-1");
+		expect(outbox.listPending()).toHaveLength(2);
+
+		await runner.run({
+			project,
+			prompt: "admin turn",
+			chatId: "admin-chat",
+			messageId: "admin-assistant",
+			userMessageId: "admin-user-message",
+			userMessageParentId: null,
+			continued: false,
+			ownerUserId: "admin-1",
+		});
+
+		expect(outbox.listPending().filter(operation => operation.chatId === "admin-chat")).toMatchObject([
+			{ operationId: "admin-user-message", principalId: "admin-1", ownerUserId: "admin-1" },
+			{ operationId: "admin-user-message:event", principalId: "admin-1", ownerUserId: "admin-1" },
+		]);
+	});
+
+	test("preserves the authenticated principal for session.new control publication and synthesis", async () => {
+		const root = mkdtempSync(join(tmpdir(), "gjc-session-new-projection-"));
+		const mappingFile = join(root, "mappings.json");
+		const sessionRoot = join(root, ".gjc", "sessions");
+		const controlPrincipal = "normal-control-user";
+		const adminPrincipal = "admin-1";
+		const turn: LiveGatewayRunnerInput = {
+			project: { ...project, cwd: root, sessionRoot },
+			prompt: "create a session",
+			chatId: "control-chat",
+			messageId: "control-assistant",
+			userMessageId: "control-session-new",
+			userMessageParentId: null,
+			continued: true,
+			ownerUserId: controlPrincipal,
+			control: { operation: "session.new" },
+		};
+		class ControlRunner extends FakeGjcTurnRunner {
+			async runControl(
+				input: LiveGatewayRunnerInput,
+				_mapping: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[1],
+				lifecycle: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[2],
+			): Promise<GjcControlResult> {
+				const sessionId = "session-control";
+				const sessionFile = join(sessionRoot, `${sessionId}.jsonl`);
+				const attachment = attachmentProof({ cwd: input.project.cwd, sessionId });
+				await lifecycle.handoff(
+					{
+						...lifecycle.address,
+						sessionId,
+						sessionFile,
+						recoveryAttachment: attachment,
+					},
+					attachment,
+				);
+				return {
+					sessionId,
+					sessionFile,
+					attachment,
+					result: {
+						text: "session created",
+						events: [{ type: "assistant", text: "session created" }],
+						sessionFile,
+						rawFrameCursor: 2,
+						eventCursor: 1,
+						attachment,
+					},
+				};
+			}
+		}
+		const mappings = new FileBackedSessionMappingStore(mappingFile);
+		mappings.setScoped(
+			{ principalId: controlPrincipal, chatId: turn.chatId },
+			{ ...mappingInput(mediumSelection), chatId: turn.chatId },
+		);
+		const outbox = new InMemoryOutboxStore();
+		try {
+			const first = createGjcRoutingLiveGatewayRunner({
+				turnRunner: new ControlRunner(),
+				mappings,
+				outbox,
+				ownerUserId: adminPrincipal,
+			});
+			await first.run(turn);
+			expect(outbox.listPending()).toMatchObject([
+				{
+					operationId: turn.userMessageId,
+					principalId: controlPrincipal,
+					ownerUserId: controlPrincipal,
+					chatId: turn.chatId,
+				},
+				{
+					operationId: `${turn.userMessageId}:event`,
+					principalId: controlPrincipal,
+					ownerUserId: controlPrincipal,
+					chatId: turn.chatId,
+				},
+			]);
+
+			const restartedMappings = new FileBackedSessionMappingStore(mappingFile);
+			synthesizeProjectionRows(outbox, restartedMappings, adminPrincipal, adminPrincipal);
+			expect(outbox.listPending()).toMatchObject([
+				{ operationId: turn.userMessageId, principalId: controlPrincipal, ownerUserId: controlPrincipal },
+				{
+					operationId: `${turn.userMessageId}:event`,
+					principalId: controlPrincipal,
+					ownerUserId: controlPrincipal,
+				},
+			]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
 	test.each([
 		["start", false],
 		["continuation", true],

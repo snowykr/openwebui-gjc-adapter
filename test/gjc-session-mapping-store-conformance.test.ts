@@ -671,3 +671,63 @@ test("scoped cleanup enumerates and retires only the requested principal", () =>
 		}
 	}
 });
+test("principal enumeration isolates normal mappings and opts into legacy admin records", () => {
+	for (const createHarness of [memoryHarness, fileHarness]) {
+		const harness = createHarness();
+		try {
+			const projectId = "shared-project";
+			const adminScope = { principalId: "admin", chatId: "admin-scoped" };
+			const userScope = { principalId: "user", chatId: "user-scoped" };
+			harness.store.setScoped(adminScope, {
+				...mapping(),
+				...adminScope,
+				projectId,
+				operationId: "admin-scoped-operation",
+			});
+			harness.store.setScoped(userScope, {
+				...mapping(),
+				...userScope,
+				projectId,
+				operationId: "user-scoped-operation",
+			});
+			harness.store.set({
+				...mapping(),
+				chatId: "admin-legacy",
+				principalId: "admin",
+				projectId,
+				operationId: "admin-legacy-operation",
+			});
+			harness.store.set({
+				...mapping(),
+				chatId: "user-legacy",
+				principalId: "user",
+				projectId,
+				operationId: "user-legacy-operation",
+			});
+			harness.store.set({
+				...mapping(),
+				chatId: "legacy-unscoped",
+				projectId,
+				operationId: "legacy-unscoped-operation",
+			});
+
+			expect(harness.store.entriesForPrincipal("admin").map(entry => entry.chatId)).toEqual(["admin-scoped"]);
+			expect(
+				harness.store.entriesForPrincipal("admin", { includeLegacyAdmin: true }).map(entry => entry.chatId),
+			).toEqual(["admin-scoped", "admin-legacy", "legacy-unscoped"]);
+			expect(harness.store.entriesForPrincipal("user").map(entry => entry.chatId)).toEqual(["user-scoped"]);
+
+			const recovered = harness.recover();
+			expect(
+				recovered.entriesForPrincipal("admin", { includeLegacyAdmin: true }).map(entry => entry.chatId),
+			).toEqual(["admin-scoped", "admin-legacy", "legacy-unscoped"]);
+			expect(
+				recovered
+					.entriesForPrincipal("admin", { includeLegacyAdmin: true })
+					.every(entry => entry.projectId === projectId),
+			).toBe(true);
+		} finally {
+			harness.cleanup();
+		}
+	}
+});

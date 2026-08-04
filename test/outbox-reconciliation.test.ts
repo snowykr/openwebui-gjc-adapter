@@ -468,6 +468,49 @@ describe("durable projection reconciliation", () => {
 		expect(result.applied.map(operation => operation.kind)).toEqual(["session_mapping", "event"]);
 		expect(synchronizedProjectIds).toEqual(["project-1", "project-1"]);
 	});
+	test("replays normal-principal rows through a scoped capability", async () => {
+		const mappings = new SessionMappingStore();
+		const mapping = {
+			principalId: "normal-user",
+			chatId: "chat-1",
+			projectId: "openwebui",
+			sessionId: "session-1",
+			rawFrameCursor: 1,
+			eventCursor: 1,
+			operationId: "op-1",
+			assistantText: "done",
+			events: [{ type: "tool_start", id: "tool-1" }],
+		};
+		const scope = { principalId: "normal-user", chatId: "chat-1" };
+		mappings.setScoped(scope, { ...mapping, operationId: "bootstrap" });
+		mappings.beginOperationScoped(scope, { id: "op-1", kind: "prompt", detail: "request" });
+		mappings.completeOperationWithMappingScoped(scope, "op-1", "request", mapping, "turn");
+		const outbox = new InMemoryOutboxStore();
+		synthesizeProjectionRows(outbox, mappings, "admin-user", "admin-user");
+		const linkedProjectIds: string[] = [];
+		const principalRows: string[] = [];
+		const result = await reconcilePendingOperations(
+			outbox,
+			createProjectionOperationApplier(
+				mappings,
+				{
+					syncLinkedProject: async projectId => {
+						linkedProjectIds.push(projectId);
+					},
+					syncPrincipalProjection: async input => {
+						principalRows.push(`${input.principalId}:${input.mapping.chatId}`);
+					},
+				},
+				"admin-user",
+			),
+		);
+
+		expect(result.failed).toEqual([]);
+		expect(result.applied.map(operation => operation.kind)).toEqual(["session_mapping", "event"]);
+		expect(principalRows).toEqual(["normal-user:chat-1", "normal-user:chat-1"]);
+		expect(linkedProjectIds).toEqual([]);
+		expect(outbox.listPending()).toEqual([]);
+	});
 	test("synthesizes missing rows from completed durable mappings", () => {
 		const mappings = new SessionMappingStore();
 		const mapping = {

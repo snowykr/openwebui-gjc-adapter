@@ -182,24 +182,61 @@ export function preflightSessionAuthorityMigrationCandidates(
 		adminPrincipalId,
 		...(now === undefined ? {} : { now }),
 	});
-	if (targetResult.status !== "not_needed" || existsSync(destinationPath)) return targetResult;
+	if (targetResult.status === "degraded") return targetResult;
+	const committedCandidateResults: SessionAuthorityMigrationResult[] = [];
 	const seen = new Set<string>();
 	for (const candidate of options.candidateSourcePaths) {
 		const sourcePath = requirePath(candidate, "candidateSourcePath");
 		if (sourcePath === destinationPath || seen.has(sourcePath)) continue;
 		seen.add(sourcePath);
 		if (!existsSync(sourcePath)) continue;
-		return preflightSessionAuthorityMigration({
+		if (candidateMigrationAlreadyCommitted(sourcePath, adminPrincipalId, stateRoot, destinationPath)) continue;
+		const candidateResult = preflightSessionAuthorityMigration({
 			sourcePath,
 			destinationPath,
 			stateRoot,
 			adminPrincipalId,
 			...(now === undefined ? {} : { now }),
 		});
+		if (candidateResult.status === "degraded") return candidateResult;
+		if (candidateResult.status === "committed") committedCandidateResults.push(candidateResult);
 	}
-	return targetResult;
+	return committedCandidateResults.at(-1) ?? targetResult;
 }
-
+function candidateMigrationAlreadyCommitted(
+	sourcePath: string,
+	adminPrincipalId: string,
+	stateRoot: string,
+	destinationPath: string,
+): boolean {
+	try {
+		const paths = migrationPaths(sourcePath, stateRoot, destinationPath);
+		const checkpointState = readCheckpoint(paths.checkpointPath);
+		const checkpoint = checkpointState.value;
+		if (
+			checkpointState.invalid !== undefined ||
+			checkpoint === undefined ||
+			checkpoint.status !== "committed" ||
+			checkpoint.destinationSha256 === undefined ||
+			!checkpointMatchesRequest(checkpoint, sourcePath, adminPrincipalId, paths)
+		)
+			return false;
+		const sourceBytes = readFileIfPresent(sourcePath);
+		const recoveryBytes = readFileIfPresent(checkpoint.sourceRecoveryPath);
+		const destinationBytes = readFileIfPresent(destinationPath);
+		return (
+			sourceBytes !== undefined &&
+			recoveryBytes !== undefined &&
+			destinationBytes !== undefined &&
+			digest(sourceBytes) === checkpoint.sourceSha256 &&
+			digest(recoveryBytes) === checkpoint.sourceSha256 &&
+			recoveryBytes.equals(sourceBytes) &&
+			digest(destinationBytes) === checkpoint.destinationSha256
+		);
+	} catch {
+		return false;
+	}
+}
 function runMigration(
 	sourcePath: string,
 	adminPrincipalId: string,

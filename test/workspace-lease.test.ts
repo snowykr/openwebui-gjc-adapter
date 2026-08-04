@@ -53,6 +53,30 @@ async function currentStartTicks(): Promise<string> {
 	return startTicks;
 }
 
+async function withoutProcessUid<T>(operation: () => Promise<T>): Promise<T> {
+	const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+	Object.defineProperty(process, "getuid", { configurable: true, value: undefined });
+	try {
+		return await operation();
+	} finally {
+		if (descriptor === undefined) Reflect.deleteProperty(process, "getuid");
+		else Object.defineProperty(process, "getuid", descriptor);
+	}
+}
+
+async function withForeignProcessUid<T>(operation: () => Promise<T>): Promise<T> {
+	const currentUid = process.getuid?.();
+	if (currentUid === undefined) return operation();
+	const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+	Object.defineProperty(process, "getuid", { configurable: true, value: () => currentUid + 1 });
+	try {
+		return await operation();
+	} finally {
+		if (descriptor === undefined) Reflect.deleteProperty(process, "getuid");
+		else Object.defineProperty(process, "getuid", descriptor);
+	}
+}
+
 describe("durable workspace leases", () => {
 	test("uses a safe lock path outside user workspace roots and private records", async () => {
 		const { manager, stateRoot } = await createManager();
@@ -83,6 +107,37 @@ describe("durable workspace leases", () => {
 			expect((await fs.stat(directory)).mode & 0o777).toBe(0o700);
 		}
 		await lease.release();
+	});
+	test("acquires a fresh lease when the UID API is unavailable", async () => {
+		const { manager } = await createManager();
+		await withoutProcessUid(async () => {
+			const lease = await manager.acquire({
+				safeKey: SAFE_KEY,
+				holderId: "portable-holder",
+				operation: "turn",
+				leaseMs: 1_000,
+			});
+			await lease.release();
+		});
+	});
+
+	test("denies a workspace lease guard owned by a foreign POSIX UID", async () => {
+		if (process.platform === "win32" || typeof process.getuid !== "function") return;
+		const { manager } = await createManager();
+		await writeGuard(manager, {
+			pid: Number.MAX_SAFE_INTEGER,
+			startTicks: "1",
+		});
+		await expect(
+			withForeignProcessUid(() =>
+				manager.acquire({
+					safeKey: SAFE_KEY,
+					holderId: "foreign-uid-holder",
+					operation: "turn",
+					leaseMs: 1_000,
+				}),
+			),
+		).rejects.toThrow(/foreign ownership/i);
 	});
 
 	test("takes over after expiry with a higher generation and fences stale holders", async () => {

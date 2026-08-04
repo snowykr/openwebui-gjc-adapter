@@ -30,6 +30,7 @@ export async function runRoutingControl(
 	if (controlled.runControl === undefined) throw new OpenWebUIControlError(control.operation);
 	const runControl = controlled.runControl;
 	const principalId = principalIdForTurn(turn);
+	const projectionOwnerUserId = principalId ?? input.ownerUserId ?? "openwebui-gjc-adapter";
 	const mappings =
 		principalId === undefined ? input.mappings : scopedSessionMappingStore(input.mappings, principalId, turn.chatId);
 	const scopedInput = mappings === input.mappings ? input : { ...input, mappings };
@@ -70,7 +71,7 @@ export async function runRoutingControl(
 				return {
 					applied,
 					mapping: await publishControlMapping(mappings, lifecycle, turn, existing, applied, hash, mapping =>
-						ensureProjectionRows(input.outbox, mapping, input.ownerUserId ?? "openwebui-gjc-adapter"),
+						ensureProjectionRows(input.outbox, mapping, projectionOwnerUserId, principalId),
 					),
 				};
 			} catch (error) {
@@ -110,6 +111,8 @@ async function continueBranch(
 	applied: Awaited<ReturnType<NonNullable<RoutingControlDependencies["turnRunner"]["runControl"]>>>,
 ): Promise<LiveGatewayRunnerResult & { readonly model?: string }> {
 	const { sessionId, sessionFile, attachment } = applied;
+	const principalId = principalIdForTurn(turn);
+	const projectionOwnerUserId = principalId ?? input.ownerUserId ?? "openwebui-gjc-adapter";
 	try {
 		if (sessionId === undefined || sessionFile === undefined || attachment === undefined)
 			throw new Error("GJC branch did not return an exact successor descriptor.");
@@ -212,7 +215,7 @@ async function continueBranch(
 						},
 						"control",
 					);
-					ensureProjectionRows(input.outbox, published, input.ownerUserId ?? "openwebui-gjc-adapter");
+					ensureProjectionRows(input.outbox, published, projectionOwnerUserId, principalId);
 					return published;
 				});
 				return withCanonicalModel(

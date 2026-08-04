@@ -119,6 +119,7 @@ services:
     volumes:
       - ${yaml(`${config}/${configName}`)}:/run/openwebui-gjc-adapter/config.json:ro
       - ${yaml(`${config}/state`)}:/var/lib/gjc
+      - ${yaml(`${config}/session`)}:/run/gjc-session:ro
       - ${yaml(`${config}/workspace`)}:/workspace
     labels:
       com.gjc.managed: "true"

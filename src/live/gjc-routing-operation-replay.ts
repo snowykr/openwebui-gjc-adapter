@@ -24,6 +24,7 @@ export async function replayRoutingOperation(
 	turn: LiveGatewayRunnerInput,
 ): Promise<(LiveGatewayRunnerResult & { readonly model?: string }) | null> {
 	const principalId = principalIdForTurn(turn);
+	const projectionOwnerUserId = principalId ?? input.ownerUserId ?? "openwebui-gjc-adapter";
 	const mappings =
 		principalId === undefined ? input.mappings : scopedSessionMappingStore(input.mappings, principalId, turn.chatId);
 	const scopedInput = mappings === input.mappings ? input : { ...input, mappings };
@@ -49,7 +50,7 @@ export async function replayRoutingOperation(
 			throw new Error(`GJC operation ${turn.userMessageId} completed without a valid immutable result binding.`);
 		const selection = result.mapping.modelSelection;
 		return replayWithLifecyclePublication(input.turnRunner, turn, result.mapping, async () => {
-			ensureProjectionRows(input.outbox, result.mapping, input.ownerUserId ?? "openwebui-gjc-adapter");
+			ensureProjectionRows(input.outbox, result.mapping, projectionOwnerUserId, principalId);
 			const events = projectTurnEvents(
 				result.events,
 				selection === undefined ? undefined : formatCanonicalModelId(selection),

@@ -40,6 +40,16 @@ export class OpenWebUIPrincipalScopeError extends Error {
 		this.name = "OpenWebUIPrincipalScopeError";
 	}
 }
+export class OpenWebUIPrincipalProjectionError extends OpenWebUIPrincipalScopeError {
+	readonly code = "openwebui_principal_projection_unavailable";
+
+	constructor() {
+		super(
+			"Normal-principal OpenWebUI resource projection writes are unavailable: the configured administrator token may not create, replace, or delete user resources.",
+		);
+		this.name = "OpenWebUIPrincipalProjectionError";
+	}
+}
 
 export type OpenWebUIPrincipalResolution =
 	| { ok: true; principal: OpenWebUIPrincipal }

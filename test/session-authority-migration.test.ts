@@ -155,6 +155,49 @@ describe("session authority pre-store migration", () => {
 			expect(readFileSync(previousPath)).toEqual(original);
 		});
 	});
+	test("does not ignore a surviving legacy candidate when a scoped destination already exists", () => {
+		withRoot((root, _sourcePath) => {
+			const candidatePath = join(root, "previous-cwd", "openwebui-session-mappings.json");
+			const destinationPath = join(root, "state", "sessions", "openwebui-session-mappings.json");
+			const candidateBytes = Buffer.from(JSON.stringify(legacyDocument()));
+			const destinationBytes = Buffer.from(JSON.stringify(scopedV2Document()));
+			mkdirSync(join(root, "previous-cwd"), { recursive: true });
+			mkdirSync(join(root, "state", "sessions"), { recursive: true });
+			writeFileSync(candidatePath, candidateBytes);
+			writeFileSync(destinationPath, destinationBytes);
+
+			const result = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [candidatePath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+
+			expect(result.status).toBe("degraded");
+			expect(result.reason).toContain("existing authority destination does not match the migration output");
+			expect(readFileSync(candidatePath)).toEqual(candidateBytes);
+			expect(readFileSync(destinationPath)).toEqual(destinationBytes);
+			expect(readFileSync(result.sourceRecoveryPath!)).toEqual(candidateBytes);
+			expect(JSON.parse(readFileSync(result.auditPath!, "utf8"))).toMatchObject({
+				sourcePath: resolve(candidatePath),
+				status: "source-retained",
+			});
+
+			const rerun = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [candidatePath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+
+			expect(rerun.status).toBe("degraded");
+			expect(rerun.sourceSha256).toBe(result.sourceSha256);
+			expect(readFileSync(candidatePath)).toEqual(candidateBytes);
+			expect(readFileSync(destinationPath)).toEqual(destinationBytes);
+		});
+	});
 
 	test("migrates the explicitly managed previous root after absent candidates", () => {
 		withRoot((root, _sourcePath) => {

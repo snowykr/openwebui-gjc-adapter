@@ -198,9 +198,9 @@ describe("project admin routes", () => {
 			throw new Error("expected project close routes");
 		const linked = await routes.projectLinkService.linkProject({ cwd: projectDirectory, name: "Dynamic Project" });
 		const mapping = await currentLifecycleMapping(linked.project.id, sessionId, projectDirectory);
-		mappings.setScoped({ principalId: "owner-test", chatId: mapping.chatId }, mapping);
+		mappings.setScoped({ principalId: "owner-1", chatId: mapping.chatId }, { ...mapping, principalId: "owner-1" });
 		await expect(
-			routes.closeSession(mappings.getScoped({ principalId: "owner-test", chatId: "dynamic-chat" })!, {
+			routes.closeSession(mappings.getScoped({ principalId: "owner-1", chatId: "dynamic-chat" })!, {
 				ingressId: "direct-close",
 				ingressHash: "direct-close",
 			}),
