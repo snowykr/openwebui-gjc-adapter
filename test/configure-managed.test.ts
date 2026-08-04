@@ -28,8 +28,7 @@ describe("managed installation rendering and preflight", () => {
 		expect(compose).toContain('command: ["serve", "--config", "/run/openwebui-gjc-adapter/config.json"]');
 		expect(compose).toContain("./config/config.json:/run/openwebui-gjc-adapter/config.json:ro");
 		expect(compose).toContain("./config/state:/var/lib/gjc");
-		expect(compose).not.toContain("/run/gjc-session");
-		expect(compose).not.toContain("./config/session:");
+		expect(compose).toContain("./config/session:/run/gjc-session:ro");
 		expect(compose).toContain("./config/workspace:/workspace");
 		expect(compose).toContain("adapter-token:\n    file: ./config/adapter-token");
 		expect(compose).toContain('      ENABLE_API_KEYS: "true"');

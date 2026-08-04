@@ -17,6 +17,7 @@ import type {
 } from "../src/gjc/turn-runner";
 import type { LiveGatewayRunnerInput } from "../src/live/chat-completions";
 import { createGjcRoutingLiveGatewayRunner, createPublicSdkGjcTurnRunner } from "../src/live/gjc-routing-runner";
+import { synthesizeProjectionRows } from "../src/live/workflow-gate-projection";
 import { buildSessionMappingPayloadHash } from "../src/live/workflow-gate-turns";
 import { InMemoryOutboxStore } from "../src/state/outbox";
 import { FakeGjcTurnRunner, project } from "./gjc-routing-runner-fixtures";
@@ -1145,6 +1146,50 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		expect(operations[0]?.operationId).not.toBe(operations[1]?.operationId);
 		expect(outbox.get("user-1")?.payloadHash).toBe(sessionMappingPayloadHash);
 		expect(outbox.get("user-1:event")?.payloadHash).toBe(eventPayloadHash);
+	});
+	test("uses the authenticated principal for scoped projection rows and synthesized replay", async () => {
+		const outbox = new InMemoryOutboxStore();
+		const mappings = new SessionMappingStore();
+		const runner = createGjcRoutingLiveGatewayRunner({
+			turnRunner: new FakeGjcTurnRunner(),
+			mappings,
+			outbox,
+			ownerUserId: "admin-1",
+		});
+
+		await runner.run({
+			project,
+			prompt: "normal turn",
+			chatId: "normal-chat",
+			messageId: "normal-assistant",
+			userMessageId: "normal-user-message",
+			userMessageParentId: null,
+			continued: false,
+			ownerUserId: "normal-1",
+		});
+
+		expect(outbox.listPending()).toMatchObject([
+			{ operationId: "normal-user-message", principalId: "normal-1", ownerUserId: "normal-1" },
+			{ operationId: "normal-user-message:event", principalId: "normal-1", ownerUserId: "normal-1" },
+		]);
+		synthesizeProjectionRows(outbox, mappings, "admin-1", "admin-1");
+		expect(outbox.listPending()).toHaveLength(2);
+
+		await runner.run({
+			project,
+			prompt: "admin turn",
+			chatId: "admin-chat",
+			messageId: "admin-assistant",
+			userMessageId: "admin-user-message",
+			userMessageParentId: null,
+			continued: false,
+			ownerUserId: "admin-1",
+		});
+
+		expect(outbox.listPending().filter(operation => operation.chatId === "admin-chat")).toMatchObject([
+			{ operationId: "admin-user-message", principalId: "admin-1", ownerUserId: "admin-1" },
+			{ operationId: "admin-user-message:event", principalId: "admin-1", ownerUserId: "admin-1" },
+		]);
 	});
 
 	test.each([

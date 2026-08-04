@@ -65,6 +65,7 @@ export function createGjcRoutingLiveGatewayRunner(
 		},
 		async run(turn: LiveGatewayRunnerInput): Promise<GjcRoutingLiveGatewayRunnerResult> {
 			const principalId = principalIdForTurn(turn);
+			const projectionOwnerUserId = principalId ?? input.ownerUserId ?? "openwebui-gjc-adapter";
 			const scopedMappings =
 				principalId === undefined
 					? input.mappings
@@ -243,7 +244,7 @@ export function createGjcRoutingLiveGatewayRunner(
 							return pendingGate === null ? routed.text : projectPendingWorkflowGateMessage(pendingGate);
 						},
 						afterPublish: routed =>
-							ensureProjectionRows(input.outbox, routed.mapping, input.ownerUserId ?? "openwebui-gjc-adapter"),
+							ensureProjectionRows(input.outbox, routed.mapping, projectionOwnerUserId, principalId),
 						...(modelSelection === undefined ? {} : { modelSelection }),
 					});
 					reassignmentStarted = false;
@@ -294,7 +295,7 @@ export function createGjcRoutingLiveGatewayRunner(
 					return pendingGate === null ? routed.text : projectPendingWorkflowGateMessage(pendingGate);
 				},
 				afterPublish: routed =>
-					ensureProjectionRows(input.outbox, routed.mapping, input.ownerUserId ?? "openwebui-gjc-adapter"),
+					ensureProjectionRows(input.outbox, routed.mapping, projectionOwnerUserId, principalId),
 				onObservedTurn: async event => {
 					if (event.type !== "agent_failed") markActivityStarted();
 					if (isNativeLifecycleEvent(event.type)) observedNativeLifecycle = true;
