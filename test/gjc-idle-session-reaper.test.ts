@@ -10,7 +10,7 @@ import type { LiveGatewayRunner, LiveGatewayRunnerInput, LiveGatewayRunnerResult
 import { createGjcIdleSessionReaper, DEFAULT_IDLE_SESSION_TIMEOUT_MS } from "../src/live/gjc-idle-session-reaper";
 import type { GjcSessionTurnRunner } from "../src/live/gjc-routing-runner";
 import type { OpenWebUIProjectionRepository } from "../src/openwebui/client";
-import { WorkspaceLeaseManager } from "../src/security/workspace-lease";
+import { type WorkspaceLeaseAcquireOptions, WorkspaceLeaseManager } from "../src/security/workspace-lease";
 import { FakeGjcTurnRunner } from "./cli-fixtures";
 
 const project = {
@@ -444,6 +444,22 @@ describe("GJC idle session reaper", () => {
 						: [],
 			};
 			const workspaceLeaseManager = new WorkspaceLeaseManager({ stateRoot: root });
+			let reaperLeaseAttempts = 0;
+			let rejectedReaperLeaseAttempts = 0;
+			const reaperWorkspaceLeaseManager = new Proxy(workspaceLeaseManager, {
+				get(target, property, receiver) {
+					if (property !== "acquire") return Reflect.get(target, property, receiver);
+					return async (options: WorkspaceLeaseAcquireOptions) => {
+						reaperLeaseAttempts += 1;
+						try {
+							return await target.acquire(options);
+						} catch (error) {
+							rejectedReaperLeaseAttempts += 1;
+							throw error;
+						}
+					};
+				},
+			});
 			const workspaceRegistry = {
 				open: async (userId: string) => ({
 					userId,
@@ -482,7 +498,7 @@ describe("GJC idle session reaper", () => {
 					return { status: "closed" };
 				},
 				workspaceRegistry,
-				workspaceLeaseManager,
+				workspaceLeaseManager: reaperWorkspaceLeaseManager,
 				now: () => clock.now,
 				setTimeout: (handler, timeoutMs) =>
 					clock.setTimeout(handler, timeoutMs) as unknown as ReturnType<typeof setTimeout>,
@@ -493,8 +509,12 @@ describe("GJC idle session reaper", () => {
 			clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
 			await flush();
 			expect(closeCalls).toEqual([]);
+			for (let attempt = 0; attempt < 100 && rejectedReaperLeaseAttempts === 0; attempt += 1) await flush();
+			expect(reaperLeaseAttempts).toBeGreaterThan(0);
+			expect(rejectedReaperLeaseAttempts).toBeGreaterThan(0);
 			releaseTurn();
 			await pendingTurn;
+			await flush();
 			for (let attempt = 0; attempt < 10 && !closeCalls.includes("chat-2"); attempt += 1) {
 				clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
 				await flush();
