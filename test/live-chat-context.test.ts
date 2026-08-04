@@ -2,16 +2,21 @@ import { describe, expect, it } from "bun:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
+import { SessionMappingStore } from "../src/gjc/session-router";
+import type { GjcTurnRunner } from "../src/gjc/turn-runner";
 import {
 	handleChatCompletions,
 	type LiveGatewayRunnerInput,
 	type LiveGatewayRunnerResult,
 } from "../src/live/chat-completions";
+import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
 import { buildOpenWebUIStatusEvent } from "../src/openwebui/events";
 import type { RegisteredProject } from "../src/projects/registry";
 import { WorkspaceLeaseManager } from "../src/security/workspace-lease";
+import { attachmentProof, lifecycleFixture } from "./gjc-lifecycle-fixtures";
+import { staticModelReaderFactory } from "./model-selection-fixtures";
 
 const project: RegisteredProject = {
 	id: "demo",
@@ -263,7 +268,7 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 				runner,
 			});
 			await startedPromise;
-			const second = await handleChatCompletions({
+			const second = handleChatCompletions({
 				request: { model: "gjc", messages: [{ role: "user", content: "second" }] },
 				headers: { ...chatHeaders, "X-OpenWebUI-User-Id": "normal-1", "X-OpenWebUI-Message-Id": "assistant-2" },
 				projects: [project],
@@ -272,14 +277,12 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 				workspaceLeaseManager,
 				runner,
 			});
-			expect(second).toMatchObject({
-				ok: false,
-				status: 503,
-				body: { error: { code: "workspace_lease_uncertain" } },
-			});
+			await Promise.resolve();
 			expect(runnerCalls).toBe(1);
 			releaseFirst();
 			expect((await first).ok).toBe(true);
+			expect((await second).ok).toBe(true);
+			expect(runnerCalls).toBe(2);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
@@ -342,6 +345,219 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 		}
 	});
 
+	it("retains the workspace lease until an abandoned routed stream settles", async () => {
+		const root = await mkdtemp(join(tmpdir(), "gjc-workspace-lease-routed-abandon-"));
+		const workspace = join(root, "workspace");
+		const safeKey = "e".repeat(64);
+		const workspaceRegistry = {
+			open: async (userId: string) => ({
+				userId,
+				safeKey,
+				root: workspace,
+				sessionRoot: join(workspace, ".gjc", "sessions"),
+			}),
+		};
+		const workspaceLeaseManager = new WorkspaceLeaseManager({ stateRoot: root });
+		const mappings = new SessionMappingStore();
+		let runnerCalls = 0;
+		let releaseFirst!: () => void;
+		let firstSettled = false;
+		const firstTurn = new Promise<void>(resolve => {
+			releaseFirst = () => {
+				firstSettled = true;
+				resolve();
+			};
+		});
+		const turnRunner: GjcTurnRunner = {
+			async startNewSession(input, publish, beforePrompt) {
+				runnerCalls += 1;
+				const first = runnerCalls === 1;
+				const address = {
+					cwd: input.cwd,
+					sessionRoot: input.sessionRoot,
+					projectId: input.projectId,
+					chatId: input.chatId,
+					sessionId: `session-${runnerCalls}`,
+					sessionFile: join(input.sessionRoot, `session-${runnerCalls}.jsonl`),
+					text: "working done",
+					events: [],
+					activeLeaf: "leaf-1",
+					rawFrameCursor: 1,
+					eventCursor: 1,
+					...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
+				};
+				const attachment = {
+					...attachmentProof(address),
+					tmuxSocket: "/tmp/tmux.sock",
+					tmuxPane: "%1",
+					tmuxPanePid: 1,
+					tmuxOwnershipTag: "owner",
+					ownedAt: "2026-07-19T00:00:00.000Z",
+				};
+				const lifecycle = lifecycleFixture(address);
+				const attachedAddress = { ...address, attachment };
+				await beforePrompt(attachedAddress, attachment, lifecycle);
+				await input.observer?.({
+					type: "message_update",
+					payload: { assistantMessageEvent: { type: "text_delta", delta: "working" } },
+				});
+				if (first) await firstTurn;
+				return publish({ ...address, attachment }, lifecycle);
+			},
+			async continueSession(_input) {
+				throw new Error("Unexpected mapped-session continuation in lease lifecycle test.");
+			},
+			async switchSession(_input) {},
+			async getState(_input) {
+				return { rawFrameCursor: 1, eventCursor: 1 };
+			},
+		};
+		const runner = createGjcRoutingLiveGatewayRunner({
+			turnRunner,
+			mappings,
+			modelReaderFactory: staticModelReaderFactory(),
+		});
+		const request = {
+			model: "gjc" as const,
+			stream: true,
+			messages: [{ role: "user" as const, content: "stream" }],
+		};
+		const firstHeaders = {
+			...chatHeaders,
+			"X-OpenWebUI-User-Id": "normal-1",
+			"X-OpenWebUI-Chat-Id": "chat-routed-1",
+			"X-OpenWebUI-Message-Id": "assistant-routed-1",
+			"X-OpenWebUI-User-Message-Id": "user-routed-1",
+		};
+		try {
+			const firstResult = await handleChatCompletions({
+				request,
+				headers: firstHeaders,
+				projects: [project],
+				owner,
+				workspaceRegistry,
+				workspaceLeaseManager,
+				runner,
+				eventSink: () => {},
+			});
+			if (!firstResult.ok || !("stream" in firstResult)) throw new Error("expected routed stream");
+			const iterator = firstResult.stream[Symbol.asyncIterator]();
+			await iterator.next();
+			const abandonment = iterator.return?.();
+			if (abandonment === undefined) throw new Error("expected an abandonable stream iterator");
+			await Promise.resolve();
+			expect(firstSettled).toBe(false);
+
+			const queued = handleChatCompletions({
+				request: { ...request, stream: false, messages: [{ role: "user", content: "queued" }] },
+				headers: {
+					...firstHeaders,
+					"X-OpenWebUI-Chat-Id": "chat-routed-2",
+					"X-OpenWebUI-Message-Id": "assistant-routed-2",
+					"X-OpenWebUI-User-Message-Id": "user-routed-2",
+				},
+				projects: [project],
+				owner,
+				workspaceRegistry,
+				workspaceLeaseManager,
+				runner,
+			});
+			await Promise.resolve();
+			expect(runnerCalls).toBe(1);
+
+			releaseFirst();
+			await abandonment;
+			expect(firstSettled).toBe(true);
+			expect((await queued).ok).toBe(true);
+			expect(runnerCalls).toBe(2);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+	it("retains same-user admission after a stream heartbeat failure until abandonment settles", async () => {
+		const safeKey = "f".repeat(64);
+		let acquired = 0;
+		let runnerCalls = 0;
+		let abandonFirst!: () => void;
+		const firstSourceSettled = new Promise<void>(resolve => {
+			abandonFirst = resolve;
+		});
+		const successfulLease = {
+			renew: async () => successfulLease,
+			assertFence: async () => {},
+			release: async () => {},
+		};
+		const failingLease = {
+			renew: async () => {
+				throw new Error("heartbeat lost");
+			},
+			assertFence: async () => {},
+			release: async () => {},
+		};
+		const workspaceLeaseManager = {
+			async acquire() {
+				acquired += 1;
+				return acquired === 1 ? failingLease : successfulLease;
+			},
+		} as unknown as WorkspaceLeaseManager;
+		const workspaceRegistry = {
+			open: async (userId: string) => ({
+				userId,
+				safeKey,
+				root: process.cwd(),
+				sessionRoot: join(process.cwd(), ".gjc", "sessions"),
+			}),
+		};
+		const runner = {
+			run() {
+				runnerCalls += 1;
+				if (runnerCalls === 1) {
+					return {
+						chunks: {
+							async *[Symbol.asyncIterator]() {
+								await firstSourceSettled;
+								yield "";
+							},
+						},
+						abandon: async () => {
+							abandonFirst();
+							await firstSourceSettled;
+						},
+						model: "gjc/anthropic/claude-sonnet-4:low",
+					};
+				}
+				return { content: "queued", model: "gjc/anthropic/claude-sonnet-4:low" };
+			},
+		};
+		const first = await handleChatCompletions({
+			request: { model: "gjc", stream: true, messages: [{ role: "user", content: "first" }] },
+			headers: { ...chatHeaders, "X-OpenWebUI-User-Id": "normal-1" },
+			projects: [project],
+			owner,
+			workspaceRegistry,
+			workspaceLeaseManager,
+			workspaceLeaseDurationMs: 30,
+			workspaceLeaseHeartbeatMs: 5,
+			runner,
+		});
+		if (!first.ok || !("stream" in first)) throw new Error("expected streaming result");
+		await new Promise(resolve => setTimeout(resolve, 20));
+		const second = handleChatCompletions({
+			request: { model: "gjc", messages: [{ role: "user", content: "second" }] },
+			headers: { ...chatHeaders, "X-OpenWebUI-User-Id": "normal-1", "X-OpenWebUI-Message-Id": "assistant-2" },
+			projects: [project],
+			owner,
+			workspaceRegistry,
+			workspaceLeaseManager,
+			runner,
+		});
+		await Promise.resolve();
+		expect(acquired).toBe(1);
+		const iterator = first.stream[Symbol.asyncIterator]();
+		await iterator.return?.().catch(() => {});
+		expect((await second).ok).toBe(true);
+		expect(acquired).toBe(2);
+	});
 	it("fails closed on lease acquisition without invoking the runner", async () => {
 		const root = await mkdtemp(join(tmpdir(), "gjc-workspace-lease-failure-"));
 		const workspace = join(root, "workspace");

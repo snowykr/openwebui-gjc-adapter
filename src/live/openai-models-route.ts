@@ -229,14 +229,18 @@ class ModelsWorkspaceLeaseAdmission {
 		try {
 			this.#lease = await this.#lease.renew(this.#durationMs);
 		} catch {
-			this.#markFailure(true);
+			// Heartbeat loss marks the admission failed but must not release the
+			// durable workspace lease from the timer path: listModels() and its
+			// temporary model reader may still be running, so a queued turn or
+			// cleanup must not acquire the same workspace concurrently. The
+			// request path releases after the reader stops (see finish()).
+			this.#markFailure();
 		}
 	}
 
-	#markFailure(finalize = false): void {
+	#markFailure(): void {
 		if (this.#failure) return;
 		this.#failure = true;
-		if (finalize) void this.finish().catch(() => {});
 	}
 }
 

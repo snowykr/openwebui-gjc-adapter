@@ -325,6 +325,8 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 	}
 }
 const DEFAULT_WORKSPACE_LEASE_DURATION_MS = 210_000;
+const DEFAULT_WORKSPACE_ADMISSION_QUEUE_LIMIT = 32;
+const DEFAULT_WORKSPACE_ADMISSION_TIMEOUT_MS = DEFAULT_WORKSPACE_LEASE_DURATION_MS;
 
 class WorkspaceLeaseUncertainError extends Error {
 	constructor() {
@@ -339,13 +341,15 @@ class WorkspaceLeaseAdmission {
 	#heartbeat: ReturnType<typeof setInterval> | undefined;
 	#renewal: Promise<void> | undefined;
 	#finishPromise: Promise<boolean> | undefined;
+	#releaseAdmission: (() => void) | undefined;
 	#failure = false;
 	#stopping = false;
 
-	constructor(lease: WorkspaceLease, durationMs: number, heartbeatMs: number) {
+	constructor(lease: WorkspaceLease, durationMs: number, heartbeatMs: number, releaseAdmission: () => void) {
 		this.#lease = lease;
 		this.#durationMs = durationMs;
 		this.#heartbeat = setInterval(() => this.#scheduleRenewal(), heartbeatMs);
+		this.#releaseAdmission = releaseAdmission;
 		(this.#heartbeat as unknown as { unref?: () => void }).unref?.();
 	}
 
@@ -370,22 +374,28 @@ class WorkspaceLeaseAdmission {
 	}
 
 	async #finish(): Promise<boolean> {
-		this.#stopping = true;
-		if (this.#heartbeat !== undefined) clearInterval(this.#heartbeat);
-		if (this.#renewal !== undefined) await this.#renewal;
-		let healthy = true;
 		try {
-			await this.#lease.assertFence();
-		} catch (error) {
-			this.#markFailure(error);
-			healthy = false;
+			this.#stopping = true;
+			if (this.#heartbeat !== undefined) clearInterval(this.#heartbeat);
+			if (this.#renewal !== undefined) await this.#renewal;
+			let healthy = true;
+			try {
+				await this.#lease.assertFence();
+			} catch (error) {
+				this.#markFailure(error);
+				healthy = false;
+			}
+			try {
+				await this.#lease.release();
+			} catch {
+				healthy = false;
+			}
+			return healthy && !this.#failure;
+		} finally {
+			const releaseAdmission = this.#releaseAdmission;
+			this.#releaseAdmission = undefined;
+			releaseAdmission?.();
 		}
-		try {
-			await this.#lease.release();
-		} catch {
-			healthy = false;
-		}
-		return healthy && !this.#failure;
 	}
 
 	#scheduleRenewal(): void {
@@ -406,17 +416,88 @@ class WorkspaceLeaseAdmission {
 		try {
 			this.#lease = await this.#lease.renew(this.#durationMs);
 		} catch (error) {
-			this.#markFailure(error, true);
+			this.#markFailure(error);
 		}
 	}
 
-	#markFailure(_error: unknown, finalize = false): void {
+	#markFailure(_error: unknown): void {
 		if (this.#failure) return;
 		this.#failure = true;
-		if (finalize) void this.finish().catch(() => {});
+	}
+}
+class WorkspaceAdmissionGate {
+	#tail = Promise.resolve();
+	#queued = 0;
+
+	constructor(readonly onIdle: () => void) {}
+
+	async acquire(timeoutMs: number, queueLimit: number): Promise<() => void> {
+		if (this.#queued >= queueLimit) throw new WorkspaceLeaseUncertainError();
+		this.#queued += 1;
+		const previous = this.#tail;
+		let releaseTurn!: () => void;
+		const turn = new Promise<void>(resolve => {
+			releaseTurn = resolve;
+		});
+		this.#tail = turn;
+		try {
+			await waitForWorkspaceAdmission(previous, timeoutMs);
+		} catch {
+			void previous.then(releaseTurn, releaseTurn).then(
+				() => this.#dequeue(),
+				() => this.#dequeue(),
+			);
+			throw new WorkspaceLeaseUncertainError();
+		}
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			releaseTurn();
+			this.#dequeue();
+		};
+	}
+
+	#dequeue(): void {
+		this.#queued -= 1;
+		if (this.#queued === 0) this.onIdle();
 	}
 }
 
+const workspaceAdmissionGates = new WeakMap<object, Map<string, WorkspaceAdmissionGate>>();
+
+function workspaceAdmissionGateFor(manager: object, safeKey: string): WorkspaceAdmissionGate {
+	let gates = workspaceAdmissionGates.get(manager);
+	if (gates === undefined) {
+		gates = new Map();
+		workspaceAdmissionGates.set(manager, gates);
+	}
+	let gate = gates.get(safeKey);
+	if (gate === undefined) {
+		gate = new WorkspaceAdmissionGate(() => {
+			if (gates?.get(safeKey) === gate) gates.delete(safeKey);
+		});
+		gates.set(safeKey, gate);
+	}
+	return gate;
+}
+
+async function waitForWorkspaceAdmission(previous: Promise<void>, timeoutMs: number): Promise<void> {
+	await new Promise<void>((resolve, reject) => {
+		const timer = setTimeout(() => reject(new WorkspaceLeaseUncertainError()), timeoutMs);
+		(timer as unknown as { unref?: () => void }).unref?.();
+		void previous.then(
+			() => {
+				clearTimeout(timer);
+				resolve();
+			},
+			error => {
+				clearTimeout(timer);
+				reject(error);
+			},
+		);
+	});
+}
 async function acquireWorkspaceLease(
 	input: HandleChatCompletionsInput,
 	safeKey: string,
@@ -424,14 +505,34 @@ async function acquireWorkspaceLease(
 	if (input.workspaceLeaseManager === undefined) throw new WorkspaceLeaseUncertainError();
 	const durationMs = resolveWorkspaceLeaseDuration(input.workspaceLeaseDurationMs);
 	const heartbeatMs = resolveWorkspaceLeaseHeartbeat(input.workspaceLeaseHeartbeatMs, durationMs);
-	const lease = await input.workspaceLeaseManager.acquire({
-		safeKey,
-		holderId: `gjc-turn-${process.pid}-${randomUUID()}`,
-		operation: "turn",
-		leaseMs: durationMs,
-	});
-	if (lease === undefined) throw new WorkspaceLeaseUncertainError();
-	return new WorkspaceLeaseAdmission(lease, durationMs, heartbeatMs);
+	const timeoutMs = resolveWorkspaceAdmissionTimeout(input.workspaceAdmissionTimeoutMs ?? durationMs);
+	const queueLimit = resolveWorkspaceAdmissionQueueLimit(input.workspaceAdmissionQueueLimit);
+	const gate = workspaceAdmissionGateFor(input.workspaceLeaseManager, safeKey);
+	const releaseAdmission = await gate.acquire(timeoutMs, queueLimit);
+	try {
+		const lease = await input.workspaceLeaseManager.acquire({
+			safeKey,
+			holderId: `gjc-turn-${process.pid}-${randomUUID()}`,
+			operation: "turn",
+			leaseMs: durationMs,
+		});
+		if (lease === undefined) throw new WorkspaceLeaseUncertainError();
+		return new WorkspaceLeaseAdmission(lease, durationMs, heartbeatMs, releaseAdmission);
+	} catch (error) {
+		releaseAdmission();
+		throw error;
+	}
+}
+function resolveWorkspaceAdmissionTimeout(value: number | undefined): number {
+	const timeoutMs = value ?? DEFAULT_WORKSPACE_ADMISSION_TIMEOUT_MS;
+	if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new WorkspaceLeaseUncertainError();
+	return timeoutMs;
+}
+
+function resolveWorkspaceAdmissionQueueLimit(value: number | undefined): number {
+	const queueLimit = value ?? DEFAULT_WORKSPACE_ADMISSION_QUEUE_LIMIT;
+	if (!Number.isSafeInteger(queueLimit) || queueLimit <= 0) throw new WorkspaceLeaseUncertainError();
+	return queueLimit;
 }
 
 function resolveWorkspaceLeaseDuration(value: number | undefined): number {

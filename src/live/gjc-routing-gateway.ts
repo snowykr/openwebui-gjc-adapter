@@ -197,7 +197,7 @@ export function createGjcRoutingLiveGatewayRunner(
 						}
 						if (projected.length > 0) await deliverLiveEvents(turn, projected);
 					};
-					void input.turnRunner
+					const backgroundRoute = input.turnRunner
 						.withLifecyclePublication(gateAddress, lifecycle =>
 							handleWorkflowGateReply(
 								{ ...input, mappings: scopedMappings },
@@ -219,7 +219,7 @@ export function createGjcRoutingLiveGatewayRunner(
 							queue.fail(error);
 						});
 					await firstActivity;
-					return withCanonicalModel({ chunks: queue }, boundSelection);
+					return withCanonicalModel({ chunks: queue, abandon: () => backgroundRoute }, boundSelection);
 				}
 			}
 			if (gateReplyResult !== null) return withCanonicalModel(gateReplyResult, boundSelection);
@@ -281,7 +281,7 @@ export function createGjcRoutingLiveGatewayRunner(
 				activityStarted = true;
 				resolveActivity();
 			};
-			void routeGjcTurn({
+			const backgroundRoute = routeGjcTurn({
 				...(principalId === undefined ? {} : { principalId }),
 				project: turn.project,
 				chatId: turn.chatId,
@@ -362,7 +362,7 @@ export function createGjcRoutingLiveGatewayRunner(
 					queue.fail(mappedError);
 				});
 			await firstActivity;
-			return withCanonicalModel({ chunks: queue }, modelSelection);
+			return withCanonicalModel({ chunks: queue, abandon: () => backgroundRoute }, modelSelection);
 		},
 	};
 }
