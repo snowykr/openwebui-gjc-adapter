@@ -2,6 +2,7 @@ import { mkdir } from "node:fs/promises";
 import * as path from "node:path";
 import { createAdapterSessionCloser } from "./adapter-close-options";
 import {
+	buildOpenWebUIPrincipalClientFactory,
 	buildOpenWebUIPrincipalEventSinkFactory,
 	buildOpenWebUIPrincipalFileContextResolverFactory,
 	buildOpenWebUIPrincipalMessageSinkFactory,
@@ -14,6 +15,7 @@ import { buildRuntimeHealthChecks, type RuntimeIsolationDiagnostic } from "./ada
 import { type AdapterConfig, loadAdapterConfig, type ResolvedAdapterConfig } from "./config";
 import { resolveLegacySessionAuthoritySourcePaths, SESSION_AUTHORITY_MAPPING_FILE } from "./config-env";
 import { preflightSessionAuthorityMigrationCandidates } from "./gjc/session-authority-migration";
+import { loadGjcSessionFile } from "./gjc/session-loader";
 import { FileBackedSessionMappingStore, type SessionMapping, type SessionMappingStore } from "./gjc/session-router";
 import type { GjcCloseReceipt } from "./gjc/turn-runner";
 import type { LiveGatewayEventSink, LiveGatewayMessageSink } from "./live/chat-completions";
@@ -32,8 +34,16 @@ import {
 	type PublicSdkSessionPortFactory,
 	resolveGjcCliPath,
 } from "./live/model-reader";
-import { createProjectionOperationApplier, synthesizeProjectionRows } from "./live/workflow-gate-projection";
+import {
+	createProjectionOperationApplier,
+	type PrincipalProjectionSynchronizerInput,
+	type ProjectionSessionSynchronizer,
+	synthesizeProjectionRows,
+} from "./live/workflow-gate-projection";
 import type { OpenWebUIProjectionRepository } from "./openwebui/client";
+import type { OpenWebUIPrincipalClient } from "./openwebui/http-client";
+import { projectGjcSessionToOpenWebUIChat } from "./projection/chat-tree";
+import { importProjectedSession } from "./projection/importer";
 import { ProjectLinkService, type SessionCloseResult } from "./projects/link-service";
 import { preflightProjectRegistrationDatabase } from "./projects/registration-preflight";
 import { auditProjectRegistrations, SqliteProjectRegistrationStore } from "./projects/registration-store";
@@ -145,6 +155,7 @@ export async function buildResolvedAdapterServerOptions(
 		}
 		const mappings = dependencies.mappings ?? new FileBackedSessionMappingStore(mappingStorePath);
 		const runtimeAdminClientFactory = buildOpenWebUIRuntimeAdminClientFactory(config);
+		const principalClientFactory = buildOpenWebUIPrincipalClientFactory(config, workspaceRegistry);
 		const runtimeAdminClient =
 			owner.ownerUserId.length === 0 || runtimeAdminClientFactory === undefined
 				? undefined
@@ -224,6 +235,20 @@ export async function buildResolvedAdapterServerOptions(
 		});
 		const previouslyLinkedProjectIds = new Set(projectLinkService.listLinkedProjects().map(project => project.id));
 		await projectLinkService.seedConfiguredProjects(projects);
+		const projectionSynchronizer: ProjectionSessionSynchronizer = {
+			syncLinkedProject: projectLinkService.syncLinkedProject.bind(projectLinkService),
+			...(principalClientFactory === undefined
+				? {}
+				: {
+						syncPrincipalProjection: async (input: PrincipalProjectionSynchronizerInput) => {
+							const principalClient = await principalClientFactory(
+								input.principalId,
+								`projection:${input.operation.operationId}`,
+							);
+							await replayPrincipalProjection(input, principalClient);
+						},
+					}),
+		};
 		if (outbox !== undefined) {
 			synthesizeProjectionRows(outbox, mappings, owner.ownerUserId, owner.ownerUserId);
 			const failedProjectionOperations = await reconcileOutboxBeforeServing(
@@ -231,7 +256,7 @@ export async function buildResolvedAdapterServerOptions(
 				projectionRepository === undefined
 					? dependencies.projectionOperationApplier
 					: (dependencies.projectionOperationApplier ??
-							createProjectionOperationApplier(mappings, projectLinkService, owner.ownerUserId)),
+							createProjectionOperationApplier(mappings, projectionSynchronizer, owner.ownerUserId)),
 			);
 			isolationDiagnostics.push({
 				name: "openwebui-projection-outbox",
@@ -363,6 +388,57 @@ export async function buildResolvedAdapterServerOptions(
 		}
 		throw startupError;
 	}
+}
+async function replayPrincipalProjection(
+	input: PrincipalProjectionSynchronizerInput,
+	principalClient: OpenWebUIPrincipalClient,
+): Promise<void> {
+	if (principalClient.principal.role !== "user" || principalClient.userId !== input.principalId)
+		throw new Error(`Projection operation ${input.operation.operationId} has an invalid normal principal capability`);
+	if (input.ownerUserId !== input.principalId)
+		throw new Error(`Projection operation ${input.operation.operationId} has an invalid principal owner binding`);
+	const workspaceRoot = principalClient.context.workspace?.root;
+	if (workspaceRoot === undefined)
+		throw new Error(`Projection operation ${input.operation.operationId} has no durable principal workspace`);
+	const sessionFile = input.mapping.sessionFile;
+	if (sessionFile === undefined)
+		throw new Error(`Projection operation ${input.operation.operationId} has no durable session file`);
+	const resolvedWorkspaceRoot = path.resolve(workspaceRoot);
+	const resolvedSessionRoot = path.join(resolvedWorkspaceRoot, ".gjc", "sessions");
+	const resolvedSessionFile = path.resolve(sessionFile);
+	const relativeSessionFile = path.relative(resolvedSessionRoot, resolvedSessionFile);
+	if (
+		relativeSessionFile.length === 0 ||
+		relativeSessionFile === ".." ||
+		relativeSessionFile.startsWith(`..${path.sep}`) ||
+		path.isAbsolute(relativeSessionFile) ||
+		!relativeSessionFile.endsWith(".jsonl")
+	)
+		throw new Error(`Projection operation ${input.operation.operationId} has an invalid principal session scope`);
+	const loaded = await loadGjcSessionFile(resolvedSessionFile);
+	if (path.resolve(loaded.filePath) !== resolvedSessionFile || loaded.header.id !== input.mapping.sessionId)
+		throw new Error(
+			`Projection operation ${input.operation.operationId} session identity does not match its mapping`,
+		);
+	if (path.resolve(loaded.header.cwd) !== resolvedWorkspaceRoot)
+		throw new Error(
+			`Projection operation ${input.operation.operationId} session cwd is outside its principal workspace`,
+		);
+	const projectedChat = projectGjcSessionToOpenWebUIChat({
+		sessionFile: loaded.filePath,
+		header: loaded.header,
+		entries: loaded.entries,
+	});
+	await importProjectedSession({
+		repository: principalClient,
+		ownerUserId: input.principalId,
+		project: {
+			id: input.mapping.projectId,
+			name: input.mapping.projectId === "openwebui" ? "OpenWebUI" : input.mapping.projectId,
+			folderId: `gjc-project-${input.mapping.projectId}`,
+		},
+		projectedChat: { ...projectedChat, openWebUIChatId: input.mapping.chatId },
+	});
 }
 
 function workspaceLeaseDuration(turnTimeoutMs: number): number {

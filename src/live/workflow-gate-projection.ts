@@ -130,14 +130,22 @@ export function synthesizeProjectionRows(
 				assistantText: operation.result.assistantText,
 				events: operation.result.events,
 			},
-			ownerUserId,
-			principalId ?? configuredAdmin,
+			principalId ?? ownerUserId,
+			principalId,
 		);
 	}
 }
 
+export interface PrincipalProjectionSynchronizerInput {
+	readonly principalId: string;
+	readonly ownerUserId: string;
+	readonly mapping: SessionMapping;
+	readonly operation: ProjectionOperation;
+}
+
 export interface ProjectionSessionSynchronizer {
 	syncLinkedProject(projectId: string): Promise<unknown>;
+	readonly syncPrincipalProjection?: (input: PrincipalProjectionSynchronizerInput) => Promise<unknown>;
 }
 
 export function createProjectionOperationApplier(
@@ -147,6 +155,7 @@ export function createProjectionOperationApplier(
 ): ProjectionOperationApplier {
 	return async (operation: ProjectionOperation) => {
 		const mapping = projectionMapping(mappings, operation, normalizePrincipalId(adminPrincipalId));
+		const principalId = normalizePrincipalId(operation.principalId);
 		const expected = expectedProjectionRows(
 			mapping,
 			operation.ownerUserId,
@@ -161,7 +170,26 @@ export function createProjectionOperationApplier(
 		) {
 			throw new Error(`Projection operation ${operation.operationId} does not match a durable session mapping`);
 		}
-		await synchronizer.syncLinkedProject(mapping.projectId);
+		if (
+			principalId === normalizePrincipalId(adminPrincipalId) &&
+			normalizePrincipalId(operation.ownerUserId) !== principalId
+		)
+			throw new Error(`Projection operation ${operation.operationId} has an invalid principal owner binding`);
+		if (principalId === undefined || principalId === normalizePrincipalId(adminPrincipalId)) {
+			await synchronizer.syncLinkedProject(mapping.projectId);
+			return;
+		}
+		if (normalizePrincipalId(operation.ownerUserId) !== principalId)
+			throw new Error(`Projection operation ${operation.operationId} has an invalid principal owner binding`);
+		const syncPrincipalProjection = synchronizer.syncPrincipalProjection;
+		if (syncPrincipalProjection === undefined)
+			throw new Error(`Projection operation ${operation.operationId} has no principal projection capability`);
+		await syncPrincipalProjection({
+			principalId,
+			ownerUserId: operation.ownerUserId,
+			mapping,
+			operation,
+		});
 	};
 }
 
@@ -173,7 +201,8 @@ function projectionMapping(
 	const operationId =
 		operation.kind === "event" ? operation.operationId.slice(0, -":event".length) : operation.operationId;
 	const principalId = normalizePrincipalId(operation.principalId);
-	const ownerIsConfiguredAdmin = normalizePrincipalId(operation.ownerUserId) === adminPrincipalId;
+	const ownerIsConfiguredAdmin =
+		adminPrincipalId !== undefined && normalizePrincipalId(operation.ownerUserId) === adminPrincipalId;
 	if (principalId === undefined && !ownerIsConfiguredAdmin)
 		throw new Error(`Projection operation ${operation.operationId} has no configured-admin legacy scope`);
 	if (operation.principalId !== undefined && principalId === undefined)
@@ -197,11 +226,13 @@ function projectionMapping(
 			recorded.result.mapping.operationId !== operationId
 		)
 			throw new Error(`Projection operation ${operation.operationId} has no completed durable result`);
-		return {
+		const mapping = {
 			...recorded.result.mapping,
 			assistantText: recorded.result.assistantText,
 			events: recorded.result.events,
 		};
+		assertProjectionMappingPrincipalBinding(mapping, principalId, adminPrincipalId, operation.operationId);
+		return mapping;
 	}
 	const mapping =
 		principalId === undefined
@@ -225,7 +256,24 @@ function projectionMapping(
 		throw new Error(`Projection operation ${operation.operationId} has no durable session mapping`);
 	if (principalId !== undefined && mapping.principalId !== undefined && mapping.principalId !== principalId)
 		throw new Error(`Projection operation ${operation.operationId} has an invalid principal binding`);
+	assertProjectionMappingPrincipalBinding(mapping, principalId, adminPrincipalId, operation.operationId);
 	return mapping;
+}
+
+function assertProjectionMappingPrincipalBinding(
+	mapping: SessionMapping,
+	principalId: string | undefined,
+	adminPrincipalId: string | undefined,
+	operationId: string,
+): void {
+	const mappingPrincipalId = normalizePrincipalId(mapping.principalId);
+	if (principalId !== undefined) {
+		if (mappingPrincipalId !== principalId)
+			throw new Error(`Projection operation ${operationId} has an invalid principal binding`);
+		return;
+	}
+	if (mappingPrincipalId !== undefined && mappingPrincipalId !== adminPrincipalId)
+		throw new Error(`Projection operation ${operationId} has an invalid legacy principal binding`);
 }
 function normalizePrincipalId(value: string | undefined): string | undefined {
 	if (typeof value !== "string") return undefined;

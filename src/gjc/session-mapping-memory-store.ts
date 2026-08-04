@@ -120,13 +120,20 @@ export class SessionMappingStore {
 			.filter(record => !isRetiredRecord(record))
 			.map(mappingFromRecord);
 	}
-	entriesForPrincipal(principalId: string): readonly SessionMapping[] {
+	entriesForPrincipal(
+		principalId: string,
+		options: { readonly includeLegacyAdmin?: boolean } = {},
+	): readonly SessionMapping[] {
 		assertPrincipalId(principalId);
 		return this.authority
 			.entries()
 			.filter(record => {
+				if (isRetiredRecord(record)) return false;
 				const scope = compositeScopeFromRecord(record);
-				return scope !== undefined && scope.principalId === principalId && !isRetiredRecord(record);
+				if (scope?.principalId === principalId) return true;
+				if (options.includeLegacyAdmin !== true) return false;
+				const legacyScope = storedScopeFromRecord(record);
+				return legacyScope?.principalId === principalId || legacyScope === undefined;
 			})
 			.map(mappingFromRecord);
 	}

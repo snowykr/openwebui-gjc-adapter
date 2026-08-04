@@ -516,7 +516,7 @@ export class OpenWebUIRuntimeAdminClient implements OpenWebUIProjectionRepositor
 		await this.#client.deleteFolder(ownerUserId, folderId, options);
 	}
 }
-export class OpenWebUIPrincipalClient {
+export class OpenWebUIPrincipalClient implements OpenWebUIProjectionRepository {
 	readonly #client: OpenWebUIHttpClient;
 	readonly #principal: OpenWebUIPrincipal;
 	readonly #context: OpenWebUIPrincipalContext;
@@ -571,12 +571,47 @@ export class OpenWebUIPrincipalClient {
 		return this.#principal.userId;
 	}
 
-	async getChat(chatId: string): Promise<OpenWebUIChatRecord | undefined> {
+	async upsertFolder(record: OpenWebUIFolderRecord): Promise<OpenWebUIFolderRecord> {
+		requirePrincipalId(record.id, "folder");
+		assertPrincipalOwner(this.#principal.userId, record.owner_user_id, "folder");
+		const stored = await this.#client.upsertFolder(record);
+		assertPrincipalOwner(this.#principal.userId, stored.owner_user_id, "folder");
+		return stored;
+	}
+
+	async getFolder(ownerUserId: string, folderId: string): Promise<OpenWebUIFolderRecord | undefined> {
+		assertPrincipalOwner(this.#principal.userId, ownerUserId, "folder");
+		requirePrincipalId(folderId, "folder");
+		const folder = await this.#client.getFolder(this.#principal.userId, folderId);
+		if (folder === undefined) return undefined;
+		assertPrincipalOwner(this.#principal.userId, folder.owner_user_id, "folder");
+		return folder;
+	}
+
+	async getChat(ownerUserId: string, chatId: string): Promise<OpenWebUIChatRecord | undefined>;
+	async getChat(chatId: string): Promise<OpenWebUIChatRecord | undefined>;
+	async getChat(ownerUserIdOrChatId: string, maybeChatId?: string): Promise<OpenWebUIChatRecord | undefined> {
+		const chatId =
+			maybeChatId === undefined
+				? ownerUserIdOrChatId
+				: (() => {
+						assertPrincipalOwner(this.#principal.userId, ownerUserIdOrChatId, "chat");
+						return maybeChatId;
+					})();
 		requirePrincipalId(chatId, "chat");
 		const chat = await this.#client.getChat(this.#principal.userId, chatId);
 		if (chat === undefined) return undefined;
 		assertPrincipalOwner(this.#principal.userId, chat.owner_user_id, "chat");
 		return chat;
+	}
+	async deleteFolder(
+		ownerUserId: string,
+		folderId: string,
+		options: { readonly deleteContents: boolean; readonly expectedProjectId?: string },
+	): Promise<void> {
+		assertPrincipalOwner(this.#principal.userId, ownerUserId, "folder");
+		requirePrincipalId(folderId, "folder");
+		await this.#client.deleteFolder(this.#principal.userId, folderId, options);
 	}
 
 	async getChatProof(chatId: string): Promise<OpenWebUIOwnerChatProof | undefined> {
@@ -605,18 +640,38 @@ export class OpenWebUIPrincipalClient {
 	}
 
 	async replaceChatMessages(
+		ownerUserId: string,
+		chatId: string,
+		messages: readonly OpenWebUIChatMessageRecord[],
+	): Promise<readonly OpenWebUIChatMessageRecord[]>;
+	async replaceChatMessages(
 		proof: OpenWebUIOwnerChatProof,
 		messages: readonly OpenWebUIChatMessageRecord[],
+	): Promise<readonly OpenWebUIChatMessageRecord[]>;
+	async replaceChatMessages(
+		ownerUserIdOrProof: string | OpenWebUIOwnerChatProof,
+		chatIdOrMessages: string | readonly OpenWebUIChatMessageRecord[],
+		maybeMessages?: readonly OpenWebUIChatMessageRecord[],
 	): Promise<readonly OpenWebUIChatMessageRecord[]> {
+		if (typeof ownerUserIdOrProof === "string") {
+			assertPrincipalOwner(this.#principal.userId, ownerUserIdOrProof, "chat");
+			if (typeof chatIdOrMessages !== "string" || maybeMessages === undefined || !Array.isArray(maybeMessages))
+				throw new OpenWebUIPrincipalScopeError("OpenWebUI projection chat messages are incomplete.");
+			const proof = await this.requireChatProof(chatIdOrMessages);
+			return await this.replaceChatMessages(proof, maybeMessages);
+		}
+		if (typeof chatIdOrMessages === "string" || !Array.isArray(chatIdOrMessages))
+			throw new OpenWebUIPrincipalScopeError("OpenWebUI projection chat messages are incomplete.");
+		const proof = ownerUserIdOrProof;
 		assertOpenWebUIOwnerChatProof(proof, { ownerUserId: this.#principal.userId, chatId: proof.chatId });
-		for (const message of messages) {
+		for (const message of chatIdOrMessages) {
 			if (message.chat_id !== proof.chatId || message.owner_user_id !== this.#principal.userId) {
 				throw new OpenWebUIPrincipalScopeError(
 					"OpenWebUI message write record does not match the owner/chat proof.",
 				);
 			}
 		}
-		return await this.#client.replaceChatMessagesWithProof(proof, messages);
+		return await this.#client.replaceChatMessagesWithProof(proof, chatIdOrMessages);
 	}
 
 	async replaceMessages(

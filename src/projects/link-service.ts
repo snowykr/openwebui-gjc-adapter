@@ -197,10 +197,10 @@ export class ProjectLinkService {
 	async #closeProjectSessions(
 		projectId: string,
 	): Promise<readonly { readonly chatId: string; readonly result: SessionCloseResult }[]> {
-		if (this.#closeSession === undefined || this.#mappings === undefined) return [];
+		if (this.#closeSession === undefined || this.#mappings === undefined || this.#ownerUserId.length === 0) return [];
 		return await Promise.all(
 			this.#mappings
-				.entries()
+				.entriesForPrincipal(this.#ownerUserId, { includeLegacyAdmin: true })
 				.filter(mapping => mapping.projectId === projectId)
 				.map(async mapping => {
 					try {
