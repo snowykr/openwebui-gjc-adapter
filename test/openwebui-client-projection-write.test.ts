@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { buildOpenWebUIStatusEvent } from "../src/openwebui/events";
-import { createOpenWebUIPrincipalClient, OpenWebUIHttpClient } from "../src/openwebui/http-client";
+import {
+	createOpenWebUIOwnerChatProof,
+	createOpenWebUIPrincipalClient,
+	OpenWebUIHttpClient,
+	OpenWebUIPrincipalProjectionError,
+} from "../src/openwebui/http-client";
 import { startRecordingServer } from "./openwebui-http-fixture";
 import { baseChat } from "./openwebui-test-fixtures";
 
@@ -123,6 +128,61 @@ describe("OpenWebUIHttpClient projection writes", () => {
 			fixture.stop();
 		}
 	});
+	test("fails normal-principal projection writes closed before any OpenWebUI mutation", async () => {
+		const fixture = startRecordingServer();
+		const principal = createOpenWebUIPrincipalClient(
+			new OpenWebUIHttpClient({ baseUrl: fixture.baseUrl, apiToken: "admin-token" }),
+			"owner-1",
+		);
+		const proof = createOpenWebUIOwnerChatProof(baseChat);
+
+		try {
+			const expectedError = {
+				code: "openwebui_principal_projection_unavailable",
+				name: "OpenWebUIPrincipalProjectionError",
+			};
+			await expect(
+				principal.upsertFolder({
+					id: "folder-1",
+					owner_user_id: "owner-1",
+					name: "Owner 1 folder",
+					metadata: { gjc_adapter: { project_id: "project-1" } },
+				}),
+			).rejects.toBeInstanceOf(OpenWebUIPrincipalProjectionError);
+			await expect(principal.upsertChat(baseChat)).rejects.toMatchObject(expectedError);
+			await expect(
+				principal.replaceChatMessages(proof, [
+					{
+						id: "message-1",
+						chat_id: "chat-1",
+						owner_user_id: "owner-1",
+						role: "assistant",
+						content: "must not write",
+						metadata: {},
+					},
+				]),
+			).rejects.toMatchObject(expectedError);
+			await expect(
+				principal.postMessageEvent({
+					chatId: "chat-1",
+					messageId: "message-1",
+					event: buildOpenWebUIStatusEvent({ description: "must not write", done: false }),
+					proof,
+				}),
+			).rejects.toMatchObject(expectedError);
+			await expect(
+				principal.updateMessageContent({
+					chatId: "chat-1",
+					messageId: "message-1",
+					content: "must not write",
+					proof,
+				}),
+			).rejects.toMatchObject(expectedError);
+			expect(fixture.requests).toHaveLength(0);
+		} finally {
+			fixture.stop();
+		}
+	});
 	test("requires a non-empty immutable normal principal user ID", () => {
 		const fixture = startRecordingServer();
 		try {
@@ -189,7 +249,7 @@ describe("OpenWebUIHttpClient projection writes", () => {
 		}
 	});
 
-	test("uses a successful owner/chat proof before posting a principal message event", async () => {
+	test("reports unavailable normal-principal message delivery after owner/chat proof without mutating OpenWebUI", async () => {
 		const fixtureOptions: { responseBody?: unknown } = {
 			responseBody: {
 				id: "chat-1",
@@ -202,21 +262,24 @@ describe("OpenWebUIHttpClient projection writes", () => {
 		};
 		const fixture = startRecordingServer(fixtureOptions);
 		const client = createOpenWebUIPrincipalClient(
-			new OpenWebUIHttpClient({ baseUrl: fixture.baseUrl, apiToken: "token-1" }),
+			new OpenWebUIHttpClient({ baseUrl: fixture.baseUrl, apiToken: "admin-token" }),
 			"owner-1",
 		);
 		try {
 			const proof = await client.requireChatProof("chat-1");
-			fixtureOptions.responseBody = true;
-			await client.postMessageEvent({
-				chatId: "chat-1",
-				messageId: "message-1",
-				event: buildOpenWebUIStatusEvent({ description: "proven", done: false }),
-				proof,
+			await expect(
+				client.postMessageEvent({
+					chatId: "chat-1",
+					messageId: "message-1",
+					event: buildOpenWebUIStatusEvent({ description: "must not write", done: false }),
+					proof,
+				}),
+			).rejects.toMatchObject({
+				code: "openwebui_principal_projection_unavailable",
+				name: "OpenWebUIPrincipalProjectionError",
 			});
 			expect(fixture.requests.map(request => [request.method, request.path])).toEqual([
 				["GET", "/api/v1/chats/chat-1"],
-				["POST", "/api/v1/chats/chat-1/messages/message-1/event"],
 			]);
 		} finally {
 			fixture.stop();

@@ -683,14 +683,17 @@ async function acquireExternalOperationLock(lockPath: string): Promise<() => Pro
 	const guardPath = `${lockPath}.guard`;
 	const owner = await currentExternalOperationLockOwner();
 	for (let attempt = 0; attempt < EXTERNAL_OPERATION_LOCK_ATTEMPTS; attempt += 1) {
+		let freshSnapshot: ExternalOperationLockSnapshot | undefined;
 		try {
 			const snapshot = await writeExternalOperationLockFile(guardPath, owner);
+			freshSnapshot = snapshot;
 			await syncDirectory(path.dirname(guardPath));
 			const markerPath = externalOperationLockRecoveryMarkerPath(guardPath);
 			const marker = await readExternalOperationLockSnapshot(markerPath);
 			if (marker !== undefined) {
 				if (await isExternalOperationLockOwnerLive(marker.owner)) {
 					await removeExternalOperationLock(guardPath, snapshot);
+					freshSnapshot = undefined;
 					await delayExternalOperationLock();
 					continue;
 				}
@@ -700,6 +703,10 @@ async function acquireExternalOperationLock(lockPath: string): Promise<() => Pro
 				await removeExternalOperationLock(guardPath, snapshot);
 			};
 		} catch (error) {
+			if (freshSnapshot !== undefined) {
+				await removeExternalOperationLock(guardPath, freshSnapshot);
+				throw error;
+			}
 			if (!isNodeFsError(error, "EEXIST")) throw error;
 			const snapshot = await readExternalOperationLockSnapshot(guardPath);
 			if (snapshot === undefined) continue;
@@ -873,7 +880,8 @@ function assertPrivateGuardStat(stats: Stats, guardPath: string): void {
 	if ((stats.mode & 0o777) !== RECORD_MODE) {
 		throw new Error(`Workspace operation lock must be private: ${guardPath}`);
 	}
-	if (typeof process.getuid !== "function" || stats.uid !== process.getuid()) {
+	const getuid = process.getuid;
+	if (typeof getuid === "function" && stats.uid !== getuid()) {
 		throw new Error(`Workspace operation lock has foreign ownership: ${guardPath}`);
 	}
 }

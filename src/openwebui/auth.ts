@@ -40,6 +40,16 @@ export class OpenWebUIPrincipalScopeError extends Error {
 		this.name = "OpenWebUIPrincipalScopeError";
 	}
 }
+export class OpenWebUIPrincipalProjectionError extends OpenWebUIPrincipalScopeError {
+	readonly code = "openwebui_principal_projection_unavailable";
+
+	constructor() {
+		super(
+			"Normal-principal OpenWebUI projection writes are unavailable: the OpenWebUI client has no principal-bound credential or supported owner impersonation operation. Refusing to use the configured administrator token.",
+		);
+		this.name = "OpenWebUIPrincipalProjectionError";
+	}
+}
 
 export type OpenWebUIPrincipalResolution =
 	| { ok: true; principal: OpenWebUIPrincipal }

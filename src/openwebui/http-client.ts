@@ -3,6 +3,7 @@ import {
 	type OpenWebUIAdminPrincipal,
 	type OpenWebUIPrincipal,
 	type OpenWebUIPrincipalContext,
+	OpenWebUIPrincipalProjectionError,
 	requireOpenWebUIAdminPrincipal,
 } from "./auth";
 import type {
@@ -42,6 +43,7 @@ export type {
 	OpenWebUIPrincipalContext,
 	OpenWebUIPrincipalWorkspaceContext,
 } from "./auth";
+export { OpenWebUIPrincipalProjectionError } from "./auth";
 export { OpenWebUIHttpConfigurationError, OpenWebUIHttpError, OpenWebUITransportError } from "./http-errors";
 export type { OpenWebUIFileBytes, OpenWebUIFileContent } from "./http-file-types";
 export type { OpenWebUIOwnerChatProof } from "./http-message-writer";
@@ -574,6 +576,7 @@ export class OpenWebUIPrincipalClient implements OpenWebUIProjectionRepository {
 	async upsertFolder(record: OpenWebUIFolderRecord): Promise<OpenWebUIFolderRecord> {
 		requirePrincipalId(record.id, "folder");
 		assertPrincipalOwner(this.#principal.userId, record.owner_user_id, "folder");
+		assertPrincipalProjectionWriteCapability(this.#principal);
 		const stored = await this.#client.upsertFolder(record);
 		assertPrincipalOwner(this.#principal.userId, stored.owner_user_id, "folder");
 		return stored;
@@ -611,6 +614,7 @@ export class OpenWebUIPrincipalClient implements OpenWebUIProjectionRepository {
 	): Promise<void> {
 		assertPrincipalOwner(this.#principal.userId, ownerUserId, "folder");
 		requirePrincipalId(folderId, "folder");
+		assertPrincipalProjectionWriteCapability(this.#principal);
 		await this.#client.deleteFolder(this.#principal.userId, folderId, options);
 	}
 
@@ -634,6 +638,7 @@ export class OpenWebUIPrincipalClient implements OpenWebUIProjectionRepository {
 	async upsertChat(record: OpenWebUIChatRecord): Promise<OpenWebUIChatRecord> {
 		requirePrincipalId(record.id, "chat");
 		assertPrincipalOwner(this.#principal.userId, record.owner_user_id, "chat");
+		assertPrincipalProjectionWriteCapability(this.#principal);
 		const stored = await this.#client.upsertChat(record);
 		assertPrincipalOwner(this.#principal.userId, stored.owner_user_id, "chat");
 		return stored;
@@ -671,6 +676,7 @@ export class OpenWebUIPrincipalClient implements OpenWebUIProjectionRepository {
 				);
 			}
 		}
+		assertPrincipalProjectionWriteCapability(this.#principal);
 		return await this.#client.replaceChatMessagesWithProof(proof, chatIdOrMessages);
 	}
 
@@ -687,6 +693,7 @@ export class OpenWebUIPrincipalClient implements OpenWebUIProjectionRepository {
 		assertOpenWebUIOwnerChatProof(input.proof, { ownerUserId: this.#principal.userId, chatId: input.chatId });
 		requirePrincipalId(input.chatId, "chat");
 		requirePrincipalId(input.messageId, "message");
+		assertPrincipalProjectionWriteCapability(this.#principal);
 		await this.#client.postMessageEvent(input);
 	}
 
@@ -696,6 +703,7 @@ export class OpenWebUIPrincipalClient implements OpenWebUIProjectionRepository {
 		assertOpenWebUIOwnerChatProof(input.proof, { ownerUserId: this.#principal.userId, chatId: input.chatId });
 		requirePrincipalId(input.chatId, "chat");
 		requirePrincipalId(input.messageId, "message");
+		assertPrincipalProjectionWriteCapability(this.#principal);
 		await this.#client.updateMessageContent(input);
 	}
 
@@ -846,6 +854,9 @@ function assertPrincipalOwner(userId: string, ownerUserId: string, resource: str
 	if (ownerUserId !== userId) {
 		throw new OpenWebUIPrincipalScopeError(`OpenWebUI principal cannot access a foreign ${resource} owner.`);
 	}
+}
+function assertPrincipalProjectionWriteCapability(principal: OpenWebUIPrincipal): void {
+	if (principal.role === "user") throw new OpenWebUIPrincipalProjectionError();
 }
 
 function requirePrincipalId(value: string, resource: string): void {

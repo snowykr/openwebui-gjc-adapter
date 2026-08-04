@@ -265,12 +265,15 @@ async function acquireRegistryLock(stateRoot: string): Promise<() => Promise<voi
 	const owner = await currentRegistryLockOwner();
 	for (let attempt = 0; attempt < REGISTRY_LOCK_ATTEMPTS; attempt += 1) {
 		let handle: fs.FileHandle | undefined;
+		let created = false;
+		let retained = false;
 		try {
 			handle = await fs.open(
 				lockPath,
 				constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
 				REGISTRY_MODE,
 			);
+			created = true;
 			await handle.writeFile(`${JSON.stringify(owner)}\n`, "utf8");
 			await handle.chmod(REGISTRY_MODE);
 			await handle.sync();
@@ -284,11 +287,12 @@ async function acquireRegistryLock(stateRoot: string): Promise<() => Promise<voi
 				device: stats.dev,
 				inode: stats.ino,
 			};
+			retained = true;
 			return async () => {
 				await removeRegistryLock(lockPath, snapshot);
 			};
 		} catch (error) {
-			await handle?.close();
+			if (created) throw error;
 			if (!isNodeFsError(error, "EEXIST")) throw error;
 			let snapshot: RegistryLockSnapshot | undefined;
 			try {
@@ -304,6 +308,9 @@ async function acquireRegistryLock(stateRoot: string): Promise<() => Promise<voi
 				} else if (await reclaimRegistryLock(lockPath, snapshot)) {
 				}
 			}
+		} finally {
+			await handle?.close();
+			if (created && !retained) await unlinkRegistryLockIfPresent(lockPath);
 		}
 	}
 	throw new Error(`User workspace registry lock is unavailable: ${stateRoot}`);
@@ -437,7 +444,8 @@ function assertPrivateRegistryLockStat(stats: Stats, lockPath: string): void {
 	if ((stats.mode & 0o777) !== REGISTRY_MODE) {
 		throw new Error(`User workspace registry lock must be private: ${lockPath}`);
 	}
-	if (typeof process.getuid !== "function" || stats.uid !== process.getuid()) {
+	const getuid = process.getuid;
+	if (typeof getuid === "function" && stats.uid !== getuid()) {
 		throw new Error(`User workspace registry lock has foreign ownership: ${lockPath}`);
 	}
 }
@@ -534,6 +542,14 @@ function isMissingProcessError(error: unknown): boolean {
 
 async function delayRegistryLock(): Promise<void> {
 	await new Promise<void>(resolve => setTimeout(resolve, REGISTRY_LOCK_DELAY_MS));
+}
+
+async function unlinkRegistryLockIfPresent(lockPath: string): Promise<void> {
+	try {
+		await fs.unlink(lockPath);
+	} catch (error) {
+		if (!isNodeFsError(error, "ENOENT")) throw error;
+	}
 }
 
 async function ensureDirectory(directory: string, label: string, enforcePrivateMode: boolean): Promise<void> {
