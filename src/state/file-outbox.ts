@@ -14,12 +14,15 @@ import { dirname, join } from "node:path";
 import { createOperationId } from "./metadata";
 import {
 	assertSameEnqueueIdentity,
+	canonicalProjectionOperationKey,
 	copyOperation,
 	type EnqueueProjectionOperationInput,
+	normalizeProjectionPrincipalId,
 	OUTBOX_DOCUMENT_VERSION,
 	type OutboxFileSystem,
 	type OutboxStore,
 	type ProjectionOperation,
+	type ProjectionOperationReference,
 	parsePersistedOutboxDocument,
 	toTimestamp,
 } from "./outbox-types";
@@ -49,15 +52,22 @@ export class FileBackedOutboxStore implements OutboxStore {
 
 	enqueue(input: EnqueueProjectionOperationInput): ProjectionOperation {
 		const operationId = input.operationId ?? createOperationId(`projection-${input.kind}`, input.now);
-		const existing = this.operations.get(operationId);
+		const principalId = normalizeProjectionPrincipalId(input.principalId);
+		const key = canonicalProjectionOperationKey(principalId, input.chatId, operationId);
+		const normalizedInput =
+			principalId === input.principalId
+				? input
+				: { ...input, ...(principalId === undefined ? {} : { principalId }) };
+		const existing = this.operations.get(key);
 		if (existing !== undefined) {
-			assertSameEnqueueIdentity(existing, input);
+			assertSameEnqueueIdentity(existing, normalizedInput);
 			return copyOperation(existing);
 		}
 
 		const timestamp = toTimestamp(input.now);
 		const operation: ProjectionOperation = {
 			operationId,
+			...(principalId === undefined ? {} : { principalId }),
 			ownerUserId: input.ownerUserId,
 			projectId: input.projectId,
 			chatId: input.chatId,
@@ -69,14 +79,14 @@ export class FileBackedOutboxStore implements OutboxStore {
 			updatedAt: timestamp,
 		};
 		const candidate = this.copyOperations();
-		candidate.set(operationId, operation);
+		candidate.set(key, operation);
 		this.persist(candidate);
 		this.operations = candidate;
 		return copyOperation(operation);
 	}
 
-	markApplying(operationId: string, now?: Date): ProjectionOperation {
-		return this.update(operationId, now, operation => ({
+	markApplying(reference: ProjectionOperationReference, now?: Date): ProjectionOperation {
+		return this.update(reference, now, operation => ({
 			...operation,
 			state: "applying",
 			attempts: operation.attempts + 1,
@@ -84,24 +94,24 @@ export class FileBackedOutboxStore implements OutboxStore {
 		}));
 	}
 
-	markApplied(operationId: string, now?: Date): ProjectionOperation {
-		return this.update(operationId, now, operation => ({
+	markApplied(reference: ProjectionOperationReference, now?: Date): ProjectionOperation {
+		return this.update(reference, now, operation => ({
 			...operation,
 			state: "applied",
 			lastError: undefined,
 		}));
 	}
 
-	markFailed(operationId: string, error: string, now?: Date): ProjectionOperation {
-		return this.update(operationId, now, operation => ({
+	markFailed(reference: ProjectionOperationReference, error: string, now?: Date): ProjectionOperation {
+		return this.update(reference, now, operation => ({
 			...operation,
 			state: "failed",
 			lastError: error,
 		}));
 	}
 
-	markReconcile(operationId: string, now?: Date): ProjectionOperation {
-		return this.update(operationId, now, operation => ({ ...operation, state: "reconcile" }));
+	markReconcile(reference: ProjectionOperationReference, now?: Date): ProjectionOperation {
+		return this.update(reference, now, operation => ({ ...operation, state: "reconcile" }));
 	}
 
 	listPending(): ProjectionOperation[] {
@@ -116,34 +126,54 @@ export class FileBackedOutboxStore implements OutboxStore {
 			.map(copyOperation);
 	}
 
-	get(operationId: string): ProjectionOperation | undefined {
-		const operation = this.operations.get(operationId);
+	get(reference: ProjectionOperationReference): ProjectionOperation | undefined {
+		const key = this.resolveKey(reference);
+		if (key === undefined) return undefined;
+		const operation = this.operations.get(key);
 		return operation === undefined ? undefined : copyOperation(operation);
 	}
 
 	private update(
-		operationId: string,
+		reference: ProjectionOperationReference,
 		now: Date | undefined,
 		change: (operation: ProjectionOperation) => ProjectionOperation,
 	): ProjectionOperation {
-		const operation = this.requireOperation(operationId);
+		const key = this.resolveKey(reference);
+		const operation = this.requireOperation(reference, key);
+		if (key === undefined) throw new Error("Unknown projection operation");
 		const updated = {
 			...change(operation),
 			updatedAt: toTimestamp(now),
 		};
 		const candidate = this.copyOperations();
-		candidate.set(operationId, updated);
+		candidate.set(key, updated);
 		this.persist(candidate);
 		this.operations = candidate;
 		return copyOperation(updated);
 	}
 
-	private requireOperation(operationId: string): ProjectionOperation {
-		const operation = this.operations.get(operationId);
+	private requireOperation(
+		reference: ProjectionOperationReference,
+		key = this.resolveKey(reference),
+	): ProjectionOperation {
+		const operation = key === undefined ? undefined : this.operations.get(key);
 		if (operation === undefined) {
+			const operationId = typeof reference === "string" ? reference : reference.operationId;
 			throw new Error(`Unknown projection operation: ${operationId}`);
 		}
 		return operation;
+	}
+
+	private resolveKey(reference: ProjectionOperationReference): string | undefined {
+		if (typeof reference !== "string") {
+			const principalId = normalizeProjectionPrincipalId(reference.principalId);
+			return canonicalProjectionOperationKey(principalId, reference.chatId, reference.operationId);
+		}
+		const matches = Array.from(this.operations.entries()).filter(
+			([, operation]) => operation.operationId === reference,
+		);
+		if (matches.length > 1) throw new Error(`Projection operation ID is ambiguous: ${reference}`);
+		return matches[0]?.[0];
 	}
 
 	private copyOperations(): Map<string, ProjectionOperation> {
@@ -157,7 +187,10 @@ export class FileBackedOutboxStore implements OutboxStore {
 		assertRegularFile(this.fileSystem, this.filePath);
 		const document = parsePersistedOutboxDocument(this.fileSystem.readFile(this.filePath, "utf8"));
 		this.operations = new Map(
-			document.operations.map(operation => [operation.operationId, copyOperation(operation)]),
+			document.operations.map(operation => [
+				canonicalProjectionOperationKey(operation.principalId, operation.chatId, operation.operationId),
+				copyOperation(operation),
+			]),
 		);
 	}
 

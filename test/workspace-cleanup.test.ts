@@ -3,16 +3,44 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createUserWorkspaceRegistry } from "../src/security/user-workspace";
-import { createWorkspaceCleanupService } from "../src/security/workspace-cleanup";
+import {
+	createWorkspaceCleanupService,
+	type WorkspaceCleanupAuthorityCoordinator,
+} from "../src/security/workspace-cleanup";
 import { createWorkspaceLeaseManager } from "../src/security/workspace-lease";
 
-async function createFixture(userId = "cleanup-user") {
+async function createFixture(
+	userId = "cleanup-user",
+	authorityCoordinatorOverride?: WorkspaceCleanupAuthorityCoordinator,
+) {
 	const stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-workspace-cleanup-"));
 	const registry = createUserWorkspaceRegistry({ stateRoot });
 	const leaseManager = createWorkspaceLeaseManager({ stateRoot });
-	const service = createWorkspaceCleanupService({ registry, leaseManager, leaseMs: 10_000, heartbeatMs: 1_000 });
+	const retiredPrincipals: string[] = [];
+	const authorityCoordinator =
+		authorityCoordinatorOverride ??
+		({
+			async retirePrincipal({
+				principalId,
+				assertFence,
+			}: {
+				readonly principalId: string;
+				readonly assertFence: () => Promise<void>;
+			}): Promise<void> {
+				await assertFence();
+				retiredPrincipals.push(principalId);
+				await assertFence();
+			},
+		} satisfies WorkspaceCleanupAuthorityCoordinator);
+	const service = createWorkspaceCleanupService({
+		registry,
+		leaseManager,
+		authorityCoordinator,
+		leaseMs: 10_000,
+		heartbeatMs: 1_000,
+	});
 	const workspace = await registry.open(userId);
-	return { stateRoot, registry, leaseManager, service, workspace, userId };
+	return { stateRoot, registry, leaseManager, service, workspace, userId, retiredPrincipals, authorityCoordinator };
 }
 
 describe("admin user workspace cleanup", () => {
@@ -71,6 +99,7 @@ describe("admin user workspace cleanup", () => {
 		});
 
 		expect(result.outcome).toBe("success");
+		expect(fixture.retiredPrincipals).toEqual([fixture.userId]);
 		await expect(fs.stat(fixture.workspace.root)).rejects.toThrow();
 		expect(await fixture.registry.resolve(fixture.userId)).toBeUndefined();
 		const auditFiles = await fs.readdir(path.join(fixture.stateRoot, "workspace-cleanup", "audit"));
@@ -81,6 +110,47 @@ describe("admin user workspace cleanup", () => {
 			) as Record<string, unknown>;
 			expect(record).not.toHaveProperty("userId");
 		}
+	});
+	test("retains cleanup-pending when principal authority retirement fails", async () => {
+		const failure = new Error("session close failed");
+		const fixture = await createFixture("cleanup-failure", {
+			async retirePrincipal({ principalId }): Promise<void> {
+				expect(principalId).toBe("cleanup-failure");
+				throw failure;
+			},
+		});
+		const file = path.join(fixture.workspace.root, "keep.txt");
+		await fs.writeFile(file, "keep");
+		const preview = await fixture.service.preview({ userId: fixture.userId });
+
+		await expect(
+			fixture.service.cleanup({ userId: fixture.userId, confirmationToken: preview.confirmationToken! }),
+		).rejects.toMatchObject({ code: "cleanup_uncertain" });
+		expect(await fs.readFile(file, "utf8")).toBe("keep");
+		expect(await fixture.registry.resolve(fixture.userId)).toBeDefined();
+		await expect(
+			fixture.leaseManager.acquire({
+				safeKey: fixture.workspace.safeKey,
+				holderId: "blocked-turn",
+				operation: "turn",
+				leaseMs: 10_000,
+			}),
+		).rejects.toThrow(/cleanup.*pending/i);
+	});
+
+	test("coordinates only the requested principal before deleting its workspace", async () => {
+		const fixture = await createFixture("target-user");
+		const foreign = await fixture.registry.open("foreign-user");
+		const preview = await fixture.service.preview({ userId: fixture.userId });
+
+		await fixture.service.cleanup({
+			userId: fixture.userId,
+			confirmationToken: preview.confirmationToken!,
+		});
+
+		expect(fixture.retiredPrincipals).toEqual(["target-user"]);
+		expect(await fixture.registry.resolve("foreign-user")).toEqual(foreign);
+		expect(await fs.stat(foreign.root)).toBeTruthy();
 	});
 
 	test("rejects symlinks without following them or escaping stateRoot", async () => {

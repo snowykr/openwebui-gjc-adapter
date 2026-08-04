@@ -102,9 +102,24 @@ async function resolvePublicSdkAttachment(
 }
 
 async function assertScopedModelReaderContext(context: ModelReaderContext | undefined): Promise<void> {
-	if (context?.principal.role !== "user") return;
+	if (context === undefined) return;
+	const principal = context.principal;
+	if (
+		typeof principal !== "object" ||
+		principal === null ||
+		(principal.role !== "admin" && principal.role !== "user") ||
+		typeof principal.userId !== "string" ||
+		principal.userId.trim().length === 0 ||
+		principal.userId.trim() !== principal.userId ||
+		/\p{Cc}/u.test(principal.userId) ||
+		/\{\{[^{}]*\}\}/u.test(principal.userId)
+	)
+		throw new ModelReaderUnavailableError("A valid OpenWebUI principal is required.");
+	if (principal.role !== "user") return;
 	if (context.workspace === undefined || context.lease === undefined)
 		throw new ModelReaderUnavailableError("A normal-user model reader requires a workspace lease.");
+	if (context.workspace.userId !== principal.userId)
+		throw new ModelReaderUnavailableError("The normal-user model reader workspace is bound to another principal.");
 	try {
 		await context.lease.assertFence();
 	} catch (error) {

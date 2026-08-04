@@ -12,7 +12,8 @@ import {
 import { assertResolvedAdapterConfig, loadConfiguredProjects, resolveAdapterConfig } from "./adapter-project-options";
 import { buildRuntimeHealthChecks, type RuntimeIsolationDiagnostic } from "./adapter-runtime-health";
 import { type AdapterConfig, loadAdapterConfig, type ResolvedAdapterConfig } from "./config";
-import { preflightSessionAuthorityMigration } from "./gjc/session-authority-migration";
+import { resolveLegacySessionAuthoritySourcePaths, SESSION_AUTHORITY_MAPPING_FILE } from "./config-env";
+import { preflightSessionAuthorityMigrationCandidates } from "./gjc/session-authority-migration";
 import { FileBackedSessionMappingStore, type SessionMapping, type SessionMappingStore } from "./gjc/session-router";
 import type { GjcCloseReceipt } from "./gjc/turn-runner";
 import type { LiveGatewayEventSink, LiveGatewayMessageSink } from "./live/chat-completions";
@@ -39,7 +40,7 @@ import { auditProjectRegistrations, SqliteProjectRegistrationStore } from "./pro
 import { RuntimeSingletonLock } from "./runtime-singleton-lock";
 import { resolveAllowedRoots } from "./security/paths";
 import { createUserWorkspaceRegistry } from "./security/user-workspace";
-import { createWorkspaceCleanupService } from "./security/workspace-cleanup";
+import { createWorkspaceCleanupService, type WorkspaceCleanupAuthorityCoordinator } from "./security/workspace-cleanup";
 import { createWorkspaceLeaseManager } from "./security/workspace-lease";
 import { type AdapterServerHandle, type AdapterServerOptions, startAdapterServer } from "./server";
 import { FileBackedOutboxStore, type OutboxStore } from "./state/outbox";
@@ -48,7 +49,7 @@ import { type ProjectionOperationApplier, reconcilePendingOperations } from "./s
 const WORKSPACE_LEASE_MIN_DURATION_MS = 210_000;
 const WORKSPACE_LEASE_HEADROOM_MS = 30_000;
 
-const SESSION_MAPPING_STORE_FILE = "openwebui-session-mappings.json";
+const SESSION_MAPPING_STORE_FILE = SESSION_AUTHORITY_MAPPING_FILE;
 const PROJECTION_OUTBOX_STORE_FILE = "openwebui-projection-outbox.json";
 
 export interface BuildAdapterServerOptionsDependencies {
@@ -68,17 +69,23 @@ export interface BuildAdapterServerOptionsDependencies {
 	readonly fallbackCloseSession?: (mapping: SessionMapping, cause: unknown) => Promise<SessionCloseResult>;
 	/** Post-ack proof must observe endpoint disappearance and the persisted owned pane/process; it must never kill. */
 	readonly proveClosedSession?: (mapping: SessionMapping, receipt: GjcCloseReceipt) => Promise<SessionCloseResult>;
+	/** Retires every principal-owned session authority only after proven close. */
+	readonly authorityCoordinator?: WorkspaceCleanupAuthorityCoordinator;
 }
 
 interface BuildAdapterServerOptionsBehavior {
 	readonly deferOpenWebUIInitialization?: boolean;
+	readonly sessionAuthorityMigrationSourcePaths?: readonly string[];
 }
 
 export async function buildAdapterServerOptionsFromEnv(
 	env: Record<string, string | undefined> = process.env,
 	dependencies: BuildAdapterServerOptionsDependencies = {},
 ): Promise<AdapterServerOptions> {
-	return buildResolvedAdapterServerOptions(loadAdapterConfig(env), dependencies);
+	const config = loadAdapterConfig(env);
+	return buildResolvedAdapterServerOptions(config, dependencies, {
+		sessionAuthorityMigrationSourcePaths: resolveLegacySessionAuthoritySourcePaths(env),
+	});
 }
 
 export async function buildAdapterServerOptions(
@@ -117,8 +124,12 @@ export async function buildResolvedAdapterServerOptions(
 		const workspaceLeaseHeartbeatMs = workspaceLeaseHeartbeat(workspaceLeaseDurationMs);
 		const mappingStorePath = path.join(config.sessionRoot, SESSION_MAPPING_STORE_FILE);
 		if (dependencies.mappings === undefined && owner.ownerUserId.length > 0) {
-			const migration = preflightSessionAuthorityMigration({
-				sourcePath: mappingStorePath,
+			const sourcePaths =
+				behavior.sessionAuthorityMigrationSourcePaths ??
+				(config.mode === "managed" ? [path.join("/run/gjc-session", SESSION_MAPPING_STORE_FILE)] : []);
+			const migration = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: sourcePaths,
+				destinationPath: mappingStorePath,
 				stateRoot: config.statePath,
 				adminPrincipalId: owner.ownerUserId,
 			});
@@ -179,6 +190,9 @@ export async function buildResolvedAdapterServerOptions(
 			...(outbox === undefined ? {} : { outbox }),
 		});
 		routingRunner = baseRoutingRunner;
+		const workspaceAuthorityCoordinator =
+			dependencies.authorityCoordinator ??
+			(closeSession === undefined ? undefined : createWorkspaceAuthorityCoordinator(mappings, closeSession));
 		if (closeSession !== undefined) {
 			idleSessionReaper = createGjcIdleSessionReaper({
 				runner: baseRoutingRunner,
@@ -211,13 +225,13 @@ export async function buildResolvedAdapterServerOptions(
 		const previouslyLinkedProjectIds = new Set(projectLinkService.listLinkedProjects().map(project => project.id));
 		await projectLinkService.seedConfiguredProjects(projects);
 		if (outbox !== undefined) {
-			synthesizeProjectionRows(outbox, mappings, owner.ownerUserId);
+			synthesizeProjectionRows(outbox, mappings, owner.ownerUserId, owner.ownerUserId);
 			const failedProjectionOperations = await reconcileOutboxBeforeServing(
 				outbox,
 				projectionRepository === undefined
 					? dependencies.projectionOperationApplier
 					: (dependencies.projectionOperationApplier ??
-							createProjectionOperationApplier(mappings, projectLinkService)),
+							createProjectionOperationApplier(mappings, projectLinkService, owner.ownerUserId)),
 			);
 			isolationDiagnostics.push({
 				name: "openwebui-projection-outbox",
@@ -267,6 +281,16 @@ export async function buildResolvedAdapterServerOptions(
 		const fileContextResolver =
 			dependencies.fileContextResolver ??
 			buildOpenWebUIPrincipalFileContextResolverFactory(config, workspaceRegistry);
+		const workspaceCleanupService =
+			workspaceAuthorityCoordinator === undefined
+				? undefined
+				: createWorkspaceCleanupService({
+						stateRoot: config.statePath,
+						registry: workspaceRegistry,
+						leaseManager: workspaceLeaseManager,
+						authorityCoordinator: workspaceAuthorityCoordinator,
+						...(owner.ownerUserId.trim().length === 0 ? {} : { adminPrincipalId: owner.ownerUserId }),
+					});
 		const shutdownCleanup = internalStore
 			? () => {
 					projectStore?.close();
@@ -306,11 +330,7 @@ export async function buildResolvedAdapterServerOptions(
 				neutralWorkspace: config.runtimeLocations.readerWorkspace,
 				workspaceRegistry,
 				workspaceLeaseManager,
-				workspaceCleanupService: createWorkspaceCleanupService({
-					stateRoot: config.statePath,
-					registry: workspaceRegistry,
-					leaseManager: workspaceLeaseManager,
-				}),
+				...(workspaceCleanupService === undefined ? {} : { workspaceCleanupService }),
 				workspaceLeaseDurationMs,
 				workspaceLeaseHeartbeatMs,
 				requireAdapterApiToken: true,
@@ -352,7 +372,28 @@ function workspaceLeaseDuration(turnTimeoutMs: number): number {
 function workspaceLeaseHeartbeat(durationMs: number): number {
 	return Math.max(1, Math.floor(durationMs / 4));
 }
-
+function createWorkspaceAuthorityCoordinator(
+	mappings: SessionMappingStore,
+	closeSession: (
+		mapping: SessionMapping,
+		ingress: { ingressId: string; ingressHash: string },
+	) => Promise<SessionCloseResult>,
+): WorkspaceCleanupAuthorityCoordinator {
+	return {
+		async retirePrincipal({ principalId, assertFence }) {
+			for (const mapping of mappings.entriesForPrincipal(principalId)) {
+				await assertFence();
+				const ingressId = `workspace-cleanup:${principalId}:${mapping.chatId}:${mapping.operationId}`;
+				const result = await closeSession(mapping, { ingressId, ingressHash: ingressId });
+				if (result.status !== "closed")
+					throw new Error(`Workspace cleanup could not close session authority for chat ${mapping.chatId}`);
+				await assertFence();
+				mappings.retireScoped({ principalId, chatId: mapping.chatId });
+				await assertFence();
+			}
+		},
+	};
+}
 function appendStartupCleanupError(startupError: unknown, cleanupError: unknown): unknown {
 	if (!(startupError instanceof Error))
 		return new AggregateError([startupError, cleanupError], "Startup failure cleanup failed");

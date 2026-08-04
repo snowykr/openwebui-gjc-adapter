@@ -4,10 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeIngressId, legacyCloseIngressId, type SessionCloseIngress } from "../src/gjc/session-router";
 import type { LiveGatewayRunner } from "../src/live/chat-completions";
+import type { ModelReaderContext } from "../src/live/model-reader";
 import { handleOpenAIChatCloseRequest } from "../src/live/openai-routes";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import type { RegisteredProject } from "../src/projects/registry";
 import { RuntimeSingletonLock } from "../src/runtime-singleton-lock";
+import { WorkspaceLeaseManager } from "../src/security/workspace-lease";
 import { createAdapterRequestHandler, startAdapterServer } from "../src/server";
 import { CANONICAL_MODEL_IDS, LOW_MODEL_ID, staticModelReaderFactory } from "./model-selection-fixtures";
 
@@ -50,6 +52,51 @@ describe("createAdapterRequestHandler", () => {
 				owned_by: "gjc",
 			})),
 		});
+	});
+	test("scopes normal model discovery to the forwarded principal workspace and lease", async () => {
+		const root = await mkdtemp(join(tmpdir(), "gjc-models-scope-"));
+		const workspace = join(root, "workspace");
+		const safeKey = "a".repeat(64);
+		let readerContext: ModelReaderContext | undefined;
+		const sourceReaderFactory = staticModelReaderFactory();
+		try {
+			const handler = createAdapterRequestHandler({
+				routes: {
+					projects: [project],
+					owner,
+					runner: fixedRunner("unused"),
+					modelReaderFactory: async (context: ModelReaderContext | undefined) => {
+						readerContext = context;
+						return sourceReaderFactory(context);
+					},
+					workspaceRegistry: {
+						open: async userId => ({
+							userId,
+							safeKey,
+							root: workspace,
+							sessionRoot: join(workspace, ".gjc", "sessions"),
+						}),
+					},
+					workspaceLeaseManager: new WorkspaceLeaseManager({ stateRoot: root }),
+				},
+			});
+
+			const response = await handler(
+				new Request("http://adapter.test/v1/models", {
+					headers: { "X-OpenWebUI-User-Id": "normal-1" },
+				}),
+			);
+
+			expect(response.status).toBe(200);
+			expect(readerContext).toMatchObject({
+				principal: { userId: "normal-1", role: "user" },
+				workspace: { userId: "normal-1", safeKey, root: workspace },
+			});
+			expect(readerContext?.lease).toBeDefined();
+			expect(readerContext?.lease).not.toHaveProperty("release");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
 	});
 	test("advertises the Codex display name without changing its canonical model ID", async () => {
 		const handler = createAdapterRequestHandler({
@@ -136,7 +183,7 @@ describe("createAdapterRequestHandler", () => {
 		expect(missingIdentity.status).toBe(401);
 		expect(unresolvedIdentity.status).toBe(401);
 		expect(response.status).toBe(200);
-		expect(readerCalls).toBeGreaterThan(0);
+		expect(readerCalls).toBe(1);
 	});
 
 	test("fails closed when CLI service requires but lacks an adapter API token", async () => {

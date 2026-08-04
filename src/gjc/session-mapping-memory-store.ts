@@ -19,6 +19,7 @@ import type { SessionMapping, SessionMappingScope } from "./session-mapping-stor
 import { operationResult } from "./session-operation-codec";
 
 const SCOPED_MAPPING_OBSERVATION = "__gjcSessionMappingScope";
+const SCOPED_MAPPING_RETIREMENT_OBSERVATION = "__gjcSessionMappingRetirement";
 
 interface StoredMappingScope {
 	readonly principalId: string;
@@ -29,23 +30,45 @@ interface CanonicalScope extends SessionMappingScope {
 	readonly key: string;
 }
 
+interface AuthorityState {
+	readonly records: readonly SessionAuthorityRecord[];
+	readonly provisional: readonly ProvisionalSessionOperation[];
+}
+
+type AuthorityStateMutation = (
+	records: readonly SessionAuthorityRecord[],
+	provisional: readonly ProvisionalSessionOperation[],
+) => AuthorityState;
+
+interface ScopedMappingRetirement {
+	readonly principalId: string;
+	readonly chatId: string;
+	readonly retiredAt: string;
+	readonly operationIds: readonly string[];
+	readonly provisionalOperationIds: readonly string[];
+}
+
 export class SessionMappingStore {
-	constructor(private readonly authority: SessionAuthority = new SessionAuthority()) {}
+	constructor(protected readonly authority: SessionAuthority = new SessionAuthority()) {}
 
 	get(chatId: string): SessionMapping | undefined {
 		const record = this.authority.get(chatId);
-		return record === undefined ? undefined : mappingFromRecord(record);
+		return record === undefined || isRetiredRecord(record) ? undefined : mappingFromRecord(record);
 	}
 	set(mapping: SessionMapping): SessionMapping {
+		assertLegacyKeyAvailable(this.authority, mapping.chatId);
 		return mappingFromRecord(this.authority.set(authorityInputFromLegacyMapping(mapping)));
 	}
 	upsert(mapping: SessionMapping): SessionMapping {
+		assertLegacyKeyAvailable(this.authority, mapping.chatId);
 		return mappingFromRecord(this.authority.upsert(authorityInputFromLegacyMapping(mapping)));
 	}
 	getScoped(scope: SessionMappingScope): SessionMapping | undefined {
 		const canonicalScope = canonicalScopeFor(scope);
 		const record = this.authority.get(canonicalScope.key);
-		return record === undefined || !isScopedRecordFor(record, canonicalScope) ? undefined : mappingFromRecord(record);
+		return record === undefined || !isScopedRecordFor(record, canonicalScope) || isRetiredRecord(record)
+			? undefined
+			: mappingFromRecord(record);
 	}
 	setScoped(scope: SessionMappingScope, mapping: SessionMapping): SessionMapping {
 		const canonicalScope = canonicalScopeFor(scope);
@@ -63,6 +86,7 @@ export class SessionMappingStore {
 		nextProjectId: string,
 		target?: SessionAuthorityTargetIdentity,
 	): void {
+		assertLegacyKeyAvailable(this.authority, chatId);
 		this.authority.beginProjectReassignment(chatId, currentProjectId, nextProjectId, target);
 	}
 	beginProjectReassignmentScoped(
@@ -76,6 +100,7 @@ export class SessionMappingStore {
 		this.authority.beginProjectReassignment(canonicalScope.key, currentProjectId, nextProjectId, target);
 	}
 	rollbackProjectReassignment(chatId: string, currentProjectId: string): void {
+		assertLegacyKeyAvailable(this.authority, chatId);
 		this.authority.rollbackProjectReassignment(chatId, currentProjectId);
 	}
 	rollbackProjectReassignmentScoped(scope: SessionMappingScope, currentProjectId: string): void {
@@ -90,36 +115,89 @@ export class SessionMappingStore {
 		this.beginProjectReassignmentScoped(scope, currentProjectId, nextProjectId);
 	}
 	entries(): readonly SessionMapping[] {
-		return this.authority.entries().map(mappingFromRecord);
+		return this.authority
+			.entries()
+			.filter(record => !isRetiredRecord(record))
+			.map(mappingFromRecord);
+	}
+	entriesForPrincipal(principalId: string): readonly SessionMapping[] {
+		assertPrincipalId(principalId);
+		return this.authority
+			.entries()
+			.filter(record => {
+				const scope = compositeScopeFromRecord(record);
+				return scope !== undefined && scope.principalId === principalId && !isRetiredRecord(record);
+			})
+			.map(mappingFromRecord);
 	}
 	entriesScoped(scope: SessionMappingScope): readonly SessionMapping[] {
 		const mapping = this.getScoped(scope);
 		return mapping === undefined ? [] : [mapping];
 	}
+	retireScoped(scope: SessionMappingScope): void {
+		const canonicalScope = canonicalScopeFor(scope);
+		this.mutateAuthorityState((records, provisional) => {
+			const record = records.find(candidate => candidate.chatId === canonicalScope.key);
+			if (record === undefined || !isScopedRecordFor(record, canonicalScope))
+				throw new Error(`Unknown or cross-principal scoped session mapping for ${canonicalScope.key}.`);
+			if (isRetiredRecord(record))
+				throw new Error(`Scoped session mapping ${canonicalScope.key} is already retired.`);
+			const retiredAt = new Date().toISOString();
+			const retirement: ScopedMappingRetirement = {
+				principalId: canonicalScope.principalId,
+				chatId: canonicalScope.chatId,
+				retiredAt,
+				operationIds: record.journal.map(operation => operation.id),
+				provisionalOperationIds: provisional
+					.filter(operation => operation.chatId === canonicalScope.key)
+					.map(operation => operation.id),
+			};
+			const nextRecord: SessionAuthorityRecord = {
+				...record,
+				journal: [],
+				...(record.reassignment?.state === "pending" ? { reassignment: undefined } : {}),
+				observations: {
+					...(record.observations ?? {}),
+					[SCOPED_MAPPING_RETIREMENT_OBSERVATION]: retirement,
+				},
+			};
+			return {
+				records: records.map(candidate => (candidate.chatId === canonicalScope.key ? nextRecord : candidate)),
+				provisional: provisional.filter(operation => operation.chatId !== canonicalScope.key),
+			};
+		});
+	}
 	operation(chatId: string, operationId: string): SessionOperation | undefined {
-		return this.authority.lookupOperation(chatId, operationId);
+		const record = this.authority.get(chatId);
+		return record === undefined || isRetiredRecord(record)
+			? undefined
+			: this.authority.lookupOperation(chatId, operationId);
 	}
 	operationScoped(scope: SessionMappingScope, operationId: string): SessionOperation | undefined {
 		const canonicalScope = canonicalScopeFor(scope);
 		const record = this.authority.get(canonicalScope.key);
-		return record === undefined || !isScopedRecordFor(record, canonicalScope)
+		return record === undefined || !isScopedRecordFor(record, canonicalScope) || isRetiredRecord(record)
 			? undefined
 			: operationForScope(this.authority.lookupOperation(canonicalScope.key, operationId), canonicalScope);
 	}
 	operations(chatId: string): readonly SessionOperation[] {
-		return this.authority.get(chatId)?.journal ?? [];
+		const record = this.authority.get(chatId);
+		return record === undefined || isRetiredRecord(record) ? [] : record.journal;
 	}
 	operationsScoped(scope: SessionMappingScope): readonly SessionOperation[] {
 		const canonicalScope = canonicalScopeFor(scope);
 		const record = this.authority.get(canonicalScope.key);
-		if (record === undefined || !isScopedRecordFor(record, canonicalScope)) return [];
+		if (record === undefined || !isScopedRecordFor(record, canonicalScope) || isRetiredRecord(record)) return [];
 		return record.journal.map(operation => operationForScope(operation, canonicalScope));
 	}
 	operationAuthority(
 		chatId: string,
 		operationId: string,
 	): SessionAuthorityRecord | SessionAuthorityTombstone | undefined {
-		return this.authority.lookupOperationAuthority(chatId, operationId);
+		const record = this.authority.get(chatId);
+		return record === undefined || isRetiredRecord(record)
+			? undefined
+			: this.authority.lookupOperationAuthority(chatId, operationId);
 	}
 	operationAuthorityScoped(
 		scope: SessionMappingScope,
@@ -127,7 +205,8 @@ export class SessionMappingStore {
 	): SessionAuthorityRecord | SessionAuthorityTombstone | undefined {
 		const canonicalScope = canonicalScopeFor(scope);
 		const record = this.authority.get(canonicalScope.key);
-		if (record === undefined || !isScopedRecordFor(record, canonicalScope)) return undefined;
+		if (record === undefined || !isScopedRecordFor(record, canonicalScope) || isRetiredRecord(record))
+			return undefined;
 		const authority = this.authority.lookupOperationAuthority(canonicalScope.key, operationId);
 		if (authority === undefined) return undefined;
 		return "retiredAt" in authority
@@ -135,6 +214,7 @@ export class SessionMappingStore {
 			: authorityRecordForScope(authority, canonicalScope);
 	}
 	assertOperationProject(chatId: string, projectId: string, operationId: string): void {
+		assertLegacyKeyAvailable(this.authority, chatId);
 		this.authority.assertOperationProject(chatId, projectId, operationId);
 	}
 	assertOperationProjectScoped(scope: SessionMappingScope, projectId: string, operationId: string): void {
@@ -143,6 +223,7 @@ export class SessionMappingStore {
 		this.authority.assertOperationProject(canonicalScope.key, projectId, operationId);
 	}
 	beginOperation(chatId: string, operation: Omit<SessionOperation, "state" | "startedAt" | "completedAt">): void {
+		assertLegacyKeyAvailable(this.authority, chatId);
 		this.authority.beginOperation(chatId, operation);
 	}
 	beginOperationScoped(
@@ -159,6 +240,7 @@ export class SessionMappingStore {
 		operationHash: string,
 		successor: AcknowledgedSuccessor,
 	): SessionOperation {
+		assertLegacyKeyAvailable(this.authority, chatId);
 		return this.authority.recordAcknowledgedSuccessor(chatId, operationId, operationHash, successor);
 	}
 	recordAcknowledgedSuccessorScoped(
@@ -181,6 +263,7 @@ export class SessionMappingStore {
 		detail?: string,
 		result?: SessionOperationResult,
 	): void {
+		assertLegacyKeyAvailable(this.authority, chatId);
 		this.authority.transitionOperation(chatId, operationId, state, detail, result);
 	}
 	transitionOperationScoped(
@@ -207,6 +290,7 @@ export class SessionMappingStore {
 		mapping: SessionMapping,
 		kind: "turn" | "control" | "close",
 	): SessionMapping {
+		assertLegacyKeyAvailable(this.authority, chatId);
 		const result = operationResult(kind, { ...mapping, operationId });
 		const resultWithCloseGeneration =
 			kind === "close"
@@ -254,18 +338,23 @@ export class SessionMappingStore {
 		);
 	}
 	provisionalOperation(chatId: string, ingressId: string): ProvisionalSessionOperation | undefined {
-		return this.authority.provisionalOperation(chatId, ingressId);
+		const record = this.authority.get(chatId);
+		return record !== undefined && isRetiredRecord(record)
+			? undefined
+			: this.authority.provisionalOperation(chatId, ingressId);
 	}
 	provisionalOperationScoped(scope: SessionMappingScope, ingressId: string): ProvisionalSessionOperation | undefined {
 		const canonicalScope = canonicalScopeFor(scope);
 		const record = this.authority.get(canonicalScope.key);
-		if (record === undefined || !isScopedRecordFor(record, canonicalScope)) return undefined;
+		if (record !== undefined && (!isScopedRecordFor(record, canonicalScope) || isRetiredRecord(record)))
+			return undefined;
 		const operation = this.authority.provisionalOperation(canonicalScope.key, ingressId);
 		return operation === undefined ? undefined : provisionalOperationForScope(operation, canonicalScope);
 	}
 	reserveProvisionalOperation(
 		operation: Omit<ProvisionalSessionOperation, "state" | "startedAt" | "completedAt">,
 	): ProvisionalSessionOperation {
+		assertLegacyKeyAvailable(this.authority, operation.chatId);
 		return this.authority.reserveProvisionalOperation(operation);
 	}
 	reserveProvisionalOperationScoped(
@@ -283,6 +372,7 @@ export class SessionMappingStore {
 		operation: Omit<ProvisionalSessionOperation, "state" | "startedAt" | "completedAt">,
 		mapping: SessionMapping,
 	): SessionMapping {
+		assertLegacyKeyAvailable(this.authority, operation.chatId);
 		return mappingFromRecord(
 			this.authority.publishProvisionalOperation(operation, authorityInputFromLegacyMapping(mapping)),
 		);
@@ -306,6 +396,7 @@ export class SessionMappingStore {
 		ingressId: string,
 		attachment: Pick<ProvisionalSessionOperation, "sessionId" | "sessionFile" | "attachment">,
 	): void {
+		assertLegacyKeyAvailable(this.authority, chatId);
 		this.authority.attachProvisionalOperation(chatId, ingressId, attachment);
 	}
 	attachProvisionalOperationScoped(
@@ -323,6 +414,7 @@ export class SessionMappingStore {
 		state: SessionOperationState,
 		detail?: string,
 	): void {
+		assertLegacyKeyAvailable(this.authority, chatId);
 		this.authority.transitionProvisionalOperation(chatId, ingressId, state, detail);
 	}
 	transitionProvisionalOperationScoped(
@@ -335,6 +427,17 @@ export class SessionMappingStore {
 		assertScopedKeyAvailable(this.authority, canonicalScope);
 		this.authority.transitionProvisionalOperation(canonicalScope.key, ingressId, state, detail);
 	}
+	protected mutateAuthorityState(mutation: AuthorityStateMutation): void {
+		const next = mutation(this.authority.entries(), this.authority.provisionalEntries());
+		(
+			this.authority as unknown as {
+				replaceAll: (
+					records: readonly SessionAuthorityRecord[],
+					provisional: readonly ProvisionalSessionOperation[],
+				) => void;
+			}
+		).replaceAll(next.records, next.provisional);
+	}
 }
 
 function canonicalScopeFor(scope: SessionMappingScope): CanonicalScope {
@@ -346,23 +449,68 @@ function canonicalScopeFor(scope: SessionMappingScope): CanonicalScope {
 		key: canonicalSessionMappingKey(scope.principalId, scope.chatId),
 	};
 }
-function isScopedRecordFor(record: SessionAuthorityRecord, scope: CanonicalScope): boolean {
+
+function assertPrincipalId(principalId: string): void {
+	canonicalSessionMappingKey(principalId, "");
+}
+
+function compositeScopeFromRecord(record: SessionAuthorityRecord): SessionMappingScope | undefined {
 	const observation = record.observations?.[SCOPED_MAPPING_OBSERVATION];
+	if (observation === undefined) return undefined;
+	if (typeof observation !== "object" || observation === null || Array.isArray(observation))
+		throw new Error("Session mapping contains invalid scope metadata.");
+	if (!Object.hasOwn(observation, "chatId")) return undefined;
+	const principalId = (observation as StoredMappingScope).principalId;
+	const chatId = (observation as StoredMappingScope).chatId;
 	if (
-		typeof observation !== "object" ||
-		observation === null ||
-		Array.isArray(observation) ||
-		!Object.hasOwn(observation, "chatId")
+		typeof principalId !== "string" ||
+		typeof chatId !== "string" ||
+		canonicalSessionMappingKey(principalId, chatId) !== record.chatId
 	)
-		return false;
-	const storedScope = storedScopeFromRecord(record);
+		throw new Error("Session mapping contains an invalid canonical scope key.");
+	return { principalId, chatId };
+}
+
+function retirementFromRecord(record: SessionAuthorityRecord): ScopedMappingRetirement | undefined {
+	const value = record.observations?.[SCOPED_MAPPING_RETIREMENT_OBSERVATION];
+	if (value === undefined) return undefined;
+	if (typeof value !== "object" || value === null || Array.isArray(value))
+		throw new Error("Session mapping contains invalid retirement metadata.");
+	const retirement = value as Partial<ScopedMappingRetirement>;
+	if (
+		typeof retirement.principalId !== "string" ||
+		typeof retirement.chatId !== "string" ||
+		typeof retirement.retiredAt !== "string" ||
+		!Array.isArray(retirement.operationIds) ||
+		!retirement.operationIds.every(operationId => typeof operationId === "string") ||
+		!Array.isArray(retirement.provisionalOperationIds) ||
+		!retirement.provisionalOperationIds.every(operationId => typeof operationId === "string") ||
+		canonicalSessionMappingKey(retirement.principalId, retirement.chatId) !== record.chatId
+	)
+		throw new Error("Session mapping contains invalid retirement metadata.");
+	return retirement as ScopedMappingRetirement;
+}
+
+function isRetiredRecord(record: SessionAuthorityRecord): boolean {
+	return retirementFromRecord(record) !== undefined;
+}
+
+function assertLegacyKeyAvailable(authority: SessionAuthority, chatId: string): void {
+	const record = authority.get(chatId);
+	if (record !== undefined && isRetiredRecord(record))
+		throw new Error(`Retired scoped session mapping ${chatId} cannot be mutated.`);
+}
+function isScopedRecordFor(record: SessionAuthorityRecord, scope: CanonicalScope): boolean {
+	const storedScope = compositeScopeFromRecord(record);
 	return storedScope?.principalId === scope.principalId && storedScope.chatId === scope.chatId;
 }
 
 function assertScopedKeyAvailable(authority: SessionAuthority, scope: CanonicalScope): void {
 	const existing = authority.get(scope.key);
-	if (existing !== undefined && !isScopedRecordFor(existing, scope))
+	if (existing === undefined) return;
+	if (!isScopedRecordFor(existing, scope))
 		throw new Error(`Scoped session mapping key ${scope.key} is occupied by an unscoped authority record.`);
+	if (isRetiredRecord(existing)) throw new Error(`Retired scoped session mapping ${scope.key} cannot be mutated.`);
 }
 
 function authorityInputFromLegacyMapping(mapping: SessionMapping): SessionAuthorityInput {

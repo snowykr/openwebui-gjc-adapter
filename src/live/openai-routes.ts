@@ -23,7 +23,7 @@ import { parseChatCompletionRequest } from "./chat-request-parser";
 import type { LiveGatewayFileContextResolver } from "./file-contexts";
 import type { ModelReaderFactory } from "./model-reader";
 import { ModelSelectionError } from "./model-selection-errors";
-import { createModelSelectionPolicy } from "./model-selection-policy";
+import { handleOpenAIModelsRequest } from "./openai-models-route";
 import {
 	asyncIterableBody,
 	jsonResponse,
@@ -66,14 +66,7 @@ export interface AdapterRouteDependencies {
 }
 
 export { chatIdFromClosePath, handleOpenAIChatCloseRequest } from "./openai-close-route";
-export async function handleOpenAIModelsRequest(routes: AdapterRouteDependencies): Promise<Response> {
-	try {
-		if (routes.modelReaderFactory === undefined) throw new TypeError("GJC model reader is unavailable");
-		return jsonResponse(await createModelSelectionPolicy(routes.modelReaderFactory).listModels());
-	} catch (error) {
-		return modelSelectionErrorResponse(error);
-	}
-}
+export { handleOpenAIModelsRequest };
 
 export async function handleOpenAIChatCompletionsRequest(
 	request: Request,

@@ -140,7 +140,7 @@ async function dispatchProviderRequest(
 			? operationId
 			: handleOpenAIChatCloseRequest(closeChatId, operationId, routes, principal);
 	}
-	if (request.method === "GET" && url.pathname === "/v1/models") return handleOpenAIModelsRequest(routes);
+	if (request.method === "GET" && url.pathname === "/v1/models") return handleOpenAIModelsRequest(routes, principal);
 	if (request.method === "POST" && url.pathname === "/v1/chat/completions")
 		return handleOpenAIChatCompletionsRequest(request, routes, principal);
 	return jsonResponse({ error: "not_found" }, { status: 404 });

@@ -51,6 +51,18 @@ export interface WorkspaceCleanupAuditRecord {
 	readonly outcome: WorkspaceCleanupAuditOutcome;
 	readonly timestamp: number;
 }
+export interface WorkspaceCleanupAuthorityRetirementRequest {
+	readonly principalId: string;
+	readonly assertFence: () => Promise<void>;
+}
+
+export interface WorkspaceCleanupAuthorityCoordinator {
+	/**
+	 * Closes every session owned by the principal and retires its durable
+	 * authority only after each close has been proven.
+	 */
+	readonly retirePrincipal: (input: WorkspaceCleanupAuthorityRetirementRequest) => Promise<void>;
+}
 
 export interface WorkspaceCleanupServiceOptions {
 	readonly stateRoot?: string;
@@ -62,6 +74,9 @@ export interface WorkspaceCleanupServiceOptions {
 	readonly confirmationTtlMs?: number;
 	readonly tokenFactory?: () => string;
 	readonly holderIdFactory?: (safeKey: string) => string;
+	readonly authorityCoordinator: WorkspaceCleanupAuthorityCoordinator;
+	/** Configured administrator identities never own user workspaces. */
+	readonly adminPrincipalId?: string;
 }
 
 export class WorkspaceCleanupError extends Error {
@@ -106,6 +121,8 @@ export class WorkspaceCleanupService {
 	readonly #confirmationTtlMs: number;
 	readonly #tokenFactory: () => string;
 	readonly #holderIdFactory: (safeKey: string) => string;
+	readonly #authorityCoordinator: WorkspaceCleanupAuthorityCoordinator;
+	readonly #adminPrincipalId: string | undefined;
 	readonly #confirmations = new Map<string, ConfirmationState>();
 
 	constructor(options: WorkspaceCleanupServiceOptions) {
@@ -113,6 +130,11 @@ export class WorkspaceCleanupService {
 		const leaseManager = options.leaseManager;
 		if (registry === undefined) throw new TypeError("Workspace cleanup requires a user workspace registry");
 		if (leaseManager === undefined) throw new TypeError("Workspace cleanup requires a workspace lease manager");
+		const authorityCoordinator = options.authorityCoordinator;
+		if (authorityCoordinator === undefined || typeof authorityCoordinator.retirePrincipal !== "function")
+			throw new TypeError("Workspace cleanup requires a workspace cleanup authority coordinator");
+		if (options.adminPrincipalId !== undefined && typeof options.adminPrincipalId !== "string")
+			throw new TypeError("Workspace cleanup admin principal ID must be a string when configured");
 		const stateRoot = path.resolve(options.stateRoot ?? registry.stateRoot);
 		if (path.resolve(registry.stateRoot) !== stateRoot || path.resolve(leaseManager.stateRoot) !== stateRoot) {
 			throw new Error("Workspace cleanup registry, lease manager, and stateRoot must match");
@@ -120,6 +142,11 @@ export class WorkspaceCleanupService {
 		this.stateRoot = stateRoot;
 		this.#registry = registry;
 		this.#leaseManager = leaseManager;
+		this.#authorityCoordinator = authorityCoordinator;
+		this.#adminPrincipalId =
+			options.adminPrincipalId === undefined || options.adminPrincipalId.length === 0
+				? undefined
+				: options.adminPrincipalId;
 		this.#now = options.now ?? Date.now;
 		this.#leaseMs = assertDuration(options.leaseMs ?? DEFAULT_LEASE_MS, "lease");
 		this.#heartbeatMs = assertHeartbeat(
@@ -137,6 +164,7 @@ export class WorkspaceCleanupService {
 
 	async preview(input: WorkspaceCleanupPreviewRequest): Promise<WorkspaceCleanupPreview> {
 		assertUserId(input?.userId);
+		assertCleanupPrincipalAllowed(input.userId, this.#adminPrincipalId);
 		const issuedAt = this.readNow();
 		const workspace = await this.#registry.resolve(input.userId);
 		if (workspace === undefined) {
@@ -168,6 +196,7 @@ export class WorkspaceCleanupService {
 
 	async cleanup(input: WorkspaceCleanupRequest): Promise<WorkspaceCleanupResult> {
 		assertUserId(input?.userId);
+		assertCleanupPrincipalAllowed(input.userId, this.#adminPrincipalId);
 		assertConfirmationToken(input?.confirmationToken);
 		const token = input.confirmationToken;
 		const state = this.#confirmations.get(token);
@@ -220,6 +249,8 @@ export class WorkspaceCleanupService {
 			lease = await guard.lease.setCleanupPending();
 			guard.updateLease(lease);
 			guard.start();
+			await guard.assertFence();
+			await retirePrincipalAuthority(this.#authorityCoordinator, workspace.userId, () => guard.assertFence());
 			await guard.assertFence();
 			await removeWorkspaceTree(workspace.root, this.stateRoot, () => guard.assertFence());
 			await guard.assertFence();
@@ -534,6 +565,30 @@ function sameIdentity(left: UserWorkspaceIdentity, right: UserWorkspaceIdentity)
 function assertUserId(userId: string): void {
 	if (typeof userId !== "string" || userId.length === 0)
 		throw new TypeError("Workspace cleanup userId must be non-empty");
+}
+function assertCleanupPrincipalAllowed(userId: string, adminPrincipalId: string | undefined): void {
+	if (adminPrincipalId !== undefined && userId === adminPrincipalId) {
+		throw new WorkspaceCleanupError(
+			"admin_workspace_forbidden",
+			"Configured administrator identities cannot be cleaned up as user workspaces",
+		);
+	}
+}
+
+async function retirePrincipalAuthority(
+	coordinator: WorkspaceCleanupAuthorityCoordinator,
+	principalId: string,
+	assertFence: () => Promise<void>,
+): Promise<void> {
+	try {
+		await coordinator.retirePrincipal({ principalId, assertFence });
+	} catch (error) {
+		if (error instanceof WorkspaceCleanupUncertainError) throw error;
+		throw new WorkspaceCleanupUncertainError(
+			"Workspace cleanup could not close and retire principal session authority",
+			{ cause: error },
+		);
+	}
 }
 
 function assertConfirmationToken(token: string): void {

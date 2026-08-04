@@ -640,8 +640,18 @@ function assertStateRoot(stateRoot: string): void {
 		throw new TypeError("Workspace lease stateRoot must be a non-empty path");
 }
 
-const operationLocks = new Map<string, Promise<void>>();
+interface ExternalOperationLockOwner {
+	readonly pid: number;
+	readonly startTicks: string;
+}
 
+interface ExternalOperationLockSnapshot {
+	readonly owner: ExternalOperationLockOwner;
+	readonly device: number;
+	readonly inode: number;
+}
+
+const operationLocks = new Map<string, Promise<void>>();
 async function withOperationLock<T>(lockPath: string, operation: () => Promise<T>): Promise<T> {
 	const previous = operationLocks.get(lockPath) ?? Promise.resolve();
 	let release!: () => void;
@@ -670,22 +680,370 @@ const EXTERNAL_OPERATION_LOCK_DELAY_MS = 10;
 
 async function acquireExternalOperationLock(lockPath: string): Promise<() => Promise<void>> {
 	const guardPath = `${lockPath}.guard`;
+	const owner = await currentExternalOperationLockOwner();
 	for (let attempt = 0; attempt < EXTERNAL_OPERATION_LOCK_ATTEMPTS; attempt += 1) {
-		let handle: fs.FileHandle | undefined;
 		try {
-			handle = await fs.open(guardPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, RECORD_MODE);
-			await handle.sync();
+			const snapshot = await writeExternalOperationLockFile(guardPath, owner);
+			await syncDirectory(path.dirname(guardPath));
+			const markerPath = externalOperationLockRecoveryMarkerPath(guardPath);
+			const marker = await readExternalOperationLockSnapshot(markerPath);
+			if (marker !== undefined) {
+				if (await isExternalOperationLockOwnerLive(marker.owner)) {
+					await removeExternalOperationLock(guardPath, snapshot);
+					await delayExternalOperationLock();
+					continue;
+				}
+				await removeStaleExternalOperationLockMarker(markerPath, marker);
+			}
 			return async () => {
-				await handle?.close();
-				await fs.unlink(guardPath);
+				await removeExternalOperationLock(guardPath, snapshot);
 			};
 		} catch (error) {
-			await handle?.close();
 			if (!isNodeFsError(error, "EEXIST")) throw error;
-			await new Promise<void>(resolve => setTimeout(resolve, EXTERNAL_OPERATION_LOCK_DELAY_MS));
+			const snapshot = await readExternalOperationLockSnapshot(guardPath);
+			if (snapshot === undefined) continue;
+			if (await isExternalOperationLockOwnerLive(snapshot.owner)) {
+				await delayExternalOperationLock();
+				continue;
+			}
+			const reclaimed = await reclaimExternalOperationLock(guardPath, snapshot, owner);
+			if (reclaimed !== undefined) return reclaimed;
 		}
 	}
 	throw new Error(`Workspace lease operation lock is unavailable: ${lockPath}`);
+}
+
+async function unlinkIfPresent(filePath: string): Promise<void> {
+	try {
+		await fs.unlink(filePath);
+	} catch (error) {
+		if (!isNodeFsError(error, "ENOENT")) throw error;
+	}
+}
+async function writeExternalOperationLockFile(
+	filePath: string,
+	owner: ExternalOperationLockOwner,
+): Promise<ExternalOperationLockSnapshot> {
+	let handle: fs.FileHandle | undefined;
+	let created = false;
+	let retained = false;
+	try {
+		handle = await fs.open(filePath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, RECORD_MODE);
+		created = true;
+		await handle.writeFile(`${JSON.stringify(owner)}\n`, "utf8");
+		await handle.chmod(RECORD_MODE);
+		await handle.sync();
+		const status = await handle.stat();
+		assertPrivateGuardStat(status, filePath);
+		retained = true;
+		return { owner, device: status.dev, inode: status.ino };
+	} finally {
+		await handle?.close();
+		if (created && !retained) await unlinkIfPresent(filePath);
+	}
+}
+
+async function currentExternalOperationLockOwner(): Promise<ExternalOperationLockOwner> {
+	return {
+		pid: process.pid,
+		startTicks: await externalOperationLockStartTicks(process.pid),
+	};
+}
+
+async function isExternalOperationLockOwnerLive(owner: ExternalOperationLockOwner): Promise<boolean> {
+	try {
+		return (await externalOperationLockStartTicks(owner.pid)) === owner.startTicks;
+	} catch (error) {
+		if (isMissingProcessError(error)) return false;
+		throw new Error("Unable to establish operation lock owner liveness", { cause: error });
+	}
+}
+
+async function externalOperationLockStartTicks(pid: number): Promise<string> {
+	if (process.platform !== "linux") {
+		throw new Error("Workspace operation lock process identity is unavailable on this platform");
+	}
+	if (!Number.isSafeInteger(pid) || pid < 1) throw new Error("Invalid workspace operation lock owner PID");
+	let stat: string;
+	try {
+		stat = await fs.readFile(`/proc/${pid}/stat`, "utf8");
+	} catch (error) {
+		if (isMissingProcessError(error)) throw error;
+		throw new Error(`Unable to read process start identity for PID ${pid}`, { cause: error });
+	}
+	const closing = stat.lastIndexOf(")");
+	const fields =
+		closing < 0
+			? []
+			: stat
+					.slice(closing + 2)
+					.trim()
+					.split(/\s+/);
+	const value = fields[19];
+	if (value === undefined || !/^\d+$/.test(value)) {
+		throw new Error(`Unable to validate process start identity for PID ${pid}`);
+	}
+	return value;
+}
+
+async function readExternalOperationLockSnapshot(
+	guardPath: string,
+): Promise<ExternalOperationLockSnapshot | undefined> {
+	let linkStatus: Stats;
+	try {
+		linkStatus = await fs.lstat(guardPath);
+	} catch (error) {
+		if (isNodeFsError(error, "ENOENT")) return undefined;
+		throw error;
+	}
+	assertPrivateGuardStat(linkStatus, guardPath);
+	let handle: fs.FileHandle | undefined;
+	try {
+		handle = await fs.open(guardPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+		const status = await handle.stat();
+		assertPrivateGuardStat(status, guardPath);
+		if (status.dev !== linkStatus.dev || status.ino !== linkStatus.ino) {
+			throw new Error(`Workspace operation lock changed while being inspected: ${guardPath}`);
+		}
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(await handle.readFile("utf8")) as unknown;
+		} catch (error) {
+			throw new Error(`Workspace operation lock metadata is not valid JSON: ${guardPath}`, { cause: error });
+		}
+		return {
+			owner: parseExternalOperationLockOwner(parsed, guardPath),
+			device: status.dev,
+			inode: status.ino,
+		};
+	} catch (error) {
+		if (isNodeFsError(error, "ENOENT")) return undefined;
+		throw error;
+	} finally {
+		await handle?.close();
+	}
+}
+
+function parseExternalOperationLockOwner(value: unknown, guardPath: string): ExternalOperationLockOwner {
+	if (!isRecord(value)) throw new Error(`Workspace operation lock metadata is invalid: ${guardPath}`);
+	const pid = value.pid;
+	const startTicks = value.startTicks;
+	if (
+		typeof pid !== "number" ||
+		!Number.isSafeInteger(pid) ||
+		pid < 1 ||
+		typeof startTicks !== "string" ||
+		!/^\d+$/.test(startTicks)
+	) {
+		throw new Error(`Workspace operation lock metadata is invalid: ${guardPath}`);
+	}
+	return { pid, startTicks };
+}
+
+function assertPrivateGuardStat(stats: Stats, guardPath: string): void {
+	if (stats.isSymbolicLink() || !stats.isFile()) {
+		throw new Error(`Workspace operation lock must be a regular file: ${guardPath}`);
+	}
+	if ((stats.mode & 0o777) !== RECORD_MODE) {
+		throw new Error(`Workspace operation lock must be private: ${guardPath}`);
+	}
+	if (typeof process.getuid !== "function" || stats.uid !== process.getuid()) {
+		throw new Error(`Workspace operation lock has foreign ownership: ${guardPath}`);
+	}
+}
+
+function externalOperationLockRecoveryMarkerPath(guardPath: string): string {
+	return `${guardPath}.reclaim`;
+}
+
+async function reclaimExternalOperationLock(
+	guardPath: string,
+	snapshot: ExternalOperationLockSnapshot,
+	owner: ExternalOperationLockOwner,
+): Promise<(() => Promise<void>) | undefined> {
+	const markerPath = externalOperationLockRecoveryMarkerPath(guardPath);
+	const marker = await acquireExternalOperationLockRecoveryMarker(markerPath, owner);
+	if (marker === undefined) return undefined;
+	let replacementPath: string | undefined;
+	let replaced = false;
+	try {
+		const current = await readExternalOperationLockSnapshot(guardPath);
+		if (
+			current === undefined ||
+			current.device !== snapshot.device ||
+			current.inode !== snapshot.inode ||
+			!sameExternalOperationLockOwner(current.owner, snapshot.owner)
+		) {
+			await removeExternalOperationLock(markerPath, marker);
+			return undefined;
+		}
+		if (await isExternalOperationLockOwnerLive(current.owner)) {
+			await removeExternalOperationLock(markerPath, marker);
+			return undefined;
+		}
+		replacementPath = `${guardPath}.replacement-${process.pid}-${randomUUID()}`;
+		const replacement = await writeExternalOperationLockFile(replacementPath, owner);
+		await fs.rename(replacementPath, guardPath);
+		replaced = true;
+		await syncDirectory(path.dirname(guardPath));
+		const claimed = await readExternalOperationLockSnapshot(guardPath);
+		if (
+			claimed === undefined ||
+			claimed.device !== replacement.device ||
+			claimed.inode !== replacement.inode ||
+			!sameExternalOperationLockOwner(claimed.owner, owner)
+		) {
+			throw new Error(`Workspace operation lock changed during recovery: ${guardPath}`);
+		}
+		await removeExternalOperationLock(markerPath, marker);
+		return async () => {
+			await removeExternalOperationLock(guardPath, claimed);
+		};
+	} catch (error) {
+		if (replacementPath !== undefined && !replaced) {
+			try {
+				await fs.unlink(replacementPath);
+			} catch (cleanupError) {
+				if (!isNodeFsError(cleanupError, "ENOENT")) throw cleanupError;
+			}
+		}
+		await removeExternalOperationLock(markerPath, marker);
+		throw error;
+	}
+}
+
+async function acquireExternalOperationLockRecoveryMarker(
+	markerPath: string,
+	owner: ExternalOperationLockOwner,
+): Promise<ExternalOperationLockSnapshot | undefined> {
+	const candidatePath = `${markerPath}.candidate-${process.pid}-${randomUUID()}`;
+	let candidateCreated = false;
+	try {
+		await writeExternalOperationLockFile(candidatePath, owner);
+		candidateCreated = true;
+		try {
+			await fs.link(candidatePath, markerPath);
+		} catch (error) {
+			if (!isNodeFsError(error, "EEXIST")) throw error;
+			const current = await readExternalOperationLockSnapshot(markerPath);
+			if (current === undefined) return undefined;
+			if (await isExternalOperationLockOwnerLive(current.owner)) {
+				await delayExternalOperationLock();
+				return undefined;
+			}
+			await removeStaleExternalOperationLockMarker(markerPath, current);
+			return undefined;
+		}
+		await syncDirectory(path.dirname(markerPath));
+		const marker = await readExternalOperationLockSnapshot(markerPath);
+		if (marker === undefined || !sameExternalOperationLockOwner(marker.owner, owner)) {
+			throw new Error(`Workspace operation lock recovery marker changed: ${markerPath}`);
+		}
+		return marker;
+	} finally {
+		if (candidateCreated) await unlinkIfPresent(candidatePath);
+	}
+}
+
+async function removeStaleExternalOperationLockMarker(
+	markerPath: string,
+	snapshot: ExternalOperationLockSnapshot,
+): Promise<void> {
+	const quarantinePath = `${markerPath}.stale-${process.pid}-${randomUUID()}`;
+	try {
+		await fs.rename(markerPath, quarantinePath);
+	} catch (error) {
+		if (isNodeFsError(error, "ENOENT")) return;
+		throw new Error(`Workspace operation lock recovery marker could not be claimed: ${markerPath}`, { cause: error });
+	}
+	try {
+		const claimed = await readExternalOperationLockSnapshot(quarantinePath);
+		if (
+			claimed === undefined ||
+			claimed.device !== snapshot.device ||
+			claimed.inode !== snapshot.inode ||
+			!sameExternalOperationLockOwner(claimed.owner, snapshot.owner)
+		) {
+			await restoreExternalOperationLockClaim(quarantinePath, markerPath);
+			return;
+		}
+		if (await isExternalOperationLockOwnerLive(claimed.owner)) {
+			await restoreExternalOperationLockClaim(quarantinePath, markerPath);
+			return;
+		}
+		const replacement = await readExternalOperationLockSnapshot(markerPath);
+		if (replacement !== undefined) {
+			await fs.unlink(quarantinePath);
+			return;
+		}
+		await fs.unlink(quarantinePath);
+		await syncDirectory(path.dirname(markerPath));
+	} catch (error) {
+		await restoreExternalOperationLockClaim(quarantinePath, markerPath);
+		throw error;
+	}
+}
+
+async function removeExternalOperationLock(guardPath: string, snapshot: ExternalOperationLockSnapshot): Promise<void> {
+	const current = await readExternalOperationLockSnapshot(guardPath);
+	if (current === undefined) return;
+	if (
+		current.device !== snapshot.device ||
+		current.inode !== snapshot.inode ||
+		!sameExternalOperationLockOwner(current.owner, snapshot.owner)
+	) {
+		throw new Error(`Workspace operation lock ownership changed before release: ${guardPath}`);
+	}
+	const releasePath = `${guardPath}.release-${process.pid}-${randomUUID()}`;
+	try {
+		await fs.rename(guardPath, releasePath);
+	} catch (error) {
+		if (isNodeFsError(error, "ENOENT")) return;
+		throw new Error(`Workspace operation lock could not be claimed for release: ${guardPath}`, { cause: error });
+	}
+	try {
+		const claimed = await readExternalOperationLockSnapshot(releasePath);
+		if (
+			claimed === undefined ||
+			claimed.device !== snapshot.device ||
+			claimed.inode !== snapshot.inode ||
+			!sameExternalOperationLockOwner(claimed.owner, snapshot.owner)
+		) {
+			await restoreExternalOperationLockClaim(releasePath, guardPath);
+			throw new Error(`Workspace operation lock changed before release: ${guardPath}`);
+		}
+		await fs.unlink(releasePath);
+		await syncDirectory(path.dirname(guardPath));
+	} catch (error) {
+		await restoreExternalOperationLockClaim(releasePath, guardPath);
+		throw error;
+	}
+}
+
+async function restoreExternalOperationLockClaim(claimPath: string, guardPath: string): Promise<void> {
+	try {
+		await fs.link(claimPath, guardPath);
+	} catch (error) {
+		if (isNodeFsError(error, "EEXIST") || isNodeFsError(error, "ENOENT")) return;
+		throw error;
+	}
+	try {
+		await fs.unlink(claimPath);
+	} catch (error) {
+		if (!isNodeFsError(error, "ENOENT")) throw error;
+	}
+}
+
+function sameExternalOperationLockOwner(left: ExternalOperationLockOwner, right: ExternalOperationLockOwner): boolean {
+	return left.pid === right.pid && left.startTicks === right.startTicks;
+}
+
+function isMissingProcessError(error: unknown): boolean {
+	return isNodeFsError(error, "ENOENT") || isNodeFsError(error, "ESRCH");
+}
+
+async function delayExternalOperationLock(): Promise<void> {
+	await new Promise<void>(resolve => setTimeout(resolve, EXTERNAL_OPERATION_LOCK_DELAY_MS));
 }
 
 async function ensureLayout(stateRoot: string, locksRoot: string, workspaceLocksRoot: string): Promise<void> {

@@ -65,6 +65,12 @@ function cleanupErrorResponse(error: unknown): { readonly status: number; readon
 			body: { error: { code: error.code, message: "Workspace cleanup confirmation is invalid or stale." } },
 		};
 	}
+	if (error instanceof WorkspaceCleanupError && error.code === "admin_workspace_forbidden") {
+		return {
+			status: 403,
+			body: { error: { code: error.code, message: "Administrator workspaces cannot be cleaned up." } },
+		};
+	}
 	if (error instanceof WorkspaceCleanupUncertainError) {
 		return { status: 503, body: { error: { code: error.code, message: "Workspace cleanup remains pending." } } };
 	}

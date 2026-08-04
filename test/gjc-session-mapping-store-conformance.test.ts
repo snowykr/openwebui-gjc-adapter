@@ -627,3 +627,47 @@ test("memory scoped mappings isolate same-chat principals and operations", () =>
 	expect(store.operationsScoped(alice).some(operation => operation.detail === "alice")).toBe(true);
 	expect(store.operationsScoped(bob).some(operation => operation.detail === "bob")).toBe(true);
 });
+test("scoped cleanup enumerates and retires only the requested principal", () => {
+	for (const createHarness of [memoryHarness, fileHarness]) {
+		const harness = createHarness();
+		try {
+			const alice = { principalId: "alice", chatId: "shared-chat" };
+			const bob = { principalId: "bob", chatId: "shared-chat" };
+			harness.store.setScoped(alice, {
+				...mapping(),
+				...alice,
+				operationId: "initial-operation",
+			});
+			harness.store.setScoped(bob, {
+				...mapping(),
+				...bob,
+				operationId: "initial-operation",
+			});
+			expect(harness.store.entriesForPrincipal("alice")).toHaveLength(1);
+			expect(harness.store.entriesForPrincipal("bob")).toHaveLength(1);
+			harness.store.retireScoped(alice);
+			expect(harness.store.getScoped(alice)).toBeUndefined();
+			expect(harness.store.entriesForPrincipal("alice")).toEqual([]);
+			expect(harness.store.operationsScoped(alice)).toEqual([]);
+			expect(harness.store.operationScoped(alice, "initial-operation")).toBeUndefined();
+			expect(harness.store.getScoped(bob)).toMatchObject({ sessionId: "session-1" });
+			expect(harness.store.entriesForPrincipal("bob")).toHaveLength(1);
+			expect(() => harness.store.retireScoped(alice)).toThrow("already retired");
+			expect(() =>
+				harness.store.setScoped(alice, {
+					...mapping(),
+					...alice,
+					sessionId: "alice-resumed",
+					operationId: "alice-resumed",
+				}),
+			).toThrow("cannot be mutated");
+
+			const recovered = harness.recover();
+			expect(recovered.getScoped(alice)).toBeUndefined();
+			expect(recovered.operationScoped(alice, "initial-operation")).toBeUndefined();
+			expect(recovered.getScoped(bob)).toMatchObject({ sessionId: "session-1" });
+		} finally {
+			harness.cleanup();
+		}
+	}
+});

@@ -41,9 +41,22 @@ const RETRYABLE_ORPHANED_PROVISIONAL_REASON =
 
 type MigrationClock = () => string;
 
-export type SessionAuthorityMigrationRequest = SessionAuthorityMigrationOptions & {
+export interface SessionAuthorityMigrationRequest extends SessionAuthorityMigrationOptions {
+	/**
+	 * Destination authority path. Legacy single-source calls default to sourcePath;
+	 * candidate migrations retain the source bytes and write only this destination.
+	 */
+	readonly destinationPath?: string;
 	readonly now?: MigrationClock;
-};
+}
+
+export interface SessionAuthorityMigrationCandidatesRequest {
+	readonly candidateSourcePaths: readonly string[];
+	readonly destinationPath: string;
+	readonly stateRoot: string;
+	readonly adminPrincipalId: string;
+	readonly now?: MigrationClock;
+}
 
 export class SessionAuthorityMigrationError extends Error {
 	readonly result?: SessionAuthorityMigrationResult;
@@ -69,12 +82,12 @@ interface RecoveryManifest {
 }
 
 interface MigrationPaths {
+	readonly destinationPath: string;
 	readonly recoveryPath: string;
 	readonly checkpointPath: string;
 	readonly auditPath: string;
 	readonly quarantineDirectory: string;
 }
-
 interface LegacyDocument {
 	readonly mappings: readonly unknown[];
 	readonly provisionalOperations: readonly unknown[];
@@ -114,7 +127,7 @@ function nonDurableDegradedResult(
 		sourceSha256,
 		migrationRecoveryPath: paths.recoveryPath,
 		recoveryPath: paths.recoveryPath,
-		destinationPath: sourcePath,
+		destinationPath: paths.destinationPath,
 		checkpointPath: paths.checkpointPath,
 		auditPath: paths.auditPath,
 		counts: sourceSha256 === undefined ? emptyCounts() : { total: 1, migrated: 0, quarantined: 1, skipped: 0 },
@@ -134,11 +147,14 @@ export function preflightSessionAuthorityMigration(
 	const sourcePath = requirePath(options.sourcePath, "sourcePath");
 	const stateRoot = requirePath(options.stateRoot, "stateRoot");
 	const adminPrincipalId = requirePrincipal(options.adminPrincipalId);
-	const paths = migrationPaths(sourcePath, stateRoot);
+	const destinationPath = requirePath(options.destinationPath ?? sourcePath, "destinationPath");
+	const paths = migrationPaths(sourcePath, stateRoot, destinationPath);
 	const now = options.now ?? (() => new Date().toISOString());
-	let lock: ReturnType<typeof AuthorityMutationLock.acquire> | undefined;
+	const locks: Array<ReturnType<typeof AuthorityMutationLock.acquire>> = [];
 	try {
-		lock = AuthorityMutationLock.acquire(sourcePath);
+		for (const lockPath of sourcePath === destinationPath ? [sourcePath] : [sourcePath, destinationPath].sort()) {
+			locks.push(AuthorityMutationLock.acquire(lockPath));
+		}
 		return runMigration(sourcePath, adminPrincipalId, paths, now);
 	} catch (error) {
 		return nonDurableDegradedResult(
@@ -148,8 +164,40 @@ export function preflightSessionAuthorityMigration(
 			`migration preflight persistence failed: ${errorMessage(error)}`,
 		);
 	} finally {
-		lock?.release();
+		for (const lock of locks.reverse()) lock.release();
 	}
+}
+
+export function preflightSessionAuthorityMigrationCandidates(
+	options: SessionAuthorityMigrationCandidatesRequest,
+): SessionAuthorityMigrationResult {
+	const destinationPath = requirePath(options.destinationPath, "destinationPath");
+	const stateRoot = requirePath(options.stateRoot, "stateRoot");
+	const adminPrincipalId = requirePrincipal(options.adminPrincipalId);
+	const now = options.now;
+	const targetResult = preflightSessionAuthorityMigration({
+		sourcePath: destinationPath,
+		destinationPath,
+		stateRoot,
+		adminPrincipalId,
+		...(now === undefined ? {} : { now }),
+	});
+	if (targetResult.status !== "not_needed" || existsSync(destinationPath)) return targetResult;
+	const seen = new Set<string>();
+	for (const candidate of options.candidateSourcePaths) {
+		const sourcePath = requirePath(candidate, "candidateSourcePath");
+		if (sourcePath === destinationPath || seen.has(sourcePath)) continue;
+		seen.add(sourcePath);
+		if (!existsSync(sourcePath)) continue;
+		return preflightSessionAuthorityMigration({
+			sourcePath,
+			destinationPath,
+			stateRoot,
+			adminPrincipalId,
+			...(now === undefined ? {} : { now }),
+		});
+	}
+	return targetResult;
 }
 
 function runMigration(
@@ -261,7 +309,29 @@ function runMigration(
 		!isV2ContainerScopedForAdmin(parsed.value, adminPrincipalId)
 	) {
 		const currentSha256 = sourceSha256 as string;
-		if (checkpoint?.status === "committed" && checkpoint.destinationSha256 === currentSha256)
+		if (
+			paths.destinationPath !== sourcePath &&
+			checkpoint?.status === "committed" &&
+			checkpoint.sourceSha256 !== currentSha256
+		) {
+			const quarantinePath = quarantineBytes(sourceBytes, paths.quarantineDirectory, currentSha256);
+			return degradedResult(
+				sourcePath,
+				adminPrincipalId,
+				paths,
+				checkpoint,
+				now,
+				"source bytes do not match the committed migration checkpoint",
+				quarantinePath,
+				currentSha256,
+				checkpoint.sourceRecoveryPath,
+			);
+		}
+		if (
+			checkpoint?.status === "committed" &&
+			checkpoint.destinationSha256 === currentSha256 &&
+			existsSync(paths.destinationPath)
+		)
 			return resultFromCheckpoint(checkpoint, paths, currentSha256);
 		return commitScopedRuntimeDestination(
 			sourcePath,
@@ -276,6 +346,7 @@ function runMigration(
 		);
 	}
 	if (
+		paths.destinationPath === sourcePath &&
 		checkpoint?.status === "committed" &&
 		manifestState.status === "valid" &&
 		parsed.ok &&
@@ -303,9 +374,43 @@ function runMigration(
 		isV2ContainerScopedForAdmin(parsed.value, adminPrincipalId)
 	) {
 		const currentSha256 = sourceSha256 as string;
+		if (
+			paths.destinationPath !== sourcePath &&
+			checkpoint?.status === "committed" &&
+			checkpoint.sourceSha256 !== currentSha256
+		) {
+			const quarantinePath = quarantineBytes(sourceBytes, paths.quarantineDirectory, currentSha256);
+			return degradedResult(
+				sourcePath,
+				adminPrincipalId,
+				paths,
+				checkpoint,
+				now,
+				"source bytes do not match the committed migration checkpoint",
+				quarantinePath,
+				currentSha256,
+				checkpoint.sourceRecoveryPath,
+			);
+		}
+		if (
+			checkpoint?.status === "committed" &&
+			checkpoint.destinationSha256 === currentSha256 &&
+			existsSync(paths.destinationPath)
+		)
+			return resultFromCheckpoint(checkpoint, paths, currentSha256);
+		if (paths.destinationPath !== sourcePath)
+			return commitScopedRuntimeDestination(
+				sourcePath,
+				adminPrincipalId,
+				paths,
+				parsed.value as {
+					readonly mappings: readonly SessionAuthorityRecord[];
+					readonly provisionalOperations?: readonly ProvisionalSessionOperation[];
+				},
+				sourceBytes,
+				now,
+			);
 		if (checkpoint?.status === "committed") {
-			if (checkpoint.destinationSha256 === currentSha256)
-				return resultFromCheckpoint(checkpoint, paths, currentSha256);
 			const quarantinePath = quarantineBytes(sourceBytes, paths.quarantineDirectory, currentSha256);
 			return degradedResult(
 				sourcePath,
@@ -468,6 +573,23 @@ function runMigration(
 	};
 	const destinationBytes = Buffer.from(`${JSON.stringify(destinationDocument, null, 2)}\n`, "utf8");
 	const destinationSha256 = digest(destinationBytes);
+	if (paths.destinationPath !== sourcePath) {
+		const existingDestination = readFileIfPresent(paths.destinationPath);
+		if (existingDestination !== undefined && digest(existingDestination) !== destinationSha256) {
+			const existingSha256 = digest(existingDestination);
+			return degradedResult(
+				sourcePath,
+				adminPrincipalId,
+				paths,
+				undefined,
+				now,
+				"existing authority destination does not match the migration output",
+				quarantineBytes(existingDestination, paths.quarantineDirectory, existingSha256),
+				existingSha256,
+				sourceRecoveryPath,
+			);
+		}
+	}
 	try {
 		writeManifest(paths.auditPath, {
 			kind: RECOVERY_KIND,
@@ -476,7 +598,7 @@ function runMigration(
 			sourceSha256: sourceSha256 as string,
 			adminPrincipalId,
 			sourceRecoveryPath,
-			destinationPath: sourcePath,
+			destinationPath: paths.destinationPath,
 			expectedDestinationSha256: destinationSha256,
 			status: "source-retained",
 			updatedAt: now(),
@@ -496,10 +618,10 @@ function runMigration(
 	}
 
 	try {
-		writeDurableFile(sourcePath, destinationBytes);
+		writeDurableFile(paths.destinationPath, destinationBytes);
 	} catch (error) {
 		const reason = `cannot durably write migrated authority: ${errorMessage(error)}`;
-		const currentBytes = readFileIfPresent(sourcePath);
+		const currentBytes = readFileIfPresent(paths.destinationPath);
 		const currentSha256 = currentBytes === undefined ? undefined : digest(currentBytes);
 		const quarantinePath =
 			currentBytes === undefined || currentSha256 === sourceSha256
@@ -526,7 +648,7 @@ function runMigration(
 			sourceSha256: sourceSha256 as string,
 			adminPrincipalId,
 			sourceRecoveryPath,
-			destinationPath: sourcePath,
+			destinationPath: paths.destinationPath,
 			expectedDestinationSha256: destinationSha256,
 			status: "destination-written",
 			updatedAt: now(),
@@ -566,7 +688,7 @@ function runMigration(
 			now,
 			`cannot durably write migration checkpoint: ${errorMessage(error)}`,
 			undefined,
-			digest(readFileSync(sourcePath)),
+			digest(readFileSync(paths.destinationPath)),
 			sourceRecoveryPath,
 		);
 	}
@@ -578,7 +700,7 @@ function runMigration(
 			sourceSha256: sourceSha256 as string,
 			adminPrincipalId,
 			sourceRecoveryPath,
-			destinationPath: sourcePath,
+			destinationPath: paths.destinationPath,
 			expectedDestinationSha256: destinationSha256,
 			status: "checkpointed",
 			updatedAt: now(),
@@ -586,7 +708,7 @@ function runMigration(
 	} catch {
 		// The committed checkpoint is sufficient to resume safely; a later run may repair the audit marker.
 	}
-	return resultFromCheckpoint(committedCheckpoint, paths, digest(readFileSync(sourcePath)));
+	return resultFromCheckpoint(committedCheckpoint, paths, digest(readFileSync(paths.destinationPath)));
 }
 
 function recoverMissingDestinationFromManifest(
@@ -653,7 +775,7 @@ function recoverMissingDestinationFromManifest(
 			manifest.sourceRecoveryPath,
 		);
 	try {
-		writeDurableFile(sourcePath, destinationBytes);
+		writeDurableFile(paths.destinationPath, destinationBytes);
 		const checkpoint = writeCommittedCheckpoint(
 			sourcePath,
 			adminPrincipalId,
@@ -731,7 +853,7 @@ function recoverMissingDestination(
 		);
 	}
 	try {
-		writeDurableFile(sourcePath, destinationBytes);
+		writeDurableFile(paths.destinationPath, destinationBytes);
 	} catch (error) {
 		return degradedResult(
 			sourcePath,
@@ -806,7 +928,7 @@ function recoverCheckpointAfterDestination(
 			undefined,
 			now,
 			"existing authority destination does not match recovered migration output",
-			quarantineBytes(readFileSync(sourcePath), paths.quarantineDirectory, destinationSha256),
+			quarantineBytes(readFileSync(paths.destinationPath), paths.quarantineDirectory, destinationSha256),
 			manifest.sourceSha256,
 			manifest.sourceRecoveryPath,
 		);
@@ -878,7 +1000,7 @@ function degradeInvalidScopedV2Source(
 			sourceSha256,
 			adminPrincipalId,
 			sourceRecoveryPath,
-			destinationPath: sourcePath,
+			destinationPath: paths.destinationPath,
 			status: "degraded",
 			updatedAt: now(),
 		});
@@ -900,6 +1022,37 @@ function commitScopedRuntimeDestination(
 ): SessionAuthorityMigrationResult {
 	const sourceSha256 = digest(sourceBytes);
 	const sourceRecoveryPath = retainSourceBytes(sourceBytes, sourceSha256, sourcePath, adminPrincipalId, paths, now);
+	if (paths.destinationPath !== sourcePath) {
+		const existingDestination = readFileIfPresent(paths.destinationPath);
+		if (existingDestination !== undefined && digest(existingDestination) !== sourceSha256) {
+			return degradedResult(
+				sourcePath,
+				adminPrincipalId,
+				paths,
+				undefined,
+				now,
+				"existing authority destination does not match the scoped migration source",
+				quarantineBytes(existingDestination, paths.quarantineDirectory, digest(existingDestination)),
+				digest(existingDestination),
+				sourceRecoveryPath,
+			);
+		}
+		try {
+			writeDurableFile(paths.destinationPath, sourceBytes);
+		} catch (error) {
+			return degradedResult(
+				sourcePath,
+				adminPrincipalId,
+				paths,
+				undefined,
+				now,
+				`cannot durably write migrated authority: ${errorMessage(error)}`,
+				undefined,
+				sourceSha256,
+				sourceRecoveryPath,
+			);
+		}
+	}
 	const checkpoint = writeCommittedCheckpoint(
 		sourcePath,
 		adminPrincipalId,
@@ -918,7 +1071,7 @@ function commitScopedRuntimeDestination(
 			sourceSha256,
 			adminPrincipalId,
 			sourceRecoveryPath,
-			destinationPath: sourcePath,
+			destinationPath: paths.destinationPath,
 			expectedDestinationSha256: sourceSha256,
 			status: "checkpointed",
 			updatedAt: now(),
@@ -1767,7 +1920,7 @@ function checkpointMatchesRequest(
 ): boolean {
 	return (
 		checkpoint.sourcePath === sourcePath &&
-		checkpoint.destinationPath === sourcePath &&
+		checkpoint.destinationPath === paths.destinationPath &&
 		checkpoint.adminPrincipalId === adminPrincipalId &&
 		resolve(checkpoint.sourceRecoveryPath).startsWith(`${paths.recoveryPath}/`)
 	);
@@ -1781,7 +1934,7 @@ function manifestMatchesRequest(
 ): boolean {
 	return (
 		manifest.sourcePath === sourcePath &&
-		manifest.destinationPath === sourcePath &&
+		manifest.destinationPath === paths.destinationPath &&
 		manifest.adminPrincipalId === adminPrincipalId &&
 		resolve(manifest.sourceRecoveryPath).startsWith(`${paths.recoveryPath}/`)
 	);
@@ -1986,7 +2139,7 @@ function retainSourceBytes(
 			sourceSha256,
 			adminPrincipalId,
 			sourceRecoveryPath,
-			destinationPath: sourcePath,
+			destinationPath: paths.destinationPath,
 			status: "source-retained",
 			updatedAt: now(),
 		});
@@ -2011,7 +2164,7 @@ function writeCommittedCheckpoint(
 		sourceSha256,
 		adminPrincipalId,
 		sourceRecoveryPath,
-		destinationPath: sourcePath,
+		destinationPath: paths.destinationPath,
 		destinationSha256,
 		status: "committed",
 		items,
@@ -2041,7 +2194,7 @@ function writeDegradedCheckpoint(
 		sourceSha256,
 		adminPrincipalId,
 		sourceRecoveryPath,
-		destinationPath: sourcePath,
+		destinationPath: paths.destinationPath,
 		status: "degraded",
 		items,
 		counts: countsFor(items),
@@ -2168,7 +2321,7 @@ function degradedWithoutCheckpoint(
 		sourceBytesPath: sourceRecoveryPath,
 		migrationRecoveryPath: paths.recoveryPath,
 		recoveryPath: paths.recoveryPath,
-		destinationPath: sourcePath,
+		destinationPath: paths.destinationPath,
 		checkpointPath: paths.checkpointPath,
 		auditPath: paths.auditPath,
 		quarantinePath,
@@ -2202,7 +2355,7 @@ function degradedResult(
 		sourceBytesPath: sourceRecoveryPath,
 		migrationRecoveryPath: paths.recoveryPath,
 		recoveryPath: paths.recoveryPath,
-		destinationPath: sourcePath,
+		destinationPath: paths.destinationPath,
 		checkpointPath: paths.checkpointPath,
 		auditPath: paths.auditPath,
 		quarantinePath,
@@ -2223,7 +2376,7 @@ function notNeededResult(
 		sourceSha256,
 		migrationRecoveryPath: paths.recoveryPath,
 		recoveryPath: paths.recoveryPath,
-		destinationPath: sourcePath,
+		destinationPath: paths.destinationPath,
 		counts: emptyCounts(),
 	};
 }
@@ -2307,7 +2460,7 @@ function syncDirectory(path: string): void {
 	}
 }
 
-function migrationPaths(sourcePath: string, stateRoot: string): MigrationPaths {
+function migrationPaths(sourcePath: string, stateRoot: string, destinationPath: string): MigrationPaths {
 	const sourceIdentity = digest(Buffer.from(sourcePath, "utf8")).slice(0, 24);
 	const recoveryPath = join(
 		resolve(stateRoot),
@@ -2315,6 +2468,7 @@ function migrationPaths(sourcePath: string, stateRoot: string): MigrationPaths {
 		`${basename(sourcePath)}-${sourceIdentity}`,
 	);
 	return {
+		destinationPath,
 		recoveryPath,
 		checkpointPath: join(recoveryPath, "checkpoint.json"),
 		auditPath: join(recoveryPath, "audit.json"),

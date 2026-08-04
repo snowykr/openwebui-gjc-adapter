@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
+import { constants } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -241,24 +242,272 @@ async function withStateLock<T>(stateRoot: string, operation: () => Promise<T>):
 const REGISTRY_LOCK_ATTEMPTS = 200;
 const REGISTRY_LOCK_DELAY_MS = 10;
 
+interface RegistryLockOwner {
+	readonly pid: number;
+	readonly startTicks: string;
+}
+
+interface RegistryLockSnapshot {
+	readonly owner: RegistryLockOwner;
+	readonly device: number;
+	readonly inode: number;
+}
+class RegistryLockMetadataError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "RegistryLockMetadataError";
+	}
+}
+
 async function acquireRegistryLock(stateRoot: string): Promise<() => Promise<void>> {
 	const lockPath = path.join(stateRoot, ".workspace-registry.lock");
+	const owner = await currentRegistryLockOwner();
 	for (let attempt = 0; attempt < REGISTRY_LOCK_ATTEMPTS; attempt += 1) {
 		let handle: fs.FileHandle | undefined;
 		try {
-			handle = await fs.open(lockPath, "wx", REGISTRY_MODE);
+			handle = await fs.open(
+				lockPath,
+				constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
+				REGISTRY_MODE,
+			);
+			await handle.writeFile(`${JSON.stringify(owner)}\n`, "utf8");
+			await handle.chmod(REGISTRY_MODE);
 			await handle.sync();
+			const stats = await handle.stat();
+			assertPrivateRegistryLockStat(stats, lockPath);
+			await handle.close();
+			handle = undefined;
+			await syncDirectory(path.dirname(lockPath));
+			const snapshot: RegistryLockSnapshot = {
+				owner,
+				device: stats.dev,
+				inode: stats.ino,
+			};
 			return async () => {
-				await handle?.close();
-				await fs.unlink(lockPath);
+				await removeRegistryLock(lockPath, snapshot);
 			};
 		} catch (error) {
 			await handle?.close();
 			if (!isNodeFsError(error, "EEXIST")) throw error;
-			await new Promise<void>(resolve => setTimeout(resolve, REGISTRY_LOCK_DELAY_MS));
+			let snapshot: RegistryLockSnapshot | undefined;
+			try {
+				snapshot = await readRegistryLockSnapshot(lockPath);
+			} catch (metadataError) {
+				if (!(metadataError instanceof RegistryLockMetadataError)) throw metadataError;
+				await delayRegistryLock();
+				continue;
+			}
+			if (snapshot !== undefined) {
+				if (await isRegistryLockOwnerLive(snapshot.owner)) {
+					await delayRegistryLock();
+				} else if (await reclaimRegistryLock(lockPath, snapshot)) {
+				}
+			}
 		}
 	}
 	throw new Error(`User workspace registry lock is unavailable: ${stateRoot}`);
+}
+
+async function currentRegistryLockOwner(): Promise<RegistryLockOwner> {
+	return {
+		pid: process.pid,
+		startTicks: await registryLockStartTicks(process.pid),
+	};
+}
+
+async function isRegistryLockOwnerLive(owner: RegistryLockOwner): Promise<boolean> {
+	try {
+		return (await registryLockStartTicks(owner.pid)) === owner.startTicks;
+	} catch (error) {
+		if (isMissingProcessError(error)) return false;
+		throw new Error("Unable to establish user workspace registry lock owner liveness", { cause: error });
+	}
+}
+
+async function registryLockStartTicks(pid: number): Promise<string> {
+	if (process.platform !== "linux") {
+		throw new Error("User workspace registry lock process identity is unavailable on this platform");
+	}
+	if (!Number.isSafeInteger(pid) || pid < 1) throw new Error("Invalid user workspace registry lock owner PID");
+	let stat: string;
+	try {
+		stat = await fs.readFile(`/proc/${pid}/stat`, "utf8");
+	} catch (error) {
+		if (isMissingProcessError(error)) throw error;
+		throw new Error(`Unable to read process start identity for PID ${pid}`, { cause: error });
+	}
+	const closing = stat.lastIndexOf(")");
+	const fields =
+		closing < 0
+			? []
+			: stat
+					.slice(closing + 2)
+					.trim()
+					.split(/\s+/);
+	const startTicks = fields[19];
+	if (startTicks === undefined || !/^\d+$/.test(startTicks)) {
+		throw new Error(`Unable to validate process start identity for PID ${pid}`);
+	}
+	return startTicks;
+}
+
+async function readRegistryLockSnapshot(lockPath: string): Promise<RegistryLockSnapshot | undefined> {
+	let linkStats: Stats;
+	try {
+		linkStats = await fs.lstat(lockPath);
+	} catch (error) {
+		if (isNodeFsError(error, "ENOENT")) return undefined;
+		throw error;
+	}
+	assertPrivateRegistryLockStat(linkStats, lockPath);
+	let handle: fs.FileHandle | undefined;
+	try {
+		handle = await fs.open(lockPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+		const stats = await handle.stat();
+		assertPrivateRegistryLockStat(stats, lockPath);
+		if (stats.dev !== linkStats.dev || stats.ino !== linkStats.ino) {
+			throw new Error(`User workspace registry lock changed while being inspected: ${lockPath}`);
+		}
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(await handle.readFile("utf8")) as unknown;
+		} catch {
+			throw new RegistryLockMetadataError(`User workspace registry lock metadata is not valid JSON: ${lockPath}`);
+		}
+		return {
+			owner: parseRegistryLockOwner(parsed, lockPath),
+			device: stats.dev,
+			inode: stats.ino,
+		};
+	} catch (error) {
+		if (isNodeFsError(error, "ENOENT")) return undefined;
+		throw error;
+	} finally {
+		await handle?.close();
+	}
+}
+
+function parseRegistryLockOwner(value: unknown, lockPath: string): RegistryLockOwner {
+	if (!isRecord(value))
+		throw new RegistryLockMetadataError(`User workspace registry lock metadata is invalid: ${lockPath}`);
+	const pid = value.pid;
+	const startTicks = value.startTicks;
+	if (
+		typeof pid !== "number" ||
+		!Number.isSafeInteger(pid) ||
+		pid < 1 ||
+		typeof startTicks !== "string" ||
+		!/^\d+$/.test(startTicks)
+	) {
+		throw new RegistryLockMetadataError(`User workspace registry lock metadata is invalid: ${lockPath}`);
+	}
+	return { pid, startTicks };
+}
+
+function assertPrivateRegistryLockStat(stats: Stats, lockPath: string): void {
+	if (stats.isSymbolicLink() || !stats.isFile()) {
+		throw new Error(`User workspace registry lock must be a regular file: ${lockPath}`);
+	}
+	if ((stats.mode & 0o777) !== REGISTRY_MODE) {
+		throw new Error(`User workspace registry lock must be private: ${lockPath}`);
+	}
+	if (typeof process.getuid !== "function" || stats.uid !== process.getuid()) {
+		throw new Error(`User workspace registry lock has foreign ownership: ${lockPath}`);
+	}
+}
+
+async function reclaimRegistryLock(lockPath: string, snapshot: RegistryLockSnapshot): Promise<boolean> {
+	const reclaimPath = `${lockPath}.reclaim-${process.pid}-${randomUUID()}`;
+	try {
+		await fs.rename(lockPath, reclaimPath);
+	} catch (error) {
+		if (isNodeFsError(error, "ENOENT")) return false;
+		throw new Error(`User workspace registry lock could not be claimed for recovery: ${lockPath}`, { cause: error });
+	}
+	try {
+		const claimed = await readRegistryLockSnapshot(reclaimPath);
+		if (
+			claimed === undefined ||
+			claimed.device !== snapshot.device ||
+			claimed.inode !== snapshot.inode ||
+			!sameRegistryLockOwner(claimed.owner, snapshot.owner)
+		) {
+			await restoreRegistryLockClaim(reclaimPath, lockPath);
+			return false;
+		}
+		if (await isRegistryLockOwnerLive(claimed.owner)) {
+			await restoreRegistryLockClaim(reclaimPath, lockPath);
+			return false;
+		}
+		await fs.unlink(reclaimPath);
+		await syncDirectory(path.dirname(lockPath));
+		return true;
+	} catch (error) {
+		await restoreRegistryLockClaim(reclaimPath, lockPath);
+		throw error;
+	}
+}
+
+async function removeRegistryLock(lockPath: string, snapshot: RegistryLockSnapshot): Promise<void> {
+	const current = await readRegistryLockSnapshot(lockPath);
+	if (current === undefined) return;
+	if (
+		current.device !== snapshot.device ||
+		current.inode !== snapshot.inode ||
+		!sameRegistryLockOwner(current.owner, snapshot.owner)
+	) {
+		throw new Error(`User workspace registry lock ownership changed before release: ${lockPath}`);
+	}
+	const releasePath = `${lockPath}.release-${process.pid}-${randomUUID()}`;
+	try {
+		await fs.rename(lockPath, releasePath);
+	} catch (error) {
+		if (isNodeFsError(error, "ENOENT")) return;
+		throw new Error(`User workspace registry lock could not be claimed for release: ${lockPath}`, { cause: error });
+	}
+	try {
+		const claimed = await readRegistryLockSnapshot(releasePath);
+		if (
+			claimed === undefined ||
+			claimed.device !== snapshot.device ||
+			claimed.inode !== snapshot.inode ||
+			!sameRegistryLockOwner(claimed.owner, snapshot.owner)
+		) {
+			await restoreRegistryLockClaim(releasePath, lockPath);
+			throw new Error(`User workspace registry lock changed before release: ${lockPath}`);
+		}
+		await fs.unlink(releasePath);
+		await syncDirectory(path.dirname(lockPath));
+	} catch (error) {
+		await restoreRegistryLockClaim(releasePath, lockPath);
+		throw error;
+	}
+}
+
+async function restoreRegistryLockClaim(claimPath: string, lockPath: string): Promise<void> {
+	try {
+		await fs.link(claimPath, lockPath);
+	} catch (error) {
+		if (isNodeFsError(error, "EEXIST") || isNodeFsError(error, "ENOENT")) return;
+		throw error;
+	}
+	try {
+		await fs.unlink(claimPath);
+	} catch (error) {
+		if (!isNodeFsError(error, "ENOENT")) throw error;
+	}
+}
+
+function sameRegistryLockOwner(left: RegistryLockOwner, right: RegistryLockOwner): boolean {
+	return left.pid === right.pid && left.startTicks === right.startTicks;
+}
+
+function isMissingProcessError(error: unknown): boolean {
+	return isNodeFsError(error, "ENOENT") || isNodeFsError(error, "ESRCH");
+}
+
+async function delayRegistryLock(): Promise<void> {
+	await new Promise<void>(resolve => setTimeout(resolve, REGISTRY_LOCK_DELAY_MS));
 }
 
 async function ensureDirectory(directory: string, label: string, enforcePrivateMode: boolean): Promise<void> {

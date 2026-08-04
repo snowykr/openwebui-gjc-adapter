@@ -10,6 +10,7 @@ import { staticModelReaderFactory } from "./model-selection-fixtures";
 function enqueuePendingOperation(store: InMemoryOutboxStore): void {
 	store.enqueue({
 		operationId: "projection-op-1",
+		principalId: "user-1",
 		ownerUserId: "user-1",
 		projectId: "project-1",
 		chatId: "chat-1",
@@ -58,7 +59,11 @@ describe("projection outbox startup reconciliation", () => {
 			await rm(root, { force: true, recursive: true });
 		}
 
-		expect(outbox.get("projection-op-1")).toMatchObject({ state: "failed", attempts: 1 });
+		expect(outbox.get({ principalId: "user-1", chatId: "chat-1", operationId: "projection-op-1" })).toMatchObject({
+			principalId: "user-1",
+			state: "failed",
+			attempts: 1,
+		});
 		expect(errors).toEqual(["Projection outbox reconciliation retained 1 failed operation(s); serving continues."]);
 		expect(options?.checks).toContainEqual(
 			expect.objectContaining({ name: "openwebui-projection-outbox", status: "degraded" }),

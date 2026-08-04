@@ -3,7 +3,10 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
-import { preflightSessionAuthorityMigration } from "../src/gjc/session-authority-migration";
+import {
+	preflightSessionAuthorityMigration,
+	preflightSessionAuthorityMigrationCandidates,
+} from "../src/gjc/session-authority-migration";
 
 const NOW = () => "2026-01-01T00:00:00.000Z";
 
@@ -114,6 +117,68 @@ describe("session authority pre-store migration", () => {
 					__gjcSessionMappingScope: { principalId: "admin-1", chatId: "chat-1" },
 				},
 			});
+		});
+	});
+	test("migrates the prior cwd-default authority into the new state session root without clearing the source", () => {
+		withRoot((root, _sourcePath) => {
+			const previousRoot = join(root, "previous-cwd");
+			const previousPath = join(previousRoot, "openwebui-session-mappings.json");
+			const destinationPath = join(root, "state", "sessions", "openwebui-session-mappings.json");
+			const original = Buffer.from(JSON.stringify(legacyDocument()));
+			mkdirSync(previousRoot, { recursive: true });
+			writeFileSync(previousPath, original);
+
+			const result = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [previousPath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+
+			expect(result.status).toBe("committed");
+			expect(result.sourcePath).toBe(resolve(previousPath));
+			expect(result.destinationPath).toBe(resolve(destinationPath));
+			expect(readFileSync(previousPath)).toEqual(original);
+			expect(JSON.parse(readFileSync(destinationPath, "utf8")).mappings[0].chatId).toBe(
+				JSON.stringify(["admin-1", "chat-1"]),
+			);
+
+			const rerun = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [previousPath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+			expect(rerun.status).toBe("not_needed");
+			expect(readFileSync(previousPath)).toEqual(original);
+		});
+	});
+
+	test("migrates the explicitly managed previous root after absent candidates", () => {
+		withRoot((root, _sourcePath) => {
+			const previousPath = join(root, "run", "gjc-session", "openwebui-session-mappings.json");
+			const destinationPath = join(root, "var", "lib", "gjc", "sessions", "openwebui-session-mappings.json");
+			const original = Buffer.from(JSON.stringify(legacyDocument()));
+			mkdirSync(join(root, "run", "gjc-session"), { recursive: true });
+			writeFileSync(previousPath, original);
+
+			const result = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [join(root, "missing", "openwebui-session-mappings.json"), previousPath],
+				destinationPath,
+				stateRoot: join(root, "var", "lib", "gjc"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+
+			expect(result.status).toBe("committed");
+			expect(result.sourcePath).toBe(resolve(previousPath));
+			expect(result.destinationPath).toBe(resolve(destinationPath));
+			expect(readFileSync(previousPath)).toEqual(original);
+			expect(JSON.parse(readFileSync(destinationPath, "utf8")).mappings[0].chatId).toBe(
+				JSON.stringify(["admin-1", "chat-1"]),
+			);
 		});
 	});
 	test("assigns an orphaned legacy provisional operation to the configured admin namespace", () => {

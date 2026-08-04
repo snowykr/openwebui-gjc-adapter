@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { WorkspaceCleanupError, WorkspaceCleanupUncertainError } from "../src/security/workspace-cleanup";
 import { createAdapterRequestHandler } from "../src/server-request-handler";
 
 const owner = { ownerUserId: "admin-1", singleOwnerLocalMode: false };
 
-function handler() {
+function handler(cleanupFailure?: unknown) {
 	const previews: string[] = [];
 	const cleanups: { userId: string; confirmationToken: string }[] = [];
 	return {
@@ -23,6 +24,7 @@ function handler() {
 					},
 					async cleanup({ userId, confirmationToken }) {
 						cleanups.push({ userId, confirmationToken });
+						if (cleanupFailure !== undefined) throw cleanupFailure;
 						return {
 							status: "removed",
 							outcome: "success",
@@ -65,5 +67,28 @@ describe("workspace cleanup admin API", () => {
 		expect(cleanup.status).toBe(200);
 		expect(adapter.previews).toEqual(["user-a"]);
 		expect(adapter.cleanups).toEqual([{ userId: "user-a", confirmationToken: "confirm" }]);
+	});
+	test("maps authority retirement failure to a pending cleanup response", async () => {
+		const adapter = handler(new WorkspaceCleanupUncertainError());
+		const response = await adapter.handler(
+			request("/admin/workspaces/user-a/cleanup", "admin-1", { confirmationToken: "confirm" }),
+		);
+
+		expect(response.status).toBe(503);
+		expect(await response.json()).toEqual({
+			error: { code: "cleanup_uncertain", message: "Workspace cleanup remains pending." },
+		});
+	});
+
+	test("rejects administrator workspace targets without invoking deletion", async () => {
+		const adapter = handler(new WorkspaceCleanupError("admin_workspace_forbidden", "not a user workspace"));
+		const response = await adapter.handler(
+			request("/admin/workspaces/admin-1/cleanup", "admin-1", { confirmationToken: "confirm" }),
+		);
+
+		expect(response.status).toBe(403);
+		expect(await response.json()).toEqual({
+			error: { code: "admin_workspace_forbidden", message: "Administrator workspaces cannot be cleaned up." },
+		});
 	});
 });

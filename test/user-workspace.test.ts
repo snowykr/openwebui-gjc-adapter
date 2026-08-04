@@ -4,6 +4,20 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createUserWorkspaceRegistry, deriveUserWorkspaceKey } from "../src/security/user-workspace";
 
+async function processStartTicks(pid = process.pid): Promise<string> {
+	const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8");
+	const closing = stat.lastIndexOf(")");
+	const fields = stat
+		.slice(closing + 2)
+		.trim()
+		.split(/\s+/);
+	const startTicks = fields[19];
+	if (startTicks === undefined || !/^\d+$/.test(startTicks)) {
+		throw new Error(`missing process start identity for PID ${pid}`);
+	}
+	return startTicks;
+}
+
 describe("durable user workspaces", () => {
 	test("derives a stable safe key without putting the raw user ID in the path", async () => {
 		const stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-workspace-key-"));
@@ -114,5 +128,80 @@ describe("durable user workspaces", () => {
 		);
 
 		await expect(registry.open("registered-user")).rejects.toThrow(/safe key|match|collision|inconsistent/i);
+	});
+	test("recovers a registry lock left by a dead process", async () => {
+		if (process.platform !== "linux") return;
+		const stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-workspace-lock-dead-"));
+		const lockPath = path.join(stateRoot, ".workspace-registry.lock");
+		await fs.writeFile(lockPath, `${JSON.stringify({ pid: Number.MAX_SAFE_INTEGER, startTicks: "1" })}\n`, {
+			mode: 0o600,
+		});
+
+		const workspace = await createUserWorkspaceRegistry({ stateRoot }).open("dead-lock-user");
+
+		expect(workspace.userId).toBe("dead-lock-user");
+		await expect(fs.lstat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	test("recovers a registry lock whose PID was reused by another process", async () => {
+		if (process.platform !== "linux") return;
+		const stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-workspace-lock-pid-reuse-"));
+		const lockPath = path.join(stateRoot, ".workspace-registry.lock");
+		const startTicks = await processStartTicks();
+		await fs.writeFile(
+			lockPath,
+			`${JSON.stringify({ pid: process.pid, startTicks: startTicks === "0" ? "1" : "0" })}\n`,
+			{ mode: 0o600 },
+		);
+
+		await expect(createUserWorkspaceRegistry({ stateRoot }).open("pid-reused-lock-user")).resolves.toMatchObject({
+			userId: "pid-reused-lock-user",
+		});
+	});
+
+	test("blocks a live registry lock owner without removing the guard", async () => {
+		if (process.platform !== "linux") return;
+		const stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-workspace-lock-live-"));
+		const lockPath = path.join(stateRoot, ".workspace-registry.lock");
+		const lockText = `${JSON.stringify({ pid: process.pid, startTicks: await processStartTicks() })}\n`;
+		await fs.writeFile(lockPath, lockText, { mode: 0o600 });
+
+		await expect(createUserWorkspaceRegistry({ stateRoot }).open("live-lock-user")).rejects.toThrow(/unavailable/i);
+		expect(await fs.readFile(lockPath, "utf8")).toBe(lockText);
+	});
+	test("blocks malformed, non-private, or symlinked registry locks without removing them", async () => {
+		if (process.platform !== "linux") return;
+		const malformedRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-workspace-lock-malformed-"));
+		const malformedPath = path.join(malformedRoot, ".workspace-registry.lock");
+		await fs.writeFile(malformedPath, "not-json\n", { mode: 0o600 });
+
+		await expect(
+			createUserWorkspaceRegistry({ stateRoot: malformedRoot }).open("malformed-lock-user"),
+		).rejects.toThrow(/metadata|JSON|unavailable/i);
+		expect(await fs.readFile(malformedPath, "utf8")).toBe("not-json\n");
+
+		const privateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-workspace-lock-nonprivate-"));
+		const privatePath = path.join(privateRoot, ".workspace-registry.lock");
+		await fs.writeFile(
+			privatePath,
+			`${JSON.stringify({ pid: process.pid, startTicks: await processStartTicks() })}\n`,
+			{
+				mode: 0o644,
+			},
+		);
+
+		await expect(
+			createUserWorkspaceRegistry({ stateRoot: privateRoot }).open("non-private-lock-user"),
+		).rejects.toThrow(/private/i);
+		expect((await fs.stat(privatePath)).mode & 0o777).toBe(0o644);
+		const symlinkRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-workspace-lock-symlink-"));
+		const symlinkPath = path.join(symlinkRoot, ".workspace-registry.lock");
+		const outside = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-workspace-lock-outside-"));
+		await fs.symlink(outside, symlinkPath);
+
+		await expect(createUserWorkspaceRegistry({ stateRoot: symlinkRoot }).open("symlink-lock-user")).rejects.toThrow(
+			/regular|symlink/i,
+		);
+		expect((await fs.lstat(symlinkPath)).isSymbolicLink()).toBe(true);
 	});
 });

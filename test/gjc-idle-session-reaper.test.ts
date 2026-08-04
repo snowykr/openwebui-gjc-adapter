@@ -516,10 +516,8 @@ describe("GJC idle session reaper", () => {
 			releaseTurn();
 			await pendingTurn;
 			await flush();
-			for (let attempt = 0; attempt < 10 && !closeCalls.includes("chat-2"); attempt += 1) {
-				clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
-				await flush();
-			}
+			clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
+			for (let attempt = 0; attempt < 200 && !closeCalls.includes("chat-2"); attempt += 1) await flush();
 			expect(closeCalls).toContain("chat-2");
 			await reaper.stop();
 		} finally {

@@ -28,6 +28,30 @@ async function createManager(start = 1_000): Promise<{
 		stateRoot,
 	};
 }
+async function writeGuard(
+	manager: WorkspaceLeaseManager,
+	metadata: Record<string, unknown>,
+	mode = 0o600,
+): Promise<string> {
+	const lockPath = manager.lockPath(SAFE_KEY);
+	await fs.mkdir(path.dirname(lockPath), { recursive: true, mode: 0o700 });
+	const guardPath = `${lockPath}.guard`;
+	await fs.writeFile(guardPath, `${JSON.stringify(metadata)}\n`, { mode });
+	await fs.chmod(guardPath, mode);
+	return guardPath;
+}
+
+async function currentStartTicks(): Promise<string> {
+	const stat = await fs.readFile(`/proc/${process.pid}/stat`, "utf8");
+	const closing = stat.lastIndexOf(")");
+	const fields = stat
+		.slice(closing + 2)
+		.trim()
+		.split(/\s+/);
+	const startTicks = fields[19];
+	if (startTicks === undefined) throw new Error("Current process start identity is unavailable");
+	return startTicks;
+}
 
 describe("durable workspace leases", () => {
 	test("uses a safe lock path outside user workspace roots and private records", async () => {
@@ -184,6 +208,107 @@ describe("durable workspace leases", () => {
 		await admitted.release();
 	});
 
+	test("reclaims a guard left by a terminated process", async () => {
+		const { manager } = await createManager();
+		const guardPath = await writeGuard(manager, {
+			pid: Number.MAX_SAFE_INTEGER,
+			startTicks: "1",
+		});
+
+		const lease = await manager.acquire({
+			safeKey: SAFE_KEY,
+			holderId: "recovered-holder",
+			operation: "turn",
+			leaseMs: 1_000,
+		});
+		await expect(fs.stat(guardPath)).rejects.toMatchObject({ code: "ENOENT" });
+		await lease.release();
+	});
+
+	test("does not steal a guard owned by a live process", async () => {
+		const { manager } = await createManager();
+		const guardPath = await writeGuard(manager, {
+			pid: process.pid,
+			startTicks: await currentStartTicks(),
+		});
+
+		await expect(
+			manager.acquire({
+				safeKey: SAFE_KEY,
+				holderId: "blocked-holder",
+				operation: "turn",
+				leaseMs: 1_000,
+			}),
+		).rejects.toThrow(/unavailable/i);
+		expect(JSON.parse(await fs.readFile(guardPath, "utf8"))).toMatchObject({ pid: process.pid });
+	});
+
+	test("fails closed for malformed, symlink, and non-private guards", async () => {
+		const malformed = await createManager();
+		await writeGuard(malformed.manager, { pid: process.pid });
+		await expect(
+			malformed.manager.acquire({ safeKey: SAFE_KEY, holderId: "malformed", operation: "turn", leaseMs: 1_000 }),
+		).rejects.toThrow(/metadata.*invalid/i);
+
+		const symlink = await createManager();
+		const target = path.join(symlink.stateRoot, "guard-target");
+		await fs.writeFile(target, "target\n", { mode: 0o600 });
+		const symlinkPath = await writeGuard(symlink.manager, { pid: process.pid, startTicks: "1" });
+		await fs.unlink(symlinkPath);
+		await fs.symlink(target, symlinkPath);
+		await expect(
+			symlink.manager.acquire({ safeKey: SAFE_KEY, holderId: "symlink", operation: "turn", leaseMs: 1_000 }),
+		).rejects.toThrow(/regular file/i);
+
+		const ambiguous = await createManager();
+		await writeGuard(ambiguous.manager, { pid: Number.MAX_SAFE_INTEGER, startTicks: "1" }, 0o644);
+		await expect(
+			ambiguous.manager.acquire({ safeKey: SAFE_KEY, holderId: "ambiguous", operation: "turn", leaseMs: 1_000 }),
+		).rejects.toThrow(/private/i);
+	});
+	test("concurrent stale-guard recovery has one winner", async () => {
+		const { manager, stateRoot } = await createManager();
+		await writeGuard(manager, { pid: Number.MAX_SAFE_INTEGER, startTicks: "1" });
+		const modulePath = path.resolve("src/security/workspace-lease.ts");
+		const childScript = `
+import { WorkspaceLeaseManager } from ${JSON.stringify(modulePath)};
+const manager = new WorkspaceLeaseManager({
+	stateRoot: ${JSON.stringify(stateRoot)},
+	now: () => Date.now(),
+	monotonicNow: () => Date.now(),
+	bootId: () => "test-boot",
+});
+try {
+	const lease = await manager.acquire({
+		safeKey: ${JSON.stringify(SAFE_KEY)},
+		holderId: "child-holder",
+		operation: "turn",
+		leaseMs: 10_000,
+	});
+	process.stdout.write("acquired\\n");
+	await new Promise(resolve => setTimeout(resolve, 3_000));
+	await lease.release();
+} catch {
+	process.stdout.write("blocked\\n");
+}
+`;
+		const children = [0, 1].map(() =>
+			Bun.spawn([process.execPath, "-e", childScript], {
+				stderr: "pipe",
+				stdout: "pipe",
+			}),
+		);
+		const outcomes = await Promise.all(
+			children.map(async child => ({
+				output: await new Response(child.stdout).text(),
+				exitCode: await child.exited,
+			})),
+		);
+
+		expect(outcomes.filter(outcome => outcome.output.includes("acquired"))).toHaveLength(1);
+		expect(outcomes.filter(outcome => outcome.output.includes("blocked"))).toHaveLength(1);
+		expect(outcomes.every(outcome => outcome.exitCode === 0)).toBe(true);
+	});
 	test("serializes concurrent admission for one workspace", async () => {
 		const { manager } = await createManager();
 		const outcomes = await Promise.allSettled([

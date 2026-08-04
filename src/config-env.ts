@@ -8,6 +8,20 @@ const DEFAULT_OPENWEBUI_BASE_URL = "http://localhost:8080";
 const DEFAULT_STATE_PATH = ".gjc/openwebui-adapter";
 const DEFAULT_GJC_COMMAND = "gjc";
 export const DEFAULT_TURN_TIMEOUT_MS = 180_000;
+export const SESSION_AUTHORITY_MAPPING_FILE = "openwebui-session-mappings.json";
+export type AdapterRuntimeMode = "managed" | "existing";
+
+export function resolveLegacySessionAuthoritySourcePaths(
+	env: Readonly<Record<string, string | undefined>>,
+	mode: AdapterRuntimeMode = "existing",
+): readonly string[] {
+	const candidates: string[] = [];
+	const configuredSessionRoot = env.GJC_OPENWEBUI_SESSION_ROOT?.trim();
+	if (mode === "existing" && (configuredSessionRoot === undefined || configuredSessionRoot.length === 0))
+		candidates.push(join(process.cwd(), SESSION_AUTHORITY_MAPPING_FILE));
+	if (mode === "managed") candidates.push(join("/run/gjc-session", SESSION_AUTHORITY_MAPPING_FILE));
+	return Object.freeze(candidates);
+}
 
 export function resolveTurnTimeoutMs(env: Readonly<Record<string, string | undefined>>): number {
 	return parsePositiveInteger(

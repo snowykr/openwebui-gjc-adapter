@@ -16,12 +16,12 @@ export async function reconcilePendingOperations(
 
 	recoverApplyingOperations(store);
 	for (const pendingOperation of store.listPending()) {
-		const applyingOperation = store.markApplying(pendingOperation.operationId);
+		const applyingOperation = store.markApplying(pendingOperation);
 		try {
 			await applier(applyingOperation);
-			applied.push(store.markApplied(applyingOperation.operationId));
+			applied.push(store.markApplied(applyingOperation));
 		} catch (error) {
-			failed.push(store.markFailed(applyingOperation.operationId, getErrorMessage(error)));
+			failed.push(store.markFailed(applyingOperation, getErrorMessage(error)));
 		}
 	}
 
@@ -30,7 +30,7 @@ export async function reconcilePendingOperations(
 
 export function recoverApplyingOperations(store: OutboxStore): ProjectionOperation[] {
 	const applyingOperations = store.listApplying?.() ?? [];
-	return applyingOperations.map(operation => store.markReconcile(operation.operationId));
+	return applyingOperations.map(operation => store.markReconcile(operation));
 }
 
 function getErrorMessage(error: unknown): string {

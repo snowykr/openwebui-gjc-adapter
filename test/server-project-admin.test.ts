@@ -981,7 +981,7 @@ function chatCommandRequest(
 async function modelIds(handler: (request: Request) => Response | Promise<Response>): Promise<string[]> {
 	const response = await handler(
 		new Request("http://adapter.test/v1/models", {
-			headers: { authorization: "Bearer adapter-token", "X-OpenWebUI-User-Id": "owner-test" },
+			headers: { authorization: "Bearer adapter-token", "X-OpenWebUI-User-Id": "owner-1" },
 		}),
 	);
 	expect(response.status).toBe(200);

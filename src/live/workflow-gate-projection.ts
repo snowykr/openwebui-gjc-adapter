@@ -65,12 +65,15 @@ export function buildEventPayloadHash(events: readonly OpenWebUIMessageEvent[]):
 export function expectedProjectionRows(
 	mapping: SessionMapping,
 	ownerUserId: string,
+	principalId: string | null | undefined = mapping.principalId,
 ): readonly EnqueueProjectionOperationInput[] {
 	const events = projectedMappingEvents(mapping);
+	const scopedPrincipalId = normalizePrincipalId(principalId === null ? undefined : principalId);
 	return [
 		{
 			operationId: mapping.operationId,
 			ownerUserId,
+			...(scopedPrincipalId === undefined ? {} : { principalId: scopedPrincipalId }),
 			projectId: mapping.projectId,
 			chatId: mapping.chatId,
 			kind: "session_mapping",
@@ -79,6 +82,7 @@ export function expectedProjectionRows(
 		{
 			operationId: `${mapping.operationId}:event`,
 			ownerUserId,
+			...(scopedPrincipalId === undefined ? {} : { principalId: scopedPrincipalId }),
 			projectId: mapping.projectId,
 			chatId: mapping.chatId,
 			kind: "event",
@@ -91,16 +95,33 @@ export function ensureProjectionRows(
 	outbox: OutboxStore | undefined,
 	mapping: SessionMapping,
 	ownerUserId: string,
+	principalId: string | null | undefined = mapping.principalId,
 ): void {
-	for (const row of expectedProjectionRows(mapping, ownerUserId)) outbox?.enqueue(row);
+	for (const row of expectedProjectionRows(mapping, ownerUserId, principalId)) outbox?.enqueue(row);
 }
 export function synthesizeProjectionRows(
 	outbox: OutboxStore,
 	mappings: SessionMappingStore,
 	ownerUserId: string,
+	adminPrincipalId?: string,
 ): void {
+	const configuredAdmin = normalizePrincipalId(adminPrincipalId);
 	for (const mapping of mappings.entries()) {
-		const operation = mappings.operation(mapping.chatId, mapping.operationId);
+		const principalId = normalizePrincipalId(mapping.principalId);
+		if (principalId === undefined && configuredAdmin === undefined) continue;
+		const operation =
+			principalId === undefined
+				? (() => {
+						const scoped =
+							configuredAdmin === undefined
+								? undefined
+								: mappings.operationScoped(
+										{ principalId: configuredAdmin, chatId: mapping.chatId },
+										mapping.operationId,
+									);
+						return scoped ?? mappings.operation(mapping.chatId, mapping.operationId);
+					})()
+				: mappings.operationScoped({ principalId, chatId: mapping.chatId }, mapping.operationId);
 		if (operation?.state !== "complete" || operation.result?.mapping.operationId !== mapping.operationId) continue;
 		ensureProjectionRows(
 			outbox,
@@ -110,6 +131,7 @@ export function synthesizeProjectionRows(
 				events: operation.result.events,
 			},
 			ownerUserId,
+			principalId ?? configuredAdmin,
 		);
 	}
 }
@@ -121,10 +143,15 @@ export interface ProjectionSessionSynchronizer {
 export function createProjectionOperationApplier(
 	mappings: SessionMappingStore,
 	synchronizer: ProjectionSessionSynchronizer,
+	adminPrincipalId?: string,
 ): ProjectionOperationApplier {
 	return async (operation: ProjectionOperation) => {
-		const mapping = projectionMapping(mappings, operation);
-		const expected = expectedProjectionRows(mapping, operation.ownerUserId).find(row => row.kind === operation.kind);
+		const mapping = projectionMapping(mappings, operation, normalizePrincipalId(adminPrincipalId));
+		const expected = expectedProjectionRows(
+			mapping,
+			operation.ownerUserId,
+			operation.principalId === undefined ? null : operation.principalId,
+		).find(row => row.kind === operation.kind);
 		if (
 			expected === undefined ||
 			expected.operationId !== operation.operationId ||
@@ -138,10 +165,31 @@ export function createProjectionOperationApplier(
 	};
 }
 
-function projectionMapping(mappings: SessionMappingStore, operation: ProjectionOperation): SessionMapping {
+function projectionMapping(
+	mappings: SessionMappingStore,
+	operation: ProjectionOperation,
+	adminPrincipalId: string | undefined,
+): SessionMapping {
 	const operationId =
 		operation.kind === "event" ? operation.operationId.slice(0, -":event".length) : operation.operationId;
-	const recorded = mappings.operation(operation.chatId, operationId);
+	const principalId = normalizePrincipalId(operation.principalId);
+	const ownerIsConfiguredAdmin = normalizePrincipalId(operation.ownerUserId) === adminPrincipalId;
+	if (principalId === undefined && !ownerIsConfiguredAdmin)
+		throw new Error(`Projection operation ${operation.operationId} has no configured-admin legacy scope`);
+	if (operation.principalId !== undefined && principalId === undefined)
+		throw new Error(`Projection operation ${operation.operationId} has an invalid principal scope`);
+	let recorded: ReturnType<SessionMappingStore["operation"]>;
+	if (principalId === undefined) {
+		recorded =
+			adminPrincipalId === undefined
+				? undefined
+				: mappings.operationScoped({ principalId: adminPrincipalId, chatId: operation.chatId }, operationId);
+		if (recorded === undefined) recorded = mappings.operation(operation.chatId, operationId);
+	} else {
+		recorded = mappings.operationScoped({ principalId, chatId: operation.chatId }, operationId);
+		if (recorded === undefined && principalId === adminPrincipalId && ownerIsConfiguredAdmin)
+			recorded = mappings.operation(operation.chatId, operationId);
+	}
 	if (recorded !== undefined) {
 		if (
 			recorded.state !== "complete" ||
@@ -155,10 +203,34 @@ function projectionMapping(mappings: SessionMappingStore, operation: ProjectionO
 			events: recorded.result.events,
 		};
 	}
-	const mapping = mappings.get(operation.chatId);
+	const mapping =
+		principalId === undefined
+			? (() => {
+					const scoped =
+						adminPrincipalId === undefined
+							? undefined
+							: mappings.getScoped({ principalId: adminPrincipalId, chatId: operation.chatId });
+					return scoped ?? mappings.get(operation.chatId);
+				})()
+			: (() => {
+					const scoped = mappings.getScoped({ principalId, chatId: operation.chatId });
+					return (
+						scoped ??
+						(principalId === adminPrincipalId && ownerIsConfiguredAdmin
+							? mappings.get(operation.chatId)
+							: undefined)
+					);
+				})();
 	if (mapping === undefined || mapping.operationId !== operationId)
 		throw new Error(`Projection operation ${operation.operationId} has no durable session mapping`);
+	if (principalId !== undefined && mapping.principalId !== undefined && mapping.principalId !== principalId)
+		throw new Error(`Projection operation ${operation.operationId} has an invalid principal binding`);
 	return mapping;
+}
+function normalizePrincipalId(value: string | undefined): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const normalized = value.trim();
+	return normalized.length === 0 ? undefined : normalized;
 }
 
 function projectedMappingEvents(mapping: SessionMapping): readonly OpenWebUIMessageEvent[] {
