@@ -34,7 +34,7 @@ describe("project admin route security boundaries", () => {
 			),
 		);
 
-		expect(response.status).toBe(401);
+		expect(response.status).toBe(403);
 		expect(service.listLinkedProjects()).toEqual([]);
 	});
 
@@ -95,7 +95,7 @@ describe("project admin route security boundaries", () => {
 		const response = await handler(
 			new Request("http://adapter.test/admin/projects/%E0%A4%A/unlink", {
 				method: "POST",
-				headers: { authorization: "Bearer adapter-token" },
+				headers: { authorization: "Bearer adapter-token", "X-OpenWebUI-User-Id": "owner-1" },
 			}),
 		);
 
@@ -135,7 +135,7 @@ describe("project admin route security boundaries", () => {
 		const unlinked = await handler(
 			new Request("http://adapter.test/admin/projects/injected-folder/unlink", {
 				method: "POST",
-				headers: { authorization: "Bearer adapter-token" },
+				headers: { authorization: "Bearer adapter-token", "X-OpenWebUI-User-Id": "owner-1" },
 			}),
 		);
 
@@ -188,7 +188,11 @@ function fixedRunner(content: string): LiveGatewayRunner {
 function jsonRequest(url: string, body: unknown): Request {
 	return new Request(url, {
 		method: "POST",
-		headers: { authorization: "Bearer adapter-token", "content-type": "application/json" },
+		headers: {
+			authorization: "Bearer adapter-token",
+			"content-type": "application/json",
+			"X-OpenWebUI-User-Id": "owner-1",
+		},
 		body: JSON.stringify(body),
 	});
 }

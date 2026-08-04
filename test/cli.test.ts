@@ -106,6 +106,7 @@ describe("adapter CLI service", () => {
 			userMessageId: "user-1",
 			userMessageParentId: null,
 			continued: false,
+			ownerUserId: "owner-test",
 		});
 
 		// Then: the injected turn runner is called through routing and assistant content is returned.
@@ -217,7 +218,7 @@ describe("adapter CLI service", () => {
 		]);
 	});
 
-	test("requires forwarded owner headers for CLI chat requests", async () => {
+	test("requires forwarded user headers for CLI chat requests", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-cli-"));
 		const projectDirectory = path.join(workspace, "Demo Project");
 		await fs.mkdir(projectDirectory);
@@ -239,10 +240,10 @@ describe("adapter CLI service", () => {
 		const response = await handler(chatRequest({ includeOwnerHeader: false }));
 
 		expect(response.status).toBe(401);
-		expect(await response.json()).toMatchObject({ error: { code: "missing-forwarded-owner" } });
+		expect(await response.json()).toMatchObject({ error: { code: "missing-forwarded-user" } });
 	});
 
-	test("does not accept a fallback owner when the CLI owner is unconfigured", async () => {
+	test("uses an isolated normal-user workspace when no administrator is configured", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-cli-"));
 		const projectDirectory = path.join(workspace, "Demo Project");
 		await fs.mkdir(projectDirectory);
@@ -257,14 +258,14 @@ describe("adapter CLI service", () => {
 				GJC_OPENWEBUI_STATE_PATH: path.join(workspace, "adapter-state"),
 				GJC_OPENWEBUI_PROJECTS: `${projectDirectory}|Demo Project`,
 			},
-			{ turnRunner },
+			{ turnRunner, modelReaderFactory: staticModelReaderFactory() },
 		);
 		const handler = createAdapterRequestHandler({ routes: options.routes });
 
 		const response = await handler(chatRequest({ userId: "unconfigured-owner" }));
 
-		expect(response.status).toBe(401);
-		expect(await response.json()).toMatchObject({ error: { code: "owner-mismatch" } });
-		expect(turnRunner.starts).toHaveLength(0);
+		expect(response.status).toBe(200);
+		expect(turnRunner.starts).toHaveLength(1);
+		expect(turnRunner.starts[0]?.cwd).toContain(path.join("workspaces", ""));
 	});
 });

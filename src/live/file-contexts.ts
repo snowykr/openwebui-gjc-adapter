@@ -5,6 +5,7 @@ import type { OpenAIChatCompletionRequest } from "./openai-types";
 
 export interface LiveGatewayFileContextResolverInput {
 	readonly reference: OpenWebUIFileReference;
+	readonly ownerUserId: string;
 	readonly project: RegisteredProject;
 	readonly chatId: string;
 	readonly userMessageId: string;
@@ -21,6 +22,7 @@ export async function appendResolvedFileContexts(input: {
 	readonly project: RegisteredProject;
 	readonly chatId: string;
 	readonly userMessageId: string;
+	readonly ownerUserId: string;
 	readonly resolver?: LiveGatewayFileContextResolver;
 }): Promise<string> {
 	if (input.resolver === undefined) return input.prompt;
@@ -28,6 +30,7 @@ export async function appendResolvedFileContexts(input: {
 	for (const reference of openWebUIFileReferences(input.messages, input.files ?? [])) {
 		const file = await input.resolver({
 			reference,
+			ownerUserId: input.ownerUserId,
 			project: input.project,
 			chatId: input.chatId,
 			userMessageId: input.userMessageId,

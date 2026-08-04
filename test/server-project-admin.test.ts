@@ -81,7 +81,7 @@ describe("project admin routes", () => {
 		const unlinked = await handler(
 			new Request("http://adapter.test/admin/projects/admin-project/unlink", {
 				method: "POST",
-				headers: { authorization: "Bearer adapter-token" },
+				headers: { authorization: "Bearer adapter-token", "X-OpenWebUI-User-Id": "owner-1" },
 			}),
 		);
 		expect(unlinked.status).toBe(200);
@@ -197,9 +197,13 @@ describe("project admin routes", () => {
 		if (routes?.projectLinkService === undefined || routes.closeSession === undefined)
 			throw new Error("expected project close routes");
 		const linked = await routes.projectLinkService.linkProject({ cwd: projectDirectory, name: "Dynamic Project" });
-		mappings.set(await currentLifecycleMapping(linked.project.id, sessionId, projectDirectory));
+		const mapping = await currentLifecycleMapping(linked.project.id, sessionId, projectDirectory);
+		mappings.setScoped({ principalId: "owner-test", chatId: mapping.chatId }, mapping);
 		await expect(
-			routes.closeSession(mappings.get("dynamic-chat")!, { ingressId: "direct-close", ingressHash: "direct-close" }),
+			routes.closeSession(mappings.getScoped({ principalId: "owner-test", chatId: "dynamic-chat" })!, {
+				ingressId: "direct-close",
+				ingressHash: "direct-close",
+			}),
 		).resolves.toMatchObject({
 			status: "uncertain",
 		});
@@ -320,7 +324,7 @@ describe("project admin routes", () => {
 		if (routes?.projectLinkService === undefined || routes.closeSession === undefined)
 			throw new Error("expected project close routes");
 		const linked = await routes.projectLinkService.linkProject({ cwd: projectDirectory, name: "Default Project" });
-		mappings.set({
+		const mapping = {
 			...mappingFor(linked.project.id, sessionId),
 			attachment: {
 				...(await currentSdkAttachment(projectDirectory, sessionId)).authority!,
@@ -329,9 +333,12 @@ describe("project admin routes", () => {
 				tmuxPanePid: Number(pid),
 				tmuxOwnershipTag: owner,
 			},
-		});
+		};
+		mappings.setScoped({ principalId: "owner-test", chatId: mapping.chatId }, mapping);
 		const closeIngress = { ingressId: "default-close", ingressHash: "default-close" };
-		await expect(routes.closeSession(mappings.get("dynamic-chat")!, closeIngress)).resolves.toEqual({
+		await expect(
+			routes.closeSession(mappings.getScoped({ principalId: "owner-test", chatId: "dynamic-chat" })!, closeIngress),
+		).resolves.toEqual({
 			status: "closed",
 		});
 		expect(calls).toEqual([]);
@@ -339,8 +346,10 @@ describe("project admin routes", () => {
 		expect(await readSdkSessionEndpoint(projectDirectory, sessionId)).toBeNull();
 		const pane = await runTmux(socket, ["display-message", "-p", "-t", tmuxPane, "#{pane_id}"]);
 		expect(pane.exitCode).not.toBe(0);
-		expect(mappings.get("dynamic-chat")).toBeDefined();
-		expect(mappings.operation("dynamic-chat", "default-close")).toMatchObject({
+		expect(mappings.getScoped({ principalId: "owner-test", chatId: "dynamic-chat" })).toBeDefined();
+		expect(
+			mappings.operationScoped({ principalId: "owner-test", chatId: "dynamic-chat" }, "default-close"),
+		).toMatchObject({
 			id: "default-close",
 			kind: "close",
 			state: "complete",
@@ -352,7 +361,9 @@ describe("project admin routes", () => {
 				mapping: { chatId: "dynamic-chat", sessionId },
 			},
 		});
-		await expect(routes.closeSession(mappings.get("dynamic-chat")!, closeIngress)).resolves.toEqual({
+		await expect(
+			routes.closeSession(mappings.getScoped({ principalId: "owner-test", chatId: "dynamic-chat" })!, closeIngress),
+		).resolves.toEqual({
 			status: "closed",
 		});
 		expect(calls).toEqual([]);
@@ -463,10 +474,11 @@ describe("project admin routes", () => {
 			tmuxOwnershipTag: "owner",
 			ownedAt: "2026-01-01T00:00:00.000Z",
 		};
-		mappings.set({
+		const staleMapping = {
 			...mappingFor(linked.project.id, sessionId),
 			attachment: { ...(await currentSdkAttachment(projectDirectory, sessionId)).authority!, ...pane },
-		});
+		};
+		mappings.setScoped({ principalId: "owner-test", chatId: staleMapping.chatId }, staleMapping);
 
 		await writeSdkDescriptor(projectDirectory, sessionId, {
 			url: "ws://127.0.0.1:9876",
@@ -474,18 +486,22 @@ describe("project admin routes", () => {
 			pid: 42,
 		});
 		await expect(
-			routes.closeSession(mappings.get("dynamic-chat")!, { ingressId: "stale-close", ingressHash: "stale-close" }),
+			routes.closeSession(mappings.getScoped({ principalId: "owner-test", chatId: "dynamic-chat" })!, {
+				ingressId: "stale-close",
+				ingressHash: "stale-close",
+			}),
 		).resolves.toMatchObject({ status: "uncertain" });
 		expect(closes).toBe(0);
 		expect(proofs).toBe(0);
 		expect(discarded).toEqual([]);
 
-		mappings.set({
+		const currentMapping = {
 			...mappingFor(linked.project.id, sessionId),
 			attachment: { ...(await currentSdkAttachment(projectDirectory, sessionId)).authority!, ...pane },
-		});
+		};
+		mappings.setScoped({ principalId: "owner-test", chatId: currentMapping.chatId }, currentMapping);
 		await expect(
-			routes.closeSession(mappings.get("dynamic-chat")!, {
+			routes.closeSession(mappings.getScoped({ principalId: "owner-test", chatId: "dynamic-chat" })!, {
 				ingressId: "current-close",
 				ingressHash: "current-close",
 			}),
@@ -596,10 +612,15 @@ describe("project admin routes", () => {
 			routes.projectLinkService.linkProject({ cwd: firstDirectory, name: "First Project" }),
 			routes.projectLinkService.linkProject({ cwd: secondDirectory, name: "Second Project" }),
 		]);
-		mappings.set(await currentLifecycleMapping(first.project.id, sessionId, firstDirectory, "first-chat"));
-		mappings.set(await currentLifecycleMapping(second.project.id, sessionId, secondDirectory, "second-chat"));
-		await routes.closeSession(mappings.get("first-chat")!, { ingressId: "close-first", ingressHash: "close-first" });
-		await routes.closeSession(mappings.get("second-chat")!, {
+		const firstMapping = await currentLifecycleMapping(first.project.id, sessionId, firstDirectory, "first-chat");
+		const secondMapping = await currentLifecycleMapping(second.project.id, sessionId, secondDirectory, "second-chat");
+		mappings.setScoped({ principalId: "owner-test", chatId: firstMapping.chatId }, firstMapping);
+		mappings.setScoped({ principalId: "owner-test", chatId: secondMapping.chatId }, secondMapping);
+		await routes.closeSession(mappings.getScoped({ principalId: "owner-test", chatId: "first-chat" })!, {
+			ingressId: "close-first",
+			ingressHash: "close-first",
+		});
+		await routes.closeSession(mappings.getScoped({ principalId: "owner-test", chatId: "second-chat" })!, {
 			ingressId: "close-second",
 			ingressHash: "close-second",
 		});
@@ -800,6 +821,7 @@ function adapterEnv(workspace: string): Record<string, string | undefined> {
 function mappingFor(projectId: string, sessionId: string): SessionMapping {
 	return {
 		chatId: "dynamic-chat",
+		principalId: "owner-test",
 		projectId,
 		sessionId,
 		rawFrameCursor: 0,
@@ -926,7 +948,11 @@ function assertExactAttachmentProof(
 function jsonRequest(url: string, body: unknown): Request {
 	return new Request(url, {
 		method: "POST",
-		headers: { authorization: "Bearer adapter-token", "content-type": "application/json" },
+		headers: {
+			authorization: "Bearer adapter-token",
+			"content-type": "application/json",
+			"X-OpenWebUI-User-Id": "owner-1",
+		},
 		body: JSON.stringify(body),
 	});
 }
@@ -954,7 +980,9 @@ function chatCommandRequest(
 
 async function modelIds(handler: (request: Request) => Response | Promise<Response>): Promise<string[]> {
 	const response = await handler(
-		new Request("http://adapter.test/v1/models", { headers: { authorization: "Bearer adapter-token" } }),
+		new Request("http://adapter.test/v1/models", {
+			headers: { authorization: "Bearer adapter-token", "X-OpenWebUI-User-Id": "owner-1" },
+		}),
 	);
 	expect(response.status).toBe(200);
 	const body = (await response.json()) as { data: { id: string }[] };

@@ -5,6 +5,7 @@ import {
 	type SessionMapping,
 	type SessionMappingStore,
 } from "../gjc/session-router";
+import { scopedSessionMappingStore } from "../gjc/session-turn-router";
 import type { GjcLifecycleTestBarrierHook } from "../gjc/turn-runner";
 import { projectPendingWorkflowGateMessage } from "../projection/workflow-gates";
 import type { OutboxStore } from "../state/outbox";
@@ -26,6 +27,11 @@ import {
 	latestPendingWorkflowGate,
 	projectTurnEvents,
 } from "./workflow-gate-turns";
+
+function principalIdForTurn(turn: LiveGatewayRunnerInput): string | undefined {
+	const ownerUserId = turn.ownerUserId;
+	return typeof ownerUserId === "string" && ownerUserId.trim().length > 0 ? ownerUserId : undefined;
+}
 
 export type GjcSessionTurnRunner = Parameters<typeof routeGjcTurn>[0]["runner"];
 export interface CreateGjcRoutingLiveGatewayRunnerInput {
@@ -58,15 +64,20 @@ export function createGjcRoutingLiveGatewayRunner(
 			await input.turnRunner.stop?.();
 		},
 		async run(turn: LiveGatewayRunnerInput): Promise<GjcRoutingLiveGatewayRunnerResult> {
-			let existing = input.mappings.get(turn.chatId);
-			const priorProvisional = input.mappings.provisionalOperation(turn.chatId, turn.userMessageId);
+			const principalId = principalIdForTurn(turn);
+			const scopedMappings =
+				principalId === undefined
+					? input.mappings
+					: scopedSessionMappingStore(input.mappings, principalId, turn.chatId);
+			let existing = scopedMappings.get(turn.chatId);
+			const priorProvisional = scopedMappings.provisionalOperation(turn.chatId, turn.userMessageId);
 			if (
 				priorProvisional !== undefined &&
 				(priorProvisional.projectId !== turn.project.id ||
 					(existing !== undefined && existing.projectId !== priorProvisional.projectId))
 			)
 				throw new Error(`GJC operation ${turn.userMessageId} is not authorized for project ${turn.project.id}.`);
-			const priorAuthority = input.mappings.operationAuthority(turn.chatId, turn.userMessageId);
+			const priorAuthority = scopedMappings.operationAuthority(turn.chatId, turn.userMessageId);
 			if (
 				priorAuthority !== undefined &&
 				("retiredAt" in priorAuthority || priorAuthority.projectId !== turn.project.id)
@@ -78,15 +89,15 @@ export function createGjcRoutingLiveGatewayRunner(
 			let reassignmentStarted = false;
 			const beginReassignment = () => {
 				if (reassignmentSource === undefined || reassignmentStarted) return;
-				input.mappings.beginProjectReassignment(turn.chatId, reassignmentSource, turn.project.id);
+				scopedMappings.beginProjectReassignment(turn.chatId, reassignmentSource, turn.project.id);
 				reassignmentStarted = true;
 			};
 			const rollbackReassignment = (cause: unknown) => {
 				if (reassignmentSource === undefined || !reassignmentStarted) return;
 				try {
-					input.mappings.rollbackProjectReassignment(turn.chatId, reassignmentSource);
+					scopedMappings.rollbackProjectReassignment(turn.chatId, reassignmentSource);
 				} catch (rollbackError) {
-					const committed = input.mappings.get(turn.chatId);
+					const committed = scopedMappings.get(turn.chatId);
 					if (committed?.projectId === turn.project.id) {
 						reassignmentStarted = false;
 						return;
@@ -139,7 +150,7 @@ export function createGjcRoutingLiveGatewayRunner(
 				};
 				if (turn.onLiveEvents === undefined) {
 					gateReplyResult = await input.turnRunner.withLifecyclePublication(gateAddress, lifecycle =>
-						handleWorkflowGateReply(input, turn, boundMapping, lifecycle),
+						handleWorkflowGateReply({ ...input, mappings: scopedMappings }, turn, boundMapping, lifecycle),
 					);
 				} else {
 					const queue = new LiveChunkQueue();
@@ -187,7 +198,13 @@ export function createGjcRoutingLiveGatewayRunner(
 					};
 					void input.turnRunner
 						.withLifecyclePublication(gateAddress, lifecycle =>
-							handleWorkflowGateReply(input, turn, boundMapping, lifecycle, observer),
+							handleWorkflowGateReply(
+								{ ...input, mappings: scopedMappings },
+								turn,
+								boundMapping,
+								lifecycle,
+								observer,
+							),
 						)
 						.then(async result => {
 							markActivityStarted();
@@ -213,6 +230,7 @@ export function createGjcRoutingLiveGatewayRunner(
 				let result: RouteGjcTurnResult;
 				try {
 					result = await routeGjcTurn({
+						...(principalId === undefined ? {} : { principalId }),
 						project: turn.project,
 						chatId: turn.chatId,
 						userMessageId: turn.userMessageId,
@@ -263,6 +281,7 @@ export function createGjcRoutingLiveGatewayRunner(
 				resolveActivity();
 			};
 			void routeGjcTurn({
+				...(principalId === undefined ? {} : { principalId }),
 				project: turn.project,
 				chatId: turn.chatId,
 				userMessageId: turn.userMessageId,

@@ -24,6 +24,7 @@ export interface ResolveLiveProjectContextInput {
 	readonly repository?: OpenWebUIProjectionRepository;
 	readonly neutralWorkspace?: string;
 	readonly now?: Date;
+	readonly allowFolderProject?: boolean;
 }
 
 export async function resolveLiveProjectContext(
@@ -33,7 +34,7 @@ export async function resolveLiveProjectContext(
 		return { ok: false, code: "model_not_found", message: `Unknown GJC model: ${input.modelId}` };
 	}
 
-	const folderProject = await findProjectByOpenWebUIChatFolder(input);
+	const folderProject = input.allowFolderProject === false ? null : await findProjectByOpenWebUIChatFolder(input);
 	if (folderProject !== null) return { ok: true, project: folderProject };
 
 	try {

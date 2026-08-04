@@ -1,6 +1,7 @@
 import type { SessionOperation, SessionOperationResult } from "./session-authority";
 import type { SessionMapping, SessionMappingStore } from "./session-mapping-store";
 import { replayCloseOperation } from "./session-operation-codec";
+import { scopedSessionMappingStore } from "./session-turn-router";
 import type { GjcCloseReceipt, GjcLifecycleTransaction } from "./turn-runner";
 
 export type SessionCloseResult =
@@ -23,28 +24,38 @@ export interface RouteGjcSessionCloseInput extends SessionCloseIngress {
 }
 
 export async function routeGjcSessionClose(input: RouteGjcSessionCloseInput): Promise<SessionCloseResult> {
+	const scopedMappings =
+		typeof input.mapping.principalId === "string" && input.mapping.principalId.trim().length > 0
+			? scopedSessionMappingStore(input.mappings, input.mapping.principalId, input.mapping.chatId)
+			: input.mappings;
+	const scopedInput = scopedMappings === input.mappings ? input : { ...input, mappings: scopedMappings };
 	const prior =
-		input.mappings.operation(input.mapping.chatId, input.ingressId) ??
-		(input.legacyIngress === undefined
+		scopedInput.mappings.operation(scopedInput.mapping.chatId, scopedInput.ingressId) ??
+		(scopedInput.legacyIngress === undefined
 			? undefined
-			: input.mappings.operation(input.mapping.chatId, input.legacyIngress.ingressId));
+			: scopedInput.mappings.operation(scopedInput.mapping.chatId, scopedInput.legacyIngress.ingressId));
 	if (prior !== undefined) {
 		const replayInput =
-			input.legacyIngress !== undefined && prior.id === input.legacyIngress.ingressId
-				? { ...input, ...input.legacyIngress }
-				: input;
+			scopedInput.legacyIngress !== undefined && prior.id === scopedInput.legacyIngress.ingressId
+				? { ...scopedInput, ...scopedInput.legacyIngress }
+				: scopedInput;
 		return replayPriorClose(replayInput, prior);
 	}
-	input.mappings.beginOperation(input.mapping.chatId, {
-		id: input.ingressId,
+	scopedInput.mappings.beginOperation(scopedInput.mapping.chatId, {
+		id: scopedInput.ingressId,
 		kind: "close",
-		ingressId: input.ingressId,
-		detail: input.ingressHash,
+		ingressId: scopedInput.ingressId,
+		detail: scopedInput.ingressHash,
 	});
 	try {
-		const proof = input.mapping.attachment;
+		const proof = scopedInput.mapping.attachment;
 		if (!hasOwnedPaneAttachment(proof)) {
-			input.mappings.transitionOperation(input.mapping.chatId, input.ingressId, "conflict", input.ingressHash);
+			scopedInput.mappings.transitionOperation(
+				scopedInput.mapping.chatId,
+				scopedInput.ingressId,
+				"conflict",
+				scopedInput.ingressHash,
+			);
 			return {
 				status: "uncertain",
 				message: "GJC close requires a complete owned-pane attachment before acknowledgement.",
@@ -52,31 +63,46 @@ export async function routeGjcSessionClose(input: RouteGjcSessionCloseInput): Pr
 		}
 		let receipt: GjcCloseReceipt;
 		try {
-			receipt = input.lifecycle.assertClosePreflight(proof);
+			receipt = scopedInput.lifecycle.assertClosePreflight(proof);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : "GJC close receipt could not be established.";
-			input.mappings.transitionOperation(input.mapping.chatId, input.ingressId, "conflict", input.ingressHash);
+			scopedInput.mappings.transitionOperation(
+				scopedInput.mapping.chatId,
+				scopedInput.ingressId,
+				"conflict",
+				scopedInput.ingressHash,
+			);
 			return { status: "uncertain", message };
 		}
-		const result = await input.close(receipt);
+		const result = await scopedInput.close(receipt);
 		if (result.status !== "closed") {
-			input.mappings.transitionOperation(input.mapping.chatId, input.ingressId, "conflict", input.ingressHash);
+			scopedInput.mappings.transitionOperation(
+				scopedInput.mapping.chatId,
+				scopedInput.ingressId,
+				"conflict",
+				scopedInput.ingressHash,
+			);
 			return result;
 		}
-		await input.lifecycle.publishClosed(receipt, () => {
-			const mapping = input.mappings.completeOperationWithMapping(
-				input.mapping.chatId,
-				input.ingressId,
-				input.ingressHash,
-				input.mapping,
+		await scopedInput.lifecycle.publishClosed(receipt, () => {
+			const mapping = scopedInput.mappings.completeOperationWithMapping(
+				scopedInput.mapping.chatId,
+				scopedInput.ingressId,
+				scopedInput.ingressHash,
+				scopedInput.mapping,
 				"close",
 			);
-			input.afterPublish?.(mapping);
+			scopedInput.afterPublish?.(mapping);
 			return mapping;
 		});
 		return result;
 	} catch (error) {
-		input.mappings.transitionOperation(input.mapping.chatId, input.ingressId, "uncertain", input.ingressHash);
+		scopedInput.mappings.transitionOperation(
+			scopedInput.mapping.chatId,
+			scopedInput.ingressId,
+			"uncertain",
+			scopedInput.ingressHash,
+		);
 		throw error;
 	}
 }

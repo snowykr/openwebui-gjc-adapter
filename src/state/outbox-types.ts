@@ -5,6 +5,7 @@ export const OUTBOX_DOCUMENT_VERSION = 1;
 
 export interface ProjectionOperation {
 	operationId: string;
+	principalId?: string;
 	ownerUserId: string;
 	projectId: string;
 	chatId: string;
@@ -19,6 +20,7 @@ export interface ProjectionOperation {
 
 export interface EnqueueProjectionOperationInput {
 	operationId?: string;
+	principalId?: string;
 	ownerUserId: string;
 	projectId: string;
 	chatId: string;
@@ -26,22 +28,33 @@ export interface EnqueueProjectionOperationInput {
 	payloadHash: string;
 	now?: Date;
 }
+export type ProjectionOperationReference = string | Pick<ProjectionOperation, "principalId" | "chatId" | "operationId">;
+
+export function canonicalProjectionOperationKey(
+	principalId: string | undefined,
+	chatId: string,
+	operationId: string,
+): string {
+	return JSON.stringify([principalId ?? null, chatId, operationId]);
+}
 export function assertSameEnqueueIdentity(existing: ProjectionOperation, input: EnqueueProjectionOperationInput): void {
 	for (const field of ["ownerUserId", "projectId", "chatId", "kind", "payloadHash"] as const) {
 		if (existing[field] !== input[field])
 			throw new Error(`Projection operation ID conflict: ${existing.operationId}`);
 	}
+	if (existing.principalId !== normalizeProjectionPrincipalId(input.principalId))
+		throw new Error(`Projection operation ID conflict: ${existing.operationId}`);
 }
 
 export interface OutboxStore {
 	enqueue(input: EnqueueProjectionOperationInput): ProjectionOperation;
-	markApplying(operationId: string, now?: Date): ProjectionOperation;
-	markApplied(operationId: string, now?: Date): ProjectionOperation;
-	markFailed(operationId: string, error: string, now?: Date): ProjectionOperation;
-	markReconcile(operationId: string, now?: Date): ProjectionOperation;
+	markApplying(reference: ProjectionOperationReference, now?: Date): ProjectionOperation;
+	markApplied(reference: ProjectionOperationReference, now?: Date): ProjectionOperation;
+	markFailed(reference: ProjectionOperationReference, error: string, now?: Date): ProjectionOperation;
+	markReconcile(reference: ProjectionOperationReference, now?: Date): ProjectionOperation;
 	listPending(): ProjectionOperation[];
 	listApplying?(): ProjectionOperation[];
-	get(operationId: string): ProjectionOperation | undefined;
+	get(reference: ProjectionOperationReference): ProjectionOperation | undefined;
 }
 
 export interface OutboxFileSystem {
@@ -76,11 +89,12 @@ export function parsePersistedOutboxDocument(serialized: string): PersistedOutbo
 	) {
 		throw new Error("Invalid outbox document");
 	}
-	const operationIds = new Set<string>();
+	const operationKeys = new Set<string>();
 	const operations = value.operations.map((operation, index) => {
 		const parsed = parseOperation(operation, index);
-		if (operationIds.has(parsed.operationId)) throw new Error(`Duplicate outbox operation ID: ${parsed.operationId}`);
-		operationIds.add(parsed.operationId);
+		const key = canonicalProjectionOperationKey(parsed.principalId, parsed.chatId, parsed.operationId);
+		if (operationKeys.has(key)) throw new Error(`Duplicate outbox operation identity: ${parsed.operationId}`);
+		operationKeys.add(key);
 		return parsed;
 	});
 	return { version: OUTBOX_DOCUMENT_VERSION, operations };
@@ -99,11 +113,14 @@ function parseOperation(value: unknown, index: number): ProjectionOperation {
 		"createdAt",
 		"updatedAt",
 	];
-	if (!isRecord(value) || !hasOnlyKeys(value, [...keys, "lastError"]) || keys.some(key => !(key in value))) {
+	const optionalKeys = ["principalId", "lastError"] as const;
+	if (!isRecord(value) || !hasOnlyKeys(value, [...keys, ...optionalKeys]) || keys.some(key => !(key in value))) {
 		throw new Error(`Invalid outbox operation at index ${index}`);
 	}
 	const hasLastError = "lastError" in value;
 	const lastError = value.lastError;
+	const hasPrincipalId = "principalId" in value;
+	const principalId = hasPrincipalId ? value.principalId : undefined;
 	if (
 		!isNonEmptyString(value.operationId) ||
 		!isNonEmptyString(value.ownerUserId) ||
@@ -120,12 +137,17 @@ function parseOperation(value: unknown, index: number): ProjectionOperation {
 	)
 		throw new Error(`Invalid outbox operation at index ${index}`);
 	let parsedLastError: string | undefined;
+	if (hasPrincipalId && !isNonEmptyPrincipalId(principalId))
+		throw new Error(`Invalid outbox operation at index ${index}`);
+	let parsedPrincipalId: string | undefined;
+	if (hasPrincipalId) parsedPrincipalId = normalizeProjectionPrincipalId(principalId as string);
 	if (hasLastError) {
 		if (typeof lastError !== "string") throw new Error(`Invalid outbox operation at index ${index}`);
 		parsedLastError = lastError;
 	}
 	const operation: ProjectionOperation = {
 		operationId: value.operationId,
+		...(parsedPrincipalId === undefined ? {} : { principalId: parsedPrincipalId }),
 		ownerUserId: value.ownerUserId,
 		projectId: value.projectId,
 		chatId: value.chatId,
@@ -152,6 +174,15 @@ function isNonEmptyString(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0;
 }
 
+function isNonEmptyPrincipalId(value: unknown): value is string {
+	return typeof value === "string" && value.trim().length > 0;
+}
+
+export function normalizeProjectionPrincipalId(value: string | undefined): string | undefined {
+	if (value === undefined) return undefined;
+	if (!isNonEmptyPrincipalId(value)) throw new Error("Projection operation principal ID must be a non-empty string.");
+	return value.trim();
+}
 function isProjectionKind(value: unknown): value is ProjectionOperationKind {
 	return (
 		value === "folder" ||

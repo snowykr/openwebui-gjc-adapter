@@ -1,14 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import { access } from "node:fs/promises";
 import * as path from "node:path";
+import { canonicalSessionMappingKey } from "../src/gjc/session-mapping-store";
 import { LOW_MODEL_ID, MEDIUM_MODEL_ID, OFF_MODEL_ID } from "./model-selection-fixtures";
 import { expectNoDeliveryMutation, expectSelectionError } from "./real-selection-expectations";
 import { RealSelectionHarness } from "./real-selection-harness";
 
 function expectNoPersistedModelSelectionBinding(document: unknown, chatId: string): void {
+	const scopedChatId = canonicalSessionMappingKey("owner-selection", chatId);
 	expect(document).toEqual(expect.objectContaining({ mappings: expect.any(Array) }));
 	const mappings = (document as { mappings: unknown[] }).mappings.filter(
-		(mapping): mapping is Record<string, unknown> => isRecord(mapping) && mapping.chatId === chatId,
+		(mapping): mapping is Record<string, unknown> => isRecord(mapping) && mapping.chatId === scopedChatId,
 	);
 	expect(mappings).toHaveLength(1);
 	for (const mapping of mappings) {
@@ -17,7 +19,7 @@ function expectNoPersistedModelSelectionBinding(document: unknown, chatId: strin
 		expect(Array.isArray(journal)).toBe(true);
 		const snapshots = (journal as unknown[])
 			.map(operation => (isRecord(operation) && isRecord(operation.result) ? operation.result.mapping : undefined))
-			.filter(snapshot => isRecord(snapshot) && snapshot.chatId === chatId);
+			.filter(snapshot => isRecord(snapshot) && snapshot.chatId === scopedChatId);
 		expect(snapshots.length).toBeGreaterThan(0);
 		for (const snapshot of snapshots) expect(snapshot).not.toHaveProperty("modelSelection");
 	}
@@ -174,9 +176,10 @@ describe("real canonical model selection scenarios", () => {
 				readonly mappings: readonly { readonly chatId?: unknown }[];
 				readonly provisionalOperations: readonly Record<string, unknown>[];
 			};
-			expect(mappingDocument.mappings.some(mapping => mapping.chatId === "chat-prompt-failed")).toBeFalse();
+			const scopedChatId = canonicalSessionMappingKey("owner-selection", "chat-prompt-failed");
+			expect(mappingDocument.mappings.some(mapping => mapping.chatId === scopedChatId)).toBeFalse();
 			const provisional = mappingDocument.provisionalOperations.filter(
-				operation => operation.chatId === "chat-prompt-failed",
+				operation => operation.chatId === scopedChatId,
 			);
 			expect(provisional).toHaveLength(1);
 			const operation = provisional[0] as Record<string, unknown>;
@@ -190,7 +193,7 @@ describe("real canonical model selection scenarios", () => {
 				ingressId: "user-prompt-failed",
 				kind: "create",
 				state: "uncertain",
-				chatId: "chat-prompt-failed",
+				chatId: scopedChatId,
 				projectId: "openwebui",
 				detail: expect.stringMatching(/^[a-f0-9]{64}$/),
 			});
@@ -275,7 +278,8 @@ describe("real canonical model selection scenarios", () => {
 			expect(await first).toMatchObject({ status: 200, body: { model: LOW_MODEL_ID } });
 			expect(await second).toMatchObject({ status: 200, body: { model: OFF_MODEL_ID } });
 			const mappings = await harness.mappingEntries();
-			const selectionFor = (chatId: string) => mappings.find(row => row.chatId === chatId)?.modelSelection;
+			const selectionFor = (chatId: string) =>
+				mappings.find(row => row.chatId === canonicalSessionMappingKey("owner-selection", chatId))?.modelSelection;
 			expect(selectionFor("chat-overlap-low")).toMatchObject({ thinkingLevel: "low" });
 			expect(selectionFor("chat-overlap-off")).toMatchObject({ thinkingLevel: "off" });
 

@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { buildAdapterServerOptionsFromEnv } from "../src/cli";
-import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
+import { InMemoryOpenWebUIProjectionRepository, type OpenWebUIProjectionRepository } from "../src/openwebui/client";
 import { SqliteProjectRegistrationStore } from "../src/projects/registration-store";
 import { registerProjectDirectory } from "../src/projects/registry";
 import { resolveAllowedRoots } from "../src/security/paths";
@@ -95,6 +95,75 @@ describe("adapter CLI project reconciliation", () => {
 
 		expect(projectListText(projectList)).toContain("unlinked: deleted-during-runtime");
 		expect(store.getProject("deleted-during-runtime")).toMatchObject({ status: "unlinked" });
+	});
+	test("keeps serving when startup linked-project projection is temporarily unavailable", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-cli-reconcile-"));
+		const projectDirectory = path.join(workspace, "Unavailable Projection");
+		await fs.mkdir(path.join(projectDirectory, ".gjc", "sessions"), { recursive: true });
+		const allowedRoots = await resolveAllowedRoots([workspace]);
+		const project = await registerProjectDirectory(
+			{ cwd: projectDirectory, name: "Unavailable Projection", openWebUIFolderId: "unavailable-folder" },
+			allowedRoots,
+		);
+		const store = new SqliteProjectRegistrationStore(":memory:");
+		store.linkProject(project, "admin");
+		let projectionAvailable = false;
+		let projectedFolder: Awaited<ReturnType<OpenWebUIProjectionRepository["upsertFolder"]>> | undefined;
+		const repository: OpenWebUIProjectionRepository = {
+			upsertFolder: async record => {
+				if (!projectionAvailable) throw new Error("OpenWebUI unavailable");
+				projectedFolder = record;
+				return record;
+			},
+			upsertChat: async record => {
+				if (!projectionAvailable) throw new Error("OpenWebUI unavailable");
+				return record;
+			},
+			replaceChatMessages: async (_ownerUserId, _chatId, messages) => {
+				if (!projectionAvailable) throw new Error("OpenWebUI unavailable");
+				return messages;
+			},
+			getFolder: async () => {
+				if (!projectionAvailable) throw new Error("OpenWebUI unavailable");
+				return projectedFolder;
+			},
+			getChat: async () => {
+				if (!projectionAvailable) throw new Error("OpenWebUI unavailable");
+				return undefined;
+			},
+		};
+		const originalError = console.error;
+		const errors: string[] = [];
+		console.error = (...args: unknown[]) => errors.push(args.join(" "));
+		let options: Awaited<ReturnType<typeof buildAdapterServerOptionsFromEnv>> | undefined;
+		let retriedProjects: readonly unknown[] | undefined;
+		try {
+			options = await buildAdapterServerOptionsFromEnv(envFor(workspace, ""), {
+				turnRunner: new FakeGjcTurnRunner(),
+				projectionRepository: repository,
+				projectRegistrationStore: store,
+				modelReaderFactory: staticModelReaderFactory(),
+			});
+			projectionAvailable = true;
+			const projectProvider = options.routes?.projectProvider;
+			if (typeof projectProvider !== "function") throw new Error("expected project provider");
+			retriedProjects = await projectProvider();
+		} finally {
+			console.error = originalError;
+			await options?.runtimeLock.release();
+			store.close();
+			await fs.rm(workspace, { force: true, recursive: true });
+		}
+
+		expect(options?.checks).toContainEqual(
+			expect.objectContaining({
+				name: "openwebui-project-projection",
+				status: "degraded",
+			}),
+		);
+		expect(retriedProjects).toHaveLength(1);
+		expect(projectedFolder).toBeDefined();
+		expect(errors).toEqual(["OpenWebUI linked-project projection reconciliation failed; serving continues."]);
 	});
 });
 

@@ -405,7 +405,10 @@ describe("CLI module boundaries", () => {
 				/\/?(?:adapter|router|cli)(?:[-/]|$)/.test(importPath),
 			),
 			resolvedServerChain:
-				baseSource.includes("buildResolvedAdapterServerOptions(loadAdapterConfig(env), dependencies)") &&
+				baseSource.includes("buildResolvedAdapterServerOptions(config, dependencies, {") &&
+				baseSource.includes(
+					"sessionAuthorityMigrationSourcePaths: resolveLegacySessionAuthoritySourcePaths(env)",
+				) &&
 				cliSource.includes("buildResolvedInstalledAdapterServerOptions(config)") &&
 				installedSource.includes("buildResolvedAdapterServerOptions(config") &&
 				baseSource.includes("createPublicSdkGjcTurnRunner({") &&

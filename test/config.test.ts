@@ -38,7 +38,7 @@ describe("adapter config contracts", () => {
 		expect(config.statePath).toBe(".gjc/openwebui-adapter");
 		expect(config.gjcCommand).toBe("gjc");
 		expect(config.turnTimeoutMs).toBe(180_000);
-		expect(config.sessionRoot).toBe(process.cwd());
+		expect(config.sessionRoot).toBe(join(config.statePath, "sessions"));
 		expect(config.allowedProjectRoots).toEqual([process.cwd()]);
 		expect(config.projects).toEqual([]);
 	});
@@ -171,11 +171,18 @@ describe("adapter config contracts", () => {
 			expect(managed.turnTimeoutMs).toBe(180_000);
 			expect(managed).toMatchObject({
 				statePath: "/var/lib/gjc",
-				sessionRoot: "/run/gjc-session",
-				allowedProjectRoots: ["/workspace", "/run/gjc-session"],
+				sessionRoot: "/var/lib/gjc/sessions",
+				allowedProjectRoots: ["/workspace", "/var/lib/gjc"],
 				adapterApiToken: "adapter",
 				gjcCommand: "gjc",
 			});
+			expect(managed.projects).toEqual([
+				{
+					cwd: "/workspace",
+					name: "default",
+					sessionRoot: "/var/lib/gjc/sessions",
+				},
+			]);
 			expect(loadInstalledAdapterConfig(file, { GJC_OPENWEBUI_TURN_TIMEOUT_MS: "300000" }).turnTimeoutMs).toBe(
 				300_000,
 			);

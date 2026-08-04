@@ -231,13 +231,13 @@ function requestInit(body: unknown, openWebUI = false): RequestInit {
 		headers: {
 			authorization: "Bearer adapter-token",
 			"content-type": "application/json",
+			"X-OpenWebUI-User-Id": "owner-1",
 			...(openWebUI
 				? {
 						"X-OpenWebUI-Chat-Id": "chat-1",
 						"X-OpenWebUI-Message-Id": "assistant-1",
 						"X-OpenWebUI-User-Message-Id": "user-1",
 						"X-OpenWebUI-User-Message-Parent-Id": "",
-						"X-OpenWebUI-User-Id": "owner-1",
 					}
 				: {}),
 		},

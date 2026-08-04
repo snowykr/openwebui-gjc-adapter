@@ -854,6 +854,77 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		expect(replayRunner.continues).toHaveLength(0);
 		expect(replayRunner.gateResponses).toHaveLength(0);
 	});
+	test("isolates persisted create, resume, and replay mappings by principal", async () => {
+		const root = mkdtempSync(join(tmpdir(), "gjc-principal-session-mapping-"));
+		const filePath = join(root, "mappings.json");
+		const firstRunner = new FakeGjcTurnRunner();
+		const first = createGjcRoutingLiveGatewayRunner({
+			turnRunner: firstRunner,
+			mappings: new FileBackedSessionMappingStore(filePath),
+		});
+		const firstTurn = (ownerUserId: string, prompt: string) => ({
+			project,
+			prompt,
+			chatId: "shared-chat",
+			messageId: "assistant-create",
+			userMessageId: "shared-create",
+			userMessageParentId: null,
+			continued: false,
+			ownerUserId,
+		});
+		const resumeTurn = (ownerUserId: string, prompt: string) => ({
+			project,
+			prompt,
+			chatId: "shared-chat",
+			messageId: "assistant-resume",
+			userMessageId: "shared-resume",
+			userMessageParentId: "assistant-create",
+			continued: true,
+			ownerUserId,
+		});
+		try {
+			await expect(first.run(firstTurn("principal-a", "from-a"))).resolves.toEqual({ content: "new:from-a" });
+			await expect(first.run(firstTurn("principal-b", "from-b"))).resolves.toEqual({ content: "new:from-b" });
+			await expect(first.run(resumeTurn("principal-a", "resume-a"))).resolves.toEqual({
+				content: "continued:resume-a",
+			});
+			await expect(first.run(resumeTurn("principal-b", "resume-b"))).resolves.toEqual({
+				content: "continued:resume-b",
+			});
+
+			const persisted = new FileBackedSessionMappingStore(filePath);
+			expect(persisted.get("shared-chat")).toBeUndefined();
+			expect(persisted.getScoped({ principalId: "principal-a", chatId: "shared-chat" })).toMatchObject({
+				principalId: "principal-a",
+				assistantText: "continued:resume-a",
+				operationId: "shared-resume",
+			});
+			expect(persisted.getScoped({ principalId: "principal-b", chatId: "shared-chat" })).toMatchObject({
+				principalId: "principal-b",
+				assistantText: "continued:resume-b",
+				operationId: "shared-resume",
+			});
+
+			const replayRunner = new FakeGjcTurnRunner();
+			const replay = createGjcRoutingLiveGatewayRunner({
+				turnRunner: replayRunner,
+				mappings: new FileBackedSessionMappingStore(filePath),
+			});
+			await expect(replay.run(firstTurn("principal-a", "from-a"))).resolves.toEqual({ content: "new:from-a" });
+			await expect(replay.run(firstTurn("principal-b", "from-b"))).resolves.toEqual({ content: "new:from-b" });
+			await expect(replay.run(resumeTurn("principal-a", "resume-a"))).resolves.toEqual({
+				content: "continued:resume-a",
+			});
+			await expect(replay.run(resumeTurn("principal-b", "resume-b"))).resolves.toEqual({
+				content: "continued:resume-b",
+			});
+			expect(replayRunner.starts).toHaveLength(0);
+			expect(replayRunner.switches).toHaveLength(0);
+			expect(replayRunner.continues).toHaveLength(0);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
 	test("persists endpoint-backed provisional create authority before a transcript exists and reconciles it on restart", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-mapping-")), "mappings.json");
 		const first = new FileBackedSessionMappingStore(filePath);
@@ -1132,7 +1203,10 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			expect(branchIndex).toBeLessThan(successorQ14Index);
 			expect(successorQ14Index).toBeLessThan(ordered.indexOf("turn.prompt"));
 
-			const persisted = new FileBackedSessionMappingStore(fixture.mappingFile).get("chat-q16");
+			const persisted = new FileBackedSessionMappingStore(fixture.mappingFile).getScoped({
+				principalId: "owner-q16",
+				chatId: "chat-q16",
+			});
 			expect(persisted).toMatchObject({
 				sessionId: "sdk-session-successor",
 				sessionFile: fixture.successorPath,
@@ -1193,7 +1267,9 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		try {
 			await expect(fixture.runner.run(fixture.turn)).rejects.toThrow("post-ack interruption");
 			const restartedMappings = new FileBackedSessionMappingStore(fixture.mappingFile);
-			expect(restartedMappings.operation("chat-q16", "branch-q16")).toMatchObject({
+			expect(
+				restartedMappings.operationScoped({ principalId: "owner-q16", chatId: "chat-q16" }, "branch-q16"),
+			).toMatchObject({
 				id: "branch-q16",
 				kind: "branch",
 				state: "uncertain",
@@ -1205,7 +1281,10 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 					}),
 				},
 			});
-			const checkpoint = restartedMappings.operation("chat-q16", "branch-q16")?.acknowledgedSuccessor;
+			const checkpoint = restartedMappings.operationScoped(
+				{ principalId: "owner-q16", chatId: "chat-q16" },
+				"branch-q16",
+			)?.acknowledgedSuccessor;
 			expect(Object.keys(checkpoint?.attachment ?? {}).sort()).toEqual([
 				"descriptorPath",
 				"descriptorStat",
@@ -1215,9 +1294,12 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				"payloadDigest",
 			]);
 			expect(
-				new FileBackedSessionMappingStore(fixture.mappingFile).operation("chat-q16", "branch-q16"),
+				new FileBackedSessionMappingStore(fixture.mappingFile).operationScoped(
+					{ principalId: "owner-q16", chatId: "chat-q16" },
+					"branch-q16",
+				),
 			).toMatchObject({ acknowledgedSuccessor: checkpoint });
-			expect(restartedMappings.get("chat-q16")).toMatchObject({
+			expect(restartedMappings.getScoped({ principalId: "owner-q16", chatId: "chat-q16" })).toMatchObject({
 				sessionId: "sdk-session-created",
 				operationId: "predecessor-q16",
 			});
@@ -1240,12 +1322,20 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				),
 			).toHaveLength(0);
 			expect(fixture.server.frames.some(frame => frame.operation === "session.close")).toBe(false);
-			expect(new FileBackedSessionMappingStore(fixture.mappingFile).get("chat-q16")).toMatchObject({
+			expect(
+				new FileBackedSessionMappingStore(fixture.mappingFile).getScoped({
+					principalId: "owner-q16",
+					chatId: "chat-q16",
+				}),
+			).toMatchObject({
 				sessionId: "sdk-session-created",
 				operationId: "predecessor-q16",
 			});
 			expect(
-				new FileBackedSessionMappingStore(fixture.mappingFile).operation("chat-q16", "branch-q16"),
+				new FileBackedSessionMappingStore(fixture.mappingFile).operationScoped(
+					{ principalId: "owner-q16", chatId: "chat-q16" },
+					"branch-q16",
+				),
 			).toMatchObject({ state: "uncertain", acknowledgedSuccessor: checkpoint });
 		} finally {
 			fixture.dispose();
@@ -2430,15 +2520,18 @@ function setupPublicSdkBranchFixture(scenario: SdkFixtureScenario, routingBarrie
 	);
 	const branchProject = { ...project, cwd: root, sessionRoot };
 	const mappings = new FileBackedSessionMappingStore(mappingFile);
-	mappings.set({
-		...mappingInput(mediumSelection),
-		chatId: "chat-q16",
-		projectId: branchProject.id,
-		sessionId: "sdk-session-created",
-		sessionFile: predecessorPath,
-		operationId: "predecessor-q16",
-		modelSelection: undefined,
-	});
+	mappings.setScoped(
+		{ principalId: "owner-q16", chatId: "chat-q16" },
+		{
+			...mappingInput(mediumSelection),
+			chatId: "chat-q16",
+			projectId: branchProject.id,
+			sessionId: "sdk-session-created",
+			sessionFile: predecessorPath,
+			operationId: "predecessor-q16",
+			modelSelection: undefined,
+		},
+	);
 	const runnerInput = {
 		cliPath: join(root, "missing-gjc-cli"),
 		runtimeLocations: {

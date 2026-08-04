@@ -59,6 +59,45 @@ describe("project link registration", () => {
 			{ sessionId: "linked-sdk", sessionFile: path.join(sdkSessionRoot, "linked-sdk.jsonl") },
 		]);
 	});
+	test("rejects managed state subtrees as project roots while allowing the durable session root", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-state-admission-"));
+		tempDirs.push(workspace);
+		const stateRoot = path.join(workspace, "managed-state");
+		const projectDirectory = path.join(workspace, "Configured Project");
+		const sessionRoot = path.join(stateRoot, "sessions");
+		await fs.mkdir(projectDirectory);
+		await fs.mkdir(sessionRoot, { recursive: true });
+		const service = new ProjectLinkService({
+			allowedRoots: await resolveAllowedRoots([workspace, stateRoot]),
+			store: new SqliteProjectRegistrationStore(":memory:"),
+			ownerUserId: "owner-1",
+			protectedPaths: protectedPathsFor(workspace),
+			protectedProjectRoots: [stateRoot],
+		});
+
+		await expect(
+			service.linkProject({ cwd: projectDirectory, name: "Configured Project", sessionRoot }),
+		).resolves.toMatchObject({ project: { cwd: projectDirectory, sessionRoot } });
+
+		for (const relativePath of [
+			"",
+			"workspaces",
+			"locks",
+			"outbox",
+			"registry",
+			"authority",
+			"migration",
+			"sessions",
+		]) {
+			const candidate = relativePath === "" ? stateRoot : path.join(stateRoot, relativePath);
+			await fs.mkdir(candidate, { recursive: true });
+			await expect(
+				service.linkProject({ cwd: candidate, name: `Managed ${relativePath || "state"}` }),
+			).rejects.toMatchObject({
+				code: "invalid_project_link",
+			});
+		}
+	});
 
 	test("keeps an explicit unlink across env seeding until the project is linked again", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-link-store-"));

@@ -25,9 +25,20 @@ export class ProjectPathAccessError extends Error {
 export async function assertProjectsAdmitted(
 	projects: readonly RegisteredProject[],
 	protectedPaths: GjcRuntimeLocations["protectedProjectPaths"],
+	protectedProjectRoots: readonly string[] = [],
 ): Promise<void> {
 	const canonicalProtectedPaths = await Promise.all(protectedPaths.map(resolveExistingOrProspectivePath));
+	const canonicalProtectedProjectRoots = await Promise.all(
+		protectedProjectRoots.map(resolveExistingOrProspectivePath),
+	);
 	for (const project of projects) {
+		const canonicalProjectCwd = await resolveExistingOrProspectivePath(project.cwd);
+		if (canonicalProtectedProjectRoots.some(protectedRoot => pathsOverlap(canonicalProjectCwd, protectedRoot))) {
+			throw new ProjectLinkError(
+				"Project paths must not overlap protected GJC runtime paths.",
+				"invalid_project_link",
+			);
+		}
 		const candidatePaths = project.sessionRoot === undefined ? [project.cwd] : [project.cwd, project.sessionRoot];
 		for (const candidatePath of candidatePaths) {
 			const canonicalCandidatePath = await resolveExistingOrProspectivePath(candidatePath);

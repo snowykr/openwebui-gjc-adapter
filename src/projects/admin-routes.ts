@@ -7,7 +7,7 @@ import type {
 	OpenAIChatCompletionResponse,
 	OpenAIModelListResponse,
 } from "../live/openai-types";
-import { type OpenWebUIOwnerContext, validateForwardedOwnerUserId } from "../openwebui/auth";
+import { type OpenWebUIOwnerContext, resolveForwardedPrincipal } from "../openwebui/auth";
 import type { OpenWebUIHeaderInput } from "../openwebui/headers";
 import { parseOpenWebUIHeaders } from "../openwebui/headers";
 import { executeProjectCommand, latestUserText } from "./admin-chat-command";
@@ -81,9 +81,12 @@ export async function handleProjectAdminChatCompletion(
 	if (!parsedHeaders.ok) {
 		return errorResult(parsedHeaders.errors.map(error => error.message).join("; "), "invalid_openwebui_headers", 400);
 	}
-	const owner = validateForwardedOwnerUserId(ownerContext, parsedHeaders.userId);
-	if (!owner.ok) {
-		return errorResult("Forwarded OpenWebUI owner does not match adapter owner.", owner.reason, 401);
+	const principal = resolveForwardedPrincipal(ownerContext, parsedHeaders.userId);
+	if (!principal.ok) {
+		return errorResult("A non-empty forwarded OpenWebUI user ID is required.", principal.reason, 401);
+	}
+	if (principal.principal.role !== "admin") {
+		return errorResult("OpenWebUI administrator privileges are required.", "admin_required", 403);
 	}
 	if (parsedHeaders.isBackgroundTask) {
 		try {

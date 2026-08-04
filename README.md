@@ -37,6 +37,9 @@ Add the required custom headers on the OpenAI connection:
   "X-OpenWebUI-Task": "{{TASK}}"
 }
 ```
+`X-OpenWebUI-User-Id` is required on every `/v1` request, including `/v1/models`. The adapter must be reachable only from trusted private or loopback OpenWebUI ingress: the shared adapter token authenticates that ingress, while the forwarded user ID establishes the request principal. Only the exact configured `GJC_OPENWEBUI_OWNER_USER_ID` is an administrator. Other users receive a durable private workspace at `<adapter-state>/workspaces/<sha256-user-id>/workspace`, with `.gjc/sessions` inside that workspace; raw user IDs never appear in paths.
+
+Normal users cannot resolve linked host projects, project-admin routes, or another principal's chat, file, message, session, replay, close, or reaper state. Administrator project operations remain available through the configured owner identity. Workspace cleanup is administrator-only: `POST /admin/workspaces/{userId}/cleanup/preview` returns a short-lived confirmation token, and `POST /admin/workspaces/{userId}/cleanup` consumes `{ "confirmationToken": "…" }`. Cleanup is lease-fenced and leaves the workspace blocked when completion is uncertain.
 
 Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. The adapter and managed image use the published `@gajae-code/ai`, `@gajae-code/bridge-client`, `@gajae-code/coding-agent`, and `@gajae-code/natives` `0.12.8` release. The image runs the published `gjc` executable as the non-root `adapter` user, including `tmux`; it does not build a private broker or apply an upstream source patch. Background task calls such as title generation are no-ops and must not create GJC sessions.
 
@@ -183,7 +186,7 @@ The same exact-proof close applies to admin close and adapter-created temporary 
 
 The adapter does not use private daemon, global broker, private protocol, or GJC database interfaces.
 
-Inside OpenWebUI, send these slash-style commands in a normal `gjc` chat for project administration:
+Inside OpenWebUI, the configured administrator can send these slash-style commands in a `gjc` chat for project administration:
 
 ```text
 /gjc project link /home/me/src/my-repo
@@ -191,7 +194,7 @@ Inside OpenWebUI, send these slash-style commands in a normal `gjc` chat for pro
 /gjc project unlink my-repo
 ```
 
-The adapter also seeds OpenWebUI Workspace Prompt hints for those project commands and for canonical GJC workflows:
+The adapter seeds only normal-user-safe workflow prompts globally:
 
 ```text
 /skill:deep-interview {{REQUEST}}

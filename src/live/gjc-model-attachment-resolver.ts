@@ -4,7 +4,7 @@ import type { GjcRuntimeLocations } from "../contracts";
 import { CliLifecycleBackend, MAX_LIFECYCLE_CLOSE_PROOF_WINDOW_MS } from "../gjc/cli-lifecycle-backend";
 import type { PublicSdkSessionAttachment } from "../gjc/public-sdk-contract";
 import { requireLifecycleAttachment, waitForSdkEndpoint } from "./gjc-routing-endpoints";
-import { registerTemporaryModelAttachment } from "./model-reader";
+import { type ModelReaderContext, registerTemporaryModelAttachment } from "./model-reader";
 
 const MODEL_CATALOG_ENDPOINT_PUBLICATION_TIMEOUT_MS = 30_000;
 
@@ -14,20 +14,22 @@ export function createPublicSdkModelAttachmentResolver(input: {
 	readonly childEnvironment: GjcRuntimeLocations["childEnvironment"];
 	/** Called only after the temporary session's close has been proven. */
 	readonly onProvenClosed?: (cwd: string, sessionId: string) => void;
-}): () => Promise<PublicSdkSessionAttachment> {
-	return async () => {
-		const sessionRoot = join(input.cwd, ".gjc", "sessions");
+}): (context?: ModelReaderContext) => Promise<PublicSdkSessionAttachment> {
+	return async (context?: ModelReaderContext) => {
+		const cwd = context?.principal.role === "user" ? context.workspace?.root : input.cwd;
+		if (cwd === undefined) throw new Error("Normal-user model attachment requires a durable workspace.");
+		const sessionRoot = join(cwd, ".gjc", "sessions");
 		await mkdir(sessionRoot, { recursive: true });
 		const backend = new CliLifecycleBackend({
 			cliPath: input.cliPath,
-			cwd: input.cwd,
+			cwd,
 			childEnvironment: input.childEnvironment,
 			endpointPublicationTimeoutMs: MODEL_CATALOG_ENDPOINT_PUBLICATION_TIMEOUT_MS,
 		});
 		const lifecycle = requireLifecycleAttachment(await backend.createEphemeral({ sessionRoot }));
 		try {
 			const attachment = await waitForSdkEndpoint(
-				input.cwd,
+				cwd,
 				lifecycle.sessionId,
 				MODEL_CATALOG_ENDPOINT_PUBLICATION_TIMEOUT_MS,
 			);
@@ -42,7 +44,7 @@ export function createPublicSdkModelAttachmentResolver(input: {
 					);
 					if (closed.status !== "closed")
 						throw new Error(`temporary model session close is ${closed.status}: ${closed.message}`);
-					input.onProvenClosed?.(resolve(input.cwd), lifecycle.sessionId);
+					input.onProvenClosed?.(resolve(cwd), lifecycle.sessionId);
 				} catch (error) {
 					if (closePossiblyApplied) throw error;
 					const fallback = await backend.fallbackBeforeCloseAcknowledgement(lifecycle);
@@ -51,7 +53,7 @@ export function createPublicSdkModelAttachmentResolver(input: {
 							[error, new Error(fallback.message)],
 							"temporary model session cleanup is uncertain",
 						);
-					input.onProvenClosed?.(resolve(input.cwd), lifecycle.sessionId);
+					input.onProvenClosed?.(resolve(cwd), lifecycle.sessionId);
 				}
 			});
 		} catch (error) {
@@ -61,7 +63,7 @@ export function createPublicSdkModelAttachmentResolver(input: {
 					[error, new Error(fallback.message)],
 					"temporary model session endpoint cleanup is uncertain",
 				);
-			input.onProvenClosed?.(resolve(input.cwd), lifecycle.sessionId);
+			input.onProvenClosed?.(resolve(cwd), lifecycle.sessionId);
 			throw error;
 		}
 	};

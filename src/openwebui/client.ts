@@ -1,17 +1,40 @@
 import { OPENWEBUI_METADATA_NAMESPACE } from "./persistence-contract";
 
 export type {
+	AdminPrincipalContext,
+	OpenWebUIAdminPrincipal,
+	OpenWebUIAdminPrincipalContext,
+	OpenWebUIPrincipal,
+	OpenWebUIPrincipalContext,
+	OpenWebUIPrincipalWorkspaceContext,
+} from "./auth";
+export {
+	createOpenWebUIAdminPrincipalContext,
+	createOpenWebUIPrincipalContext,
+	OpenWebUIPrincipalScopeError,
+	requireOpenWebUIAdminPrincipal,
+} from "./auth";
+export type {
+	OpenWebUIBootstrapClientConfig,
 	OpenWebUIFileBytes,
 	OpenWebUIFileContent,
 	OpenWebUIHttpClientConfig,
+	OpenWebUIPrincipalFile,
+	OpenWebUIPrincipalFileContent,
 	PostOpenWebUIMessageEventInput,
 	UpdateOpenWebUIMessageContentInput,
 } from "./http-client";
 export {
+	createOpenWebUIBootstrapClient,
+	OpenWebUIBootstrapClient,
 	OpenWebUIHttpClient,
 	OpenWebUIHttpConfigurationError,
 	OpenWebUIHttpError,
+	OpenWebUIPrincipalClient,
+	OpenWebUIPrincipalClientFactory,
+	OpenWebUIRuntimeAdminClient,
 	OpenWebUITransportError,
+	RuntimeAdminClientFactory,
 } from "./http-client";
 export { OpenWebUIInvalidResponseError } from "./http-parsers";
 

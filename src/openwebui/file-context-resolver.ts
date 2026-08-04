@@ -6,6 +6,7 @@ import type { ResolvedOpenWebUIFileContext } from "../live/chat-file-context-for
 import type { LiveGatewayFileContextResolver } from "../live/file-contexts";
 import type { RegisteredProject } from "../projects/registry";
 import type { OpenWebUIFileBytes, OpenWebUIFileContent } from "./client";
+import { type OpenWebUIPrincipalClient, OpenWebUIPrincipalScopeError } from "./http-client";
 
 const ATTACHMENT_CACHE_DIRECTORY = ".gjc/openwebui-attachments";
 const MAX_SEGMENT_LENGTH = 80;
@@ -15,14 +16,35 @@ const PRIVATE_FILE_MODE = 0o600;
 export interface OpenWebUIFileContextClient {
 	getFileContent(fileId: string): Promise<OpenWebUIFileContent | undefined>;
 	getFileBytes(fileId: string): Promise<OpenWebUIFileBytes | undefined>;
+	getFile?(fileId: string): Promise<OpenWebUIFileContextRecord | undefined>;
+	readonly ownerUserId?: string;
+}
+
+export interface OpenWebUIFileContextRecord {
+	readonly metadata?: OpenWebUIFileContent;
+	readonly original?: OpenWebUIFileBytes;
+}
+
+export interface OpenWebUIPrincipalFileContextClient extends OpenWebUIFileContextClient {
+	readonly ownerUserId: string;
+	getFile(fileId: string): Promise<OpenWebUIFileContextRecord | undefined>;
 }
 
 export function createOpenWebUIFileContextResolver(client: OpenWebUIFileContextClient): LiveGatewayFileContextResolver {
 	return async input => {
-		const [metadata, original] = await Promise.all([
-			client.getFileContent(input.reference.id),
-			client.getFileBytes(input.reference.id),
-		]);
+		let metadata: OpenWebUIFileContent | undefined;
+		let original: OpenWebUIFileBytes | undefined;
+		if (client.getFile !== undefined) {
+			const file = await client.getFile(input.reference.id);
+			metadata = file?.metadata;
+			original = file?.original;
+		} else {
+			[metadata, original] = await Promise.all([
+				client.getFileContent(input.reference.id),
+				client.getFileBytes(input.reference.id),
+			]);
+		}
+		assertPrincipalFileContext(client, input.reference.id, metadata, original);
 		if (metadata === undefined && original === undefined) return undefined;
 		const localPath =
 			original === undefined
@@ -38,6 +60,34 @@ export function createOpenWebUIFileContextResolver(client: OpenWebUIFileContextC
 					});
 		return resolvedFileContext({ referenceId: input.reference.id, metadata, original, localPath });
 	};
+}
+
+export function createOpenWebUIPrincipalFileContextResolver(
+	client: OpenWebUIPrincipalClient,
+): LiveGatewayFileContextResolver {
+	return createOpenWebUIFileContextResolver(client);
+}
+
+function assertPrincipalFileContext(
+	client: OpenWebUIFileContextClient,
+	fileId: string,
+	metadata: OpenWebUIFileContent | undefined,
+	original: OpenWebUIFileBytes | undefined,
+): void {
+	if (client.ownerUserId === undefined) return;
+	if (metadata === undefined) {
+		throw new OpenWebUIPrincipalScopeError("OpenWebUI principal file metadata proof is required.");
+	}
+	if (metadata.id !== fileId) {
+		throw new OpenWebUIPrincipalScopeError("OpenWebUI principal file metadata ID does not match the requested file.");
+	}
+	const ownerUserId = (metadata as OpenWebUIFileContent & { readonly owner_user_id?: unknown }).owner_user_id;
+	if (ownerUserId !== client.ownerUserId) {
+		throw new OpenWebUIPrincipalScopeError("OpenWebUI principal file metadata owner proof does not match.");
+	}
+	if (original !== undefined && original.id !== fileId) {
+		throw new OpenWebUIPrincipalScopeError("OpenWebUI principal file content ID does not match metadata.");
+	}
 }
 
 async function materializeOpenWebUIFile(input: {

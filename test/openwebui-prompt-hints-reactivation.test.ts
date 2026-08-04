@@ -14,12 +14,14 @@ describe("OpenWebUI prompt hint reactivation", () => {
 				updated: 1,
 				unchanged: 0,
 				skipped: 0,
+				verified: true,
 			});
 			expect(fixture.requests.map(request => request.path)).toEqual([
 				"/api/v1/prompts/list?page=1",
 				"/api/v1/prompts/id/prompt-link/update",
 				"/api/v1/prompts/id/prompt-link/toggle",
 				...Array.from({ length: GJC_OPENWEBUI_PROMPT_HINTS.length - 1 }, () => "/api/v1/prompts/create"),
+				"/api/v1/prompts/list?page=1",
 			]);
 			expect(fixture.prompt.is_active).toBe(true);
 		} finally {
@@ -32,28 +34,38 @@ interface RecordedPromptRequest {
 	readonly method: string;
 	readonly path: string;
 }
+type PromptRecord = {
+	readonly id: string;
+	readonly command: string;
+	readonly name: string;
+	readonly content: string;
+	readonly tags: readonly string[];
+	readonly meta: Record<string, unknown>;
+	is_active: boolean;
+};
 
 function startPromptServer() {
 	const requests: RecordedPromptRequest[] = [];
 	const prompt = {
 		id: "prompt-link",
-		command: "gjc-project-link",
-		name: "GJC: Link project folder",
-		content: "/gjc project link {{PROJECT_PATH}}",
-		tags: ["gjc", "project"],
+		command: "gjc-skill-deep-interview",
+		name: "GJC: Deep interview",
+		content: "/skill:deep-interview {{REQUEST}}",
+		tags: ["gjc", "workflow"],
 		meta: {
 			gjc_adapter: { prompt_hint: true },
-			description: "Link a local folder into OpenWebUI and import its GJC session history.",
+			description: "Start the GJC deep-interview workflow for clarifying requirements.",
 		},
 		is_active: false,
 	};
+	const prompts: PromptRecord[] = [prompt];
 	const server = Bun.serve({
 		port: 0,
 		async fetch(request) {
 			const url = new URL(request.url);
 			requests.push({ method: request.method, path: `${url.pathname}${url.search}` });
 			if (request.method === "GET" && url.pathname === "/api/v1/prompts/list") {
-				return Response.json({ items: [prompt], total: 1 });
+				return Response.json({ items: prompts, total: prompts.length });
 			}
 			if (request.method === "POST" && url.pathname === "/api/v1/prompts/id/prompt-link/update") {
 				return Response.json(prompt);
@@ -64,7 +76,18 @@ function startPromptServer() {
 			}
 			if (request.method === "POST" && url.pathname === "/api/v1/prompts/create") {
 				const body: unknown = await request.json();
-				return Response.json({ id: "created", ...(isRecord(body) ? body : {}), is_active: true });
+				if (!isRecord(body)) return Response.json({ detail: "invalid body" }, { status: 400 });
+				const created = {
+					id: `created-${prompts.length}`,
+					command: String(body.command),
+					name: String(body.name),
+					content: String(body.content),
+					tags: Array.isArray(body.tags) ? body.tags.map(String) : [],
+					meta: isRecord(body.meta) ? body.meta : {},
+					is_active: true,
+				};
+				prompts.push(created);
+				return Response.json(created);
 			}
 			return Response.json({ detail: "unexpected request" }, { status: 500 });
 		},

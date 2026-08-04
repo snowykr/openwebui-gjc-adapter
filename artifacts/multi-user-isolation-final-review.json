@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "sourceHash": "sha256:8fecd299dbc92bacf41fbba7216d6feea3033b8880d2a1f26767e2736dcffe53",
+  "changeSet": "current cumulative git diff",
+  "verification": {
+    "commands": [
+      "bun run check",
+      "bun test",
+      "git diff --check",
+      "bun test --reporter=junit --reporter-outfile artifacts/multi-user-isolation-test-report.xml"
+    ],
+    "result": "945 pass, 0 fail"
+  },
+  "deployment": {
+    "readyz": 200,
+    "activeState": "active",
+    "subState": "running",
+    "restartCount": 0
+  },
+  "architectureReview": {
+    "status": "CLEAR",
+    "recommendation": "APPROVE",
+    "evidence": "agent://116-ProjectionRetryArchitecture"
+  },
+  "qaReview": {
+    "status": "passed",
+    "evidence": "agent://117-ProjectionRetryQa"
+  },
+  "cleanup": {
+    "status": "passed",
+    "evidence": "git diff --check passed; final changed implementation and test paths were reviewed by the architecture and QA lanes."
+  },
+  "blockers": []
+}

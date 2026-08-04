@@ -175,6 +175,43 @@ describe("live OpenAI-compatible chat completions", () => {
 			},
 		]);
 	});
+	it("completes a streaming response when OpenWebUI projections fail", async () => {
+		const originalError = console.error;
+		const errors: string[] = [];
+		console.error = (...args: unknown[]) => errors.push(args.join(" "));
+		try {
+			const result = await handleChatCompletions({
+				request: { ...request, stream: true },
+				headers: chatHeaders,
+				projects: [projectWithFolder],
+				owner,
+				projectContextRepository: await demoRepository(),
+				runner: {
+					run() {
+						return {
+							chunks: ["done"],
+							model: "gjc/anthropic/claude-sonnet-4:low",
+							events: [{ type: "status", data: { description: "Tool ran", done: true } }],
+						};
+					},
+				},
+				eventSink() {
+					throw new Error("projection unavailable");
+				},
+				messageSink() {
+					throw new Error("projection unavailable");
+				},
+			});
+			expect(result.ok).toBe(true);
+			if (!result.ok || !("stream" in result)) throw new Error("Expected a streaming completion.");
+			let frames = "";
+			for await (const frame of result.stream) frames += frame;
+			expect(frames).toContain("data: [DONE]");
+			expect(errors).toHaveLength(2);
+		} finally {
+			console.error = originalError;
+		}
+	});
 });
 
 function fixedRunner(content: string): LiveGatewayRunner {
