@@ -1,4 +1,5 @@
 export interface SessionMapping {
+	readonly principalId?: string;
 	readonly chatId: string;
 	readonly projectId: string;
 	readonly sessionId: string;
@@ -13,6 +14,12 @@ export interface SessionMapping {
 	readonly attachment?: import("./session-authority").SessionAttachmentProof;
 }
 
+export interface SessionMappingScope {
+	readonly principalId: string;
+	readonly chatId: string;
+}
+
+export { canonicalSessionMappingKey } from "./session-authority";
 export { FileBackedSessionMappingStore } from "./session-file-backed-mapping-store";
 export { copySessionMapping } from "./session-mapping-copy";
 export { SessionMappingStore } from "./session-mapping-memory-store";

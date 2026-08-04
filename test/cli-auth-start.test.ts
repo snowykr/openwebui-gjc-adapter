@@ -83,7 +83,7 @@ describe("adapter CLI auth and start", () => {
 		await waitForStartedServer(proc, `http://127.0.0.1:${port}/healthz`);
 
 		const modelsResponse = await fetch(`http://127.0.0.1:${port}/v1/models`, {
-			headers: { authorization: "Bearer adapter-token" },
+			headers: { authorization: "Bearer adapter-token", "X-OpenWebUI-User-Id": "owner-test" },
 		});
 		const body = (await modelsResponse.json()) as { object: string; data: { id: string }[] };
 		expect({ status: modelsResponse.status, body }).toMatchObject({ status: 200 });

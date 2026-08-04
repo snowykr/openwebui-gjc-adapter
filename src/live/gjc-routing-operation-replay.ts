@@ -1,4 +1,5 @@
 import type { SessionMappingStore } from "../gjc/session-router";
+import { scopedSessionMappingStore } from "../gjc/session-turn-router";
 import type { OutboxStore } from "../state/outbox";
 import type { LiveGatewayRunnerInput, LiveGatewayRunnerResult } from "./chat-completions";
 import type { GjcSessionTurnRunner } from "./gjc-routing-gateway";
@@ -22,9 +23,13 @@ export async function replayRoutingOperation(
 	input: RoutingOperationReplayDependencies,
 	turn: LiveGatewayRunnerInput,
 ): Promise<(LiveGatewayRunnerResult & { readonly model?: string }) | null> {
-	const priorOperation = input.mappings.operation(turn.chatId, turn.userMessageId);
+	const principalId = principalIdForTurn(turn);
+	const mappings =
+		principalId === undefined ? input.mappings : scopedSessionMappingStore(input.mappings, principalId, turn.chatId);
+	const scopedInput = mappings === input.mappings ? input : { ...input, mappings };
+	const priorOperation = mappings.operation(turn.chatId, turn.userMessageId);
 	const priorAuthority =
-		priorOperation === undefined ? undefined : input.mappings.operationAuthority(turn.chatId, turn.userMessageId);
+		priorOperation === undefined ? undefined : mappings.operationAuthority(turn.chatId, turn.userMessageId);
 	if (
 		priorOperation !== undefined &&
 		(priorAuthority === undefined ||
@@ -60,7 +65,7 @@ export async function replayRoutingOperation(
 		priorOperation?.state === "uncertain" &&
 		priorOperation.detail === controlOperationHash(turn)
 	) {
-		const predecessor = input.mappings.get(turn.chatId);
+		const predecessor = mappings.get(turn.chatId);
 		if (predecessor === undefined) throw new Error(`GJC operation ${turn.userMessageId} requires reconciliation.`);
 		if (input.turnRunner.withLifecyclePublication === undefined)
 			throw new Error("GJC runner must provide lifecycle publication for acknowledged successor recovery.");
@@ -82,7 +87,7 @@ export async function replayRoutingOperation(
 			},
 			lifecycle =>
 				publishRecoveredAcknowledgedSuccessor(
-					input.mappings,
+					mappings,
 					turn,
 					predecessor,
 					lifecycle,
@@ -102,11 +107,15 @@ export async function replayRoutingOperation(
 			`GJC workflow gate operation ${turn.userMessageId} completed without a valid immutable result binding.`,
 		);
 	return replayWithLifecyclePublication(input.turnRunner, turn, result.mapping, async () => {
-		const replayed = replayCompletedWorkflowGateReply(input, turn);
+		const replayed = replayCompletedWorkflowGateReply(scopedInput, turn);
 		if (replayed === null)
 			throw new Error(
 				`GJC workflow gate operation ${turn.userMessageId} completed without a valid immutable result binding.`,
 			);
 		return withCanonicalModel(replayed, result.mapping.modelSelection);
 	});
+}
+function principalIdForTurn(turn: LiveGatewayRunnerInput): string | undefined {
+	const ownerUserId = turn.ownerUserId;
+	return typeof ownerUserId === "string" && ownerUserId.trim().length > 0 ? ownerUserId : undefined;
 }

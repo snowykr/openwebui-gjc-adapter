@@ -38,8 +38,11 @@ export async function resolveNormalSelection(
 	requestedModelId: string,
 ): Promise<NormalizedModelSelection> {
 	const createReader =
-		input.modelReaderFactory ??
-		(input.createNeutralModelReader === undefined ? undefined : () => input.createNeutralModelReader?.(turn));
+		input.modelReaderFactory === undefined
+			? input.createNeutralModelReader === undefined
+				? undefined
+				: () => input.createNeutralModelReader?.(turn)
+			: () => input.modelReaderFactory?.(turn.modelReaderContext);
 	if (createReader === undefined) throw new TypeError("GJC model selection reader is unavailable");
 	return createModelSelectionPolicy(async () => {
 		const reader = await createReader();

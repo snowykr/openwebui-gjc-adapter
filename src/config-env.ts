@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import type { AdapterProjectConfig, ResolvedAdapterConfig } from "./config";
 import { resolveGjcRuntimeLocations } from "./configure/runtime-locations";
 
@@ -108,6 +109,11 @@ export function loadAdapterConfig(env: Record<string, string | undefined> = proc
 		...(serviceHome === undefined ? {} : { serviceHome }),
 		environment: env,
 	});
+	const statePath = requireNonEmptyString(
+		env.GJC_OPENWEBUI_STATE_PATH,
+		DEFAULT_STATE_PATH,
+		"GJC_OPENWEBUI_STATE_PATH",
+	);
 	return Object.freeze({
 		bindHost: requireNonEmptyString(env.GJC_OPENWEBUI_BIND_HOST, DEFAULT_BIND_HOST, "GJC_OPENWEBUI_BIND_HOST"),
 		bindPort: parsePort(env.GJC_OPENWEBUI_BIND_PORT),
@@ -117,7 +123,7 @@ export function loadAdapterConfig(env: Record<string, string | undefined> = proc
 		...(openWebUIAdminEmail === undefined ? {} : { openWebUIAdminEmail }),
 		...(openWebUIAdminPassword === undefined ? {} : { openWebUIAdminPassword }),
 		...(ownerUserId === undefined ? {} : { ownerUserId }),
-		statePath: requireNonEmptyString(env.GJC_OPENWEBUI_STATE_PATH, DEFAULT_STATE_PATH, "GJC_OPENWEBUI_STATE_PATH"),
+		statePath,
 		gjcCommand: requireNonEmptyString(
 			env.GJC_OPENWEBUI_GJC_COMMAND,
 			DEFAULT_GJC_COMMAND,
@@ -127,7 +133,11 @@ export function loadAdapterConfig(env: Record<string, string | undefined> = proc
 		gjcCodingAgentDir: runtimeLocations.agentDir,
 		runtimeLocations,
 		turnTimeoutMs: resolveTurnTimeoutMs(env),
-		sessionRoot: requireNonEmptyString(env.GJC_OPENWEBUI_SESSION_ROOT, process.cwd(), "GJC_OPENWEBUI_SESSION_ROOT"),
+		sessionRoot: requireNonEmptyString(
+			env.GJC_OPENWEBUI_SESSION_ROOT,
+			join(statePath, "sessions"),
+			"GJC_OPENWEBUI_SESSION_ROOT",
+		),
 		allowedProjectRoots: parseAllowedProjectRoots(env.GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS, process.cwd()),
 		...(artifactBaseUrl === undefined
 			? {}

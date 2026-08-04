@@ -86,11 +86,13 @@ export function startRecordingServer(options: RecordingServerOptions = {}) {
 					meta: requestBody.meta ?? {},
 				});
 			}
-			if (request.method === "POST" && url.pathname === "/api/v1/folders/folder-1/update") {
+			if (request.method === "POST" && /^\/api\/v1\/folders\/[^/]+\/update$/.test(url.pathname)) {
+				const folderId = url.pathname.split("/")[4];
+				const configured = options.folders?.find(folder => folder.id === folderId);
 				return Response.json({
-					id: "folder-1",
-					user_id: "owner-1",
-					name: "Owner 1 folder",
+					id: folderId,
+					user_id: configured?.userId ?? "owner-1",
+					name: configured?.name ?? "Owner 1 folder",
 					meta: requestBody.meta ?? {},
 				});
 			}

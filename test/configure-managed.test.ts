@@ -23,12 +23,13 @@ describe("managed installation rendering and preflight", () => {
 		expect(compose).toContain("GJC_OPENWEBUI_BIND_HOST: 0.0.0.0");
 		expect(compose).toContain("GJC_OPENWEBUI_ADAPTER_API_TOKEN_FILE: /run/secrets/adapter-token");
 		expect(compose).toContain("GJC_OPENWEBUI_STATE_PATH: /var/lib/gjc");
-		expect(compose).toContain("GJC_OPENWEBUI_SESSION_ROOT: /run/gjc-session");
-		expect(compose).toContain("GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS: /workspace");
+		expect(compose).toContain("GJC_OPENWEBUI_SESSION_ROOT: /var/lib/gjc/sessions");
+		expect(compose).toContain("GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS: /workspace:/var/lib/gjc");
 		expect(compose).toContain('command: ["serve", "--config", "/run/openwebui-gjc-adapter/config.json"]');
 		expect(compose).toContain("./config/config.json:/run/openwebui-gjc-adapter/config.json:ro");
 		expect(compose).toContain("./config/state:/var/lib/gjc");
-		expect(compose).toContain("./config/session:/run/gjc-session");
+		expect(compose).not.toContain("/run/gjc-session");
+		expect(compose).not.toContain("./config/session:");
 		expect(compose).toContain("./config/workspace:/workspace");
 		expect(compose).toContain("adapter-token:\n    file: ./config/adapter-token");
 		expect(compose).toContain('      ENABLE_API_KEYS: "true"');

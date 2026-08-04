@@ -10,6 +10,7 @@ import type { LiveGatewayRunner, LiveGatewayRunnerInput, LiveGatewayRunnerResult
 import { createGjcIdleSessionReaper, DEFAULT_IDLE_SESSION_TIMEOUT_MS } from "../src/live/gjc-idle-session-reaper";
 import type { GjcSessionTurnRunner } from "../src/live/gjc-routing-runner";
 import type { OpenWebUIProjectionRepository } from "../src/openwebui/client";
+import { WorkspaceLeaseManager } from "../src/security/workspace-lease";
 import { FakeGjcTurnRunner } from "./cli-fixtures";
 
 const project = {
@@ -28,6 +29,21 @@ class MappingFixture {
 	}
 	entries(): readonly SessionMapping[] {
 		return [this.mapping];
+	}
+	getScoped(scope: { readonly principalId: string; readonly chatId: string }): SessionMapping | undefined {
+		const mapping = this.get(scope.chatId);
+		return mapping?.principalId === scope.principalId ? mapping : undefined;
+	}
+	operationScoped(
+		scope: { readonly principalId: string; readonly chatId: string },
+		operationId: string,
+	): SessionOperation | undefined {
+		return this.getScoped(scope)?.operationId === this.mapping.operationId
+			? this.operationRecords.get(operationId)
+			: undefined;
+	}
+	operationsScoped(scope: { readonly principalId: string; readonly chatId: string }): readonly SessionOperation[] {
+		return this.getScoped(scope) === undefined ? [] : [...this.operationRecords.values()];
 	}
 	operation(_chatId: string, operationId: string): SessionOperation | undefined {
 		return this.operationRecords.get(operationId);
@@ -107,12 +123,14 @@ function createInput(chatId = "chat-1"): LiveGatewayRunnerInput {
 		userMessageId: "turn-1",
 		userMessageParentId: null,
 		continued: false,
+		ownerUserId: "owner-1",
 	};
 }
 
 function createMapping(operationId: string): SessionMapping {
 	return {
 		chatId: "chat-1",
+		principalId: "owner-1",
 		projectId: project.id,
 		sessionId: "session-1",
 		sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
@@ -179,18 +197,105 @@ function createHarness(
 			clock.setTimeout(handler, timeoutMs) as unknown as ReturnType<typeof setTimeout>,
 		clearTimeout: timer => clock.clearTimeout(timer as unknown as number),
 		discardSessionAttachment: (cwd, sessionId) => discarded.push(`${cwd}:${sessionId}`),
+		adminPrincipalId: "owner-1",
 	});
 	return { clock, mappings, closeCalls, discarded, reaper };
 }
 
 async function flush(): Promise<void> {
-	await Promise.resolve();
-	await Promise.resolve();
-	await Promise.resolve();
-	await Promise.resolve();
+	for (let index = 0; index < 12; index += 1) await Promise.resolve();
+	await new Promise<void>(resolve => setImmediate(resolve));
+	await Bun.sleep(5);
 }
 
 describe("GJC idle session reaper", () => {
+	test("partitions same-chat lifecycle state by principal and closes only each scoped mapping", async () => {
+		const clock = new ManualTimers();
+		const mappingsByPrincipal = new Map<string, SessionMapping>([
+			["owner-a", { ...createMapping("turn-a"), principalId: "owner-a" }],
+			["owner-b", { ...createMapping("turn-b"), principalId: "owner-b" }],
+		]);
+		const operationsByPrincipal = new Map<string, SessionOperation>([
+			["owner-a", completedOperation("turn-a", 0)],
+			["owner-b", completedOperation("turn-b", 0)],
+		]);
+		const mappings = {
+			get: () => undefined,
+			getScoped: ({ principalId, chatId }: { principalId: string; chatId: string }) =>
+				chatId === "chat-1" ? mappingsByPrincipal.get(principalId) : undefined,
+			entries: () => [...mappingsByPrincipal.values()],
+			operation: () => undefined,
+			operationScoped: ({ principalId, chatId }: { principalId: string; chatId: string }, operationId: string) => {
+				const operation = chatId === "chat-1" ? operationsByPrincipal.get(principalId) : undefined;
+				return operation?.id === operationId ? operation : undefined;
+			},
+			operations: () => [],
+			operationsScoped: ({ principalId, chatId }: { principalId: string; chatId: string }) => {
+				const operation = chatId === "chat-1" ? operationsByPrincipal.get(principalId) : undefined;
+				return operation === undefined ? [] : [operation];
+			},
+		};
+		const workspaceRegistry = {
+			open: async (userId: string) => ({
+				userId,
+				safeKey: "a".repeat(64),
+				root: "/workspace",
+				sessionRoot: "/workspace/.gjc/sessions",
+			}),
+		};
+		const workspaceLeaseManager = {
+			acquire: async () =>
+				({
+					assertFence: async () => {},
+					release: async () => {},
+				}) as never,
+		};
+		const runnerCalls: string[] = [];
+		const closeCalls: string[] = [];
+		const reaper = createGjcIdleSessionReaper({
+			runner: {
+				run: async turn => {
+					const owner = turn.ownerUserId ?? "legacy";
+					runnerCalls.push(owner);
+					return {
+						chunks: (async function* () {
+							yield owner;
+						})(),
+					};
+				},
+			},
+			mappings,
+			closeSession: async mapping => {
+				closeCalls.push(mapping.principalId ?? "legacy");
+				return { status: "closed" };
+			},
+			now: () => clock.now,
+			setTimeout: (handler, timeoutMs) =>
+				clock.setTimeout(handler, timeoutMs) as unknown as ReturnType<typeof setTimeout>,
+			clearTimeout: timer => clock.clearTimeout(timer as unknown as number),
+			workspaceRegistry,
+			workspaceLeaseManager,
+		});
+		const [first, second] = await Promise.all([
+			reaper.runner.run({ ...createInput(), ownerUserId: "owner-a" }),
+			reaper.runner.run({ ...createInput(), ownerUserId: "owner-b" }),
+		]);
+		expect(runnerCalls).toEqual(["owner-a", "owner-b"]);
+		if (first.chunks !== undefined)
+			for await (const _chunk of first.chunks) {
+				// drain
+			}
+		if (second.chunks !== undefined)
+			for await (const _chunk of second.chunks) {
+				// drain
+			}
+		await flush();
+		expect(clock.count()).toBe(1);
+		clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
+		await flush();
+		expect(closeCalls.sort()).toEqual(["owner-a", "owner-b"]);
+		await reaper.stop();
+	});
 	test("uses the ten-minute default and does not close before the threshold", async () => {
 		const harness = createHarness();
 		await harness.reaper.runner.run(createInput());
@@ -210,6 +315,7 @@ describe("GJC idle session reaper", () => {
 		const reaper = createGjcIdleSessionReaper({
 			runner: { run: async () => ({ content: "done", model: "gjc" }) },
 			mappings,
+			adminPrincipalId: "owner-1",
 			closeSession: async () => {
 				closeCalls += 1;
 				return { status: "closed" };
@@ -234,6 +340,7 @@ describe("GJC idle session reaper", () => {
 		const reaper = createGjcIdleSessionReaper({
 			runner: { run: async () => ({ content: "done", model: "gjc" }) },
 			mappings,
+			adminPrincipalId: "owner-1",
 			closeSession: async () => {
 				closeCalls += 1;
 				return { status: "closed" };
@@ -251,6 +358,39 @@ describe("GJC idle session reaper", () => {
 		await reaper.stop();
 	});
 
+	test("rejects an explicit close without a principal owner", async () => {
+		const harness = createHarness();
+		await expect(
+			harness.reaper.closeSession(
+				{ ...harness.mappings.mapping, principalId: undefined },
+				{ ingressId: "missing-principal-close", ingressHash: "missing-principal-close" },
+			),
+		).rejects.toThrow("explicit principal owner");
+		expect(harness.closeCalls).toHaveLength(0);
+		await harness.reaper.stop();
+	});
+	test("does not reap an unowned persisted mapping", async () => {
+		const clock = new ManualTimers();
+		const mappings = new MappingFixture();
+		mappings.mapping = { ...mappings.mapping, principalId: undefined };
+		let closeCalls = 0;
+		const reaper = createGjcIdleSessionReaper({
+			runner: { run: async () => ({ content: "done", model: "gjc" }) },
+			mappings,
+			closeSession: async () => {
+				closeCalls += 1;
+				return { status: "closed" };
+			},
+			now: () => clock.now,
+			setTimeout: (handler, timeoutMs) =>
+				clock.setTimeout(handler, timeoutMs) as unknown as ReturnType<typeof setTimeout>,
+			clearTimeout: timer => clock.clearTimeout(timer as unknown as number),
+		});
+		clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS * 2);
+		await flush();
+		expect(closeCalls).toBe(0);
+		await reaper.stop();
+	});
 	test("an active turn prevents an idle close race", async () => {
 		let complete!: () => void;
 		const harness = createHarness({
@@ -270,6 +410,100 @@ describe("GJC idle session reaper", () => {
 		await flush();
 		expect(harness.closeCalls).toHaveLength(0);
 		await harness.reaper.stop();
+	});
+	test("serializes a same-user idle close behind a turn in another chat", async () => {
+		const root = await mkdtemp(join(tmpdir(), "gjc-idle-reaper-lease-"));
+		try {
+			const clock = new ManualTimers();
+			const principalId = "normal-1";
+			const safeKey = "a".repeat(64);
+			const mappingByChat = new Map<string, SessionMapping>([
+				["chat-1", { ...createMapping("turn-1"), chatId: "chat-1", principalId }],
+				["chat-2", { ...createMapping("turn-2"), chatId: "chat-2", principalId }],
+			]);
+			const operationByChat = new Map<string, SessionOperation>([
+				["chat-1", completedOperation("turn-1", 0)],
+				["chat-2", completedOperation("turn-2", 0)],
+			]);
+			const mappings = {
+				entries: () => [...mappingByChat.values()],
+				getScoped: ({ principalId: owner, chatId }: { principalId: string; chatId: string }) =>
+					owner === principalId ? mappingByChat.get(chatId) : undefined,
+				operationScoped: (
+					{ principalId: owner, chatId }: { principalId: string; chatId: string },
+					operationId: string,
+				) => {
+					const operation = owner === principalId ? operationByChat.get(chatId) : undefined;
+					return operation?.id === operationId ? operation : undefined;
+				},
+				operationsScoped: ({ principalId: owner, chatId }: { principalId: string; chatId: string }) =>
+					owner === principalId
+						? operationByChat.get(chatId) === undefined
+							? []
+							: [operationByChat.get(chatId)!]
+						: [],
+			};
+			const workspaceLeaseManager = new WorkspaceLeaseManager({ stateRoot: root });
+			const workspaceRegistry = {
+				open: async (userId: string) => ({
+					userId,
+					safeKey,
+					root,
+					sessionRoot: join(root, ".gjc", "sessions"),
+				}),
+			};
+			let releaseTurn!: () => void;
+			const turnFinished = new Promise<void>(resolve => {
+				releaseTurn = resolve;
+			});
+			let turnStarted!: () => void;
+			const started = new Promise<void>(resolve => {
+				turnStarted = resolve;
+			});
+			const closeCalls: string[] = [];
+			const reaper = createGjcIdleSessionReaper({
+				runner: {
+					run: async turn => {
+						const lease = await workspaceLeaseManager.acquire({
+							safeKey,
+							holderId: "turn-holder",
+							operation: "turn",
+							leaseMs: 60_000,
+						});
+						turnStarted();
+						await turnFinished;
+						await lease.release();
+						return { content: turn.chatId, model: "gjc" };
+					},
+				},
+				mappings,
+				closeSession: async mapping => {
+					closeCalls.push(mapping.chatId);
+					return { status: "closed" };
+				},
+				workspaceRegistry,
+				workspaceLeaseManager,
+				now: () => clock.now,
+				setTimeout: (handler, timeoutMs) =>
+					clock.setTimeout(handler, timeoutMs) as unknown as ReturnType<typeof setTimeout>,
+				clearTimeout: timer => clock.clearTimeout(timer as unknown as number),
+			});
+			const pendingTurn = reaper.runner.run({ ...createInput("chat-1"), ownerUserId: principalId });
+			await started;
+			clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
+			await flush();
+			expect(closeCalls).toEqual([]);
+			releaseTurn();
+			await pendingTurn;
+			for (let attempt = 0; attempt < 10 && !closeCalls.includes("chat-2"); attempt += 1) {
+				clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS);
+				await flush();
+			}
+			expect(closeCalls).toContain("chat-2");
+			await reaper.stop();
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
 	});
 	test("an explicit close shares the chat gate with a normal turn", async () => {
 		let complete!: () => void;
@@ -597,6 +831,7 @@ describe("GJC idle session reaper", () => {
 		const reaper = createGjcIdleSessionReaper({
 			runner: { run: async () => ({ content: "done", model: "gjc" }) },
 			mappings,
+			adminPrincipalId: "owner-1",
 			closeSession: async () => {
 				closeCalls += 1;
 				return { status: "closed" };
@@ -617,19 +852,21 @@ describe("GJC idle session reaper", () => {
 		clock.now = Date.now();
 		const mappings = new SessionMappingStore();
 		const retained = createMapping("turn-1");
-		mappings.set(retained);
-		mappings.beginOperation("chat-1", {
+		const scope = { principalId: retained.principalId!, chatId: retained.chatId };
+		mappings.setScoped(scope, retained);
+		mappings.beginOperationScoped(scope, {
 			id: "manual-close-operation",
 			kind: "close",
 			ingressId: "manual-close-operation",
 			detail: "manual-close-hash",
 		});
-		mappings.transitionOperation("chat-1", "manual-close-operation", "uncertain", "manual-close-hash");
+		mappings.transitionOperationScoped(scope, "manual-close-operation", "uncertain", "manual-close-hash");
 		let closeCalls = 0;
 		const createReaper = () =>
 			createGjcIdleSessionReaper({
 				runner: { run: async () => ({ content: "done", model: "gjc" }) },
 				mappings,
+				adminPrincipalId: "owner-1",
 				closeSession: async () => {
 					closeCalls += 1;
 					return { status: "closed" };
@@ -653,23 +890,25 @@ describe("GJC idle session reaper", () => {
 		clock.now = Date.now();
 		const mappings = new SessionMappingStore();
 		const retained = createMapping("turn-1");
-		mappings.set(retained);
+		const scope = { principalId: retained.principalId!, chatId: retained.chatId };
+		mappings.setScoped(scope, retained);
 		const closeIngressId = "manual-close-operation";
-		mappings.beginOperation("chat-1", {
+		mappings.beginOperationScoped(scope, {
 			id: closeIngressId,
 			kind: "close",
 			ingressId: closeIngressId,
 			detail: "manual-close-hash",
 		});
-		mappings.completeOperationWithMapping("chat-1", closeIngressId, "manual-close-hash", retained, "close");
-		const persistedClose = mappings.operation("chat-1", closeIngressId);
+		mappings.completeOperationWithMappingScoped(scope, closeIngressId, "manual-close-hash", retained, "close");
+		const persistedClose = mappings.operationScoped(scope, closeIngressId);
 		expect(persistedClose?.result?.mapping.operationId).toBe(closeIngressId);
 		expect(persistedClose?.result?.correlation?.mappingOperationId).toBe(retained.operationId);
-		expect(mappings.get("chat-1")?.operationId).toBe(retained.operationId);
+		expect(mappings.getScoped(scope)?.operationId).toBe(retained.operationId);
 		let closeCalls = 0;
 		const reaper = createGjcIdleSessionReaper({
 			runner: { run: async () => ({ content: "done", model: "gjc" }) },
 			mappings,
+			adminPrincipalId: "owner-1",
 			closeSession: async () => {
 				closeCalls += 1;
 				return { status: "closed" };
@@ -699,6 +938,7 @@ describe("GJC idle session reaper", () => {
 		const reaper = createGjcIdleSessionReaper({
 			runner: { run: async () => ({ content: "done", model: "gjc" }) },
 			mappings,
+			adminPrincipalId: "owner-1",
 			closeSession: async (_mapping, ingress) => {
 				closeCalls.push(ingress.ingressId);
 				return { status: "closed" };
@@ -726,6 +966,7 @@ describe("GJC idle session reaper", () => {
 		const reaper = createGjcIdleSessionReaper({
 			runner: { run: async () => ({ content: "done", model: "gjc" }) },
 			mappings,
+			adminPrincipalId: "owner-1",
 			closeSession: async () => {
 				closeCalls += 1;
 				return { status: "closed" };
@@ -749,6 +990,7 @@ describe("GJC idle session reaper", () => {
 		const reaper = createGjcIdleSessionReaper({
 			runner: { run: async () => ({ content: "done", model: "gjc" }) },
 			mappings,
+			adminPrincipalId: "owner-1",
 			closeSession: async () => {
 				closeCalls += 1;
 				return { status: "closed" };
@@ -944,6 +1186,7 @@ describe("GJC idle session reaper", () => {
 				},
 			},
 			mappings,
+			adminPrincipalId: "owner-1",
 			closeSession: async () => ({ status: "closed" }),
 			setTimeout: (handler, timeoutMs) =>
 				clock.setTimeout(handler, timeoutMs) as unknown as ReturnType<typeof setTimeout>,
@@ -1011,6 +1254,7 @@ describe("GJC idle session reaper", () => {
 				},
 			},
 			mappings,
+			adminPrincipalId: "owner-1",
 			closeSession: async () => ({ status: "closed" }),
 			now: () => clock.now,
 			setTimeout: (handler, timeoutMs) =>
@@ -1069,6 +1313,7 @@ describe("GJC idle session reaper", () => {
 				}),
 			},
 			mappings,
+			adminPrincipalId: "owner-1",
 			closeSession: async () => ({ status: "closed" }),
 			now: () => clock.now,
 			setTimeout: (handler, timeoutMs) =>
@@ -1144,6 +1389,7 @@ describe("GJC idle session reaper", () => {
 				},
 			},
 			mappings,
+			adminPrincipalId: "owner-1",
 			closeSession: async () => ({ status: "closed" }),
 			now: () => clock.now,
 			setTimeout: (handler, timeoutMs) =>
@@ -1184,7 +1430,7 @@ describe("GJC idle session reaper", () => {
 		await harness.reaper.stop();
 	});
 });
-test("adapter initialization failure stops the constructed reaper", async () => {
+test("a linked-project projection failure does not stop the constructed reaper", async () => {
 	const root = await mkdtemp(join(tmpdir(), "gjc-idle-reaper-init-"));
 	const failure = new Error("projection startup failure");
 	let stopCalls = 0;
@@ -1207,29 +1453,33 @@ test("adapter initialization failure stops the constructed reaper", async () => 
 		},
 	};
 	try {
-		await expect(
-			buildAdapterServerOptions(
-				{
-					mode: "existing",
-					bindHost: "127.0.0.1",
-					bindPort: 8765,
-					openWebUIBaseUrl: "http://127.0.0.1:3000",
-					allowedProjectRoots: [root],
-					projects: [{ cwd: root, name: "demo" }],
-					statePath: join(root, "state"),
-					sessionRoot: join(root, "sessions"),
-					gjcCommand: "/bin/true",
-					turnTimeoutMs: 60_000,
-				},
-				{ turnRunner, projectionRepository },
-			),
-		).rejects.toThrow(failure);
+		const options = await buildAdapterServerOptions(
+			{
+				mode: "existing",
+				bindHost: "127.0.0.1",
+				bindPort: 8765,
+				openWebUIBaseUrl: "http://127.0.0.1:3000",
+				allowedProjectRoots: [root],
+				projects: [{ cwd: root, name: "demo" }],
+				statePath: join(root, "state"),
+				sessionRoot: join(root, "sessions"),
+				gjcCommand: "/bin/true",
+				turnTimeoutMs: 60_000,
+			},
+			{ turnRunner, projectionRepository },
+		);
+		expect(options.checks).toContainEqual(
+			expect.objectContaining({ name: "openwebui-project-projection", status: "degraded" }),
+		);
+		expect(stopCalls).toBe(0);
+		await options.routes?.runner.stop?.();
+		await options.runtimeLock.release();
 		expect(stopCalls).toBe(1);
 	} finally {
 		await rm(root, { force: true, recursive: true });
 	}
 });
-test("adapter initialization failure without close support stops the base routing runner", async () => {
+test("a linked-project projection failure does not stop the base routing runner", async () => {
 	const root = await mkdtemp(join(tmpdir(), "gjc-idle-reaper-no-close-init-"));
 	const failure = new Error("projection startup failure");
 	let stopCalls = 0;
@@ -1253,23 +1503,27 @@ test("adapter initialization failure without close support stops the base routin
 		},
 	};
 	try {
-		await expect(
-			buildAdapterServerOptions(
-				{
-					mode: "existing",
-					bindHost: "127.0.0.1",
-					bindPort: 8765,
-					openWebUIBaseUrl: "http://127.0.0.1:3000",
-					allowedProjectRoots: [root],
-					projects: [{ cwd: root, name: "demo" }],
-					statePath: join(root, "state"),
-					sessionRoot: join(root, "sessions"),
-					gjcCommand: "/bin/true",
-					turnTimeoutMs: 60_000,
-				},
-				{ turnRunner, projectionRepository },
-			),
-		).rejects.toThrow(failure);
+		const options = await buildAdapterServerOptions(
+			{
+				mode: "existing",
+				bindHost: "127.0.0.1",
+				bindPort: 8765,
+				openWebUIBaseUrl: "http://127.0.0.1:3000",
+				allowedProjectRoots: [root],
+				projects: [{ cwd: root, name: "demo" }],
+				statePath: join(root, "state"),
+				sessionRoot: join(root, "sessions"),
+				gjcCommand: "/bin/true",
+				turnTimeoutMs: 60_000,
+			},
+			{ turnRunner, projectionRepository },
+		);
+		expect(options.checks).toContainEqual(
+			expect.objectContaining({ name: "openwebui-project-projection", status: "degraded" }),
+		);
+		expect(stopCalls).toBe(0);
+		await options.routes?.runner.stop?.();
+		await options.runtimeLock.release();
 		expect(stopCalls).toBe(1);
 	} finally {
 		await rm(root, { force: true, recursive: true });

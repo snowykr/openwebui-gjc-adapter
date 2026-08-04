@@ -22,6 +22,7 @@ export async function buildResolvedInstalledAdapterServerOptions(
 				: new OpenWebUIPromptHintClient({
 						baseUrl: config.openWebUIBaseUrl,
 						apiToken: config.openWebUIApiToken,
+						installationId: config.installationId,
 					});
 		const projectLinkService = options.routes?.projectLinkService;
 		return {
@@ -39,7 +40,12 @@ export async function buildResolvedInstalledAdapterServerOptions(
 				openWebUIBaseUrl: config.openWebUIBaseUrl,
 				openWebUIApiToken: config.openWebUIApiToken,
 				initialize: async () => {
-					if (promptHintClient !== undefined) await promptHintClient.seedGjcPromptHints();
+					if (promptHintClient !== undefined) {
+						const migration = await promptHintClient.migrateGjcPromptHints();
+						if (migration.degraded)
+							throw new Error("OpenWebUI project-admin prompt hint migration requires operator reconciliation.");
+						await promptHintClient.seedGjcPromptHints();
+					}
 					if (projectLinkService !== undefined) {
 						const previouslyLinkedProjectIds = new Set(
 							projectLinkService.listLinkedProjects().map(project => project.id),

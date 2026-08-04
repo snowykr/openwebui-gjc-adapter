@@ -223,7 +223,7 @@ describe("configure CLI grammar and acknowledgements", () => {
 					adapterApiToken: "adapter",
 				},
 			});
-			expect(captured?.routes?.projectContextRepository).toBeDefined();
+			expect(captured?.routes?.projectContextRepository).toBeUndefined();
 			expect(captured?.routes?.eventSink).toBeDefined();
 			expect(captured?.routes?.messageSink).toBeDefined();
 			expect(captured?.routes?.fileContextResolver).toBeDefined();

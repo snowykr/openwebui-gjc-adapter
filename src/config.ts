@@ -122,13 +122,13 @@ export function loadInstalledAdapterConfig(
 		gjcCodingAgentDir: runtimeLocations.agentDir,
 		runtimeLocations,
 		turnTimeoutMs: resolveTurnTimeoutMs(env),
-		sessionRoot: managed ? "/run/gjc-session" : `${projectRoot}/.gjc/sessions`,
-		allowedProjectRoots: managed ? [projectRoot, "/run/gjc-session"] : [projectRoot],
+		sessionRoot: managed ? "/var/lib/gjc/sessions" : `${projectRoot}/.gjc/sessions`,
+		allowedProjectRoots: managed ? [projectRoot, "/var/lib/gjc"] : [projectRoot],
 		projects: [
 			{
 				cwd: projectRoot,
 				name: "default",
-				sessionRoot: managed ? "/run/gjc-session" : `${projectRoot}/.gjc/sessions`,
+				sessionRoot: managed ? "/var/lib/gjc/sessions" : `${projectRoot}/.gjc/sessions`,
 			},
 		],
 	});

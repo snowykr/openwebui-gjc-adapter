@@ -1,14 +1,158 @@
 import type { SessionOperationResult } from "./session-authority";
 import { ensureSdkSessionFile, validateSessionFile } from "./session-file";
 import { recoverInitialMappedSession } from "./session-initial-create-recovery";
+import type { SessionMapping, SessionMappingScope, SessionMappingStore } from "./session-mapping-store";
 import { copyAttachment, hashTurnIngress, normalizeModelSelection } from "./session-operation-codec";
 import { resolveEffectiveGjcSessionRoot } from "./session-root";
 import type { RouteGjcTurnInput, RouteGjcTurnResult } from "./session-turn-router-contract";
 import { startNewMappedSession } from "./session-turn-router-new";
 import { type GjcTurnRunner, getProjectSessionRoot } from "./turn-runner";
 
-export async function routeGjcTurn(input: RouteGjcTurnInput): Promise<RouteGjcTurnResult> {
-	const existing = input.mappings.get(input.chatId);
+export interface ScopedRouteGjcTurnInput extends RouteGjcTurnInput {
+	readonly principalId?: string;
+}
+
+const scopedStoreCache = new WeakMap<object, Map<string, SessionMappingStore>>();
+
+export function scopedSessionMappingStore(
+	mappings: SessionMappingStore,
+	principalId: string,
+	chatId: string,
+): SessionMappingStore {
+	const key = JSON.stringify([principalId, chatId]);
+	let byScope = scopedStoreCache.get(mappings);
+	if (byScope === undefined) {
+		byScope = new Map();
+		scopedStoreCache.set(mappings, byScope);
+	}
+	const cached = byScope.get(key);
+	if (cached !== undefined) return cached;
+	const scope: SessionMappingScope = { principalId, chatId };
+	const requireChat = (actual: string): void => {
+		if (actual !== chatId)
+			throw new Error(`Scoped session mapping chat ID ${actual} does not match scope ${chatId}.`);
+	};
+	const withPrincipal = (mapping: SessionMapping): SessionMapping =>
+		mapping.principalId === undefined ? { ...mapping, principalId } : mapping;
+	const methods = {
+		get: (actual: string) => {
+			requireChat(actual);
+			return mappings.getScoped(scope);
+		},
+		set: (mapping: SessionMapping) => mappings.setScoped(scope, withPrincipal(mapping)),
+		upsert: (mapping: SessionMapping) => mappings.upsertScoped(scope, withPrincipal(mapping)),
+		beginProjectReassignment: (
+			actual: string,
+			currentProjectId: string,
+			nextProjectId: string,
+			target?: Parameters<SessionMappingStore["beginProjectReassignmentScoped"]>[3],
+		) => {
+			requireChat(actual);
+			mappings.beginProjectReassignmentScoped(scope, currentProjectId, nextProjectId, target);
+		},
+		rollbackProjectReassignment: (actual: string, currentProjectId: string) => {
+			requireChat(actual);
+			mappings.rollbackProjectReassignmentScoped(scope, currentProjectId);
+		},
+		reassignProjectAuthority: (actual: string, currentProjectId: string, nextProjectId: string) => {
+			requireChat(actual);
+			mappings.reassignProjectAuthorityScoped(scope, currentProjectId, nextProjectId);
+		},
+		entries: () => mappings.entriesScoped(scope),
+		operation: (actual: string, operationId: string) => {
+			requireChat(actual);
+			return mappings.operationScoped(scope, operationId);
+		},
+		operations: (actual: string) => {
+			requireChat(actual);
+			return mappings.operationsScoped(scope);
+		},
+		operationAuthority: (actual: string, operationId: string) => {
+			requireChat(actual);
+			return mappings.operationAuthorityScoped(scope, operationId);
+		},
+		assertOperationProject: (actual: string, projectId: string, operationId: string) => {
+			requireChat(actual);
+			mappings.assertOperationProjectScoped(scope, projectId, operationId);
+		},
+		beginOperation: (actual: string, operation: Parameters<SessionMappingStore["beginOperation"]>[1]) => {
+			requireChat(actual);
+			mappings.beginOperationScoped(scope, operation);
+		},
+		recordAcknowledgedSuccessor: (
+			actual: string,
+			operationId: string,
+			operationHash: string,
+			successor: Parameters<SessionMappingStore["recordAcknowledgedSuccessor"]>[3],
+		) => {
+			requireChat(actual);
+			return mappings.recordAcknowledgedSuccessorScoped(scope, operationId, operationHash, successor);
+		},
+		transitionOperation: (
+			actual: string,
+			operationId: string,
+			state: Parameters<SessionMappingStore["transitionOperation"]>[2],
+			detail?: string,
+			result?: Parameters<SessionMappingStore["transitionOperation"]>[4],
+		) => {
+			requireChat(actual);
+			mappings.transitionOperationScoped(scope, operationId, state, detail, result);
+		},
+		completeOperationWithMapping: (
+			actual: string,
+			operationId: string,
+			detail: string,
+			mapping: SessionMapping,
+			kind: Parameters<SessionMappingStore["completeOperationWithMapping"]>[4],
+		) => {
+			requireChat(actual);
+			return mappings.completeOperationWithMappingScoped(scope, operationId, detail, withPrincipal(mapping), kind);
+		},
+		provisionalOperation: (actual: string, ingressId: string) => {
+			requireChat(actual);
+			return mappings.provisionalOperationScoped(scope, ingressId);
+		},
+		reserveProvisionalOperation: (operation: Parameters<SessionMappingStore["reserveProvisionalOperation"]>[0]) =>
+			mappings.reserveProvisionalOperationScoped(scope, operation),
+		publishProvisionalOperation: (
+			operation: Parameters<SessionMappingStore["publishProvisionalOperation"]>[0],
+			mapping: SessionMapping,
+		) => mappings.publishProvisionalOperationScoped(scope, operation, withPrincipal(mapping)),
+		attachProvisionalOperation: (
+			actual: string,
+			ingressId: string,
+			attachment: Parameters<SessionMappingStore["attachProvisionalOperation"]>[2],
+		) => {
+			requireChat(actual);
+			mappings.attachProvisionalOperationScoped(scope, ingressId, attachment);
+		},
+		transitionProvisionalOperation: (
+			actual: string,
+			ingressId: string,
+			state: Parameters<SessionMappingStore["transitionProvisionalOperation"]>[2],
+			detail?: string,
+		) => {
+			requireChat(actual);
+			mappings.transitionProvisionalOperationScoped(scope, ingressId, state, detail);
+		},
+	};
+	const scoped = new Proxy(mappings, {
+		get(target, property, receiver) {
+			const method = methods[property as keyof typeof methods];
+			return method === undefined ? Reflect.get(target, property, receiver) : method;
+		},
+	});
+	byScope.set(key, scoped);
+	return scoped;
+}
+
+export async function routeGjcTurn(input: ScopedRouteGjcTurnInput): Promise<RouteGjcTurnResult> {
+	const mappings =
+		typeof input.principalId === "string" && input.principalId.trim().length > 0
+			? scopedSessionMappingStore(input.mappings, input.principalId, input.chatId)
+			: input.mappings;
+	const scopedInput = mappings === input.mappings ? input : { ...input, mappings };
+	const existing = mappings.get(input.chatId);
 	const operationHash = hashTurnIngress({
 		chatId: input.chatId,
 		projectId: input.project.id,
@@ -16,8 +160,7 @@ export async function routeGjcTurn(input: RouteGjcTurnInput): Promise<RouteGjcTu
 		text: input.text,
 		...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
 	});
-	const priorOperation =
-		existing === undefined ? undefined : input.mappings.operation(input.chatId, input.userMessageId);
+	const priorOperation = existing === undefined ? undefined : mappings.operation(input.chatId, input.userMessageId);
 	if (priorOperation?.state === "complete") {
 		if (priorOperation.detail !== operationHash)
 			throw new Error(`GJC operation ${input.userMessageId} conflicts with a different ingress payload.`);
@@ -51,10 +194,10 @@ export async function routeGjcTurn(input: RouteGjcTurnInput): Promise<RouteGjcTu
 		throw new Error(`GJC operation ${input.userMessageId} requires reconciliation.`);
 	}
 
-	if (existing === undefined && input.mappings.provisionalOperation(input.chatId, input.userMessageId) !== undefined)
-		return recoverInitialMappedSession(input, operationHash);
+	if (existing === undefined && mappings.provisionalOperation(input.chatId, input.userMessageId) !== undefined)
+		return recoverInitialMappedSession(scopedInput, operationHash);
 	if (existing === undefined || existing.projectId !== input.project.id) {
-		return startNewMappedSession(input);
+		return startNewMappedSession(scopedInput);
 	}
 
 	const sessionRoot = resolveEffectiveGjcSessionRoot(
@@ -62,7 +205,7 @@ export async function routeGjcTurn(input: RouteGjcTurnInput): Promise<RouteGjcTu
 		getProjectSessionRoot(input.project),
 		input.runner.resolveSessionRoot,
 	);
-	const operation = beginDurableOperation(input);
+	const operation = beginDurableOperation(scopedInput, mappings);
 	let existingSessionFile: string | undefined;
 	try {
 		existingSessionFile = await ensureSdkSessionFile(
@@ -72,7 +215,7 @@ export async function routeGjcTurn(input: RouteGjcTurnInput): Promise<RouteGjcTu
 			existing.sessionId,
 		);
 	} catch (error) {
-		input.mappings.transitionOperation(input.chatId, operation.key, "uncertain", operation.hash);
+		mappings.transitionOperation(input.chatId, operation.key, "uncertain", operation.hash);
 		throw error;
 	}
 	const address = {
@@ -142,7 +285,7 @@ export async function routeGjcTurn(input: RouteGjcTurnInput): Promise<RouteGjcTu
 				const proof = result.attachment ?? state.attachment ?? existing.attachment;
 				if (proof === undefined) throw new Error("GJC turn did not return a validated current attachment.");
 				const mapping = await lifecycle.publish(proof, () => {
-					const published = input.mappings.completeOperationWithMapping(
+					const published = mappings.completeOperationWithMapping(
 						input.chatId,
 						operation.key,
 						operation.hash,
@@ -154,14 +297,17 @@ export async function routeGjcTurn(input: RouteGjcTurnInput): Promise<RouteGjcTu
 				});
 				return { assistantText, events: result.events, mapping };
 			} catch (error) {
-				input.mappings.transitionOperation(input.chatId, operation.key, "uncertain", operation.hash);
+				mappings.transitionOperation(input.chatId, operation.key, "uncertain", operation.hash);
 				throw error;
 			}
 		},
 	);
 }
 
-function beginDurableOperation(input: RouteGjcTurnInput): { readonly key: string; readonly hash: string } {
+function beginDurableOperation(
+	input: RouteGjcTurnInput,
+	mappings: SessionMappingStore,
+): { readonly key: string; readonly hash: string } {
 	const key = input.userMessageId;
 	const hash = hashTurnIngress({
 		chatId: input.chatId,
@@ -170,7 +316,7 @@ function beginDurableOperation(input: RouteGjcTurnInput): { readonly key: string
 		text: input.text,
 		...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
 	});
-	input.mappings.beginOperation(input.chatId, { id: key, kind: "prompt", ingressId: key, detail: hash });
+	mappings.beginOperation(input.chatId, { id: key, kind: "prompt", ingressId: key, detail: hash });
 	return { key, hash };
 }
 

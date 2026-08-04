@@ -1,19 +1,33 @@
 import {
+	canonicalSessionMappingKey,
 	type ProvisionalSessionOperation,
 	SessionAuthority,
+	type SessionAuthorityInput,
 	type SessionOperation,
 	type SessionOperationResult,
 	type SessionOperationState,
 } from "./session-authority";
 import type {
 	AcknowledgedSuccessor,
+	SessionAuthorityReassignment,
 	SessionAuthorityRecord,
 	SessionAuthorityTargetIdentity,
 	SessionAuthorityTombstone,
 } from "./session-authority-types";
 import { copySessionMapping } from "./session-mapping-copy";
-import type { SessionMapping } from "./session-mapping-store";
+import type { SessionMapping, SessionMappingScope } from "./session-mapping-store";
 import { operationResult } from "./session-operation-codec";
+
+const SCOPED_MAPPING_OBSERVATION = "__gjcSessionMappingScope";
+
+interface StoredMappingScope {
+	readonly principalId: string;
+	readonly chatId?: string;
+}
+
+interface CanonicalScope extends SessionMappingScope {
+	readonly key: string;
+}
 
 export class SessionMappingStore {
 	constructor(private readonly authority: SessionAuthority = new SessionAuthority()) {}
@@ -23,10 +37,25 @@ export class SessionMappingStore {
 		return record === undefined ? undefined : mappingFromRecord(record);
 	}
 	set(mapping: SessionMapping): SessionMapping {
-		return mappingFromRecord(this.authority.set(copySessionMapping(mapping)));
+		return mappingFromRecord(this.authority.set(authorityInputFromLegacyMapping(mapping)));
 	}
 	upsert(mapping: SessionMapping): SessionMapping {
-		return mappingFromRecord(this.authority.upsert(copySessionMapping(mapping)));
+		return mappingFromRecord(this.authority.upsert(authorityInputFromLegacyMapping(mapping)));
+	}
+	getScoped(scope: SessionMappingScope): SessionMapping | undefined {
+		const canonicalScope = canonicalScopeFor(scope);
+		const record = this.authority.get(canonicalScope.key);
+		return record === undefined || !isScopedRecordFor(record, canonicalScope) ? undefined : mappingFromRecord(record);
+	}
+	setScoped(scope: SessionMappingScope, mapping: SessionMapping): SessionMapping {
+		const canonicalScope = canonicalScopeFor(scope);
+		assertScopedKeyAvailable(this.authority, canonicalScope);
+		return mappingFromRecord(this.authority.set(authorityInputForScope(canonicalScope, mapping)));
+	}
+	upsertScoped(scope: SessionMappingScope, mapping: SessionMapping): SessionMapping {
+		const canonicalScope = canonicalScopeFor(scope);
+		assertScopedKeyAvailable(this.authority, canonicalScope);
+		return mappingFromRecord(this.authority.upsert(authorityInputForScope(canonicalScope, mapping)));
 	}
 	beginProjectReassignment(
 		chatId: string,
@@ -36,20 +65,55 @@ export class SessionMappingStore {
 	): void {
 		this.authority.beginProjectReassignment(chatId, currentProjectId, nextProjectId, target);
 	}
+	beginProjectReassignmentScoped(
+		scope: SessionMappingScope,
+		currentProjectId: string,
+		nextProjectId: string,
+		target?: SessionAuthorityTargetIdentity,
+	): void {
+		const canonicalScope = canonicalScopeFor(scope);
+		assertScopedKeyAvailable(this.authority, canonicalScope);
+		this.authority.beginProjectReassignment(canonicalScope.key, currentProjectId, nextProjectId, target);
+	}
 	rollbackProjectReassignment(chatId: string, currentProjectId: string): void {
 		this.authority.rollbackProjectReassignment(chatId, currentProjectId);
+	}
+	rollbackProjectReassignmentScoped(scope: SessionMappingScope, currentProjectId: string): void {
+		const canonicalScope = canonicalScopeFor(scope);
+		assertScopedKeyAvailable(this.authority, canonicalScope);
+		this.authority.rollbackProjectReassignment(canonicalScope.key, currentProjectId);
 	}
 	reassignProjectAuthority(chatId: string, currentProjectId: string, nextProjectId: string): void {
 		this.beginProjectReassignment(chatId, currentProjectId, nextProjectId);
 	}
+	reassignProjectAuthorityScoped(scope: SessionMappingScope, currentProjectId: string, nextProjectId: string): void {
+		this.beginProjectReassignmentScoped(scope, currentProjectId, nextProjectId);
+	}
 	entries(): readonly SessionMapping[] {
 		return this.authority.entries().map(mappingFromRecord);
+	}
+	entriesScoped(scope: SessionMappingScope): readonly SessionMapping[] {
+		const mapping = this.getScoped(scope);
+		return mapping === undefined ? [] : [mapping];
 	}
 	operation(chatId: string, operationId: string): SessionOperation | undefined {
 		return this.authority.lookupOperation(chatId, operationId);
 	}
+	operationScoped(scope: SessionMappingScope, operationId: string): SessionOperation | undefined {
+		const canonicalScope = canonicalScopeFor(scope);
+		const record = this.authority.get(canonicalScope.key);
+		return record === undefined || !isScopedRecordFor(record, canonicalScope)
+			? undefined
+			: operationForScope(this.authority.lookupOperation(canonicalScope.key, operationId), canonicalScope);
+	}
 	operations(chatId: string): readonly SessionOperation[] {
 		return this.authority.get(chatId)?.journal ?? [];
+	}
+	operationsScoped(scope: SessionMappingScope): readonly SessionOperation[] {
+		const canonicalScope = canonicalScopeFor(scope);
+		const record = this.authority.get(canonicalScope.key);
+		if (record === undefined || !isScopedRecordFor(record, canonicalScope)) return [];
+		return record.journal.map(operation => operationForScope(operation, canonicalScope));
 	}
 	operationAuthority(
 		chatId: string,
@@ -57,11 +121,37 @@ export class SessionMappingStore {
 	): SessionAuthorityRecord | SessionAuthorityTombstone | undefined {
 		return this.authority.lookupOperationAuthority(chatId, operationId);
 	}
+	operationAuthorityScoped(
+		scope: SessionMappingScope,
+		operationId: string,
+	): SessionAuthorityRecord | SessionAuthorityTombstone | undefined {
+		const canonicalScope = canonicalScopeFor(scope);
+		const record = this.authority.get(canonicalScope.key);
+		if (record === undefined || !isScopedRecordFor(record, canonicalScope)) return undefined;
+		const authority = this.authority.lookupOperationAuthority(canonicalScope.key, operationId);
+		if (authority === undefined) return undefined;
+		return "retiredAt" in authority
+			? authorityTombstoneForScope(authority, canonicalScope)
+			: authorityRecordForScope(authority, canonicalScope);
+	}
 	assertOperationProject(chatId: string, projectId: string, operationId: string): void {
 		this.authority.assertOperationProject(chatId, projectId, operationId);
 	}
+	assertOperationProjectScoped(scope: SessionMappingScope, projectId: string, operationId: string): void {
+		const canonicalScope = canonicalScopeFor(scope);
+		assertScopedKeyAvailable(this.authority, canonicalScope);
+		this.authority.assertOperationProject(canonicalScope.key, projectId, operationId);
+	}
 	beginOperation(chatId: string, operation: Omit<SessionOperation, "state" | "startedAt" | "completedAt">): void {
 		this.authority.beginOperation(chatId, operation);
+	}
+	beginOperationScoped(
+		scope: SessionMappingScope,
+		operation: Omit<SessionOperation, "state" | "startedAt" | "completedAt">,
+	): void {
+		const canonicalScope = canonicalScopeFor(scope);
+		assertScopedKeyAvailable(this.authority, canonicalScope);
+		this.authority.beginOperation(canonicalScope.key, operation);
 	}
 	recordAcknowledgedSuccessor(
 		chatId: string,
@@ -71,6 +161,19 @@ export class SessionMappingStore {
 	): SessionOperation {
 		return this.authority.recordAcknowledgedSuccessor(chatId, operationId, operationHash, successor);
 	}
+	recordAcknowledgedSuccessorScoped(
+		scope: SessionMappingScope,
+		operationId: string,
+		operationHash: string,
+		successor: AcknowledgedSuccessor,
+	): SessionOperation {
+		const canonicalScope = canonicalScopeFor(scope);
+		assertScopedKeyAvailable(this.authority, canonicalScope);
+		return operationForScope(
+			this.authority.recordAcknowledgedSuccessor(canonicalScope.key, operationId, operationHash, successor),
+			canonicalScope,
+		);
+	}
 	transitionOperation(
 		chatId: string,
 		operationId: string,
@@ -79,6 +182,23 @@ export class SessionMappingStore {
 		result?: SessionOperationResult,
 	): void {
 		this.authority.transitionOperation(chatId, operationId, state, detail, result);
+	}
+	transitionOperationScoped(
+		scope: SessionMappingScope,
+		operationId: string,
+		state: SessionOperationState,
+		detail?: string,
+		result?: SessionOperationResult,
+	): void {
+		const canonicalScope = canonicalScopeFor(scope);
+		assertScopedKeyAvailable(this.authority, canonicalScope);
+		this.authority.transitionOperation(
+			canonicalScope.key,
+			operationId,
+			state,
+			detail,
+			result === undefined ? undefined : operationResultForScope(result, canonicalScope),
+		);
 	}
 	completeOperationWithMapping(
 		chatId: string,
@@ -100,7 +220,35 @@ export class SessionMappingStore {
 				chatId,
 				operationId,
 				detail,
-				copySessionMapping(mapping),
+				authorityInputFromLegacyMapping(mapping),
+				resultWithCloseGeneration,
+			),
+		);
+	}
+	completeOperationWithMappingScoped(
+		scope: SessionMappingScope,
+		operationId: string,
+		detail: string,
+		mapping: SessionMapping,
+		kind: "turn" | "control" | "close",
+	): SessionMapping {
+		const canonicalScope = canonicalScopeFor(scope);
+		assertScopedKeyAvailable(this.authority, canonicalScope);
+		const authorityMapping = authorityInputForScope(canonicalScope, mapping);
+		const result = operationResult(kind, { ...authorityMapping, operationId });
+		const resultWithCloseGeneration =
+			kind === "close"
+				? {
+						...result,
+						correlation: { ...result.correlation, mappingOperationId: mapping.operationId },
+					}
+				: result;
+		return mappingFromRecord(
+			this.authority.completeOperationWithMapping(
+				canonicalScope.key,
+				operationId,
+				detail,
+				authorityMapping,
 				resultWithCloseGeneration,
 			),
 		);
@@ -108,16 +256,50 @@ export class SessionMappingStore {
 	provisionalOperation(chatId: string, ingressId: string): ProvisionalSessionOperation | undefined {
 		return this.authority.provisionalOperation(chatId, ingressId);
 	}
+	provisionalOperationScoped(scope: SessionMappingScope, ingressId: string): ProvisionalSessionOperation | undefined {
+		const canonicalScope = canonicalScopeFor(scope);
+		const record = this.authority.get(canonicalScope.key);
+		if (record === undefined || !isScopedRecordFor(record, canonicalScope)) return undefined;
+		const operation = this.authority.provisionalOperation(canonicalScope.key, ingressId);
+		return operation === undefined ? undefined : provisionalOperationForScope(operation, canonicalScope);
+	}
 	reserveProvisionalOperation(
 		operation: Omit<ProvisionalSessionOperation, "state" | "startedAt" | "completedAt">,
 	): ProvisionalSessionOperation {
 		return this.authority.reserveProvisionalOperation(operation);
 	}
+	reserveProvisionalOperationScoped(
+		scope: SessionMappingScope,
+		operation: Omit<ProvisionalSessionOperation, "state" | "startedAt" | "completedAt">,
+	): ProvisionalSessionOperation {
+		const canonicalScope = canonicalScopeFor(scope);
+		assertScopedKeyAvailable(this.authority, canonicalScope);
+		return provisionalOperationForScope(
+			this.authority.reserveProvisionalOperation(provisionalOperationInputForScope(canonicalScope, operation)),
+			canonicalScope,
+		);
+	}
 	publishProvisionalOperation(
 		operation: Omit<ProvisionalSessionOperation, "state" | "startedAt" | "completedAt">,
 		mapping: SessionMapping,
 	): SessionMapping {
-		return mappingFromRecord(this.authority.publishProvisionalOperation(operation, copySessionMapping(mapping)));
+		return mappingFromRecord(
+			this.authority.publishProvisionalOperation(operation, authorityInputFromLegacyMapping(mapping)),
+		);
+	}
+	publishProvisionalOperationScoped(
+		scope: SessionMappingScope,
+		operation: Omit<ProvisionalSessionOperation, "state" | "startedAt" | "completedAt">,
+		mapping: SessionMapping,
+	): SessionMapping {
+		const canonicalScope = canonicalScopeFor(scope);
+		assertScopedKeyAvailable(this.authority, canonicalScope);
+		return mappingFromRecord(
+			this.authority.publishProvisionalOperation(
+				provisionalOperationInputForScope(canonicalScope, operation),
+				authorityInputForScope(canonicalScope, mapping),
+			),
+		);
 	}
 	attachProvisionalOperation(
 		chatId: string,
@@ -125,6 +307,15 @@ export class SessionMappingStore {
 		attachment: Pick<ProvisionalSessionOperation, "sessionId" | "sessionFile" | "attachment">,
 	): void {
 		this.authority.attachProvisionalOperation(chatId, ingressId, attachment);
+	}
+	attachProvisionalOperationScoped(
+		scope: SessionMappingScope,
+		ingressId: string,
+		attachment: Pick<ProvisionalSessionOperation, "sessionId" | "sessionFile" | "attachment">,
+	): void {
+		const canonicalScope = canonicalScopeFor(scope);
+		assertScopedKeyAvailable(this.authority, canonicalScope);
+		this.authority.attachProvisionalOperation(canonicalScope.key, ingressId, attachment);
 	}
 	transitionProvisionalOperation(
 		chatId: string,
@@ -134,16 +325,217 @@ export class SessionMappingStore {
 	): void {
 		this.authority.transitionProvisionalOperation(chatId, ingressId, state, detail);
 	}
+	transitionProvisionalOperationScoped(
+		scope: SessionMappingScope,
+		ingressId: string,
+		state: SessionOperationState,
+		detail?: string,
+	): void {
+		const canonicalScope = canonicalScopeFor(scope);
+		assertScopedKeyAvailable(this.authority, canonicalScope);
+		this.authority.transitionProvisionalOperation(canonicalScope.key, ingressId, state, detail);
+	}
 }
 
-function mappingFromRecord({
-	version: _version,
-	createdAt: _createdAt,
-	header: _header,
-	observations: _observations,
-	journal: _journal,
-	reassignment: _reassignment,
-	...mapping
-}: import("./session-authority").SessionAuthorityRecord): SessionMapping {
-	return copySessionMapping(mapping);
+function canonicalScopeFor(scope: SessionMappingScope): CanonicalScope {
+	if (scope === undefined || scope === null || typeof scope !== "object")
+		throw new Error("Scoped session mapping requires a principal/chat scope.");
+	return {
+		principalId: scope.principalId,
+		chatId: scope.chatId,
+		key: canonicalSessionMappingKey(scope.principalId, scope.chatId),
+	};
+}
+function isScopedRecordFor(record: SessionAuthorityRecord, scope: CanonicalScope): boolean {
+	const observation = record.observations?.[SCOPED_MAPPING_OBSERVATION];
+	if (
+		typeof observation !== "object" ||
+		observation === null ||
+		Array.isArray(observation) ||
+		!Object.hasOwn(observation, "chatId")
+	)
+		return false;
+	const storedScope = storedScopeFromRecord(record);
+	return storedScope?.principalId === scope.principalId && storedScope.chatId === scope.chatId;
+}
+
+function assertScopedKeyAvailable(authority: SessionAuthority, scope: CanonicalScope): void {
+	const existing = authority.get(scope.key);
+	if (existing !== undefined && !isScopedRecordFor(existing, scope))
+		throw new Error(`Scoped session mapping key ${scope.key} is occupied by an unscoped authority record.`);
+}
+
+function authorityInputFromLegacyMapping(mapping: SessionMapping): SessionAuthorityInput {
+	const copied = copySessionMapping(mapping);
+	const { principalId, ...authorityMapping } = copied;
+	return {
+		...authorityMapping,
+		...(principalId === undefined ? {} : { observations: { [SCOPED_MAPPING_OBSERVATION]: { principalId } } }),
+	};
+}
+
+function authorityInputForScope(scope: CanonicalScope, mapping: SessionMapping): SessionAuthorityInput {
+	const copied = copySessionMapping(mapping);
+	if (copied.chatId !== scope.chatId)
+		throw new Error(`Scoped session mapping chat ID ${copied.chatId} does not match scope ${scope.chatId}.`);
+	if (copied.principalId !== undefined && copied.principalId !== scope.principalId)
+		throw new Error(
+			`Scoped session mapping principal ID ${copied.principalId} does not match scope ${scope.principalId}.`,
+		);
+	const { principalId: _principalId, ...authorityMapping } = { ...copied, principalId: scope.principalId };
+	return {
+		...authorityMapping,
+		chatId: scope.key,
+		observations: {
+			[SCOPED_MAPPING_OBSERVATION]: {
+				principalId: scope.principalId,
+				chatId: scope.chatId,
+			},
+		},
+	};
+}
+
+function provisionalOperationInputForScope(
+	scope: CanonicalScope,
+	operation: Omit<ProvisionalSessionOperation, "state" | "startedAt" | "completedAt">,
+): Omit<ProvisionalSessionOperation, "state" | "startedAt" | "completedAt"> {
+	if (operation.chatId !== scope.chatId)
+		throw new Error(`Scoped session operation chat ID ${operation.chatId} does not match scope ${scope.chatId}.`);
+	return { ...operation, chatId: scope.key };
+}
+
+function provisionalOperationForScope(
+	operation: ProvisionalSessionOperation,
+	scope: CanonicalScope,
+): ProvisionalSessionOperation {
+	return { ...operation, chatId: scope.chatId };
+}
+
+function operationResultForScope(result: SessionOperationResult, scope: CanonicalScope): SessionOperationResult {
+	const { principalId, ...mapping } = result.mapping as SessionOperationResult["mapping"] & {
+		readonly principalId?: string;
+	};
+	if (mapping.chatId !== scope.chatId && mapping.chatId !== scope.key)
+		throw new Error(`Scoped session operation chat ID ${mapping.chatId} does not match scope ${scope.chatId}.`);
+	if (principalId !== undefined && principalId !== scope.principalId)
+		throw new Error(
+			`Scoped session operation principal ID ${principalId} does not match scope ${scope.principalId}.`,
+		);
+	return {
+		...result,
+		mapping: {
+			...mapping,
+			chatId: scope.key,
+		},
+		...(result.correlation === undefined
+			? {}
+			: {
+					correlation: {
+						...result.correlation,
+						...(result.correlation.chatId === scope.chatId ? { chatId: scope.key } : {}),
+					},
+				}),
+	};
+}
+
+function operationForScope(operation: SessionOperation, scope: CanonicalScope): SessionOperation;
+function operationForScope(
+	operation: SessionOperation | undefined,
+	scope: CanonicalScope,
+): SessionOperation | undefined;
+function operationForScope(
+	operation: SessionOperation | undefined,
+	scope: CanonicalScope,
+): SessionOperation | undefined {
+	if (operation === undefined || operation.result === undefined) return operation;
+	return {
+		...operation,
+		result: {
+			...operation.result,
+			mapping: {
+				...operation.result.mapping,
+				...(operation.result.mapping.chatId === scope.key
+					? { chatId: scope.chatId, principalId: scope.principalId }
+					: {}),
+			} as SessionOperationResult["mapping"],
+			...(operation.result.correlation === undefined
+				? {}
+				: {
+						correlation: {
+							...operation.result.correlation,
+							...(operation.result.correlation.chatId === scope.key ? { chatId: scope.chatId } : {}),
+						},
+					}),
+		},
+	};
+}
+
+function authorityRecordForScope(record: SessionAuthorityRecord, scope: CanonicalScope): SessionAuthorityRecord {
+	return {
+		...record,
+		chatId: scope.chatId,
+		header: { ...record.header, chatId: scope.chatId },
+		journal: record.journal.map(operation => operationForScope(operation, scope) as SessionOperation),
+		...(record.reassignment === undefined ? {} : { reassignment: reassignmentForScope(record.reassignment, scope) }),
+	};
+}
+
+function reassignmentForScope(
+	reassignment: SessionAuthorityReassignment,
+	scope: CanonicalScope,
+): SessionAuthorityReassignment {
+	return {
+		...reassignment,
+		...(reassignment.sourceTombstone === undefined
+			? {}
+			: { sourceTombstone: authorityTombstoneForScope(reassignment.sourceTombstone, scope) }),
+		...(reassignment.priorTombstone === undefined
+			? {}
+			: { priorTombstone: authorityTombstoneForScope(reassignment.priorTombstone, scope) }),
+	};
+}
+
+function authorityTombstoneForScope(
+	tombstone: SessionAuthorityTombstone,
+	scope: CanonicalScope,
+): SessionAuthorityTombstone {
+	return {
+		...tombstone,
+		chatId: scope.chatId,
+		header: { ...tombstone.header, chatId: scope.chatId },
+		journal: tombstone.journal.map(operation => operationForScope(operation, scope) as SessionOperation),
+		...(tombstone.prior === undefined ? {} : { prior: authorityTombstoneForScope(tombstone.prior, scope) }),
+	};
+}
+
+function mappingFromRecord(record: SessionAuthorityRecord): SessionMapping {
+	const storedScope = storedScopeFromRecord(record);
+	const {
+		version: _version,
+		createdAt: _createdAt,
+		header: _header,
+		observations: _observations,
+		journal: _journal,
+		reassignment: _reassignment,
+		...mapping
+	} = record;
+	return copySessionMapping({
+		...mapping,
+		chatId: storedScope?.chatId ?? mapping.chatId,
+		...(storedScope === undefined ? {} : { principalId: storedScope.principalId }),
+	});
+}
+
+function storedScopeFromRecord(record: SessionAuthorityRecord): SessionMappingScope | undefined {
+	const observation = record.observations?.[SCOPED_MAPPING_OBSERVATION];
+	if (observation === undefined) return undefined;
+	if (typeof observation !== "object" || observation === null || Array.isArray(observation))
+		throw new Error("Session mapping contains invalid scope metadata.");
+	const principalId = (observation as StoredMappingScope).principalId;
+	const chatId = (observation as StoredMappingScope).chatId;
+	if (typeof principalId !== "string") throw new Error("Session mapping contains invalid scope metadata.");
+	if (chatId === undefined) return { principalId, chatId: record.chatId };
+	if (typeof chatId !== "string" || canonicalSessionMappingKey(principalId, chatId) !== record.chatId)
+		throw new Error("Session mapping contains an invalid canonical scope key.");
+	return { principalId, chatId };
 }

@@ -45,13 +45,17 @@ export async function deliverFinalAssistantContent(input: {
 	readonly content: string;
 }): Promise<void> {
 	if (input.messageSink === undefined) return;
-	await input.messageSink({
-		chatId: input.chatId,
-		messageId: input.messageId,
-		ownerUserId: input.ownerUserId,
-		projectId: input.projectId,
-		content: input.content,
-	});
+	try {
+		await input.messageSink({
+			chatId: input.chatId,
+			messageId: input.messageId,
+			ownerUserId: input.ownerUserId,
+			projectId: input.projectId,
+			content: input.content,
+		});
+	} catch {
+		console.error("OpenWebUI assistant-message projection failed after the GJC response was delivered.");
+	}
 }
 
 export async function deliverRunnerEvents(input: {
@@ -63,11 +67,15 @@ export async function deliverRunnerEvents(input: {
 	readonly projectId: string;
 }): Promise<void> {
 	if (input.eventSink === undefined || input.events === undefined || input.events.length === 0) return;
-	await input.eventSink({
-		chatId: input.chatId,
-		messageId: input.messageId,
-		ownerUserId: input.ownerUserId,
-		projectId: input.projectId,
-		events: input.events,
-	});
+	try {
+		await input.eventSink({
+			chatId: input.chatId,
+			messageId: input.messageId,
+			ownerUserId: input.ownerUserId,
+			projectId: input.projectId,
+			events: input.events,
+		});
+	} catch {
+		console.error("OpenWebUI event projection failed; the GJC response remains available through this request.");
+	}
 }

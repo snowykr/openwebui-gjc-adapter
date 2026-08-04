@@ -113,13 +113,12 @@ services:
       GJC_OPENWEBUI_BASE_URL: http://openwebui:8080
       GJC_OPENWEBUI_ADAPTER_API_TOKEN_FILE: /run/secrets/adapter-token
       GJC_OPENWEBUI_STATE_PATH: /var/lib/gjc
-      GJC_OPENWEBUI_SESSION_ROOT: /run/gjc-session
-      GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS: /workspace
+      GJC_OPENWEBUI_SESSION_ROOT: /var/lib/gjc/sessions
+      GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS: /workspace:/var/lib/gjc
     command: ["serve", "--config", "/run/openwebui-gjc-adapter/config.json"]
     volumes:
       - ${yaml(`${config}/${configName}`)}:/run/openwebui-gjc-adapter/config.json:ro
       - ${yaml(`${config}/state`)}:/var/lib/gjc
-      - ${yaml(`${config}/session`)}:/run/gjc-session
       - ${yaml(`${config}/workspace`)}:/workspace
     labels:
       com.gjc.managed: "true"
