@@ -2,16 +2,21 @@ import { describe, expect, it } from "bun:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
+import { SessionMappingStore } from "../src/gjc/session-router";
+import type { GjcTurnRunner } from "../src/gjc/turn-runner";
 import {
 	handleChatCompletions,
 	type LiveGatewayRunnerInput,
 	type LiveGatewayRunnerResult,
 } from "../src/live/chat-completions";
+import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
 import { buildOpenWebUIStatusEvent } from "../src/openwebui/events";
 import type { RegisteredProject } from "../src/projects/registry";
 import { WorkspaceLeaseManager } from "../src/security/workspace-lease";
+import { attachmentProof, lifecycleFixture } from "./gjc-lifecycle-fixtures";
+import { staticModelReaderFactory } from "./model-selection-fixtures";
 
 const project: RegisteredProject = {
 	id: "demo",
@@ -342,6 +347,154 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 		}
 	});
 
+	it("retains the workspace lease until an abandoned routed stream settles", async () => {
+		const root = await mkdtemp(join(tmpdir(), "gjc-workspace-lease-routed-abandon-"));
+		const workspace = join(root, "workspace");
+		const safeKey = "e".repeat(64);
+		const workspaceRegistry = {
+			open: async (userId: string) => ({
+				userId,
+				safeKey,
+				root: workspace,
+				sessionRoot: join(workspace, ".gjc", "sessions"),
+			}),
+		};
+		const workspaceLeaseManager = new WorkspaceLeaseManager({ stateRoot: root });
+		const mappings = new SessionMappingStore();
+		let runnerCalls = 0;
+		let releaseFirst!: () => void;
+		let firstSettled = false;
+		const firstTurn = new Promise<void>(resolve => {
+			releaseFirst = () => {
+				firstSettled = true;
+				resolve();
+			};
+		});
+		const turnRunner: GjcTurnRunner = {
+			async startNewSession(input, publish, beforePrompt) {
+				runnerCalls += 1;
+				const first = runnerCalls === 1;
+				const address = {
+					cwd: input.cwd,
+					sessionRoot: input.sessionRoot,
+					projectId: input.projectId,
+					chatId: input.chatId,
+					sessionId: `session-${runnerCalls}`,
+					sessionFile: join(input.sessionRoot, `session-${runnerCalls}.jsonl`),
+					text: "working done",
+					events: [],
+					activeLeaf: "leaf-1",
+					rawFrameCursor: 1,
+					eventCursor: 1,
+					...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
+				};
+				const attachment = {
+					...attachmentProof(address),
+					tmuxSocket: "/tmp/tmux.sock",
+					tmuxPane: "%1",
+					tmuxPanePid: 1,
+					tmuxOwnershipTag: "owner",
+					ownedAt: "2026-07-19T00:00:00.000Z",
+				};
+				const lifecycle = lifecycleFixture(address);
+				const attachedAddress = { ...address, attachment };
+				await beforePrompt(attachedAddress, attachment, lifecycle);
+				await input.observer?.({
+					type: "message_update",
+					payload: { assistantMessageEvent: { type: "text_delta", delta: "working" } },
+				});
+				if (first) await firstTurn;
+				return publish({ ...address, attachment }, lifecycle);
+			},
+			async continueSession(_input) {
+				throw new Error("Unexpected mapped-session continuation in lease lifecycle test.");
+			},
+			async switchSession(_input) {},
+			async getState(_input) {
+				return { rawFrameCursor: 1, eventCursor: 1 };
+			},
+		};
+		const runner = createGjcRoutingLiveGatewayRunner({
+			turnRunner,
+			mappings,
+			modelReaderFactory: staticModelReaderFactory(),
+		});
+		const request = {
+			model: "gjc" as const,
+			stream: true,
+			messages: [{ role: "user" as const, content: "stream" }],
+		};
+		const firstHeaders = {
+			...chatHeaders,
+			"X-OpenWebUI-User-Id": "normal-1",
+			"X-OpenWebUI-Chat-Id": "chat-routed-1",
+			"X-OpenWebUI-Message-Id": "assistant-routed-1",
+			"X-OpenWebUI-User-Message-Id": "user-routed-1",
+		};
+		try {
+			const firstResult = await handleChatCompletions({
+				request,
+				headers: firstHeaders,
+				projects: [project],
+				owner,
+				workspaceRegistry,
+				workspaceLeaseManager,
+				runner,
+				eventSink: () => {},
+			});
+			if (!firstResult.ok || !("stream" in firstResult)) throw new Error("expected routed stream");
+			const iterator = firstResult.stream[Symbol.asyncIterator]();
+			await iterator.next();
+			const abandonment = iterator.return?.();
+			if (abandonment === undefined) throw new Error("expected an abandonable stream iterator");
+			await Promise.resolve();
+			expect(firstSettled).toBe(false);
+
+			const blocked = await handleChatCompletions({
+				request: { ...request, stream: false, messages: [{ role: "user", content: "blocked" }] },
+				headers: {
+					...firstHeaders,
+					"X-OpenWebUI-Chat-Id": "chat-routed-2",
+					"X-OpenWebUI-Message-Id": "assistant-routed-2",
+					"X-OpenWebUI-User-Message-Id": "user-routed-2",
+				},
+				projects: [project],
+				owner,
+				workspaceRegistry,
+				workspaceLeaseManager,
+				runner,
+			});
+			expect(blocked).toMatchObject({
+				ok: false,
+				status: 503,
+				body: { error: { code: "workspace_lease_uncertain" } },
+			});
+			expect(runnerCalls).toBe(1);
+
+			releaseFirst();
+			await abandonment;
+			expect(firstSettled).toBe(true);
+
+			const admitted = await handleChatCompletions({
+				request: { ...request, stream: false, messages: [{ role: "user", content: "admitted" }] },
+				headers: {
+					...firstHeaders,
+					"X-OpenWebUI-Chat-Id": "chat-routed-3",
+					"X-OpenWebUI-Message-Id": "assistant-routed-3",
+					"X-OpenWebUI-User-Message-Id": "user-routed-3",
+				},
+				projects: [project],
+				owner,
+				workspaceRegistry,
+				workspaceLeaseManager,
+				runner,
+			});
+			expect(admitted.ok).toBe(true);
+			expect(runnerCalls).toBe(2);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
 	it("fails closed on lease acquisition without invoking the runner", async () => {
 		const root = await mkdtemp(join(tmpdir(), "gjc-workspace-lease-failure-"));
 		const workspace = join(root, "workspace");
