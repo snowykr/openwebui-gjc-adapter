@@ -40,6 +40,7 @@ export function replayCompletedWorkflowGateReply(
 	turn: LiveGatewayRunnerInput,
 ): LiveGatewayRunnerResult | null {
 	const principalId = principalIdForTurn(turn);
+	const projectionOwnerUserId = principalId ?? input.ownerUserId ?? "openwebui-gjc-adapter";
 	const mappings =
 		principalId === undefined ? input.mappings : scopedSessionMappingStore(input.mappings, principalId, turn.chatId);
 	const priorOperation = mappings.operation(turn.chatId, turn.userMessageId);
@@ -66,7 +67,8 @@ export function replayCompletedWorkflowGateReply(
 			assistantText: result.assistantText,
 			events: result.events,
 		},
-		input.ownerUserId ?? "openwebui-gjc-adapter",
+		projectionOwnerUserId,
+		principalId,
 	);
 	return { content: result.assistantText };
 }
@@ -78,6 +80,7 @@ export async function handleWorkflowGateReply(
 	observer?: GjcTurnEventObserver,
 ): Promise<LiveGatewayRunnerResult | null> {
 	const principalId = principalIdForTurn(turn);
+	const projectionOwnerUserId = principalId ?? input.ownerUserId ?? "openwebui-gjc-adapter";
 	const mappings =
 		principalId === undefined ? input.mappings : scopedSessionMappingStore(input.mappings, principalId, turn.chatId);
 	if (
@@ -147,7 +150,8 @@ export async function handleWorkflowGateReply(
 				assistantText: priorOperation.result.assistantText,
 				events: priorOperation.result.events,
 			},
-			input.ownerUserId ?? "openwebui-gjc-adapter",
+			projectionOwnerUserId,
+			principalId,
 		);
 		return { content: priorOperation.result.assistantText };
 	}
@@ -229,7 +233,7 @@ export async function handleWorkflowGateReply(
 				nextMapping,
 				"control",
 			);
-			ensureProjectionRows(input.outbox, published, input.ownerUserId ?? "openwebui-gjc-adapter");
+			ensureProjectionRows(input.outbox, published, projectionOwnerUserId, principalId);
 			return published;
 		});
 		const projectedEvents = projectTurnEvents(
