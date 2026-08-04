@@ -32,9 +32,9 @@ export interface WorkspaceLeaseRecord {
 	readonly leaseExpiresAt: number;
 	/** Highest wall-clock instant durably observed for this lease generation. */
 	readonly observedAt: number;
-	/** Linux boot identifier used to bind monotonic lease expiry to one boot. */
+	/** Boot identifier used to bind monotonic lease expiry when available. */
 	readonly bootId: string;
-	/** Monotonic uptime deadline in milliseconds for the associated boot. */
+	/** Monotonic uptime deadline in milliseconds for the associated boot, or zero when unavailable. */
 	readonly monotonicExpiresAt: number;
 	readonly cleanupPending: boolean;
 }
@@ -43,7 +43,7 @@ export interface WorkspaceLeaseManagerOptions {
 	readonly stateRoot: string;
 	readonly now?: () => number;
 	readonly monotonicNow?: () => number;
-	readonly bootId?: () => string;
+	readonly bootId?: () => string | undefined;
 	/** Alias for callers that use clock terminology. `now` takes precedence. */
 	readonly clock?: () => number;
 }
@@ -84,7 +84,7 @@ export class WorkspaceLeaseManager {
 		this.workspaceLocksRoot = path.join(this.locksRoot, "workspaces");
 		this.#now = options.now ?? options.clock ?? Date.now;
 		this.#monotonicNow = options.monotonicNow ?? defaultMonotonicNow;
-		this.#bootId = normalizeBootId((options.bootId ?? defaultBootId)());
+		this.#bootId = resolveBootId(options.bootId ?? defaultBootId);
 	}
 
 	/** Returns the durable lock path without creating any workspace directories. */
@@ -141,9 +141,9 @@ export class WorkspaceLeaseManager {
 				holderId: options.holderId,
 				operation: options.operation,
 				leaseExpiresAt: addLeaseDuration(clock.wallNow, duration),
+				monotonicExpiresAt: clock.bootId.length === 0 ? 0 : addLeaseDuration(clock.monotonicNow, duration),
 				observedAt: clock.wallNow,
 				bootId: clock.bootId,
-				monotonicExpiresAt: addLeaseDuration(clock.monotonicNow, duration),
 				cleanupPending: current?.cleanupPending ?? false,
 			};
 			await writeRecord(lockPath, record, this.workspaceLocksRoot);
@@ -187,8 +187,8 @@ export class WorkspaceLeaseManager {
 				...current,
 				leaseExpiresAt: addLeaseDuration(clock.wallNow, duration),
 				observedAt: clock.wallNow,
+				monotonicExpiresAt: clock.bootId.length === 0 ? 0 : addLeaseDuration(clock.monotonicNow, duration),
 				bootId: clock.bootId,
-				monotonicExpiresAt: addLeaseDuration(clock.monotonicNow, duration),
 			};
 			await writeRecord(lockPath, renewed, this.workspaceLocksRoot);
 			if (normalized.handle !== undefined) normalized.handle.updateFromManager(renewed);
@@ -586,6 +586,7 @@ function assertCurrentFence(
 }
 
 function isActive(record: WorkspaceLeaseRecord, clock: WorkspaceLeaseClock): boolean {
+	if (clock.bootId.length === 0) return record.leaseExpiresAt > clock.wallNow;
 	return record.bootId === clock.bootId && record.monotonicExpiresAt > clock.monotonicNow;
 }
 
@@ -1176,7 +1177,7 @@ function parseRecord(value: unknown, lockPath: string): WorkspaceLeaseRecord {
 				: (() => {
 						throw new Error(`Invalid workspace lease observed clock value: ${lockPath}`);
 					})();
-	const bootId = value.bootId === undefined ? "" : normalizeBootId(value.bootId);
+	const bootId = value.bootId === undefined || value.bootId === "" ? "" : normalizeBootId(value.bootId);
 	const monotonicExpiresAt =
 		value.monotonicExpiresAt === undefined
 			? 0
@@ -1253,15 +1254,21 @@ function defaultMonotonicNow(): number {
 	return Math.floor(os.uptime() * 1_000);
 }
 
-function defaultBootId(): string {
+function defaultBootId(): string | undefined {
 	if (process.platform === "linux") {
 		try {
-			return readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+			const bootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+			if (bootId.length > 0) return bootId;
 		} catch {
-			// Fall through to the host-scoped conservative fallback.
+			// Fall through to the wall-clock expiry fallback.
 		}
 	}
-	return `${process.platform}:${os.hostname()}`;
+	return undefined;
+}
+
+function resolveBootId(factory: () => string | undefined): string {
+	const value = factory();
+	return value === undefined ? "" : normalizeBootId(value);
 }
 
 function normalizeBootId(value: unknown): string {

@@ -40,6 +40,7 @@ export interface ProjectLinkServiceOptions {
 	readonly repository?: OpenWebUIProjectionRepository;
 	readonly mappings?: SessionMappingStore;
 	readonly protectedPaths: GjcRuntimeLocations["protectedProjectPaths"];
+	readonly protectedProjectRoots?: readonly string[];
 	readonly runtimeLocations?: GjcSessionStorageLocations;
 	readonly closeSession?: ProjectSessionCloser;
 }
@@ -73,6 +74,7 @@ export class ProjectLinkService {
 	readonly #repository?: OpenWebUIProjectionRepository;
 	readonly #mappings?: SessionMappingStore;
 	readonly #protectedPaths: GjcRuntimeLocations["protectedProjectPaths"];
+	readonly #protectedProjectRoots: readonly string[];
 	readonly #runtimeLocations?: GjcSessionStorageLocations;
 	readonly #closeSession?: ProjectSessionCloser;
 
@@ -83,12 +85,13 @@ export class ProjectLinkService {
 		this.#repository = options.repository;
 		this.#mappings = options.mappings;
 		this.#protectedPaths = options.protectedPaths;
+		this.#protectedProjectRoots = options.protectedProjectRoots ?? [];
 		this.#runtimeLocations = options.runtimeLocations;
 		this.#closeSession = options.closeSession;
 	}
 
 	async seedConfiguredProjects(projects: readonly RegisteredProject[]): Promise<void> {
-		await assertProjectsAdmitted(projects, this.#protectedPaths);
+		await assertProjectsAdmitted(projects, this.#protectedPaths, this.#protectedProjectRoots);
 		this.#store.seedConfiguredProjects(projects);
 	}
 
@@ -105,7 +108,7 @@ export class ProjectLinkService {
 			}
 			throw error;
 		}
-		await assertProjectsAdmitted([registered], this.#protectedPaths);
+		await assertProjectsAdmitted([registered], this.#protectedPaths, this.#protectedProjectRoots);
 		const previous = this.#store.getProject(registered.cwd);
 		let project = this.#store.linkProject(registered, source);
 		try {

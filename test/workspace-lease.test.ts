@@ -228,6 +228,49 @@ describe("durable workspace leases", () => {
 		});
 		expect(replacement.generation).toBe(lease.generation + 1);
 	});
+	test("uses wall-clock expiry when a platform has no boot identity", async () => {
+		const stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-workspace-lease-portable-"));
+		let wallNow = 1_000;
+		let monotonicNow = 100_000;
+		const manager = new WorkspaceLeaseManager({
+			stateRoot,
+			now: () => wallNow,
+			monotonicNow: () => monotonicNow,
+			bootId: () => undefined,
+		});
+		const lease = await manager.acquire({
+			safeKey: SAFE_KEY,
+			holderId: "portable-holder",
+			operation: "turn",
+			leaseMs: 100,
+		});
+
+		expect(lease.record).toMatchObject({
+			bootId: "",
+			monotonicExpiresAt: 0,
+			leaseExpiresAt: 1_100,
+		});
+		await expect(manager.assertFence(lease)).resolves.toMatchObject({ generation: lease.generation });
+
+		wallNow = 1_100;
+		monotonicNow = 1;
+		const restartedManager = new WorkspaceLeaseManager({
+			stateRoot,
+			now: () => wallNow,
+			monotonicNow: () => monotonicNow,
+			bootId: () => undefined,
+		});
+
+		await expect(restartedManager.assertFence(lease)).rejects.toThrow(/expired/i);
+		const replacement = await restartedManager.acquire({
+			safeKey: SAFE_KEY,
+			holderId: "portable-replacement",
+			operation: "turn",
+			leaseMs: 100,
+		});
+		expect(replacement.generation).toBe(lease.generation + 1);
+		await replacement.release();
+	});
 	test("cleanup-pending denies non-cleanup admission and can be cleared by a fenced holder", async () => {
 		const { manager, setNow } = await createManager();
 		const holder = await manager.acquire({

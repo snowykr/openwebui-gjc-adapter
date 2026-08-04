@@ -112,6 +112,7 @@ export async function buildResolvedAdapterServerOptions(
 	behavior: BuildAdapterServerOptionsBehavior = {},
 ): Promise<AdapterServerOptions> {
 	assertResolvedAdapterConfig(config);
+	const protectedProjectRoots = config.mode === "managed" ? [config.statePath] : [];
 	await mkdir(config.statePath, { recursive: true });
 	const lock = await RuntimeSingletonLock.acquire(config.statePath);
 	const internalStore = dependencies.projectRegistrationStore === undefined;
@@ -122,9 +123,17 @@ export async function buildResolvedAdapterServerOptions(
 	try {
 		const isolationDiagnostics: RuntimeIsolationDiagnostic[] = [];
 		if (internalStore)
-			await preflightProjectRegistrationDatabase(databasePath, config.runtimeLocations.protectedProjectPaths);
+			await preflightProjectRegistrationDatabase(
+				databasePath,
+				config.runtimeLocations.protectedProjectPaths,
+				protectedProjectRoots,
+			);
 		projectStore = dependencies.projectRegistrationStore ?? new SqliteProjectRegistrationStore(databasePath);
-		await auditProjectRegistrations(projectStore, config.runtimeLocations.protectedProjectPaths);
+		await auditProjectRegistrations(
+			projectStore,
+			config.runtimeLocations.protectedProjectPaths,
+			protectedProjectRoots,
+		);
 		const allowedRoots = await resolveAllowedRoots(config.allowedProjectRoots);
 		const projects = await loadConfiguredProjects(config, allowedRoots);
 		const owner = buildOwnerContext(config);
@@ -230,6 +239,7 @@ export async function buildResolvedAdapterServerOptions(
 			repository: projectionRepository,
 			mappings,
 			protectedPaths: config.runtimeLocations.protectedProjectPaths,
+			protectedProjectRoots,
 			runtimeLocations: config.runtimeLocations,
 			...(closeSessionForRoutes === undefined ? {} : { closeSession: closeSessionForRoutes }),
 		});
