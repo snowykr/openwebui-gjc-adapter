@@ -21,7 +21,9 @@ export async function reconcilePendingOperations(
 			await applier(applyingOperation);
 			applied.push(store.markApplied(applyingOperation));
 		} catch (error) {
-			failed.push(store.markFailed(applyingOperation, getErrorMessage(error)));
+			const failedOperation = store.markFailed(applyingOperation, getErrorMessage(error));
+			failed.push(failedOperation);
+			store.markReconcile(failedOperation);
 		}
 	}
 

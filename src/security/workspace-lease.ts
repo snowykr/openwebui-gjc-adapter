@@ -8,6 +8,7 @@ import * as path from "node:path";
 const DIRECTORY_MODE = 0o700;
 const RECORD_MODE = 0o600;
 const SAFE_KEY_PATTERN = /^[a-f0-9]{64}$/;
+const PORTABLE_PROCESS_IDENTITY = "portable";
 const OPERATION_PATTERN = /^[a-z][a-z0-9-]{0,63}$/;
 const MAX_CORRELATION_ID_LENGTH = 256;
 
@@ -752,13 +753,39 @@ async function writeExternalOperationLockFile(
 }
 
 async function currentExternalOperationLockOwner(): Promise<ExternalOperationLockOwner> {
+	if (process.platform !== "linux") {
+		return { pid: process.pid, startTicks: PORTABLE_PROCESS_IDENTITY };
+	}
 	return {
 		pid: process.pid,
 		startTicks: await externalOperationLockStartTicks(process.pid),
 	};
 }
+/**
+ * Portable liveness only establishes whether a PID currently exists. A present
+ * PID is therefore always treated as live because portable platforms provide no
+ * safe PID-reuse identity.
+ */
+function portableProcessIsLive(pid: number): boolean {
+	if (!Number.isSafeInteger(pid) || pid < 1) throw new Error("Invalid workspace operation lock owner PID");
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		if (isMissingProcessError(error)) return false;
+		if (isNodeFsError(error, "EPERM")) return true;
+		throw error;
+	}
+}
 
 async function isExternalOperationLockOwnerLive(owner: ExternalOperationLockOwner): Promise<boolean> {
+	if (process.platform !== "linux") {
+		try {
+			return portableProcessIsLive(owner.pid);
+		} catch (error) {
+			throw new Error("Unable to establish operation lock owner liveness", { cause: error });
+		}
+	}
 	try {
 		return (await externalOperationLockStartTicks(owner.pid)) === owner.startTicks;
 	} catch (error) {
@@ -836,13 +863,12 @@ function parseExternalOperationLockOwner(value: unknown, guardPath: string): Ext
 	if (!isRecord(value)) throw new Error(`Workspace operation lock metadata is invalid: ${guardPath}`);
 	const pid = value.pid;
 	const startTicks = value.startTicks;
-	if (
-		typeof pid !== "number" ||
-		!Number.isSafeInteger(pid) ||
-		pid < 1 ||
-		typeof startTicks !== "string" ||
-		!/^\d+$/.test(startTicks)
-	) {
+	const validStartTicks =
+		typeof startTicks === "string" &&
+		(process.platform === "linux"
+			? /^\d+$/.test(startTicks)
+			: /^\d+$/.test(startTicks) || startTicks === PORTABLE_PROCESS_IDENTITY);
+	if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid < 1 || !validStartTicks) {
 		throw new Error(`Workspace operation lock metadata is invalid: ${guardPath}`);
 	}
 	return { pid, startTicks };

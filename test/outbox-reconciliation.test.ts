@@ -396,7 +396,7 @@ describe("reconcilePendingOperations", () => {
 
 		expect(result.applied).toEqual([]);
 		expect(result.failed.map(operation => operation.operationId)).toEqual(["op-1"]);
-		expect(store.get("op-1")?.state).toBe("failed");
+		expect(store.get("op-1")?.state).toBe("reconcile");
 		expect(store.get("op-1")?.attempts).toBe(1);
 		expect(store.get("op-1")?.lastError).toBe("OpenWebUI unavailable");
 	});
