@@ -512,6 +512,7 @@ describe("GJC idle session reaper", () => {
 			for (let attempt = 0; attempt < 100 && rejectedReaperLeaseAttempts === 0; attempt += 1) await flush();
 			expect(reaperLeaseAttempts).toBeGreaterThan(0);
 			expect(rejectedReaperLeaseAttempts).toBeGreaterThan(0);
+			await flush();
 			releaseTurn();
 			await pendingTurn;
 			await flush();
