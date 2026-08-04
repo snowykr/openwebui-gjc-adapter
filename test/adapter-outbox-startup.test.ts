@@ -3,11 +3,16 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildAdapterServerOptions } from "../src/adapter-server-options";
-import { buildProjectionPayloadHash, InMemoryOutboxStore } from "../src/state/outbox";
+import {
+	buildProjectionPayloadHash,
+	FileBackedOutboxStore,
+	InMemoryOutboxStore,
+	type OutboxStore,
+} from "../src/state/outbox";
 import { FakeGjcTurnRunner } from "./cli-fixtures";
 import { staticModelReaderFactory } from "./model-selection-fixtures";
 
-function enqueuePendingOperation(store: InMemoryOutboxStore): void {
+function enqueuePendingOperation(store: OutboxStore): void {
 	store.enqueue({
 		operationId: "projection-op-1",
 		principalId: "user-1",
@@ -21,7 +26,7 @@ function enqueuePendingOperation(store: InMemoryOutboxStore): void {
 }
 
 describe("projection outbox startup reconciliation", () => {
-	test("retains a failed projection without taking the adapter offline", async () => {
+	test("retains a failed projection as retryable without taking the adapter offline", async () => {
 		const root = await mkdtemp(join(tmpdir(), "gjc-adapter-outbox-startup-"));
 		const outbox = new InMemoryOutboxStore();
 		enqueuePendingOperation(outbox);
@@ -61,12 +66,74 @@ describe("projection outbox startup reconciliation", () => {
 
 		expect(outbox.get({ principalId: "user-1", chatId: "chat-1", operationId: "projection-op-1" })).toMatchObject({
 			principalId: "user-1",
-			state: "failed",
+			state: "reconcile",
 			attempts: 1,
 		});
 		expect(errors).toEqual(["Projection outbox reconciliation retained 1 failed operation(s); serving continues."]);
 		expect(options?.checks).toContainEqual(
 			expect.objectContaining({ name: "openwebui-projection-outbox", status: "degraded" }),
 		);
+	});
+	test("retries a failed projection after a healthy restart exactly once", async () => {
+		const root = await mkdtemp(join(tmpdir(), "gjc-adapter-outbox-retry-"));
+		const outboxPath = join(root, "projection-outbox.json");
+		const persisted = new FileBackedOutboxStore(outboxPath);
+		enqueuePendingOperation(persisted);
+		const config = {
+			mode: "existing" as const,
+			bindHost: "127.0.0.1",
+			bindPort: 8765,
+			openWebUIBaseUrl: "http://127.0.0.1:3000",
+			allowedProjectRoots: [],
+			projects: [],
+			statePath: root,
+			sessionRoot: join(root, "sessions"),
+			gjcCommand: "/opt/gjc",
+			turnTimeoutMs: 240_000,
+		};
+		let failedOptions: Awaited<ReturnType<typeof buildAdapterServerOptions>> | undefined;
+		try {
+			failedOptions = await buildAdapterServerOptions(config, {
+				outbox: new FileBackedOutboxStore(outboxPath),
+				turnRunner: new FakeGjcTurnRunner(),
+				modelReaderFactory: staticModelReaderFactory(),
+				projectionOperationApplier: () => {
+					throw new Error("temporary projection outage");
+				},
+			});
+		} finally {
+			await failedOptions?.shutdownCleanup?.();
+			await failedOptions?.runtimeLock.release();
+		}
+		expect(new FileBackedOutboxStore(outboxPath).get("projection-op-1")).toMatchObject({
+			operationId: "projection-op-1",
+			state: "reconcile",
+			attempts: 1,
+			lastError: "temporary projection outage",
+		});
+
+		const replayed: string[] = [];
+		let healthyOptions: Awaited<ReturnType<typeof buildAdapterServerOptions>> | undefined;
+		try {
+			healthyOptions = await buildAdapterServerOptions(config, {
+				outbox: new FileBackedOutboxStore(outboxPath),
+				turnRunner: new FakeGjcTurnRunner(),
+				modelReaderFactory: staticModelReaderFactory(),
+				projectionOperationApplier: operation => {
+					replayed.push(operation.operationId);
+				},
+			});
+		} finally {
+			await healthyOptions?.shutdownCleanup?.();
+			await healthyOptions?.runtimeLock.release();
+		}
+
+		expect(replayed).toEqual(["projection-op-1"]);
+		expect(new FileBackedOutboxStore(outboxPath).get("projection-op-1")).toMatchObject({
+			operationId: "projection-op-1",
+			state: "applied",
+			attempts: 2,
+		});
+		await rm(root, { force: true, recursive: true });
 	});
 });

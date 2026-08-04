@@ -152,7 +152,7 @@ export function preflightSessionAuthorityMigration(
 	const now = options.now ?? (() => new Date().toISOString());
 	const locks: Array<ReturnType<typeof AuthorityMutationLock.acquire>> = [];
 	try {
-		for (const lockPath of sourcePath === destinationPath ? [sourcePath] : [sourcePath, destinationPath].sort()) {
+		for (const lockPath of migrationLockPaths(sourcePath, destinationPath, stateRoot)) {
 			locks.push(AuthorityMutationLock.acquire(lockPath));
 		}
 		return runMigration(sourcePath, adminPrincipalId, paths, now);
@@ -2495,6 +2495,22 @@ function syncDirectory(path: string): void {
 	} finally {
 		closeSync(descriptor);
 	}
+}
+
+function migrationLockPaths(sourcePath: string, destinationPath: string, stateRoot: string): readonly string[] {
+	const locks = new Map<string, string>();
+	for (const authorityPath of [sourcePath, destinationPath]) {
+		const lockPath = migrationLockPath(authorityPath, stateRoot);
+		const priorPath = locks.get(lockPath);
+		if (priorPath !== undefined && priorPath !== authorityPath)
+			throw new Error(`migration lock path collision for ${priorPath} and ${authorityPath}`);
+		locks.set(lockPath, authorityPath);
+	}
+	return [...locks.keys()].sort();
+}
+
+function migrationLockPath(authorityPath: string, stateRoot: string): string {
+	return join(resolve(stateRoot), "session-authority-migration", "locks", `path-${digest(authorityPath)}`);
 }
 
 function migrationPaths(sourcePath: string, stateRoot: string, destinationPath: string): MigrationPaths {

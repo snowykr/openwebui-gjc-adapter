@@ -1,8 +1,18 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
+import { AuthorityMutationLock } from "../src/gjc/session-authority-file";
 import {
 	preflightSessionAuthorityMigration,
 	preflightSessionAuthorityMigrationCandidates,
@@ -222,6 +232,67 @@ describe("session authority pre-store migration", () => {
 			expect(JSON.parse(readFileSync(destinationPath, "utf8")).mappings[0].chatId).toBe(
 				JSON.stringify(["admin-1", "chat-1"]),
 			);
+		});
+	});
+	test("migrates a read-only managed candidate using only state-root locks", () => {
+		withRoot((root, _sourcePath) => {
+			const sourceDirectory = join(root, "run", "gjc-session");
+			const sourcePath = join(sourceDirectory, "openwebui-session-mappings.json");
+			const destinationPath = join(root, "state", "sessions", "openwebui-session-mappings.json");
+			const stateRoot = join(root, "state");
+			const original = Buffer.from(JSON.stringify(legacyDocument()));
+			const sourceLockMarker = Buffer.from("legacy source lock marker\n");
+			mkdirSync(sourceDirectory, { recursive: true });
+			writeFileSync(sourcePath, original);
+			writeFileSync(`${sourcePath}.lock`, sourceLockMarker);
+			chmodSync(sourceDirectory, 0o555);
+			try {
+				const result = preflightSessionAuthorityMigrationCandidates({
+					candidateSourcePaths: [sourcePath],
+					destinationPath,
+					stateRoot,
+					adminPrincipalId: "admin-1",
+					now: NOW,
+				});
+				expect(result.status).toBe("committed");
+				expect(readFileSync(sourcePath)).toEqual(original);
+				expect(readFileSync(`${sourcePath}.lock`)).toEqual(sourceLockMarker);
+				expect(existsSync(join(sourceDirectory, "openwebui-session-mappings.json.lock"))).toBe(true);
+				expect(JSON.parse(readFileSync(destinationPath, "utf8")).mappings[0].chatId).toBe(
+					JSON.stringify(["admin-1", "chat-1"]),
+				);
+			} finally {
+				chmodSync(sourceDirectory, 0o755);
+			}
+		});
+	});
+	test("serializes candidate migration on the state-root source lock", () => {
+		withRoot((root, _sourcePath) => {
+			const sourcePath = join(root, "candidate", "openwebui-session-mappings.json");
+			const destinationPath = join(root, "state", "sessions", "openwebui-session-mappings.json");
+			const stateRoot = join(root, "state");
+			const original = Buffer.from(JSON.stringify(legacyDocument()));
+			mkdirSync(join(root, "candidate"), { recursive: true });
+			writeFileSync(sourcePath, original);
+			const sourceDigest = createHash("sha256").update(sourcePath).digest("hex");
+			const heldLock = AuthorityMutationLock.acquire(
+				join(stateRoot, "session-authority-migration", "locks", `path-${sourceDigest}`),
+			);
+			try {
+				const result = preflightSessionAuthorityMigrationCandidates({
+					candidateSourcePaths: [sourcePath],
+					destinationPath,
+					stateRoot,
+					adminPrincipalId: "admin-1",
+					now: NOW,
+				});
+				expect(result.status).toBe("degraded");
+				expect(result.reason).toContain("migration preflight persistence failed");
+				expect(readFileSync(sourcePath)).toEqual(original);
+				expect(existsSync(destinationPath)).toBe(false);
+			} finally {
+				heldLock.release();
+			}
 		});
 	});
 	test("assigns an orphaned legacy provisional operation to the configured admin namespace", () => {

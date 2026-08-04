@@ -7,6 +7,7 @@ import * as path from "node:path";
 const DIRECTORY_MODE = 0o700;
 const REGISTRY_MODE = 0o600;
 const SAFE_KEY_PATTERN = /^[a-f0-9]{64}$/;
+const PORTABLE_PROCESS_IDENTITY = "portable";
 
 export interface UserWorkspace {
 	readonly userId: string;
@@ -309,13 +310,39 @@ async function acquireRegistryLock(stateRoot: string): Promise<() => Promise<voi
 }
 
 async function currentRegistryLockOwner(): Promise<RegistryLockOwner> {
+	if (process.platform !== "linux") {
+		return { pid: process.pid, startTicks: PORTABLE_PROCESS_IDENTITY };
+	}
 	return {
 		pid: process.pid,
 		startTicks: await registryLockStartTicks(process.pid),
 	};
 }
+/**
+ * Portable liveness only establishes whether a PID currently exists. A present
+ * PID is therefore always treated as live because portable platforms provide no
+ * safe PID-reuse identity.
+ */
+function portableProcessIsLive(pid: number): boolean {
+	if (!Number.isSafeInteger(pid) || pid < 1) throw new Error("Invalid user workspace registry lock owner PID");
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		if (isMissingProcessError(error)) return false;
+		if (isNodeFsError(error, "EPERM")) return true;
+		throw error;
+	}
+}
 
 async function isRegistryLockOwnerLive(owner: RegistryLockOwner): Promise<boolean> {
+	if (process.platform !== "linux") {
+		try {
+			return portableProcessIsLive(owner.pid);
+		} catch (error) {
+			throw new Error("Unable to establish user workspace registry lock owner liveness", { cause: error });
+		}
+	}
 	try {
 		return (await registryLockStartTicks(owner.pid)) === owner.startTicks;
 	} catch (error) {
@@ -392,13 +419,12 @@ function parseRegistryLockOwner(value: unknown, lockPath: string): RegistryLockO
 		throw new RegistryLockMetadataError(`User workspace registry lock metadata is invalid: ${lockPath}`);
 	const pid = value.pid;
 	const startTicks = value.startTicks;
-	if (
-		typeof pid !== "number" ||
-		!Number.isSafeInteger(pid) ||
-		pid < 1 ||
-		typeof startTicks !== "string" ||
-		!/^\d+$/.test(startTicks)
-	) {
+	const validStartTicks =
+		typeof startTicks === "string" &&
+		(process.platform === "linux"
+			? /^\d+$/.test(startTicks)
+			: /^\d+$/.test(startTicks) || startTicks === PORTABLE_PROCESS_IDENTITY);
+	if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid < 1 || !validStartTicks) {
 		throw new RegistryLockMetadataError(`User workspace registry lock metadata is invalid: ${lockPath}`);
 	}
 	return { pid, startTicks };
