@@ -153,6 +153,10 @@ export function composeThinkingAssistantContent(text: string, events: readonly G
 			const delta = textField(assistant, "delta") ?? textField(assistant, "text");
 			if (delta === undefined || delta.length === 0) continue;
 			if (!thinkingOpen) {
+				// A `<details>` block must sit at a markdown block boundary;
+				// opening it right after answer text would be swallowed into the
+				// preceding paragraph and render as literal HTML.
+				if (out.length > 0) out += "\n\n";
 				out += THINKING_DETAILS_OPEN;
 				thinkingOpen = true;
 			}

@@ -186,7 +186,7 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 		expect(content).toBe(
 			"<details>\n<summary>Thinking</summary>\n\nt1\n</details>\n\n" +
 				"new:" +
-				"<details>\n<summary>Thinking</summary>\n\nt2\n</details>\n\n" +
+				"\n\n<details>\n<summary>Thinking</summary>\n\nt2\n</details>\n\n" +
 				"hello",
 		);
 	});

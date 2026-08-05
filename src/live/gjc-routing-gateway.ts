@@ -160,6 +160,7 @@ export function createGjcRoutingLiveGatewayRunner(
 					let activityStarted = false;
 					let observedNativeLifecycle = false;
 					let thinkingDetailsOpen = false;
+					let streamedAnything = false;
 					const terminalEvents: ReturnType<typeof projectTurnEvents>[number][] = [];
 					let resolveActivity!: () => void;
 					let rejectActivity!: (error: unknown) => void;
@@ -175,11 +176,17 @@ export function createGjcRoutingLiveGatewayRunner(
 					const closeThinkingDetails = async (): Promise<void> => {
 						if (!thinkingDetailsOpen) return;
 						await queue.push(THINKING_DETAILS_CLOSE);
+						streamedAnything = true;
 						thinkingDetailsOpen = false;
 					};
 					const openThinkingDetails = async (): Promise<void> => {
 						if (thinkingDetailsOpen) return;
+						// A `<details>` block must sit at a markdown block boundary;
+						// opening it right after streamed answer text would render as
+						// literal HTML inside the preceding paragraph.
+						if (streamedAnything) await queue.push("\n\n");
 						await queue.push(THINKING_DETAILS_OPEN);
+						streamedAnything = true;
 						thinkingDetailsOpen = true;
 					};
 					const observer = async (event: import("../gjc/turn-runner").GjcTurnEvent) => {
@@ -211,6 +218,7 @@ export function createGjcRoutingLiveGatewayRunner(
 							await queue.push(
 								typeof assistant.delta === "string" ? assistant.delta : (assistant.text as string),
 							);
+							streamedAnything = true;
 							return;
 						}
 						const projected = projectTurnEvents(
@@ -299,6 +307,7 @@ export function createGjcRoutingLiveGatewayRunner(
 			let observedNativeLifecycle = false;
 			let agentStartDelivered = false;
 			let thinkingDetailsOpen = false;
+			let streamedAnything = false;
 			let resolveActivity!: () => void;
 			let rejectActivity!: (error: unknown) => void;
 			const firstActivity = new Promise<void>((resolve, reject) => {
@@ -313,11 +322,17 @@ export function createGjcRoutingLiveGatewayRunner(
 			const closeThinkingDetails = async (): Promise<void> => {
 				if (!thinkingDetailsOpen) return;
 				await queue.push(THINKING_DETAILS_CLOSE);
+				streamedAnything = true;
 				thinkingDetailsOpen = false;
 			};
 			const openThinkingDetails = async (): Promise<void> => {
 				if (thinkingDetailsOpen) return;
+				// A `<details>` block must sit at a markdown block boundary;
+				// opening it right after streamed answer text would render as
+				// literal HTML inside the preceding paragraph.
+				if (streamedAnything) await queue.push("\n\n");
 				await queue.push(THINKING_DETAILS_OPEN);
+				streamedAnything = true;
 				thinkingDetailsOpen = true;
 			};
 			const backgroundRoute = routeGjcTurn({
@@ -368,6 +383,7 @@ export function createGjcRoutingLiveGatewayRunner(
 						if (delta !== undefined) {
 							await closeThinkingDetails();
 							await queue.push(delta);
+							streamedAnything = true;
 						}
 						return;
 					}
