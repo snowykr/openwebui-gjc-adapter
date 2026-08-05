@@ -88,7 +88,12 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 			if (principal.role === "user") {
 				if (workspace === undefined || input.workspaceLeaseManager === undefined)
 					return workspaceLeaseErrorResult();
-				backgroundLease = await acquireWorkspaceLease(input, workspace.safeKey);
+				try {
+					backgroundLease = await acquireWorkspaceLease(input, workspace.safeKey);
+				} catch {
+					// A busy workspace is retryable, not a missing/bad model.
+					return workspaceLeaseErrorResult();
+				}
 			}
 			const modelReaderFactory =
 				principal.role === "user"
@@ -114,6 +119,9 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 				}),
 			});
 		} catch (error) {
+			if (error instanceof WorkspaceLeaseUncertainError) {
+				return await finishWorkspaceLease(backgroundLease, workspaceLeaseErrorResult());
+			}
 			const result =
 				error instanceof ModelSelectionError
 					? selectionErrorResult(error)

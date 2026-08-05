@@ -660,6 +660,53 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 			await rm(root, { recursive: true, force: true });
 		}
 	});
+	it("reports workspace lease failures for normal-user background tasks instead of model errors", async () => {
+		const root = await mkdtemp(join(tmpdir(), "gjc-bg-lease-error-"));
+		const workspace = join(root, "workspace");
+		try {
+			const result = await handleChatCompletions({
+				request: { model: "gjc", messages: [{ role: "user", content: "title" }] },
+				headers: {
+					...chatHeaders,
+					"X-OpenWebUI-User-Id": "normal-1",
+					"X-OpenWebUI-Task": "title",
+				},
+				projects: [],
+				owner,
+				modelReaderFactory: async () => ({
+					getAvailableModels: async () => [],
+					getActiveProviders: async () => [],
+					getState: async () => ({}),
+					stop: async () => {},
+				}),
+				workspaceRegistry: {
+					open: async userId => ({
+						userId,
+						safeKey: "f".repeat(64),
+						root: workspace,
+						sessionRoot: join(workspace, ".gjc", "sessions"),
+					}),
+				},
+				workspaceLeaseManager: {
+					async acquire() {
+						throw new Error("already held");
+					},
+				},
+				runner: {
+					run() {
+						return { content: "unused", model: "gjc/anthropic/claude-sonnet-4:low" };
+					},
+				},
+			});
+			expect(result).toMatchObject({
+				ok: false,
+				status: 503,
+				body: { error: { code: "workspace_lease_uncertain" } },
+			});
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
 });
 
 async function demoRepository(): Promise<InMemoryOpenWebUIProjectionRepository> {
