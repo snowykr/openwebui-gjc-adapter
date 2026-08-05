@@ -160,6 +160,87 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 			}),
 		]);
 	});
+	test("finishes a streamed gate reply with thinking deltas without diverging", async () => {
+		const turnRunner = new FakeGjcTurnRunner();
+		const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent);
+		turnRunner.gateResponseEvents = [
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "thinking_delta", text: "t1" } } },
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "text_delta", text: "workflow " } } },
+			{ type: "agent_end" },
+		];
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings });
+		const result = await runner.run({
+			...replyInput("1"),
+			requestedModelId: "gjc/anthropic/claude-sonnet-4:medium",
+			onLiveEvents: () => undefined,
+		});
+		if (result.chunks === undefined) throw new Error("expected live chunks");
+		let content = "";
+		for await (const chunk of result.chunks) content += chunk;
+		expect(content).toBe("<details>\n<summary>Thinking</summary>\n\nt1\n</details>\n\n" + "workflow gate accepted");
+	});
+	test("preserves thinking in a non-streamed gate reply", async () => {
+		const turnRunner = new FakeGjcTurnRunner();
+		const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent);
+		turnRunner.gateResponseEvents = [
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "thinking_delta", text: "t1" } } },
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "text_delta", text: "workflow " } } },
+		];
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings });
+		const result = await runner.run({
+			...replyInput("1"),
+			requestedModelId: "gjc/anthropic/claude-sonnet-4:medium",
+		});
+		expect(result.content).toBe(
+			"<details>\n<summary>Thinking</summary>\n\nt1\n</details>\n\n" + "workflow gate accepted",
+		);
+	});
+	test("replays a completed gate answer without injecting preflight thinking", async () => {
+		const turnRunner = new FakeGjcTurnRunner();
+		turnRunner.gateResponseEvents = [
+			{
+				type: "message_update",
+				payload: { assistantMessageEvent: { type: "thinking_delta", text: "reply-think" } },
+			},
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "text_delta", text: "workflow " } } },
+		];
+		const mappings = new SessionMappingStore();
+		mappings.set({
+			chatId: "chat-1",
+			projectId: project.id,
+			sessionId: "session-1",
+			sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
+			activeLeaf: "leaf-1",
+			rawFrameCursor: 7,
+			eventCursor: 3,
+			operationId: "user-1",
+			assistantText: "pending",
+			modelSelection: { provider: "anthropic", modelId: "claude-sonnet-4", thinkingLevel: "medium" },
+			events: [
+				{
+					type: "message_update",
+					payload: { assistantMessageEvent: { type: "thinking_delta", text: "old-think" } },
+				},
+				deepInterviewWorkflowGateEvent as never,
+			],
+		});
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings });
+		const first = await runner.run({
+			...replyInput("1"),
+			requestedModelId: "gjc/anthropic/claude-sonnet-4:medium",
+		});
+		expect(first.content).toBe(
+			"<details>\n<summary>Thinking</summary>\n\nreply-think\n</details>\n\n" + "workflow gate accepted",
+		);
+		const replayed = await runner.run({
+			...replyInput("1"),
+			requestedModelId: "gjc/anthropic/claude-sonnet-4:medium",
+		});
+		expect(replayed.content).toBe(
+			"<details>\n<summary>Thinking</summary>\n\nreply-think\n</details>\n\n" + "workflow gate accepted",
+		);
+		expect(replayed.content).not.toContain("old-think");
+	});
 	test("delivers workflow gate artifact fallback after terminal-only observation", async () => {
 		const turnRunner = new FakeGjcTurnRunner();
 		const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent);

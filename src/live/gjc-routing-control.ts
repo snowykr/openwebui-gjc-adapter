@@ -11,6 +11,7 @@ import { sameAttachmentProof } from "./gjc-routing-proof";
 import { controlOperationHash, controlOperationKind, publishControlMapping } from "./gjc-routing-publication";
 import { withCanonicalModel } from "./gjc-routing-selection";
 import { formatCanonicalModelId } from "./models";
+import { composeThinkingAssistantContent } from "./session-event-frames";
 import { ensureProjectionRows, projectTurnEvents } from "./workflow-gate-turns";
 export interface RoutingControlDependencies {
 	readonly turnRunner: Parameters<typeof routeGjcTurn>[0]["runner"];
@@ -87,7 +88,7 @@ export async function runRoutingControl(
 	const result = applied.result;
 	return withCanonicalModel(
 		{
-			content: result?.text ?? mapping.assistantText ?? "",
+			content: composeThinkingAssistantContent(result?.text ?? mapping.assistantText ?? "", result?.events ?? []),
 			...(result === undefined || result.events.length === 0
 				? {}
 				: {
@@ -220,7 +221,7 @@ async function continueBranch(
 				});
 				return withCanonicalModel(
 					{
-						content: result.text,
+						content: composeThinkingAssistantContent(result.text, result.events),
 						...(result.events.length === 0 ? {} : { events: projectTurnEvents(result.events, undefined) }),
 					},
 					mapping.modelSelection,

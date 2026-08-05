@@ -112,13 +112,12 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 		});
 		let content = "";
 		if (result.chunks !== undefined) for await (const chunk of result.chunks) content += chunk;
-		expect(content).toBe("new:hello");
+		expect(content).toBe("<details>\n<summary>Thinking</summary>\n\nSESSION_SECRET_MARKER\n</details>\n\nnew:hello");
 
 		const serialized = JSON.stringify(liveEvents);
 		expect(serialized).not.toContain(secret);
 		expect(liveEvents).toEqual([
 			status("Thinking started", false, "skill_progress"),
-			status("Thinking in progress", false, "skill_progress"),
 			status("Thinking: Checking weather", false, "skill_progress"),
 			status("Thinking completed", true, "skill_progress"),
 			status("Thinking completed", true, "skill_progress"),
@@ -189,6 +188,125 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 			}
 		})();
 		await expect(drain).rejects.toThrow("Workspace lease admission is uncertain.");
+	});
+	test("preserves thinking/answer phase order for a multi-phase streamed turn", async () => {
+		const turnRunner = new FakeGjcTurnRunner();
+		turnRunner.observedEvents = [
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "thinking_delta", text: "t1" } } },
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "text_delta", text: "new:" } } },
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "thinking_delta", text: "t2" } } },
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "text_delta", text: "hello" } } },
+		];
+		turnRunner.events = turnRunner.observedEvents;
+		const runner = createGjcRoutingLiveGatewayRunner({
+			turnRunner,
+			mappings: new SessionMappingStore(),
+			modelReaderFactory: staticModelReaderFactory(),
+		});
+		const result = await runner.run({
+			project,
+			prompt: "hello",
+			chatId: "chat-interleave",
+			messageId: "assistant-interleave",
+			userMessageId: "user-interleave",
+			userMessageParentId: null,
+			continued: false,
+			requestedModelId: "gjc",
+			onLiveEvents: () => undefined,
+		});
+		if (result.chunks === undefined) throw new Error("expected live chunks");
+		let content = "";
+		for await (const chunk of result.chunks) content += chunk;
+		expect(content).toBe(
+			"<details>\n<summary>Thinking</summary>\n\nt1\n</details>\n\n" +
+				"new:" +
+				"\n\n<details>\n<summary>Thinking</summary>\n\nt2\n</details>\n\n" +
+				"hello",
+		);
+	});
+	test("ignores empty text deltas before a thinking block", async () => {
+		const turnRunner = new FakeGjcTurnRunner();
+		turnRunner.observedEvents = [
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "text_delta", text: "" } } },
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "thinking_delta", text: "t1" } } },
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "text_delta", text: "new:" } } },
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "text_delta", text: "hello" } } },
+		];
+		turnRunner.events = turnRunner.observedEvents;
+		const runner = createGjcRoutingLiveGatewayRunner({
+			turnRunner,
+			mappings: new SessionMappingStore(),
+			modelReaderFactory: staticModelReaderFactory(),
+		});
+		const result = await runner.run({
+			project,
+			prompt: "hello",
+			chatId: "chat-empty-delta",
+			messageId: "assistant-empty-delta",
+			userMessageId: "user-empty-delta",
+			userMessageParentId: null,
+			continued: false,
+			requestedModelId: "gjc",
+			onLiveEvents: () => undefined,
+		});
+		if (result.chunks === undefined) throw new Error("expected live chunks");
+		let content = "";
+		for await (const chunk of result.chunks) content += chunk;
+		expect(content).toBe("<details>\n<summary>Thinking</summary>\n\nt1\n</details>\n\n" + "new:hello");
+	});
+	test("uses the finalized answer when streamed text diverges from it", async () => {
+		const turnRunner = new FakeGjcTurnRunner();
+		turnRunner.events = [
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "thinking_delta", text: "t1" } } },
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "text_delta", text: "draft" } } },
+		];
+		const runner = createGjcRoutingLiveGatewayRunner({
+			turnRunner,
+			mappings: new SessionMappingStore(),
+			modelReaderFactory: staticModelReaderFactory(),
+		});
+		const result = await runner.run({
+			project,
+			prompt: "hello",
+			chatId: "chat-divergence",
+			messageId: "assistant-divergence",
+			userMessageId: "user-divergence",
+			userMessageParentId: null,
+			continued: false,
+			requestedModelId: "gjc",
+		});
+		expect(result.content).toBe("<details>\n<summary>Thinking</summary>\n\nt1\n</details>\n\n" + "new:hello");
+	});
+	test("surfaces streamed text divergence instead of concatenating draft and final", async () => {
+		const turnRunner = new FakeGjcTurnRunner();
+		turnRunner.observedEvents = [
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "thinking_delta", text: "t1" } } },
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "text_delta", text: "draft" } } },
+		];
+		turnRunner.events = turnRunner.observedEvents;
+		const runner = createGjcRoutingLiveGatewayRunner({
+			turnRunner,
+			mappings: new SessionMappingStore(),
+			modelReaderFactory: staticModelReaderFactory(),
+		});
+		const result = await runner.run({
+			project,
+			prompt: "hello",
+			chatId: "chat-divergence-stream",
+			messageId: "assistant-divergence-stream",
+			userMessageId: "user-divergence-stream",
+			userMessageParentId: null,
+			continued: false,
+			requestedModelId: "gjc",
+			onLiveEvents: () => undefined,
+		});
+		if (result.chunks === undefined) throw new Error("expected live chunks");
+		const drain = (async () => {
+			for await (const _chunk of result.chunks) {
+				// Drain so the background route settles and the divergence surfaces.
+			}
+		})();
+		await expect(drain).rejects.toThrow("Live stream diverged from final assistant text.");
 	});
 	test("rejects before opening a stream when the first observed frame is agent_failed", async () => {
 		const turnRunner = new FakeGjcTurnRunner();

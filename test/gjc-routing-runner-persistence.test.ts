@@ -13,6 +13,7 @@ import type {
 	GjcLifecyclePublicationAddress,
 	GjcLifecycleTestBarrierHook,
 	GjcLifecycleTransaction,
+	GjcTurnEvent,
 	GjcTurnRunner,
 } from "../src/gjc/turn-runner";
 import type { LiveGatewayRunnerInput } from "../src/live/chat-completions";
@@ -2271,6 +2272,33 @@ test("promotes a delayed acknowledged session.new successor after restart", asyn
 		fixture.dispose();
 	}
 });
+test("recovers an acknowledged session.new without predecessor thinking", async () => {
+	const fixture = setupAcknowledgedSessionNewFixture("absent", [
+		{ type: "message_update", payload: { assistantMessageEvent: { type: "thinking_delta", text: "old-think" } } },
+	]);
+	try {
+		await expect(fixture.runner.run(fixture.turn)).rejects.toThrow();
+		writeFileSync(
+			fixture.successorPath,
+			`${JSON.stringify({
+				type: "session",
+				version: 3,
+				id: "sdk-session-new",
+				timestamp: "2026-01-01T00:00:00.000Z",
+				cwd: fixture.root,
+			})}\n`,
+		);
+		const replay = createGjcRoutingLiveGatewayRunner({
+			turnRunner: createPublicSdkGjcTurnRunner(fixture.runnerInput),
+			mappings: new FileBackedSessionMappingStore(fixture.mappingFile),
+		});
+		await expect(replay.run(fixture.turn)).resolves.toMatchObject({ content: "" });
+		const restarted = new FileBackedSessionMappingStore(fixture.mappingFile);
+		expect(restarted.get("chat-session-new")?.events ?? []).toEqual([]);
+	} finally {
+		fixture.dispose();
+	}
+});
 
 test.each(["duplicate", "descriptor replacement"] as const)(
 	"does not promote an acknowledged session.new successor after restart on %s",
@@ -2365,7 +2393,10 @@ test.each(["duplicate", "invalid"] as const)(
 	},
 );
 
-function setupAcknowledgedSessionNewFixture(transcript: "absent" | "valid" | "duplicate" | "invalid") {
+function setupAcknowledgedSessionNewFixture(
+	transcript: "absent" | "valid" | "duplicate" | "invalid",
+	predecessorEvents: readonly GjcTurnEvent[] = [],
+) {
 	const root = mkdtempSync(join(tmpdir(), "gjc-session-new-ack-"));
 	const sessionRoot = join(root, ".gjc", "sessions");
 	const endpointRoot = join(root, ".gjc", "state", "sdk");
@@ -2391,6 +2422,7 @@ function setupAcknowledgedSessionNewFixture(transcript: "absent" | "valid" | "du
 		sessionId: "sdk-session-created",
 		sessionFile: predecessorPath,
 		operationId: "predecessor",
+		...(predecessorEvents.length === 0 ? {} : { events: predecessorEvents }),
 	});
 	const barrier: GjcLifecycleTestBarrierHook = (phase, evidence) => {
 		if (phase !== "post_ack_pre_transcript") return;

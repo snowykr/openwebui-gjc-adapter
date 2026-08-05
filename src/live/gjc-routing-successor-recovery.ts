@@ -6,6 +6,7 @@ import type { LiveGatewayRunnerInput, LiveGatewayRunnerResult } from "./chat-com
 import { readPublishedSdkEndpoint, validatePersistedSessionIdentity } from "./gjc-routing-endpoints";
 import { sameAttachmentProof } from "./gjc-routing-proof";
 import { withCanonicalModel } from "./gjc-routing-selection";
+import { composeThinkingAssistantContent } from "./session-event-frames";
 
 export interface RecoveredAcknowledgedSuccessor {
 	readonly sessionFile: string;
@@ -65,9 +66,16 @@ export async function publishRecoveredAcknowledgedSuccessor(
 				sessionFile: recovered.sessionFile,
 				operationId: turn.userMessageId,
 				attachment: recovered.attachment,
+				// The recovered successor is a new session with no events of its
+				// own; the predecessor's events must not leak into the mapping
+				// or the composed no-result control response.
+				events: [],
 			},
 			"control",
 		),
 	);
-	return withCanonicalModel({ content: mapping.assistantText ?? "" }, mapping.modelSelection);
+	return withCanonicalModel(
+		{ content: composeThinkingAssistantContent(mapping.assistantText ?? "", mapping.events ?? []) },
+		mapping.modelSelection,
+	);
 }
