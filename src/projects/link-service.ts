@@ -43,6 +43,7 @@ export interface ProjectLinkServiceOptions {
 	readonly protectedProjectRoots?: readonly string[];
 	readonly runtimeLocations?: GjcSessionStorageLocations;
 	readonly closeSession?: ProjectSessionCloser;
+	readonly allowedSessionRoots?: readonly string[];
 }
 
 export interface ProjectLinkResult {
@@ -77,6 +78,7 @@ export class ProjectLinkService {
 	readonly #protectedProjectRoots: readonly string[];
 	readonly #runtimeLocations?: GjcSessionStorageLocations;
 	readonly #closeSession?: ProjectSessionCloser;
+	readonly #allowedSessionRoots: readonly string[];
 
 	constructor(options: ProjectLinkServiceOptions) {
 		this.#allowedRoots = options.allowedRoots;
@@ -88,10 +90,16 @@ export class ProjectLinkService {
 		this.#protectedProjectRoots = options.protectedProjectRoots ?? [];
 		this.#runtimeLocations = options.runtimeLocations;
 		this.#closeSession = options.closeSession;
+		this.#allowedSessionRoots = options.allowedSessionRoots ?? [];
 	}
 
 	async seedConfiguredProjects(projects: readonly RegisteredProject[]): Promise<void> {
-		await assertProjectsAdmitted(projects, this.#protectedPaths, this.#protectedProjectRoots);
+		await assertProjectsAdmitted(
+			projects,
+			this.#protectedPaths,
+			this.#protectedProjectRoots,
+			this.#allowedSessionRoots,
+		);
 		this.#store.seedConfiguredProjects(projects);
 	}
 
@@ -108,7 +116,12 @@ export class ProjectLinkService {
 			}
 			throw error;
 		}
-		await assertProjectsAdmitted([registered], this.#protectedPaths, this.#protectedProjectRoots);
+		await assertProjectsAdmitted(
+			[registered],
+			this.#protectedPaths,
+			this.#protectedProjectRoots,
+			this.#allowedSessionRoots,
+		);
 		const previous = this.#store.getProject(registered.cwd);
 		let project = this.#store.linkProject(registered, source);
 		try {

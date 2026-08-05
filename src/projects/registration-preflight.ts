@@ -48,6 +48,7 @@ export async function preflightProjectRegistrationDatabase(
 	databasePath: string,
 	protectedPaths: GjcRuntimeLocations["protectedProjectPaths"],
 	protectedProjectRoots: readonly string[] = [],
+	allowedSessionRoots: readonly string[] = [],
 ): Promise<void> {
 	try {
 		for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -70,7 +71,7 @@ export async function preflightProjectRegistrationDatabase(
 					if (attempt + 1 < 3) continue;
 					throw incompatibleDatabase();
 				}
-				await auditClone(clonePath, protectedPaths, protectedProjectRoots);
+				await auditClone(clonePath, protectedPaths, protectedProjectRoots, allowedSessionRoots);
 				return;
 			} catch (error) {
 				primary = normalizePreflightError(error);
@@ -153,12 +154,13 @@ async function auditClone(
 	clonePath: string,
 	protectedPaths: GjcRuntimeLocations["protectedProjectPaths"],
 	protectedProjectRoots: readonly string[],
+	allowedSessionRoots: readonly string[] = [],
 ): Promise<void> {
 	let database: Database | undefined;
 	let primary: Error | undefined;
 	try {
 		database = new Database(clonePath, { readonly: true, create: false, strict: true });
-		await assertProjectsAdmitted(readProjects(database), protectedPaths, protectedProjectRoots);
+		await assertProjectsAdmitted(readProjects(database), protectedPaths, protectedProjectRoots, allowedSessionRoots);
 	} catch (error) {
 		primary = normalizePreflightError(error);
 		throw primary;

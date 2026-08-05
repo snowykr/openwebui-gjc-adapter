@@ -73,6 +73,7 @@ describe("project link registration", () => {
 			ownerUserId: "owner-1",
 			protectedPaths: protectedPathsFor(workspace),
 			protectedProjectRoots: [stateRoot],
+			allowedSessionRoots: [sessionRoot],
 		});
 
 		await expect(
