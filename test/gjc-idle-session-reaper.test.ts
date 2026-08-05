@@ -7,6 +7,7 @@ import type { SessionAttachmentProof, SessionOperation } from "../src/gjc/sessio
 import type { SessionMapping } from "../src/gjc/session-router";
 import { SessionMappingStore } from "../src/gjc/session-router";
 import type { LiveGatewayRunner, LiveGatewayRunnerInput, LiveGatewayRunnerResult } from "../src/live/chat-completions";
+import { acquireWorkspaceAdmission } from "../src/live/chat-completions";
 import { createGjcIdleSessionReaper, DEFAULT_IDLE_SESSION_TIMEOUT_MS } from "../src/live/gjc-idle-session-reaper";
 import type { GjcSessionTurnRunner } from "../src/live/gjc-routing-runner";
 import type { OpenWebUIProjectionRepository } from "../src/openwebui/client";
@@ -541,6 +542,50 @@ describe("GJC idle session reaper", () => {
 		await pendingClose;
 		expect(harness.closeCalls).toHaveLength(1);
 		await harness.reaper.stop();
+	});
+	test("queues an explicit close behind the shared workspace admission gate", async () => {
+		const root = await mkdtemp(join(tmpdir(), "gjc-reaper-shared-admission-"));
+		try {
+			const workspaceLeaseManager = new WorkspaceLeaseManager({ stateRoot: root });
+			const safeKey = "b".repeat(64);
+			const workspaceRegistry = {
+				open: async (userId: string) => ({
+					userId,
+					safeKey,
+					root,
+					sessionRoot: join(root, ".gjc", "sessions"),
+				}),
+			};
+			const mappings = new SessionMappingStore();
+			const retained = { ...createMapping("turn-1"), principalId: "normal-1" };
+			mappings.setScoped({ principalId: "normal-1", chatId: retained.chatId }, retained);
+			let closeCalls = 0;
+			const reaper = createGjcIdleSessionReaper({
+				runner: { run: async () => ({ content: "done", model: "gjc" }) },
+				mappings,
+				closeSession: async () => {
+					closeCalls += 1;
+					return { status: "closed" };
+				},
+				workspaceRegistry,
+				workspaceLeaseManager,
+			});
+
+			const releaseTurn = await acquireWorkspaceAdmission(workspaceLeaseManager, safeKey, 5000, 8);
+			const pendingClose = reaper.closeSession(retained, {
+				ingressId: "manual-close",
+				ingressHash: "manual-close",
+			});
+			await flush();
+			expect(closeCalls).toBe(0);
+			releaseTurn();
+			const result = await pendingClose;
+			expect(result).toEqual({ status: "closed" });
+			expect(closeCalls).toBe(1);
+			await reaper.stop();
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
 	});
 	test("does not close while a persisted session operation is pending", async () => {
 		const harness = createHarness();

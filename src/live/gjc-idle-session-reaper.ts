@@ -9,9 +9,11 @@ import {
 import type { UserWorkspaceRegistry } from "../security/user-workspace";
 import type { WorkspaceLease, WorkspaceLeaseManager } from "../security/workspace-lease";
 import type { LiveGatewayRunner, LiveGatewayRunnerInput, LiveGatewayRunnerResult } from "./chat-completions";
+import { acquireWorkspaceAdmission } from "./chat-completions";
 
 export const DEFAULT_IDLE_SESSION_TIMEOUT_MS = 600_000;
 const DEFAULT_WORKSPACE_LEASE_DURATION_MS = 210_000;
+const REAPER_WORKSPACE_ADMISSION_QUEUE_LIMIT = 32;
 
 type MappingScope = Readonly<{ principalId: string; chatId: string }>;
 type MappingStore = Pick<import("../gjc/session-router").SessionMappingStore, "entries"> & {
@@ -601,13 +603,14 @@ class IdleSessionReaper {
 				// Configured administrator sessions intentionally do not have a user workspace lease.
 			});
 		const releaseWorkspaceGate = await this.workspaceGateFor(principalId).acquire();
+		let releaseAdmission: (() => void) | undefined;
 		try {
 			const registry = this.input.workspaceRegistry;
 			const leaseManager = this.input.workspaceLeaseManager;
 			if (registry === undefined || leaseManager === undefined) throw new WorkspaceLeaseUncertainError();
 			const durationMs = this.input.workspaceLeaseDurationMs ?? DEFAULT_WORKSPACE_LEASE_DURATION_MS;
 			if (!Number.isSafeInteger(durationMs) || durationMs <= 0) throw new WorkspaceLeaseUncertainError();
-			let lease: WorkspaceLease;
+			let safeKey: string;
 			try {
 				const workspace = await registry.open(principalId);
 				if (
@@ -616,8 +619,27 @@ class IdleSessionReaper {
 					normalizePrincipalId(workspace.safeKey) === undefined
 				)
 					throw new Error("Workspace identity could not be verified.");
+				safeKey = workspace.safeKey;
+			} catch {
+				throw new WorkspaceLeaseUncertainError();
+			}
+			// Join the same workspace admission queue as chat/model requests so an
+			// admitted completion waits behind a close/reap (and vice versa)
+			// instead of losing the durable-lease race.
+			try {
+				releaseAdmission = await acquireWorkspaceAdmission(
+					leaseManager,
+					safeKey,
+					durationMs,
+					REAPER_WORKSPACE_ADMISSION_QUEUE_LIMIT,
+				);
+			} catch {
+				throw new WorkspaceLeaseUncertainError();
+			}
+			let lease: WorkspaceLease;
+			try {
 				lease = await leaseManager.acquire({
-					safeKey: workspace.safeKey,
+					safeKey,
 					holderId: `gjc-${operation}-${process.pid}-${randomUUID()}`,
 					operation,
 					leaseMs: durationMs,
@@ -657,6 +679,7 @@ class IdleSessionReaper {
 			if (failed) throw workError;
 			return result;
 		} finally {
+			releaseAdmission?.();
 			releaseWorkspaceGate();
 		}
 	}
