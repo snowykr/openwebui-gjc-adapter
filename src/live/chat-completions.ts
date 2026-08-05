@@ -159,7 +159,10 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 
 	let runnerResult: LiveGatewayRunnerResult | undefined;
 	try {
-		const projects = input.projectProvider === undefined ? input.projects : await input.projectProvider();
+		const projects =
+			principal.role === "admin" && input.projectProvider !== undefined
+				? await input.projectProvider()
+				: input.projects;
 		const projectContext = await resolveLiveProjectContext({
 			projects,
 			modelId: requestedModelId,

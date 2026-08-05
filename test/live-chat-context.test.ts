@@ -598,6 +598,68 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 			await rm(root, { recursive: true, force: true });
 		}
 	});
+	it("does not invoke the admin project synchronizer for normal-user turns", async () => {
+		const root = await mkdtemp(join(tmpdir(), "gjc-provider-gate-normal-"));
+		const workspace = join(root, "workspace");
+		try {
+			let providerCalls = 0;
+			const result = await handleChatCompletions({
+				request: { model: "gjc", messages: [{ role: "user", content: "hi" }] },
+				headers: { ...chatHeaders, "X-OpenWebUI-User-Id": "normal-1" },
+				projects: [],
+				projectProvider: async () => {
+					providerCalls += 1;
+					return [project];
+				},
+				owner,
+				workspaceRegistry: {
+					open: async userId => ({
+						userId,
+						safeKey: "f".repeat(64),
+						root: workspace,
+						sessionRoot: join(workspace, ".gjc", "sessions"),
+					}),
+				},
+				workspaceLeaseManager: new WorkspaceLeaseManager({ stateRoot: root }),
+				runner: {
+					run() {
+						return { content: "ok", model: "gjc/anthropic/claude-sonnet-4:low" };
+					},
+				},
+			});
+			expect(result.ok).toBe(true);
+			expect(providerCalls).toBe(0);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("invokes the project provider only for admin turns", async () => {
+		const root = await mkdtemp(join(tmpdir(), "gjc-provider-gate-admin-"));
+		try {
+			let providerCalls = 0;
+			const result = await handleChatCompletions({
+				request: { model: "gjc", messages: [{ role: "user", content: "hi" }] },
+				headers: chatHeaders,
+				projects: [],
+				neutralWorkspace: join(root, "neutral"),
+				projectProvider: async () => {
+					providerCalls += 1;
+					return [project];
+				},
+				owner,
+				runner: {
+					run() {
+						return { content: "ok", model: "gjc/anthropic/claude-sonnet-4:low" };
+					},
+				},
+			});
+			expect(result.ok).toBe(true);
+			expect(providerCalls).toBe(1);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
 });
 
 async function demoRepository(): Promise<InMemoryOpenWebUIProjectionRepository> {
