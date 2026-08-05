@@ -219,14 +219,16 @@ export class ProjectLinkService {
 				.entriesForPrincipal(this.#ownerUserId, { includeLegacyAdmin: true })
 				.filter(mapping => mapping.projectId === projectId)
 				.map(async mapping => {
+					const boundMapping =
+						mapping.principalId === undefined ? { ...mapping, principalId: this.#ownerUserId } : mapping;
 					try {
 						return {
-							chatId: mapping.chatId,
-							result: await this.#closeSession!(mapping, {
-								ingressId: closeIngressId(`project-unlink:${projectId}`, mapping),
+							chatId: boundMapping.chatId,
+							result: await this.#closeSession!(boundMapping, {
+								ingressId: closeIngressId(`project-unlink:${projectId}`, boundMapping),
 								ingressHash: `project-unlink:${projectId}`,
 								legacyIngress: {
-									ingressId: legacyCloseIngressId(`project-unlink:${projectId}`, mapping),
+									ingressId: legacyCloseIngressId(`project-unlink:${projectId}`, boundMapping),
 									ingressHash: `project-unlink:${projectId}`,
 								},
 							}),
@@ -234,7 +236,7 @@ export class ProjectLinkService {
 					} catch (error) {
 						if (error instanceof Error && error.message.includes("conflicts")) throw error;
 						return {
-							chatId: mapping.chatId,
+							chatId: boundMapping.chatId,
 							result: {
 								status: "uncertain",
 								message:

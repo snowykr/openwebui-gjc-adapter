@@ -385,10 +385,13 @@ class IdleSessionReaper {
 	}
 
 	private refreshMappings(): void {
-		for (const mapping of this.input.mappings.entries()) {
-			if (!hasOwnedPaneAttachment(mapping.attachment)) continue;
-			const principalId = principalIdForMapping(mapping);
+		for (const rawMapping of this.input.mappings.entries()) {
+			if (!hasOwnedPaneAttachment(rawMapping.attachment)) continue;
+			const principalId = principalIdForMapping(rawMapping) ?? normalizePrincipalId(this.input.adminPrincipalId);
 			if (principalId === undefined) continue;
+			// Legacy admin rows are intentionally unscoped; bind the configured
+			// admin so upgraded sessions enter idle tracking and can be closed.
+			const mapping = rawMapping.principalId === undefined ? { ...rawMapping, principalId } : rawMapping;
 			const operations = this.operationsFor(principalId, mapping.chatId);
 			const currentOperation = this.operationFor(principalId, mapping.chatId, mapping.operationId);
 			const journal = operations ?? (currentOperation === undefined ? [] : [currentOperation]);

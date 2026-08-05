@@ -231,7 +231,7 @@ describe("project link registration", () => {
 		await service.unlinkProject(projectId);
 
 		expect(closed.sort()).toEqual(
-			["owner-1:shared-chat", "owner-1:legacy-admin-chat", "legacy:legacy-unscoped-chat"].sort(),
+			["owner-1:shared-chat", "owner-1:legacy-admin-chat", "owner-1:legacy-unscoped-chat"].sort(),
 		);
 		expect(mappings.getScoped({ principalId: "normal-user", chatId: sharedChat })).toMatchObject({
 			principalId: "normal-user",

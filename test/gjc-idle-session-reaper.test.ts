@@ -587,6 +587,32 @@ describe("GJC idle session reaper", () => {
 			await rm(root, { recursive: true, force: true });
 		}
 	});
+	test("seeds idle tracking for legacy admin mappings without a principal", async () => {
+		const clock = new ManualTimers();
+		clock.now = 1_000;
+		const mappings = new SessionMappingStore();
+		mappings.setLegacyAdminPrincipalId("owner-1");
+		const retained = { ...createMapping("turn-1"), principalId: undefined };
+		mappings.set(retained);
+		let closeCalls = 0;
+		const reaper = createGjcIdleSessionReaper({
+			runner: { run: async () => ({ content: "done", model: "gjc" }) },
+			mappings,
+			adminPrincipalId: "owner-1",
+			closeSession: async () => {
+				closeCalls += 1;
+				return { status: "closed" };
+			},
+			now: () => clock.now,
+			setTimeout: (handler, timeoutMs) =>
+				clock.setTimeout(handler, timeoutMs) as unknown as ReturnType<typeof setTimeout>,
+			clearTimeout: timer => clock.clearTimeout(timer as unknown as number),
+		});
+		clock.advance(DEFAULT_IDLE_SESSION_TIMEOUT_MS + 1_000);
+		await flush();
+		expect(closeCalls).toBe(1);
+		await reaper.stop();
+	});
 	test("does not close while a persisted session operation is pending", async () => {
 		const harness = createHarness();
 		harness.mappings.recordActivity("pending-turn", "pending", harness.clock.now);
