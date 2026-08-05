@@ -213,6 +213,7 @@ describe("durable user workspaces", () => {
 				mode: 0o644,
 			},
 		);
+		await fs.chmod(privatePath, 0o644);
 
 		await expect(
 			createUserWorkspaceRegistry({ stateRoot: privateRoot }).open("non-private-lock-user"),

@@ -33,6 +33,7 @@ describe("managed installation rendering and preflight", () => {
 		expect(compose).toContain("adapter-token:\n    file: ./config/adapter-token");
 		expect(compose).toContain('      ENABLE_API_KEYS: "true"');
 		expect(compose).toContain('      ENABLE_OLLAMA_API: "false"');
+		expect(compose).toContain('      BYPASS_MODEL_ACCESS_CONTROL: "true"');
 		expect(compose).not.toContain("ENABLE_API_KEY: ");
 		expect(compose).not.toContain('"0.0.0.0:');
 		expect(compose).not.toContain("ADAPTER_TOKEN=");

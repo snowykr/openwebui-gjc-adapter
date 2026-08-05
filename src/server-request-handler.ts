@@ -52,6 +52,7 @@ export function createAdapterRequestHandler(
 	return async request => {
 		const url = new URL(request.url);
 		if (url.pathname === "/v1" || url.pathname.startsWith("/v1/")) {
+			const providerAuthenticated = isProviderAuthenticated(request, routes, runtime);
 			const authError = authenticateProviderRequest(request, routes, runtime);
 			if (authError !== undefined) return authError;
 			if (runtime !== undefined) {
@@ -62,6 +63,8 @@ export function createAdapterRequestHandler(
 						{ status: 503 },
 					);
 			}
+			if (routes !== undefined && providerAuthenticated && isCatalogOnlyModelsRequest(request, url))
+				return handleOpenAIModelsRequest(routes, undefined, { catalogOnly: true });
 			const principal = resolveRequestPrincipal(request, routes);
 			if (principal instanceof Response) return principal;
 			return dispatchProviderRequest(request, url, routes, principal);
@@ -144,6 +147,23 @@ async function dispatchProviderRequest(
 	if (request.method === "POST" && url.pathname === "/v1/chat/completions")
 		return handleOpenAIChatCompletionsRequest(request, routes, principal);
 	return jsonResponse({ error: "not_found" }, { status: 404 });
+}
+
+function isCatalogOnlyModelsRequest(request: Request, url: URL): boolean {
+	return (
+		request.method === "GET" &&
+		url.pathname === "/v1/models" &&
+		request.headers.get("x-openwebui-user-id") === "{{USER_ID}}"
+	);
+}
+
+function isProviderAuthenticated(
+	request: Request,
+	routes: AdapterRouteDependencies | undefined,
+	runtime: AdapterRuntimeConfig | undefined,
+): boolean {
+	const expectedToken = runtime === undefined ? routes?.adapterApiToken : runtime.adapterToken;
+	return expectedToken !== undefined && bearerToken(request) === expectedToken;
 }
 
 function resolveRequestPrincipal(

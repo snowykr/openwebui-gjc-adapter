@@ -133,6 +133,7 @@ services:
     image: ${yaml(input.openWebUIImage)}
     environment:
       ENABLE_OLLAMA_API: "false"
+      BYPASS_MODEL_ACCESS_CONTROL: "true"
       ENABLE_API_KEYS: "true"
     ports:
       - "127.0.0.1:${port}:8080"

@@ -185,6 +185,144 @@ describe("createAdapterRequestHandler", () => {
 		expect(response.status).toBe(200);
 		expect(readerCalls).toBe(1);
 	});
+	test("serves the exact OpenWebUI model-discovery placeholder through a provider-authenticated catalog path", async () => {
+		const readerContexts: Array<ModelReaderContext | undefined> = [];
+		const handler = createAdapterRequestHandler({
+			routes: {
+				projects: [project],
+				owner,
+				runner: fixedRunner("unused"),
+				adapterApiToken: "adapter-token",
+				requireAdapterApiToken: true,
+				modelReaderFactory: async (context: ModelReaderContext | undefined) => {
+					readerContexts.push(context);
+					return modelReaderFactory(context);
+				},
+			},
+		});
+
+		const unauthenticated = await handler(
+			new Request("http://adapter.test/v1/models", {
+				headers: { "X-OpenWebUI-User-Id": "{{USER_ID}}" },
+			}),
+		);
+		const authorized = await handler(
+			new Request("http://adapter.test/v1/models", {
+				headers: {
+					authorization: "Bearer adapter-token",
+					"X-OpenWebUI-User-Id": "{{USER_ID}}",
+				},
+			}),
+		);
+
+		expect(unauthenticated.status).toBe(401);
+		expect(authorized.status).toBe(200);
+		expect(await authorized.json()).toEqual({
+			object: "list",
+			data: CANONICAL_MODEL_IDS.map(id => ({
+				id,
+				name: id.slice("gjc/".length),
+				object: "model",
+				created: 1783468800,
+				owned_by: "gjc",
+			})),
+		});
+		expect(readerContexts).toEqual([undefined]);
+	});
+
+	test("rejects the model-discovery placeholder on chat completions", async () => {
+		let runnerCalls = 0;
+		const handler = createAdapterRequestHandler({
+			routes: {
+				projects: [project],
+				owner,
+				runner: {
+					run: () => {
+						runnerCalls += 1;
+						return { content: "unexpected" };
+					},
+				},
+				adapterApiToken: "adapter-token",
+				requireAdapterApiToken: true,
+			},
+		});
+
+		const response = await handler(
+			new Request("http://adapter.test/v1/chat/completions", {
+				method: "POST",
+				headers: {
+					authorization: "Bearer adapter-token",
+					"content-type": "application/json",
+					"X-OpenWebUI-User-Id": "{{USER_ID}}",
+				},
+				body: JSON.stringify({ model: LOW_MODEL_ID, messages: [{ role: "user", content: "hello" }] }),
+			}),
+		);
+
+		expect(response.status).toBe(401);
+		expect(await response.json()).toMatchObject({ error: { code: "missing-forwarded-user" } });
+		expect(runnerCalls).toBe(0);
+	});
+
+	test("keeps catalog fallback out of user workspaces, leases, and mappings", async () => {
+		let workspaceOpens = 0;
+		let leaseAcquires = 0;
+		let mappingReads = 0;
+		const readerContexts: Array<ModelReaderContext | undefined> = [];
+		const handler = createAdapterRequestHandler({
+			routes: {
+				projects: [project],
+				owner,
+				runner: fixedRunner("unused"),
+				adapterApiToken: "adapter-token",
+				requireAdapterApiToken: true,
+				modelReaderFactory: async (context: ModelReaderContext | undefined) => {
+					readerContexts.push(context);
+					return modelReaderFactory(context);
+				},
+				workspaceRegistry: {
+					open: async userId => {
+						workspaceOpens += 1;
+						return {
+							userId,
+							safeKey: "a".repeat(64),
+							root: "/tmp/catalog-user",
+							sessionRoot: "/tmp/catalog-user/.gjc/sessions",
+						};
+					},
+				},
+				workspaceLeaseManager: {
+					acquire: async () => {
+						leaseAcquires += 1;
+						throw new Error("catalog fallback must not acquire a user lease");
+					},
+				},
+				mappings: {
+					getScoped: () => {
+						mappingReads += 1;
+						return undefined;
+					},
+				},
+			},
+		});
+
+		const response = await handler(
+			new Request("http://adapter.test/v1/models", {
+				headers: {
+					authorization: "Bearer adapter-token",
+					"X-OpenWebUI-User-Id": "{{USER_ID}}",
+				},
+			}),
+		);
+
+		expect(response.status).toBe(200);
+		expect(readerContexts).toEqual([undefined]);
+		expect({ workspaceOpens, leaseAcquires, mappingReads }).toEqual({
+			workspaceOpens: 0,
+			leaseAcquires: 0,
+			mappingReads: 0,
+		});
+	});
 
 	test("fails closed when CLI service requires but lacks an adapter API token", async () => {
 		const handler = createAdapterRequestHandler({
