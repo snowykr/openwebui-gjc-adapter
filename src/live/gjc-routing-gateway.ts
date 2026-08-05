@@ -10,6 +10,7 @@ import type { GjcLifecycleTestBarrierHook } from "../gjc/turn-runner";
 import { projectPendingWorkflowGateMessage } from "../projection/workflow-gates";
 import type { OutboxStore } from "../state/outbox";
 import type { LiveGatewayRunner, LiveGatewayRunnerInput, LiveGatewayRunnerResult } from "./chat-completions";
+import { isWorkspaceLeaseUncertainError } from "./chat-completions";
 import { runRoutingControl } from "./gjc-routing-control";
 import { replayRoutingOperation } from "./gjc-routing-operation-replay";
 import {
@@ -157,6 +158,7 @@ export function createGjcRoutingLiveGatewayRunner(
 					const queue = new LiveChunkQueue();
 					let activityStarted = false;
 					let observedNativeLifecycle = false;
+					let leaseFailed = false;
 					const terminalEvents: ReturnType<typeof projectTurnEvents>[number][] = [];
 					let resolveActivity!: () => void;
 					let rejectActivity!: (error: unknown) => void;
@@ -195,7 +197,13 @@ export function createGjcRoutingLiveGatewayRunner(
 							terminalEvents.push(...projected);
 							return;
 						}
-						if (projected.length > 0) await deliverLiveEvents(turn, projected);
+						if (projected.length > 0) {
+							try {
+								await deliverLiveEvents(turn, projected);
+							} catch {
+								leaseFailed = true;
+							}
+						}
 					};
 					const backgroundRoute = input.turnRunner
 						.withLifecyclePublication(gateAddress, lifecycle =>
@@ -209,6 +217,7 @@ export function createGjcRoutingLiveGatewayRunner(
 						)
 						.then(async result => {
 							markActivityStarted();
+							if (leaseFailed) throw new Error("Workspace lease was lost during the streamed turn.");
 							if (result === null) throw new Error("Pending workflow gate disappeared before its reply.");
 							const completionEvents = observedNativeLifecycle ? terminalEvents : (result.events ?? []);
 							if (completionEvents.length > 0) await deliverLiveEvents(turn, completionEvents);
@@ -270,6 +279,7 @@ export function createGjcRoutingLiveGatewayRunner(
 			let activityStarted = false;
 			let observedNativeLifecycle = false;
 			let agentStartDelivered = false;
+			let leaseFailed = false;
 			let resolveActivity!: () => void;
 			let rejectActivity!: (error: unknown) => void;
 			const firstActivity = new Promise<void>((resolve, reject) => {
@@ -326,7 +336,11 @@ export function createGjcRoutingLiveGatewayRunner(
 					);
 					if (projected.length > 0) {
 						if (event.type === "agent_start") agentStartDelivered = true;
-						await deliverLiveEvents(turn, projected);
+						try {
+							await deliverLiveEvents(turn, projected);
+						} catch {
+							leaseFailed = true;
+						}
 					}
 				},
 				...(modelSelection === undefined ? {} : { modelSelection }),
@@ -334,6 +348,7 @@ export function createGjcRoutingLiveGatewayRunner(
 				.then(async result => {
 					reassignmentStarted = false;
 					markActivityStarted();
+					if (leaseFailed) throw new Error("Workspace lease was lost during the streamed turn.");
 					const canonicalModel =
 						result.mapping.modelSelection === undefined
 							? undefined
@@ -439,7 +454,11 @@ async function deliverLiveEvents(
 ): Promise<void> {
 	try {
 		await turn.onLiveEvents?.(events);
-	} catch {
+	} catch (error) {
+		// A lost workspace fence is not a best-effort delivery failure: the
+		// streamed turn must abort so its background route cannot keep mutating
+		// the workspace after another process may have taken the lease.
+		if (isWorkspaceLeaseUncertainError(error)) throw error;
 		// OpenWebUI progress delivery is best-effort and cannot invalidate an accepted GJC turn.
 	}
 }

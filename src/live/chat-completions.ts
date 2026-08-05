@@ -339,6 +339,12 @@ const DEFAULT_WORKSPACE_LEASE_DURATION_MS = 210_000;
 const DEFAULT_WORKSPACE_ADMISSION_QUEUE_LIMIT = 32;
 const DEFAULT_WORKSPACE_ADMISSION_TIMEOUT_MS = DEFAULT_WORKSPACE_LEASE_DURATION_MS;
 
+export function isWorkspaceLeaseUncertainError(error: unknown): boolean {
+	return (
+		error instanceof WorkspaceLeaseUncertainError ||
+		(error instanceof Error && error.name === "WorkspaceLeaseUncertainError")
+	);
+}
 class WorkspaceLeaseUncertainError extends Error {
 	constructor() {
 		super("Workspace lease admission is uncertain.");
