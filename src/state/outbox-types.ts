@@ -46,6 +46,13 @@ export function assertSameEnqueueIdentity(existing: ProjectionOperation, input: 
 		throw new Error(`Projection operation ID conflict: ${existing.operationId}`);
 }
 
+/** A projection row whose target (project, chat, mapping) no longer exists; settled as obsolete, never retried. */
+export class ProjectionObsoleteError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "ProjectionObsoleteError";
+	}
+}
 export interface OutboxStore {
 	enqueue(input: EnqueueProjectionOperationInput): ProjectionOperation;
 	markApplying(reference: ProjectionOperationReference, now?: Date): ProjectionOperation;

@@ -22,7 +22,11 @@ export type {
 	ProjectionOperationReference,
 	ProjectionOperationState,
 } from "./outbox-types";
-export { canonicalProjectionOperationKey, normalizeProjectionPrincipalId } from "./outbox-types";
+export {
+	canonicalProjectionOperationKey,
+	normalizeProjectionPrincipalId,
+	ProjectionObsoleteError,
+} from "./outbox-types";
 
 export class InMemoryOutboxStore implements OutboxStore {
 	private readonly operations = new Map<string, ProjectionOperation>();

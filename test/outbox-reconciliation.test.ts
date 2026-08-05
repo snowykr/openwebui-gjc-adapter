@@ -511,6 +511,75 @@ describe("durable projection reconciliation", () => {
 		expect(linkedProjectIds).toEqual([]);
 		expect(outbox.listPending()).toEqual([]);
 	});
+	test("settles admin projection rows for unlinked projects as obsolete", async () => {
+		const mappings = new SessionMappingStore();
+		const mapping = {
+			chatId: "chat-1",
+			projectId: "project-1",
+			sessionId: "session-1",
+			rawFrameCursor: 1,
+			eventCursor: 1,
+			operationId: "op-1",
+		};
+		mappings.set({ ...mapping, operationId: "bootstrap" });
+		mappings.beginOperation("chat-1", { id: "op-1", kind: "prompt", detail: "request" });
+		mappings.completeOperationWithMapping("chat-1", "op-1", "request", mapping, "turn");
+		const outbox = new InMemoryOutboxStore();
+		synthesizeProjectionRows(outbox, mappings, "user-1", "user-1");
+
+		const result = await reconcilePendingOperations(
+			outbox,
+			createProjectionOperationApplier(
+				mappings,
+				{
+					syncLinkedProject: async () => {
+						throw new Error("Linked project is unavailable for projection: project-1");
+					},
+				},
+				"user-1",
+			),
+		);
+
+		expect(result.failed).toEqual([]);
+		expect(result.applied.map(operation => operation.kind)).toEqual(["session_mapping", "event"]);
+		expect(outbox.listPending()).toEqual([]);
+	});
+
+	test("settles projection rows whose mapping was retired as obsolete", async () => {
+		const mappings = new SessionMappingStore();
+		const mapping = {
+			principalId: "normal-user",
+			chatId: "chat-1",
+			projectId: "openwebui",
+			sessionId: "session-1",
+			rawFrameCursor: 1,
+			eventCursor: 1,
+			operationId: "op-1",
+		};
+		const scope = { principalId: "normal-user", chatId: "chat-1" };
+		mappings.setScoped(scope, { ...mapping, operationId: "bootstrap" });
+		mappings.beginOperationScoped(scope, { id: "op-1", kind: "prompt", detail: "request" });
+		mappings.completeOperationWithMappingScoped(scope, "op-1", "request", mapping, "turn");
+		const outbox = new InMemoryOutboxStore();
+		synthesizeProjectionRows(outbox, mappings, "owner-1", "owner-1");
+		mappings.retireScoped(scope);
+
+		const result = await reconcilePendingOperations(
+			outbox,
+			createProjectionOperationApplier(
+				mappings,
+				{
+					syncLinkedProject: async () => {},
+					syncPrincipalProjection: async () => {},
+				},
+				"owner-1",
+			),
+		);
+
+		expect(result.failed).toEqual([]);
+		expect(result.applied.map(operation => operation.kind)).toEqual(["session_mapping", "event"]);
+		expect(outbox.listPending()).toEqual([]);
+	});
 	test("synthesizes missing rows from completed durable mappings", () => {
 		const mappings = new SessionMappingStore();
 		const mapping = {

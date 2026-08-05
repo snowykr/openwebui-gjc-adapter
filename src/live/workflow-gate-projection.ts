@@ -12,6 +12,7 @@ import {
 	buildProjectionPayloadHash,
 	type EnqueueProjectionOperationInput,
 	type OutboxStore,
+	ProjectionObsoleteError,
 	type ProjectionOperation,
 } from "../state/outbox";
 import type { ProjectionOperationApplier } from "../state/reconciler";
@@ -176,7 +177,18 @@ export function createProjectionOperationApplier(
 		)
 			throw new Error(`Projection operation ${operation.operationId} has an invalid principal owner binding`);
 		if (principalId === undefined || principalId === normalizePrincipalId(adminPrincipalId)) {
-			await synchronizer.syncLinkedProject(mapping.projectId);
+			try {
+				await synchronizer.syncLinkedProject(mapping.projectId);
+			} catch (error) {
+				// A project that was unlinked after the row was enqueued has no
+				// projection target; settle the row instead of retrying forever.
+				if (error instanceof Error && error.message.includes("Linked project is unavailable")) {
+					throw new ProjectionObsoleteError(
+						`Projection operation ${operation.operationId} is for an unlinked project`,
+					);
+				}
+				throw error;
+			}
 			return;
 		}
 		if (normalizePrincipalId(operation.ownerUserId) !== principalId)
@@ -204,9 +216,11 @@ function projectionMapping(
 	const ownerIsConfiguredAdmin =
 		adminPrincipalId !== undefined && normalizePrincipalId(operation.ownerUserId) === adminPrincipalId;
 	if (principalId === undefined && !ownerIsConfiguredAdmin)
-		throw new Error(`Projection operation ${operation.operationId} has no configured-admin legacy scope`);
+		throw new ProjectionObsoleteError(
+			`Projection operation ${operation.operationId} has no configured-admin legacy scope`,
+		);
 	if (operation.principalId !== undefined && principalId === undefined)
-		throw new Error(`Projection operation ${operation.operationId} has an invalid principal scope`);
+		throw new ProjectionObsoleteError(`Projection operation ${operation.operationId} has an invalid principal scope`);
 	let recorded: ReturnType<SessionMappingStore["operation"]>;
 	if (principalId === undefined) {
 		recorded =
@@ -253,9 +267,11 @@ function projectionMapping(
 					);
 				})();
 	if (mapping === undefined || mapping.operationId !== operationId)
-		throw new Error(`Projection operation ${operation.operationId} has no durable session mapping`);
+		throw new ProjectionObsoleteError(`Projection operation ${operation.operationId} has no durable session mapping`);
 	if (principalId !== undefined && mapping.principalId !== undefined && mapping.principalId !== principalId)
-		throw new Error(`Projection operation ${operation.operationId} has an invalid principal binding`);
+		throw new ProjectionObsoleteError(
+			`Projection operation ${operation.operationId} has an invalid principal binding`,
+		);
 	assertProjectionMappingPrincipalBinding(mapping, principalId, adminPrincipalId, operation.operationId);
 	return mapping;
 }
