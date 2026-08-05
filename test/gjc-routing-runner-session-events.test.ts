@@ -112,13 +112,12 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 		});
 		let content = "";
 		if (result.chunks !== undefined) for await (const chunk of result.chunks) content += chunk;
-		expect(content).toBe("new:hello");
+		expect(content).toBe("<details>\n<summary>Thinking</summary>\n\nSESSION_SECRET_MARKER\n</details>\n\nnew:hello");
 
 		const serialized = JSON.stringify(liveEvents);
 		expect(serialized).not.toContain(secret);
 		expect(liveEvents).toEqual([
 			status("Thinking started", false, "skill_progress"),
-			status("Thinking in progress", false, "skill_progress"),
 			status("Thinking: Checking weather", false, "skill_progress"),
 			status("Thinking completed", true, "skill_progress"),
 			status("Thinking completed", true, "skill_progress"),

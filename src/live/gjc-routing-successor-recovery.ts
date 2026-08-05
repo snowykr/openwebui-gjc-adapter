@@ -6,6 +6,7 @@ import type { LiveGatewayRunnerInput, LiveGatewayRunnerResult } from "./chat-com
 import { readPublishedSdkEndpoint, validatePersistedSessionIdentity } from "./gjc-routing-endpoints";
 import { sameAttachmentProof } from "./gjc-routing-proof";
 import { withCanonicalModel } from "./gjc-routing-selection";
+import { composeThinkingAssistantContent } from "./session-event-frames";
 
 export interface RecoveredAcknowledgedSuccessor {
 	readonly sessionFile: string;
@@ -69,5 +70,8 @@ export async function publishRecoveredAcknowledgedSuccessor(
 			"control",
 		),
 	);
-	return withCanonicalModel({ content: mapping.assistantText ?? "" }, mapping.modelSelection);
+	return withCanonicalModel(
+		{ content: composeThinkingAssistantContent(mapping.assistantText ?? "", mapping.events ?? []) },
+		mapping.modelSelection,
+	);
 }

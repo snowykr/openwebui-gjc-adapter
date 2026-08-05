@@ -21,6 +21,7 @@ import {
 import type { ModelReader, ModelReaderFactory } from "./model-reader";
 import { modelSelectionError } from "./model-selection-errors";
 import { formatCanonicalModelId } from "./models";
+import { composeThinkingAssistantContent, THINKING_DETAILS_CLOSE, THINKING_DETAILS_OPEN } from "./session-event-frames";
 import {
 	ensureProjectionRows,
 	handleWorkflowGateReply,
@@ -121,10 +122,11 @@ export function createGjcRoutingLiveGatewayRunner(
 			) {
 				const selection = assertBoundRequest(existing, requestedModelId, "duplicate");
 				const events = projectTurnEvents(existing.events ?? [], formatCanonicalModelId(selection));
-				const result =
-					events.length === 0
-						? { content: existing.assistantText ?? "" }
-						: { content: existing.assistantText ?? "", events };
+				const assistantContent = composeThinkingAssistantContent(
+					existing.assistantText ?? "",
+					existing.events ?? [],
+				);
+				const result = events.length === 0 ? { content: assistantContent } : { content: assistantContent, events };
 				return withCanonicalModel(result, selection);
 			}
 			if (turn.control !== undefined && isSameProject(existing, turn))
@@ -157,6 +159,8 @@ export function createGjcRoutingLiveGatewayRunner(
 					const queue = new LiveChunkQueue();
 					let activityStarted = false;
 					let observedNativeLifecycle = false;
+					let thinkingText = "";
+					let thinkingDetailsOpen = false;
 					const terminalEvents: ReturnType<typeof projectTurnEvents>[number][] = [];
 					let resolveActivity!: () => void;
 					let rejectActivity!: (error: unknown) => void;
@@ -169,6 +173,16 @@ export function createGjcRoutingLiveGatewayRunner(
 						activityStarted = true;
 						resolveActivity();
 					};
+					const closeThinkingDetails = async (): Promise<void> => {
+						if (!thinkingDetailsOpen) return;
+						await queue.push(THINKING_DETAILS_CLOSE);
+						thinkingDetailsOpen = false;
+					};
+					const openThinkingDetails = async (): Promise<void> => {
+						if (thinkingDetailsOpen) return;
+						await queue.push(THINKING_DETAILS_OPEN);
+						thinkingDetailsOpen = true;
+					};
 					const observer = async (event: import("../gjc/turn-runner").GjcTurnEvent) => {
 						if (isNativeLifecycleEvent(event.type)) observedNativeLifecycle = true;
 						if (event.type !== "agent_failed") markActivityStarted();
@@ -177,11 +191,25 @@ export function createGjcRoutingLiveGatewayRunner(
 							payload !== undefined && isRecord(payload.assistantMessageEvent)
 								? payload.assistantMessageEvent
 								: undefined;
+						if (event.type === "message_update" && assistant?.type === "thinking_delta") {
+							const delta =
+								typeof assistant.delta === "string"
+									? assistant.delta
+									: typeof assistant.text === "string"
+										? assistant.text
+										: undefined;
+							if (delta === undefined || delta.length === 0) return;
+							await openThinkingDetails();
+							await queue.push(delta);
+							thinkingText += delta;
+							return;
+						}
 						if (
 							event.type === "message_update" &&
 							assistant?.type === "text_delta" &&
 							(typeof assistant.delta === "string" || typeof assistant.text === "string")
 						) {
+							await closeThinkingDetails();
 							await queue.push(
 								typeof assistant.delta === "string" ? assistant.delta : (assistant.text as string),
 							);
@@ -212,7 +240,8 @@ export function createGjcRoutingLiveGatewayRunner(
 							if (result === null) throw new Error("Pending workflow gate disappeared before its reply.");
 							const completionEvents = observedNativeLifecycle ? terminalEvents : (result.events ?? []);
 							if (completionEvents.length > 0) await deliverLiveEvents(turn, completionEvents);
-							await queue.finish(result.content ?? "");
+							await closeThinkingDetails();
+							await queue.finish(composeThinkingContent(thinkingText, result.content ?? ""));
 						})
 						.catch(error => {
 							if (!activityStarted) rejectActivity(error);
@@ -259,10 +288,11 @@ export function createGjcRoutingLiveGatewayRunner(
 						? undefined
 						: formatCanonicalModelId(result.mapping.modelSelection),
 				);
+				const assistantContent = composeThinkingAssistantContent(result.assistantText, result.events);
 				const response =
 					projectedEvents.length > 0
-						? { content: result.assistantText, events: projectedEvents }
-						: { content: result.assistantText };
+						? { content: assistantContent, events: projectedEvents }
+						: { content: assistantContent };
 				return withCanonicalModel(response, result.mapping.modelSelection);
 			}
 			beginReassignment();
@@ -270,6 +300,8 @@ export function createGjcRoutingLiveGatewayRunner(
 			let activityStarted = false;
 			let observedNativeLifecycle = false;
 			let agentStartDelivered = false;
+			let thinkingText = "";
+			let thinkingDetailsOpen = false;
 			let resolveActivity!: () => void;
 			let rejectActivity!: (error: unknown) => void;
 			const firstActivity = new Promise<void>((resolve, reject) => {
@@ -280,6 +312,16 @@ export function createGjcRoutingLiveGatewayRunner(
 				if (activityStarted) return;
 				activityStarted = true;
 				resolveActivity();
+			};
+			const closeThinkingDetails = async (): Promise<void> => {
+				if (!thinkingDetailsOpen) return;
+				await queue.push(THINKING_DETAILS_CLOSE);
+				thinkingDetailsOpen = false;
+			};
+			const openThinkingDetails = async (): Promise<void> => {
+				if (thinkingDetailsOpen) return;
+				await queue.push(THINKING_DETAILS_OPEN);
+				thinkingDetailsOpen = true;
 			};
 			const backgroundRoute = routeGjcTurn({
 				...(principalId === undefined ? {} : { principalId }),
@@ -307,6 +349,19 @@ export function createGjcRoutingLiveGatewayRunner(
 							: undefined;
 					const assistantType =
 						assistant !== undefined && typeof assistant.type === "string" ? assistant.type : undefined;
+					if (event.type === "message_update" && assistantType === "thinking_delta") {
+						const delta =
+							typeof assistant?.delta === "string"
+								? assistant.delta
+								: typeof assistant?.text === "string"
+									? assistant.text
+									: undefined;
+						if (delta === undefined || delta.length === 0) return;
+						await openThinkingDetails();
+						await queue.push(delta);
+						thinkingText += delta;
+						return;
+					}
 					if (event.type === "message_update" && assistantType === "text_delta") {
 						const delta =
 							typeof assistant?.delta === "string"
@@ -314,7 +369,10 @@ export function createGjcRoutingLiveGatewayRunner(
 								: typeof assistant?.text === "string"
 									? assistant.text
 									: undefined;
-						if (delta !== undefined) await queue.push(delta);
+						if (delta !== undefined) {
+							await closeThinkingDetails();
+							await queue.push(delta);
+						}
 						return;
 					}
 					const projected = projectTurnEvents(
@@ -347,7 +405,8 @@ export function createGjcRoutingLiveGatewayRunner(
 								: result.events.filter(event => !(agentStartDelivered && event.type === "agent_start"));
 					const projected = projectTurnEvents(completionEvents, canonicalModel);
 					if (projected.length > 0) await deliverLiveEvents(turn, projected);
-					await queue.finish(result.assistantText);
+					await closeThinkingDetails();
+					await queue.finish(composeThinkingContent(thinkingText, result.assistantText));
 				})
 				.catch(error => {
 					let mappedError: unknown = isModelSelectionApplyFailure(error)
@@ -432,6 +491,9 @@ class LiveChunkQueue implements AsyncIterable<string> {
 			},
 		};
 	}
+}
+function composeThinkingContent(thinking: string, text: string): string {
+	return thinking.length === 0 ? text : `${THINKING_DETAILS_OPEN}${thinking}${THINKING_DETAILS_CLOSE}${text}`;
 }
 async function deliverLiveEvents(
 	turn: LiveGatewayRunnerInput,

@@ -51,7 +51,11 @@ function thinkingFrame(event: GjcTurnEvent): ProjectableAgentFrame | undefined {
 		case "thinking_start":
 			return skillFrame("Thinking started", "start");
 		case "thinking_delta":
-			return skillFrame("Thinking in progress", "progress");
+			// Thinking deltas stream token-by-token; projecting each one as a
+			// status event floods OpenWebUI with repeated "Thinking in progress"
+			// lines. The raw thinking text is delivered through the assistant
+			// message content instead (see thinkingDetailsFromEvents).
+			return undefined;
 		case "reasoning_summary_delta": {
 			const delta = textField(assistant ?? {}, "delta")?.trim();
 			return delta === undefined || delta.length === 0
@@ -108,6 +112,33 @@ function skillFrame(label: string, phase: "start" | "progress" | "end"): Project
 
 function subagentFrame(label: string): ProjectableAgentFrame {
 	return { kind: "subagent_progress", label, phase: "progress" };
+}
+
+export const THINKING_DETAILS_OPEN = "<details>\n<summary>Thinking</summary>\n\n";
+export const THINKING_DETAILS_CLOSE = "\n</details>\n\n";
+
+/**
+ * Reconstructs the raw thinking text from streamed `thinking_delta` events so
+ * OpenWebUI can render the actual reasoning instead of a generic status line.
+ */
+export function thinkingTextFromEvents(events: readonly GjcTurnEvent[]): string {
+	let text = "";
+	for (const event of events) {
+		if (event.type !== "message_update") continue;
+		const assistant = recordPayload(event, "assistantMessageEvent");
+		if (assistant === undefined) continue;
+		if (textField(assistant, "type") !== "thinking_delta") continue;
+		const delta = textField(assistant, "delta") ?? textField(assistant, "text");
+		if (delta !== undefined) text += delta;
+	}
+	return text;
+}
+
+/** Composes the assistant content with a collapsible thinking block when thinking exists. */
+export function composeThinkingAssistantContent(text: string, events: readonly GjcTurnEvent[]): string {
+	const thinking = thinkingTextFromEvents(events);
+	if (thinking.length === 0) return text;
+	return `${THINKING_DETAILS_OPEN}${thinking}${THINKING_DETAILS_CLOSE}${text}`;
 }
 
 function safeToolName(event: GjcTurnEvent): string | undefined {

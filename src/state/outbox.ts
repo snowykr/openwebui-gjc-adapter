@@ -3,11 +3,13 @@ import {
 	assertSameEnqueueIdentity,
 	canonicalProjectionOperationKey,
 	copyOperation,
+	createPendingProjectionOperation,
 	type EnqueueProjectionOperationInput,
 	normalizeProjectionPrincipalId,
 	type OutboxStore,
 	type ProjectionOperation,
 	type ProjectionOperationReference,
+	sameKeyEnqueueDisposition,
 	toTimestamp,
 } from "./outbox-types";
 
@@ -37,24 +39,28 @@ export class InMemoryOutboxStore implements OutboxStore {
 				: { ...input, ...(principalId === undefined ? {} : { principalId }) };
 		const existing = this.operations.get(key);
 		if (existing !== undefined) {
+			const disposition = sameKeyEnqueueDisposition(existing, normalizedInput);
+			if (disposition === "idempotent") return copyOperation(existing);
+			if (disposition === "supersede") {
+				const operation = createPendingProjectionOperation(
+					normalizedInput,
+					operationId,
+					principalId,
+					toTimestamp(normalizedInput.now),
+				);
+				this.operations.set(key, operation);
+				return copyOperation(operation);
+			}
 			assertSameEnqueueIdentity(existing, normalizedInput);
 			return copyOperation(existing);
 		}
 
-		const timestamp = toTimestamp(input.now);
-		const operation: ProjectionOperation = {
+		const operation = createPendingProjectionOperation(
+			normalizedInput,
 			operationId,
-			...(principalId === undefined ? {} : { principalId }),
-			ownerUserId: input.ownerUserId,
-			projectId: input.projectId,
-			chatId: input.chatId,
-			kind: input.kind,
-			state: "pending",
-			payloadHash: input.payloadHash,
-			attempts: 0,
-			createdAt: timestamp,
-			updatedAt: timestamp,
-		};
+			principalId,
+			toTimestamp(input.now),
+		);
 		this.operations.set(key, operation);
 		return copyOperation(operation);
 	}
