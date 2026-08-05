@@ -412,6 +412,13 @@ async function replayPrincipalProjection(
 		throw new Error(`Projection operation ${input.operation.operationId} has an invalid normal principal capability`);
 	if (input.ownerUserId !== input.principalId)
 		throw new Error(`Projection operation ${input.operation.operationId} has an invalid principal owner binding`);
+	// Normal principals cannot create or replace folders/chats (the configured
+	// admin token may not impersonate them), and their durable event rows were
+	// already delivered live through the proof-bound sink with no message target
+	// to replay. Skip both row kinds so startup reconciliation marks them
+	// applied instead of retrying unsupported rows forever and leaving the
+	// adapter permanently degraded.
+	if (input.operation.kind === "session_mapping" || input.operation.kind === "event") return;
 	const workspaceRoot = principalClient.context.workspace?.root;
 	if (workspaceRoot === undefined)
 		throw new Error(`Projection operation ${input.operation.operationId} has no durable principal workspace`);

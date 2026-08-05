@@ -3,6 +3,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildAdapterServerOptions } from "../src/adapter-server-options";
+import { SessionMappingStore } from "../src/gjc/session-router";
+import { synthesizeProjectionRows } from "../src/live/workflow-gate-projection";
 import {
 	buildProjectionPayloadHash,
 	FileBackedOutboxStore,
@@ -135,5 +137,71 @@ describe("projection outbox startup reconciliation", () => {
 			attempts: 2,
 		});
 		await rm(root, { force: true, recursive: true });
+	});
+	test("skips unsupported normal-principal projection rows instead of retrying them forever", async () => {
+		const root = await mkdtemp(join(tmpdir(), "gjc-adapter-outbox-normal-skip-"));
+		try {
+			const mappings = new SessionMappingStore();
+			const mapping = {
+				principalId: "normal-user",
+				chatId: "chat-1",
+				projectId: "openwebui",
+				sessionId: "session-1",
+				rawFrameCursor: 1,
+				eventCursor: 1,
+				operationId: "op-1",
+				assistantText: "done",
+			};
+			const scope = { principalId: "normal-user", chatId: "chat-1" };
+			mappings.setScoped(scope, { ...mapping, operationId: "bootstrap" });
+			mappings.beginOperationScoped(scope, { id: "op-1", kind: "prompt", detail: "request" });
+			mappings.completeOperationWithMappingScoped(scope, "op-1", "request", mapping, "turn");
+			const outbox = new InMemoryOutboxStore();
+			synthesizeProjectionRows(outbox, mappings, "owner-1", "owner-1");
+
+			const originalError = console.error;
+			const errors: string[] = [];
+			console.error = (...args: unknown[]) => errors.push(args.join(" "));
+			let options: Awaited<ReturnType<typeof buildAdapterServerOptions>> | undefined;
+			try {
+				options = await buildAdapterServerOptions(
+					{
+						mode: "existing",
+						bindHost: "127.0.0.1",
+						bindPort: 8765,
+						openWebUIBaseUrl: "http://127.0.0.1:3000",
+						openWebUIApiToken: "token",
+						ownerUserId: "owner-1",
+						allowedProjectRoots: [],
+						projects: [],
+						statePath: root,
+						sessionRoot: join(root, "sessions"),
+						gjcCommand: "/opt/gjc",
+						turnTimeoutMs: 240_000,
+					},
+					{
+						outbox,
+						mappings,
+						turnRunner: new FakeGjcTurnRunner(),
+						modelReaderFactory: staticModelReaderFactory(),
+					},
+					{ deferOpenWebUIInitialization: true },
+				);
+			} finally {
+				console.error = originalError;
+				await options?.shutdownCleanup?.();
+				await options?.runtimeLock.release();
+			}
+
+			expect(outbox.get({ principalId: "normal-user", chatId: "chat-1", operationId: "op-1" })).toMatchObject({
+				state: "applied",
+			});
+			expect(outbox.get({ principalId: "normal-user", chatId: "chat-1", operationId: "op-1:event" })).toMatchObject({
+				state: "applied",
+			});
+			expect(errors).toEqual([]);
+		} finally {
+			await rm(root, { force: true, recursive: true });
+		}
 	});
 });
