@@ -134,11 +134,44 @@ export function thinkingTextFromEvents(events: readonly GjcTurnEvent[]): string 
 	return text;
 }
 
-/** Composes the assistant content with a collapsible thinking block when thinking exists. */
+/**
+ * Composes the assistant content while preserving the streamed phase order:
+ * thinking blocks appear interleaved with answer text exactly as the turn
+ * emitted them (`thinking1 → answer1 → thinking2 → answer2`), so OpenWebUI
+ * renders each `<details>` block at its position instead of merging them.
+ */
 export function composeThinkingAssistantContent(text: string, events: readonly GjcTurnEvent[]): string {
-	const thinking = thinkingTextFromEvents(events);
-	if (thinking.length === 0) return text;
-	return `${THINKING_DETAILS_OPEN}${thinking}${THINKING_DETAILS_CLOSE}${text}`;
+	let out = "";
+	let thinkingOpen = false;
+	let streamedText = "";
+	for (const event of events) {
+		if (event.type !== "message_update") continue;
+		const assistant = recordPayload(event, "assistantMessageEvent");
+		if (assistant === undefined) continue;
+		const type = textField(assistant, "type");
+		if (type === "thinking_delta") {
+			const delta = textField(assistant, "delta") ?? textField(assistant, "text");
+			if (delta === undefined || delta.length === 0) continue;
+			if (!thinkingOpen) {
+				out += THINKING_DETAILS_OPEN;
+				thinkingOpen = true;
+			}
+			out += delta;
+		} else if (type === "text_delta") {
+			const delta = textField(assistant, "delta") ?? textField(assistant, "text");
+			if (delta === undefined || delta.length === 0) continue;
+			if (thinkingOpen) {
+				out += THINKING_DETAILS_CLOSE;
+				thinkingOpen = false;
+			}
+			out += delta;
+			streamedText += delta;
+		}
+	}
+	if (thinkingOpen) out += THINKING_DETAILS_CLOSE;
+	if (streamedText === text) return out;
+	if (text.startsWith(streamedText)) return out + text.slice(streamedText.length);
+	return `${out}${text}`;
 }
 
 function safeToolName(event: GjcTurnEvent): string | undefined {

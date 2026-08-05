@@ -159,7 +159,6 @@ export function createGjcRoutingLiveGatewayRunner(
 					const queue = new LiveChunkQueue();
 					let activityStarted = false;
 					let observedNativeLifecycle = false;
-					let thinkingText = "";
 					let thinkingDetailsOpen = false;
 					const terminalEvents: ReturnType<typeof projectTurnEvents>[number][] = [];
 					let resolveActivity!: () => void;
@@ -201,7 +200,6 @@ export function createGjcRoutingLiveGatewayRunner(
 							if (delta === undefined || delta.length === 0) return;
 							await openThinkingDetails();
 							await queue.push(delta);
-							thinkingText += delta;
 							return;
 						}
 						if (
@@ -241,7 +239,7 @@ export function createGjcRoutingLiveGatewayRunner(
 							const completionEvents = observedNativeLifecycle ? terminalEvents : (result.events ?? []);
 							if (completionEvents.length > 0) await deliverLiveEvents(turn, completionEvents);
 							await closeThinkingDetails();
-							await queue.finish(composeThinkingContent(thinkingText, result.content ?? ""));
+							await queue.finish(composeThinkingAssistantContent(result.content ?? "", result.events ?? []));
 						})
 						.catch(error => {
 							if (!activityStarted) rejectActivity(error);
@@ -300,7 +298,6 @@ export function createGjcRoutingLiveGatewayRunner(
 			let activityStarted = false;
 			let observedNativeLifecycle = false;
 			let agentStartDelivered = false;
-			let thinkingText = "";
 			let thinkingDetailsOpen = false;
 			let resolveActivity!: () => void;
 			let rejectActivity!: (error: unknown) => void;
@@ -359,7 +356,6 @@ export function createGjcRoutingLiveGatewayRunner(
 						if (delta === undefined || delta.length === 0) return;
 						await openThinkingDetails();
 						await queue.push(delta);
-						thinkingText += delta;
 						return;
 					}
 					if (event.type === "message_update" && assistantType === "text_delta") {
@@ -406,7 +402,7 @@ export function createGjcRoutingLiveGatewayRunner(
 					const projected = projectTurnEvents(completionEvents, canonicalModel);
 					if (projected.length > 0) await deliverLiveEvents(turn, projected);
 					await closeThinkingDetails();
-					await queue.finish(composeThinkingContent(thinkingText, result.assistantText));
+					await queue.finish(composeThinkingAssistantContent(result.assistantText, result.events));
 				})
 				.catch(error => {
 					let mappedError: unknown = isModelSelectionApplyFailure(error)
@@ -491,9 +487,6 @@ class LiveChunkQueue implements AsyncIterable<string> {
 			},
 		};
 	}
-}
-function composeThinkingContent(thinking: string, text: string): string {
-	return thinking.length === 0 ? text : `${THINKING_DETAILS_OPEN}${thinking}${THINKING_DETAILS_CLOSE}${text}`;
 }
 async function deliverLiveEvents(
 	turn: LiveGatewayRunnerInput,

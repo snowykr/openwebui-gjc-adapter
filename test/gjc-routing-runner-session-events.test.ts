@@ -155,6 +155,41 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 			);
 		}
 	});
+	test("preserves thinking/answer phase order for a multi-phase streamed turn", async () => {
+		const turnRunner = new FakeGjcTurnRunner();
+		turnRunner.observedEvents = [
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "thinking_delta", text: "t1" } } },
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "text_delta", text: "new:" } } },
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "thinking_delta", text: "t2" } } },
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "text_delta", text: "hello" } } },
+		];
+		turnRunner.events = turnRunner.observedEvents;
+		const runner = createGjcRoutingLiveGatewayRunner({
+			turnRunner,
+			mappings: new SessionMappingStore(),
+			modelReaderFactory: staticModelReaderFactory(),
+		});
+		const result = await runner.run({
+			project,
+			prompt: "hello",
+			chatId: "chat-interleave",
+			messageId: "assistant-interleave",
+			userMessageId: "user-interleave",
+			userMessageParentId: null,
+			continued: false,
+			requestedModelId: "gjc",
+			onLiveEvents: () => undefined,
+		});
+		if (result.chunks === undefined) throw new Error("expected live chunks");
+		let content = "";
+		for await (const chunk of result.chunks) content += chunk;
+		expect(content).toBe(
+			"<details>\n<summary>Thinking</summary>\n\nt1\n</details>\n\n" +
+				"new:" +
+				"<details>\n<summary>Thinking</summary>\n\nt2\n</details>\n\n" +
+				"hello",
+		);
+	});
 	test("rejects before opening a stream when the first observed frame is agent_failed", async () => {
 		const turnRunner = new FakeGjcTurnRunner();
 		turnRunner.observedEvents = [{ type: "agent_failed" }];
