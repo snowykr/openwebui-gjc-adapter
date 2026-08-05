@@ -82,8 +82,13 @@ export class SessionMappingStore {
 			return mappingFromRecord(record);
 		if (this.#adminPrincipalId !== undefined && scope.principalId === this.#adminPrincipalId) {
 			const legacy = this.authority.get(scope.chatId);
-			if (legacy !== undefined && !isScopedRecordFor(legacy, canonicalScope) && !isRetiredRecord(legacy))
-				return mappingFromRecord(legacy);
+			if (legacy !== undefined && !isScopedRecordFor(legacy, canonicalScope) && !isRetiredRecord(legacy)) {
+				const mapping = mappingFromRecord(legacy);
+				// Downstream scoped-only paths (HTTP close, idle reaper) treat a
+				// missing principalId as unowned; bind the admin's legacy row to
+				// the scoped principal exactly like the write path does.
+				return mapping.principalId === undefined ? { ...mapping, principalId: scope.principalId } : mapping;
+			}
 		}
 		return undefined;
 	}

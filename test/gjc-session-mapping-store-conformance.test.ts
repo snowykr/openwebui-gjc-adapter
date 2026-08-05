@@ -744,6 +744,7 @@ test("scoped lookups fall back to legacy mappings only for the configured admin"
 
 			expect(harness.store.getScoped({ principalId: "admin-1", chatId: "legacy-admin-chat" })).toMatchObject({
 				chatId: "legacy-admin-chat",
+				principalId: "admin-1",
 				operationId: "legacy-admin-operation",
 			});
 			expect(harness.store.getScoped({ principalId: "normal-1", chatId: "legacy-admin-chat" })).toBeUndefined();
