@@ -156,6 +156,40 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 			);
 		}
 	});
+	test("aborts a streamed turn when live event delivery loses the workspace lease", async () => {
+		const turnRunner = new FakeGjcTurnRunner();
+		turnRunner.observedEvents = [
+			{ type: "message_update", payload: { assistantMessageEvent: { type: "thinking_start" } } },
+			{ type: "agent_end" },
+		];
+		const runner = createGjcRoutingLiveGatewayRunner({
+			turnRunner,
+			mappings: new SessionMappingStore(),
+			modelReaderFactory: staticModelReaderFactory(),
+		});
+		const result = await runner.run({
+			project,
+			prompt: "hello",
+			chatId: "chat-lease-abort",
+			messageId: "assistant-lease-abort",
+			userMessageId: "user-lease-abort",
+			userMessageParentId: null,
+			continued: false,
+			requestedModelId: "gjc",
+			onLiveEvents: async () => {
+				const error = new Error("Workspace lease admission is uncertain.");
+				error.name = "WorkspaceLeaseUncertainError";
+				throw error;
+			},
+		});
+		if (result.chunks === undefined) throw new Error("expected live chunks");
+		const drain = (async () => {
+			for await (const _chunk of result.chunks) {
+				// Drain the stream so the background route settles and the abort surfaces.
+			}
+		})();
+		await expect(drain).rejects.toThrow("Workspace lease admission is uncertain.");
+	});
 	test("rejects before opening a stream when the first observed frame is agent_failed", async () => {
 		const turnRunner = new FakeGjcTurnRunner();
 		turnRunner.observedEvents = [{ type: "agent_failed" }];

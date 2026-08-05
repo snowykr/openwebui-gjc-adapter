@@ -1,8 +1,10 @@
-import type { OpenWebUIOwnerContext } from "../openwebui/auth";
+import type { OpenWebUIOwnerContext, OpenWebUIPrincipal } from "../openwebui/auth";
 import type { OpenWebUIProjectionRepository } from "../openwebui/client";
 import type { OpenWebUIMessageEvent } from "../openwebui/events";
 import type { OpenWebUIHeaderInput } from "../openwebui/headers";
 import type { RegisteredProject } from "../projects/registry";
+import type { UserWorkspaceRegistry } from "../security/user-workspace";
+import type { WorkspaceLeaseManager } from "../security/workspace-lease";
 import type { LiveGatewayEventSink, LiveGatewayMessageSink } from "./chat-delivery";
 import type { OpenAIErrorResponse } from "./chat-response-format";
 import type { LiveGatewayFileContextResolver } from "./file-contexts";
@@ -32,7 +34,10 @@ export interface LiveGatewayRunnerInput {
 	readonly continued: boolean;
 	readonly requestedModelId?: string;
 	/** Authenticated OpenWebUI owner bound by the request handler for branch controls. */
+	/** Authenticated OpenWebUI principal bound by the request handler for branch controls. */
 	readonly ownerUserId?: string;
+	/** Principal/workspace/lease scope for model selection during this turn. */
+	readonly modelReaderContext?: import("./model-reader").ModelReaderContext;
 	/** Message lineage supplied by OpenWebUI for the regenerated message. */
 	readonly messageMetadata?: Readonly<Record<string, unknown>>;
 	readonly control?: OpenWebUIControl;
@@ -104,4 +109,17 @@ export interface HandleChatCompletionsInput {
 	readonly projectContextRepository?: OpenWebUIProjectionRepository;
 	readonly neutralWorkspace?: string;
 	readonly modelReaderFactory?: import("./model-reader").ModelReaderFactory;
+	/** Canonical request principal; absent only for legacy direct callers. */
+	readonly principal?: OpenWebUIPrincipal;
+	/** Lazily provisions durable normal-user workspace context. */
+	readonly workspaceRegistry?: Pick<UserWorkspaceRegistry, "open">;
+	/** Durable normal-user workspace lease admission. */
+	readonly workspaceLeaseManager?: Pick<WorkspaceLeaseManager, "acquire">;
+	/** Lease duration and renewal heartbeat are injectable for focused lifecycle tests. */
+	readonly workspaceLeaseDurationMs?: number;
+	/** Same-process normal-user admission wait bound. */
+	readonly workspaceAdmissionTimeoutMs?: number;
+	/** Maximum same-process normal-user admission queue depth. */
+	readonly workspaceAdmissionQueueLimit?: number;
+	readonly workspaceLeaseHeartbeatMs?: number;
 }

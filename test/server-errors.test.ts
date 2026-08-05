@@ -17,7 +17,9 @@ describe("createAdapterRequestHandler chat completion errors", () => {
 				},
 			},
 		});
-		const failed = await unavailable(new Request("http://adapter.test/v1/models"));
+		const failed = await unavailable(
+			new Request("http://adapter.test/v1/models", { headers: { "X-OpenWebUI-User-Id": "owner-1" } }),
+		);
 		expect(failed.status).toBe(503);
 		expect(await failed.json()).toEqual({
 			error: {
@@ -46,7 +48,9 @@ describe("createAdapterRequestHandler chat completion errors", () => {
 				}),
 			},
 		});
-		const succeeded = await empty(new Request("http://adapter.test/v1/models"));
+		const succeeded = await empty(
+			new Request("http://adapter.test/v1/models", { headers: { "X-OpenWebUI-User-Id": "owner-1" } }),
+		);
 		expect(succeeded.status).toBe(200);
 		expect(await succeeded.json()).toEqual({ object: "list", data: [] });
 	});
@@ -79,7 +83,7 @@ describe("createAdapterRequestHandler chat completion errors", () => {
 		const response = await handler(
 			new Request("http://adapter.test/v1/chat/completions", {
 				method: "POST",
-				headers: { "content-type": "application/json" },
+				headers: { "content-type": "application/json", "X-OpenWebUI-User-Id": "owner-1" },
 				body: "{",
 			}),
 		);

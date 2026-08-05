@@ -40,8 +40,10 @@ export interface ProjectLinkServiceOptions {
 	readonly repository?: OpenWebUIProjectionRepository;
 	readonly mappings?: SessionMappingStore;
 	readonly protectedPaths: GjcRuntimeLocations["protectedProjectPaths"];
+	readonly protectedProjectRoots?: readonly string[];
 	readonly runtimeLocations?: GjcSessionStorageLocations;
 	readonly closeSession?: ProjectSessionCloser;
+	readonly allowedSessionRoots?: readonly string[];
 }
 
 export interface ProjectLinkResult {
@@ -73,8 +75,10 @@ export class ProjectLinkService {
 	readonly #repository?: OpenWebUIProjectionRepository;
 	readonly #mappings?: SessionMappingStore;
 	readonly #protectedPaths: GjcRuntimeLocations["protectedProjectPaths"];
+	readonly #protectedProjectRoots: readonly string[];
 	readonly #runtimeLocations?: GjcSessionStorageLocations;
 	readonly #closeSession?: ProjectSessionCloser;
+	readonly #allowedSessionRoots: readonly string[];
 
 	constructor(options: ProjectLinkServiceOptions) {
 		this.#allowedRoots = options.allowedRoots;
@@ -83,12 +87,19 @@ export class ProjectLinkService {
 		this.#repository = options.repository;
 		this.#mappings = options.mappings;
 		this.#protectedPaths = options.protectedPaths;
+		this.#protectedProjectRoots = options.protectedProjectRoots ?? [];
 		this.#runtimeLocations = options.runtimeLocations;
 		this.#closeSession = options.closeSession;
+		this.#allowedSessionRoots = options.allowedSessionRoots ?? [];
 	}
 
 	async seedConfiguredProjects(projects: readonly RegisteredProject[]): Promise<void> {
-		await assertProjectsAdmitted(projects, this.#protectedPaths);
+		await assertProjectsAdmitted(
+			projects,
+			this.#protectedPaths,
+			this.#protectedProjectRoots,
+			this.#allowedSessionRoots,
+		);
 		this.#store.seedConfiguredProjects(projects);
 	}
 
@@ -105,7 +116,12 @@ export class ProjectLinkService {
 			}
 			throw error;
 		}
-		await assertProjectsAdmitted([registered], this.#protectedPaths);
+		await assertProjectsAdmitted(
+			[registered],
+			this.#protectedPaths,
+			this.#protectedProjectRoots,
+			this.#allowedSessionRoots,
+		);
 		const previous = this.#store.getProject(registered.cwd);
 		let project = this.#store.linkProject(registered, source);
 		try {
@@ -197,20 +213,22 @@ export class ProjectLinkService {
 	async #closeProjectSessions(
 		projectId: string,
 	): Promise<readonly { readonly chatId: string; readonly result: SessionCloseResult }[]> {
-		if (this.#closeSession === undefined || this.#mappings === undefined) return [];
+		if (this.#closeSession === undefined || this.#mappings === undefined || this.#ownerUserId.length === 0) return [];
 		return await Promise.all(
 			this.#mappings
-				.entries()
+				.entriesForPrincipal(this.#ownerUserId, { includeLegacyAdmin: true })
 				.filter(mapping => mapping.projectId === projectId)
 				.map(async mapping => {
+					const boundMapping =
+						mapping.principalId === undefined ? { ...mapping, principalId: this.#ownerUserId } : mapping;
 					try {
 						return {
-							chatId: mapping.chatId,
-							result: await this.#closeSession!(mapping, {
-								ingressId: closeIngressId(`project-unlink:${projectId}`, mapping),
+							chatId: boundMapping.chatId,
+							result: await this.#closeSession!(boundMapping, {
+								ingressId: closeIngressId(`project-unlink:${projectId}`, boundMapping),
 								ingressHash: `project-unlink:${projectId}`,
 								legacyIngress: {
-									ingressId: legacyCloseIngressId(`project-unlink:${projectId}`, mapping),
+									ingressId: legacyCloseIngressId(`project-unlink:${projectId}`, boundMapping),
 									ingressHash: `project-unlink:${projectId}`,
 								},
 							}),
@@ -218,7 +236,7 @@ export class ProjectLinkService {
 					} catch (error) {
 						if (error instanceof Error && error.message.includes("conflicts")) throw error;
 						return {
-							chatId: mapping.chatId,
+							chatId: boundMapping.chatId,
 							result: {
 								status: "uncertain",
 								message:

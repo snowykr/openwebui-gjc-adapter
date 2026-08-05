@@ -1,6 +1,7 @@
 import { assertPublishedSdkAttachmentCurrent } from "../gjc/public-sdk-session-port";
 import { SdkV3OperationError } from "../gjc/sdk-v3-protocol";
 import type { routeGjcTurn, SessionMapping, SessionMappingStore } from "../gjc/session-router";
+import { scopedSessionMappingStore } from "../gjc/session-turn-router";
 import type { GjcLifecycleTestBarrierHook } from "../gjc/turn-runner";
 import type { OutboxStore } from "../state/outbox";
 import type { LiveGatewayRunnerInput, LiveGatewayRunnerResult } from "./chat-completions";
@@ -28,6 +29,11 @@ export async function runRoutingControl(
 	if (control === undefined) throw new Error("OpenWebUI control request was not supplied.");
 	if (controlled.runControl === undefined) throw new OpenWebUIControlError(control.operation);
 	const runControl = controlled.runControl;
+	const principalId = principalIdForTurn(turn);
+	const projectionOwnerUserId = principalId ?? input.ownerUserId ?? "openwebui-gjc-adapter";
+	const mappings =
+		principalId === undefined ? input.mappings : scopedSessionMappingStore(input.mappings, principalId, turn.chatId);
+	const scopedInput = mappings === input.mappings ? input : { ...input, mappings };
 	const hash = controlOperationHash(turn);
 	if (controlled.withLifecyclePublication === undefined)
 		throw new Error("GJC runner must provide lifecycle publication for controls.");
@@ -43,7 +49,7 @@ export async function runRoutingControl(
 			recoveryAttachment: existing.attachment,
 		},
 		async lifecycle => {
-			input.mappings.beginOperation(turn.chatId, {
+			mappings.beginOperation(turn.chatId, {
 				id: turn.userMessageId,
 				kind: control.operation === "session.new" ? "create" : controlOperationKind(control.operation),
 				ingressId: turn.userMessageId,
@@ -57,25 +63,25 @@ export async function runRoutingControl(
 					lifecycle,
 					control.operation === "session.new" || control.operation === "branch"
 						? successor => {
-								input.mappings.recordAcknowledgedSuccessor(turn.chatId, turn.userMessageId, hash, successor);
+								mappings.recordAcknowledgedSuccessor(turn.chatId, turn.userMessageId, hash, successor);
 							}
 						: undefined,
 				);
 				if (control.operation === "branch") return { applied };
 				return {
 					applied,
-					mapping: await publishControlMapping(input.mappings, lifecycle, turn, existing, applied, hash, mapping =>
-						ensureProjectionRows(input.outbox, mapping, input.ownerUserId ?? "openwebui-gjc-adapter"),
+					mapping: await publishControlMapping(mappings, lifecycle, turn, existing, applied, hash, mapping =>
+						ensureProjectionRows(input.outbox, mapping, projectionOwnerUserId, principalId),
 					),
 				};
 			} catch (error) {
-				input.mappings.transitionOperation(turn.chatId, turn.userMessageId, "uncertain", hash);
+				mappings.transitionOperation(turn.chatId, turn.userMessageId, "uncertain", hash);
 				throw error;
 			}
 		},
 	);
 	if (control.operation === "branch")
-		return continueBranch(input, turn, existing, sessionRoot, hash, controlled, predecessor.applied);
+		return continueBranch(scopedInput, turn, existing, sessionRoot, hash, controlled, predecessor.applied);
 	const { applied, mapping } = predecessor;
 	if (mapping === undefined) throw new Error("GJC control did not publish a mapping.");
 	const result = applied.result;
@@ -105,6 +111,8 @@ async function continueBranch(
 	applied: Awaited<ReturnType<NonNullable<RoutingControlDependencies["turnRunner"]["runControl"]>>>,
 ): Promise<LiveGatewayRunnerResult & { readonly model?: string }> {
 	const { sessionId, sessionFile, attachment } = applied;
+	const principalId = principalIdForTurn(turn);
+	const projectionOwnerUserId = principalId ?? input.ownerUserId ?? "openwebui-gjc-adapter";
 	try {
 		if (sessionId === undefined || sessionFile === undefined || attachment === undefined)
 			throw new Error("GJC branch did not return an exact successor descriptor.");
@@ -207,7 +215,7 @@ async function continueBranch(
 						},
 						"control",
 					);
-					ensureProjectionRows(input.outbox, published, input.ownerUserId ?? "openwebui-gjc-adapter");
+					ensureProjectionRows(input.outbox, published, projectionOwnerUserId, principalId);
 					return published;
 				});
 				return withCanonicalModel(
@@ -223,6 +231,10 @@ async function continueBranch(
 			}
 		},
 	);
+}
+function principalIdForTurn(turn: LiveGatewayRunnerInput): string | undefined {
+	const ownerUserId = turn.ownerUserId;
+	return typeof ownerUserId === "string" && ownerUserId.trim().length > 0 ? ownerUserId : undefined;
 }
 function assertCurrentBranchPredecessor(
 	mappings: SessionMappingStore,

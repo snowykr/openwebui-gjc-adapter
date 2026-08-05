@@ -32,7 +32,10 @@ describe("adapter CLI prompt hints", () => {
 
 			expect(fixture.requests.map(request => request.path)).toEqual([
 				"/api/v1/prompts/list?page=1",
+				"/api/v1/prompts/list?page=1",
+				"/api/v1/prompts/list?page=1",
 				...GJC_OPENWEBUI_PROMPT_HINTS.map(() => "/api/v1/prompts/create"),
+				"/api/v1/prompts/list?page=1",
 			]);
 			expect(fixture.prompts.map(prompt => prompt.command)).toEqual(
 				GJC_OPENWEBUI_PROMPT_HINTS.map(prompt => prompt.command),
@@ -47,9 +50,10 @@ interface RecordedPromptRequest {
 	readonly method: string;
 	readonly path: string;
 }
-
 interface CreatedPrompt {
+	readonly id: string;
 	readonly command: string;
+	readonly body: Record<string, unknown>;
 }
 
 function startPromptServer() {
@@ -61,15 +65,17 @@ function startPromptServer() {
 			const url = new URL(request.url);
 			requests.push({ method: request.method, path: `${url.pathname}${url.search}` });
 			if (request.method === "GET" && url.pathname === "/api/v1/prompts/list") {
-				return Response.json({ items: [], total: 0 });
+				return Response.json({ items: prompts.map(prompt => prompt.body), total: prompts.length });
 			}
 			if (request.method === "POST" && url.pathname === "/api/v1/prompts/create") {
 				const body = await request.json();
 				if (!isRecord(body) || typeof body.command !== "string") {
 					return Response.json({ detail: "bad prompt" }, { status: 400 });
 				}
-				prompts.push({ command: body.command });
-				return Response.json({ id: `prompt-${prompts.length}`, ...body, is_active: true });
+				const id = `prompt-${prompts.length + 1}`;
+				const stored = { id, ...body, is_active: true };
+				prompts.push({ id, command: body.command, body: stored });
+				return Response.json(stored);
 			}
 			return Response.json({ detail: "unexpected request" }, { status: 500 });
 		},

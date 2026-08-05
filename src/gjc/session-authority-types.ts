@@ -167,3 +167,67 @@ export interface SessionAuthorityRecord {
 
 export type SessionAuthorityInput = Omit<SessionAuthorityRecord, "version" | "createdAt" | "header" | "journal"> &
 	Partial<Pick<SessionAuthorityRecord, "createdAt" | "journal" | "header" | "version">>;
+export const SESSION_AUTHORITY_MIGRATION_VERSION = 1 as const;
+
+export const SESSION_MAPPING_SCOPE_OBSERVATION = "__gjcSessionMappingScope" as const;
+
+export type SessionAuthorityMigrationStatus = "committed" | "degraded" | "not_needed";
+export type SessionAuthorityMigrationItemStatus = "migrated" | "quarantined" | "skipped";
+
+export interface SessionAuthorityMigrationItem {
+	readonly identity: string;
+	readonly sourceIndex: number;
+	readonly legacyChatId?: string;
+	readonly destinationChatId?: string;
+	readonly status: SessionAuthorityMigrationItemStatus;
+	readonly reason?: string;
+}
+
+export interface SessionAuthorityMigrationCounts {
+	readonly total: number;
+	readonly migrated: number;
+	readonly quarantined: number;
+	readonly skipped: number;
+}
+
+export interface SessionAuthorityMigrationCheckpoint {
+	readonly kind: "openwebui-gjc-session-authority-migration";
+	readonly version: typeof SESSION_AUTHORITY_MIGRATION_VERSION;
+	readonly sourcePath: string;
+	readonly sourceSha256: string;
+	readonly adminPrincipalId: string;
+	readonly sourceRecoveryPath: string;
+	readonly destinationPath: string;
+	readonly destinationSha256?: string;
+	readonly status: SessionAuthorityMigrationStatus;
+	readonly items: readonly SessionAuthorityMigrationItem[];
+	readonly counts: SessionAuthorityMigrationCounts;
+	readonly updatedAt: string;
+	readonly completedAt?: string;
+	readonly quarantinePath?: string;
+	readonly reason?: string;
+}
+
+export interface SessionAuthorityMigrationResult {
+	readonly status: SessionAuthorityMigrationStatus;
+	readonly sourcePath: string;
+	readonly sourceSha256?: string;
+	readonly sourceRecoveryPath?: string;
+	readonly originalSourcePath?: string;
+	readonly sourceBytesPath?: string;
+	readonly migrationRecoveryPath: string;
+	readonly recoveryPath: string;
+	readonly destinationPath: string;
+	readonly checkpointPath?: string;
+	readonly auditPath?: string;
+	readonly quarantinePath?: string;
+	readonly checkpoint?: SessionAuthorityMigrationCheckpoint;
+	readonly counts: SessionAuthorityMigrationCounts;
+	readonly reason?: string;
+}
+
+export interface SessionAuthorityMigrationOptions {
+	readonly sourcePath: string;
+	readonly stateRoot: string;
+	readonly adminPrincipalId: string;
+}

@@ -5,10 +5,12 @@ import {
 	type SessionMapping,
 	type SessionMappingStore,
 } from "../gjc/session-router";
+import { scopedSessionMappingStore } from "../gjc/session-turn-router";
 import type { GjcLifecycleTestBarrierHook } from "../gjc/turn-runner";
 import { projectPendingWorkflowGateMessage } from "../projection/workflow-gates";
 import type { OutboxStore } from "../state/outbox";
 import type { LiveGatewayRunner, LiveGatewayRunnerInput, LiveGatewayRunnerResult } from "./chat-completions";
+import { isWorkspaceLeaseUncertainError } from "./chat-completions";
 import { runRoutingControl } from "./gjc-routing-control";
 import { replayRoutingOperation } from "./gjc-routing-operation-replay";
 import {
@@ -26,6 +28,11 @@ import {
 	latestPendingWorkflowGate,
 	projectTurnEvents,
 } from "./workflow-gate-turns";
+
+function principalIdForTurn(turn: LiveGatewayRunnerInput): string | undefined {
+	const ownerUserId = turn.ownerUserId;
+	return typeof ownerUserId === "string" && ownerUserId.trim().length > 0 ? ownerUserId : undefined;
+}
 
 export type GjcSessionTurnRunner = Parameters<typeof routeGjcTurn>[0]["runner"];
 export interface CreateGjcRoutingLiveGatewayRunnerInput {
@@ -58,15 +65,21 @@ export function createGjcRoutingLiveGatewayRunner(
 			await input.turnRunner.stop?.();
 		},
 		async run(turn: LiveGatewayRunnerInput): Promise<GjcRoutingLiveGatewayRunnerResult> {
-			let existing = input.mappings.get(turn.chatId);
-			const priorProvisional = input.mappings.provisionalOperation(turn.chatId, turn.userMessageId);
+			const principalId = principalIdForTurn(turn);
+			const projectionOwnerUserId = principalId ?? input.ownerUserId ?? "openwebui-gjc-adapter";
+			const scopedMappings =
+				principalId === undefined
+					? input.mappings
+					: scopedSessionMappingStore(input.mappings, principalId, turn.chatId);
+			let existing = scopedMappings.get(turn.chatId);
+			const priorProvisional = scopedMappings.provisionalOperation(turn.chatId, turn.userMessageId);
 			if (
 				priorProvisional !== undefined &&
 				(priorProvisional.projectId !== turn.project.id ||
 					(existing !== undefined && existing.projectId !== priorProvisional.projectId))
 			)
 				throw new Error(`GJC operation ${turn.userMessageId} is not authorized for project ${turn.project.id}.`);
-			const priorAuthority = input.mappings.operationAuthority(turn.chatId, turn.userMessageId);
+			const priorAuthority = scopedMappings.operationAuthority(turn.chatId, turn.userMessageId);
 			if (
 				priorAuthority !== undefined &&
 				("retiredAt" in priorAuthority || priorAuthority.projectId !== turn.project.id)
@@ -78,15 +91,15 @@ export function createGjcRoutingLiveGatewayRunner(
 			let reassignmentStarted = false;
 			const beginReassignment = () => {
 				if (reassignmentSource === undefined || reassignmentStarted) return;
-				input.mappings.beginProjectReassignment(turn.chatId, reassignmentSource, turn.project.id);
+				scopedMappings.beginProjectReassignment(turn.chatId, reassignmentSource, turn.project.id);
 				reassignmentStarted = true;
 			};
 			const rollbackReassignment = (cause: unknown) => {
 				if (reassignmentSource === undefined || !reassignmentStarted) return;
 				try {
-					input.mappings.rollbackProjectReassignment(turn.chatId, reassignmentSource);
+					scopedMappings.rollbackProjectReassignment(turn.chatId, reassignmentSource);
 				} catch (rollbackError) {
-					const committed = input.mappings.get(turn.chatId);
+					const committed = scopedMappings.get(turn.chatId);
 					if (committed?.projectId === turn.project.id) {
 						reassignmentStarted = false;
 						return;
@@ -139,12 +152,13 @@ export function createGjcRoutingLiveGatewayRunner(
 				};
 				if (turn.onLiveEvents === undefined) {
 					gateReplyResult = await input.turnRunner.withLifecyclePublication(gateAddress, lifecycle =>
-						handleWorkflowGateReply(input, turn, boundMapping, lifecycle),
+						handleWorkflowGateReply({ ...input, mappings: scopedMappings }, turn, boundMapping, lifecycle),
 					);
 				} else {
 					const queue = new LiveChunkQueue();
 					let activityStarted = false;
 					let observedNativeLifecycle = false;
+					let leaseFailed = false;
 					const terminalEvents: ReturnType<typeof projectTurnEvents>[number][] = [];
 					let resolveActivity!: () => void;
 					let rejectActivity!: (error: unknown) => void;
@@ -183,14 +197,31 @@ export function createGjcRoutingLiveGatewayRunner(
 							terminalEvents.push(...projected);
 							return;
 						}
-						if (projected.length > 0) await deliverLiveEvents(turn, projected);
+						if (projected.length > 0) {
+							try {
+								await deliverLiveEvents(turn, projected);
+							} catch (error) {
+								leaseFailed = true;
+								// Re-throw so routeGjcTurn/continueSession abort the
+								// background turn promptly instead of deferring to the
+								// final .then (which only runs after the turn settles).
+								throw error;
+							}
+						}
 					};
-					void input.turnRunner
+					const backgroundRoute = input.turnRunner
 						.withLifecyclePublication(gateAddress, lifecycle =>
-							handleWorkflowGateReply(input, turn, boundMapping, lifecycle, observer),
+							handleWorkflowGateReply(
+								{ ...input, mappings: scopedMappings },
+								turn,
+								boundMapping,
+								lifecycle,
+								observer,
+							),
 						)
 						.then(async result => {
 							markActivityStarted();
+							if (leaseFailed) throw new Error("Workspace lease was lost during the streamed turn.");
 							if (result === null) throw new Error("Pending workflow gate disappeared before its reply.");
 							const completionEvents = observedNativeLifecycle ? terminalEvents : (result.events ?? []);
 							if (completionEvents.length > 0) await deliverLiveEvents(turn, completionEvents);
@@ -201,7 +232,7 @@ export function createGjcRoutingLiveGatewayRunner(
 							queue.fail(error);
 						});
 					await firstActivity;
-					return withCanonicalModel({ chunks: queue }, boundSelection);
+					return withCanonicalModel({ chunks: queue, abandon: () => backgroundRoute }, boundSelection);
 				}
 			}
 			if (gateReplyResult !== null) return withCanonicalModel(gateReplyResult, boundSelection);
@@ -213,6 +244,7 @@ export function createGjcRoutingLiveGatewayRunner(
 				let result: RouteGjcTurnResult;
 				try {
 					result = await routeGjcTurn({
+						...(principalId === undefined ? {} : { principalId }),
 						project: turn.project,
 						chatId: turn.chatId,
 						userMessageId: turn.userMessageId,
@@ -225,7 +257,7 @@ export function createGjcRoutingLiveGatewayRunner(
 							return pendingGate === null ? routed.text : projectPendingWorkflowGateMessage(pendingGate);
 						},
 						afterPublish: routed =>
-							ensureProjectionRows(input.outbox, routed.mapping, input.ownerUserId ?? "openwebui-gjc-adapter"),
+							ensureProjectionRows(input.outbox, routed.mapping, projectionOwnerUserId, principalId),
 						...(modelSelection === undefined ? {} : { modelSelection }),
 					});
 					reassignmentStarted = false;
@@ -251,6 +283,7 @@ export function createGjcRoutingLiveGatewayRunner(
 			let activityStarted = false;
 			let observedNativeLifecycle = false;
 			let agentStartDelivered = false;
+			let leaseFailed = false;
 			let resolveActivity!: () => void;
 			let rejectActivity!: (error: unknown) => void;
 			const firstActivity = new Promise<void>((resolve, reject) => {
@@ -262,7 +295,8 @@ export function createGjcRoutingLiveGatewayRunner(
 				activityStarted = true;
 				resolveActivity();
 			};
-			void routeGjcTurn({
+			const backgroundRoute = routeGjcTurn({
+				...(principalId === undefined ? {} : { principalId }),
 				project: turn.project,
 				chatId: turn.chatId,
 				userMessageId: turn.userMessageId,
@@ -275,7 +309,7 @@ export function createGjcRoutingLiveGatewayRunner(
 					return pendingGate === null ? routed.text : projectPendingWorkflowGateMessage(pendingGate);
 				},
 				afterPublish: routed =>
-					ensureProjectionRows(input.outbox, routed.mapping, input.ownerUserId ?? "openwebui-gjc-adapter"),
+					ensureProjectionRows(input.outbox, routed.mapping, projectionOwnerUserId, principalId),
 				onObservedTurn: async event => {
 					if (event.type !== "agent_failed") markActivityStarted();
 					if (isNativeLifecycleEvent(event.type)) observedNativeLifecycle = true;
@@ -306,7 +340,15 @@ export function createGjcRoutingLiveGatewayRunner(
 					);
 					if (projected.length > 0) {
 						if (event.type === "agent_start") agentStartDelivered = true;
-						await deliverLiveEvents(turn, projected);
+						try {
+							await deliverLiveEvents(turn, projected);
+						} catch (error) {
+							leaseFailed = true;
+							// Re-throw so routeGjcTurn/continueSession abort the
+							// background turn promptly instead of deferring to the
+							// final .then (which only runs after the turn settles).
+							throw error;
+						}
 					}
 				},
 				...(modelSelection === undefined ? {} : { modelSelection }),
@@ -314,6 +356,7 @@ export function createGjcRoutingLiveGatewayRunner(
 				.then(async result => {
 					reassignmentStarted = false;
 					markActivityStarted();
+					if (leaseFailed) throw new Error("Workspace lease was lost during the streamed turn.");
 					const canonicalModel =
 						result.mapping.modelSelection === undefined
 							? undefined
@@ -342,7 +385,7 @@ export function createGjcRoutingLiveGatewayRunner(
 					queue.fail(mappedError);
 				});
 			await firstActivity;
-			return withCanonicalModel({ chunks: queue }, modelSelection);
+			return withCanonicalModel({ chunks: queue, abandon: () => backgroundRoute }, modelSelection);
 		},
 	};
 }
@@ -419,7 +462,11 @@ async function deliverLiveEvents(
 ): Promise<void> {
 	try {
 		await turn.onLiveEvents?.(events);
-	} catch {
+	} catch (error) {
+		// A lost workspace fence is not a best-effort delivery failure: the
+		// streamed turn must abort so its background route cannot keep mutating
+		// the workspace after another process may have taken the lease.
+		if (isWorkspaceLeaseUncertainError(error)) throw error;
 		// OpenWebUI progress delivery is best-effort and cannot invalidate an accepted GJC turn.
 	}
 }

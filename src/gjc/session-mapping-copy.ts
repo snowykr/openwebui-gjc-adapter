@@ -4,6 +4,7 @@ import { copyAttachment } from "./session-operation-codec";
 
 export function copySessionMapping(mapping: SessionMapping): SessionMapping {
 	return {
+		...(mapping.principalId === undefined ? {} : { principalId: mapping.principalId }),
 		chatId: mapping.chatId,
 		projectId: mapping.projectId,
 		sessionId: mapping.sessionId,

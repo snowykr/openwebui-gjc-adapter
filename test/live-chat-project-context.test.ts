@@ -116,7 +116,7 @@ describe("live chat project context", () => {
 		]);
 	});
 
-	it("rejects forwarded user mismatches", async () => {
+	it("requires a private workspace for forwarded normal users", async () => {
 		const result = await handleChatCompletions({
 			request,
 			headers: { ...chatHeaders, "X-OpenWebUI-User-Id": "other-user" },
@@ -125,7 +125,7 @@ describe("live chat project context", () => {
 			runner: fixedRunner("unused"),
 		});
 
-		expect(result).toMatchObject({ ok: false, status: 401, body: { error: { code: "owner-mismatch" } } });
+		expect(result).toMatchObject({ ok: false, status: 503, body: { error: { code: "workspace_unavailable" } } });
 	});
 
 	it("routes normal completions using folder project context", async () => {

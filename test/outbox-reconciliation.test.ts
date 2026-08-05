@@ -28,14 +28,15 @@ import { messageEntry, writeSessionFile } from "./session-sync-fixtures";
 
 const createdAt = new Date("2026-07-08T00:00:00.000Z");
 
-function enqueueChatOperation(store: OutboxStore, operationId = "op-1"): void {
+function enqueueChatOperation(store: OutboxStore, operationId = "op-1", principalId?: string, chatId = "chat-1"): void {
 	store.enqueue({
 		operationId,
+		...(principalId === undefined ? {} : { principalId }),
 		ownerUserId: "user-1",
 		projectId: "project-1",
-		chatId: "chat-1",
+		chatId,
 		kind: "chat",
-		payloadHash: buildProjectionPayloadHash({ chatId: "chat-1", title: "Example" }),
+		payloadHash: buildProjectionPayloadHash({ chatId, title: "Example" }),
 		now: createdAt,
 	});
 }
@@ -75,6 +76,20 @@ describe("InMemoryOutboxStore", () => {
 
 		expect(replayed).toMatchObject({ operationId: "op-1", state: "pending", attempts: 0 });
 	});
+	test("keeps identical remote identifiers independent across principals", () => {
+		const store = new InMemoryOutboxStore();
+		enqueueChatOperation(store, "shared-operation", "principal-a");
+		enqueueChatOperation(store, "shared-operation", "principal-b");
+
+		expect(store.listPending()).toHaveLength(2);
+		expect(
+			store.get({ principalId: "principal-a", chatId: "chat-1", operationId: "shared-operation" }),
+		).toMatchObject({ principalId: "principal-a", chatId: "chat-1", operationId: "shared-operation" });
+		expect(
+			store.get({ principalId: "principal-b", chatId: "chat-1", operationId: "shared-operation" }),
+		).toMatchObject({ principalId: "principal-b", chatId: "chat-1", operationId: "shared-operation" });
+		expect(() => store.get("shared-operation")).toThrow("ambiguous");
+	});
 
 	test("builds stable canonical payload hashes", () => {
 		const left = buildProjectionPayloadHash({
@@ -103,6 +118,25 @@ describe("FileBackedOutboxStore", () => {
 		expect(second.get("op-1")).toMatchObject({ operationId: "op-1", state: "pending" });
 		expect(second.listPending().map(operation => operation.operationId)).toEqual(["op-1"]);
 	});
+	test("persists principal scope across store restarts", () => {
+		const filePath = `${tmpdir()}/openwebui-gjc-adapter-scoped-restart-${Date.now()}.json`;
+		const first = new FileBackedOutboxStore(filePath);
+		try {
+			enqueueChatOperation(first, "shared-operation", "principal-a");
+			enqueueChatOperation(first, "shared-operation", "principal-b");
+
+			const second = new FileBackedOutboxStore(filePath);
+			expect(second.listPending().map(operation => operation.principalId)).toEqual(["principal-a", "principal-b"]);
+			expect(
+				second.get({ principalId: "principal-a", chatId: "chat-1", operationId: "shared-operation" }),
+			).toMatchObject({ principalId: "principal-a" });
+			expect(
+				second.get({ principalId: "principal-b", chatId: "chat-1", operationId: "shared-operation" }),
+			).toMatchObject({ principalId: "principal-b" });
+		} finally {
+			rmSync(filePath, { force: true });
+		}
+	});
 	test("rejects corrupt or unversioned persisted documents", () => {
 		const directory = mkdtempSync(join(tmpdir(), "openwebui-gjc-adapter-outbox-"));
 		try {
@@ -113,6 +147,74 @@ describe("FileBackedOutboxStore", () => {
 
 			writeFileSync(filePath, JSON.stringify({ version: 2, operations: [] }));
 			expect(() => new FileBackedOutboxStore(filePath)).toThrow("Invalid outbox document");
+		} finally {
+			rmSync(directory, { force: true, recursive: true });
+		}
+	});
+	test("parses legacy persisted rows without a principal scope", () => {
+		const directory = mkdtempSync(join(tmpdir(), "openwebui-gjc-adapter-outbox-legacy-"));
+		try {
+			const filePath = join(directory, "outbox.json");
+			writeFileSync(
+				filePath,
+				JSON.stringify({
+					version: 1,
+					operations: [
+						{
+							operationId: "legacy-op",
+							ownerUserId: "admin",
+							projectId: "project-1",
+							chatId: "chat-1",
+							kind: "chat",
+							state: "pending",
+							payloadHash: buildProjectionPayloadHash({ chatId: "chat-1", title: "Legacy" }),
+							attempts: 0,
+							createdAt: createdAt.toISOString(),
+							updatedAt: createdAt.toISOString(),
+						},
+					],
+				}),
+			);
+
+			const store = new FileBackedOutboxStore(filePath);
+			const legacy = store.get("legacy-op");
+			expect(legacy).toMatchObject({
+				operationId: "legacy-op",
+				chatId: "chat-1",
+			});
+			expect(legacy).not.toHaveProperty("principalId");
+		} finally {
+			rmSync(directory, { force: true, recursive: true });
+		}
+	});
+
+	test("rejects malformed present principal metadata", () => {
+		const directory = mkdtempSync(join(tmpdir(), "openwebui-gjc-adapter-outbox-principal-"));
+		try {
+			const filePath = join(directory, "outbox.json");
+			writeFileSync(
+				filePath,
+				JSON.stringify({
+					version: 1,
+					operations: [
+						{
+							operationId: "bad-principal",
+							principalId: " ",
+							ownerUserId: "admin",
+							projectId: "project-1",
+							chatId: "chat-1",
+							kind: "chat",
+							state: "pending",
+							payloadHash: buildProjectionPayloadHash({ chatId: "chat-1", title: "Bad" }),
+							attempts: 0,
+							createdAt: createdAt.toISOString(),
+							updatedAt: createdAt.toISOString(),
+						},
+					],
+				}),
+			);
+
+			expect(() => new FileBackedOutboxStore(filePath)).toThrow("Invalid outbox operation");
 		} finally {
 			rmSync(directory, { force: true, recursive: true });
 		}
@@ -294,7 +396,7 @@ describe("reconcilePendingOperations", () => {
 
 		expect(result.applied).toEqual([]);
 		expect(result.failed.map(operation => operation.operationId)).toEqual(["op-1"]);
-		expect(store.get("op-1")?.state).toBe("failed");
+		expect(store.get("op-1")?.state).toBe("reconcile");
 		expect(store.get("op-1")?.attempts).toBe(1);
 		expect(store.get("op-1")?.lastError).toBe("OpenWebUI unavailable");
 	});
@@ -351,16 +453,132 @@ describe("durable projection reconciliation", () => {
 		const synchronizedProjectIds: string[] = [];
 		const result = await reconcilePendingOperations(
 			outbox,
-			createProjectionOperationApplier(mappings, {
-				syncLinkedProject: async projectId => {
-					synchronizedProjectIds.push(projectId);
+			createProjectionOperationApplier(
+				mappings,
+				{
+					syncLinkedProject: async projectId => {
+						synchronizedProjectIds.push(projectId);
+					},
 				},
-			}),
+				"user-1",
+			),
 		);
 
 		expect(result.failed).toEqual([]);
 		expect(result.applied.map(operation => operation.kind)).toEqual(["session_mapping", "event"]);
 		expect(synchronizedProjectIds).toEqual(["project-1", "project-1"]);
+	});
+	test("replays normal-principal rows through a scoped capability", async () => {
+		const mappings = new SessionMappingStore();
+		const mapping = {
+			principalId: "normal-user",
+			chatId: "chat-1",
+			projectId: "openwebui",
+			sessionId: "session-1",
+			rawFrameCursor: 1,
+			eventCursor: 1,
+			operationId: "op-1",
+			assistantText: "done",
+			events: [{ type: "tool_start", id: "tool-1" }],
+		};
+		const scope = { principalId: "normal-user", chatId: "chat-1" };
+		mappings.setScoped(scope, { ...mapping, operationId: "bootstrap" });
+		mappings.beginOperationScoped(scope, { id: "op-1", kind: "prompt", detail: "request" });
+		mappings.completeOperationWithMappingScoped(scope, "op-1", "request", mapping, "turn");
+		const outbox = new InMemoryOutboxStore();
+		synthesizeProjectionRows(outbox, mappings, "admin-user", "admin-user");
+		const linkedProjectIds: string[] = [];
+		const principalRows: string[] = [];
+		const result = await reconcilePendingOperations(
+			outbox,
+			createProjectionOperationApplier(
+				mappings,
+				{
+					syncLinkedProject: async projectId => {
+						linkedProjectIds.push(projectId);
+					},
+					syncPrincipalProjection: async input => {
+						principalRows.push(`${input.principalId}:${input.mapping.chatId}`);
+					},
+				},
+				"admin-user",
+			),
+		);
+
+		expect(result.failed).toEqual([]);
+		expect(result.applied.map(operation => operation.kind)).toEqual(["session_mapping", "event"]);
+		expect(principalRows).toEqual(["normal-user:chat-1", "normal-user:chat-1"]);
+		expect(linkedProjectIds).toEqual([]);
+		expect(outbox.listPending()).toEqual([]);
+	});
+	test("settles admin projection rows for unlinked projects as obsolete", async () => {
+		const mappings = new SessionMappingStore();
+		const mapping = {
+			chatId: "chat-1",
+			projectId: "project-1",
+			sessionId: "session-1",
+			rawFrameCursor: 1,
+			eventCursor: 1,
+			operationId: "op-1",
+		};
+		mappings.set({ ...mapping, operationId: "bootstrap" });
+		mappings.beginOperation("chat-1", { id: "op-1", kind: "prompt", detail: "request" });
+		mappings.completeOperationWithMapping("chat-1", "op-1", "request", mapping, "turn");
+		const outbox = new InMemoryOutboxStore();
+		synthesizeProjectionRows(outbox, mappings, "user-1", "user-1");
+
+		const result = await reconcilePendingOperations(
+			outbox,
+			createProjectionOperationApplier(
+				mappings,
+				{
+					syncLinkedProject: async () => {
+						throw new Error("Linked project is unavailable for projection: project-1");
+					},
+				},
+				"user-1",
+			),
+		);
+
+		expect(result.failed).toEqual([]);
+		expect(result.applied.map(operation => operation.kind)).toEqual(["session_mapping", "event"]);
+		expect(outbox.listPending()).toEqual([]);
+	});
+
+	test("settles projection rows whose mapping was retired as obsolete", async () => {
+		const mappings = new SessionMappingStore();
+		const mapping = {
+			principalId: "normal-user",
+			chatId: "chat-1",
+			projectId: "openwebui",
+			sessionId: "session-1",
+			rawFrameCursor: 1,
+			eventCursor: 1,
+			operationId: "op-1",
+		};
+		const scope = { principalId: "normal-user", chatId: "chat-1" };
+		mappings.setScoped(scope, { ...mapping, operationId: "bootstrap" });
+		mappings.beginOperationScoped(scope, { id: "op-1", kind: "prompt", detail: "request" });
+		mappings.completeOperationWithMappingScoped(scope, "op-1", "request", mapping, "turn");
+		const outbox = new InMemoryOutboxStore();
+		synthesizeProjectionRows(outbox, mappings, "owner-1", "owner-1");
+		mappings.retireScoped(scope);
+
+		const result = await reconcilePendingOperations(
+			outbox,
+			createProjectionOperationApplier(
+				mappings,
+				{
+					syncLinkedProject: async () => {},
+					syncPrincipalProjection: async () => {},
+				},
+				"owner-1",
+			),
+		);
+
+		expect(result.failed).toEqual([]);
+		expect(result.applied.map(operation => operation.kind)).toEqual(["session_mapping", "event"]);
+		expect(outbox.listPending()).toEqual([]);
 	});
 	test("synthesizes missing rows from completed durable mappings", () => {
 		const mappings = new SessionMappingStore();
@@ -377,8 +595,8 @@ describe("durable projection reconciliation", () => {
 		mappings.completeOperationWithMapping("chat-1", "op-1", "request", mapping, "turn");
 		const outbox = new InMemoryOutboxStore();
 
-		synthesizeProjectionRows(outbox, mappings, "user-1");
-		synthesizeProjectionRows(outbox, mappings, "user-1");
+		synthesizeProjectionRows(outbox, mappings, "user-1", "user-1");
+		synthesizeProjectionRows(outbox, mappings, "user-1", "user-1");
 
 		expect(outbox.listPending().map(row => row.operationId)).toEqual(["op-1", "op-1:event"]);
 	});
@@ -421,9 +639,12 @@ describe("durable projection reconciliation", () => {
 				protectedPaths: ["/tmp/a", "/tmp/b", "/tmp/c", "/tmp/d"],
 			});
 			const outbox = new InMemoryOutboxStore();
-			synthesizeProjectionRows(outbox, mappings, "user-1");
+			synthesizeProjectionRows(outbox, mappings, "user-1", "user-1");
 
-			const result = await reconcilePendingOperations(outbox, createProjectionOperationApplier(mappings, service));
+			const result = await reconcilePendingOperations(
+				outbox,
+				createProjectionOperationApplier(mappings, service, "user-1"),
+			);
 
 			expect(result.failed).toEqual([]);
 			expect(outbox.listPending()).toEqual([]);
@@ -452,9 +673,13 @@ describe("durable projection reconciliation", () => {
 
 		const result = await reconcilePendingOperations(
 			outbox,
-			createProjectionOperationApplier(mappings, {
-				syncLinkedProject: async () => undefined,
-			}),
+			createProjectionOperationApplier(
+				mappings,
+				{
+					syncLinkedProject: async () => undefined,
+				},
+				"user-1",
+			),
 		);
 
 		expect(result.applied).toEqual([]);

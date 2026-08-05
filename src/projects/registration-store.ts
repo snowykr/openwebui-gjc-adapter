@@ -203,8 +203,10 @@ export class SqliteProjectRegistrationStore {
 export async function auditProjectRegistrations(
 	store: SqliteProjectRegistrationStore,
 	protectedPaths: GjcRuntimeLocations["protectedProjectPaths"],
+	protectedProjectRoots: readonly string[] = [],
+	allowedSessionRoots: readonly string[] = [],
 ): Promise<void> {
-	await assertProjectsAdmitted(store.listProjects(), protectedPaths);
+	await assertProjectsAdmitted(store.listProjects(), protectedPaths, protectedProjectRoots, allowedSessionRoots);
 }
 
 function projectRegistrationSchema(): string {

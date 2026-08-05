@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SessionAuthority } from "../src/gjc/session-authority";
+import { canonicalSessionMappingKey, SessionAuthority } from "../src/gjc/session-authority";
 import { appendJournal } from "../src/gjc/session-operation-codec";
 import { FileBackedSessionMappingStore, type SessionMapping, SessionMappingStore } from "../src/gjc/session-router";
 
@@ -575,4 +575,189 @@ test("journal merge rejects cross-field collisions in either order", () => {
 	expect(() => appendJournal([operation], [{ ...operation, id: "other-id", ingressId: "operation-id" }])).toThrow(
 		"conflicts",
 	);
+});
+test("canonical session mapping keys preserve tuple boundaries", () => {
+	expect(canonicalSessionMappingKey("principal|one", "chat")).not.toBe(
+		canonicalSessionMappingKey("principal", "one|chat"),
+	);
+	expect(() => canonicalSessionMappingKey("", "chat")).toThrow("non-empty principal ID");
+});
+
+test("memory scoped mappings isolate same-chat principals and operations", () => {
+	const store = new SessionMappingStore();
+	const alice = { principalId: "alice", chatId: "shared-chat" };
+	const bob = { principalId: "bob", chatId: "shared-chat" };
+	const aliceMapping = {
+		...mapping(),
+		...alice,
+		sessionId: "alice-session",
+		operationId: "alice-initial",
+	};
+	const bobMapping = {
+		...mapping(),
+		...bob,
+		sessionId: "bob-session",
+		operationId: "bob-initial",
+	};
+
+	expect(store.setScoped(alice, aliceMapping)).toMatchObject(alice);
+	expect(store.setScoped(bob, bobMapping)).toMatchObject(bob);
+	expect(store.getScoped(alice)).toMatchObject({
+		principalId: "alice",
+		chatId: "shared-chat",
+		sessionId: "alice-session",
+	});
+	expect(store.getScoped(bob)).toMatchObject({
+		principalId: "bob",
+		chatId: "shared-chat",
+		sessionId: "bob-session",
+	});
+	expect(store.get("shared-chat")).toBeUndefined();
+
+	store.beginOperationScoped(alice, { id: "same-operation", kind: "prompt", detail: "alice" });
+	store.beginOperationScoped(bob, { id: "same-operation", kind: "prompt", detail: "bob" });
+	expect(store.operationScoped(alice, "same-operation")).toMatchObject({
+		id: "same-operation",
+		detail: "alice",
+	});
+	expect(store.operationScoped(bob, "same-operation")).toMatchObject({
+		id: "same-operation",
+		detail: "bob",
+	});
+	expect(store.operationsScoped(alice).some(operation => operation.detail === "alice")).toBe(true);
+	expect(store.operationsScoped(bob).some(operation => operation.detail === "bob")).toBe(true);
+});
+test("scoped cleanup enumerates and retires only the requested principal", () => {
+	for (const createHarness of [memoryHarness, fileHarness]) {
+		const harness = createHarness();
+		try {
+			const alice = { principalId: "alice", chatId: "shared-chat" };
+			const bob = { principalId: "bob", chatId: "shared-chat" };
+			harness.store.setScoped(alice, {
+				...mapping(),
+				...alice,
+				operationId: "initial-operation",
+			});
+			harness.store.setScoped(bob, {
+				...mapping(),
+				...bob,
+				operationId: "initial-operation",
+			});
+			expect(harness.store.entriesForPrincipal("alice")).toHaveLength(1);
+			expect(harness.store.entriesForPrincipal("bob")).toHaveLength(1);
+			harness.store.retireScoped(alice);
+			expect(harness.store.getScoped(alice)).toBeUndefined();
+			expect(harness.store.entriesForPrincipal("alice")).toEqual([]);
+			expect(harness.store.operationsScoped(alice)).toEqual([]);
+			expect(harness.store.operationScoped(alice, "initial-operation")).toBeUndefined();
+			expect(harness.store.getScoped(bob)).toMatchObject({ sessionId: "session-1" });
+			expect(harness.store.entriesForPrincipal("bob")).toHaveLength(1);
+			expect(() => harness.store.retireScoped(alice)).toThrow("already retired");
+			expect(() =>
+				harness.store.setScoped(alice, {
+					...mapping(),
+					...alice,
+					sessionId: "alice-resumed",
+					operationId: "alice-resumed",
+				}),
+			).toThrow("cannot be mutated");
+
+			const recovered = harness.recover();
+			expect(recovered.getScoped(alice)).toBeUndefined();
+			expect(recovered.operationScoped(alice, "initial-operation")).toBeUndefined();
+			expect(recovered.getScoped(bob)).toMatchObject({ sessionId: "session-1" });
+		} finally {
+			harness.cleanup();
+		}
+	}
+});
+test("principal enumeration isolates normal mappings and opts into legacy admin records", () => {
+	for (const createHarness of [memoryHarness, fileHarness]) {
+		const harness = createHarness();
+		try {
+			const projectId = "shared-project";
+			const adminScope = { principalId: "admin", chatId: "admin-scoped" };
+			const userScope = { principalId: "user", chatId: "user-scoped" };
+			harness.store.setScoped(adminScope, {
+				...mapping(),
+				...adminScope,
+				projectId,
+				operationId: "admin-scoped-operation",
+			});
+			harness.store.setScoped(userScope, {
+				...mapping(),
+				...userScope,
+				projectId,
+				operationId: "user-scoped-operation",
+			});
+			harness.store.set({
+				...mapping(),
+				chatId: "admin-legacy",
+				principalId: "admin",
+				projectId,
+				operationId: "admin-legacy-operation",
+			});
+			harness.store.set({
+				...mapping(),
+				chatId: "user-legacy",
+				principalId: "user",
+				projectId,
+				operationId: "user-legacy-operation",
+			});
+			harness.store.set({
+				...mapping(),
+				chatId: "legacy-unscoped",
+				projectId,
+				operationId: "legacy-unscoped-operation",
+			});
+
+			expect(harness.store.entriesForPrincipal("admin").map(entry => entry.chatId)).toEqual(["admin-scoped"]);
+			expect(
+				harness.store.entriesForPrincipal("admin", { includeLegacyAdmin: true }).map(entry => entry.chatId),
+			).toEqual(["admin-scoped", "admin-legacy", "legacy-unscoped"]);
+			expect(harness.store.entriesForPrincipal("user").map(entry => entry.chatId)).toEqual(["user-scoped"]);
+
+			const recovered = harness.recover();
+			expect(
+				recovered.entriesForPrincipal("admin", { includeLegacyAdmin: true }).map(entry => entry.chatId),
+			).toEqual(["admin-scoped", "admin-legacy", "legacy-unscoped"]);
+			expect(
+				recovered
+					.entriesForPrincipal("admin", { includeLegacyAdmin: true })
+					.every(entry => entry.projectId === projectId),
+			).toBe(true);
+		} finally {
+			harness.cleanup();
+		}
+	}
+});
+test("scoped lookups fall back to legacy mappings only for the configured admin", () => {
+	for (const createHarness of [memoryHarness, fileHarness]) {
+		const harness = createHarness();
+		try {
+			harness.store.set({
+				...mapping(),
+				chatId: "legacy-admin-chat",
+				operationId: "legacy-admin-operation",
+			});
+			harness.store.setLegacyAdminPrincipalId("admin-1");
+
+			expect(harness.store.getScoped({ principalId: "admin-1", chatId: "legacy-admin-chat" })).toMatchObject({
+				chatId: "legacy-admin-chat",
+				principalId: "admin-1",
+				operationId: "legacy-admin-operation",
+			});
+			expect(harness.store.getScoped({ principalId: "normal-1", chatId: "legacy-admin-chat" })).toBeUndefined();
+
+			harness.store.upsertScoped(
+				{ principalId: "admin-1", chatId: "legacy-admin-chat" },
+				{ ...mapping(), chatId: "legacy-admin-chat", operationId: "admin-scoped-operation" },
+			);
+			expect(harness.store.getScoped({ principalId: "admin-1", chatId: "legacy-admin-chat" })).toMatchObject({
+				operationId: "admin-scoped-operation",
+			});
+		} finally {
+			harness.cleanup();
+		}
+	}
 });

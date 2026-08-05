@@ -1,4 +1,5 @@
 import type { OutboxStore, ProjectionOperation } from "./outbox";
+import { ProjectionObsoleteError } from "./outbox-types";
 
 export type ProjectionOperationApplier = (operation: ProjectionOperation) => void | Promise<void>;
 
@@ -16,12 +17,20 @@ export async function reconcilePendingOperations(
 
 	recoverApplyingOperations(store);
 	for (const pendingOperation of store.listPending()) {
-		const applyingOperation = store.markApplying(pendingOperation.operationId);
+		const applyingOperation = store.markApplying(pendingOperation);
 		try {
 			await applier(applyingOperation);
-			applied.push(store.markApplied(applyingOperation.operationId));
+			applied.push(store.markApplied(applyingOperation));
 		} catch (error) {
-			failed.push(store.markFailed(applyingOperation.operationId, getErrorMessage(error)));
+			if (error instanceof ProjectionObsoleteError) {
+				// The projection target (project, chat, or mapping authority) no
+				// longer exists; settle the row so it is not retried forever.
+				applied.push(store.markApplied(applyingOperation));
+				continue;
+			}
+			const failedOperation = store.markFailed(applyingOperation, getErrorMessage(error));
+			failed.push(failedOperation);
+			store.markReconcile(failedOperation);
 		}
 	}
 
@@ -30,7 +39,7 @@ export async function reconcilePendingOperations(
 
 export function recoverApplyingOperations(store: OutboxStore): ProjectionOperation[] {
 	const applyingOperations = store.listApplying?.() ?? [];
-	return applyingOperations.map(operation => store.markReconcile(operation.operationId));
+	return applyingOperations.map(operation => store.markReconcile(operation));
 }
 
 function getErrorMessage(error: unknown): string {

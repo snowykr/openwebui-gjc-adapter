@@ -2,6 +2,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { DEFAULT_TURN_TIMEOUT_MS } from "../src/config";
+import { canonicalSessionMappingKey } from "../src/gjc/session-mapping-store";
 import type { OpenAIModelListResponse } from "../src/live/openai-types";
 import * as cli from "./cli-fixtures";
 import { RealSelectionCoordinator } from "./real-selection-coordinator";
@@ -193,7 +194,8 @@ export class RealSelectionHarness {
 
 	async removeModelBinding(chatId: string): Promise<void> {
 		const file = path.join(this.root, "sessions", "openwebui-session-mappings.json");
-		const document = parseMappingDocument(JSON.parse(await readFile(file, "utf8")), chatId);
+		const scopedChatId = canonicalSessionMappingKey("owner-selection", chatId);
+		const document = parseMappingDocument(JSON.parse(await readFile(file, "utf8")), scopedChatId);
 		await writeFile(file, JSON.stringify(document, null, 2), "utf8");
 	}
 	async removeOutboxOperations(chatId: string): Promise<void> {
@@ -256,7 +258,7 @@ export class RealSelectionHarness {
 	}
 
 	private authHeaders(): Headers {
-		return new Headers({ authorization: `Bearer ${this.token}` });
+		return new Headers({ authorization: `Bearer ${this.token}`, "X-OpenWebUI-User-Id": "owner-selection" });
 	}
 }
 

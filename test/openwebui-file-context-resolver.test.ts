@@ -22,6 +22,7 @@ describe("createOpenWebUIFileContextResolver", () => {
 
 		const resolved = await resolver({
 			reference: { id: "file-1", name: "direct.pdf", type: "application/pdf" },
+			ownerUserId: "user-1",
 			project: registeredProject(projectRoot),
 			chatId: "chat-1",
 			userMessageId: "user-1",
@@ -48,6 +49,7 @@ describe("createOpenWebUIFileContextResolver", () => {
 
 		const resolved = await resolver({
 			reference: { id: "missing-bytes", name: "direct.pdf", type: "application/pdf" },
+			ownerUserId: "user-1",
 			project: registeredProject(projectRoot),
 			chatId: "chat-1",
 			userMessageId: "user-1",
@@ -77,6 +79,7 @@ describe("createOpenWebUIFileContextResolver", () => {
 		await expect(
 			resolver({
 				reference: { id: "file-1", name: "direct.pdf", type: "application/pdf" },
+				ownerUserId: "user-1",
 				project: registeredProject(projectRoot),
 				chatId: "chat-1",
 				userMessageId: "user-1",

@@ -100,6 +100,7 @@ describe("live direct OpenWebUI attachments", () => {
 		expect(resolverInputs).toEqual([
 			{
 				reference: { id: "file-1", name: "uploaded.pdf", type: "application/pdf" },
+				ownerUserId: "owner-1",
 				project: projectWithFolder,
 				chatId: "chat-1",
 				userMessageId: "user-1",

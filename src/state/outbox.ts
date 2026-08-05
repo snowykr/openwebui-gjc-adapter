@@ -1,10 +1,13 @@
 import { createOperationId } from "./metadata";
 import {
 	assertSameEnqueueIdentity,
+	canonicalProjectionOperationKey,
 	copyOperation,
 	type EnqueueProjectionOperationInput,
+	normalizeProjectionPrincipalId,
 	type OutboxStore,
 	type ProjectionOperation,
+	type ProjectionOperationReference,
 	toTimestamp,
 } from "./outbox-types";
 
@@ -16,7 +19,13 @@ export type {
 	OutboxStore,
 	ProjectionOperation,
 	ProjectionOperationKind,
+	ProjectionOperationReference,
 	ProjectionOperationState,
+} from "./outbox-types";
+export {
+	canonicalProjectionOperationKey,
+	normalizeProjectionPrincipalId,
+	ProjectionObsoleteError,
 } from "./outbox-types";
 
 export class InMemoryOutboxStore implements OutboxStore {
@@ -24,15 +33,22 @@ export class InMemoryOutboxStore implements OutboxStore {
 
 	enqueue(input: EnqueueProjectionOperationInput): ProjectionOperation {
 		const operationId = input.operationId ?? createOperationId(`projection-${input.kind}`, input.now);
-		const existing = this.operations.get(operationId);
+		const principalId = normalizeProjectionPrincipalId(input.principalId);
+		const key = canonicalProjectionOperationKey(principalId, input.chatId, operationId);
+		const normalizedInput =
+			principalId === input.principalId
+				? input
+				: { ...input, ...(principalId === undefined ? {} : { principalId }) };
+		const existing = this.operations.get(key);
 		if (existing !== undefined) {
-			assertSameEnqueueIdentity(existing, input);
+			assertSameEnqueueIdentity(existing, normalizedInput);
 			return copyOperation(existing);
 		}
 
 		const timestamp = toTimestamp(input.now);
 		const operation: ProjectionOperation = {
 			operationId,
+			...(principalId === undefined ? {} : { principalId }),
 			ownerUserId: input.ownerUserId,
 			projectId: input.projectId,
 			chatId: input.chatId,
@@ -43,12 +59,12 @@ export class InMemoryOutboxStore implements OutboxStore {
 			createdAt: timestamp,
 			updatedAt: timestamp,
 		};
-		this.operations.set(operationId, operation);
+		this.operations.set(key, operation);
 		return copyOperation(operation);
 	}
 
-	markApplying(operationId: string, now?: Date): ProjectionOperation {
-		const operation = this.requireOperation(operationId);
+	markApplying(reference: ProjectionOperationReference, now?: Date): ProjectionOperation {
+		const operation = this.requireOperation(reference);
 		operation.state = "applying";
 		operation.attempts += 1;
 		operation.updatedAt = toTimestamp(now);
@@ -56,24 +72,24 @@ export class InMemoryOutboxStore implements OutboxStore {
 		return copyOperation(operation);
 	}
 
-	markApplied(operationId: string, now?: Date): ProjectionOperation {
-		const operation = this.requireOperation(operationId);
+	markApplied(reference: ProjectionOperationReference, now?: Date): ProjectionOperation {
+		const operation = this.requireOperation(reference);
 		operation.state = "applied";
 		operation.updatedAt = toTimestamp(now);
 		operation.lastError = undefined;
 		return copyOperation(operation);
 	}
 
-	markFailed(operationId: string, error: string, now?: Date): ProjectionOperation {
-		const operation = this.requireOperation(operationId);
+	markFailed(reference: ProjectionOperationReference, error: string, now?: Date): ProjectionOperation {
+		const operation = this.requireOperation(reference);
 		operation.state = "failed";
 		operation.updatedAt = toTimestamp(now);
 		operation.lastError = error;
 		return copyOperation(operation);
 	}
 
-	markReconcile(operationId: string, now?: Date): ProjectionOperation {
-		const operation = this.requireOperation(operationId);
+	markReconcile(reference: ProjectionOperationReference, now?: Date): ProjectionOperation {
+		const operation = this.requireOperation(reference);
 		operation.state = "reconcile";
 		operation.updatedAt = toTimestamp(now);
 		return copyOperation(operation);
@@ -91,16 +107,32 @@ export class InMemoryOutboxStore implements OutboxStore {
 			.map(copyOperation);
 	}
 
-	get(operationId: string): ProjectionOperation | undefined {
-		const operation = this.operations.get(operationId);
+	get(reference: ProjectionOperationReference): ProjectionOperation | undefined {
+		const key = this.resolveKey(reference);
+		if (key === undefined) return undefined;
+		const operation = this.operations.get(key);
 		return operation === undefined ? undefined : copyOperation(operation);
 	}
 
-	private requireOperation(operationId: string): ProjectionOperation {
-		const operation = this.operations.get(operationId);
+	private requireOperation(reference: ProjectionOperationReference): ProjectionOperation {
+		const key = this.resolveKey(reference);
+		const operation = key === undefined ? undefined : this.operations.get(key);
 		if (operation === undefined) {
+			const operationId = typeof reference === "string" ? reference : reference.operationId;
 			throw new Error(`Unknown projection operation: ${operationId}`);
 		}
 		return operation;
+	}
+
+	private resolveKey(reference: ProjectionOperationReference): string | undefined {
+		if (typeof reference !== "string") {
+			const principalId = normalizeProjectionPrincipalId(reference.principalId);
+			return canonicalProjectionOperationKey(principalId, reference.chatId, reference.operationId);
+		}
+		const matches = Array.from(this.operations.entries()).filter(
+			([, operation]) => operation.operationId === reference,
+		);
+		if (matches.length > 1) throw new Error(`Projection operation ID is ambiguous: ${reference}`);
+		return matches[0]?.[0];
 	}
 }

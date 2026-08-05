@@ -16,6 +16,7 @@ import type {
 	GjcTurnResult,
 } from "../src/gjc/turn-runner";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
+import { synthesizeProjectionRows } from "../src/live/workflow-gate-projection";
 import { InMemoryOutboxStore } from "../src/state/outbox";
 import {
 	decisionWorkflowGateEvent,
@@ -68,6 +69,55 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 			expectedSessionId: "session-1",
 			expectedCwd: project.cwd,
 		});
+	});
+	test("preserves the authenticated principal for workflow gate publication and replay after restart", async () => {
+		const root = mkdtempSync(join(tmpdir(), "gjc-workflow-gate-projection-"));
+		const mappingFile = join(root, "mappings.json");
+		const principalId = "normal-workflow-user";
+		const adminPrincipalId = "admin-1";
+		const seed = pendingGateMappings(deepInterviewWorkflowGateEvent);
+		const seedMapping = requiredMapping(seed);
+		const mappings = new FileBackedSessionMappingStore(mappingFile);
+		mappings.setScoped({ principalId, chatId: "chat-1" }, { ...seedMapping, principalId });
+		const turn = { ...replyInput("1"), ownerUserId: principalId };
+		const outbox = new InMemoryOutboxStore();
+		try {
+			const first = createGjcRoutingLiveGatewayRunner({
+				turnRunner: new FakeGjcTurnRunner(),
+				mappings,
+				outbox,
+				ownerUserId: adminPrincipalId,
+			});
+			await first.run(turn);
+			expect(outbox.listPending()).toMatchObject([
+				{ operationId: turn.userMessageId, principalId, ownerUserId: principalId },
+				{ operationId: `${turn.userMessageId}:event`, principalId, ownerUserId: principalId },
+			]);
+
+			const restartedMappings = new FileBackedSessionMappingStore(mappingFile);
+			const synthesized = new InMemoryOutboxStore();
+			synthesizeProjectionRows(synthesized, restartedMappings, adminPrincipalId, adminPrincipalId);
+			expect(synthesized.listPending()).toMatchObject([
+				{ operationId: turn.userMessageId, principalId, ownerUserId: principalId },
+				{ operationId: `${turn.userMessageId}:event`, principalId, ownerUserId: principalId },
+			]);
+
+			const replayRunner = new FakeGjcTurnRunner();
+			const replay = createGjcRoutingLiveGatewayRunner({
+				turnRunner: replayRunner,
+				mappings: restartedMappings,
+				outbox: synthesized,
+				ownerUserId: adminPrincipalId,
+			});
+			await replay.run(turn);
+			expect(synthesized.listPending()).toMatchObject([
+				{ operationId: turn.userMessageId, principalId, ownerUserId: principalId },
+				{ operationId: `${turn.userMessageId}:event`, principalId, ownerUserId: principalId },
+			]);
+			expect(replayRunner.gateResponses).toHaveLength(0);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 	test("streams resumed workflow gate events before completion", async () => {
 		const turnRunner = new FakeGjcTurnRunner();

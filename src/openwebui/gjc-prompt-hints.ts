@@ -12,7 +12,7 @@ const PROMPT_META = {
 	[OPENWEBUI_METADATA_NAMESPACE]: { prompt_hint: true },
 } as const;
 
-export const GJC_OPENWEBUI_PROMPT_HINTS: readonly OpenWebUIPromptHint[] = [
+export const GJC_LEGACY_PROJECT_ADMIN_PROMPT_HINTS: readonly OpenWebUIPromptHint[] = [
 	{
 		command: "gjc-project-link",
 		name: "GJC: Link project folder",
@@ -43,6 +43,9 @@ export const GJC_OPENWEBUI_PROMPT_HINTS: readonly OpenWebUIPromptHint[] = [
 			description: "Remove a project folder from OpenWebUI display without deleting local GJC history.",
 		},
 	},
+];
+
+export const GJC_OPENWEBUI_PROMPT_HINTS: readonly OpenWebUIPromptHint[] = [
 	{
 		command: "gjc-skill-deep-interview",
 		name: "GJC: Deep interview",
@@ -84,3 +87,19 @@ export const GJC_OPENWEBUI_PROMPT_HINTS: readonly OpenWebUIPromptHint[] = [
 		},
 	},
 ];
+
+export const GJC_OPENWEBUI_PROMPT_HINT_MARKER = "prompt_hint" as const;
+export const GJC_OPENWEBUI_PROMPT_HINT_INSTALLATION_ID_KEYS = ["installation_id", "installationId"] as const;
+
+export function isGjcProjectAdminPromptCommand(command: string): boolean {
+	return GJC_LEGACY_PROJECT_ADMIN_PROMPT_HINTS.some(hint => hint.command === command);
+}
+
+export function isCanonicalGjcProjectAdminPromptHint(
+	hint: Pick<OpenWebUIPromptHint, "command" | "name" | "content">,
+): boolean {
+	return GJC_LEGACY_PROJECT_ADMIN_PROMPT_HINTS.some(
+		canonical =>
+			canonical.command === hint.command && canonical.name === hint.name && canonical.content === hint.content,
+	);
+}

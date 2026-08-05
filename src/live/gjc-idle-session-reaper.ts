@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { SessionOperation } from "../gjc/session-authority";
 import {
 	closeIngressId,
@@ -5,12 +6,20 @@ import {
 	type SessionCloseResult,
 	type SessionMapping,
 } from "../gjc/session-router";
+import type { UserWorkspaceRegistry } from "../security/user-workspace";
+import type { WorkspaceLease, WorkspaceLeaseManager } from "../security/workspace-lease";
 import type { LiveGatewayRunner, LiveGatewayRunnerInput, LiveGatewayRunnerResult } from "./chat-completions";
+import { acquireWorkspaceAdmission } from "./chat-completions";
 
 export const DEFAULT_IDLE_SESSION_TIMEOUT_MS = 600_000;
+const DEFAULT_WORKSPACE_LEASE_DURATION_MS = 210_000;
+const REAPER_WORKSPACE_ADMISSION_QUEUE_LIMIT = 32;
 
-type MappingStore = Pick<import("../gjc/session-router").SessionMappingStore, "get" | "entries" | "operation"> & {
-	readonly operations?: (chatId: string) => readonly SessionOperation[];
+type MappingScope = Readonly<{ principalId: string; chatId: string }>;
+type MappingStore = Pick<import("../gjc/session-router").SessionMappingStore, "entries"> & {
+	readonly getScoped: (scope: MappingScope) => SessionMapping | undefined;
+	readonly operationScoped: (scope: MappingScope, operationId: string) => SessionOperation | undefined;
+	readonly operationsScoped: (scope: MappingScope) => readonly SessionOperation[];
 };
 type SessionCloser = (mapping: SessionMapping, ingress: SessionCloseIngress) => Promise<SessionCloseResult>;
 type IdleTimer = ReturnType<typeof setTimeout>;
@@ -27,6 +36,13 @@ export interface CreateGjcIdleSessionReaperInput {
 	readonly setTimeout?: TimerFactory;
 	readonly clearTimeout?: TimerClearer;
 	readonly discardSessionAttachment?: (cwd: string, sessionId: string) => void;
+	/** User workspace admission is required for non-admin principals. */
+	readonly workspaceRegistry?: Pick<UserWorkspaceRegistry, "open">;
+	/** User workspace fencing is required for non-admin principals. */
+	readonly workspaceLeaseManager?: Pick<WorkspaceLeaseManager, "acquire">;
+	readonly workspaceLeaseDurationMs?: number;
+	/** The configured OpenWebUI owner is an administrator and has no user workspace. */
+	readonly adminPrincipalId?: string;
 }
 
 export interface GjcIdleSessionReaper {
@@ -59,9 +75,10 @@ class IdleSessionReaper {
 	#stopped = false;
 	#baseStopped = false;
 	#stopPromise: Promise<void> | undefined;
-	#inFlightIdleCloses = new Set<Promise<void>>();
-	#inFlightNonIdleWork = new Set<Promise<void>>();
-	#handedOffStreams = new Set<() => Promise<void>>();
+	#inFlightIdleCloses = new Map<string, Set<Promise<void>>>();
+	#inFlightNonIdleWork = new Map<string, Set<Promise<void>>>();
+	#handedOffStreams = new Map<string, Set<() => Promise<void>>>();
+	readonly #workspaceGates = new Map<string, SerialGate>();
 
 	constructor(private readonly input: CreateGjcIdleSessionReaperInput) {
 		const timeoutMs = input.idleTimeoutMs ?? DEFAULT_IDLE_SESSION_TIMEOUT_MS;
@@ -86,12 +103,18 @@ class IdleSessionReaper {
 			this.#timer = undefined;
 		}
 		while (
-			this.#inFlightIdleCloses.size > 0 ||
-			this.#inFlightNonIdleWork.size > 0 ||
-			this.#handedOffStreams.size > 0
+			trackedCount(this.#inFlightIdleCloses) > 0 ||
+			trackedCount(this.#inFlightNonIdleWork) > 0 ||
+			trackedCount(this.#handedOffStreams) > 0
 		) {
-			const abandonment = [...this.#handedOffStreams].map(stream => Promise.resolve().then(stream));
-			await Promise.allSettled([...this.#inFlightIdleCloses, ...this.#inFlightNonIdleWork, ...abandonment]);
+			const abandonment = [...this.#handedOffStreams.values()].flatMap(streams =>
+				[...streams].map(stream => Promise.resolve().then(stream)),
+			);
+			await Promise.allSettled([
+				...trackedPromises(this.#inFlightIdleCloses),
+				...trackedPromises(this.#inFlightNonIdleWork),
+				...abandonment,
+			]);
 		}
 		if (this.#baseStopped) return;
 		this.#baseStopped = true;
@@ -99,8 +122,10 @@ class IdleSessionReaper {
 	}
 	private async closeExternal(mapping: SessionMapping, ingress: SessionCloseIngress): Promise<SessionCloseResult> {
 		if (this.#stopped) throw new Error("GJC idle session reaper is stopped.");
-		const state = this.stateFor(mapping.chatId);
-		const settleWork = this.trackNonIdleWork();
+		const principalId = principalIdForMapping(mapping);
+		if (principalId === undefined) throw new Error("GJC close requires an explicit principal owner.");
+		const state = this.stateFor(principalId, mapping.chatId);
+		const settleWork = this.trackNonIdleWork(state);
 		state.active += 1;
 		let release: (() => void) | undefined;
 		let closeAttempted = false;
@@ -109,49 +134,62 @@ class IdleSessionReaper {
 		try {
 			release = await state.gate.acquire();
 			if (this.#stopped) throw new Error("GJC idle session reaper is stopped.");
-			const current = this.input.mappings.get(mapping.chatId);
-			if (current === undefined || mappingGeneration(current) !== mappingGeneration(mapping))
-				throw new Error(`GJC close mapping for chat ${mapping.chatId} is stale.`);
-			attemptedMapping = current;
-			const generation = mappingGeneration(current);
-			const pendingOperation = this.input.mappings
-				.operations?.(current.chatId)
-				?.find(operation => operation.state === "pending");
-			if (pendingOperation !== undefined)
-				return { status: "unavailable", message: "GJC close is deferred while a session operation is pending." };
-			const currentOperation = this.input.mappings.operation(current.chatId, current.operationId);
-			if (currentOperation !== undefined && currentOperation.state !== "complete")
-				return {
-					status: "unavailable",
-					message: "GJC close is deferred until the current session operation completes.",
-				};
-			if (state.generation === generation && state.closed) return { status: "closed" };
-			if (
-				!state.rearmAfterActivity &&
-				this.closeOperations(current, state).some(operation => operation.state === "complete")
-			) {
-				state.mapping = current;
-				state.generation = generation;
-				state.rearmAfterActivity = false;
-				state.closed = true;
-				return { status: "closed" };
-			}
-			state.closeInFlight = true;
-			const closeIngress = this.rearmedCloseIngress(current, ingress, state);
-			closeAttempted = true;
-			attemptedIngressId = closeIngress.ingressId;
-			const result = await this.input.closeSession(current, closeIngress);
-			if (result.status === "closed") {
-				const proof = current.attachment;
-				if (proof?.expectedCwd !== undefined)
-					this.input.discardSessionAttachment?.(proof.expectedCwd, current.sessionId);
-				state.mapping = current;
-				state.generation = generation;
-				state.closed = true;
-			} else {
-				state.idleIneligible = state.idleIneligible || !isReaperCloseIngress(current, closeIngress.ingressId);
-				state.lastActivityAt = this.#now();
-			}
+			const result = await this.withWorkspaceLease(
+				principalId,
+				"close",
+				async (assertFence): Promise<SessionCloseResult> => {
+					if (this.#stopped) throw new Error("GJC idle session reaper is stopped.");
+					const current = this.mappingFor(principalId, mapping.chatId);
+					if (current === undefined || mappingGeneration(current) !== mappingGeneration(mapping))
+						throw new Error(`GJC close mapping for chat ${mapping.chatId} is stale.`);
+					attemptedMapping = current;
+					const generation = mappingGeneration(current);
+					const pendingOperation = this.operationsFor(principalId, current.chatId)?.find(
+						operation => operation.state === "pending",
+					);
+					if (pendingOperation !== undefined)
+						return {
+							status: "unavailable",
+							message: "GJC close is deferred while a session operation is pending.",
+						};
+					const currentOperation = this.operationFor(principalId, current.chatId, current.operationId);
+					if (currentOperation !== undefined && currentOperation.state !== "complete")
+						return {
+							status: "unavailable",
+							message: "GJC close is deferred until the current session operation completes.",
+						};
+					if (state.generation === generation && state.closed) return { status: "closed" };
+					if (
+						!state.rearmAfterActivity &&
+						this.closeOperations(current, state).some(operation => operation.state === "complete")
+					) {
+						state.mapping = current;
+						state.generation = generation;
+						state.rearmAfterActivity = false;
+						state.closed = true;
+						return { status: "closed" };
+					}
+					await assertFence();
+					state.closeInFlight = true;
+					const closeIngress = this.rearmedCloseIngress(current, ingress, state);
+					closeAttempted = true;
+					attemptedIngressId = closeIngress.ingressId;
+					const result = await this.input.closeSession(current, closeIngress);
+					if (result.status === "closed") {
+						await assertFence();
+						const proof = current.attachment;
+						if (proof?.expectedCwd !== undefined)
+							this.input.discardSessionAttachment?.(proof.expectedCwd, current.sessionId);
+						state.mapping = current;
+						state.generation = generation;
+						state.closed = true;
+					} else {
+						state.idleIneligible = state.idleIneligible || !isReaperCloseIngress(current, closeIngress.ingressId);
+						state.lastActivityAt = this.#now();
+					}
+					return result;
+				},
+			);
 			return result;
 		} catch (error) {
 			if (
@@ -173,8 +211,10 @@ class IdleSessionReaper {
 
 	private async run(turn: LiveGatewayRunnerInput): Promise<LiveGatewayRunnerResult> {
 		if (this.#stopped) throw new Error("GJC idle session reaper is stopped.");
-		const state = this.stateFor(turn.chatId);
-		const settleWork = this.trackNonIdleWork();
+		const principalId = principalIdForTurn(turn);
+		if (principalId === undefined) throw new Error("GJC turn requires an explicit principal owner.");
+		const state = this.stateFor(principalId, turn.chatId);
+		const settleWork = this.trackNonIdleWork(state);
 		state.active += 1;
 		this.schedule();
 		let release: (() => void) | undefined;
@@ -185,7 +225,7 @@ class IdleSessionReaper {
 			if (finalized) return;
 			finalized = true;
 			state.active -= 1;
-			if (streamAbandonment !== undefined) this.#handedOffStreams.delete(streamAbandonment);
+			if (streamAbandonment !== undefined) this.deleteHandedOffStream(state, streamAbandonment);
 			if (outcome === "turn" || outcome === "control") this.markTurnCompleted(state);
 			else this.deferAfterFailure(state);
 			release?.();
@@ -219,7 +259,7 @@ class IdleSessionReaper {
 					return abandonment;
 				};
 				streamAbandonment = abandon;
-				this.#handedOffStreams.add(abandon);
+				this.addHandedOffStream(state, abandon);
 				const wrapped = { ...result, chunks, abandon };
 				handedOff = true;
 				return wrapped;
@@ -239,25 +279,52 @@ class IdleSessionReaper {
 	): TrackedChunks {
 		return new TrackedChunks(source, onComplete, onFailure);
 	}
-	private trackNonIdleWork(): () => void {
+	private trackNonIdleWork(state: ChatState): () => void {
 		let resolve!: () => void;
 		let settled = false;
 		const work = new Promise<void>(completion => {
 			resolve = completion;
 		});
-		this.#inFlightNonIdleWork.add(work);
+		const tracked = this.#inFlightNonIdleWork.get(state.key) ?? new Set<Promise<void>>();
+		tracked.add(work);
+		this.#inFlightNonIdleWork.set(state.key, tracked);
 		return () => {
 			if (settled) return;
 			settled = true;
-			this.#inFlightNonIdleWork.delete(work);
+			tracked.delete(work);
+			if (tracked.size === 0) this.#inFlightNonIdleWork.delete(state.key);
 			resolve();
 		};
 	}
-
-	private stateFor(chatId: string): ChatState {
-		const existing = this.#states.get(chatId);
+	private addHandedOffStream(state: ChatState, stream: () => Promise<void>): void {
+		const tracked = this.#handedOffStreams.get(state.key) ?? new Set<() => Promise<void>>();
+		tracked.add(stream);
+		this.#handedOffStreams.set(state.key, tracked);
+	}
+	private deleteHandedOffStream(state: ChatState, stream: () => Promise<void>): void {
+		const tracked = this.#handedOffStreams.get(state.key);
+		if (tracked === undefined) return;
+		tracked.delete(stream);
+		if (tracked.size === 0) this.#handedOffStreams.delete(state.key);
+	}
+	private mappingFor(principalId: string, chatId: string): SessionMapping | undefined {
+		const mapping = this.input.mappings.getScoped({ principalId, chatId });
+		if (mapping === undefined) return undefined;
+		return principalIdForMapping(mapping) === principalId ? mapping : undefined;
+	}
+	private operationFor(principalId: string, chatId: string, operationId: string): SessionOperation | undefined {
+		return this.input.mappings.operationScoped({ principalId, chatId }, operationId);
+	}
+	private operationsFor(principalId: string, chatId: string): readonly SessionOperation[] {
+		return this.input.mappings.operationsScoped({ principalId, chatId });
+	}
+	private stateFor(principalId: string, chatId: string): ChatState {
+		const key = stateKey(principalId, chatId);
+		const existing = this.#states.get(key);
 		if (existing !== undefined) return existing;
 		const state: ChatState = {
+			key,
+			principalId,
 			chatId,
 			mapping: undefined,
 			generation: undefined,
@@ -272,12 +339,19 @@ class IdleSessionReaper {
 			closeInFlight: false,
 			gate: new SerialGate(),
 		};
-		this.#states.set(chatId, state);
+		this.#states.set(key, state);
 		return state;
+	}
+	private workspaceGateFor(principalId: string): SerialGate {
+		const existing = this.#workspaceGates.get(principalId);
+		if (existing !== undefined) return existing;
+		const gate = new SerialGate();
+		this.#workspaceGates.set(principalId, gate);
+		return gate;
 	}
 
 	private markTurnCompleted(state: ChatState): void {
-		const current = this.input.mappings.get(state.chatId);
+		const current = this.mappingFor(state.principalId, state.chatId);
 		if (current === undefined) return;
 		const generation = mappingGeneration(current);
 		const rearm = state.rearmAfterActivity || (state.closed && state.generation === generation);
@@ -294,7 +368,7 @@ class IdleSessionReaper {
 	}
 
 	private deferAfterFailure(state: ChatState): void {
-		const current = this.input.mappings.get(state.chatId);
+		const current = this.mappingFor(state.principalId, state.chatId);
 		if (current === undefined) return;
 		const generation = mappingGeneration(current);
 		const rearm = state.rearmAfterActivity || (state.closed && state.generation === generation);
@@ -311,22 +385,30 @@ class IdleSessionReaper {
 	}
 
 	private refreshMappings(): void {
-		for (const mapping of this.input.mappings.entries()) {
-			if (!hasOwnedPaneAttachment(mapping.attachment)) continue;
-			const operations = this.input.mappings.operations?.(mapping.chatId);
-			const currentOperation = this.input.mappings.operation(mapping.chatId, mapping.operationId);
+		for (const rawMapping of this.input.mappings.entries()) {
+			if (!hasOwnedPaneAttachment(rawMapping.attachment)) continue;
+			const principalId = principalIdForMapping(rawMapping) ?? normalizePrincipalId(this.input.adminPrincipalId);
+			if (principalId === undefined) continue;
+			// Legacy admin rows are intentionally unscoped; bind the configured
+			// admin so upgraded sessions enter idle tracking and can be closed.
+			const mapping = rawMapping.principalId === undefined ? { ...rawMapping, principalId } : rawMapping;
+			const operations = this.operationsFor(principalId, mapping.chatId);
+			const currentOperation = this.operationFor(principalId, mapping.chatId, mapping.operationId);
 			const journal = operations ?? (currentOperation === undefined ? [] : [currentOperation]);
 			const closeOperations = this.closeOperations(mapping);
 			const manualClosePending = hasPendingManualClose(mapping, journal, currentOperation);
 			const alreadyClosed = closeOperations.some(operation => operation.state === "complete");
 			const generation = mappingGeneration(mapping);
-			const state = this.#states.get(mapping.chatId);
+			const key = stateKey(principalId, mapping.chatId);
+			const state = this.#states.get(key);
 			const activityAt =
 				mappingActivityAt(mapping, journal) ??
 				(state?.generation === generation ? state.lastActivityAt : this.#now());
 			const rearmAfterActivity = activityFollowsCompletedClose(mapping, journal, closeOperations);
 			if (state === undefined) {
-				this.#states.set(mapping.chatId, {
+				this.#states.set(key, {
+					key,
+					principalId,
 					chatId: mapping.chatId,
 					mapping,
 					generation,
@@ -426,11 +508,19 @@ class IdleSessionReaper {
 	}
 	private trackIdleClose(state: ChatState): void {
 		const close = this.attemptClose(state);
-		this.#inFlightIdleCloses.add(close);
+		const tracked = this.#inFlightIdleCloses.get(state.key) ?? new Set<Promise<void>>();
+		tracked.add(close);
+		this.#inFlightIdleCloses.set(state.key, tracked);
 		void close.then(
-			() => this.#inFlightIdleCloses.delete(close),
-			() => this.#inFlightIdleCloses.delete(close),
+			() => this.deleteIdleClose(state, close),
+			() => this.deleteIdleClose(state, close),
 		);
+	}
+	private deleteIdleClose(state: ChatState, close: Promise<void>): void {
+		const tracked = this.#inFlightIdleCloses.get(state.key);
+		if (tracked === undefined) return;
+		tracked.delete(close);
+		if (tracked.size === 0) this.#inFlightIdleCloses.delete(state.key);
 	}
 
 	private async attemptClose(state: ChatState): Promise<void> {
@@ -438,87 +528,177 @@ class IdleSessionReaper {
 		try {
 			state.closeQueued = false;
 			if (this.#stopped || state.closed || state.idleIneligible || state.active > 0) return;
-			const current = this.input.mappings.get(state.chatId);
-			if (current === undefined) {
-				state.closed = true;
-				return;
-			}
-			const generation = mappingGeneration(current);
-			if (state.generation !== generation) {
-				this.adoptCurrentMapping(state, current);
-				return;
-			}
-			if (!hasOwnedPaneAttachment(current.attachment)) {
-				state.idleIneligible = true;
-				return;
-			}
-			const pendingOperation = this.input.mappings
-				.operations?.(current.chatId)
-				?.find(operation => operation.state === "pending");
-			if (pendingOperation !== undefined) {
-				state.lastActivityAt = this.#now();
-				return;
-			}
-			const closeOperations = this.closeOperations(current, state);
-			if (closeOperations.some(operation => operation.state === "complete") && !state.rearmAfterActivity) {
-				state.closed = true;
-				return;
-			}
-			if (closeOperations.some(operation => operation.state === "pending")) {
-				state.lastActivityAt = this.#now();
-				return;
-			}
-			const operation = this.input.mappings.operation(current.chatId, current.operationId);
-			if (operation !== undefined && operation.state !== "complete") {
-				state.lastActivityAt = this.#now();
-				return;
-			}
-			if (state.lastActivityAt + this.#timeoutMs > this.#now()) return;
-			state.closeInFlight = true;
 			try {
-				const ingress = this.nextCloseIngress(current, state);
-				const result = await this.input.closeSession(current, ingress);
-				if (result.status !== "closed") {
-					state.lastActivityAt = this.#now();
-					return;
-				}
-				const proof = current.attachment;
-				if (proof?.expectedCwd !== undefined)
-					this.input.discardSessionAttachment?.(proof.expectedCwd, current.sessionId);
-				state.closed = true;
-				state.rearmAfterActivity = false;
-				state.mapping = current;
+				await this.withWorkspaceLease(state.principalId, "reaper", async assertFence => {
+					if (this.#stopped || state.closed || state.idleIneligible || state.active > 0) return;
+					const current = this.mappingFor(state.principalId, state.chatId);
+					if (current === undefined) {
+						state.closed = true;
+						return;
+					}
+					const generation = mappingGeneration(current);
+					if (state.generation !== generation) {
+						this.adoptCurrentMapping(state, current);
+						return;
+					}
+					if (!hasOwnedPaneAttachment(current.attachment)) {
+						state.idleIneligible = true;
+						return;
+					}
+					const pendingOperation = this.operationsFor(state.principalId, current.chatId)?.find(
+						operation => operation.state === "pending",
+					);
+					if (pendingOperation !== undefined) {
+						state.lastActivityAt = this.#now();
+						return;
+					}
+					const closeOperations = this.closeOperations(current, state);
+					if (closeOperations.some(operation => operation.state === "complete") && !state.rearmAfterActivity) {
+						state.closed = true;
+						return;
+					}
+					if (closeOperations.some(operation => operation.state === "pending")) {
+						state.lastActivityAt = this.#now();
+						return;
+					}
+					const operation = this.operationFor(state.principalId, current.chatId, current.operationId);
+					if (operation !== undefined && operation.state !== "complete") {
+						state.lastActivityAt = this.#now();
+						return;
+					}
+					if (state.lastActivityAt + this.#timeoutMs > this.#now()) return;
+					await assertFence();
+					state.closeInFlight = true;
+					try {
+						const ingress = this.nextCloseIngress(current, state);
+						const result = await this.input.closeSession(current, ingress);
+						if (result.status !== "closed") {
+							state.lastActivityAt = this.#now();
+							return;
+						}
+						await assertFence();
+						const proof = current.attachment;
+						if (proof?.expectedCwd !== undefined)
+							this.input.discardSessionAttachment?.(proof.expectedCwd, current.sessionId);
+						state.closed = true;
+						state.rearmAfterActivity = false;
+						state.mapping = current;
+					} finally {
+						state.closeInFlight = false;
+					}
+				});
 			} catch {
 				state.lastActivityAt = this.#now();
-			} finally {
-				state.closeInFlight = false;
 			}
 		} finally {
 			release();
 			this.schedule();
 		}
 	}
+	private async withWorkspaceLease<T>(
+		principalId: string,
+		operation: "close" | "reaper",
+		work: (assertFence: () => Promise<void>) => Promise<T>,
+	): Promise<T> {
+		const adminPrincipalId = normalizePrincipalId(this.input.adminPrincipalId);
+		if (adminPrincipalId !== undefined && principalId === adminPrincipalId)
+			return work(async () => {
+				// Configured administrator sessions intentionally do not have a user workspace lease.
+			});
+		const releaseWorkspaceGate = await this.workspaceGateFor(principalId).acquire();
+		let releaseAdmission: (() => void) | undefined;
+		try {
+			const registry = this.input.workspaceRegistry;
+			const leaseManager = this.input.workspaceLeaseManager;
+			if (registry === undefined || leaseManager === undefined) throw new WorkspaceLeaseUncertainError();
+			const durationMs = this.input.workspaceLeaseDurationMs ?? DEFAULT_WORKSPACE_LEASE_DURATION_MS;
+			if (!Number.isSafeInteger(durationMs) || durationMs <= 0) throw new WorkspaceLeaseUncertainError();
+			let safeKey: string;
+			try {
+				const workspace = await registry.open(principalId);
+				if (
+					workspace === undefined ||
+					normalizePrincipalId(workspace.userId) !== principalId ||
+					normalizePrincipalId(workspace.safeKey) === undefined
+				)
+					throw new Error("Workspace identity could not be verified.");
+				safeKey = workspace.safeKey;
+			} catch {
+				throw new WorkspaceLeaseUncertainError();
+			}
+			// Join the same workspace admission queue as chat/model requests so an
+			// admitted completion waits behind a close/reap (and vice versa)
+			// instead of losing the durable-lease race.
+			try {
+				releaseAdmission = await acquireWorkspaceAdmission(
+					leaseManager,
+					safeKey,
+					durationMs,
+					REAPER_WORKSPACE_ADMISSION_QUEUE_LIMIT,
+				);
+			} catch {
+				throw new WorkspaceLeaseUncertainError();
+			}
+			let lease: WorkspaceLease;
+			try {
+				lease = await leaseManager.acquire({
+					safeKey,
+					holderId: `gjc-${operation}-${process.pid}-${randomUUID()}`,
+					operation,
+					leaseMs: durationMs,
+				});
+				if (lease === undefined) throw new Error("Workspace lease was not returned.");
+			} catch {
+				throw new WorkspaceLeaseUncertainError();
+			}
+			const assertFence = async (): Promise<void> => {
+				try {
+					await lease.assertFence();
+				} catch {
+					throw new WorkspaceLeaseUncertainError();
+				}
+			};
+			let failed = false;
+			let workError: unknown;
+			let result!: T;
+			try {
+				await assertFence();
+				result = await work(assertFence);
+			} catch (error) {
+				failed = true;
+				workError = error;
+			}
+			let releaseFailed = false;
+			try {
+				await lease.release();
+			} catch {
+				releaseFailed = true;
+			}
+			if (releaseFailed) {
+				const uncertainty = new WorkspaceLeaseUncertainError();
+				if (failed) throw new AggregateError([workError, uncertainty], "Workspace lease finalization failed.");
+				throw uncertainty;
+			}
+			if (failed) throw workError;
+			return result;
+		} finally {
+			releaseAdmission?.();
+			releaseWorkspaceGate();
+		}
+	}
 
-	private closeOperations(mapping: SessionMapping, state?: ChatState): readonly SessionOperation[] {
+	private closeOperations(mapping: SessionMapping, _state?: ChatState): readonly SessionOperation[] {
+		const principalId = principalIdForMapping(mapping);
+		if (principalId === undefined) return [];
 		const prefix = closeIngressId(mapping.operationId, mapping);
-		const persisted = this.input.mappings.operations?.(mapping.chatId);
-		if (persisted !== undefined) {
-			const currentOperation = this.input.mappings.operation(mapping.chatId, mapping.operationId);
-			return persisted.filter(
-				operation =>
-					operation.kind === "close" &&
-					(operationResultMatchesMapping(operation, mapping, currentOperation, persisted) ||
-						(operation.state !== "complete" && closeOperationIndex(operation, prefix) >= 0)),
-			);
-		}
-		const operations: SessionOperation[] = [];
-		const maxAttempt = state?.closeAttempt ?? 0;
-		for (let attempt = 0; attempt <= maxAttempt; attempt++) {
-			const ingressId = closeIngressIdForAttempt(prefix, attempt);
-			const operation = this.input.mappings.operation(mapping.chatId, ingressId);
-			if (operation !== undefined && operation.kind === "close") operations.push(operation);
-		}
-		return operations;
+		const persisted = this.operationsFor(principalId, mapping.chatId);
+		const currentOperation = this.operationFor(principalId, mapping.chatId, mapping.operationId);
+		return persisted.filter(
+			operation =>
+				operation.kind === "close" &&
+				(operationResultMatchesMapping(operation, mapping, currentOperation, persisted) ||
+					(operation.state !== "complete" && closeOperationIndex(operation, prefix) >= 0)),
+		);
 	}
 
 	private nextCloseIngress(mapping: SessionMapping, state: ChatState): SessionCloseIngress {
@@ -537,11 +717,10 @@ class IdleSessionReaper {
 		ingress: SessionCloseIngress,
 		state: ChatState,
 	): SessionCloseIngress {
-		const prior = this.input.mappings.operation(mapping.chatId, ingress.ingressId);
+		const prior = this.operationFor(state.principalId, mapping.chatId, ingress.ingressId);
 		if (!state.rearmAfterActivity || prior?.kind !== "close" || prior.state !== "complete") return ingress;
 		const prefix = `${ingress.ingressId}:rearmed:${mapping.operationId}:`;
-		const attempts = this.input.mappings
-			.operations?.(mapping.chatId)
+		const attempts = this.operationsFor(state.principalId, mapping.chatId)
 			?.map(operation => rearmedIngressAttempt(operation, prefix))
 			.filter((attempt): attempt is number => attempt !== undefined);
 		const attempt = attempts === undefined ? state.rearmAttempt + 1 : Math.max(0, ...attempts) + 1;
@@ -560,8 +739,14 @@ class IdleSessionReaper {
 		state.closeAttempt = 0;
 		state.rearmAttempt = 0;
 		state.closed = false;
-		const operation = this.input.mappings.operation(mapping.chatId, mapping.operationId);
+		const operation = this.operationFor(state.principalId, mapping.chatId, mapping.operationId);
 		state.lastActivityAt = operationCompletedAt(operation) ?? this.#now();
+	}
+}
+class WorkspaceLeaseUncertainError extends Error {
+	constructor() {
+		super("Workspace lease admission is uncertain.");
+		this.name = "WorkspaceLeaseUncertainError";
 	}
 }
 function hasPendingManualClose(
@@ -657,7 +842,33 @@ function rearmedIngressAttempt(operation: SessionOperation, prefix: string): num
 	return Number.isInteger(attempt) && attempt > 0 ? attempt : undefined;
 }
 
+function trackedCount<T>(tracked: ReadonlyMap<string, ReadonlySet<T>>): number {
+	let count = 0;
+	for (const values of tracked.values()) count += values.size;
+	return count;
+}
+function trackedPromises<T>(tracked: ReadonlyMap<string, ReadonlySet<T>>): T[] {
+	const values: T[] = [];
+	for (const entries of tracked.values()) values.push(...entries);
+	return values;
+}
+function stateKey(principalId: string, chatId: string): string {
+	return JSON.stringify([principalId, chatId]);
+}
+function principalIdForMapping(mapping: SessionMapping): string | undefined {
+	return normalizePrincipalId(mapping.principalId);
+}
+function principalIdForTurn(turn: LiveGatewayRunnerInput): string | undefined {
+	return normalizePrincipalId(turn.ownerUserId);
+}
+function normalizePrincipalId(value: string | undefined): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const trimmed = value.trim();
+	return trimmed.length === 0 ? undefined : trimmed;
+}
 interface ChatState {
+	readonly key: string;
+	readonly principalId: string;
 	readonly chatId: string;
 	readonly gate: SerialGate;
 	mapping: SessionMapping | undefined;

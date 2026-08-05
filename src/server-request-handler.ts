@@ -13,6 +13,7 @@ import {
 	handleOpenAIModelsRequest,
 	jsonResponse,
 } from "./live/openai-routes";
+import { isOpenWebUIAdmin, type OpenWebUIPrincipal, resolveForwardedPrincipal } from "./openwebui/auth";
 import {
 	handleProjectLinkRequest,
 	handleProjectListRequest,
@@ -21,6 +22,11 @@ import {
 	parseProjectAdminJsonRequest,
 	projectIdFromUnlinkPath,
 } from "./projects/admin-routes";
+import {
+	previewWorkspaceCleanup,
+	runWorkspaceCleanup,
+	workspaceCleanupPath,
+} from "./projects/workspace-cleanup-routes";
 import { type AdapterRuntimeConfig, createRuntimeReadinessReconciler } from "./server-runtime-readiness";
 
 export type AdapterRequestHandlerOptions = {
@@ -46,6 +52,7 @@ export function createAdapterRequestHandler(
 	return async request => {
 		const url = new URL(request.url);
 		if (url.pathname === "/v1" || url.pathname.startsWith("/v1/")) {
+			const providerAuthenticated = isProviderAuthenticated(request, routes, runtime);
 			const authError = authenticateProviderRequest(request, routes, runtime);
 			if (authError !== undefined) return authError;
 			if (runtime !== undefined) {
@@ -56,6 +63,11 @@ export function createAdapterRequestHandler(
 						{ status: 503 },
 					);
 			}
+			if (routes !== undefined && providerAuthenticated && isCatalogOnlyModelsRequest(request, url))
+				return handleOpenAIModelsRequest(routes, undefined, { catalogOnly: true });
+			const principal = resolveRequestPrincipal(request, routes);
+			if (principal instanceof Response) return principal;
+			return dispatchProviderRequest(request, url, routes, principal);
 		}
 		if (request.method === "GET" && url.pathname === "/healthz") {
 			const report = buildHealthReport(checks);
@@ -67,15 +79,6 @@ export function createAdapterRequestHandler(
 			const report = buildReadinessReport(runtimeReadiness);
 			return jsonResponse(report, { status: report.status === "ready" ? 200 : 503 });
 		}
-		const closeChatId = request.method === "POST" ? chatIdFromClosePath(url.pathname) : undefined;
-		if (routes !== undefined && closeChatId !== undefined) {
-			const operationId = await closeOperationId(request);
-			return operationId instanceof Response
-				? operationId
-				: handleOpenAIChatCloseRequest(closeChatId, operationId, routes);
-		}
-		if (routes !== undefined && request.method === "GET" && url.pathname === "/v1/models")
-			return handleOpenAIModelsRequest(routes);
 		if (routes?.projectLinkService !== undefined && request.method === "GET" && url.pathname === "/admin/projects")
 			return projectList(request, routes);
 		if (
@@ -86,33 +89,120 @@ export function createAdapterRequestHandler(
 			return projectLink(request, routes);
 		if (routes?.projectLinkService !== undefined && request.method === "POST" && isProjectUnlinkPath(url.pathname))
 			return projectUnlink(request, url.pathname, routes);
-		if (routes !== undefined && request.method === "POST" && url.pathname === "/v1/chat/completions")
-			return handleOpenAIChatCompletionsRequest(request, routes);
+		const cleanupPath =
+			routes?.workspaceCleanupService === undefined ? undefined : workspaceCleanupPath(url.pathname);
+		if (cleanupPath !== undefined) {
+			const principal = requireAdminPrincipal(request, routes!);
+			if (principal instanceof Response) return principal;
+			if (cleanupPath.operation === "preview" && request.method === "POST") {
+				const result = await previewWorkspaceCleanup(routes!.workspaceCleanupService!, cleanupPath.userId);
+				return jsonResponse(result.body, { status: result.status });
+			}
+			if (cleanupPath.operation === "cleanup" && request.method === "POST") {
+				const result = await runWorkspaceCleanup(routes!.workspaceCleanupService!, cleanupPath.userId, request);
+				return jsonResponse(result.body, { status: result.status });
+			}
+		}
 		return jsonResponse({ error: "not_found" }, { status: 404 });
 	};
 }
 
 async function projectList(request: Request, routes: AdapterRouteDependencies): Promise<Response> {
-	const error = authenticateAdapterRequest(request, routes.adapterApiToken, routes.requireAdapterApiToken);
-	if (error !== undefined) return error;
+	const principal = requireAdminPrincipal(request, routes);
+	if (principal instanceof Response) return principal;
 	const result = await handleProjectListRequest(routes.projectLinkService!);
 	return jsonResponse(result.body, { status: result.status });
 }
 async function projectLink(request: Request, routes: AdapterRouteDependencies): Promise<Response> {
-	const error = authenticateAdapterRequest(request, routes.adapterApiToken, routes.requireAdapterApiToken);
-	if (error !== undefined) return error;
+	const principal = requireAdminPrincipal(request, routes);
+	if (principal instanceof Response) return principal;
 	const body = await parseProjectAdminJsonRequest(request);
 	if (!body.ok) return jsonResponse(body.result.body, { status: body.result.status });
 	const result = await handleProjectLinkRequest(routes.projectLinkService!, body.value);
 	return jsonResponse(result.body, { status: result.status });
 }
 async function projectUnlink(request: Request, pathname: string, routes: AdapterRouteDependencies): Promise<Response> {
-	const error = authenticateAdapterRequest(request, routes.adapterApiToken, routes.requireAdapterApiToken);
-	if (error !== undefined) return error;
+	const principal = requireAdminPrincipal(request, routes);
+	if (principal instanceof Response) return principal;
 	const projectId = projectIdFromUnlinkPath(pathname);
 	if (!projectId.ok) return jsonResponse(projectId.result.body, { status: projectId.result.status });
 	const result = await handleProjectUnlinkRequest(routes.projectLinkService!, projectId.value);
 	return jsonResponse(result.body, { status: result.status });
+}
+async function dispatchProviderRequest(
+	request: Request,
+	url: URL,
+	routes: AdapterRouteDependencies | undefined,
+	principal: OpenWebUIPrincipal,
+): Promise<Response> {
+	if (routes === undefined) return jsonResponse({ error: "not_found" }, { status: 404 });
+	const closeChatId = request.method === "POST" ? chatIdFromClosePath(url.pathname) : undefined;
+	if (closeChatId !== undefined) {
+		const operationId = await closeOperationId(request);
+		return operationId instanceof Response
+			? operationId
+			: handleOpenAIChatCloseRequest(closeChatId, operationId, routes, principal);
+	}
+	if (request.method === "GET" && url.pathname === "/v1/models") return handleOpenAIModelsRequest(routes, principal);
+	if (request.method === "POST" && url.pathname === "/v1/chat/completions")
+		return handleOpenAIChatCompletionsRequest(request, routes, principal);
+	return jsonResponse({ error: "not_found" }, { status: 404 });
+}
+
+function isCatalogOnlyModelsRequest(request: Request, url: URL): boolean {
+	return (
+		request.method === "GET" &&
+		url.pathname === "/v1/models" &&
+		request.headers.get("x-openwebui-user-id") === "{{USER_ID}}"
+	);
+}
+
+function isProviderAuthenticated(
+	request: Request,
+	routes: AdapterRouteDependencies | undefined,
+	runtime: AdapterRuntimeConfig | undefined,
+): boolean {
+	const expectedToken = runtime === undefined ? routes?.adapterApiToken : runtime.adapterToken;
+	return expectedToken !== undefined && bearerToken(request) === expectedToken;
+}
+
+function resolveRequestPrincipal(
+	request: Request,
+	routes: AdapterRouteDependencies | undefined,
+): OpenWebUIPrincipal | Response {
+	if (routes === undefined) return jsonResponse({ error: "service_unavailable" }, { status: 503 });
+	const result = resolveForwardedPrincipal(routes.owner, request.headers.get("x-openwebui-user-id"));
+	if (!result.ok)
+		return jsonResponse(
+			{
+				error: {
+					message: "A non-empty forwarded OpenWebUI user ID is required.",
+					type: "authentication_error",
+					code: result.reason,
+				},
+			},
+			{ status: 401 },
+		);
+	return result.principal;
+}
+
+function requireAdminPrincipal(request: Request, routes: AdapterRouteDependencies): OpenWebUIPrincipal | Response {
+	const authError = authenticateAdapterRequest(request, routes.adapterApiToken, routes.requireAdapterApiToken);
+	if (authError !== undefined) return authError;
+	const principal = resolveRequestPrincipal(request, routes);
+	if (principal instanceof Response) return principal;
+	if (!isOpenWebUIAdmin(principal) || principal.userId !== routes.owner.ownerUserId)
+		return jsonResponse(
+			{
+				error: {
+					message: "OpenWebUI administrator privileges are required.",
+					type: "authorization_error",
+					code: "admin_required",
+				},
+			},
+			{ status: 403 },
+		);
+	return principal;
 }
 function bearerToken(request: Request): string | undefined {
 	return /^Bearer[ \t]+([^ \t]+)[ \t]*$/i.exec(request.headers.get("authorization") ?? "")?.[1];

@@ -59,6 +59,46 @@ describe("project link registration", () => {
 			{ sessionId: "linked-sdk", sessionFile: path.join(sdkSessionRoot, "linked-sdk.jsonl") },
 		]);
 	});
+	test("rejects managed state subtrees as project roots while allowing the durable session root", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-state-admission-"));
+		tempDirs.push(workspace);
+		const stateRoot = path.join(workspace, "managed-state");
+		const projectDirectory = path.join(workspace, "Configured Project");
+		const sessionRoot = path.join(stateRoot, "sessions");
+		await fs.mkdir(projectDirectory);
+		await fs.mkdir(sessionRoot, { recursive: true });
+		const service = new ProjectLinkService({
+			allowedRoots: await resolveAllowedRoots([workspace, stateRoot]),
+			store: new SqliteProjectRegistrationStore(":memory:"),
+			ownerUserId: "owner-1",
+			protectedPaths: protectedPathsFor(workspace),
+			protectedProjectRoots: [stateRoot],
+			allowedSessionRoots: [sessionRoot],
+		});
+
+		await expect(
+			service.linkProject({ cwd: projectDirectory, name: "Configured Project", sessionRoot }),
+		).resolves.toMatchObject({ project: { cwd: projectDirectory, sessionRoot } });
+
+		for (const relativePath of [
+			"",
+			"workspaces",
+			"locks",
+			"outbox",
+			"registry",
+			"authority",
+			"migration",
+			"sessions",
+		]) {
+			const candidate = relativePath === "" ? stateRoot : path.join(stateRoot, relativePath);
+			await fs.mkdir(candidate, { recursive: true });
+			await expect(
+				service.linkProject({ cwd: candidate, name: `Managed ${relativePath || "state"}` }),
+			).rejects.toMatchObject({
+				code: "invalid_project_link",
+			});
+		}
+	});
 
 	test("keeps an explicit unlink across env seeding until the project is linked again", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-link-store-"));
@@ -123,6 +163,80 @@ describe("project link registration", () => {
 		expect(service.listLinkedProjects()).toHaveLength(1);
 		expect(await repository.getChat("owner-1", "gjc-project-demo-project-session-session-one")).toMatchObject({
 			title: "Existing Session",
+		});
+	});
+	test("admin unlink closes only configured-admin mappings when a normal principal collides on project and chat IDs", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-link-scope-"));
+		tempDirs.push(workspace);
+		const projectDirectory = path.join(workspace, "Admin Project");
+		await fs.mkdir(projectDirectory);
+		const mappings = new SessionMappingStore();
+		const closed: string[] = [];
+		const projectId = "admin-project";
+		const sharedChat = "shared-chat";
+		mappings.setScoped(
+			{ principalId: "owner-1", chatId: sharedChat },
+			{
+				chatId: sharedChat,
+				principalId: "owner-1",
+				projectId,
+				sessionId: "admin-session",
+				rawFrameCursor: 1,
+				eventCursor: 1,
+				operationId: "admin-operation",
+			},
+		);
+		mappings.setScoped(
+			{ principalId: "normal-user", chatId: sharedChat },
+			{
+				chatId: sharedChat,
+				principalId: "normal-user",
+				projectId,
+				sessionId: "normal-session",
+				rawFrameCursor: 1,
+				eventCursor: 1,
+				operationId: "normal-operation",
+			},
+		);
+		mappings.set({
+			chatId: "legacy-admin-chat",
+			principalId: "owner-1",
+			projectId,
+			sessionId: "legacy-admin-session",
+			rawFrameCursor: 1,
+			eventCursor: 1,
+			operationId: "legacy-admin-operation",
+		});
+		mappings.set({
+			chatId: "legacy-unscoped-chat",
+			projectId,
+			sessionId: "legacy-unscoped-session",
+			rawFrameCursor: 1,
+			eventCursor: 1,
+			operationId: "legacy-unscoped-operation",
+		});
+		const service = new ProjectLinkService({
+			allowedRoots: await resolveAllowedRoots([workspace]),
+			store: new SqliteProjectRegistrationStore(":memory:"),
+			ownerUserId: "owner-1",
+			mappings,
+			closeSession: async mapping => {
+				closed.push(`${mapping.principalId ?? "legacy"}:${mapping.chatId}`);
+				return { status: "closed" };
+			},
+			protectedPaths: protectedPathsFor(workspace),
+		});
+
+		await service.linkProject({ cwd: projectDirectory, name: "Admin Project" });
+		await service.unlinkProject(projectId);
+
+		expect(closed.sort()).toEqual(
+			["owner-1:shared-chat", "owner-1:legacy-admin-chat", "owner-1:legacy-unscoped-chat"].sort(),
+		);
+		expect(mappings.getScoped({ principalId: "normal-user", chatId: sharedChat })).toMatchObject({
+			principalId: "normal-user",
+			projectId,
+			sessionId: "normal-session",
 		});
 	});
 

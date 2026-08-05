@@ -13,6 +13,7 @@ import * as projectLinkServiceModule from "../src/projects/link-service";
 import { ProjectLinkService } from "../src/projects/link-service";
 import { isProjectPathValidationError, ProjectPathAccessError } from "../src/projects/project-admission";
 import { SqliteProjectRegistrationStore } from "../src/projects/registration-store";
+import type { RegisteredProject } from "../src/projects/registry";
 import * as pathsModule from "../src/security/paths";
 import { resolveAllowedRoots } from "../src/security/paths";
 
@@ -42,6 +43,46 @@ describe("project link registration failure handling", () => {
 			code: "invalid_project_link",
 			message: "Project paths must not overlap protected GJC runtime paths.",
 		});
+	});
+	test("rejects explicit session roots under protected roots except the allowed durable directory", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-admission-session-root-"));
+		tempDirs.push(workspace);
+		const protectedPaths = protectedPathsFor(workspace);
+		const protectedRoots = [path.join(workspace, "state")];
+		const allowedSessionRoot = path.join(workspace, "state", "sessions");
+
+		const candidate: unknown = Reflect.get(projectLinkServiceModule, "assertProjectsAdmitted");
+		expect(typeof candidate).toBe("function");
+		if (typeof candidate !== "function") return;
+		const admit = (projects: readonly RegisteredProject[]) =>
+			Reflect.apply(candidate, projectLinkServiceModule, [
+				projects,
+				protectedPaths,
+				protectedRoots,
+				[allowedSessionRoot],
+			]);
+
+		const cwd = path.join(workspace, "projects", "safe");
+		await expect(
+			admit([
+				{
+					...projectFixture("state-session-root", cwd, workspace),
+					sessionRoot: path.join(workspace, "state", "locks"),
+				},
+			]),
+		).rejects.toMatchObject({
+			code: "invalid_project_link",
+			message: "Project session root must not overlap protected GJC runtime paths.",
+		});
+		await expect(
+			admit([{ ...projectFixture("state-root-itself", cwd, workspace), sessionRoot: protectedRoots[0] }]),
+		).rejects.toMatchObject({
+			code: "invalid_project_link",
+			message: "Project session root must not overlap protected GJC runtime paths.",
+		});
+		await expect(
+			admit([{ ...projectFixture("durable-session-root", cwd, workspace), sessionRoot: allowedSessionRoot }]),
+		).resolves.toBeUndefined();
 	});
 	test("classifies project access failures as invalid link input", () => {
 		expect(isProjectPathValidationError(new ProjectPathAccessError("Project directory access denied"))).toBe(true);

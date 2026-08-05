@@ -1,6 +1,7 @@
 import { ensureSdkSessionFile } from "../gjc/session-file";
 import type { SessionMapping, SessionMappingStore } from "../gjc/session-router";
 import { validateSessionFile } from "../gjc/session-router";
+import { scopedSessionMappingStore } from "../gjc/session-turn-router";
 import type { GjcLifecycleTransaction, GjcTurnEventObserver } from "../gjc/turn-runner";
 import {
 	answerFromWorkflowGateReply,
@@ -38,7 +39,11 @@ export function replayCompletedWorkflowGateReply(
 	input: WorkflowGateTurnDependencies,
 	turn: LiveGatewayRunnerInput,
 ): LiveGatewayRunnerResult | null {
-	const priorOperation = input.mappings.operation(turn.chatId, turn.userMessageId);
+	const principalId = principalIdForTurn(turn);
+	const projectionOwnerUserId = principalId ?? input.ownerUserId ?? "openwebui-gjc-adapter";
+	const mappings =
+		principalId === undefined ? input.mappings : scopedSessionMappingStore(input.mappings, principalId, turn.chatId);
+	const priorOperation = mappings.operation(turn.chatId, turn.userMessageId);
 	if (priorOperation?.state !== "complete" || priorOperation.kind !== "gate") return null;
 	const result = priorOperation.result;
 	if (result?.kind !== "control" || result.mapping.operationId !== turn.userMessageId)
@@ -62,18 +67,35 @@ export function replayCompletedWorkflowGateReply(
 			assistantText: result.assistantText,
 			events: result.events,
 		},
-		input.ownerUserId ?? "openwebui-gjc-adapter",
+		projectionOwnerUserId,
+		principalId,
 	);
 	return { content: result.assistantText };
 }
 export async function handleWorkflowGateReply(
 	input: WorkflowGateTurnDependencies,
 	turn: LiveGatewayRunnerInput,
-	preflightMapping: SessionMapping,
+	preflightMapping: SessionMapping | undefined,
 	lifecycle: GjcLifecycleTransaction,
 	observer?: GjcTurnEventObserver,
 ): Promise<LiveGatewayRunnerResult | null> {
-	const mapping = preflightMapping ?? input.mappings.get(turn.chatId);
+	const principalId = principalIdForTurn(turn);
+	const projectionOwnerUserId = principalId ?? input.ownerUserId ?? "openwebui-gjc-adapter";
+	const mappings =
+		principalId === undefined ? input.mappings : scopedSessionMappingStore(input.mappings, principalId, turn.chatId);
+	if (
+		principalId !== undefined &&
+		preflightMapping !== undefined &&
+		(preflightMapping.principalId === undefined || preflightMapping.principalId !== principalId)
+	)
+		throw new Error(`GJC workflow gate mapping for ${turn.chatId} is not bound to the requested principal.`);
+	const mapping = preflightMapping ?? mappings.get(turn.chatId);
+	if (
+		principalId !== undefined &&
+		mapping !== undefined &&
+		(mapping.principalId === undefined || mapping.principalId !== principalId)
+	)
+		throw new Error(`GJC workflow gate mapping for ${turn.chatId} is not bound to the requested principal.`);
 	if (mapping === undefined || mapping.projectId !== turn.project.id) return null;
 	const pendingGate = latestPendingWorkflowGate(mapping.events ?? []);
 	if (pendingGate === null) return null;
@@ -109,7 +131,7 @@ export async function handleWorkflowGateReply(
 		);
 	}
 	const operationDetail = workflowGateOperationHash(turn, pendingGate);
-	const priorOperation = input.mappings.operation(turn.chatId, turn.userMessageId);
+	const priorOperation = mappings.operation(turn.chatId, turn.userMessageId);
 	if (priorOperation?.state === "complete") {
 		if (
 			priorOperation.detail !== operationDetail ||
@@ -128,7 +150,8 @@ export async function handleWorkflowGateReply(
 				assistantText: priorOperation.result.assistantText,
 				events: priorOperation.result.events,
 			},
-			input.ownerUserId ?? "openwebui-gjc-adapter",
+			projectionOwnerUserId,
+			principalId,
 		);
 		return { content: priorOperation.result.assistantText };
 	}
@@ -139,7 +162,7 @@ export async function handleWorkflowGateReply(
 	) {
 		throw new Error(`GJC workflow gate operation ${turn.userMessageId} requires reconciliation.`);
 	}
-	input.mappings.beginOperation(turn.chatId, {
+	mappings.beginOperation(turn.chatId, {
 		id: turn.userMessageId,
 		kind: "gate",
 		ingressId: turn.userMessageId,
@@ -203,14 +226,14 @@ export async function handleWorkflowGateReply(
 			attachment: result.attachment,
 		};
 		await lifecycle.publish(result.attachment, () => {
-			const published = input.mappings.completeOperationWithMapping(
+			const published = mappings.completeOperationWithMapping(
 				turn.chatId,
 				turn.userMessageId,
 				operationDetail,
 				nextMapping,
 				"control",
 			);
-			ensureProjectionRows(input.outbox, published, input.ownerUserId ?? "openwebui-gjc-adapter");
+			ensureProjectionRows(input.outbox, published, projectionOwnerUserId, principalId);
 			return published;
 		});
 		const projectedEvents = projectTurnEvents(
@@ -221,9 +244,16 @@ export async function handleWorkflowGateReply(
 			? { content: responseText }
 			: { content: responseText, events: projectedEvents };
 	} catch (error) {
-		input.mappings.transitionOperation(turn.chatId, turn.userMessageId, "uncertain", operationDetail);
+		mappings.transitionOperation(turn.chatId, turn.userMessageId, "uncertain", operationDetail);
 		throw error;
 	}
+}
+
+function principalIdForTurn(turn: LiveGatewayRunnerInput): string | undefined {
+	const ownerUserId = turn.ownerUserId;
+	if (typeof ownerUserId !== "string") return undefined;
+	const principalId = ownerUserId.trim();
+	return principalId.length === 0 ? undefined : principalId;
 }
 
 export function latestPendingWorkflowGate(events: NonNullable<SessionMapping["events"]>): PendingWorkflowGate | null {

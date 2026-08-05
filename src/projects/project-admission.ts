@@ -25,9 +25,40 @@ export class ProjectPathAccessError extends Error {
 export async function assertProjectsAdmitted(
 	projects: readonly RegisteredProject[],
 	protectedPaths: GjcRuntimeLocations["protectedProjectPaths"],
+	protectedProjectRoots: readonly string[] = [],
+	allowedSessionRoots: readonly string[] = [],
 ): Promise<void> {
 	const canonicalProtectedPaths = await Promise.all(protectedPaths.map(resolveExistingOrProspectivePath));
+	const canonicalProtectedProjectRoots = await Promise.all(
+		protectedProjectRoots.map(resolveExistingOrProspectivePath),
+	);
+	const canonicalAllowedSessionRoots = await Promise.all(allowedSessionRoots.map(resolveExistingOrProspectivePath));
 	for (const project of projects) {
+		const canonicalProjectCwd = await resolveExistingOrProspectivePath(project.cwd);
+		if (canonicalProtectedProjectRoots.some(protectedRoot => pathsOverlap(canonicalProjectCwd, protectedRoot))) {
+			throw new ProjectLinkError(
+				"Project paths must not overlap protected GJC runtime paths.",
+				"invalid_project_link",
+			);
+		}
+		if (project.sessionRoot !== undefined) {
+			const canonicalSessionRoot = await resolveExistingOrProspectivePath(project.sessionRoot);
+			// The allowlist admits the durable sessions directory and its
+			// descendants only; an ancestor such as the protected state root
+			// itself must still be rejected.
+			const sessionRootAllowed = canonicalAllowedSessionRoots.some(allowed =>
+				isPathInsideRoot(canonicalSessionRoot, allowed),
+			);
+			if (
+				!sessionRootAllowed &&
+				canonicalProtectedProjectRoots.some(protectedRoot => pathsOverlap(canonicalSessionRoot, protectedRoot))
+			) {
+				throw new ProjectLinkError(
+					"Project session root must not overlap protected GJC runtime paths.",
+					"invalid_project_link",
+				);
+			}
+		}
 		const candidatePaths = project.sessionRoot === undefined ? [project.cwd] : [project.cwd, project.sessionRoot];
 		for (const candidatePath of candidatePaths) {
 			const canonicalCandidatePath = await resolveExistingOrProspectivePath(candidatePath);

@@ -1,6 +1,6 @@
+import type { SessionMappingScope } from "../gjc/session-mapping-store";
 import type { SessionCloseIngress, SessionMapping } from "../gjc/session-router";
-import { closeIngressId, legacyCloseIngressId } from "../gjc/session-router";
-import type { OpenWebUIOwnerContext } from "../openwebui/auth";
+import type { OpenWebUIOwnerContext, OpenWebUIPrincipal } from "../openwebui/auth";
 import type { OpenWebUIProjectionRepository } from "../openwebui/client";
 import {
 	handleProjectAdminChatCompletion,
@@ -9,6 +9,9 @@ import {
 } from "../projects/admin-routes";
 import type { ProjectLinkService, SessionCloseResult } from "../projects/link-service";
 import type { RegisteredProject } from "../projects/registry";
+import type { UserWorkspaceRegistry } from "../security/user-workspace";
+import type { WorkspaceCleanupService } from "../security/workspace-cleanup";
+import type { WorkspaceLeaseManager } from "../security/workspace-lease";
 import {
 	handleChatCompletions,
 	type LiveChatCompletionsResult,
@@ -19,8 +22,16 @@ import {
 import { parseChatCompletionRequest } from "./chat-request-parser";
 import type { LiveGatewayFileContextResolver } from "./file-contexts";
 import type { ModelReaderFactory } from "./model-reader";
-import { ModelSelectionError, modelSelectionError } from "./model-selection-errors";
-import { createModelSelectionPolicy } from "./model-selection-policy";
+import { ModelSelectionError } from "./model-selection-errors";
+import { handleOpenAIModelsRequest } from "./openai-models-route";
+import {
+	asyncIterableBody,
+	jsonResponse,
+	modelSelectionErrorResponse,
+	sanitizeRunnerError,
+} from "./openai-response-utils";
+
+export { asyncIterableBody, jsonResponse } from "./openai-response-utils";
 
 export type ProjectProvider =
 	| readonly RegisteredProject[]
@@ -42,93 +53,25 @@ export interface AdapterRouteDependencies {
 	readonly requireAdapterApiToken?: boolean;
 	readonly modelReaderFactory?: ModelReaderFactory;
 	readonly neutralWorkspace?: string;
-	readonly mappings?: { get(chatId: string): SessionMapping | undefined };
+	readonly workspaceRegistry?: Pick<UserWorkspaceRegistry, "open">;
+	readonly workspaceLeaseManager?: Pick<WorkspaceLeaseManager, "acquire">;
+	readonly workspaceLeaseDurationMs?: number;
+	readonly workspaceLeaseHeartbeatMs?: number;
+	readonly mappings?: {
+		readonly getScoped: (scope: SessionMappingScope) => SessionMapping | undefined;
+	};
 	readonly closeSession?: ChatSessionCloser;
 	readonly projectAdminFailureSink?: ProjectAdminFailureSink;
+	readonly workspaceCleanupService?: Pick<WorkspaceCleanupService, "preview" | "cleanup">;
 }
 
-export function jsonResponse(value: unknown, init?: ResponseInit): Response {
-	return new Response(JSON.stringify(value), {
-		...init,
-		headers: {
-			"content-type": "application/json; charset=utf-8",
-			...init?.headers,
-		},
-	});
-}
-
-export async function handleOpenAIChatCloseRequest(
-	chatId: string,
-	operationId: string,
-	routes: AdapterRouteDependencies,
-): Promise<Response> {
-	const mapping = routes.mappings?.get(chatId);
-	if (mapping === undefined) {
-		return jsonResponse(
-			{
-				error: {
-					message: "No GJC session is mapped to this chat.",
-					type: "invalid_request_error",
-					code: "chat_session_not_found",
-				},
-				operationId,
-			},
-			{ status: 404 },
-		);
-	}
-	if (routes.closeSession === undefined) {
-		return jsonResponse(
-			{ status: "unavailable", message: "GJC session close is unavailable.", operationId },
-			{ status: 503 },
-		);
-	}
-	try {
-		const ingressId = closeIngressId(`http:${operationId}`, mapping);
-		const legacyIngressId = legacyCloseIngressId(operationId, mapping);
-		const result = await routes.closeSession(mapping, {
-			ingressId,
-			ingressHash: ingressId,
-			legacyIngress: { ingressId: legacyIngressId, ingressHash: legacyIngressId },
-		});
-		return jsonResponse(
-			{ ...result, operationId },
-			{
-				status: result.status === "closed" ? 200 : result.status === "unavailable" ? 503 : 202,
-			},
-		);
-	} catch (error) {
-		const message = error instanceof Error ? error.message : "GJC session close acknowledgement was not received.";
-		if (message.includes("conflicts")) {
-			return jsonResponse(
-				{ error: { message, type: "invalid_request_error", code: "chat_close_conflict" }, operationId },
-				{ status: 409 },
-			);
-		}
-		return jsonResponse({ status: "uncertain", message, operationId }, { status: 202 });
-	}
-}
-
-export function chatIdFromClosePath(pathname: string): string | undefined {
-	const match = /^\/v1\/chats\/([^/]+)\/close$/.exec(pathname);
-	if (match === null) return undefined;
-	try {
-		return decodeURIComponent(match[1]);
-	} catch {
-		return undefined;
-	}
-}
-export async function handleOpenAIModelsRequest(routes: AdapterRouteDependencies): Promise<Response> {
-	try {
-		if (routes.modelReaderFactory === undefined) throw new TypeError("GJC model reader is unavailable");
-		return jsonResponse(await createModelSelectionPolicy(routes.modelReaderFactory).listModels());
-	} catch (error) {
-		return modelSelectionErrorResponse(error);
-	}
-}
+export { chatIdFromClosePath, handleOpenAIChatCloseRequest } from "./openai-close-route";
+export { handleOpenAIModelsRequest };
 
 export async function handleOpenAIChatCompletionsRequest(
 	request: Request,
 	routes: AdapterRouteDependencies,
+	principal?: OpenWebUIPrincipal,
 ): Promise<Response> {
 	let body: unknown;
 	try {
@@ -158,7 +101,30 @@ export async function handleOpenAIChatCompletionsRequest(
 			{ status: 400 },
 		);
 	}
+	if (principal === undefined) {
+		return jsonResponse(
+			{
+				error: {
+					message: "A non-empty OpenWebUI user identity is required.",
+					type: "authentication_error",
+					code: "missing-forwarded-user",
+				},
+			},
+			{ status: 401 },
+		);
+	}
 	if (routes.projectLinkService !== undefined && isProjectAdminChatCompletionRequest(parsed.request)) {
+		if (principal.role !== "admin" || principal.userId !== routes.owner.ownerUserId)
+			return jsonResponse(
+				{
+					error: {
+						message: "OpenWebUI administrator privileges are required.",
+						type: "authorization_error",
+						code: "admin_required",
+					},
+				},
+				{ status: 403 },
+			);
 		const result = await handleProjectAdminChatCompletion(
 			routes.projectLinkService,
 			parsed.request,
@@ -185,6 +151,11 @@ export async function handleOpenAIChatCompletionsRequest(
 			projectContextRepository: routes.projectContextRepository,
 			neutralWorkspace: routes.neutralWorkspace,
 			modelReaderFactory: routes.modelReaderFactory,
+			workspaceRegistry: routes.workspaceRegistry,
+			workspaceLeaseManager: routes.workspaceLeaseManager,
+			workspaceLeaseDurationMs: routes.workspaceLeaseDurationMs,
+			workspaceLeaseHeartbeatMs: routes.workspaceLeaseHeartbeatMs,
+			principal,
 		});
 	} catch (error) {
 		if (error instanceof ModelSelectionError) return modelSelectionErrorResponse(error);
@@ -209,50 +180,6 @@ export async function handleOpenAIChatCompletionsRequest(
 	}
 	return jsonResponse(result.body, { status: result.status });
 }
-
-export function asyncIterableBody(source: AsyncIterable<string>): ReadableStream<Uint8Array> {
-	const iterator = source[Symbol.asyncIterator]();
-	const encoder = new TextEncoder();
-	const abandon = (): Promise<void> => {
-		if (!("abandon" in source)) return Promise.resolve();
-		return (source as { abandon?: () => Promise<void> }).abandon?.() ?? Promise.resolve();
-	};
-	const closeIterator = async (awaitAbandon: boolean) => {
-		const abandoned = abandon();
-		if (awaitAbandon) await abandoned;
-		else void abandoned.catch(() => {});
-		await iterator.return?.();
-	};
-	return new ReadableStream<Uint8Array>({
-		async pull(controller) {
-			try {
-				const next = await iterator.next();
-				if (next.done) controller.close();
-				else controller.enqueue(encoder.encode(next.value));
-			} catch (error) {
-				await closeIterator(false);
-				controller.error(error);
-			}
-		},
-		async cancel() {
-			await closeIterator(true);
-		},
-	});
-}
-
-function modelSelectionErrorResponse(error: unknown): Response {
-	const selectionError =
-		error instanceof ModelSelectionError ? error : modelSelectionError("model_catalog_unavailable");
-	return jsonResponse(
-		{ error: { message: selectionError.message, type: selectionError.type, code: selectionError.code } },
-		{ status: selectionError.status },
-	);
-}
-function sanitizeRunnerError(error: unknown): string {
-	const message = error instanceof Error ? error.message : String(error);
-	return message.replace(/Bearer\s+\S+/gi, "Bearer [redacted]").replace(/[A-Za-z0-9_-]{24,}/g, "[redacted]");
-}
-
 async function resolveProjects(provider: ProjectProvider): Promise<readonly RegisteredProject[]> {
 	return typeof provider === "function" ? await provider() : provider;
 }

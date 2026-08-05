@@ -4,9 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeIngressId, legacyCloseIngressId, type SessionCloseIngress } from "../src/gjc/session-router";
 import type { LiveGatewayRunner } from "../src/live/chat-completions";
+import type { ModelReaderContext } from "../src/live/model-reader";
+import { handleOpenAIChatCloseRequest } from "../src/live/openai-routes";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import type { RegisteredProject } from "../src/projects/registry";
 import { RuntimeSingletonLock } from "../src/runtime-singleton-lock";
+import { WorkspaceLeaseManager } from "../src/security/workspace-lease";
 import { createAdapterRequestHandler, startAdapterServer } from "../src/server";
 import { CANONICAL_MODEL_IDS, LOW_MODEL_ID, staticModelReaderFactory } from "./model-selection-fixtures";
 
@@ -34,7 +37,9 @@ describe("createAdapterRequestHandler", () => {
 			routes: { projects: [project], owner, runner: fixedRunner("unused"), modelReaderFactory },
 		});
 
-		const response = await handler(new Request("http://adapter.test/v1/models"));
+		const response = await handler(
+			new Request("http://adapter.test/v1/models", { headers: { "X-OpenWebUI-User-Id": "owner-1" } }),
+		);
 
 		expect(response.status).toBe(200);
 		expect(await response.json()).toEqual({
@@ -48,6 +53,51 @@ describe("createAdapterRequestHandler", () => {
 			})),
 		});
 	});
+	test("scopes normal model discovery to the forwarded principal workspace and lease", async () => {
+		const root = await mkdtemp(join(tmpdir(), "gjc-models-scope-"));
+		const workspace = join(root, "workspace");
+		const safeKey = "a".repeat(64);
+		let readerContext: ModelReaderContext | undefined;
+		const sourceReaderFactory = staticModelReaderFactory();
+		try {
+			const handler = createAdapterRequestHandler({
+				routes: {
+					projects: [project],
+					owner,
+					runner: fixedRunner("unused"),
+					modelReaderFactory: async (context: ModelReaderContext | undefined) => {
+						readerContext = context;
+						return sourceReaderFactory(context);
+					},
+					workspaceRegistry: {
+						open: async userId => ({
+							userId,
+							safeKey,
+							root: workspace,
+							sessionRoot: join(workspace, ".gjc", "sessions"),
+						}),
+					},
+					workspaceLeaseManager: new WorkspaceLeaseManager({ stateRoot: root }),
+				},
+			});
+
+			const response = await handler(
+				new Request("http://adapter.test/v1/models", {
+					headers: { "X-OpenWebUI-User-Id": "normal-1" },
+				}),
+			);
+
+			expect(response.status).toBe(200);
+			expect(readerContext).toMatchObject({
+				principal: { userId: "normal-1", role: "user" },
+				workspace: { userId: "normal-1", safeKey, root: workspace },
+			});
+			expect(readerContext?.lease).toBeDefined();
+			expect(readerContext?.lease).not.toHaveProperty("release");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
 	test("advertises the Codex display name without changing its canonical model ID", async () => {
 		const handler = createAdapterRequestHandler({
 			routes: {
@@ -58,7 +108,9 @@ describe("createAdapterRequestHandler", () => {
 			},
 		});
 
-		const response = await handler(new Request("http://adapter.test/v1/models"));
+		const response = await handler(
+			new Request("http://adapter.test/v1/models", { headers: { "X-OpenWebUI-User-Id": "owner-1" } }),
+		);
 
 		expect(response.status).toBe(200);
 		expect(await response.json()).toEqual({
@@ -96,12 +148,180 @@ describe("createAdapterRequestHandler", () => {
 
 		const unauthorized = await handler(new Request("http://adapter.test/v1/models"));
 		const authorized = await handler(
-			new Request("http://adapter.test/v1/models", { headers: { authorization: "Bearer adapter-token" } }),
+			new Request("http://adapter.test/v1/models", {
+				headers: { authorization: "Bearer adapter-token", "X-OpenWebUI-User-Id": "owner-1" },
+			}),
 		);
 
 		expect(unauthorized.status).toBe(401);
 		expect(await unauthorized.json()).toMatchObject({ error: { code: "invalid_api_key" } });
 		expect(authorized.status).toBe(200);
+	});
+	test("requires a forwarded user identity before serving the shared model catalog", async () => {
+		let readerCalls = 0;
+		const handler = createAdapterRequestHandler({
+			routes: {
+				projects: [project],
+				owner,
+				runner: fixedRunner("unused"),
+				modelReaderFactory: async () => {
+					readerCalls += 1;
+					return await modelReaderFactory();
+				},
+			},
+		});
+
+		const missingIdentity = await handler(new Request("http://adapter.test/v1/models"));
+		const unresolvedIdentity = await handler(
+			new Request("http://adapter.test/v1/models", {
+				headers: { "X-OpenWebUI-User-Id": "{{USER_ID}}" },
+			}),
+		);
+		const response = await handler(
+			new Request("http://adapter.test/v1/models", { headers: { "X-OpenWebUI-User-Id": "owner-1" } }),
+		);
+		expect(missingIdentity.status).toBe(401);
+		expect(unresolvedIdentity.status).toBe(401);
+		expect(response.status).toBe(200);
+		expect(readerCalls).toBe(1);
+	});
+	test("serves the exact OpenWebUI model-discovery placeholder through a provider-authenticated catalog path", async () => {
+		const readerContexts: Array<ModelReaderContext | undefined> = [];
+		const handler = createAdapterRequestHandler({
+			routes: {
+				projects: [project],
+				owner,
+				runner: fixedRunner("unused"),
+				adapterApiToken: "adapter-token",
+				requireAdapterApiToken: true,
+				modelReaderFactory: async (context: ModelReaderContext | undefined) => {
+					readerContexts.push(context);
+					return modelReaderFactory(context);
+				},
+			},
+		});
+
+		const unauthenticated = await handler(
+			new Request("http://adapter.test/v1/models", {
+				headers: { "X-OpenWebUI-User-Id": "{{USER_ID}}" },
+			}),
+		);
+		const authorized = await handler(
+			new Request("http://adapter.test/v1/models", {
+				headers: {
+					authorization: "Bearer adapter-token",
+					"X-OpenWebUI-User-Id": "{{USER_ID}}",
+				},
+			}),
+		);
+
+		expect(unauthenticated.status).toBe(401);
+		expect(authorized.status).toBe(200);
+		expect(await authorized.json()).toEqual({
+			object: "list",
+			data: CANONICAL_MODEL_IDS.map(id => ({
+				id,
+				name: id.slice("gjc/".length),
+				object: "model",
+				created: 1783468800,
+				owned_by: "gjc",
+			})),
+		});
+		expect(readerContexts).toEqual([undefined]);
+	});
+
+	test("rejects the model-discovery placeholder on chat completions", async () => {
+		let runnerCalls = 0;
+		const handler = createAdapterRequestHandler({
+			routes: {
+				projects: [project],
+				owner,
+				runner: {
+					run: () => {
+						runnerCalls += 1;
+						return { content: "unexpected" };
+					},
+				},
+				adapterApiToken: "adapter-token",
+				requireAdapterApiToken: true,
+			},
+		});
+
+		const response = await handler(
+			new Request("http://adapter.test/v1/chat/completions", {
+				method: "POST",
+				headers: {
+					authorization: "Bearer adapter-token",
+					"content-type": "application/json",
+					"X-OpenWebUI-User-Id": "{{USER_ID}}",
+				},
+				body: JSON.stringify({ model: LOW_MODEL_ID, messages: [{ role: "user", content: "hello" }] }),
+			}),
+		);
+
+		expect(response.status).toBe(401);
+		expect(await response.json()).toMatchObject({ error: { code: "missing-forwarded-user" } });
+		expect(runnerCalls).toBe(0);
+	});
+
+	test("keeps catalog fallback out of user workspaces, leases, and mappings", async () => {
+		let workspaceOpens = 0;
+		let leaseAcquires = 0;
+		let mappingReads = 0;
+		const readerContexts: Array<ModelReaderContext | undefined> = [];
+		const handler = createAdapterRequestHandler({
+			routes: {
+				projects: [project],
+				owner,
+				runner: fixedRunner("unused"),
+				adapterApiToken: "adapter-token",
+				requireAdapterApiToken: true,
+				modelReaderFactory: async (context: ModelReaderContext | undefined) => {
+					readerContexts.push(context);
+					return modelReaderFactory(context);
+				},
+				workspaceRegistry: {
+					open: async userId => {
+						workspaceOpens += 1;
+						return {
+							userId,
+							safeKey: "a".repeat(64),
+							root: "/tmp/catalog-user",
+							sessionRoot: "/tmp/catalog-user/.gjc/sessions",
+						};
+					},
+				},
+				workspaceLeaseManager: {
+					acquire: async () => {
+						leaseAcquires += 1;
+						throw new Error("catalog fallback must not acquire a user lease");
+					},
+				},
+				mappings: {
+					getScoped: () => {
+						mappingReads += 1;
+						return undefined;
+					},
+				},
+			},
+		});
+
+		const response = await handler(
+			new Request("http://adapter.test/v1/models", {
+				headers: {
+					authorization: "Bearer adapter-token",
+					"X-OpenWebUI-User-Id": "{{USER_ID}}",
+				},
+			}),
+		);
+
+		expect(response.status).toBe(200);
+		expect(readerContexts).toEqual([undefined]);
+		expect({ workspaceOpens, leaseAcquires, mappingReads }).toEqual({
+			workspaceOpens: 0,
+			leaseAcquires: 0,
+			mappingReads: 0,
+		});
 	});
 
 	test("fails closed when CLI service requires but lacks an adapter API token", async () => {
@@ -138,7 +358,9 @@ describe("createAdapterRequestHandler", () => {
 			new Request("http://adapter.test/readyz", { headers: { authorization: "Bearer provider-token" } }),
 		);
 		const provider = await handler(
-			new Request("http://adapter.test/v1/models", { headers: { authorization: "Bearer provider-token" } }),
+			new Request("http://adapter.test/v1/models", {
+				headers: { authorization: "Bearer provider-token", "X-OpenWebUI-User-Id": "owner-1" },
+			}),
 		);
 
 		expect(unauthorized.status).toBe(401);
@@ -240,7 +462,7 @@ describe("createAdapterRequestHandler", () => {
 		const malformed = await handler(
 			new Request("http://adapter.test/v1/chat/completions", {
 				method: "POST",
-				headers: { "content-type": "application/json" },
+				headers: { "content-type": "application/json", "X-OpenWebUI-User-Id": "owner-1" },
 				body: "{",
 			}),
 		);
@@ -272,6 +494,7 @@ describe("createAdapterRequestHandler", () => {
 			rawFrameCursor: 0,
 			eventCursor: 0,
 			operationId: "turn-1",
+			principalId: "owner-1",
 		};
 		const ingresses: SessionCloseIngress[] = [];
 		const handler = createAdapterRequestHandler({
@@ -281,7 +504,10 @@ describe("createAdapterRequestHandler", () => {
 				runner: fixedRunner("unused"),
 				adapterApiToken: "adapter-token",
 				requireAdapterApiToken: true,
-				mappings: { get: chatId => (chatId === mapping.chatId ? mapping : undefined) },
+				mappings: {
+					getScoped: scope =>
+						scope.principalId === mapping.principalId && scope.chatId === mapping.chatId ? mapping : undefined,
+				},
 				closeSession: async (_mapping, ingress) => {
 					ingresses.push(ingress);
 					return { status: "closed" };
@@ -292,7 +518,11 @@ describe("createAdapterRequestHandler", () => {
 		const response = await handler(
 			new Request("http://adapter.test/v1/chats/chat-1/close", {
 				method: "POST",
-				headers: { authorization: "Bearer adapter-token", "idempotency-key": "close-operation-1" },
+				headers: {
+					authorization: "Bearer adapter-token",
+					"idempotency-key": "close-operation-1",
+					"X-OpenWebUI-User-Id": "owner-1",
+				},
 			}),
 		);
 
@@ -305,6 +535,46 @@ describe("createAdapterRequestHandler", () => {
 			ingressId: legacyCloseIngressId("close-operation-1", mapping),
 			ingressHash: legacyCloseIngressId("close-operation-1", mapping),
 		});
+	});
+	test("rejects close requests without a principal and never falls back to unscoped mappings", async () => {
+		const mapping = {
+			chatId: "chat-1",
+			projectId: "demo",
+			sessionId: "session-1",
+			rawFrameCursor: 0,
+			eventCursor: 0,
+			operationId: "turn-1",
+			principalId: "owner-1",
+		};
+		let rawGets = 0;
+		let scopedGets = 0;
+		const routes = {
+			projects: [project],
+			owner,
+			runner: fixedRunner("unused"),
+			mappings: {
+				get: () => {
+					rawGets += 1;
+					return mapping;
+				},
+				getScoped: () => {
+					scopedGets += 1;
+					return { ...mapping, principalId: undefined };
+				},
+			},
+			closeSession: async () => ({ status: "closed" as const }),
+		};
+		const missingPrincipal = await handleOpenAIChatCloseRequest("chat-1", "close-1", routes);
+		expect(missingPrincipal.status).toBe(401);
+		expect(rawGets).toBe(0);
+		expect(scopedGets).toBe(0);
+		const unownedMapping = await handleOpenAIChatCloseRequest("chat-1", "close-2", routes, {
+			userId: "owner-1",
+			role: "user",
+		});
+		expect(unownedMapping.status).toBe(404);
+		expect(rawGets).toBe(0);
+		expect(scopedGets).toBe(1);
 	});
 });
 describe("Bun transport configuration", () => {
