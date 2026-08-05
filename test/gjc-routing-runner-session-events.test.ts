@@ -188,7 +188,7 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 				// Drain the stream so the background route settles and the abort surfaces.
 			}
 		})();
-		await expect(drain).rejects.toThrow("Workspace lease was lost during the streamed turn.");
+		await expect(drain).rejects.toThrow("Workspace lease admission is uncertain.");
 	});
 	test("rejects before opening a stream when the first observed frame is agent_failed", async () => {
 		const turnRunner = new FakeGjcTurnRunner();

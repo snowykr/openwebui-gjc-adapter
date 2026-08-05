@@ -200,8 +200,12 @@ export function createGjcRoutingLiveGatewayRunner(
 						if (projected.length > 0) {
 							try {
 								await deliverLiveEvents(turn, projected);
-							} catch {
+							} catch (error) {
 								leaseFailed = true;
+								// Re-throw so routeGjcTurn/continueSession abort the
+								// background turn promptly instead of deferring to the
+								// final .then (which only runs after the turn settles).
+								throw error;
 							}
 						}
 					};
@@ -338,8 +342,12 @@ export function createGjcRoutingLiveGatewayRunner(
 						if (event.type === "agent_start") agentStartDelivered = true;
 						try {
 							await deliverLiveEvents(turn, projected);
-						} catch {
+						} catch (error) {
 							leaseFailed = true;
+							// Re-throw so routeGjcTurn/continueSession abort the
+							// background turn promptly instead of deferring to the
+							// final .then (which only runs after the turn settles).
+							throw error;
 						}
 					}
 				},
