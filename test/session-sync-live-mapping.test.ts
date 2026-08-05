@@ -40,6 +40,18 @@ test("SDK session sync preserves an existing live mapping", async () => {
 			assistantText: "live answer",
 			modelSelection: { provider: "future", modelId: "capable", thinkingLevel: "high" },
 		});
+		mappings.upsertScoped(
+			{ principalId: "normal-user", chatId: "normal-user-live-chat" },
+			{
+				chatId: "normal-user-live-chat",
+				projectId: project.id,
+				sessionId: "live-session",
+				sessionFile,
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "normal-user-message",
+			},
+		);
 
 		const result = await syncProjectSessionsToOpenWebUI({
 			repository: new InMemoryOpenWebUIProjectionRepository(),

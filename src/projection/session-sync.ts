@@ -98,7 +98,7 @@ export async function syncProjectSessionsToOpenWebUI(
 					continue;
 				}
 				importedSessionIds.add(loaded.header.id);
-				const existingMapping = findMappedMapping(input.mappings, project.id, loaded.header.id);
+				const existingMapping = findMappedMapping(input.mappings, input.ownerUserId, project.id, loaded.header.id);
 				const projectedChat = projectGjcSessionToOpenWebUIChat({
 					sessionFile: loaded.filePath,
 					header: loaded.header,
@@ -186,11 +186,12 @@ async function listRootSessionFiles(sessionRoot: string): Promise<readonly strin
 
 function findMappedMapping(
 	mappings: SessionMappingStore | undefined,
+	principalId: string,
 	projectId: string,
 	sessionId: string,
 ): SessionMapping | undefined {
 	const entries = mappings
-		?.entries()
+		?.entriesForPrincipal(principalId, { includeLegacyAdmin: true })
 		.filter(mapping => mapping.projectId === projectId && mapping.sessionId === sessionId);
 	if (entries === undefined || entries.length === 0) return undefined;
 	for (let index = entries.length - 1; index >= 0; index -= 1) {
