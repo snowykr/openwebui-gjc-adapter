@@ -9,10 +9,16 @@ import type { AdapterRouteDependencies } from "./openai-routes";
 
 const DEFAULT_MODELS_WORKSPACE_LEASE_DURATION_MS = 210_000;
 
+type OpenAIModelsRequestOptions = {
+	readonly catalogOnly?: boolean;
+};
+
 export async function handleOpenAIModelsRequest(
 	routes: AdapterRouteDependencies,
 	principal?: OpenWebUIPrincipal,
+	options?: OpenAIModelsRequestOptions,
 ): Promise<Response> {
+	if (options?.catalogOnly === true) return handleCatalogOnlyModelsRequest(routes);
 	if (!isValidModelsPrincipal(principal)) return missingModelsPrincipalResponse();
 	if (principal.role === "admin" && principal.userId !== routes.owner.ownerUserId)
 		return adminModelsPrincipalRequiredResponse();
@@ -89,6 +95,15 @@ function isValidModelsPrincipal(principal: OpenWebUIPrincipal | undefined): prin
 		!/\{\{[^{}]*\}\}/u.test(principal.userId) &&
 		(principal.role === "admin" || principal.role === "user")
 	);
+}
+
+async function handleCatalogOnlyModelsRequest(routes: AdapterRouteDependencies): Promise<Response> {
+	try {
+		if (routes.modelReaderFactory === undefined) throw new TypeError("GJC model reader is unavailable");
+		return jsonResponse(await createModelSelectionPolicy(routes.modelReaderFactory).listModels());
+	} catch (error) {
+		return modelSelectionErrorResponse(error);
+	}
 }
 
 function missingModelsPrincipalResponse(): Response {
