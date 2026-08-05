@@ -40,6 +40,18 @@ test("SDK session sync preserves an existing live mapping", async () => {
 			assistantText: "live answer",
 			modelSelection: { provider: "future", modelId: "capable", thinkingLevel: "high" },
 		});
+		mappings.upsertScoped(
+			{ principalId: "normal-user", chatId: "normal-user-live-chat" },
+			{
+				chatId: "normal-user-live-chat",
+				projectId: project.id,
+				sessionId: "live-session",
+				sessionFile,
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "normal-user-message",
+			},
+		);
 
 		const result = await syncProjectSessionsToOpenWebUI({
 			repository: new InMemoryOpenWebUIProjectionRepository(),
@@ -51,6 +63,47 @@ test("SDK session sync preserves an existing live mapping", async () => {
 
 		expect(result.imported).toMatchObject([{ chatId: "live-chat", sessionId: "live-session" }]);
 		expect(mappings.get("live-chat")).toEqual(liveMapping);
+	} finally {
+		await fs.rm(workspace, { recursive: true, force: true });
+	}
+});
+test("sync writes fresh historical imports under the configured admin principal", async () => {
+	const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-sync-admin-scoped-"));
+	try {
+		const home = path.join(workspace, "home");
+		const agentDir = path.join(home, ".gjc", "agent");
+		const projectDirectory = path.join(workspace, "Project Import");
+		const sdkSessionRoot = path.join(agentDir, "sessions", `-tmp-${path.basename(workspace)}-Project Import`);
+		const sessionFile = path.join(sdkSessionRoot, "import-session.jsonl");
+		await fs.mkdir(sdkSessionRoot, { recursive: true });
+		await fs.mkdir(projectDirectory, { recursive: true });
+		await writeSessionFile(sessionFile, {
+			header: { id: "import-session", title: "Import Session", cwd: projectDirectory },
+			entries: [messageEntry("import-user", null, "user", "import transcript")],
+		});
+		const project = await registerProjectDirectory(
+			{ cwd: projectDirectory, name: "Project Import", sessionRoot: path.join(workspace, "mapping-root") },
+			await resolveAllowedRoots([workspace]),
+		);
+		const mappings = new SessionMappingStore();
+		mappings.setLegacyAdminPrincipalId("admin-1");
+
+		const result = await syncProjectSessionsToOpenWebUI({
+			repository: new InMemoryOpenWebUIProjectionRepository(),
+			ownerUserId: "admin-1",
+			projects: [project],
+			mappings,
+			runtimeLocations: { home, agentDir },
+		});
+
+		expect(result.imported).toHaveLength(1);
+		const imported = result.imported[0]!;
+		expect(mappings.getScoped({ principalId: "admin-1", chatId: imported.chatId })).toMatchObject({
+			chatId: imported.chatId,
+			sessionId: "import-session",
+			operationId: "historical-import",
+		});
+		expect(mappings.get(imported.chatId)).toBeUndefined();
 	} finally {
 		await fs.rm(workspace, { recursive: true, force: true });
 	}

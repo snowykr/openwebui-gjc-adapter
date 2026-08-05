@@ -731,3 +731,32 @@ test("principal enumeration isolates normal mappings and opts into legacy admin 
 		}
 	}
 });
+test("scoped lookups fall back to legacy mappings only for the configured admin", () => {
+	for (const createHarness of [memoryHarness, fileHarness]) {
+		const harness = createHarness();
+		try {
+			harness.store.set({
+				...mapping(),
+				chatId: "legacy-admin-chat",
+				operationId: "legacy-admin-operation",
+			});
+			harness.store.setLegacyAdminPrincipalId("admin-1");
+
+			expect(harness.store.getScoped({ principalId: "admin-1", chatId: "legacy-admin-chat" })).toMatchObject({
+				chatId: "legacy-admin-chat",
+				operationId: "legacy-admin-operation",
+			});
+			expect(harness.store.getScoped({ principalId: "normal-1", chatId: "legacy-admin-chat" })).toBeUndefined();
+
+			harness.store.upsertScoped(
+				{ principalId: "admin-1", chatId: "legacy-admin-chat" },
+				{ ...mapping(), chatId: "legacy-admin-chat", operationId: "admin-scoped-operation" },
+			);
+			expect(harness.store.getScoped({ principalId: "admin-1", chatId: "legacy-admin-chat" })).toMatchObject({
+				operationId: "admin-scoped-operation",
+			});
+		} finally {
+			harness.cleanup();
+		}
+	}
+});

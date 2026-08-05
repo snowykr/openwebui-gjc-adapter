@@ -98,7 +98,7 @@ export async function syncProjectSessionsToOpenWebUI(
 					continue;
 				}
 				importedSessionIds.add(loaded.header.id);
-				const existingMapping = findMappedMapping(input.mappings, project.id, loaded.header.id);
+				const existingMapping = findMappedMapping(input.mappings, input.ownerUserId, project.id, loaded.header.id);
 				const projectedChat = projectGjcSessionToOpenWebUIChat({
 					sessionFile: loaded.filePath,
 					header: loaded.header,
@@ -114,7 +114,7 @@ export async function syncProjectSessionsToOpenWebUI(
 					},
 				});
 				if (existingMapping === undefined || existingMapping.operationId === "historical-import") {
-					input.mappings?.upsert({
+					const importMapping: SessionMapping = {
 						chatId: result.chatId,
 						projectId: project.id,
 						sessionId: loaded.header.id,
@@ -122,7 +122,15 @@ export async function syncProjectSessionsToOpenWebUI(
 						rawFrameCursor: 0,
 						eventCursor: 0,
 						operationId: "historical-import",
-					});
+					};
+					if (input.ownerUserId.length > 0) {
+						input.mappings?.upsertScoped(
+							{ principalId: input.ownerUserId, chatId: result.chatId },
+							importMapping,
+						);
+					} else {
+						input.mappings?.upsert(importMapping);
+					}
 				}
 				imported.push({
 					projectId: project.id,
@@ -186,11 +194,12 @@ async function listRootSessionFiles(sessionRoot: string): Promise<readonly strin
 
 function findMappedMapping(
 	mappings: SessionMappingStore | undefined,
+	principalId: string,
 	projectId: string,
 	sessionId: string,
 ): SessionMapping | undefined {
 	const entries = mappings
-		?.entries()
+		?.entriesForPrincipal(principalId, { includeLegacyAdmin: true })
 		.filter(mapping => mapping.projectId === projectId && mapping.sessionId === sessionId);
 	if (entries === undefined || entries.length === 0) return undefined;
 	for (let index = entries.length - 1; index >= 0; index -= 1) {

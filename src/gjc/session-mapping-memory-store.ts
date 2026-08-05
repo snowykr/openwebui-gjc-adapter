@@ -49,7 +49,19 @@ interface ScopedMappingRetirement {
 }
 
 export class SessionMappingStore {
+	#adminPrincipalId: string | undefined;
+
 	constructor(protected readonly authority: SessionAuthority = new SessionAuthority()) {}
+
+	/**
+	 * Configures the sole administrator principal. Scoped lookups for exactly
+	 * this principal fall back to legacy unscoped mappings, which by invariant
+	 * belong only to the configured admin (historical-import rows and
+	 * pre-scoping authority state). Normal principals never see them.
+	 */
+	setLegacyAdminPrincipalId(principalId: string | undefined): void {
+		this.#adminPrincipalId = principalId?.trim() || undefined;
+	}
 
 	get(chatId: string): SessionMapping | undefined {
 		const record = this.authority.get(chatId);
@@ -66,9 +78,14 @@ export class SessionMappingStore {
 	getScoped(scope: SessionMappingScope): SessionMapping | undefined {
 		const canonicalScope = canonicalScopeFor(scope);
 		const record = this.authority.get(canonicalScope.key);
-		return record === undefined || !isScopedRecordFor(record, canonicalScope) || isRetiredRecord(record)
-			? undefined
-			: mappingFromRecord(record);
+		if (record !== undefined && isScopedRecordFor(record, canonicalScope) && !isRetiredRecord(record))
+			return mappingFromRecord(record);
+		if (this.#adminPrincipalId !== undefined && scope.principalId === this.#adminPrincipalId) {
+			const legacy = this.authority.get(scope.chatId);
+			if (legacy !== undefined && !isScopedRecordFor(legacy, canonicalScope) && !isRetiredRecord(legacy))
+				return mappingFromRecord(legacy);
+		}
+		return undefined;
 	}
 	setScoped(scope: SessionMappingScope, mapping: SessionMapping): SessionMapping {
 		const canonicalScope = canonicalScopeFor(scope);

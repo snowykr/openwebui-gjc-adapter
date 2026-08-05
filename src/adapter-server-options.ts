@@ -16,7 +16,7 @@ import { type AdapterConfig, loadAdapterConfig, type ResolvedAdapterConfig } fro
 import { resolveLegacySessionAuthoritySourcePaths, SESSION_AUTHORITY_MAPPING_FILE } from "./config-env";
 import { preflightSessionAuthorityMigrationCandidates } from "./gjc/session-authority-migration";
 import { loadGjcSessionFile } from "./gjc/session-loader";
-import { FileBackedSessionMappingStore, type SessionMapping, type SessionMappingStore } from "./gjc/session-router";
+import { FileBackedSessionMappingStore, type SessionMapping, SessionMappingStore } from "./gjc/session-router";
 import type { GjcCloseReceipt } from "./gjc/turn-runner";
 import type { LiveGatewayEventSink, LiveGatewayMessageSink } from "./live/chat-completions";
 import type { LiveGatewayFileContextResolver } from "./live/file-contexts";
@@ -163,6 +163,7 @@ export async function buildResolvedAdapterServerOptions(
 			});
 		}
 		const mappings = dependencies.mappings ?? new FileBackedSessionMappingStore(mappingStorePath);
+		if (mappings instanceof SessionMappingStore) mappings.setLegacyAdminPrincipalId(owner.ownerUserId);
 		const runtimeAdminClientFactory = buildOpenWebUIRuntimeAdminClientFactory(config);
 		const principalClientFactory = buildOpenWebUIPrincipalClientFactory(config, workspaceRegistry);
 		const runtimeAdminClient =
