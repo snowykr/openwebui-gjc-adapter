@@ -2,12 +2,14 @@ import { randomUUID } from "node:crypto";
 import type { OpenWebUIPrincipal } from "../openwebui/auth";
 import type { UserWorkspace } from "../security/user-workspace";
 import type { WorkspaceLease } from "../security/workspace-lease";
+import { acquireWorkspaceAdmission } from "./chat-completions";
 import type { ModelReaderContext } from "./model-reader";
 import { createModelSelectionPolicy } from "./model-selection-policy";
 import { jsonResponse, modelSelectionErrorResponse } from "./openai-response-utils";
 import type { AdapterRouteDependencies } from "./openai-routes";
 
 const DEFAULT_MODELS_WORKSPACE_LEASE_DURATION_MS = 210_000;
+const MODELS_WORKSPACE_ADMISSION_QUEUE_LIMIT = 32;
 
 type OpenAIModelsRequestOptions = {
 	readonly catalogOnly?: boolean;
@@ -41,6 +43,17 @@ export async function handleOpenAIModelsRequest(
 		const heartbeatMs = routes.workspaceLeaseHeartbeatMs ?? Math.max(1, Math.floor(leaseDurationMs / 4));
 		if (!Number.isSafeInteger(heartbeatMs) || heartbeatMs <= 0 || heartbeatMs * 3 >= leaseDurationMs)
 			return modelsWorkspaceLeaseErrorResponse();
+		let releaseAdmission: (() => void) | undefined;
+		try {
+			releaseAdmission = await acquireWorkspaceAdmission(
+				routes.workspaceLeaseManager,
+				workspace.safeKey,
+				leaseDurationMs,
+				MODELS_WORKSPACE_ADMISSION_QUEUE_LIMIT,
+			);
+		} catch {
+			return modelsWorkspaceLeaseErrorResponse();
+		}
 		let lease: WorkspaceLease;
 		try {
 			lease = await routes.workspaceLeaseManager.acquire({
@@ -50,10 +63,14 @@ export async function handleOpenAIModelsRequest(
 				leaseMs: leaseDurationMs,
 			});
 		} catch {
+			releaseAdmission();
 			return modelsWorkspaceLeaseErrorResponse();
 		}
-		if (lease === undefined) return modelsWorkspaceLeaseErrorResponse();
-		const admission = new ModelsWorkspaceLeaseAdmission(lease, leaseDurationMs, heartbeatMs);
+		if (lease === undefined) {
+			releaseAdmission();
+			return modelsWorkspaceLeaseErrorResponse();
+		}
+		const admission = new ModelsWorkspaceLeaseAdmission(lease, leaseDurationMs, heartbeatMs, releaseAdmission);
 		const context: ModelReaderContext = {
 			principal,
 			workspace,
@@ -166,13 +183,15 @@ class ModelsWorkspaceLeaseAdmission {
 	readonly #heartbeat: ReturnType<typeof setInterval>;
 	#renewal: Promise<void> | undefined;
 	#finishPromise: Promise<boolean> | undefined;
+	#releaseAdmission: (() => void) | undefined;
 	#failure = false;
 	#stopping = false;
 
-	constructor(lease: WorkspaceLease, durationMs: number, heartbeatMs: number) {
+	constructor(lease: WorkspaceLease, durationMs: number, heartbeatMs: number, releaseAdmission: () => void) {
 		this.#lease = lease;
 		this.#durationMs = durationMs;
 		this.#heartbeat = setInterval(() => this.#scheduleRenewal(), heartbeatMs);
+		this.#releaseAdmission = releaseAdmission;
 		(this.#heartbeat as unknown as { unref?: () => void }).unref?.();
 	}
 
@@ -193,22 +212,28 @@ class ModelsWorkspaceLeaseAdmission {
 	}
 
 	async #finish(): Promise<boolean> {
-		this.#stopping = true;
-		clearInterval(this.#heartbeat);
-		if (this.#renewal !== undefined) await this.#renewal;
-		let healthy = true;
 		try {
-			await this.#lease.assertFence();
-		} catch {
-			this.#markFailure();
-			healthy = false;
+			this.#stopping = true;
+			clearInterval(this.#heartbeat);
+			if (this.#renewal !== undefined) await this.#renewal;
+			let healthy = true;
+			try {
+				await this.#lease.assertFence();
+			} catch {
+				this.#markFailure();
+				healthy = false;
+			}
+			try {
+				await this.#lease.release();
+			} catch {
+				healthy = false;
+			}
+			return healthy && !this.#failure;
+		} finally {
+			const releaseAdmission = this.#releaseAdmission;
+			this.#releaseAdmission = undefined;
+			releaseAdmission?.();
 		}
-		try {
-			await this.#lease.release();
-		} catch {
-			healthy = false;
-		}
-		return healthy && !this.#failure;
 	}
 
 	#scheduleRenewal(): void {

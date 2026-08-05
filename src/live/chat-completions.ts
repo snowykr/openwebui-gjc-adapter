@@ -501,6 +501,16 @@ async function waitForWorkspaceAdmission(previous: Promise<void>, timeoutMs: num
 		);
 	});
 }
+/** Acquires the same-process workspace admission queue for a normal-user operation. */
+export async function acquireWorkspaceAdmission(
+	manager: object,
+	safeKey: string,
+	timeoutMs: number,
+	queueLimit: number,
+): Promise<() => void> {
+	return workspaceAdmissionGateFor(manager, safeKey).acquire(timeoutMs, queueLimit);
+}
+
 async function acquireWorkspaceLease(
 	input: HandleChatCompletionsInput,
 	safeKey: string,
@@ -510,8 +520,12 @@ async function acquireWorkspaceLease(
 	const heartbeatMs = resolveWorkspaceLeaseHeartbeat(input.workspaceLeaseHeartbeatMs, durationMs);
 	const timeoutMs = resolveWorkspaceAdmissionTimeout(input.workspaceAdmissionTimeoutMs ?? durationMs);
 	const queueLimit = resolveWorkspaceAdmissionQueueLimit(input.workspaceAdmissionQueueLimit);
-	const gate = workspaceAdmissionGateFor(input.workspaceLeaseManager, safeKey);
-	const releaseAdmission = await gate.acquire(timeoutMs, queueLimit);
+	const releaseAdmission = await acquireWorkspaceAdmission(
+		input.workspaceLeaseManager,
+		safeKey,
+		timeoutMs,
+		queueLimit,
+	);
 	try {
 		const lease = await input.workspaceLeaseManager.acquire({
 			safeKey,
