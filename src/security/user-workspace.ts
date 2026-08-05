@@ -451,6 +451,26 @@ function assertPrivateRegistryLockStat(stats: Stats, lockPath: string): void {
 }
 
 async function reclaimRegistryLock(lockPath: string, snapshot: RegistryLockSnapshot): Promise<boolean> {
+	// Verify the live path still holds the stale snapshot BEFORE claiming it.
+	// Never rename a lock another process has replaced since the snapshot was
+	// read, and never leave the path absent while a live owner still relies on
+	// its guard; otherwise a concurrent acquirer can enter the registry
+	// critical section alongside the moved owner.
+	let current: RegistryLockSnapshot | undefined;
+	try {
+		current = await readRegistryLockSnapshot(lockPath);
+	} catch (error) {
+		if (!(error instanceof RegistryLockMetadataError)) throw error;
+		return false;
+	}
+	if (
+		current === undefined ||
+		current.device !== snapshot.device ||
+		current.inode !== snapshot.inode ||
+		!sameRegistryLockOwner(current.owner, snapshot.owner)
+	) {
+		return false;
+	}
 	const reclaimPath = `${lockPath}.reclaim-${process.pid}-${randomUUID()}`;
 	try {
 		await fs.rename(lockPath, reclaimPath);
