@@ -43,8 +43,11 @@ export async function assertProjectsAdmitted(
 		}
 		if (project.sessionRoot !== undefined) {
 			const canonicalSessionRoot = await resolveExistingOrProspectivePath(project.sessionRoot);
+			// The allowlist admits the durable sessions directory and its
+			// descendants only; an ancestor such as the protected state root
+			// itself must still be rejected.
 			const sessionRootAllowed = canonicalAllowedSessionRoots.some(allowed =>
-				pathsOverlap(canonicalSessionRoot, allowed),
+				isPathInsideRoot(canonicalSessionRoot, allowed),
 			);
 			if (
 				!sessionRootAllowed &&

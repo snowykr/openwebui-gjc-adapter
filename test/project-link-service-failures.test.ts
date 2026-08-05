@@ -75,6 +75,12 @@ describe("project link registration failure handling", () => {
 			message: "Project session root must not overlap protected GJC runtime paths.",
 		});
 		await expect(
+			admit([{ ...projectFixture("state-root-itself", cwd, workspace), sessionRoot: protectedRoots[0] }]),
+		).rejects.toMatchObject({
+			code: "invalid_project_link",
+			message: "Project session root must not overlap protected GJC runtime paths.",
+		});
+		await expect(
 			admit([{ ...projectFixture("durable-session-root", cwd, workspace), sessionRoot: allowedSessionRoot }]),
 		).resolves.toBeUndefined();
 	});
