@@ -128,8 +128,9 @@ describe("OpenWebUIHttpClient projection writes", () => {
 			fixture.stop();
 		}
 	});
-	test("fails normal-principal projection writes closed before any OpenWebUI mutation", async () => {
-		const fixture = startRecordingServer();
+	test("allows proof-bound normal-principal event and content writes while blocking resource projection", async () => {
+		const fixtureOptions: { responseBody?: unknown } = {};
+		const fixture = startRecordingServer(fixtureOptions);
 		const principal = createOpenWebUIPrincipalClient(
 			new OpenWebUIHttpClient({ baseUrl: fixture.baseUrl, apiToken: "admin-token" }),
 			"owner-1",
@@ -162,23 +163,38 @@ describe("OpenWebUIHttpClient projection writes", () => {
 					},
 				]),
 			).rejects.toMatchObject(expectedError);
+
+			fixtureOptions.responseBody = true;
 			await expect(
 				principal.postMessageEvent({
 					chatId: "chat-1",
 					messageId: "message-1",
-					event: buildOpenWebUIStatusEvent({ description: "must not write", done: false }),
+					event: buildOpenWebUIStatusEvent({ description: "verified event", done: false }),
 					proof,
 				}),
-			).rejects.toMatchObject(expectedError);
+			).resolves.toBeUndefined();
 			await expect(
 				principal.updateMessageContent({
 					chatId: "chat-1",
 					messageId: "message-1",
-					content: "must not write",
+					content: "verified content",
 					proof,
 				}),
-			).rejects.toMatchObject(expectedError);
-			expect(fixture.requests).toHaveLength(0);
+			).resolves.toBeUndefined();
+			expect(fixture.requests).toEqual([
+				{
+					method: "POST",
+					path: "/api/v1/chats/chat-1/messages/message-1/event",
+					authorization: "Bearer admin-token",
+					body: { type: "status", data: { description: "verified event", done: false } },
+				},
+				{
+					method: "POST",
+					path: "/api/v1/chats/chat-1/messages/message-1",
+					authorization: "Bearer admin-token",
+					body: { content: "verified content" },
+				},
+			]);
 		} finally {
 			fixture.stop();
 		}
@@ -249,7 +265,7 @@ describe("OpenWebUIHttpClient projection writes", () => {
 		}
 	});
 
-	test("reports unavailable normal-principal message delivery after owner/chat proof without mutating OpenWebUI", async () => {
+	test("delivers proof-bound normal-principal message events", async () => {
 		const fixtureOptions: { responseBody?: unknown } = {
 			responseBody: {
 				id: "chat-1",
@@ -267,19 +283,18 @@ describe("OpenWebUIHttpClient projection writes", () => {
 		);
 		try {
 			const proof = await client.requireChatProof("chat-1");
+			fixtureOptions.responseBody = true;
 			await expect(
 				client.postMessageEvent({
 					chatId: "chat-1",
 					messageId: "message-1",
-					event: buildOpenWebUIStatusEvent({ description: "must not write", done: false }),
+					event: buildOpenWebUIStatusEvent({ description: "verified event", done: false }),
 					proof,
 				}),
-			).rejects.toMatchObject({
-				code: "openwebui_principal_projection_unavailable",
-				name: "OpenWebUIPrincipalProjectionError",
-			});
+			).resolves.toBeUndefined();
 			expect(fixture.requests.map(request => [request.method, request.path])).toEqual([
 				["GET", "/api/v1/chats/chat-1"],
+				["POST", "/api/v1/chats/chat-1/messages/message-1/event"],
 			]);
 		} finally {
 			fixture.stop();

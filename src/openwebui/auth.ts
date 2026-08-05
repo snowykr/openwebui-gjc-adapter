@@ -45,7 +45,7 @@ export class OpenWebUIPrincipalProjectionError extends OpenWebUIPrincipalScopeEr
 
 	constructor() {
 		super(
-			"Normal-principal OpenWebUI projection writes are unavailable: the OpenWebUI client has no principal-bound credential or supported owner impersonation operation. Refusing to use the configured administrator token.",
+			"Normal-principal OpenWebUI resource projection writes are unavailable: the configured administrator token may not create, replace, or delete user resources.",
 		);
 		this.name = "OpenWebUIPrincipalProjectionError";
 	}

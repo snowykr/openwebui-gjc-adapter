@@ -693,7 +693,6 @@ export class OpenWebUIPrincipalClient implements OpenWebUIProjectionRepository {
 		assertOpenWebUIOwnerChatProof(input.proof, { ownerUserId: this.#principal.userId, chatId: input.chatId });
 		requirePrincipalId(input.chatId, "chat");
 		requirePrincipalId(input.messageId, "message");
-		assertPrincipalProjectionWriteCapability(this.#principal);
 		await this.#client.postMessageEvent(input);
 	}
 
@@ -703,7 +702,6 @@ export class OpenWebUIPrincipalClient implements OpenWebUIProjectionRepository {
 		assertOpenWebUIOwnerChatProof(input.proof, { ownerUserId: this.#principal.userId, chatId: input.chatId });
 		requirePrincipalId(input.chatId, "chat");
 		requirePrincipalId(input.messageId, "message");
-		assertPrincipalProjectionWriteCapability(this.#principal);
 		await this.#client.updateMessageContent(input);
 	}
 
