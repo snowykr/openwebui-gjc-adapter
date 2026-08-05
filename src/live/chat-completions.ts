@@ -416,14 +416,13 @@ class WorkspaceLeaseAdmission {
 		try {
 			this.#lease = await this.#lease.renew(this.#durationMs);
 		} catch (error) {
-			this.#markFailure(error, true);
+			this.#markFailure(error);
 		}
 	}
 
-	#markFailure(_error: unknown, finalize = false): void {
+	#markFailure(_error: unknown): void {
 		if (this.#failure) return;
 		this.#failure = true;
-		if (finalize) void this.finish().catch(() => {});
 	}
 }
 class WorkspaceAdmissionGate {

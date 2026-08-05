@@ -2239,11 +2239,21 @@ test("promotes a delayed acknowledged session.new successor after restart", asyn
 			"generation",
 			"payloadDigest",
 		]);
+		const outbox = new InMemoryOutboxStore();
 		const replay = createGjcRoutingLiveGatewayRunner({
 			turnRunner: createPublicSdkGjcTurnRunner(fixture.runnerInput),
 			mappings: new FileBackedSessionMappingStore(fixture.mappingFile),
+			outbox,
+			ownerUserId: "admin-1",
 		});
 		await expect(replay.run(fixture.turn)).resolves.toMatchObject({ content: "" });
+		expect(outbox.listPending()).toContainEqual(
+			expect.objectContaining({
+				operationId: "session-new",
+				ownerUserId: "admin-1",
+				chatId: "chat-session-new",
+			}),
+		);
 		const restarted = new FileBackedSessionMappingStore(fixture.mappingFile);
 		expect(restarted.get("chat-session-new")).toMatchObject({
 			sessionId: "sdk-session-new",

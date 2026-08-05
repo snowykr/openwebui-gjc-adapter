@@ -474,6 +474,90 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 			await rm(root, { recursive: true, force: true });
 		}
 	});
+	it("retains same-user admission after a stream heartbeat failure until abandonment settles", async () => {
+		const safeKey = "f".repeat(64);
+		let acquired = 0;
+		let runnerCalls = 0;
+		let abandonFirst!: () => void;
+		const firstSourceSettled = new Promise<void>(resolve => {
+			abandonFirst = resolve;
+		});
+		const successfulLease = {
+			renew: async () => successfulLease,
+			assertFence: async () => {},
+			release: async () => {},
+		};
+		const failingLease = {
+			renew: async () => {
+				throw new Error("heartbeat lost");
+			},
+			assertFence: async () => {},
+			release: async () => {},
+		};
+		const workspaceLeaseManager = {
+			async acquire() {
+				acquired += 1;
+				return acquired === 1 ? failingLease : successfulLease;
+			},
+		} as unknown as WorkspaceLeaseManager;
+		const workspaceRegistry = {
+			open: async (userId: string) => ({
+				userId,
+				safeKey,
+				root: process.cwd(),
+				sessionRoot: join(process.cwd(), ".gjc", "sessions"),
+			}),
+		};
+		const runner = {
+			run() {
+				runnerCalls += 1;
+				if (runnerCalls === 1) {
+					return {
+						chunks: {
+							async *[Symbol.asyncIterator]() {
+								await firstSourceSettled;
+								yield "";
+							},
+						},
+						abandon: async () => {
+							abandonFirst();
+							await firstSourceSettled;
+						},
+						model: "gjc/anthropic/claude-sonnet-4:low",
+					};
+				}
+				return { content: "queued", model: "gjc/anthropic/claude-sonnet-4:low" };
+			},
+		};
+		const first = await handleChatCompletions({
+			request: { model: "gjc", stream: true, messages: [{ role: "user", content: "first" }] },
+			headers: { ...chatHeaders, "X-OpenWebUI-User-Id": "normal-1" },
+			projects: [project],
+			owner,
+			workspaceRegistry,
+			workspaceLeaseManager,
+			workspaceLeaseDurationMs: 30,
+			workspaceLeaseHeartbeatMs: 5,
+			runner,
+		});
+		if (!first.ok || !("stream" in first)) throw new Error("expected streaming result");
+		await new Promise(resolve => setTimeout(resolve, 20));
+		const second = handleChatCompletions({
+			request: { model: "gjc", messages: [{ role: "user", content: "second" }] },
+			headers: { ...chatHeaders, "X-OpenWebUI-User-Id": "normal-1", "X-OpenWebUI-Message-Id": "assistant-2" },
+			projects: [project],
+			owner,
+			workspaceRegistry,
+			workspaceLeaseManager,
+			runner,
+		});
+		await Promise.resolve();
+		expect(acquired).toBe(1);
+		const iterator = first.stream[Symbol.asyncIterator]();
+		await iterator.return?.().catch(() => {});
+		expect((await second).ok).toBe(true);
+		expect(acquired).toBe(2);
+	});
 	it("fails closed on lease acquisition without invoking the runner", async () => {
 		const root = await mkdtemp(join(tmpdir(), "gjc-workspace-lease-failure-"));
 		const workspace = join(root, "workspace");

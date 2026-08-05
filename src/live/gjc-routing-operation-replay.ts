@@ -86,15 +86,21 @@ export async function replayRoutingOperation(
 				sessionFile: recovered.sessionFile,
 				recoveryAttachment: recovered.attachment,
 			},
-			lifecycle =>
-				publishRecoveredAcknowledgedSuccessor(
+			async lifecycle => {
+				const published = await publishRecoveredAcknowledgedSuccessor(
 					mappings,
 					turn,
 					predecessor,
 					lifecycle,
 					controlOperationHash(turn),
 					recovered,
-				),
+				);
+				const mapping = mappings.get(turn.chatId);
+				if (mapping === undefined || mapping.operationId !== turn.userMessageId)
+					throw new Error(`GJC operation ${turn.userMessageId} recovery did not publish a current mapping.`);
+				ensureProjectionRows(input.outbox, mapping, projectionOwnerUserId, principalId);
+				return published;
+			},
 		);
 	}
 	if (turn.control !== undefined && priorOperation?.state === "pending")
