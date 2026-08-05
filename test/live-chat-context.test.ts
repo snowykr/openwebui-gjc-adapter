@@ -268,7 +268,7 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 				runner,
 			});
 			await startedPromise;
-			const second = await handleChatCompletions({
+			const second = handleChatCompletions({
 				request: { model: "gjc", messages: [{ role: "user", content: "second" }] },
 				headers: { ...chatHeaders, "X-OpenWebUI-User-Id": "normal-1", "X-OpenWebUI-Message-Id": "assistant-2" },
 				projects: [project],
@@ -277,14 +277,12 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 				workspaceLeaseManager,
 				runner,
 			});
-			expect(second).toMatchObject({
-				ok: false,
-				status: 503,
-				body: { error: { code: "workspace_lease_uncertain" } },
-			});
+			await Promise.resolve();
 			expect(runnerCalls).toBe(1);
 			releaseFirst();
 			expect((await first).ok).toBe(true);
+			expect((await second).ok).toBe(true);
+			expect(runnerCalls).toBe(2);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
@@ -450,8 +448,8 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 			await Promise.resolve();
 			expect(firstSettled).toBe(false);
 
-			const blocked = await handleChatCompletions({
-				request: { ...request, stream: false, messages: [{ role: "user", content: "blocked" }] },
+			const queued = handleChatCompletions({
+				request: { ...request, stream: false, messages: [{ role: "user", content: "queued" }] },
 				headers: {
 					...firstHeaders,
 					"X-OpenWebUI-Chat-Id": "chat-routed-2",
@@ -464,32 +462,13 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 				workspaceLeaseManager,
 				runner,
 			});
-			expect(blocked).toMatchObject({
-				ok: false,
-				status: 503,
-				body: { error: { code: "workspace_lease_uncertain" } },
-			});
+			await Promise.resolve();
 			expect(runnerCalls).toBe(1);
 
 			releaseFirst();
 			await abandonment;
 			expect(firstSettled).toBe(true);
-
-			const admitted = await handleChatCompletions({
-				request: { ...request, stream: false, messages: [{ role: "user", content: "admitted" }] },
-				headers: {
-					...firstHeaders,
-					"X-OpenWebUI-Chat-Id": "chat-routed-3",
-					"X-OpenWebUI-Message-Id": "assistant-routed-3",
-					"X-OpenWebUI-User-Message-Id": "user-routed-3",
-				},
-				projects: [project],
-				owner,
-				workspaceRegistry,
-				workspaceLeaseManager,
-				runner,
-			});
-			expect(admitted.ok).toBe(true);
+			expect((await queued).ok).toBe(true);
 			expect(runnerCalls).toBe(2);
 		} finally {
 			await rm(root, { recursive: true, force: true });

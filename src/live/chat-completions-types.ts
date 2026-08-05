@@ -117,5 +117,9 @@ export interface HandleChatCompletionsInput {
 	readonly workspaceLeaseManager?: Pick<WorkspaceLeaseManager, "acquire">;
 	/** Lease duration and renewal heartbeat are injectable for focused lifecycle tests. */
 	readonly workspaceLeaseDurationMs?: number;
+	/** Same-process normal-user admission wait bound. */
+	readonly workspaceAdmissionTimeoutMs?: number;
+	/** Maximum same-process normal-user admission queue depth. */
+	readonly workspaceAdmissionQueueLimit?: number;
 	readonly workspaceLeaseHeartbeatMs?: number;
 }
