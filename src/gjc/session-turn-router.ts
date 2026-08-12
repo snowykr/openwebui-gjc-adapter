@@ -348,15 +348,16 @@ async function withLifecyclePublication<T>(
 export function replayOperation(operationId: string, result: SessionOperationResult | undefined): RouteGjcTurnResult {
 	if (result === undefined || result.kind !== "turn" || result.mapping.operationId !== operationId)
 		throw new Error(`GJC operation ${operationId} completed without a valid immutable result binding.`);
+	const replayEvents = result.events ?? [];
 	return {
 		assistantText: result.assistantText,
-		events: result.events,
+		events: replayEvents,
 		mapping: {
 			...result.mapping,
 			...(result.mapping.attachment === undefined ? {} : { attachment: copyAttachment(result.mapping.attachment) }),
 			operationId,
 			assistantText: result.assistantText,
-			events: result.events,
+			events: replayEvents,
 		},
 	};
 }

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalSessionMappingKey, SessionAuthority } from "../src/gjc/session-authority";
@@ -42,6 +42,46 @@ function memoryHarness(): StoreHarness {
 		},
 		cleanup: () => {},
 	};
+}
+
+function readAuthorityMerged(filePath: string): any {
+	const base = JSON.parse(readFileSync(filePath, "utf8"));
+	const walPath = `${filePath}.wal`;
+	let walBytes: string;
+	try {
+		walBytes = readFileSync(walPath, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return base;
+		throw error;
+	}
+	const lines = walBytes.split("\n").filter(line => line.length > 0);
+	if (lines.length === 0) return base;
+	let header: any;
+	try {
+		header = JSON.parse(lines[0]!);
+	} catch {
+		return base;
+	}
+	const baseStat = statSync(filePath);
+	if (header?.base?.size !== baseStat.size || header?.base?.mtimeMs !== baseStat.mtimeMs) return base;
+	const records = new Map<string, any>();
+	const provisional = new Map<string, any>();
+	for (const record of base.mappings ?? []) records.set(record.chatId, record);
+	for (const operation of base.provisionalOperations ?? [])
+		provisional.set(JSON.stringify([operation.chatId, operation.ingressId ?? operation.id]), operation);
+	for (const line of lines.slice(1)) {
+		let delta: any;
+		try {
+			delta = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (delta?.kind !== "openwebui-gjc-session-authority-wal") continue;
+		for (const record of delta.records ?? []) records.set(record.chatId, record);
+		for (const item of delta.provisional ?? [])
+			if (item?.key !== undefined) provisional.set(item.key, item.operation);
+	}
+	return { ...base, mappings: [...records.values()], provisionalOperations: [...provisional.values()] };
 }
 
 function fileHarness(): StoreHarness {
@@ -504,7 +544,7 @@ test("file rejects an invalid retained prior tombstone during a pending reassign
 		});
 		store.beginProjectReassignment(source.chatId, target.projectId, "project-3");
 
-		const document = JSON.parse(readFileSync(filePath, "utf8"));
+		const document = readAuthorityMerged(filePath);
 		document.mappings[0].reassignment.priorTombstone.chatId = "other-chat";
 		writeFileSync(filePath, JSON.stringify(document));
 

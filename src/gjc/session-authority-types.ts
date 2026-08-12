@@ -69,7 +69,7 @@ export interface SessionOperationGateBinding {
 export interface SessionOperationResult {
 	readonly kind: "turn" | "control" | "close";
 	readonly assistantText: string;
-	readonly events: readonly GjcTurnEvent[];
+	readonly events?: readonly GjcTurnEvent[];
 	readonly mapping: Readonly<{
 		chatId: string;
 		projectId: string;

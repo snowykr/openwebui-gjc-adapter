@@ -176,8 +176,7 @@ function isOperationResult(value: unknown): value is SessionOperationResult {
 		!hasOnlyKeys(value, ["kind", "assistantText", "events", "mapping", "correlation", "gate"]) ||
 		(value.kind !== "turn" && value.kind !== "control" && value.kind !== "close") ||
 		typeof value.assistantText !== "string" ||
-		!Array.isArray(value.events) ||
-		!value.events.every(isEvent) ||
+		(value.events !== undefined && (!Array.isArray(value.events) || !value.events.every(isEvent))) ||
 		!hasOnlyKeys(value.mapping, [
 			"chatId",
 			"projectId",

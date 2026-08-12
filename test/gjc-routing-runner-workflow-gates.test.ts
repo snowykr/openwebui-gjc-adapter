@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { NormalizedModelSelection } from "../src/contracts";
@@ -342,7 +342,7 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 				const filePath = join(root, "mappings.json");
 				const mappings = new FileBackedSessionMappingStore(filePath);
 				mappings.set({ ...baseMapping("seed-chat"), operationId: "seed-user" });
-				const before = readFileSync(filePath, "utf8");
+				const before = readAuthorityMerged(filePath);
 				class FailingStartFakeGjcTurnRunner extends FakeGjcTurnRunner {
 					async startNewSession<T>(
 						input: GjcStartNewSessionInput,
@@ -372,12 +372,12 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 					`${failure} failed`,
 				);
 				expect(mappings.get("failed-chat")).toBeUndefined();
-				const document = JSON.parse(readFileSync(filePath, "utf8")) as {
+				const document = readAuthorityMerged(filePath) as {
 					readonly mappings: readonly { readonly chatId?: unknown }[];
 					readonly provisionalOperations: readonly Record<string, unknown>[];
 				};
 				expect(document.mappings).toEqual(
-					(JSON.parse(before) as { readonly mappings: readonly { readonly chatId?: unknown }[] }).mappings,
+					(before as { readonly mappings: readonly { readonly chatId?: unknown }[] }).mappings,
 				);
 				expect(document.mappings.some(mapping => mapping.chatId === "failed-chat")).toBeFalse();
 				expect(document.provisionalOperations).toHaveLength(1);
@@ -430,7 +430,7 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 			expect(readFileSync(filePath, "utf8")).toBe(legacy);
 
 			mappings.set({ ...baseMapping("next-chat"), operationId: "next-user" });
-			expect(JSON.parse(readFileSync(filePath, "utf8"))).toMatchObject({
+			expect(readAuthorityMerged(filePath)).toMatchObject({
 				provisionalOperations: [],
 			});
 
@@ -463,6 +463,46 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 		}
 	});
 });
+
+function readAuthorityMerged(filePath: string): any {
+	const base = JSON.parse(readFileSync(filePath, "utf8"));
+	const walPath = `${filePath}.wal`;
+	let walBytes: string;
+	try {
+		walBytes = readFileSync(walPath, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return base;
+		throw error;
+	}
+	const lines = walBytes.split("\n").filter(line => line.length > 0);
+	if (lines.length === 0) return base;
+	let header: any;
+	try {
+		header = JSON.parse(lines[0]!);
+	} catch {
+		return base;
+	}
+	const baseStat = statSync(filePath);
+	if (header?.base?.size !== baseStat.size || header?.base?.mtimeMs !== baseStat.mtimeMs) return base;
+	const records = new Map<string, any>();
+	const provisional = new Map<string, any>();
+	for (const record of base.mappings ?? []) records.set(record.chatId, record);
+	for (const operation of base.provisionalOperations ?? [])
+		provisional.set(JSON.stringify([operation.chatId, operation.ingressId ?? operation.id]), operation);
+	for (const line of lines.slice(1)) {
+		let delta: any;
+		try {
+			delta = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (delta?.kind !== "openwebui-gjc-session-authority-wal") continue;
+		for (const record of delta.records ?? []) records.set(record.chatId, record);
+		for (const item of delta.provisional ?? [])
+			if (item?.key !== undefined) provisional.set(item.key, item.operation);
+	}
+	return { ...base, mappings: [...records.values()], provisionalOperations: [...provisional.values()] };
+}
 
 function pendingGateMappings(
 	event: unknown,

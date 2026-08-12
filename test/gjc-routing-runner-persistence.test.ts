@@ -1,12 +1,23 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+	appendFileSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GjcRuntimeLocations, NormalizedModelSelection } from "../src/contracts";
 import type { PublicSdkSessionPort } from "../src/gjc/public-sdk-contract";
 import { PublicSdkSessionClient } from "../src/gjc/public-sdk-session-port";
 import { FileSessionAuthority, SessionAuthorityDurabilityError } from "../src/gjc/session-authority-persistence";
+import type { ProvisionalSessionOperation, SessionAuthorityRecord } from "../src/gjc/session-authority-types";
 import { FileBackedSessionMappingStore, SessionMappingStore } from "../src/gjc/session-router";
 import type {
 	GjcControlResult,
@@ -257,9 +268,16 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			const authority = new FileSessionAuthority(filePath);
 			authority.set(mappingInput(mediumSelection));
 			authority.beginReassignment("chat-1", project.id, "project-b");
-			expect(readFileSync(filePath, "utf8")).toContain('"state": "pending"');
+			expect(readAuthorityMerged(filePath).mappings[0].reassignment).toMatchObject({
+				state: "pending",
+				targetProjectId: "project-b",
+			});
 
 			authority.rollbackReassignment("chat-1", project.id);
+			expect(readAuthorityMerged(filePath).mappings[0].reassignment).toMatchObject({
+				state: "rolled_back",
+				targetProjectId: "project-b",
+			});
 			expect(new FileSessionAuthority(filePath).get("chat-1")?.reassignment).toMatchObject({
 				state: "rolled_back",
 				targetProjectId: "project-b",
@@ -282,21 +300,73 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				.sort(),
 		).toEqual(["chat-1", "chat-2"]);
 	});
-	test.each(["write", "fsync", "rename"])("restores live authority after an injected %s failure", phase => {
-		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-failure-")), "mappings.json");
+	test.each(["open", "fsync", "close"])(
+		"rolls back memory and boot state after an injected WAL append %s failure",
+		phase => {
+			const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-failure-")), "mappings.json");
+			const authority = new FailingFileSessionAuthority(filePath);
+			authority.set(mappingInput(mediumSelection));
+			authority.walFailure = new Error(`injected wal ${phase} failure`);
+
+			expect(() =>
+				authority.set({
+					...mappingInput(mediumSelection),
+					chatId: `${phase}-chat`,
+					operationId: `${phase}-operation`,
+				}),
+			).toThrow(`injected wal ${phase} failure`);
+			expect(authority.entries().map(record => record.chatId)).toEqual(["chat-1"]);
+			expect(new FileSessionAuthority(filePath).entries().map(record => record.chatId)).toEqual(["chat-1"]);
+		},
+	);
+	test("keeps a WAL-append mutation durable when a later compaction rewrite fails", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-compaction-failure-")), "mappings.json");
 		const authority = new FailingFileSessionAuthority(filePath);
 		authority.set(mappingInput(mediumSelection));
-		authority.failure = new Error(`injected ${phase} failure`);
+		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+		authority.failure = new Error("injected compaction failure");
 
-		expect(() =>
-			authority.set({
-				...mappingInput(mediumSelection),
-				chatId: `${phase}-chat`,
-				operationId: `${phase}-operation`,
-			}),
-		).toThrow(`injected ${phase} failure`);
-		expect(authority.entries().map(record => record.chatId)).toEqual(["chat-1"]);
-		expect(new FileSessionAuthority(filePath).entries().map(record => record.chatId)).toEqual(["chat-1"]);
+		expect(() => authority.forceCompaction()).toThrow("injected compaction failure");
+		// the WAL still carries chat-2, so neither memory nor boot state loses it
+		expect(
+			authority
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2"]);
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2"]);
+	});
+	test("rolls back a compaction rewrite failure inside a mutation to the pre-mutation snapshot", () => {
+		const filePath = join(
+			mkdtempSync(join(tmpdir(), "gjc-session-authority-compaction-mutation-failure-")),
+			"mappings.json",
+		);
+		const authority = new CompactionFailingFileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+		authority.failure = new Error("injected compaction failure");
+		const candidate = authority.set({ ...mappingInput(mediumSelection), chatId: "chat-3", operationId: "user-3" });
+
+		expect(() => authority.replaceAllDuringMutation([candidate], [])).toThrow("injected compaction failure");
+		// memory rolls back to the snapshot taken at mutation entry (chat-1..chat-3),
+		// and the WAL still carries chat-2 and chat-3, so boot state matches
+		expect(
+			authority
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2", "chat-3"]);
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2", "chat-3"]);
 	});
 	test.each(["open", "fsync", "close"])("reloads visible authority after an injected directory %s failure", phase => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-directory-failure-")), "mappings.json");
@@ -329,6 +399,145 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				.map(record => record.chatId)
 				.sort(),
 		).toEqual(["chat-1", `${phase}-chat`]);
+	});
+	test("a fresh authority sees a WAL-append mutation before any compaction", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-replay-")), "mappings.json");
+		const authority = new FileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+
+		const baseDocument = JSON.parse(readFileSync(filePath, "utf8"));
+		expect(baseDocument.mappings.map((record: { readonly chatId: string }) => record.chatId)).toEqual(["chat-1"]);
+		expect(readFileSync(`${filePath}.wal`, "utf8")).toContain("chat-2");
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2"]);
+	});
+	test("compacts a threshold-crossing WAL into a normalized compact base", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-compaction-")), "mappings.json");
+		const walPath = `${filePath}.wal`;
+		const authority = new FileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		const padding = "x".repeat(1024 * 1024);
+		let previousWalSize = -1;
+		let grew = 0;
+		let compacted = false;
+		let mutation = 0;
+		for (; mutation < 400; mutation += 1) {
+			authority.set({
+				...mappingInput(mediumSelection),
+				chatId: "chat-1",
+				operationId: `user-${mutation}`,
+				assistantText: `${padding}turn-${mutation}`,
+			});
+			const size = existsSync(walPath) ? statSync(walPath).size : 0;
+			if (size > previousWalSize) grew += 1;
+			// a compaction rewrite truncates the WAL inside the same mutation
+			if (grew >= 3 && size < previousWalSize) {
+				compacted = true;
+				break;
+			}
+			previousWalSize = size;
+		}
+		expect(compacted).toBe(true);
+
+		const baseBytes = readFileSync(filePath, "utf8");
+		expect(baseBytes).not.toMatch(/\n {2}/);
+		expect(baseBytes).toContain(`turn-${mutation}`);
+		expect(existsSync(walPath)).toBe(false);
+		const document = JSON.parse(baseBytes) as {
+			readonly mappings: readonly {
+				readonly journal: readonly { readonly result?: Record<string, unknown> }[];
+			}[];
+		};
+		for (const mapping of document.mappings)
+			for (const operation of mapping.journal) {
+				if (operation.result !== undefined) expect(operation.result).not.toHaveProperty("events");
+			}
+		expect(new FileSessionAuthority(filePath).get("chat-1")?.assistantText).toContain(`turn-${mutation}`);
+	});
+	test("boot recovers the valid WAL prefix and compacts after a crash mid-append", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-garbage-")), "mappings.json");
+		const walPath = `${filePath}.wal`;
+		const authority = new FileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+		appendFileSync(
+			walPath,
+			'{"kind":"openwebui-gjc-session-authority-wal","version":1,"records":[{"chatId":"crashed"',
+		);
+
+		const booted = new FileSessionAuthority(filePath);
+		expect(
+			booted
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2"]);
+		const document = JSON.parse(readFileSync(filePath, "utf8"));
+		expect(document.mappings.map((record: { readonly chatId: string }) => record.chatId).sort()).toEqual([
+			"chat-1",
+			"chat-2",
+		]);
+		expect(existsSync(walPath)).toBe(false);
+	});
+	test("discards a stale WAL when the base is replaced behind the store's back", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-external-edit-")), "mappings.json");
+		const walPath = `${filePath}.wal`;
+		const authority = new FileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+
+		const document = JSON.parse(readFileSync(filePath, "utf8"));
+		const seeded = document.mappings[0];
+		document.mappings.push({
+			...seeded,
+			chatId: "operator-chat",
+			header: { ...seeded.header, chatId: "operator-chat" },
+		});
+		writeFileSync(filePath, JSON.stringify(document));
+
+		const booted = new FileSessionAuthority(filePath);
+		expect(
+			booted
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "operator-chat"]);
+		expect(existsSync(walPath)).toBe(false);
+		booted.set({ ...mappingInput(mediumSelection), chatId: "chat-3", operationId: "user-3" });
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-3", "operator-chat"]);
+	});
+	test("a no-op mutation does not grow the WAL", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-noop-")), "mappings.json");
+		const walPath = `${filePath}.wal`;
+		const authority = new FileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		expect(existsSync(walPath)).toBe(false);
+
+		authority.set(mappingInput(mediumSelection));
+		expect(existsSync(walPath)).toBe(false);
+	});
+	test("reconciles a WAL-replayed pending operation on boot", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-reconcile-")), "mappings.json");
+		const authority = new FileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.beginOperation("chat-1", { id: "pending-op", kind: "prompt", detail: "hash" });
+		expect(readFileSync(`${filePath}.wal`, "utf8")).toContain('"state":"pending"');
+
+		const booted = new FileSessionAuthority(filePath);
+		expect(booted.lookupOperation("chat-1", "pending-op")).toMatchObject({ state: "uncertain" });
+		// boot compacts after reconciling: the WAL is truncated and the base carries the reconciled state
+		expect(existsSync(`${filePath}.wal`)).toBe(false);
+		expect(readFileSync(filePath, "utf8")).toContain('"state":"uncertain"');
 	});
 	test("durably records acknowledged create successors without replacing their predecessor", () => {
 		withFileStore((store, filePath) => {
@@ -2396,7 +2605,7 @@ function setupAcknowledgedSessionNewFixture(transcript: "absent" | "valid" | "du
 		if (phase !== "post_ack_pre_transcript") return;
 		barrierHits += 1;
 		expect(evidence).toMatchObject({ cwd: root, sessionId: "sdk-session-new" });
-		const persisted: any = JSON.parse(readFileSync(mappingFile, "utf8"));
+		const persisted: any = readAuthorityMerged(mappingFile);
 		expect(persisted.mappings[0]).toMatchObject({ sessionId: "sdk-session-created" });
 		expect(persisted.mappings[0].journal).toContainEqual(
 			expect.objectContaining({
@@ -2488,15 +2697,34 @@ function tmuxPanesInCwd(cwd: string): string[] {
 }
 class FailingFileSessionAuthority extends FileSessionAuthority {
 	failure: Error | undefined;
+	walFailure: Error | undefined;
 	directoryFailure: Error | undefined;
 
+	forceCompaction(): void {
+		this.persist();
+	}
 	protected override persist(): void {
 		if (this.failure !== undefined) throw this.failure;
 		super.persist();
 	}
+	protected override appendWal(
+		records: readonly SessionAuthorityRecord[],
+		provisional: readonly { readonly key: string; readonly operation: ProvisionalSessionOperation }[],
+	): void {
+		if (this.walFailure !== undefined) throw this.walFailure;
+		super.appendWal(records, provisional);
+	}
 	protected override syncDirectory(): void {
 		if (this.directoryFailure !== undefined) throw this.directoryFailure;
 		super.syncDirectory();
+	}
+}
+class CompactionFailingFileSessionAuthority extends FailingFileSessionAuthority {
+	replaceAllDuringMutation(
+		records: readonly SessionAuthorityRecord[],
+		provisional: readonly ProvisionalSessionOperation[] = [],
+	): void {
+		this.mutate(() => this.replaceAll(records, provisional));
 	}
 }
 const lowSelection = { provider: "anthropic", modelId: "claude-sonnet-4", thinkingLevel: "low" } as const;
@@ -2510,6 +2738,46 @@ async function withLifecyclePublication<T>(
 	if (runner.withLifecyclePublication === undefined) throw new Error("GJC runner must provide lifecycle publication.");
 	return runner.withLifecyclePublication(address, effect);
 }
+function readAuthorityMerged(filePath: string): any {
+	const base = JSON.parse(readFileSync(filePath, "utf8"));
+	const walPath = `${filePath}.wal`;
+	let walBytes: string;
+	try {
+		walBytes = readFileSync(walPath, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return base;
+		throw error;
+	}
+	const lines = walBytes.split("\n").filter(line => line.length > 0);
+	if (lines.length === 0) return base;
+	let header: any;
+	try {
+		header = JSON.parse(lines[0]!);
+	} catch {
+		return base;
+	}
+	const baseStat = statSync(filePath);
+	if (header?.base?.size !== baseStat.size || header?.base?.mtimeMs !== baseStat.mtimeMs) return base;
+	const records = new Map<string, any>();
+	const provisional = new Map<string, any>();
+	for (const record of base.mappings ?? []) records.set(record.chatId, record);
+	for (const operation of base.provisionalOperations ?? [])
+		provisional.set(JSON.stringify([operation.chatId, operation.ingressId ?? operation.id]), operation);
+	for (const line of lines.slice(1)) {
+		let delta: any;
+		try {
+			delta = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (delta?.kind !== "openwebui-gjc-session-authority-wal") continue;
+		for (const record of delta.records ?? []) records.set(record.chatId, record);
+		for (const item of delta.provisional ?? [])
+			if (item?.key !== undefined) provisional.set(item.key, item.operation);
+	}
+	return { ...base, mappings: [...records.values()], provisionalOperations: [...provisional.values()] };
+}
+
 function mappingInput(modelSelection: NormalizedModelSelection) {
 	return {
 		chatId: "chat-1",
@@ -2802,7 +3070,7 @@ function provisionalPersistenceCheckingPort(
 			if (property !== "prompt") return value.bind(target);
 			return async (...args: Parameters<PublicSdkSessionPort["prompt"]>) => {
 				if (!alreadyChecked()) {
-					const persisted: unknown = JSON.parse(readFileSync(mappingFile, "utf8"));
+					const persisted: unknown = readAuthorityMerged(mappingFile);
 					expect(persisted).toMatchObject({
 						provisionalOperations: [
 							{

@@ -35,6 +35,9 @@ import {
 export class SessionAuthorityJournal {
 	readonly records = new Map<string, SessionAuthorityRecord>();
 	readonly provisional = new Map<string, ProvisionalSessionOperation>();
+	readonly #dirtyRecords = new Set<string>();
+	readonly #dirtyProvisional = new Set<string>();
+	#forceCompaction = false;
 	store(input: SessionAuthorityInput): SessionAuthorityRecord {
 		const existing = this.records.get(input.chatId);
 		if (existing !== undefined && existing.projectId !== input.projectId)
@@ -57,7 +60,7 @@ export class SessionAuthorityJournal {
 			throw new Error(`Session authority for chat ${input.chatId} is assigned to another project.`);
 		assertInputIdentityFence(input, existing);
 		const next = existing === undefined ? createAuthorityIdentity(input) : updateAuthorityIdentity(input, existing);
-		this.records.set(next.chatId, next);
+		this.setRecord(next.chatId, next);
 		return copy(next);
 	}
 	beginProjectReassignment(
@@ -105,7 +108,7 @@ export class SessionAuthorityJournal {
 				...(retainedPriorTombstone === undefined ? {} : { priorTombstone: copyTombstone(retainedPriorTombstone) }),
 			},
 		};
-		this.records.set(chatId, next);
+		this.setRecord(chatId, next);
 		return copy(next);
 	}
 	reassignProject(chatId: string, currentProjectId: string, nextProjectId: string): boolean {
@@ -143,7 +146,7 @@ export class SessionAuthorityJournal {
 			const key = provisionalKey(chatId, reassignment.target.ingressId ?? reassignment.target.id);
 			const provisional = this.provisional.get(key);
 			if (provisional !== undefined && provisional.state === "pending")
-				this.provisional.set(key, {
+				this.setProvisional(key, {
 					...provisional,
 					state: "uncertain",
 					detail: "project reassignment rolled back; external effect evidence retained",
@@ -153,7 +156,7 @@ export class SessionAuthorityJournal {
 			...existing,
 			reassignment: { ...reassignment, state: "rolled_back" as const, completedAt: new Date().toISOString() },
 		};
-		this.records.set(chatId, next);
+		this.setRecord(chatId, next);
 		return copy(next);
 	}
 	require(chatId: string): SessionAuthorityRecord {
@@ -244,7 +247,7 @@ export class SessionAuthorityJournal {
 			)
 				throw new Error(`Session authority for chat ${operation.chatId} is assigned to another project.`);
 			if (reassignment.target === undefined) {
-				this.records.set(operation.chatId, {
+				this.setRecord(operation.chatId, {
 					...record,
 					reassignment: { ...reassignment, target: targetIdentity(operation) },
 				});
@@ -263,7 +266,7 @@ export class SessionAuthorityJournal {
 		}
 		assertReservableIdentity(operation, journalFor(record), [...this.provisional.values()]);
 		const next = { ...operation, state: "pending" as const, startedAt: new Date().toISOString() };
-		this.provisional.set(key, next);
+		this.setProvisional(key, next);
 		return copyProvisionalOperation(next);
 	}
 	publish(
@@ -310,12 +313,12 @@ export class SessionAuthorityJournal {
 				},
 			};
 			assertInputIdentityFence(committed, undefined);
-			this.records.set(operation.chatId, committed);
-			this.provisional.set(key, { ...reserved, state: "complete", completedAt });
+			this.setRecord(operation.chatId, committed);
+			this.setProvisional(key, { ...reserved, state: "complete", completedAt });
 			return copy(committed);
 		}
 		const next = this.store({ ...mapping, journal: [journalOperation] });
-		this.provisional.set(key, { ...reserved, state: "complete", completedAt });
+		this.setProvisional(key, { ...reserved, state: "complete", completedAt });
 		return next;
 	}
 	transitionProvisional(
@@ -335,7 +338,7 @@ export class SessionAuthorityJournal {
 			...(detail === undefined ? {} : { detail }),
 			...(state === "complete" ? { completedAt: new Date().toISOString() } : {}),
 		};
-		this.provisional.set(key, next);
+		this.setProvisional(key, next);
 		return copyProvisionalOperation(next);
 	}
 	attach(
@@ -356,7 +359,7 @@ export class SessionAuthorityJournal {
 		)
 			throw new Error("Provisional session authority requires an exact endpoint and owned-pane proof.");
 		const next = { ...current, ...attachment };
-		this.provisional.set(key, next);
+		this.setProvisional(key, next);
 		return copyProvisionalOperation(next);
 	}
 	begin(
@@ -382,7 +385,7 @@ export class SessionAuthorityJournal {
 			...record,
 			journal: [...record.journal, { ...operation, state: "pending" as const, startedAt: new Date().toISOString() }],
 		};
-		this.records.set(chatId, next);
+		this.setRecord(chatId, next);
 		return copy(next);
 	}
 	acknowledge(
@@ -410,7 +413,7 @@ export class SessionAuthorityJournal {
 		}
 		const journal = [...record.journal];
 		journal[index] = { ...current, acknowledgedSuccessor: copyAcknowledgedSuccessor(successor) };
-		this.records.set(chatId, { ...record, journal });
+		this.setRecord(chatId, { ...record, journal });
 		return copyOperation(journal[index]!);
 	}
 	transition(
@@ -444,23 +447,68 @@ export class SessionAuthorityJournal {
 			...(state === "complete" ? { completedAt: new Date().toISOString() } : {}),
 		};
 		const next = { ...record, journal };
-		this.records.set(chatId, next);
+		this.setRecord(chatId, next);
 		return copy(next);
 	}
 	reconcile(): readonly SessionAuthorityRecord[] {
-		return reconcileSessionAuthority(this.records, this.provisional);
+		return reconcileSessionAuthority(this.records, this.provisional, this.#dirtyRecords, this.#dirtyProvisional);
 	}
 	replace(records: readonly SessionAuthorityRecord[], provisional: readonly ProvisionalSessionOperation[] = []): void {
 		if (!isAuthorityDocumentRelationallyValid(records, provisional))
 			throw new Error("Refusing to replace session authority with invalid operation identities.");
 		this.records.clear();
 		this.provisional.clear();
-		for (const record of records) this.records.set(record.chatId, copy(record));
-		for (const operation of provisional)
-			this.provisional.set(
-				provisionalKey(operation.chatId, operation.ingressId ?? operation.id),
-				copyProvisionalOperation(operation),
-			);
+		for (const record of records) {
+			this.records.set(record.chatId, copy(record));
+			this.#dirtyRecords.add(record.chatId);
+		}
+		for (const operation of provisional) {
+			const key = provisionalKey(operation.chatId, operation.ingressId ?? operation.id);
+			this.provisional.set(key, copyProvisionalOperation(operation));
+			this.#dirtyProvisional.add(key);
+		}
+		this.#forceCompaction = true;
+	}
+	takeDirtyRecords(): readonly SessionAuthorityRecord[] {
+		const records = [...this.#dirtyRecords].flatMap(chatId => {
+			const record = this.records.get(chatId);
+			return record === undefined ? [] : [copy(record)];
+		});
+		this.#dirtyRecords.clear();
+		return records;
+	}
+	takeDirtyProvisional(): readonly { readonly key: string; readonly operation: ProvisionalSessionOperation }[] {
+		const operations = [...this.#dirtyProvisional].flatMap(key => {
+			const operation = this.provisional.get(key);
+			return operation === undefined ? [] : [{ key, operation: copyProvisionalOperation(operation) }];
+		});
+		this.#dirtyProvisional.clear();
+		return operations;
+	}
+	get hasDirty(): boolean {
+		return this.#forceCompaction || this.#dirtyRecords.size > 0 || this.#dirtyProvisional.size > 0;
+	}
+	get needsCompaction(): boolean {
+		return this.#forceCompaction;
+	}
+	clearDirty(): void {
+		this.#dirtyRecords.clear();
+		this.#dirtyProvisional.clear();
+		this.#forceCompaction = false;
+	}
+	private setRecord(chatId: string, record: SessionAuthorityRecord): void {
+		const prior = this.records.get(chatId);
+		this.records.set(chatId, record);
+		if (prior !== record && !(prior !== undefined && JSON.stringify(prior) === JSON.stringify(record))) {
+			this.#dirtyRecords.add(chatId);
+		}
+	}
+	private setProvisional(key: string, operation: ProvisionalSessionOperation): void {
+		const prior = this.provisional.get(key);
+		this.provisional.set(key, operation);
+		if (prior !== operation && !(prior !== undefined && JSON.stringify(prior) === JSON.stringify(operation))) {
+			this.#dirtyProvisional.add(key);
+		}
 	}
 }
 function journalFor(record: SessionAuthorityRecord | undefined): readonly SessionOperation[] {
