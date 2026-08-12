@@ -183,6 +183,7 @@ export class SessionMappingStore {
 			};
 			const nextRecord: SessionAuthorityRecord = {
 				...record,
+				events: undefined,
 				journal: [],
 				...(record.reassignment?.state === "pending" ? { reassignment: undefined } : {}),
 				observations: {

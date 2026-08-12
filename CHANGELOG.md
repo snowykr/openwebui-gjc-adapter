@@ -36,3 +36,4 @@
 - Made installed `serve --config` honor and validate `GJC_OPENWEBUI_TURN_TIMEOUT_MS` instead of always forcing the 180-second default.
 - Rejected accepted SDK turns whose terminal assistant message reports a provider transport error, including usage-limit failures, instead of persisting and returning an empty successful response.
 - Removed the obsolete global `GJC` default prompt suggestion that auto-sent a generic coding-agent request; project and workflow Workspace Prompt hints remain available.
+- Stopped the session authority from duplicating full per-turn event arrays inside every journal result and bounded record-level event growth in workflow-gate chains, so mapping documents no longer grow without bound and retired mappings drop their event payloads.

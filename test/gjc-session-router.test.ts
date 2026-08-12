@@ -264,7 +264,9 @@ describe("routeGjcTurn", () => {
 		expect(mappings.entries()).toHaveLength(1);
 		expect(duplicate.mapping).toEqual(first.mapping);
 		expect(duplicate.assistantText).toBe("new:hello");
-		expect(duplicate.events).toEqual([{ type: "assistant", text: "new:hello" }]);
+		// Journal results no longer carry the event stream; a replay returns the
+		// retained content only (the event stream lives on the record mapping).
+		expect(duplicate.events).toEqual([]);
 	});
 	test("replays a completed create after restart without a second session effect", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "gjc-create-journal-"));
@@ -281,7 +283,12 @@ describe("routeGjcTurn", () => {
 			expect(firstRunner.starts).toHaveLength(1);
 			expect(replayRunner.starts).toHaveLength(0);
 			expect(replayRunner.continues).toHaveLength(0);
-			expect(duplicate).toEqual(first);
+			expect(duplicate.assistantText).toBe(first.assistantText);
+			expect(duplicate.mapping).toEqual(first.mapping);
+			// Journal results no longer carry the event stream; a replay returns
+			// the retained content only (the event stream lives on the record
+			// mapping and the session transcript).
+			expect(duplicate.events).toEqual([]);
 		} finally {
 			rmSync(directory, { recursive: true, force: true });
 		}

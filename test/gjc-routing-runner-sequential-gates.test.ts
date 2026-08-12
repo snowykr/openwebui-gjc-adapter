@@ -57,7 +57,77 @@ describe("createGjcRoutingLiveGatewayRunner sequential workflow gates", () => {
 			rmSync(root, { recursive: true, force: true });
 		}
 	});
+	test("carries only workflow-gate events across gate replies instead of the full history", async () => {
+		const root = mkdtempSync(join(tmpdir(), "gjc-sequential-gate-carry-"));
+		try {
+			const filePath = join(root, "mappings.json");
+			const mappings = new FileBackedSessionMappingStore(filePath);
+			mappings.set({
+				chatId: "chat-1",
+				projectId: project.id,
+				sessionId: "session-1",
+				sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
+				activeLeaf: "leaf-1",
+				rawFrameCursor: 7,
+				eventCursor: 3,
+				operationId: "user-1",
+				assistantText: "pending",
+				modelSelection: { provider: "anthropic", modelId: "claude-sonnet-4", thinkingLevel: "medium" },
+				events: [deepInterviewWorkflowGateEvent],
+			});
+
+			const firstRunner = new FakeGjcTurnRunner();
+			firstRunner.gateResponseEvents = [firstTurnMessageUpdate, nextWorkflowGateEvent];
+			const first = createGjcRoutingLiveGatewayRunner({ turnRunner: firstRunner, mappings });
+			await first.run(gateReplyInput("user-2"));
+
+			const secondRunner = new FakeGjcTurnRunner();
+			secondRunner.gateResponseEvents = [secondTurnMessageUpdate];
+			const second = createGjcRoutingLiveGatewayRunner({ turnRunner: secondRunner, mappings });
+			await second.run(gateReplyInput("user-3"));
+
+			const persisted = new FileBackedSessionMappingStore(filePath).get("chat-1");
+			expect(persisted?.events?.filter(event => event.type === "workflow_gate").map(event => event.id)).toEqual([
+				"gate-deep-1",
+				"gate-deep-2",
+			]);
+			const serialized = JSON.stringify(persisted?.events);
+			expect(serialized).toContain("second-turn-update-text");
+			expect(serialized).not.toContain("first-turn-update-text");
+			expect(persisted?.events?.at(-1)).toMatchObject({ type: "message_update" });
+			expect(firstRunner.gateResponses).toHaveLength(1);
+			expect(secondRunner.gateResponses).toHaveLength(1);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
 });
+
+function gateReplyInput(userMessageId: string) {
+	return {
+		project,
+		prompt: "1",
+		chatId: "chat-1",
+		messageId: `assistant-${userMessageId}`,
+		userMessageId,
+		userMessageParentId: "user-1",
+		continued: true,
+	};
+}
+
+const firstTurnMessageUpdate = {
+	type: "message_update",
+	payload: {
+		assistantMessageEvent: { type: "text_delta", text: "first-turn-update-text" },
+	},
+} as const;
+
+const secondTurnMessageUpdate = {
+	type: "message_update",
+	payload: {
+		assistantMessageEvent: { type: "text_delta", text: "second-turn-update-text" },
+	},
+} as const;
 
 const nextWorkflowGateEvent = {
 	type: "workflow_gate",

@@ -50,26 +50,22 @@ export function replayCompletedWorkflowGateReply(
 		throw new Error(
 			`GJC workflow gate operation ${turn.userMessageId} completed without a valid immutable result binding.`,
 		);
-	const matchesIngress = result.events.some(event => {
+	const recordMapping = mappings.get(turn.chatId);
+	const matchesIngress = (recordMapping?.events ?? []).some(event => {
 		if (event.type !== "workflow_gate") return false;
 		const gate = pendingWorkflowGateFromEvent(event);
 		return gate !== null && workflowGateOperationHash(turn, gate) === priorOperation.detail;
 	});
-	if (!matchesIngress)
+	// A replayed gate that was superseded by a REGULAR (non-gate) turn no longer
+	// carries its gate event on the record; the durable detail hash still binds
+	// the operation to the answered gate, so accept the replay when the result
+	// binding checks above already passed.
+	if (!matchesIngress && (priorOperation.detail ?? "").length === 0)
 		throw new Error(
 			`GJC workflow gate operation ${turn.userMessageId} completed without a valid immutable result binding.`,
 		);
-	ensureProjectionRows(
-		input.outbox,
-		{
-			...result.mapping,
-			operationId: turn.userMessageId,
-			assistantText: result.assistantText,
-			events: result.events,
-		},
-		projectionOwnerUserId,
-		principalId,
-	);
+	if (recordMapping !== undefined && recordMapping.operationId === turn.userMessageId)
+		ensureProjectionRows(input.outbox, recordMapping, projectionOwnerUserId, principalId);
 	return { content: result.assistantText };
 }
 export async function handleWorkflowGateReply(
@@ -142,17 +138,10 @@ export async function handleWorkflowGateReply(
 				`GJC workflow gate operation ${turn.userMessageId} completed without a valid immutable result binding.`,
 			);
 		}
-		ensureProjectionRows(
-			input.outbox,
-			{
-				...priorOperation.result.mapping,
-				operationId: turn.userMessageId,
-				assistantText: priorOperation.result.assistantText,
-				events: priorOperation.result.events,
-			},
-			projectionOwnerUserId,
-			principalId,
-		);
+		// The completed operation's rows were enqueued at completion from the
+		// published record mapping; only re-enqueue when it is still current.
+		if (mapping.operationId === turn.userMessageId)
+			ensureProjectionRows(input.outbox, mapping, projectionOwnerUserId, principalId);
 		return { content: priorOperation.result.assistantText };
 	}
 	if (
@@ -214,6 +203,9 @@ export async function handleWorkflowGateReply(
 		}
 		const nextPendingGate = latestPendingWorkflowGate(result.events);
 		const responseText = nextPendingGate === null ? result.text : projectPendingWorkflowGateMessage(nextPendingGate);
+		const carriedGateEvents = markWorkflowGateAccepted(mapping.events ?? [], pendingGate.gateId).filter(
+			event => event.type === "workflow_gate",
+		);
 		const nextMapping = {
 			...mapping,
 			sessionFile: validateSessionFile(turn.project, result.sessionFile ?? existingSessionFile, sessionRoot),
@@ -222,7 +214,7 @@ export async function handleWorkflowGateReply(
 			eventCursor: result.eventCursor,
 			operationId: turn.userMessageId,
 			assistantText: responseText,
-			events: [...markWorkflowGateAccepted(mapping.events ?? [], pendingGate.gateId), ...result.events],
+			events: [...carriedGateEvents, ...result.events],
 			attachment: result.attachment,
 		};
 		await lifecycle.publish(result.attachment, () => {

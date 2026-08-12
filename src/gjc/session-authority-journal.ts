@@ -530,11 +530,10 @@ function assertTargetIdentity(target: SessionAuthorityTargetIdentity): void {
 }
 
 function toTombstone(record: SessionAuthorityRecord, retiredAt: string): SessionAuthorityTombstone {
-	const { reassignment: _reassignment, ...source } = record;
+	const { reassignment: _reassignment, events: _events, ...source } = record;
 	return {
 		...source,
 		header: { ...source.header },
-		events: source.events === undefined ? undefined : source.events.map(event => ({ ...event })),
 		...(source.modelSelection === undefined ? {} : { modelSelection: { ...source.modelSelection } }),
 		observations: source.observations === undefined ? undefined : structuredClone(source.observations),
 		...(source.attachment === undefined
