@@ -153,12 +153,20 @@ export class RealSelectionHarness {
 	}
 
 	async mappingBytes(): Promise<string> {
-		return JSON.stringify(await this.readAuthorityMerged(), null, 2);
+		const merged = await this.readAuthorityMerged();
+		if (merged === undefined) throw new Error("Session authority base document is missing");
+		return JSON.stringify(merged, null, 2);
 	}
 
-	async readAuthorityMerged(): Promise<Record<string, unknown>> {
+	async readAuthorityMerged(): Promise<Record<string, unknown> | undefined> {
 		const file = path.join(this.root, "sessions", "openwebui-session-mappings.json");
-		const base = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
+		let base: Record<string, unknown>;
+		try {
+			base = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
+		} catch (error) {
+			if (isMissingFile(error)) return undefined;
+			throw error;
+		}
 		const walPath = `${file}.wal`;
 		let walBytes: string;
 		try {
@@ -249,7 +257,9 @@ export class RealSelectionHarness {
 	async removeModelBinding(chatId: string): Promise<void> {
 		const file = path.join(this.root, "sessions", "openwebui-session-mappings.json");
 		const scopedChatId = canonicalSessionMappingKey("owner-selection", chatId);
-		const document = parseMappingDocument(await this.readAuthorityMerged(), scopedChatId);
+		const merged = await this.readAuthorityMerged();
+		if (merged === undefined) throw new Error("Session authority base document is missing");
+		const document = parseMappingDocument(merged, scopedChatId);
 		await writeFile(file, JSON.stringify(document, null, 2), "utf8");
 		try {
 			await unlink(`${file}.wal`);
