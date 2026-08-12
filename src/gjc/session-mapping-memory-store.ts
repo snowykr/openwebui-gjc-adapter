@@ -143,6 +143,18 @@ export class SessionMappingStore {
 			.filter(record => !isRetiredRecord(record))
 			.map(mappingFromRecord);
 	}
+	/**
+	 * Read-only, no-copy view for boot synthesis: the same filters and scope
+	 * derivation as {@link entries}, but the mapping shapes and their event
+	 * arrays are shared by reference with the authority records. Callers must
+	 * not mutate the returned mappings or their event payloads.
+	 */
+	mappingRecords(): readonly SessionMapping[] {
+		return this.authority
+			.records()
+			.filter(record => !isRetiredRecord(record))
+			.map(mappingFromRecordShallow);
+	}
 	entriesForPrincipal(
 		principalId: string,
 		options: { readonly includeLegacyAdmin?: boolean } = {},
@@ -705,6 +717,23 @@ function mappingFromRecord(record: SessionAuthorityRecord): SessionMapping {
 		chatId: storedScope?.chatId ?? mapping.chatId,
 		...(storedScope === undefined ? {} : { principalId: storedScope.principalId }),
 	});
+}
+function mappingFromRecordShallow(record: SessionAuthorityRecord): SessionMapping {
+	const storedScope = storedScopeFromRecord(record);
+	const {
+		version: _version,
+		createdAt: _createdAt,
+		header: _header,
+		observations: _observations,
+		journal: _journal,
+		reassignment: _reassignment,
+		...mapping
+	} = record;
+	return {
+		...mapping,
+		chatId: storedScope?.chatId ?? mapping.chatId,
+		...(storedScope === undefined ? {} : { principalId: storedScope.principalId }),
+	};
 }
 
 function storedScopeFromRecord(record: SessionAuthorityRecord): SessionMappingScope | undefined {

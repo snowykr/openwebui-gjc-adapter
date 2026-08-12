@@ -18,6 +18,7 @@ import type { GjcRuntimeLocations, NormalizedModelSelection } from "../src/contr
 import type { PublicSdkSessionPort } from "../src/gjc/public-sdk-contract";
 import { PublicSdkSessionClient } from "../src/gjc/public-sdk-session-port";
 import {
+	AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES,
 	FileSessionAuthority,
 	findGenerationOffset,
 	SessionAuthorityDurabilityError,
@@ -1630,6 +1631,62 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				.map(record => record.chatId)
 				.sort(),
 		).toEqual(["chat-1", "chat-3", "operator-chat"]);
+	});
+	test("boot-compacts an oversized legacy authority document in one bounded step", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-boot-compaction-"));
+		const filePath = join(directory, "mappings.json");
+		try {
+			const oversized = oversizedAuthorityJson(70 * 1024 * 1024);
+			writeFileSync(filePath, oversized.json);
+			const beforeBytes = statSync(filePath).size;
+			expect(beforeBytes).toBeGreaterThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			const afterBytes = statSync(filePath).size;
+			expect(afterBytes).toBeLessThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+			const compacted = JSON.parse(readFileSync(filePath, "utf8")) as {
+				readonly mappings: readonly {
+					readonly journal: readonly { readonly result?: Record<string, unknown> }[];
+				}[];
+			};
+			for (const mapping of compacted.mappings)
+				for (const operation of mapping.journal)
+					if (operation.result !== undefined) expect(operation.result).not.toHaveProperty("events");
+			expect(store.bootCompaction).toEqual({ beforeBytes, afterBytes });
+			expect(store.bootCompaction?.beforeBytes).toBeGreaterThan(store.bootCompaction?.afterBytes ?? 0);
+			expect(store.get("chat-1")).toMatchObject({
+				chatId: "chat-1",
+				projectId: project.id,
+				sessionId: "session-1",
+				operationId: "operation-1",
+			});
+			expect(store.operation("chat-1", "operation-1")?.result?.events).toHaveLength(oversized.eventCount);
+
+			const secondBootBytes = statSync(filePath).size;
+			const booted = new FileSessionAuthority(filePath);
+			expect(statSync(filePath).size).toBe(secondBootBytes);
+			expect(booted.lookupOperation("chat-1", "operation-1")?.result?.assistantText).toBe("done");
+			expect(new FileBackedSessionMappingStore(filePath).bootCompaction).toBeUndefined();
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+	test("does not rewrite a boot authority document below the compaction threshold", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-boot-compaction-threshold-"));
+		const filePath = join(directory, "mappings.json");
+		try {
+			const near = oversizedAuthorityJson(55 * 1024 * 1024);
+			writeFileSync(filePath, near.json);
+			const beforeBytes = statSync(filePath).size;
+			expect(beforeBytes).toBeLessThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			expect(statSync(filePath).size).toBe(beforeBytes);
+			expect(store.bootCompaction).toBeUndefined();
+			expect(store.operation("chat-1", "operation-1")?.result?.events).toHaveLength(near.eventCount);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
 	});
 	test("a no-op mutation does not grow the WAL", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-noop-")), "mappings.json");
@@ -3917,6 +3974,22 @@ function acknowledgedSuccessor(): any {
 			expectedCwd: "/workspace",
 		},
 	};
+}
+function oversizedAuthorityJson(targetBytes: number): { readonly json: string; readonly eventCount: number } {
+	const chunk = "x".repeat(512 * 1024);
+	const eventCount = Math.max(2, Math.ceil(targetBytes / (512 * 1024)));
+	const events = Array.from({ length: eventCount }, (_, index) => ({
+		type: "assistant" as const,
+		text: `event-${index}`,
+		payload: { transcript: `${chunk}-${index}` },
+	}));
+	const document = validAuthorityDocument();
+	// A pending provisional operation would make boot reconcile-and-persist via
+	// the pre-existing branch; the oversized boot-compaction branch is only
+	// exercised when nothing else requires a rewrite.
+	document.provisionalOperations = [];
+	document.mappings[0].journal[0].result.events = events;
+	return { json: JSON.stringify(document), eventCount };
 }
 function validAuthorityDocument(): any {
 	const timestamp = "2026-01-01T00:00:00.000Z";

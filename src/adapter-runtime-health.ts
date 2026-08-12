@@ -5,6 +5,7 @@ import type { AdapterHealthCheck } from "./health";
 export interface RuntimeIsolationDiagnostic {
 	readonly name:
 		| "session-authority-migration"
+		| "session-authority-compaction"
 		| "openwebui-prompt-hints"
 		| "openwebui-project-projection"
 		| "openwebui-projection-outbox";

@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildAdapterServerOptions } from "../src/adapter-server-options";
-import { SessionMappingStore } from "../src/gjc/session-router";
+import { AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES } from "../src/gjc/session-authority-persistence";
+import { FileBackedSessionMappingStore, SessionMappingStore } from "../src/gjc/session-router";
 import { synthesizeProjectionRows } from "../src/live/workflow-gate-projection";
 import {
 	buildProjectionPayloadHash,
@@ -14,6 +15,59 @@ import {
 import { FakeGjcTurnRunner } from "./cli-fixtures";
 import { staticModelReaderFactory } from "./model-selection-fixtures";
 
+function oversizedAuthorityJson(): string {
+	const timestamp = "2026-08-03T00:00:00.000Z";
+	const chatId = "chat-1";
+	const chunk = "x".repeat(512 * 1024);
+	// Well above AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES; the size is dominated
+	// by journal-result events that the boot compaction drops.
+	const events = Array.from({ length: 140 }, (_, index) => ({
+		type: "assistant" as const,
+		text: `event-${index}`,
+		payload: { transcript: `${chunk}-${index}` },
+	}));
+	const mapping = {
+		version: 2,
+		chatId,
+		projectId: "project-1",
+		sessionId: "session-1",
+		createdAt: timestamp,
+		header: { chatId, projectId: "project-1", sessionId: "session-1" },
+		rawFrameCursor: 0,
+		eventCursor: 0,
+		operationId: "operation-1",
+		assistantText: "done",
+		events: [],
+		journal: [
+			{
+				id: "operation-1",
+				kind: "prompt",
+				state: "complete",
+				startedAt: timestamp,
+				completedAt: timestamp,
+				result: {
+					kind: "turn",
+					assistantText: "done",
+					events,
+					mapping: {
+						chatId,
+						projectId: "project-1",
+						sessionId: "session-1",
+						rawFrameCursor: 0,
+						eventCursor: 0,
+						operationId: "operation-1",
+					},
+				},
+			},
+		],
+	};
+	return JSON.stringify({
+		kind: "openwebui-gjc-session-authority",
+		version: 2,
+		mappings: [mapping],
+		provisionalOperations: [],
+	});
+}
 function enqueuePendingOperation(store: OutboxStore): void {
 	store.enqueue({
 		operationId: "projection-op-1",
@@ -137,6 +191,49 @@ describe("projection outbox startup reconciliation", () => {
 			attempts: 2,
 		});
 		await rm(root, { force: true, recursive: true });
+	});
+	test("reports a one-time boot compaction of an oversized session authority", async () => {
+		const root = await mkdtemp(join(tmpdir(), "gjc-adapter-authority-compaction-"));
+		const authorityPath = join(root, "sessions", "mappings.json");
+		let options: Awaited<ReturnType<typeof buildAdapterServerOptions>> | undefined;
+		try {
+			await mkdir(join(root, "sessions"), { recursive: true });
+			await writeFile(authorityPath, oversizedAuthorityJson());
+			const mappings = new FileBackedSessionMappingStore(authorityPath);
+			expect(mappings.bootCompaction).toBeDefined();
+			expect(mappings.bootCompaction?.beforeBytes).toBeGreaterThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+			options = await buildAdapterServerOptions(
+				{
+					mode: "existing",
+					bindHost: "127.0.0.1",
+					bindPort: 8765,
+					openWebUIBaseUrl: "http://127.0.0.1:3000",
+					allowedProjectRoots: [],
+					projects: [],
+					statePath: root,
+					sessionRoot: join(root, "sessions"),
+					gjcCommand: "/opt/gjc",
+					turnTimeoutMs: 240_000,
+				},
+				{
+					mappings,
+					turnRunner: new FakeGjcTurnRunner(),
+					modelReaderFactory: staticModelReaderFactory(),
+				},
+				{ deferOpenWebUIInitialization: true },
+			);
+			expect(options.checks).toContainEqual(
+				expect.objectContaining({
+					name: "session-authority-compaction",
+					status: "ok",
+					detail: expect.stringMatching(/^Session authority compacted from \d+ to \d+ bytes\.$/),
+				}),
+			);
+		} finally {
+			await options?.shutdownCleanup?.();
+			await options?.runtimeLock.release();
+			await rm(root, { force: true, recursive: true });
+		}
 	});
 	test("skips unsupported normal-principal projection rows instead of retrying them forever", async () => {
 		const root = await mkdtemp(join(tmpdir(), "gjc-adapter-outbox-normal-skip-"));

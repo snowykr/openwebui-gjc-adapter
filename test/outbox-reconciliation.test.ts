@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { join } from "node:path";
-import { SessionMappingStore } from "../src/gjc/session-router";
+import { FileBackedSessionMappingStore, SessionMappingStore } from "../src/gjc/session-router";
 import {
 	createProjectionOperationApplier,
 	expectedProjectionRows,
@@ -706,6 +706,91 @@ describe("durable projection reconciliation", () => {
 		}
 	});
 
+	test("synthesizes byte-identical projection rows from in-memory and file-backed stores", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-outbox-lean-synthesis-"));
+		try {
+			const filePath = join(directory, "mappings.json");
+			const mapping = {
+				chatId: "chat-1",
+				projectId: "project-1",
+				sessionId: "session-1",
+				rawFrameCursor: 1,
+				eventCursor: 1,
+				operationId: "op-1",
+				assistantText: "done",
+				events: [{ type: "tool_start", id: "tool-1", payload: { nested: { value: [1, 2, 3] } } }],
+			};
+			const memory = new SessionMappingStore();
+			memory.set({ ...mapping, operationId: "bootstrap" });
+			memory.beginOperation("chat-1", { id: "op-1", kind: "prompt", detail: "request" });
+			memory.completeOperationWithMapping("chat-1", "op-1", "request", mapping, "turn");
+
+			const fileBacked = new FileBackedSessionMappingStore(filePath);
+			fileBacked.set({ ...mapping, operationId: "bootstrap" });
+			fileBacked.beginOperation("chat-1", { id: "op-1", kind: "prompt", detail: "request" });
+			fileBacked.completeOperationWithMapping("chat-1", "op-1", "request", mapping, "turn");
+			const booted = new FileBackedSessionMappingStore(filePath);
+
+			const memoryOutbox = new InMemoryOutboxStore();
+			const fileOutbox = new InMemoryOutboxStore();
+			synthesizeProjectionRows(memoryOutbox, memory, "user-1", "user-1");
+			synthesizeProjectionRows(fileOutbox, booted, "user-1", "user-1");
+
+			const rows = (store: OutboxStore) =>
+				store
+					.listPending()
+					.map(row => ({ operationId: row.operationId, kind: row.kind, payloadHash: row.payloadHash }));
+			expect(rows(fileOutbox)).toEqual(rows(memoryOutbox));
+			expect(rows(fileOutbox)).toHaveLength(2);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+	test("mappingRecords() matches entries() for a mix of scoped, legacy, and retired records", () => {
+		const mappings = new SessionMappingStore();
+		const scopedA = {
+			principalId: "principal-a",
+			chatId: "chat-a",
+			projectId: "project-a",
+			sessionId: "session-a",
+			rawFrameCursor: 3,
+			eventCursor: 2,
+			operationId: "op-a",
+			assistantText: "from a",
+			events: [{ type: "assistant", text: "from a", payload: { shared: true } }],
+		};
+		const scopedB = {
+			principalId: "principal-b",
+			chatId: "chat-b",
+			projectId: "project-b",
+			sessionId: "session-b",
+			rawFrameCursor: 5,
+			eventCursor: 4,
+			operationId: "op-b",
+		};
+		const scopeA = { principalId: scopedA.principalId, chatId: scopedA.chatId };
+		const scopeB = { principalId: scopedB.principalId, chatId: scopedB.chatId };
+		mappings.setScoped(scopeA, scopedA);
+		mappings.setScoped(scopeB, scopedB);
+		mappings.set({
+			chatId: "chat-legacy",
+			projectId: "project-legacy",
+			sessionId: "session-legacy",
+			rawFrameCursor: 1,
+			eventCursor: 1,
+			operationId: "op-legacy",
+		});
+		mappings.retireScoped(scopeB);
+
+		expect(mappings.mappingRecords()).toEqual(mappings.entries());
+		expect(
+			mappings
+				.mappingRecords()
+				.map(mapping => mapping.chatId)
+				.sort(),
+		).toEqual(["chat-a", "chat-legacy"]);
+		expect(mappings.mappingRecords()[0]?.events?.[0]?.payload).toEqual({ shared: true });
+	});
 	test("fails closed when a row cannot be reconstructed exactly", async () => {
 		const mappings = new SessionMappingStore();
 		const mapping = {

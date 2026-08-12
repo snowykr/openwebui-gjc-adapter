@@ -22,6 +22,13 @@ export class SessionAuthority {
 	entries(): readonly SessionAuthorityRecord[] {
 		return [...this.#journal.records.values()].map(copy);
 	}
+	/**
+	 * Read-only view of the live records; callers must not mutate the returned
+	 * records or their nested event payloads.
+	 */
+	records(): readonly SessionAuthorityRecord[] {
+		return [...this.#journal.records.values()];
+	}
 	set(input: SessionAuthorityInput): SessionAuthorityRecord {
 		return this.#journal.store(input);
 	}

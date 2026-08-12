@@ -88,6 +88,7 @@ type WalIdentity = {
 	 * but must be upgraded before the next append. */
 	readonly digestBound?: boolean;
 };
+export const AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES = 64 * 1024 * 1024;
 
 export class SessionAuthorityDurabilityError extends Error {
 	constructor(filePath: string, cause: unknown) {
@@ -100,6 +101,13 @@ export class FileSessionAuthority extends SessionAuthority {
 	#baseIdentity: BaseIdentity | undefined = undefined;
 	#walIdentity: WalIdentity | undefined = undefined;
 	protected walCompactionThresholdBytes = WAL_COMPACTION_THRESHOLD_BYTES;
+	#baseIdentity: { readonly size: number; readonly mtimeMs: number } | undefined = undefined;
+	#walIdentity: { readonly size: number; readonly mtimeMs: number } | undefined = undefined;
+	/**
+	 * Base-class-owned so a subclass capture written during the constructor
+	 * survives field initialization (subclass fields run after `super()`).
+	 */
+	protected bootCompactionBeforeBytes: number | undefined = undefined;
 
 	/** When the caller already holds the authority mutation lock (which is not
 	 * reentrant), pass it in so the boot-time replay/compaction stays inside the
@@ -124,6 +132,11 @@ export class FileSessionAuthority extends SessionAuthority {
 			if (trailingGarbage || this.walOversized() || pendingOperations) {
 				if (pendingOperations) super.reconcileRestart();
 				this.persist();
+			}
+			const beforeBytes = statIdentity(this.filePath)?.size ?? 0;
+			if (beforeBytes > AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES) {
+				this.persist();
+				this.recordBootCompaction(beforeBytes);
 			}
 		} finally {
 			if (lock === undefined) held.release();
@@ -460,6 +473,14 @@ export class FileSessionAuthority extends SessionAuthority {
 							: {}),
 					};
 		this.clearDirtyJournal();
+	}
+	/**
+	 * Captures a one-time normalizing boot compaction of an oversized base
+	 * document. Subclasses may override to observe the before-bytes; the base
+	 * implementation records it for `bootCompactionBeforeBytes`.
+	 */
+	protected recordBootCompaction(beforeBytes: number): void {
+		this.bootCompactionBeforeBytes = beforeBytes;
 	}
 	protected persist(): void {
 		const mappings = this.entries();
