@@ -599,9 +599,16 @@ export class FileSessionAuthority extends SessionAuthority {
 		try {
 			header = JSON.parse(lines[0]!);
 		} catch {
-			header = undefined;
+			// A header that cannot even be parsed is corruption, not a stale WAL:
+			// deleting the file would discard the acknowledged deltas that follow.
+			throw new SessionAuthorityLoadError(this.filePath, "authority WAL header is malformed");
 		}
-		if (!isWalHeader(header, this.#baseIdentity)) {
+		if (!isWalHeaderShape(header))
+			throw new SessionAuthorityLoadError(this.filePath, "authority WAL header is malformed");
+		if (!isWalHeaderBoundToBase(header, this.#baseIdentity)) {
+			// A syntactically valid header demonstrably bound to a DIFFERENT base
+			// is a stale WAL (an external base edit wins); only then is deletion
+			// safe.
 			this.dropWalFile();
 			return { trailingGarbage: false };
 		}
@@ -768,31 +775,45 @@ export class FileSessionAuthority extends SessionAuthority {
 		} catch {
 			return false;
 		}
-		const lines = contents.split("\n").filter(line => line.length > 0);
+		const parts = contents.split("\n");
+		const hasTrailingNewline = parts.length > 0 && parts[parts.length - 1] === "";
+		const lines = parts.filter(line => line.length > 0);
 		const firstLine = lines[0];
 		if (firstLine === undefined) return false;
 		let header: unknown;
 		try {
 			header = JSON.parse(firstLine);
 		} catch {
-			return false;
+			throw new SessionAuthorityLoadError(this.filePath, "authority WAL header is malformed");
 		}
-		if (!isWalHeader(header, this.#baseIdentity)) return false;
+		if (!isWalHeaderShape(header))
+			throw new SessionAuthorityLoadError(this.filePath, "authority WAL header is malformed");
+		if (!isWalHeaderBoundToBase(header, this.#baseIdentity)) return false;
 		if ((header as Record<string, unknown>).version !== WAL_VERSION) return "legacy";
-		let expectedChain = WAL_CHAIN_SEED;
+		// Verify the full chained prefix and seed the identity from the last
+		// line's head.
+		let expectedHead = lineChainHash(WAL_CHAIN_SEED, firstLine);
 		let digest: string | undefined;
 		let lastLineLength = 0;
-		for (const line of lines) {
+		for (let index = 1; index < lines.length; index += 1) {
+			const line = lines[index]!;
 			let parsed: unknown;
 			try {
 				parsed = JSON.parse(line);
 			} catch {
+				if (index === lines.length - 1 && !hasTrailingNewline) return false;
 				return false;
 			}
+			if (!isWalDelta(parsed)) return false;
 			const record = parsed as Record<string, unknown>;
-			if (!isNonEmptyString(record.prevHash) || record.prevHash !== expectedChain) return false;
-			expectedChain = lineChainHash(record.prevHash, line);
-			digest = expectedChain;
+			if (
+				!isNonEmptyString(record.prevHash) ||
+				record.prevHash !== expectedHead ||
+				lineChainHash(record.prevHash, walDeltaBodyJson(record)) !== record.head
+			)
+				return false;
+			expectedHead = record.head as string;
+			digest = expectedHead;
 			lastLineLength = Buffer.byteLength(line, "utf8");
 		}
 		if (digest === undefined) return false;
@@ -1067,8 +1088,8 @@ function sameStatIdentity(
 function walHeader(base: BaseIdentity | undefined): unknown {
 	return { kind: WAL_KIND, version: WAL_VERSION, base, prevHash: WAL_CHAIN_SEED };
 }
-function isWalHeader(value: unknown, base: BaseIdentity | undefined): boolean {
-	if (typeof value !== "object" || value === null || base === undefined) return false;
+function isWalHeaderShape(value: unknown): value is Record<string, unknown> {
+	if (typeof value !== "object" || value === null) return false;
 	const header = value as Record<string, unknown>;
 	if (
 		header.kind !== WAL_KIND ||
@@ -1077,13 +1098,20 @@ function isWalHeader(value: unknown, base: BaseIdentity | undefined): boolean {
 	)
 		return false;
 	if (header.version === WAL_VERSION && !isNonEmptyString(header.prevHash)) return false;
-	const recorded = header.base as Record<string, unknown>;
+	return true;
+}
+function isWalHeaderBoundToBase(value: unknown, base: BaseIdentity | undefined): boolean {
+	if (!isWalHeaderShape(value) || base === undefined) return false;
+	const recorded = (value as Record<string, unknown>).base as Record<string, unknown>;
 	if (recorded.size !== base.size || recorded.mtimeMs !== base.mtimeMs) return false;
 	// A generation-bearing base requires the header to carry the same
 	// generation, so a timestamp-preserving external replacement with the same
 	// byte length cannot replay stale deltas over it. Legacy stat-only WALs
 	// (and bases that predate generations) remain bound by the stat fields.
 	return base.generation === undefined ? recorded.generation === undefined : recorded.generation === base.generation;
+}
+function isWalHeader(value: unknown, base: BaseIdentity | undefined): boolean {
+	return isWalHeaderShape(value) && isWalHeaderBoundToBase(value, base);
 }
 function walDelta(
 	records: readonly SessionAuthorityRecord[],

@@ -645,6 +645,22 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		).toThrow("chain is broken");
 		expect(() => new FileSessionAuthority(filePath)).toThrow("chain is broken");
 	});
+	test("fails closed on a malformed WAL header", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-malformed-header-")), "mappings.json");
+		const walPath = `${filePath}.wal`;
+		const authority = new FileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+
+		// Corrupt the first byte of the header: the acknowledged delta that
+		// follows must not be silently deleted (only a valid stale header bound
+		// to another base is deletable).
+		const contents = readFileSync(walPath, "utf8");
+		writeFileSync(walPath, `X${contents.slice(1)}`);
+
+		expect(() => new FileSessionAuthority(filePath)).toThrow("header is malformed");
+		expect(existsSync(walPath)).toBe(true);
+	});
 	test("fails closed when a WAL line before the tail is malformed", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-corruption-")), "mappings.json");
 		const walPath = `${filePath}.wal`;
