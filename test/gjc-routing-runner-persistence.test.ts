@@ -752,7 +752,7 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		expect(persisted).toContain('"gateId":"gate-1"');
 		expect(persisted).toContain('"commandId":"command-1"');
 	});
-	test("detects a generation-preserving same-size base edit on the live fast path", () => {
+	test("keeps the live fast path O(1) for generation-preserving base edits and discards the stale WAL at boot", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-live-base-edit-")), "mappings.json");
 		const walPath = `${filePath}.wal`;
 		const authority = new FileSessionAuthority(filePath);
@@ -761,7 +761,10 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		expect(existsSync(walPath)).toBe(true);
 
 		// An external tool edits the base IN PLACE (same generation, byte length,
-		// and mtime) while the instance is live.
+		// and mtime) while the instance is live. The per-mutation fast path stays
+		// O(1) (stat + generation window; no full base re-read), so the append
+		// proceeds against in-memory state; the WAL header digest binding then
+		// discards the stale WAL at boot, preserving the edit.
 		const original = readFileSync(filePath, "utf8");
 		const rewritten = original.replaceAll("session-1", "session-9");
 		expect(rewritten.length).toBe(original.length);
@@ -769,37 +772,85 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		writeFileSync(filePath, rewritten);
 		utimesSync(filePath, mtimeMs / 1000, mtimeMs / 1000);
 
-		// The next mutation must detect the digest change, reload the edited
-		// base, and append against it, so the acknowledged mutation survives a
-		// restart alongside the operator edit.
 		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-3", operationId: "user-3" });
 
-		expect(
-			authority
-				.entries()
-				.map(record => record.sessionId)
-				.sort(),
-		).toEqual(["session-1", "session-9"]);
-		expect(
-			authority
-				.entries()
-				.map(record => record.chatId)
-				.sort(),
-		).toEqual(["chat-1", "chat-3"]);
+		// Boot discards the stale WAL (digest mismatch): the edit is preserved
+		// and the acknowledged mutation chained to the old digest is not replayed
+		// over the edited base.
 		const booted = new FileSessionAuthority(filePath);
 		expect(
 			booted
 				.entries()
 				.map(record => record.sessionId)
 				.sort(),
-		).toEqual(["session-1", "session-9"]);
+		).toEqual(["session-9"]);
 		expect(
 			booted
 				.entries()
 				.map(record => record.chatId)
 				.sort(),
-		).toEqual(["chat-1", "chat-3"]);
-		expect(booted.entries().find(record => record.chatId === "chat-1")?.sessionId).toBe("session-9");
+		).toEqual(["chat-1"]);
+	});
+	test("upgrades a chained WAL whose header predates the base digest before appending", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-digest-less-header-")), "mappings.json");
+		const walPath = `${filePath}.wal`;
+		const authority = new FileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+
+		// Hand-craft an older-release v2 WAL: a header WITHOUT the base digest,
+		// with its chain computed over that exact header text, plus a delta for a
+		// second mapping.
+		const stat = statSync(filePath);
+		const baseDoc = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
+		const seed = "openwebui-gjc-session-authority-wal:v2";
+		const chain = (prev: string, text: string) =>
+			createHash("sha256").update(prev).update("\n").update(text).digest("hex");
+		const headerJson = JSON.stringify({
+			kind: "openwebui-gjc-session-authority-wal",
+			version: 2,
+			base: { size: stat.size, mtimeMs: stat.mtimeMs, generation: baseDoc.generation },
+			prevHash: seed,
+		});
+		const headerHead = chain(seed, headerJson);
+		const rec1 = authority.entries()[0]!;
+		const rec2 = {
+			...JSON.parse(JSON.stringify(rec1)),
+			chatId: "chat-2",
+			operationId: "user-2",
+			header: { ...rec1.header, chatId: "chat-2" },
+			journal: [{ ...rec1.journal[0]!, id: "user-2", ingressId: "user-2" }],
+		};
+		const body = {
+			kind: "openwebui-gjc-session-authority-wal",
+			version: 2,
+			records: [rec2],
+			provisional: [],
+			prevHash: headerHead,
+		};
+		const deltaJson = JSON.stringify({ ...body, head: chain(headerHead, JSON.stringify(body)) });
+		writeFileSync(walPath, `${headerJson}\n${deltaJson}\n`);
+
+		// Boot replays the legacy header (deltas applied, stat/generation-bound),
+		// and the next mutation upgrades the WAL to a digest-bound header instead
+		// of appending beneath the digest-less one.
+		const live = new FileSessionAuthority(filePath);
+		expect(
+			live
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2"]);
+		live.set({ ...mappingInput(mediumSelection), chatId: "chat-3", operationId: "user-3" });
+
+		// The digest-less WAL was compacted into the base (reset), so no
+		// digest-less header can persist; the state survives a restart.
+		expect(existsSync(walPath)).toBe(false);
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2", "chat-3"]);
 	});
 	test("fails closed on a malformed WAL header", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-malformed-header-")), "mappings.json");

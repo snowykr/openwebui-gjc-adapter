@@ -83,6 +83,10 @@ type WalIdentity = {
 	readonly version: 1 | 2;
 	/** Byte length of the last line's JSON text; present for chained v2 WALs. */
 	readonly lastLineLength?: number;
+	/** Whether the WAL header binds the base CONTENT digest. Older v2 headers
+	 * predate the digest field; they remain replayable (stat/generation-bound)
+	 * but must be upgraded before the next append. */
+	readonly digestBound?: boolean;
 };
 
 export class SessionAuthorityDurabilityError extends Error {
@@ -315,7 +319,6 @@ export class FileSessionAuthority extends SessionAuthority {
 			sameStatIdentity(baseStat, this.#baseIdentity) &&
 			sameStatIdentity(walStat, this.#walIdentity) &&
 			this.baseGenerationMatchesDisk() &&
-			this.baseDigestMatchesDisk() &&
 			this.walDigestMatchesDisk()
 		)
 			return;
@@ -355,22 +358,6 @@ export class FileSessionAuthority extends SessionAuthority {
 		return (
 			readGenerationAtOffset(this.filePath, base.generationOffset, base.generationSpanLength) === base.generation
 		);
-	}
-	/** Recomputes the base document digest and compares it to the cached one, so
-	 * an external same-size timestamp-preserving rewrite that keeps the
-	 * generation is still detected on the live fast path before any append (the
-	 * WAL header binds the digest, so appending under a stale digest would
-	 * otherwise be acknowledged and then discarded at boot). This is O(base),
-	 * the same cost class as the WAL chain verification. */
-	private baseDigestMatchesDisk(): boolean {
-		const base = this.#baseIdentity;
-		if (base === undefined || base.digest === undefined) return true;
-		try {
-			const raw = readFileSync(this.filePath, "utf8");
-			return createHash("sha256").update(raw).digest("hex") === base.digest;
-		} catch {
-			return false;
-		}
 	}
 	/** Binds the cached WAL state to a collision-resistant identity that
 	 * authenticates the on-disk prefix before every acknowledged append: every
@@ -636,6 +623,11 @@ export class FileSessionAuthority extends SessionAuthority {
 			return { trailingGarbage: false };
 		}
 		const chained = (header as Record<string, unknown>).version === WAL_VERSION;
+		// Older v2 headers predate the base digest field; they stay replayable
+		// but must be upgraded (digest-bound) before the next append.
+		const digestBound = isNonEmptyString(
+			((header as Record<string, unknown>).base as Record<string, unknown> | undefined)?.digest,
+		);
 		// For chained v2 WALs every line carries its own chained head, which
 		// commits to the ENTIRE prefix, and its prevHash must equal the previous
 		// line's head. A replaced interior delta therefore breaks the chain and
@@ -671,7 +663,13 @@ export class FileSessionAuthority extends SessionAuthority {
 		}
 		this.replaceAllWithReferences([...records.values()], [...provisional.values()]);
 		this.#walIdentity = chained
-			? { ...statIdentity(walPath)!, digest: expectedHead, lastLineLength, version: WAL_VERSION }
+			? {
+					...statIdentity(walPath)!,
+					digest: expectedHead,
+					lastLineLength,
+					version: WAL_VERSION,
+					...(this.#baseIdentity?.digest === undefined ? {} : { digestBound }),
+				}
 			: { ...statIdentity(walPath)!, digest: walSampleDigestFromContents(contents), version: WAL_LEGACY_VERSION };
 		this.clearDirtyJournal();
 		return { trailingGarbage };
@@ -685,6 +683,18 @@ export class FileSessionAuthority extends SessionAuthority {
 			// bounded sample identity; compact it into the base before the first
 			// v2 append so the WAL becomes chain-covered from its first line
 			// instead of remaining sample-bound until the compaction threshold.
+			this.persist();
+			return;
+		}
+		if (
+			this.#walIdentity !== undefined &&
+			this.#baseIdentity?.digest !== undefined &&
+			this.#walIdentity.digestBound === false
+		) {
+			// An older chained WAL whose header predates the base digest field is
+			// replayable but not content-bound; upgrade it (compact into the base,
+			// reset the WAL) before the first append so the new header binds the
+			// base digest.
 			this.persist();
 			return;
 		}
@@ -785,7 +795,13 @@ export class FileSessionAuthority extends SessionAuthority {
 	protected refreshWalIdentity(writtenDigest: string, lastLineLength: number): void {
 		const stat = statIdentity(this.walPath);
 		if (stat === undefined) throw new Error("WAL stat cannot be refreshed after a write");
-		this.#walIdentity = { ...stat, digest: writtenDigest, lastLineLength, version: WAL_VERSION };
+		this.#walIdentity = {
+			...stat,
+			digest: writtenDigest,
+			lastLineLength,
+			version: WAL_VERSION,
+			...(this.#baseIdentity?.digest === undefined ? {} : { digestBound: true }),
+		};
 	}
 	/** Reads an existing WAL, validates its header against the current base, and
 	 * adopts it: "chained" seeds the identity by verifying every v2 chain link;
@@ -813,6 +829,9 @@ export class FileSessionAuthority extends SessionAuthority {
 			throw new SessionAuthorityLoadError(this.filePath, "authority WAL header is malformed");
 		if (!isWalHeaderBoundToBase(header, this.#baseIdentity)) return false;
 		if ((header as Record<string, unknown>).version !== WAL_VERSION) return "legacy";
+		const digestBound = isNonEmptyString(
+			((header as Record<string, unknown>).base as Record<string, unknown> | undefined)?.digest,
+		);
 		// Verify the full chained prefix and seed the identity from the last
 		// line's head.
 		let expectedHead = lineChainHash(WAL_CHAIN_SEED, firstLine);
@@ -840,7 +859,13 @@ export class FileSessionAuthority extends SessionAuthority {
 			lastLineLength = Buffer.byteLength(line, "utf8");
 		}
 		if (digest === undefined) return false;
-		this.#walIdentity = { ...statIdentity(walPath)!, digest, lastLineLength, version: WAL_VERSION };
+		this.#walIdentity = {
+			...statIdentity(walPath)!,
+			digest,
+			lastLineLength,
+			version: WAL_VERSION,
+			...(this.#baseIdentity?.digest === undefined ? {} : { digestBound }),
+		};
 		return "chained";
 	}
 	/** Reloads memory from the durable base and WAL so in-memory state matches
@@ -1212,10 +1237,12 @@ function isWalHeaderBoundToBase(value: unknown, base: BaseIdentity | undefined):
 	// (and bases that predate generations) remain bound by the stat fields.
 	if (base.generation === undefined ? recorded.generation !== undefined : recorded.generation !== base.generation)
 		return false;
-	// When the cached identity and the header both carry a content digest,
-	// require them to match too: an external rewrite that preserves generation,
+	// When both the cached identity and the header carry a content digest,
+	// require them to match: an external rewrite that preserves generation,
 	// size, and mtime still changes the digest, so a stale WAL is discarded
-	// instead of being replayed over the edited base.
+	// instead of being replayed over the edited base. A header that predates
+	// the digest field remains replayable (stat/generation-bound) and is
+	// upgraded before the next append.
 	if (base.digest !== undefined && isNonEmptyString(recorded.digest)) return recorded.digest === base.digest;
 	return true;
 }
