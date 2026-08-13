@@ -469,6 +469,37 @@ export class SessionAuthorityJournal {
 		}
 		this.#forceCompaction = true;
 	}
+	/** Reference-based replacement for internal hot paths (boot replay, reload,
+	 * rollback): the passed objects are owned exclusively by the caller (fresh
+	 * parses or this journal's own prior copy-on-write values), so storing them
+	 * directly avoids a second full-document deep copy. */
+	replaceReferences(
+		records: readonly SessionAuthorityRecord[],
+		provisional: readonly ProvisionalSessionOperation[] = [],
+	): void {
+		if (!isAuthorityDocumentRelationallyValid(records, provisional))
+			throw new Error("Refusing to replace session authority with invalid operation identities.");
+		this.records.clear();
+		this.provisional.clear();
+		for (const record of records) {
+			this.records.set(record.chatId, record);
+			this.#dirtyRecords.add(record.chatId);
+		}
+		for (const operation of provisional) {
+			const key = provisionalKey(operation.chatId, operation.ingressId ?? operation.id);
+			this.provisional.set(key, operation);
+			this.#dirtyProvisional.add(key);
+		}
+		this.#forceCompaction = true;
+	}
+	/** Live references to the journal's own maps for shallow seeding (never the
+	 * copying public accessors) on hot paths. */
+	rawEntries(): {
+		readonly records: ReadonlyMap<string, SessionAuthorityRecord>;
+		readonly provisional: ReadonlyMap<string, ProvisionalSessionOperation>;
+	} {
+		return { records: this.records, provisional: this.provisional };
+	}
 	/** Shallow rollback snapshot: every mutation stores NEW record/provisional
 	 * objects (copy-on-write), so retaining the current values by reference is
 	 * sufficient to restore the pre-mutation state on failure without

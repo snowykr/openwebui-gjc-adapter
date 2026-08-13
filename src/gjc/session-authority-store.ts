@@ -161,6 +161,18 @@ export class SessionAuthority {
 	} {
 		return this.#journal.snapshotReferences();
 	}
+	protected rawJournalEntries(): {
+		readonly records: ReadonlyMap<string, SessionAuthorityRecord>;
+		readonly provisional: ReadonlyMap<string, ProvisionalSessionOperation>;
+	} {
+		return this.#journal.rawEntries();
+	}
+	protected replaceAllWithReferences(
+		records: readonly SessionAuthorityRecord[],
+		provisional: readonly ProvisionalSessionOperation[] = [],
+	): void {
+		this.#journal.replaceReferences(records, provisional);
+	}
 	protected hasDirtyJournal(): boolean {
 		return this.#journal.hasDirty;
 	}

@@ -38,7 +38,6 @@ import {
 	isProvisionalOperation,
 	isV2Record,
 } from "./session-authority-validation";
-import { provisionalKey } from "./session-operation-codec";
 
 const WAL_KIND = "openwebui-gjc-session-authority-wal" as const;
 const WAL_VERSION = 1 as const;
@@ -244,7 +243,7 @@ export class FileSessionAuthority extends SessionAuthority {
 		readonly records: ReadonlyMap<string, SessionAuthorityRecord>;
 		readonly provisional: ReadonlyMap<string, ProvisionalSessionOperation>;
 	}): void {
-		this.replaceAll([...rollback.records.values()], [...rollback.provisional.values()]);
+		this.replaceAllWithReferences([...rollback.records.values()], [...rollback.provisional.values()]);
 		this.clearDirtyJournal();
 	}
 	private verifyAgainstDisk(): void {
@@ -270,7 +269,7 @@ export class FileSessionAuthority extends SessionAuthority {
 		if (base === undefined) return true;
 		return readBaseGeneration(this.filePath) === (base.generation ?? undefined);
 	}
-	private load(): void {
+	protected load(): void {
 		if (!existsSync(this.filePath)) {
 			this.#baseIdentity = undefined;
 			this.clearDirtyJournal();
@@ -284,7 +283,7 @@ export class FileSessionAuthority extends SessionAuthority {
 		}
 		if (isLegacyMappingDocument(document)) {
 			this.quarantineLegacyDocument();
-			this.replaceAll([]);
+			this.replaceAllWithReferences([]);
 			this.#baseIdentity = statIdentity(this.filePath);
 			this.clearDirtyJournal();
 			return;
@@ -294,7 +293,7 @@ export class FileSessionAuthority extends SessionAuthority {
 			!isAuthorityDocumentRelationallyValid(document.mappings, document.provisionalOperations ?? [])
 		)
 			throw new SessionAuthorityLoadError(this.filePath, "authority document is not a valid v2 authority");
-		this.replaceAll(document.mappings, document.provisionalOperations ?? []);
+		this.replaceAllWithReferences(document.mappings, document.provisionalOperations ?? []);
 		const stat = statIdentity(this.filePath);
 		this.#baseIdentity =
 			stat === undefined
@@ -314,6 +313,13 @@ export class FileSessionAuthority extends SessionAuthority {
 			!isAuthorityDocumentRelationallyValid(mappings, provisionalOperations)
 		)
 			throw new Error("Refusing to persist an invalid v2 session authority.");
+		// The rewritten base must also become the in-memory state: a legacy
+		// record whose result event arrays were stripped only on disk would
+		// otherwise re-introduce them through the next WAL delta, so every
+		// subsequent mutation would append a large delta and immediately
+		// re-compact.
+		const normalizedMappings = mappings.map(normalizeRecordForPersistence);
+		const normalizedProvisional = provisionalOperations.map(normalizeProvisionalForPersistence);
 		mkdirSync(dirname(this.filePath), { recursive: true });
 		const temporary = `${this.filePath}.tmp-${process.pid}-${Date.now()}`;
 		const descriptor = openSync(temporary, "wx", 0o600);
@@ -328,8 +334,8 @@ export class FileSessionAuthority extends SessionAuthority {
 					kind: "openwebui-gjc-session-authority",
 					version: SESSION_AUTHORITY_VERSION,
 					generation: nextGeneration,
-					mappings: mappings.map(normalizeRecordForPersistence),
-					provisionalOperations: provisionalOperations.map(normalizeProvisionalForPersistence),
+					mappings: normalizedMappings,
+					provisionalOperations: normalizedProvisional,
 				})}\n`,
 				"utf8",
 			);
@@ -341,8 +347,18 @@ export class FileSessionAuthority extends SessionAuthority {
 		try {
 			this.syncDirectory();
 		} catch (error) {
-			this.load();
 			this.#walIdentity = undefined;
+			try {
+				this.load();
+			} catch (loadError) {
+				// The base may already contain the mutation; a failed reload must
+				// still surface uncertain durability so callers cannot treat this
+				// as a clean rollback and retry.
+				throw new SessionAuthorityDurabilityError(
+					this.filePath,
+					new AggregateError([error, loadError], "authority reload failed after the base replacement"),
+				);
+			}
 			try {
 				if (existsSync(this.walPath)) unlinkSync(this.walPath);
 			} catch {
@@ -357,10 +373,20 @@ export class FileSessionAuthority extends SessionAuthority {
 			// mutation is committed; reload the visible state and surface uncertain
 			// durability instead of letting mutate() restore a pre-mutation snapshot
 			// (a retry could then conflict with or duplicate the committed write).
-			this.load();
 			this.#walIdentity = undefined;
+			try {
+				this.load();
+			} catch (loadError) {
+				throw new SessionAuthorityDurabilityError(
+					this.filePath,
+					new AggregateError([error, loadError], "authority reload failed after the WAL reset"),
+				);
+			}
 			throw new SessionAuthorityDurabilityError(this.filePath, error);
 		}
+		// The normalized records become the live journal state so subsequent WAL
+		// deltas stay compact (no stripped event arrays are re-introduced).
+		this.replaceAllWithReferences(normalizedMappings, normalizedProvisional);
 		this.#baseIdentity = { ...statIdentity(this.filePath)!, generation: nextGeneration };
 		this.clearDirtyJournal();
 	}
@@ -395,11 +421,9 @@ export class FileSessionAuthority extends SessionAuthority {
 			this.dropWalFile();
 			return { trailingGarbage: false };
 		}
-		const records = new Map<string, SessionAuthorityRecord>();
-		const provisional = new Map<string, ProvisionalSessionOperation>();
-		for (const record of this.entries()) records.set(record.chatId, record);
-		for (const operation of this.provisionalEntries())
-			provisional.set(provisionalKey(operation.chatId, operation.ingressId ?? operation.id), operation);
+		const raw = this.rawJournalEntries();
+		const records = new Map(raw.records);
+		const provisional = new Map(raw.provisional);
 		let trailingGarbage = false;
 		for (const line of lines.slice(1)) {
 			let delta: unknown;
@@ -416,7 +440,7 @@ export class FileSessionAuthority extends SessionAuthority {
 			for (const record of delta.records) records.set(record.chatId, record);
 			for (const item of delta.provisional) provisional.set(item.key, item.operation);
 		}
-		this.replaceAll([...records.values()], [...provisional.values()]);
+		this.replaceAllWithReferences([...records.values()], [...provisional.values()]);
 		this.#walIdentity = statIdentity(walPath);
 		this.clearDirtyJournal();
 		return { trailingGarbage };
@@ -479,11 +503,17 @@ export class FileSessionAuthority extends SessionAuthority {
 	}
 	/** Reloads memory from the durable base and WAL so in-memory state matches
 	 * what boot will replay; used when a durability failure leaves the committed
-	 * state uncertain. */
+	 * state uncertain. A reload failure is itself a durability error so the
+	 * caller can never mistake it for a clean rollback. */
 	private reloadDurableState(): void {
-		this.load();
-		if (existsSync(this.walPath)) this.replayWal();
-		else this.#walIdentity = undefined;
+		try {
+			this.load();
+			if (existsSync(this.walPath)) this.replayWal();
+			else this.#walIdentity = undefined;
+		} catch (error) {
+			this.#walIdentity = undefined;
+			throw new SessionAuthorityDurabilityError(this.filePath, error);
+		}
 	}
 	protected recoverFailedWalAppend(
 		previousStat: { readonly size: number; readonly mtimeMs: number } | undefined,
@@ -643,6 +673,10 @@ function readBaseGeneration(path: string): string | undefined {
 					}
 					continue;
 				}
+				// Whitespace outside strings is insignificant: it must never clear
+				// the pending key-colon state (an external writer may emit formatted
+				// JSON such as `"generation": "uuid"`).
+				if (byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d) continue;
 				if (byte === 0x22) {
 					// A root-level string starts: either a key or the value after a
 					// colon. Nested strings (depth >= 2) are ignored entirely.

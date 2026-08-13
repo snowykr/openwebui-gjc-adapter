@@ -644,6 +644,121 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				.sort(),
 		).toEqual(["chat-1", "chat-2"]);
 	});
+	test("finds the generation when an external writer formats the document with whitespace", () => {
+		const filePath = join(
+			mkdtempSync(join(tmpdir(), "gjc-session-authority-generation-whitespace-")),
+			"mappings.json",
+		);
+		const authority = new FileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+
+		// An external writer may emit formatted JSON such as `"generation": "uuid"`;
+		// the scanner must skip whitespace instead of treating it as a scalar
+		// token that cancels the pending key-colon state.
+		const formatted = JSON.stringify(JSON.parse(readFileSync(filePath, "utf8"))).replace(
+			'"generation":',
+			'"generation": ',
+		);
+		writeFileSync(filePath, `${formatted}\n`);
+
+		const live = new FileSessionAuthority(filePath);
+		live.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+
+		// No forced reload/compaction: the mutation appended to the WAL.
+		expect(existsSync(`${filePath}.wal`)).toBe(true);
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2"]);
+	});
+	test("normalizes in-memory records after compaction so later WAL deltas stay compact", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-normalize-memory-")), "mappings.json");
+		const authority = new SmallThresholdFailingFileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		const legacyResult = {
+			kind: "turn" as const,
+			assistantText: "legacy",
+			events: [
+				{ type: "message_update", id: "marker-event", payload: { marker: "giant-legacy-event-payload", padding } },
+			],
+			mapping: {
+				chatId: "chat-1",
+				projectId: project.id,
+				sessionId: "session-1",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "op-legacy",
+			},
+		};
+		authority.beginOperation("chat-1", { id: "op-legacy", kind: "prompt", detail: "legacy" });
+		// The oversized delta triggers a compaction that strips the result events
+		// from the rewritten base.
+		authority.transitionOperation("chat-1", "op-legacy", "complete", "legacy", legacyResult);
+		expect(readFileSync(filePath, "utf8")).not.toContain("giant-legacy-event-payload");
+
+		// The next mutation's WAL delta must stay compact: the stripped events
+		// must not be re-introduced from the in-memory journal.
+		authority.set({
+			...mappingInput(mediumSelection),
+			chatId: "chat-1",
+			operationId: "user-2",
+			assistantText: "follow-up",
+		});
+		const wal = existsSync(`${filePath}.wal`) ? readFileSync(`${filePath}.wal`, "utf8") : "";
+		expect(wal).not.toContain("giant-legacy-event-payload");
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1"]);
+	});
+	class ReloadFailingFileSessionAuthority extends FailingFileSessionAuthority {
+		loadFailure: Error | undefined;
+		protected override walCompactionThresholdBytes = 1024;
+
+		protected override load(): void {
+			if (this.loadFailure !== undefined) throw this.loadFailure;
+			super.load();
+		}
+	}
+	test("keeps the durability classification when the post-rewrite reload also fails", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-reload-failure-")), "mappings.json");
+		const authority = new ReloadFailingFileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.directoryFailure = new Error("injected directory sync failure");
+		authority.loadFailure = new Error("injected reload failure");
+
+		let error: unknown;
+		try {
+			authority.set({
+				...mappingInput(mediumSelection),
+				chatId: "chat-2",
+				operationId: "user-2",
+				assistantText: `${padding}turn-2`,
+			});
+		} catch (caught) {
+			error = caught;
+		}
+
+		expect(error).toBeInstanceOf(SessionAuthorityDurabilityError);
+		// The renamed base may contain the mutation, so memory must not roll back
+		// to a pre-mutation snapshot that a retry could duplicate.
+		expect(
+			authority
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2"]);
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2"]);
+	});
 	class RecoveryDirectoryFailingFileSessionAuthority extends FailingFileSessionAuthority {
 		syncCalls = 0;
 		postWriteFailure: Error | undefined;
