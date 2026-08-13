@@ -42,6 +42,10 @@ import {
 const WAL_KIND = "openwebui-gjc-session-authority-wal" as const;
 const WAL_VERSION = 1 as const;
 const WAL_COMPACTION_THRESHOLD_BYTES = 32 * 1024 * 1024;
+/** WALs up to this size are cheap to fully re-verify per mutation; beyond it,
+ * per-turn verification trusts the stat identity and the boot replay validates
+ * every line. */
+const WAL_FULL_VERIFY_THRESHOLD_BYTES = 1024 * 1024;
 
 type BaseIdentity = { readonly size: number; readonly mtimeMs: number; readonly generation?: string };
 
@@ -301,10 +305,14 @@ export class FileSessionAuthority extends SessionAuthority {
 	 * identity: a replacement with different valid contents that preserves byte
 	 * length and mtime must be replayed before the next mutation is appended,
 	 * otherwise the append would be acknowledged against a state that a restart
-	 * never replays. */
+	 * never replays. Full-content verification is bounded: while the WAL is
+	 * small the digest is cheap, and larger WALs rely on the stat identity per
+	 * turn with the full line-by-line replay validation at boot/compaction, so
+	 * per-turn I/O never grows toward the compaction threshold. */
 	private walDigestMatchesDisk(): boolean {
 		const wal = this.#walIdentity;
 		if (wal === undefined) return true;
+		if (wal.size > WAL_FULL_VERIFY_THRESHOLD_BYTES) return true;
 		return walFileDigest(this.walPath) === wal.digest;
 	}
 	protected load(): void {
@@ -467,7 +475,9 @@ export class FileSessionAuthority extends SessionAuthority {
 		} catch (error) {
 			throw new SessionAuthorityLoadError(this.filePath, "authority WAL is unreadable", error);
 		}
-		const lines = contents.split("\n").filter(line => line.length > 0);
+		const parts = contents.split("\n");
+		const hasTrailingNewline = parts.length > 0 && parts[parts.length - 1] === "";
+		const lines = parts.filter(line => line.length > 0);
 		if (lines.length === 0) {
 			this.dropWalFile();
 			return { trailingGarbage: false };
@@ -486,17 +496,26 @@ export class FileSessionAuthority extends SessionAuthority {
 		const records = new Map(raw.records);
 		const provisional = new Map(raw.provisional);
 		let trailingGarbage = false;
-		for (const line of lines.slice(1)) {
+		const deltaLines = lines.slice(1);
+		for (let index = 0; index < deltaLines.length; index += 1) {
+			const line = deltaLines[index]!;
 			let delta: unknown;
 			try {
 				delta = JSON.parse(line);
 			} catch {
-				trailingGarbage = true;
-				break;
+				delta = undefined;
 			}
-			if (!isWalDelta(delta)) {
-				trailingGarbage = true;
-				break;
+			if (delta === undefined || !isWalDelta(delta)) {
+				// Only an unterminated malformed FINAL line is a crash-truncation
+				// artifact that can be recovered by compacting the valid prefix. A
+				// malformed non-final line (or a newline-terminated malformed line)
+				// is corruption: silently dropping every acknowledged mutation
+				// after it would be data loss, so fail closed instead.
+				if (index === deltaLines.length - 1 && !hasTrailingNewline) {
+					trailingGarbage = true;
+					break;
+				}
+				throw new SessionAuthorityLoadError(this.filePath, "authority WAL is corrupt before its final line");
 			}
 			for (const record of delta.records) records.set(record.chatId, record);
 			for (const item of delta.provisional) provisional.set(item.key, item.operation);

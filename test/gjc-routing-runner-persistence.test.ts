@@ -651,6 +651,68 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				.sort(),
 		).toEqual(["chat-1", "chat-3", "chat-9"]);
 	});
+	test("fails closed when a WAL line before the tail is malformed", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-corruption-")), "mappings.json");
+		const walPath = `${filePath}.wal`;
+		const authority = new FileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-3", operationId: "user-3" });
+
+		// Corrupt a NON-FINAL line: silently compacting the prefix would delete
+		// the acknowledged chat-3 mutation, so boot must fail closed.
+		const lines = readFileSync(walPath, "utf8").split("\n");
+		lines[1] = "{corrupt-delta";
+		writeFileSync(walPath, lines.join("\n"));
+
+		expect(() => new FileSessionAuthority(filePath)).toThrow("corrupt before its final line");
+	});
+	test("trusts the stat identity per turn once the WAL exceeds the full-verify bound", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-verify-bound-")), "mappings.json");
+		const walPath = `${filePath}.wal`;
+		const authority = new FileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		const pad = "x".repeat(400 * 1024);
+		authority.set({
+			...mappingInput(mediumSelection),
+			chatId: "chat-2",
+			operationId: "user-2",
+			assistantText: `${pad}turn-2`,
+		});
+		authority.set({
+			...mappingInput(mediumSelection),
+			chatId: "chat-3",
+			operationId: "user-3",
+			assistantText: `${pad}turn-3`,
+		});
+		authority.set({
+			...mappingInput(mediumSelection),
+			chatId: "chat-4",
+			operationId: "user-4",
+			assistantText: `${pad}turn-4`,
+		});
+		expect(statSync(walPath).size).toBeGreaterThan(1024 * 1024);
+
+		// Above the bound the per-turn check trusts the stat identity (full
+		// line-by-line validation happens at boot), so the mutation appends
+		// without forcing a reload and boot replays the complete WAL.
+		const original = readFileSync(walPath, "utf8");
+		const replaced = original.replaceAll("chat-2", "chat-9");
+		expect(replaced.length).toBe(original.length);
+		const mtimeMs = statSync(walPath).mtimeMs;
+		writeFileSync(walPath, replaced);
+		utimesSync(walPath, mtimeMs / 1000, mtimeMs / 1000);
+
+		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-5", operationId: "user-5" });
+
+		expect(existsSync(walPath)).toBe(true);
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-3", "chat-4", "chat-5", "chat-9"]);
+	});
 	test("upgrades a generation-less base before the first WAL append", () => {
 		const filePath = join(
 			mkdtempSync(join(tmpdir(), "gjc-session-authority-generation-less-upgrade-")),
