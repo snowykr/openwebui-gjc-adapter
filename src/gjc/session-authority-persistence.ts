@@ -375,6 +375,10 @@ export class FileSessionAuthority extends SessionAuthority {
 		}
 		const parts = contents.split("\n");
 		const hasTrailingNewline = parts.length > 0 && parts[parts.length - 1] === "";
+		// An unterminated final line is a torn write even when its prefix parses
+		// as valid JSON; the cached identity cannot be verified against it, so the
+		// caller reloads and replayWal compacts the valid prefix.
+		if (!hasTrailingNewline) return undefined;
 		const lines = parts.filter(line => line.length > 0);
 		if (lines.length === 0) return undefined;
 		let header: unknown;
@@ -498,11 +502,11 @@ export class FileSessionAuthority extends SessionAuthority {
 					new AggregateError([error, loadError], "authority reload failed after the base replacement"),
 				);
 			}
-			try {
-				if (existsSync(this.walPath)) unlinkSync(this.walPath);
-			} catch {
-				// The base already supersedes the WAL; a stale file is discarded at the next boot stat check.
-			}
+			// Keep the WAL: the base rename's directory sync failed, so the
+			// replacement is not known durable. If a crash then loses the rename
+			// while an unlink reached storage, startup would see the old base
+			// without its WAL-only acknowledged mutations. The WAL's generation
+			// binding makes it stale (and harmless) if the new base survives.
 			throw new SessionAuthorityDurabilityError(this.filePath, error);
 		}
 		try {
@@ -575,10 +579,19 @@ export class FileSessionAuthority extends SessionAuthority {
 		}
 		const parts = contents.split("\n");
 		const hasTrailingNewline = parts.length > 0 && parts[parts.length - 1] === "";
-		const lines = parts.filter(line => line.length > 0);
+		let lines = parts.filter(line => line.length > 0);
+		let trailingGarbage = false;
+		if (!hasTrailingNewline && lines.length > 0) {
+			// An unterminated final line is a torn write even when its prefix
+			// happens to parse as a valid delta: treat it as uncommitted and
+			// recover the valid prefix instead of letting the next append write a
+			// second JSON object directly after it (which would corrupt the file).
+			trailingGarbage = true;
+			lines = lines.slice(0, -1);
+		}
 		if (lines.length === 0) {
 			this.dropWalFile();
-			return { trailingGarbage: false };
+			return { trailingGarbage };
 		}
 		let header: unknown;
 		try {
@@ -600,7 +613,6 @@ export class FileSessionAuthority extends SessionAuthority {
 		const raw = this.rawJournalEntries();
 		const records = new Map(raw.records);
 		const provisional = new Map(raw.provisional);
-		let trailingGarbage = false;
 		const deltaLines = lines.slice(1);
 		const verifyLink = (prevHash: unknown, line: string): void => {
 			if (!chained) return;
@@ -617,18 +629,8 @@ export class FileSessionAuthority extends SessionAuthority {
 			} catch {
 				delta = undefined;
 			}
-			if (delta === undefined || !isWalDelta(delta)) {
-				// Only an unterminated malformed FINAL line is a crash-truncation
-				// artifact that can be recovered by compacting the valid prefix. A
-				// malformed non-final line (or a newline-terminated malformed line)
-				// is corruption: silently dropping every acknowledged mutation
-				// after it would be data loss, so fail closed instead.
-				if (index === deltaLines.length - 1 && !hasTrailingNewline) {
-					trailingGarbage = true;
-					break;
-				}
+			if (delta === undefined || !isWalDelta(delta))
 				throw new SessionAuthorityLoadError(this.filePath, "authority WAL is corrupt before its final line");
-			}
 			const deltaRecord = delta as Record<string, unknown>;
 			verifyLink(deltaRecord.prevHash, line);
 			lastLineLength = Buffer.byteLength(line, "utf8");

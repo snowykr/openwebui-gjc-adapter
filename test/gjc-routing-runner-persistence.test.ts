@@ -670,6 +670,64 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 
 		expect(() => new FileSessionAuthority(filePath)).toThrow("corrupt before its final line");
 	});
+	test("treats an unterminated valid-JSON final line as a torn tail", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-torn-tail-")), "mappings.json");
+		const walPath = `${filePath}.wal`;
+		const authority = new FileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-3", operationId: "user-3" });
+
+		// A torn write leaves the final delta's JSON but not its newline; the
+		// tail must be treated as uncommitted and the valid prefix compacted,
+		// not replayed (which would let the next append corrupt the file).
+		const contents = readFileSync(walPath, "utf8");
+		expect(contents.endsWith("\n")).toBe(true);
+		writeFileSync(walPath, contents.slice(0, -1));
+
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2"]);
+	});
+	test("retains the WAL when the base rename durability is uncertain", () => {
+		class SmallThresholdDirectoryFailingAuthority extends FailingFileSessionAuthority {
+			protected override walCompactionThresholdBytes = 1024;
+		}
+		const filePath = join(
+			mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-retain-on-sync-failure-")),
+			"mappings.json",
+		);
+		const walPath = `${filePath}.wal`;
+		const authority = new SmallThresholdDirectoryFailingAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.set({
+			...mappingInput(mediumSelection),
+			chatId: "chat-2",
+			operationId: "user-2",
+			assistantText: `${padding}turn-2`,
+		});
+		authority.directoryFailure = new Error("injected directory sync failure");
+
+		let error: unknown;
+		try {
+			authority.set({
+				...mappingInput(mediumSelection),
+				chatId: "chat-3",
+				operationId: "user-3",
+				assistantText: `${padding}turn-3`,
+			});
+		} catch (caught) {
+			error = caught;
+		}
+
+		expect(error).toBeInstanceOf(SessionAuthorityDurabilityError);
+		// The rename was not durably synced, so the WAL must be kept to keep the
+		// previous base + WAL pair complete if a crash loses the rename.
+		expect(existsSync(walPath)).toBe(true);
+	});
 	test("fails closed at boot when an interior WAL delta was replaced", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-interior-swap-")), "mappings.json");
 		const walPath = `${filePath}.wal`;
