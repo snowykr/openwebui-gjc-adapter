@@ -667,8 +667,8 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 
 		expect(() => new FileSessionAuthority(filePath)).toThrow("corrupt before its final line");
 	});
-	test("detects a same-size same-mtime WAL replacement regardless of WAL size", () => {
-		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-verify-bound-")), "mappings.json");
+	test("fails closed at boot when an interior WAL delta was replaced", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-interior-swap-")), "mappings.json");
 		const walPath = `${filePath}.wal`;
 		const authority = new FileSessionAuthority(filePath);
 		authority.set(mappingInput(mediumSelection));
@@ -693,31 +693,44 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		});
 		expect(statSync(walPath).size).toBeGreaterThan(1024 * 1024);
 
-		// The bounded head+tail content sample detects the swap at ANY WAL size:
-		// the head-region delta is replaced while preserving byte length and
-		// mtime, and the live authority must replay the replacement before the
-		// next append.
+		// Replace an INTERIOR delta: the chained hashes cryptographically cover
+		// every line, so the next live verification (and any boot) fails closed on
+		// the broken link instead of silently replaying the replaced state.
 		const original = readFileSync(walPath, "utf8");
 		const replaced = original.replaceAll("chat-2", "chat-9");
 		expect(replaced.length).toBe(original.length);
-		const mtimeMs = statSync(walPath).mtimeMs;
 		writeFileSync(walPath, replaced);
-		utimesSync(walPath, mtimeMs / 1000, mtimeMs / 1000);
 
-		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-5", operationId: "user-5" });
+		expect(() =>
+			authority.set({ ...mappingInput(mediumSelection), chatId: "chat-5", operationId: "user-5" }),
+		).toThrow("chain is broken");
+		expect(() => new FileSessionAuthority(filePath)).toThrow("chain is broken");
+	});
+	test("keeps chained digests byte-consistent for non-ASCII WAL content", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-non-ascii-")), "mappings.json");
+		const walPath = `${filePath}.wal`;
+		const authority = new FileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.set({
+			...mappingInput(mediumSelection),
+			chatId: "chat-2",
+			operationId: "user-2",
+			assistantText: "café-한글-β",
+		});
 
-		expect(
-			authority
-				.entries()
-				.map(record => record.chatId)
-				.sort(),
-		).toEqual(["chat-1", "chat-3", "chat-4", "chat-5", "chat-9"]);
+		// A restart re-derives the chain identity from the file's UTF-8 bytes; the
+		// next mutation must match it (no forced reload/compaction), so the WAL
+		// persists with the appended delta.
+		const restarted = new FileSessionAuthority(filePath);
+		restarted.set({ ...mappingInput(mediumSelection), chatId: "chat-3", operationId: "user-3" });
+
+		expect(existsSync(walPath)).toBe(true);
 		expect(
 			new FileSessionAuthority(filePath)
 				.entries()
 				.map(record => record.chatId)
 				.sort(),
-		).toEqual(["chat-1", "chat-3", "chat-4", "chat-5", "chat-9"]);
+		).toEqual(["chat-1", "chat-2", "chat-3"]);
 	});
 	test("upgrades a generation-less base before the first WAL append", () => {
 		const filePath = join(
@@ -880,9 +893,9 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 	class IdentityRefreshFailingFileSessionAuthority extends FailingFileSessionAuthority {
 		identityFailure: Error | undefined;
 
-		protected override refreshWalIdentity(): void {
+		protected override refreshWalIdentity(writtenDigest: string, lastLineLength: number): void {
 			if (this.identityFailure !== undefined) throw this.identityFailure;
-			super.refreshWalIdentity();
+			super.refreshWalIdentity(writtenDigest, lastLineLength);
 		}
 	}
 	test("classifies a post-fsync identity refresh failure as a durability error", () => {
