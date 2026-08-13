@@ -947,21 +947,38 @@ const GENERATION_KEY_OFFSET = JSON.stringify({
 	version: 2,
 	generation: "",
 }).indexOf('"generation"');
-/** Finds the byte offset of the top-level generation key in a parsed document
- * by matching an occurrence whose value equals the known generation (nested
- * "generation" keys in observations cannot collide because their values
- * differ). Used at load time for externally written documents, so the live
- * per-mutation verification can read a bounded window at the cached offset
- * instead of scanning the whole document. */
-function findGenerationOffset(raw: string, generation: string): number | undefined {
-	let index = raw.indexOf('"generation"');
-	while (index >= 0) {
-		const match = /^\s*:\s*"([^"]*)"/.exec(raw.slice(index + '"generation"'.length));
-		// The offset must be a BYTE offset (readSync interprets it as such) while
-		// indexOf counts UTF-16 code units; convert through the byte length of
-		// the preceding text so non-ASCII content before the key cannot skew it.
-		if (match !== null && match[1] === generation) return Buffer.byteLength(raw.slice(0, index), "utf8");
-		index = raw.indexOf('"generation"', index + 1);
+/** Finds the byte offset of the TOP-LEVEL generation key in a parsed
+ * document by scanning the raw text with container-depth tracking: a nested
+ * `observations.generation` carrying the same value must never shadow the
+ * top-level key, otherwise the per-mutation window read would verify the
+ * wrong occurrence and miss a same-stat top-level replacement. */
+export function findGenerationOffset(raw: string, generation: string): number | undefined {
+	let depth = 0;
+	let inString = false;
+	let escaped = false;
+	for (let index = 0; index < raw.length; index += 1) {
+		const char = raw[index]!;
+		if (inString) {
+			if (escaped) escaped = false;
+			else if (char === "\\") escaped = true;
+			else if (char === '"') inString = false;
+			continue;
+		}
+		if (char === '"') {
+			// Only depth-1 strings are top-level keys (the document's top-level
+			// values are never the literal string "generation").
+			if (depth === 1 && raw.slice(index + 1).startsWith('generation"')) {
+				const match = /^\s*:\s*"([^"]*)"/.exec(raw.slice(index + '"generation"'.length));
+				// The offset must be a BYTE offset (readSync interprets it as such)
+				// while this scan counts UTF-16 code units; convert through the
+				// byte length of the preceding text.
+				if (match !== null && match[1] === generation) return Buffer.byteLength(raw.slice(0, index), "utf8");
+			}
+			inString = true;
+			continue;
+		}
+		if (char === "{" || char === "[") depth += 1;
+		else if (char === "}" || char === "]") depth = Math.max(0, depth - 1);
 	}
 	return undefined;
 }

@@ -17,7 +17,11 @@ import { join } from "node:path";
 import type { GjcRuntimeLocations, NormalizedModelSelection } from "../src/contracts";
 import type { PublicSdkSessionPort } from "../src/gjc/public-sdk-contract";
 import { PublicSdkSessionClient } from "../src/gjc/public-sdk-session-port";
-import { FileSessionAuthority, SessionAuthorityDurabilityError } from "../src/gjc/session-authority-persistence";
+import {
+	FileSessionAuthority,
+	findGenerationOffset,
+	SessionAuthorityDurabilityError,
+} from "../src/gjc/session-authority-persistence";
 import type { ProvisionalSessionOperation, SessionAuthorityRecord } from "../src/gjc/session-authority-types";
 import { FileBackedSessionMappingStore, SessionMappingStore } from "../src/gjc/session-router";
 import type {
@@ -731,6 +735,38 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				.map(record => record.chatId)
 				.sort(),
 		).toEqual(["chat-1", "chat-2", "chat-3"]);
+	});
+	test("finds the top-level generation offset even when a nested observation shadows the value", () => {
+		// An externally written document places mappings before the generation
+		// and carries an observation whose "generation" key holds the SAME value
+		// as the top-level key.
+		const raw = JSON.stringify({
+			kind: "openwebui-gjc-session-authority",
+			version: 2,
+			mappings: [
+				{
+					version: 2,
+					chatId: "chat-1",
+					projectId: "project-1",
+					sessionId: "session-1",
+					createdAt: "2026-01-01T00:00:00.000Z",
+					header: { chatId: "chat-1", projectId: "project-1", sessionId: "session-1" },
+					observations: { generation: "shadowed-same-value" },
+					journal: [],
+					rawFrameCursor: 0,
+					eventCursor: 0,
+					operationId: "user-1",
+				},
+			],
+			generation: "shadowed-same-value",
+		});
+		const topLevelIndex = raw.lastIndexOf('"generation"');
+		const nestedIndex = raw.indexOf('"generation"');
+		expect(nestedIndex).toBeLessThan(topLevelIndex);
+
+		expect(findGenerationOffset(raw, "shadowed-same-value")).toBe(
+			Buffer.byteLength(raw.slice(0, topLevelIndex), "utf8"),
+		);
 	});
 	test("upgrades a generation-less base before the first WAL append", () => {
 		const filePath = join(
