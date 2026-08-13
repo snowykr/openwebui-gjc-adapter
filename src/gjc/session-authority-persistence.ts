@@ -329,7 +329,13 @@ export class FileSessionAuthority extends SessionAuthority {
 	 * writer reorders the document. */
 	private baseGenerationMatchesDisk(): boolean {
 		const base = this.#baseIdentity;
-		if (base === undefined || base.generation === undefined || base.generationOffset === undefined) return true;
+		if (base === undefined) return true;
+		// A known generation with no cached byte offset cannot be verified: treat
+		// it as a mismatch (fail closed) so a same-stat replacement cannot slip
+		// through, and the next append upgrades the document to the standard
+		// layout that carries a deterministic offset.
+		if (base.generation === undefined) return true;
+		if (base.generationOffset === undefined) return false;
 		return readGenerationAtOffset(this.filePath, base.generationOffset) === base.generation;
 	}
 	/** The cached WAL state is bound to the WAL's CONTENT, not only its stat
@@ -614,13 +620,19 @@ export class FileSessionAuthority extends SessionAuthority {
 				created = true;
 			}
 		}
-		if (created && this.#baseIdentity?.generation === undefined) {
+		if (
+			created &&
+			(this.#baseIdentity?.generation === undefined || this.#baseIdentity?.generationOffset === undefined)
+		) {
 			// A generation-less base (pre-upgrade v2 documents, or migration
-			// output) must be rewritten with a fresh generation BEFORE the first
-			// WAL append: a stat-only header would let a timestamp-preserving
-			// restore replay stale deltas over the replacement. Persisting writes
-			// the full current state (including this mutation) with a generation,
-			// so the append is never made under a weak identity.
+			// output) or a base whose generation offset cannot be matched in its
+			// raw representation (e.g. escaped JSON keys) must be rewritten with a
+			// fresh generation in the standard layout BEFORE the first WAL append:
+			// otherwise the WAL would be bound by stat only, or the per-mutation
+			// generation check would be disabled and a timestamp-preserving restore
+			// could replay stale deltas over the replacement. Persisting writes the
+			// full current state (including this mutation) with a deterministic
+			// generation offset, so the append is never made under a weak identity.
 			this.persist();
 			return;
 		}
@@ -897,7 +909,7 @@ function walLastLine(
 	} catch {
 		return undefined;
 	}
-	const readLength = lastLineLength + 2;
+	const readLength = lastLineLength + 1;
 	if (stat.size < lastLineLength) return undefined;
 	let descriptor: number;
 	try {
@@ -909,7 +921,10 @@ function walLastLine(
 		const buffer = Buffer.alloc(readLength);
 		const bytesRead = readSync(descriptor, buffer, 0, buffer.length, Math.max(0, stat.size - readLength));
 		if (bytesRead <= 0) return undefined;
-		const text = buffer.toString("utf8", 0, bytesRead).replace(/[\n\r]+$/, "");
+		const text = buffer
+			.toString("utf8", 0, bytesRead)
+			.replace(/^[\n\r]+/, "")
+			.replace(/[\n\r]+$/, "");
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(text);

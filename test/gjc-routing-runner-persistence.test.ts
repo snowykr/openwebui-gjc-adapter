@@ -736,6 +736,55 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				.sort(),
 		).toEqual(["chat-1", "chat-2", "chat-3"]);
 	});
+	test("verifies the final WAL line without reloading on the next mutation", () => {
+		class LoadCountingFileSessionAuthority extends FailingFileSessionAuthority {
+			loadCalls = 0;
+
+			protected override load(): void {
+				this.loadCalls += 1;
+				super.load();
+			}
+		}
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-final-line-verify-")), "mappings.json");
+		const authority = new LoadCountingFileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+		const loadCallsAfterAppend = authority.loadCalls;
+
+		// The final-line chain check must match the cached digest, so the next
+		// mutation appends without re-reading the whole base and WAL.
+		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-3", operationId: "user-3" });
+
+		expect(authority.loadCalls).toBe(loadCallsAfterAppend);
+	});
+	test("upgrades a base whose generation offset cannot be matched in the raw text", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-escaped-generation-")), "mappings.json");
+		const authority = new FileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+
+		// An external writer escapes the generation KEY: JSON.parse still yields
+		// the document, but the raw text no longer carries the literal key, so
+		// the byte offset cannot be matched. The first mutation must rewrite the
+		// base in the standard layout instead of appending under an unverifiable
+		// identity.
+		const parsed = readFileSync(filePath, "utf8").replace('"generation"', '"gener\\u0061tion"');
+		writeFileSync(filePath, parsed);
+
+		const live = new FileSessionAuthority(filePath);
+		live.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+
+		expect(existsSync(`${filePath}.wal`)).toBe(false);
+		const upgraded = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
+		expect(typeof upgraded.generation).toBe("string");
+		// The rewritten document carries the literal key in the standard layout.
+		expect(readFileSync(filePath, "utf8")).toContain('"generation":');
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2"]);
+	});
 	test("finds the top-level generation offset even when a nested observation shadows the value", () => {
 		// An externally written document places mappings before the generation
 		// and carries an observation whose "generation" key holds the SAME value
