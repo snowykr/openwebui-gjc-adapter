@@ -1835,6 +1835,7 @@ function isAuthorityDocument(value: unknown): value is {
 		Object.keys(value).every(key =>
 			["kind", "version", "generation", "mappings", "provisionalOperations"].includes(key),
 		) &&
+		(value.generation === undefined || (typeof value.generation === "string" && value.generation.length > 0)) &&
 		Array.isArray(value.mappings) &&
 		value.mappings.every(isV2Record) &&
 		(value.provisionalOperations === undefined ||
@@ -1855,6 +1856,7 @@ function isV2AuthorityContainer(value: unknown): value is {
 		Object.keys(value).every(key =>
 			["kind", "version", "generation", "mappings", "provisionalOperations"].includes(key),
 		) &&
+		(value.generation === undefined || (typeof value.generation === "string" && value.generation.length > 0)) &&
 		Array.isArray(value.mappings)
 	);
 }

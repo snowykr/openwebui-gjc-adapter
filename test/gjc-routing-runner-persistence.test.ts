@@ -616,6 +616,41 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				.sort(),
 		).toEqual(["chat-1", "chat-3"]);
 	});
+	test("reloads a live authority when the WAL is replaced with a same-size same-mtime document", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-live-wal-swap-")), "mappings.json");
+		const walPath = `${filePath}.wal`;
+		const authority = new FileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+		expect(existsSync(walPath)).toBe(true);
+
+		// Replace the WAL with different valid contents (the delta now names
+		// chat-9) while preserving the byte length and the mtime.
+		const original = readFileSync(walPath, "utf8");
+		const replaced = original.replaceAll("chat-2", "chat-9");
+		expect(replaced.length).toBe(original.length);
+		const mtimeMs = statSync(walPath).mtimeMs;
+		writeFileSync(walPath, replaced);
+		utimesSync(walPath, mtimeMs / 1000, mtimeMs / 1000);
+
+		// The next mutation must detect the content swap and replay the
+		// replacement before appending, so memory never diverges from what a
+		// restart will replay.
+		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-3", operationId: "user-3" });
+
+		expect(
+			authority
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-3", "chat-9"]);
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-3", "chat-9"]);
+	});
 	test("finds the base generation regardless of its position in the document", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-generation-position-")), "mappings.json");
 		const authority = new FileSessionAuthority(filePath);

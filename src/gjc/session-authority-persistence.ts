@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, type Hash, randomUUID } from "node:crypto";
 import {
 	closeSync,
 	constants,
@@ -54,7 +54,10 @@ export class SessionAuthorityDurabilityError extends Error {
 
 export class FileSessionAuthority extends SessionAuthority {
 	#baseIdentity: BaseIdentity | undefined = undefined;
-	#walIdentity: { readonly size: number; readonly mtimeMs: number } | undefined = undefined;
+	#walIdentity: { readonly size: number; readonly mtimeMs: number; readonly digest: string } | undefined = undefined;
+	/** Incremental hash of the WAL content as this instance knows it, so appends
+	 * can extend the digest in O(delta) instead of re-hashing the whole file. */
+	#walHasher: Hash | undefined = undefined;
 	protected walCompactionThresholdBytes = WAL_COMPACTION_THRESHOLD_BYTES;
 
 	constructor(private readonly filePath: string) {
@@ -64,6 +67,7 @@ export class FileSessionAuthority extends SessionAuthority {
 			if (!existsSync(this.filePath)) {
 				this.#baseIdentity = undefined;
 				this.#walIdentity = undefined;
+				this.#walHasher = undefined;
 				this.dropWalFile();
 				return;
 			}
@@ -252,7 +256,8 @@ export class FileSessionAuthority extends SessionAuthority {
 		if (
 			sameStatIdentity(baseStat, this.#baseIdentity) &&
 			sameStatIdentity(walStat, this.#walIdentity) &&
-			this.baseGenerationMatchesDisk()
+			this.baseGenerationMatchesDisk() &&
+			this.walDigestMatchesDisk()
 		)
 			return;
 		this.load();
@@ -268,6 +273,16 @@ export class FileSessionAuthority extends SessionAuthority {
 		const base = this.#baseIdentity;
 		if (base === undefined) return true;
 		return readBaseGeneration(this.filePath) === (base.generation ?? undefined);
+	}
+	/** The cached WAL state is bound to the WAL's CONTENT, not only its stat
+	 * identity: a replacement with different valid contents that preserves byte
+	 * length and mtime must be replayed before the next mutation is appended,
+	 * otherwise the append would be acknowledged against a state that a restart
+	 * never replays. */
+	private walDigestMatchesDisk(): boolean {
+		const wal = this.#walIdentity;
+		if (wal === undefined) return true;
+		return walFileDigest(this.walPath) === wal.digest;
 	}
 	protected load(): void {
 		if (!existsSync(this.filePath)) {
@@ -348,6 +363,7 @@ export class FileSessionAuthority extends SessionAuthority {
 			this.syncDirectory();
 		} catch (error) {
 			this.#walIdentity = undefined;
+			this.#walHasher = undefined;
 			try {
 				this.load();
 			} catch (loadError) {
@@ -374,6 +390,7 @@ export class FileSessionAuthority extends SessionAuthority {
 			// durability instead of letting mutate() restore a pre-mutation snapshot
 			// (a retry could then conflict with or duplicate the committed write).
 			this.#walIdentity = undefined;
+			this.#walHasher = undefined;
 			try {
 				this.load();
 			} catch (loadError) {
@@ -441,7 +458,8 @@ export class FileSessionAuthority extends SessionAuthority {
 			for (const item of delta.provisional) provisional.set(item.key, item.operation);
 		}
 		this.replaceAllWithReferences([...records.values()], [...provisional.values()]);
-		this.#walIdentity = statIdentity(walPath);
+		this.#walHasher = createHash("sha256").update(contents);
+		this.#walIdentity = { ...statIdentity(walPath)!, digest: this.#walHasher.copy().digest("hex") };
 		this.clearDirtyJournal();
 		return { trailingGarbage };
 	}
@@ -452,8 +470,8 @@ export class FileSessionAuthority extends SessionAuthority {
 		const walPath = this.walPath;
 		let created = false;
 		if (this.#walIdentity === undefined) {
-			if (existsSync(walPath) && this.walHasValidHeader(walPath)) {
-				this.#walIdentity = statIdentity(walPath);
+			if (this.adoptExistingWal(walPath)) {
+				// adopted: identity + hasher seeded
 			} else {
 				if (existsSync(walPath)) unlinkSync(walPath);
 				created = true;
@@ -464,8 +482,20 @@ export class FileSessionAuthority extends SessionAuthority {
 		try {
 			descriptor = openSync(walPath, "a", 0o600);
 			try {
-				if (created) writeFileSync(descriptor, `${JSON.stringify(walHeader(this.#baseIdentity))}\n`, "utf8");
-				writeFileSync(descriptor, `${JSON.stringify(walDelta(records, provisional))}\n`, "utf8");
+				if (created) {
+					const headerLine = `${JSON.stringify(walHeader(this.#baseIdentity))}\n`;
+					writeFileSync(descriptor, headerLine, "utf8");
+					this.#walHasher = createHash("sha256").update(headerLine);
+				} else if (this.#walHasher === undefined) {
+					// Defensive: the hasher should always be seeded alongside the
+					// identity; re-seed from the current file when it is not.
+					const existing = walFileHash(this.walPath);
+					if (existing === undefined) throw new Error("WAL content cannot be read before appending");
+					this.#walHasher = existing;
+				}
+				const deltaLine = `${JSON.stringify(walDelta(records, provisional))}\n`;
+				writeFileSync(descriptor, deltaLine, "utf8");
+				this.#walHasher.update(deltaLine);
 				fsyncSync(descriptor);
 			} finally {
 				closeSync(descriptor);
@@ -478,13 +508,17 @@ export class FileSessionAuthority extends SessionAuthority {
 			try {
 				this.syncDirectory();
 			} catch (error) {
-				this.#walIdentity = statIdentity(walPath);
+				this.#walIdentity = { ...statIdentity(walPath)!, digest: this.#walHasher!.copy().digest("hex") };
 				throw new SessionAuthorityDurabilityError(this.filePath, error);
 			}
 		}
-		this.#walIdentity = statIdentity(walPath);
+		this.#walIdentity = { ...statIdentity(walPath)!, digest: this.#walHasher!.copy().digest("hex") };
 	}
-	private walHasValidHeader(walPath: string): boolean {
+	/** Reads an existing WAL, validates its header against the current base, and
+	 * adopts it as the live identity (stat + content digest + incremental
+	 * hasher). Returns false when the WAL is unreadable, has no valid header, or
+	 * does not match the base identity. */
+	private adoptExistingWal(walPath: string): boolean {
 		let contents: string;
 		try {
 			contents = readFileSync(walPath, "utf8");
@@ -499,7 +533,10 @@ export class FileSessionAuthority extends SessionAuthority {
 		} catch {
 			return false;
 		}
-		return isWalHeader(header, this.#baseIdentity);
+		if (!isWalHeader(header, this.#baseIdentity)) return false;
+		this.#walHasher = createHash("sha256").update(contents);
+		this.#walIdentity = { ...statIdentity(walPath)!, digest: this.#walHasher.copy().digest("hex") };
+		return true;
 	}
 	/** Reloads memory from the durable base and WAL so in-memory state matches
 	 * what boot will replay; used when a durability failure leaves the committed
@@ -512,6 +549,7 @@ export class FileSessionAuthority extends SessionAuthority {
 			else this.#walIdentity = undefined;
 		} catch (error) {
 			this.#walIdentity = undefined;
+			this.#walHasher = undefined;
 			throw new SessionAuthorityDurabilityError(this.filePath, error);
 		}
 	}
@@ -527,6 +565,7 @@ export class FileSessionAuthority extends SessionAuthority {
 				// state and surface uncertain durability so callers do not retry an
 				// operation that boot will consider committed.
 				this.#walIdentity = undefined;
+				this.#walHasher = undefined;
 				this.reloadDurableState();
 				throw new SessionAuthorityDurabilityError(this.filePath, error);
 			}
@@ -537,15 +576,18 @@ export class FileSessionAuthority extends SessionAuthority {
 				this.syncDirectory();
 			} catch (error) {
 				this.#walIdentity = undefined;
+				this.#walHasher = undefined;
 				this.reloadDurableState();
 				throw new SessionAuthorityDurabilityError(this.filePath, error);
 			}
 			this.#walIdentity = undefined;
+			this.#walHasher = undefined;
 			return;
 		}
 		try {
 			if (!existsSync(walPath)) {
 				this.#walIdentity = undefined;
+				this.#walHasher = undefined;
 				return;
 			}
 			const descriptor = openSync(walPath, "r+");
@@ -559,11 +601,15 @@ export class FileSessionAuthority extends SessionAuthority {
 			} finally {
 				closeSync(descriptor);
 			}
-			this.#walIdentity = previousStat;
+			const rolledBack = walFileHash(walPath);
+			if (rolledBack === undefined) throw new Error("WAL rollback content cannot be re-read");
+			this.#walHasher = rolledBack;
+			this.#walIdentity = { ...previousStat, digest: rolledBack.copy().digest("hex") };
 		} catch (error) {
 			// A complete delta may remain replayable despite the reported append
 			// error; reload the WAL-visible state and surface uncertain durability.
 			this.#walIdentity = undefined;
+			this.#walHasher = undefined;
 			this.reloadDurableState();
 			throw new SessionAuthorityDurabilityError(this.filePath, error);
 		}
@@ -572,6 +618,7 @@ export class FileSessionAuthority extends SessionAuthority {
 		const walPath = this.walPath;
 		if (existsSync(walPath)) unlinkSync(walPath);
 		this.#walIdentity = undefined;
+		this.#walHasher = undefined;
 	}
 	private resetWalFile(): void {
 		this.dropWalFile();
@@ -617,6 +664,33 @@ export class FileSessionAuthority extends SessionAuthority {
 	}
 }
 
+/** Streams a file through SHA-256 in bounded chunks; undefined when the file
+ * is unreadable. */
+function walFileHash(path: string): Hash | undefined {
+	let descriptor: number;
+	try {
+		descriptor = openSync(path, "r");
+	} catch {
+		return undefined;
+	}
+	try {
+		const hash = createHash("sha256");
+		const buffer = Buffer.alloc(64 * 1024);
+		let offset = 0;
+		while (true) {
+			const bytesRead = readSync(descriptor, buffer, 0, buffer.length, offset);
+			if (bytesRead <= 0) break;
+			hash.update(buffer.subarray(0, bytesRead));
+			offset += bytesRead;
+		}
+		return hash;
+	} finally {
+		closeSync(descriptor);
+	}
+}
+function walFileDigest(path: string): string | undefined {
+	return walFileHash(path)?.digest("hex");
+}
 function statIdentity(path: string): { readonly size: number; readonly mtimeMs: number } | undefined {
 	if (!existsSync(path)) return undefined;
 	const stat = statSync(path);

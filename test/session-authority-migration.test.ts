@@ -1848,6 +1848,22 @@ describe("session authority pre-store migration", () => {
 			expect(result.status).toBe("not_needed");
 		});
 	});
+	test("degrades a scoped v2 document with an invalid generation value during preflight", () => {
+		withRoot((root, sourcePath) => {
+			const document = scopedV2Document();
+			document.generation = 42;
+			writeFileSync(sourcePath, `${JSON.stringify(document)}\n`);
+
+			const result = preflightSessionAuthorityMigration({
+				sourcePath,
+				stateRoot: root,
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+
+			expect(result.status).toBe("degraded");
+		});
+	});
 	test("preserves source evidence when the checkpoint path is unreadable", () => {
 		withRoot((root, sourcePath) => {
 			const sourceBytes = Buffer.from(JSON.stringify(legacyDocument()));
