@@ -348,25 +348,67 @@ export class FileSessionAuthority extends SessionAuthority {
 			readGenerationAtOffset(this.filePath, base.generationOffset, base.generationSpanLength) === base.generation
 		);
 	}
-	/** Binds the cached WAL state to a bounded identity that authenticates the
-	 * on-disk prefix before every append: the final line carries the chained
-	 * head (a hash that commits to the ENTIRE prefix), so reading one line is
-	 * enough to confirm the file matches the incrementally maintained chain. A
-	 * whole-file or tail replacement therefore has a different head and is
-	 * detected; an interior-only tamper is caught by the full chain
-	 * verification on reload/boot, which fails closed. */
+	/** Binds the cached WAL state to a collision-resistant identity that
+	 * authenticates the on-disk prefix before every acknowledged append: every
+	 * chained link is verified from the bytes (each line's head commits its own
+	 * body and links to the previous head), so an interior same-size same-mtime
+	 * delta replacement or corruption is detected live and fails closed. The
+	 * WAL is bounded by the compaction threshold, so this is O(WAL), not
+	 * O(base). */
 	private walDigestMatchesDisk(): boolean {
 		const wal = this.#walIdentity;
 		if (wal === undefined) return true;
-		if (wal.version === WAL_VERSION && wal.lastLineLength !== undefined) {
-			const lastLine = walLastLine(this.walPath, wal.lastLineLength);
-			return (
-				lastLine !== undefined &&
-				lineChainHash(lastLine.prevHash, lastLine.bodyJson) === lastLine.head &&
-				lastLine.head === wal.digest
-			);
+		if (wal.version === WAL_VERSION) {
+			const verified = this.verifyWalChainOnDisk();
+			return verified !== undefined && verified.digest === wal.digest;
 		}
 		return walSampleDigestFromFile(this.walPath) === wal.digest;
+	}
+	/** Streams the WAL and verifies every chained link against the on-disk
+	 * bytes (header + deltas): each line's prevHash must equal the previous
+	 * head and its body must recompute its embedded head. Returns the final
+	 * head, or undefined when any link is broken, unreadable, or the tail is
+	 * torn. */
+	private verifyWalChainOnDisk(): { readonly digest: string } | undefined {
+		let contents: string;
+		try {
+			contents = readFileSync(this.walPath, "utf8");
+		} catch {
+			return undefined;
+		}
+		const parts = contents.split("\n");
+		const hasTrailingNewline = parts.length > 0 && parts[parts.length - 1] === "";
+		if (!hasTrailingNewline) return undefined;
+		const lines = parts.filter(line => line.length > 0);
+		if (lines.length === 0) return undefined;
+		let header: unknown;
+		try {
+			header = JSON.parse(lines[0]!);
+		} catch {
+			return undefined;
+		}
+		if (!isWalHeader(header, this.#baseIdentity) || (header as Record<string, unknown>).version !== WAL_VERSION)
+			return undefined;
+		let expectedHead = lineChainHash(WAL_CHAIN_SEED, lines[0]!);
+		for (let index = 1; index < lines.length; index += 1) {
+			const line = lines[index]!;
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(line);
+			} catch {
+				return undefined;
+			}
+			if (!isWalDelta(parsed)) return undefined;
+			const record = parsed as Record<string, unknown>;
+			if (
+				!isNonEmptyString(record.prevHash) ||
+				record.prevHash !== expectedHead ||
+				lineChainHash(record.prevHash, walDeltaBodyJson(record)) !== record.head
+			)
+				return undefined;
+			expectedHead = record.head as string;
+		}
+		return { digest: expectedHead };
 	}
 	protected load(): void {
 		if (!existsSync(this.filePath)) {
@@ -909,47 +951,6 @@ function walSampleDigestFromFile(path: string): string | undefined {
 			hash.update(tail.subarray(0, Math.max(0, tailBytes)));
 		}
 		return hash.digest("hex");
-	} finally {
-		closeSync(descriptor);
-	}
-}
-/** Reads the final chained line of a v2 WAL (bounded to its known byte length
- * plus one terminator byte) and returns its prevHash, chained head, and the
- * body serialization needed to recompute the head byte-identically. */
-function walLastLine(
-	path: string,
-	lastLineLength: number,
-): { readonly prevHash: string; readonly head: string; readonly bodyJson: string } | undefined {
-	let stat: { readonly size: number };
-	try {
-		stat = statSync(path);
-	} catch {
-		return undefined;
-	}
-	if (stat.size < lastLineLength) return undefined;
-	let descriptor: number;
-	try {
-		descriptor = openSync(path, "r");
-	} catch {
-		return undefined;
-	}
-	try {
-		const buffer = Buffer.alloc(lastLineLength + 1);
-		const bytesRead = readSync(descriptor, buffer, 0, buffer.length, Math.max(0, stat.size - buffer.length));
-		if (bytesRead <= 0) return undefined;
-		const text = buffer
-			.toString("utf8", 0, bytesRead)
-			.replace(/^[\n\r]+/, "")
-			.replace(/[\n\r]+$/, "");
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(text);
-		} catch {
-			return undefined;
-		}
-		const record = parsed as Record<string, unknown>;
-		if (!isNonEmptyString(record.prevHash) || !isNonEmptyString(record.head)) return undefined;
-		return { prevHash: record.prevHash, head: record.head, bodyJson: walDeltaBodyJson(record) };
 	} finally {
 		closeSync(descriptor);
 	}
