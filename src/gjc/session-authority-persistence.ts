@@ -427,8 +427,29 @@ export class FileSessionAuthority extends SessionAuthority {
 		// The normalized records become the live journal state so subsequent WAL
 		// deltas stay compact (no stripped event arrays are re-introduced).
 		this.replaceAllWithReferences(normalizedMappings, normalizedProvisional);
-		this.#baseIdentity = { ...statIdentity(this.filePath)!, generation: nextGeneration };
+		try {
+			this.refreshBaseIdentity(nextGeneration);
+		} catch (error) {
+			// The base was renamed, directory-synced, and the WAL removed before
+			// this point, so the mutation is committed; a failed base stat refresh
+			// must surface uncertain durability instead of letting mutate() restore
+			// a pre-mutation snapshot that a retry could duplicate.
+			try {
+				this.load();
+			} catch (loadError) {
+				throw new SessionAuthorityDurabilityError(
+					this.filePath,
+					new AggregateError([error, loadError], "authority reload failed after the base replacement"),
+				);
+			}
+			throw new SessionAuthorityDurabilityError(this.filePath, error);
+		}
 		this.clearDirtyJournal();
+	}
+	/** Refreshes the cached base identity (stat + generation) after a rewrite;
+	 * separated so the post-commit failure handling can guard it. */
+	protected refreshBaseIdentity(nextGeneration: string): void {
+		this.#baseIdentity = { ...statIdentity(this.filePath)!, generation: nextGeneration };
 	}
 	protected syncDirectory(): void {
 		const directory = openSync(dirname(this.filePath), "r");

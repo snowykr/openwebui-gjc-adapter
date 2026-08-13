@@ -858,6 +858,49 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			super.load();
 		}
 	}
+	class BaseStatFailingFileSessionAuthority extends FailingFileSessionAuthority {
+		baseStatFailure: Error | undefined;
+		protected override walCompactionThresholdBytes = 1024;
+
+		protected override refreshBaseIdentity(nextGeneration: string): void {
+			if (this.baseStatFailure !== undefined) throw this.baseStatFailure;
+			super.refreshBaseIdentity(nextGeneration);
+		}
+	}
+	test("keeps the durability classification when the final base stat fails", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-base-stat-failure-")), "mappings.json");
+		const authority = new BaseStatFailingFileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.baseStatFailure = new Error("injected base stat failure");
+
+		let error: unknown;
+		try {
+			authority.set({
+				...mappingInput(mediumSelection),
+				chatId: "chat-2",
+				operationId: "user-2",
+				assistantText: `${padding}turn-2`,
+			});
+		} catch (caught) {
+			error = caught;
+		}
+
+		expect(error).toBeInstanceOf(SessionAuthorityDurabilityError);
+		// The base already contains the committed mutation; memory must not roll
+		// back to a pre-mutation snapshot that a retry could duplicate.
+		expect(
+			authority
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2"]);
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2"]);
+	});
 	test("keeps the durability classification when the post-rewrite reload also fails", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-reload-failure-")), "mappings.json");
 		const authority = new ReloadFailingFileSessionAuthority(filePath);
