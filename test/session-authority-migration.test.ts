@@ -1902,6 +1902,62 @@ describe("session authority pre-store migration", () => {
 			expect(new FileSessionAuthority(destinationPath).entries()).toHaveLength(2);
 		});
 	});
+	test("ignores a stale WAL when recognizing a committed migration", () => {
+		withRoot((root, sourcePath) => {
+			const destinationPath = join(root, "relocated", "authority.json");
+			const source = new FileSessionAuthority(sourcePath);
+			source.set({
+				chatId: "chat-1",
+				projectId: "project-1",
+				sessionId: "session-1",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-1",
+			});
+			source.set({
+				chatId: "chat-2",
+				projectId: "project-1",
+				sessionId: "session-2",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-2",
+			});
+			const first = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [sourcePath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+			expect(first.status).toBe("committed");
+			expect(existsSync(`${sourcePath}.wal`)).toBe(false);
+
+			// A crash after base compaction leaves a stale WAL beside the source,
+			// bound to a PREVIOUS base (size/mtime 0). It carries no applicable
+			// mutations, so the committed-candidate check must ignore it instead of
+			// forcing a rewrite that would change the source digest and degrade the
+			// otherwise intact migration.
+			writeFileSync(
+				`${sourcePath}.wal`,
+				`${JSON.stringify({
+					kind: "openwebui-gjc-session-authority-wal",
+					version: 1,
+					base: { size: 0, mtimeMs: 0 },
+				})}\n`,
+			);
+
+			const second = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [sourcePath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+
+			expect(second.status).toBe("not_needed");
+			expect(new FileSessionAuthority(destinationPath).entries()).toHaveLength(2);
+		});
+	});
 	test("merges a candidate's WAL-only mutations after a committed migration", () => {
 		withRoot((root, sourcePath) => {
 			const destinationPath = join(root, "relocated", "authority.json");

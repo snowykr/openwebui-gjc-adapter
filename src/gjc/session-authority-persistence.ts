@@ -993,6 +993,47 @@ export function compactAuthorityForRelocation(
 ): void {
 	new FileSessionAuthority(filePath, lock).compactForRelocation(lock);
 }
+/** Inspects whether the WAL beside a base is applicable to it: "current" when
+ * its header is syntactically valid and demonstrably bound to the current
+ * base (its deltas are replayable), "stale" when the header is valid but
+ * bound to a DIFFERENT base (no applicable mutations), "malformed" when the
+ * header cannot be parsed or is structurally invalid (fail closed), and
+ * "none" when no WAL exists. Used by the migration layer so a stale WAL left
+ * by a crash after compaction cannot force a pointless source rewrite. */
+export function walBindingForBase(walPath: string, basePath: string): "none" | "current" | "stale" | "malformed" {
+	if (!existsSync(walPath)) return "none";
+	let contents: string;
+	try {
+		contents = readFileSync(walPath, "utf8");
+	} catch {
+		return "none";
+	}
+	const firstLine = contents.split("\n")[0];
+	if (firstLine === undefined || firstLine.length === 0) return "malformed";
+	let header: unknown;
+	try {
+		header = JSON.parse(firstLine);
+	} catch {
+		return "malformed";
+	}
+	if (!isWalHeaderShape(header)) return "malformed";
+	const stat = statIdentity(basePath);
+	if (stat === undefined) return "stale";
+	let generation: string | undefined;
+	try {
+		const raw = readFileSync(basePath, "utf8");
+		const document: unknown = JSON.parse(raw);
+		if (isAuthorityDocument(document) && typeof (document as Record<string, unknown>).generation === "string")
+			generation = (document as Record<string, unknown>).generation as string;
+	} catch {
+		generation = undefined;
+	}
+	const identity: BaseIdentity = {
+		...stat,
+		...(generation === undefined ? {} : { generation }),
+	};
+	return isWalHeaderBoundToBase(header, identity) ? "current" : "stale";
+}
 /** The compact single-line document this instance writes always places the
  * top-level generation key at a fixed byte offset. */
 const GENERATION_KEY_OFFSET = JSON.stringify({

@@ -13,7 +13,7 @@ import {
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { AuthorityMutationLock } from "./session-authority-file";
-import { compactAuthorityForRelocation } from "./session-authority-persistence";
+import { compactAuthorityForRelocation, walBindingForBase } from "./session-authority-persistence";
 import {
 	type ProvisionalSessionOperation,
 	SESSION_AUTHORITY_MIGRATION_VERSION,
@@ -230,9 +230,13 @@ function candidateMigrationAlreadyCommitted(
 			return false;
 		// A source WAL may carry acknowledged mutations that exist only beside
 		// the retained old path; the candidate is not "already committed" until
-		// those are merged into the destination (runMigration compacts the
-		// validated WAL into the base before converting).
-		if (existsSync(`${sourcePath}.wal`)) return false;
+		// those are merged into the destination. A stale WAL bound to a previous
+		// base (e.g. left by a crash after base compaction) carries no applicable
+		// mutations and must not force a rewrite, while a malformed header fails
+		// closed.
+		const walBinding = walBindingForBase(`${sourcePath}.wal`, sourcePath);
+		if (walBinding === "malformed") throw new Error("authority WAL header is malformed");
+		if (walBinding === "current") return false;
 		const sourceBytes = readFileIfPresent(sourcePath);
 		const recoveryBytes = readFileIfPresent(checkpoint.sourceRecoveryPath);
 		const destinationBytes = readFileIfPresent(destinationPath);
@@ -295,7 +299,12 @@ function runMigration(
 		if (probe.ok && isAuthorityDocument(probe.value)) {
 			const lock = AuthorityMutationLock.acquire(sourcePath);
 			try {
-				if (existsSync(`${sourcePath}.wal`)) compactAuthorityForRelocation(sourcePath, lock);
+				// Compact only a CURRENT WAL: a stale WAL bound to a previous base
+				// carries no applicable mutations and rewriting the base would only
+				// churn its digest.
+				const walBinding = walBindingForBase(`${sourcePath}.wal`, sourcePath);
+				if (walBinding === "malformed") throw new Error("authority WAL header is malformed");
+				if (walBinding === "current") compactAuthorityForRelocation(sourcePath, lock);
 				sourceBytes = readFileSync(sourcePath);
 			} finally {
 				lock.release();
