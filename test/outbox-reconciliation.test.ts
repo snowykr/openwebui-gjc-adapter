@@ -430,7 +430,7 @@ describe("reconcilePendingOperations", () => {
 	});
 });
 describe("durable projection reconciliation", () => {
-	test("reconstructs exact mapping and event rows from a completed superseded operation", async () => {
+	test("settles rows for a superseded completed operation as obsolete without re-syncing", async () => {
 		const mappings = new SessionMappingStore();
 		const mapping = {
 			chatId: "chat-1",
@@ -466,7 +466,55 @@ describe("durable projection reconciliation", () => {
 
 		expect(result.failed).toEqual([]);
 		expect(result.applied.map(operation => operation.kind)).toEqual(["session_mapping", "event"]);
-		expect(synchronizedProjectIds).toEqual(["project-1", "project-1"]);
+		expect(synchronizedProjectIds).toEqual([]);
+		expect(outbox.listPending()).toEqual([]);
+	});
+	test("synthesized projection rows hash identically to rows built from the record mapping", async () => {
+		const mappings = new SessionMappingStore();
+		const mapping = {
+			chatId: "chat-1",
+			projectId: "project-1",
+			sessionId: "session-1",
+			rawFrameCursor: 1,
+			eventCursor: 1,
+			operationId: "op-1",
+			assistantText: "done",
+			events: [{ type: "tool_start", id: "tool-1" }],
+		};
+		mappings.set({ ...mapping, operationId: "bootstrap" });
+		mappings.beginOperation("chat-1", { id: "op-1", kind: "prompt", detail: "request" });
+		mappings.completeOperationWithMapping("chat-1", "op-1", "request", mapping, "turn");
+		const outbox = new InMemoryOutboxStore();
+		synthesizeProjectionRows(outbox, mappings, "user-1", "user-1");
+
+		const current = mappings.get("chat-1");
+		if (current === undefined) throw new Error("expected current mapping");
+		expect(
+			outbox
+				.listPending()
+				.map(row => ({ operationId: row.operationId, kind: row.kind, payloadHash: row.payloadHash })),
+		).toEqual(
+			expectedProjectionRows(current, "user-1").map(row => ({
+				operationId: row.operationId!,
+				kind: row.kind,
+				payloadHash: row.payloadHash,
+			})),
+		);
+
+		const result = await reconcilePendingOperations(
+			outbox,
+			createProjectionOperationApplier(
+				mappings,
+				{
+					syncLinkedProject: async () => undefined,
+				},
+				"user-1",
+			),
+		);
+
+		expect(result.failed).toEqual([]);
+		expect(result.applied.map(operation => operation.kind)).toEqual(["session_mapping", "event"]);
+		expect(outbox.listPending()).toEqual([]);
 	});
 	test("replays normal-principal rows through a scoped capability", async () => {
 		const mappings = new SessionMappingStore();
@@ -520,6 +568,7 @@ describe("durable projection reconciliation", () => {
 			rawFrameCursor: 1,
 			eventCursor: 1,
 			operationId: "op-1",
+			assistantText: "done",
 		};
 		mappings.set({ ...mapping, operationId: "bootstrap" });
 		mappings.beginOperation("chat-1", { id: "op-1", kind: "prompt", detail: "request" });
@@ -623,6 +672,7 @@ describe("durable projection reconciliation", () => {
 				rawFrameCursor: 1,
 				eventCursor: 1,
 				operationId: "op-1",
+				assistantText: "done",
 			};
 			mappings.set({ ...mapping, operationId: "bootstrap" });
 			mappings.beginOperation("chat-1", { id: "op-1", kind: "prompt", detail: "request" });

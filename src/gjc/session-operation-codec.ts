@@ -6,6 +6,7 @@ import type {
 	SessionAuthorityInput,
 	SessionAuthorityRecord,
 	SessionOperation,
+	SessionOperationGateBinding,
 	SessionOperationResult,
 } from "./session-authority-types";
 import { isRecord } from "./session-authority-validation-primitives";
@@ -68,14 +69,23 @@ export function legacyCloseIngressId(operationId: string, mapping: SessionOperat
 		.digest("hex")}`;
 }
 
+/**
+ * Builds the immutable result binding for a completed session operation.
+ *
+ * Journal results no longer carry the per-turn event stream; the event stream
+ * lives on the record mapping and in the session transcript (.jsonl). New
+ * durable results bind an empty array so the session authority document never
+ * duplicates (or accumulates) full event arrays on every completed operation.
+ */
 export function operationResult(
 	kind: "turn" | "control" | "close",
 	mapping: SessionOperationMapping,
+	gate?: SessionOperationGateBinding,
 ): SessionOperationResult {
 	return {
 		kind,
 		assistantText: mapping.assistantText ?? "",
-		events: mapping.events ?? [],
+		events: [],
 		mapping: {
 			chatId: mapping.chatId,
 			projectId: mapping.projectId,
@@ -89,6 +99,7 @@ export function operationResult(
 			...(mapping.attachment === undefined ? {} : { attachment: copyAttachment(mapping.attachment) }),
 		},
 		...(kind === "close" ? { correlation: { closeStatus: "closed" } } : {}),
+		...(gate === undefined ? {} : { gate }),
 	};
 }
 

@@ -1,3 +1,4 @@
+import type { SessionOperationGateBinding } from "../gjc/session-authority-types";
 import { ensureSdkSessionFile } from "../gjc/session-file";
 import type { SessionMapping, SessionMappingStore } from "../gjc/session-router";
 import { validateSessionFile } from "../gjc/session-router";
@@ -50,26 +51,33 @@ export function replayCompletedWorkflowGateReply(
 		throw new Error(
 			`GJC workflow gate operation ${turn.userMessageId} completed without a valid immutable result binding.`,
 		);
-	const matchesIngress = result.events.some(event => {
+	const recordMapping = mappings.get(turn.chatId);
+	const matchesIngress = (recordMapping?.events ?? []).some(event => {
 		if (event.type !== "workflow_gate") return false;
 		const gate = pendingWorkflowGateFromEvent(event);
 		return gate !== null && workflowGateOperationHash(turn, gate) === priorOperation.detail;
 	});
-	if (!matchesIngress)
+	// The completed operation's own result may still carry the gate event in
+	// legacy documents; recompute the request hash from it as well.
+	const matchesLegacyResult = result.events.some(event => {
+		if (event.type !== "workflow_gate") return false;
+		const gate = pendingWorkflowGateFromEvent(event);
+		return gate !== null && workflowGateOperationHash(turn, gate) === priorOperation.detail;
+	});
+	// New documents discard the gate event once the operation is superseded, but
+	// bind the compact answered-gate identity on the durable result, so the
+	// request hash can still be recomputed and compared against the stored
+	// detail. Without a matching binding the replay is a conflicting ingress
+	// even when the operation is no longer the record's current one.
+	const gateBinding = result.gate;
+	const matchesBinding =
+		gateBinding !== undefined && workflowGateOperationHash(turn, gateBinding) === priorOperation.detail;
+	if (!matchesIngress && !matchesLegacyResult && !matchesBinding)
 		throw new Error(
 			`GJC workflow gate operation ${turn.userMessageId} completed without a valid immutable result binding.`,
 		);
-	ensureProjectionRows(
-		input.outbox,
-		{
-			...result.mapping,
-			operationId: turn.userMessageId,
-			assistantText: result.assistantText,
-			events: result.events,
-		},
-		projectionOwnerUserId,
-		principalId,
-	);
+	if (recordMapping !== undefined && recordMapping.operationId === turn.userMessageId)
+		ensureProjectionRows(input.outbox, recordMapping, projectionOwnerUserId, principalId);
 	return { content: result.assistantText };
 }
 export async function handleWorkflowGateReply(
@@ -142,17 +150,10 @@ export async function handleWorkflowGateReply(
 				`GJC workflow gate operation ${turn.userMessageId} completed without a valid immutable result binding.`,
 			);
 		}
-		ensureProjectionRows(
-			input.outbox,
-			{
-				...priorOperation.result.mapping,
-				operationId: turn.userMessageId,
-				assistantText: priorOperation.result.assistantText,
-				events: priorOperation.result.events,
-			},
-			projectionOwnerUserId,
-			principalId,
-		);
+		// The completed operation's rows were enqueued at completion from the
+		// published record mapping; only re-enqueue when it is still current.
+		if (mapping.operationId === turn.userMessageId)
+			ensureProjectionRows(input.outbox, mapping, projectionOwnerUserId, principalId);
 		return { content: priorOperation.result.assistantText };
 	}
 	if (
@@ -214,6 +215,20 @@ export async function handleWorkflowGateReply(
 		}
 		const nextPendingGate = latestPendingWorkflowGate(result.events);
 		const responseText = nextPendingGate === null ? result.text : projectPendingWorkflowGateMessage(nextPendingGate);
+		// Bound the carried gate history: retain only the gate event just answered
+		// (needed to verify replays of THIS operation against its durable detail
+		// binding) plus any gates emitted by this reply; accepted gates from
+		// earlier chain steps are dropped, so a chain of N gates keeps O(1) gate
+		// payloads instead of N full schemas and options.
+		const answeredGateEvent = (mapping.events ?? []).find(
+			event => event.type === "workflow_gate" && pendingWorkflowGateFromEvent(event)?.gateId === pendingGate.gateId,
+		);
+		const carriedGateEvents =
+			answeredGateEvent === undefined
+				? []
+				: markWorkflowGateAccepted([answeredGateEvent], pendingGate.gateId).filter(
+						event => event.type === "workflow_gate",
+					);
 		const nextMapping = {
 			...mapping,
 			sessionFile: validateSessionFile(turn.project, result.sessionFile ?? existingSessionFile, sessionRoot),
@@ -222,8 +237,23 @@ export async function handleWorkflowGateReply(
 			eventCursor: result.eventCursor,
 			operationId: turn.userMessageId,
 			assistantText: responseText,
-			events: [...markWorkflowGateAccepted(mapping.events ?? [], pendingGate.gateId), ...result.events],
+			events: [...carriedGateEvents, ...result.events],
 			attachment: result.attachment,
+		};
+		// Compact answered-gate identity (no schema/options/context payload), so a
+		// replay can still recompute the durable request hash even after the gate
+		// event is no longer retained on the record.
+		const gateBinding: SessionOperationGateBinding = {
+			gateId: pendingGate.gateId,
+			...(pendingGate.commandId === undefined ||
+			pendingGate.turnId === undefined ||
+			pendingGate.sessionId === undefined
+				? {}
+				: {
+						commandId: pendingGate.commandId,
+						turnId: pendingGate.turnId,
+						sessionId: pendingGate.sessionId,
+					}),
 		};
 		await lifecycle.publish(result.attachment, () => {
 			const published = mappings.completeOperationWithMapping(
@@ -232,6 +262,7 @@ export async function handleWorkflowGateReply(
 				operationDetail,
 				nextMapping,
 				"control",
+				gateBinding,
 			);
 			ensureProjectionRows(input.outbox, published, projectionOwnerUserId, principalId);
 			return published;

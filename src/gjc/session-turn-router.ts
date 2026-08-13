@@ -104,9 +104,17 @@ export function scopedSessionMappingStore(
 			detail: string,
 			mapping: SessionMapping,
 			kind: Parameters<SessionMappingStore["completeOperationWithMapping"]>[4],
+			gate?: Parameters<SessionMappingStore["completeOperationWithMapping"]>[5],
 		) => {
 			requireChat(actual);
-			return mappings.completeOperationWithMappingScoped(scope, operationId, detail, withPrincipal(mapping), kind);
+			return mappings.completeOperationWithMappingScoped(
+				scope,
+				operationId,
+				detail,
+				withPrincipal(mapping),
+				kind,
+				gate,
+			);
 		},
 		provisionalOperation: (actual: string, ingressId: string) => {
 			requireChat(actual);
@@ -165,6 +173,13 @@ export async function routeGjcTurn(input: ScopedRouteGjcTurnInput): Promise<Rout
 		if (priorOperation.detail !== operationHash)
 			throw new Error(`GJC operation ${input.userMessageId} conflicts with a different ingress payload.`);
 		const replayed = replayOperation(input.userMessageId, priorOperation.result);
+		// Journal results no longer carry the event stream; the record mapping
+		// retains it. Replay the CURRENT record mapping so projection rows hash
+		// identically to completion, and skip re-enqueueing a superseded
+		// operation whose rows already exist (they settle as obsolete).
+		const currentMapping = mappings.get(input.chatId);
+		const isCurrentReplay = currentMapping !== undefined && currentMapping.operationId === input.userMessageId;
+		const replayMapping = isCurrentReplay ? currentMapping! : replayed.mapping;
 		const sessionRoot = resolveEffectiveGjcSessionRoot(
 			input.project.cwd,
 			getProjectSessionRoot(input.project),
@@ -182,8 +197,8 @@ export async function routeGjcTurn(input: ScopedRouteGjcTurnInput): Promise<Rout
 				recoveryAttachment: replayed.mapping.attachment,
 			},
 			async () => {
-				input.afterPublish?.(replayed);
-				return replayed;
+				if (isCurrentReplay) input.afterPublish?.({ ...replayed, mapping: replayMapping });
+				return { ...replayed, mapping: replayMapping };
 			},
 		);
 	}

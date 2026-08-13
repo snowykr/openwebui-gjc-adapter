@@ -49,10 +49,18 @@ export async function replayRoutingOperation(
 		)
 			throw new Error(`GJC operation ${turn.userMessageId} completed without a valid immutable result binding.`);
 		const selection = result.mapping.modelSelection;
+		const recordMapping = mappings.get(turn.chatId);
+		// Journal results no longer carry the event stream; the record mapping
+		// retains it. Enqueue projection rows only for a still-CURRENT operation
+		// and only from the record mapping, so payload hashes match the
+		// completion-time rows (re-enqueueing an event-less journal binding
+		// would conflict with them). A superseded operation's rows settle as
+		// obsolete during reconciliation.
+		const isCurrentReplay = recordMapping !== undefined && recordMapping.operationId === turn.userMessageId;
 		return replayWithLifecyclePublication(input.turnRunner, turn, result.mapping, async () => {
-			ensureProjectionRows(input.outbox, result.mapping, projectionOwnerUserId, principalId);
+			if (isCurrentReplay) ensureProjectionRows(input.outbox, recordMapping!, projectionOwnerUserId, principalId);
 			const events = projectTurnEvents(
-				result.events,
+				isCurrentReplay ? (recordMapping!.events ?? []) : result.events,
 				selection === undefined ? undefined : formatCanonicalModelId(selection),
 			);
 			return withCanonicalModel(

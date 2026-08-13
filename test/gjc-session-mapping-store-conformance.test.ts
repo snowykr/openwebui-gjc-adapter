@@ -445,6 +445,34 @@ describe("session mapping store authority conformance", () => {
 		});
 	}
 });
+test("file retirement drops the retired record's event payloads from the persisted authority", () => {
+	const directory = mkdtempSync(join(tmpdir(), "gjc-retire-drops-events-"));
+	const filePath = join(directory, "authority.json");
+	const scope = { principalId: "alice", chatId: "chat-1" };
+	try {
+		const store = new FileBackedSessionMappingStore(filePath);
+		store.setScoped(scope, {
+			chatId: "chat-1",
+			projectId: "project-1",
+			sessionId: "session-1",
+			rawFrameCursor: 1,
+			eventCursor: 2,
+			operationId: "op-1",
+			assistantText: "done",
+			events: [{ type: "tool_start", id: "tool-1", payload: { marker: "retire-me-event-payload" } }],
+		});
+		expect(readFileSync(filePath, "utf8")).toContain("retire-me-event-payload");
+
+		store.retireScoped(scope);
+
+		const persisted = readFileSync(filePath, "utf8");
+		expect(persisted).not.toContain("retire-me-event-payload");
+		expect(JSON.parse(persisted).mappings[0]).not.toHaveProperty("events");
+		expect(store.getScoped(scope)).toBeUndefined();
+	} finally {
+		rmSync(directory, { recursive: true, force: true });
+	}
+});
 test("file rejects an invalid retained prior tombstone during a pending reassignment", () => {
 	const directory = mkdtempSync(join(tmpdir(), "gjc-mapping-prior-tombstone-"));
 	const filePath = join(directory, "authority.json");

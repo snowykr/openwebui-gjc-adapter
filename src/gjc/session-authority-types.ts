@@ -59,6 +59,13 @@ export interface AcknowledgedSuccessor {
 	readonly attachment: EndpointSessionAttachmentProof;
 }
 
+export interface SessionOperationGateBinding {
+	readonly gateId: string;
+	readonly commandId?: string;
+	readonly turnId?: string;
+	readonly sessionId?: string;
+}
+
 export interface SessionOperationResult {
 	readonly kind: "turn" | "control" | "close";
 	readonly assistantText: string;
@@ -76,6 +83,10 @@ export interface SessionOperationResult {
 		attachment?: SessionAttachmentProof;
 	}>;
 	readonly correlation?: Readonly<Record<string, string>>;
+	/** Compact answered-gate identity for workflow gate operations, so replays
+	 * of a superseded gate can still recompute the durable request hash even
+	 * after the gate event itself is no longer retained on the record. */
+	readonly gate?: SessionOperationGateBinding;
 }
 
 export interface SessionOperation {
