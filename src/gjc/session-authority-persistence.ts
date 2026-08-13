@@ -315,6 +315,7 @@ export class FileSessionAuthority extends SessionAuthority {
 			sameStatIdentity(baseStat, this.#baseIdentity) &&
 			sameStatIdentity(walStat, this.#walIdentity) &&
 			this.baseGenerationMatchesDisk() &&
+			this.baseDigestMatchesDisk() &&
 			this.walDigestMatchesDisk()
 		)
 			return;
@@ -354,6 +355,22 @@ export class FileSessionAuthority extends SessionAuthority {
 		return (
 			readGenerationAtOffset(this.filePath, base.generationOffset, base.generationSpanLength) === base.generation
 		);
+	}
+	/** Recomputes the base document digest and compares it to the cached one, so
+	 * an external same-size timestamp-preserving rewrite that keeps the
+	 * generation is still detected on the live fast path before any append (the
+	 * WAL header binds the digest, so appending under a stale digest would
+	 * otherwise be acknowledged and then discarded at boot). This is O(base),
+	 * the same cost class as the WAL chain verification. */
+	private baseDigestMatchesDisk(): boolean {
+		const base = this.#baseIdentity;
+		if (base === undefined || base.digest === undefined) return true;
+		try {
+			const raw = readFileSync(this.filePath, "utf8");
+			return createHash("sha256").update(raw).digest("hex") === base.digest;
+		} catch {
+			return false;
+		}
 	}
 	/** Binds the cached WAL state to a collision-resistant identity that
 	 * authenticates the on-disk prefix before every acknowledged append: every

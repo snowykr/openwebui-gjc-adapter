@@ -752,6 +752,55 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		expect(persisted).toContain('"gateId":"gate-1"');
 		expect(persisted).toContain('"commandId":"command-1"');
 	});
+	test("detects a generation-preserving same-size base edit on the live fast path", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-live-base-edit-")), "mappings.json");
+		const walPath = `${filePath}.wal`;
+		const authority = new FileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+		expect(existsSync(walPath)).toBe(true);
+
+		// An external tool edits the base IN PLACE (same generation, byte length,
+		// and mtime) while the instance is live.
+		const original = readFileSync(filePath, "utf8");
+		const rewritten = original.replaceAll("session-1", "session-9");
+		expect(rewritten.length).toBe(original.length);
+		const mtimeMs = statSync(filePath).mtimeMs;
+		writeFileSync(filePath, rewritten);
+		utimesSync(filePath, mtimeMs / 1000, mtimeMs / 1000);
+
+		// The next mutation must detect the digest change, reload the edited
+		// base, and append against it, so the acknowledged mutation survives a
+		// restart alongside the operator edit.
+		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-3", operationId: "user-3" });
+
+		expect(
+			authority
+				.entries()
+				.map(record => record.sessionId)
+				.sort(),
+		).toEqual(["session-1", "session-9"]);
+		expect(
+			authority
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-3"]);
+		const booted = new FileSessionAuthority(filePath);
+		expect(
+			booted
+				.entries()
+				.map(record => record.sessionId)
+				.sort(),
+		).toEqual(["session-1", "session-9"]);
+		expect(
+			booted
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-3"]);
+		expect(booted.entries().find(record => record.chatId === "chat-1")?.sessionId).toBe("session-9");
+	});
 	test("fails closed on a malformed WAL header", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-malformed-header-")), "mappings.json");
 		const walPath = `${filePath}.wal`;
