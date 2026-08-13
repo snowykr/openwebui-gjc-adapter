@@ -651,6 +651,36 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				.sort(),
 		).toEqual(["chat-1", "chat-3", "chat-9"]);
 	});
+	test("upgrades a generation-less base before the first WAL append", () => {
+		const filePath = join(
+			mkdtempSync(join(tmpdir(), "gjc-session-authority-generation-less-upgrade-")),
+			"mappings.json",
+		);
+		const authority = new FileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+
+		// Strip the generation, simulating a pre-upgrade v2 document (or
+		// migration output that omits it).
+		const parsed = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
+		delete parsed.generation;
+		writeFileSync(filePath, `${JSON.stringify(parsed)}\n`);
+
+		const live = new FileSessionAuthority(filePath);
+		live.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+
+		// The mutation upgraded the base with a fresh generation instead of
+		// appending to a WAL whose header is bound by stat only.
+		const upgraded = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
+		expect(typeof upgraded.generation).toBe("string");
+		expect((upgraded.generation as string).length).toBeGreaterThan(0);
+		expect(existsSync(`${filePath}.wal`)).toBe(false);
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2"]);
+	});
 	test("finds the base generation regardless of its position in the document", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-generation-position-")), "mappings.json");
 		const authority = new FileSessionAuthority(filePath);

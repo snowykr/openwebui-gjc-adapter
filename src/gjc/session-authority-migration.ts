@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { AuthorityMutationLock } from "./session-authority-file";
+import { compactAuthorityForRelocation } from "./session-authority-persistence";
 import {
 	type ProvisionalSessionOperation,
 	SESSION_AUTHORITY_MIGRATION_VERSION,
@@ -265,6 +266,18 @@ function runMigration(
 	}
 
 	const sourceExists = existsSync(sourcePath);
+	if (sourceExists) {
+		// A v2 authority whose latest acknowledged mutations exist only in its
+		// WAL must be compacted (WAL replayed into the base, WAL truncated)
+		// BEFORE the source is read, so relocation/migration copies the complete
+		// committed state instead of silently losing WAL-only mutations. Only
+		// fully valid v2 documents are compacted; anything else is left for the
+		// migration flow's own classification (and an unreadable WAL fails the
+		// preflight loudly instead of losing mutations silently).
+		const probe = parseJson(readFileSync(sourcePath));
+		if (probe.ok && isAuthorityDocument(probe.value) && existsSync(`${sourcePath}.wal`))
+			compactAuthorityForRelocation(sourcePath);
+	}
 	const sourceBytes = sourceExists ? readFileSync(sourcePath) : undefined;
 	const sourceSha256 = sourceBytes === undefined ? undefined : digest(sourceBytes);
 	const manifestState = readManifest(paths.auditPath);

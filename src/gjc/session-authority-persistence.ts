@@ -240,6 +240,19 @@ export class FileSessionAuthority extends SessionAuthority {
 			lock.release();
 		}
 	}
+	/** Exposed for relocation/migration: replays a valid WAL beside the base and
+	 * rewrites the base with the complete acknowledged state (fresh generation,
+	 * WAL truncated), so a subsequent copy of the base file carries every
+	 * WAL-committed mutation instead of losing it. */
+	public compactForRelocation(): void {
+		const lock = AuthorityMutationLock.acquire(this.filePath);
+		try {
+			this.verifyAgainstDisk();
+			this.persist();
+		} finally {
+			lock.release();
+		}
+	}
 	/** Restores the pre-mutation state from a shallow reference snapshot and
 	 * clears the dirty markers, so a failed (non-durable) mutation leaves memory
 	 * exactly as it was at mutation entry. */
@@ -487,6 +500,16 @@ export class FileSessionAuthority extends SessionAuthority {
 				created = true;
 			}
 		}
+		if (created && this.#baseIdentity?.generation === undefined) {
+			// A generation-less base (pre-upgrade v2 documents, or migration
+			// output) must be rewritten with a fresh generation BEFORE the first
+			// WAL append: a stat-only header would let a timestamp-preserving
+			// restore replay stale deltas over the replacement. Persisting writes
+			// the full current state (including this mutation) with a generation,
+			// so the append is never made under a weak identity.
+			this.persist();
+			return;
+		}
 		const previousStat = this.#walIdentity;
 		let descriptor: number;
 		try {
@@ -729,6 +752,12 @@ function statIdentity(path: string): { readonly size: number; readonly mtimeMs: 
 	const stat = statSync(path);
 	return { size: stat.size, mtimeMs: stat.mtimeMs };
 }
+/** Compacts an authority in place (replays a valid WAL into the base, then
+ * rewrites it with a fresh generation and truncates the WAL), so relocation or
+ * migration can copy the base file without losing WAL-committed mutations. */
+export function compactAuthorityForRelocation(filePath: string): void {
+	new FileSessionAuthority(filePath).compactForRelocation();
+}
 /** Streams the base document and extracts the TOP-LEVEL generation value
  * without assuming JSON property order or a fixed prefix size. The document is
  * scanned in bounded chunks while tracking container depth and string state,
@@ -919,7 +948,7 @@ function normalizeResult(result: SessionOperationResult): SessionOperationResult
 	return withoutEvents;
 }
 
-function isAuthorityDocument(value: unknown): value is {
+export function isAuthorityDocument(value: unknown): value is {
 	kind: string;
 	version: number;
 	generation?: string;

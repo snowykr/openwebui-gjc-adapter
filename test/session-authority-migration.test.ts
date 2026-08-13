@@ -17,6 +17,7 @@ import {
 	preflightSessionAuthorityMigration,
 	preflightSessionAuthorityMigrationCandidates,
 } from "../src/gjc/session-authority-migration";
+import { FileSessionAuthority } from "../src/gjc/session-authority-persistence";
 
 const NOW = () => "2026-01-01T00:00:00.000Z";
 
@@ -1862,6 +1863,43 @@ describe("session authority pre-store migration", () => {
 			});
 
 			expect(result.status).toBe("degraded");
+		});
+	});
+	test("relocates a v2 authority including its WAL-committed mutations", () => {
+		withRoot((root, sourcePath) => {
+			const source = new FileSessionAuthority(sourcePath);
+			source.set({
+				chatId: "chat-1",
+				projectId: "project-1",
+				sessionId: "session-1",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-1",
+			});
+			source.set({
+				chatId: "chat-2",
+				projectId: "project-1",
+				sessionId: "session-2",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-2",
+			});
+			expect(existsSync(`${sourcePath}.wal`)).toBe(true);
+
+			const destinationPath = join(root, "relocated", "authority.json");
+			const result = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [sourcePath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+
+			expect(result.status).toBe("committed");
+			// The relocated document carries the WAL-committed chat-2 mutation.
+			const relocated = readFileSync(destinationPath, "utf8");
+			expect(relocated).toContain("chat-2");
+			expect(new FileSessionAuthority(destinationPath).entries()).toHaveLength(2);
 		});
 	});
 	test("preserves source evidence when the checkpoint path is unreadable", () => {
