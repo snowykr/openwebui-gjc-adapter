@@ -62,10 +62,10 @@ type BaseIdentity = {
 	 * so the live per-mutation verification reads a bounded window instead of
 	 * scanning the whole document. */
 	readonly generationOffset?: number;
-	/** UTF-8 byte length of the cached generation value, so the per-mutation
-	 * read window is sized for the value instead of a fixed prefix that a long
-	 * value would truncate. */
-	readonly generationValueLength?: number;
+	/** UTF-8 byte length of the serialized generation span (key + whitespace +
+	 * colon + quoted value), so the per-mutation read window covers the complete
+	 * value regardless of an external writer's formatting. */
+	readonly generationSpanLength?: number;
 };
 type WalIdentity = {
 	readonly size: number;
@@ -307,7 +307,8 @@ export class FileSessionAuthority extends SessionAuthority {
 		if (
 			sameStatIdentity(baseStat, this.#baseIdentity) &&
 			sameStatIdentity(walStat, this.#walIdentity) &&
-			this.baseGenerationMatchesDisk()
+			this.baseGenerationMatchesDisk() &&
+			this.walDigestMatchesDisk()
 		)
 			return;
 		this.load();
@@ -342,10 +343,24 @@ export class FileSessionAuthority extends SessionAuthority {
 		// through, and the next append upgrades the document to the standard
 		// layout that carries a deterministic offset.
 		if (base.generation === undefined) return true;
-		if (base.generationOffset === undefined || base.generationValueLength === undefined) return false;
+		if (base.generationOffset === undefined || base.generationSpanLength === undefined) return false;
 		return (
-			readGenerationAtOffset(this.filePath, base.generationOffset, base.generationValueLength) === base.generation
+			readGenerationAtOffset(this.filePath, base.generationOffset, base.generationSpanLength) === base.generation
 		);
+	}
+	/** Binds the cached WAL state to a collision-resistant identity checked in
+	 * O(last-line) on the fast path: the final chained link covers the tail and
+	 * whole-file replacements (a same-size same-mtime swap), while an interior
+	 * delta change is caught by the full chain verification on the next reload
+	 * or boot, which fails closed on the broken link. */
+	private walDigestMatchesDisk(): boolean {
+		const wal = this.#walIdentity;
+		if (wal === undefined) return true;
+		if (wal.version === WAL_VERSION && wal.lastLineLength !== undefined) {
+			const lastLine = walLastLine(this.walPath, wal.lastLineLength);
+			return lastLine !== undefined && lineChainHash(lastLine.prevHash, lastLine.text) === wal.digest;
+		}
+		return walSampleDigestFromFile(this.walPath) === wal.digest;
 	}
 	protected load(): void {
 		if (!existsSync(this.filePath)) {
@@ -381,11 +396,7 @@ export class FileSessionAuthority extends SessionAuthority {
 				: {
 						...stat,
 						...(typeof document.generation === "string"
-							? {
-									generation: document.generation,
-									generationOffset: findGenerationOffset(rawDocument, document.generation),
-									generationValueLength: Buffer.byteLength(document.generation, "utf8"),
-								}
+							? generationSpanFromDocument(rawDocument, document.generation)
 							: {}),
 					};
 		this.clearDirtyJournal();
@@ -501,7 +512,7 @@ export class FileSessionAuthority extends SessionAuthority {
 			...statIdentity(this.filePath)!,
 			generation: nextGeneration,
 			generationOffset: GENERATION_KEY_OFFSET,
-			generationValueLength: Buffer.byteLength(nextGeneration, "utf8"),
+			generationSpanLength: Buffer.byteLength(`"generation":"${nextGeneration}"`, "utf8"),
 		};
 	}
 	protected syncDirectory(): void {
@@ -865,6 +876,75 @@ function walSampleDigestFromContents(contents: string): string {
 	if (bytes.length > WAL_SAMPLE_BYTES) hash.update(bytes.subarray(bytes.length - WAL_SAMPLE_BYTES));
 	return hash.digest("hex");
 }
+function walSampleDigestFromFile(path: string): string | undefined {
+	let stat: { readonly size: number };
+	try {
+		stat = statSync(path);
+	} catch {
+		return undefined;
+	}
+	let descriptor: number;
+	try {
+		descriptor = openSync(path, "r");
+	} catch {
+		return undefined;
+	}
+	try {
+		const hash = createHash("sha256");
+		hash.update(String(stat.size));
+		const head = Buffer.alloc(WAL_SAMPLE_BYTES);
+		const headBytes = readSync(descriptor, head, 0, head.length, 0);
+		hash.update(head.subarray(0, Math.max(0, headBytes)));
+		if (stat.size > WAL_SAMPLE_BYTES) {
+			const tail = Buffer.alloc(WAL_SAMPLE_BYTES);
+			const tailBytes = readSync(descriptor, tail, 0, tail.length, stat.size - WAL_SAMPLE_BYTES);
+			hash.update(tail.subarray(0, Math.max(0, tailBytes)));
+		}
+		return hash.digest("hex");
+	} finally {
+		closeSync(descriptor);
+	}
+}
+/** Reads the final chained line of a v2 WAL (bounded to its known byte length
+ * plus one terminator byte) and returns its prevHash and exact text. */
+function walLastLine(
+	path: string,
+	lastLineLength: number,
+): { readonly prevHash: string; readonly text: string } | undefined {
+	let stat: { readonly size: number };
+	try {
+		stat = statSync(path);
+	} catch {
+		return undefined;
+	}
+	if (stat.size < lastLineLength) return undefined;
+	let descriptor: number;
+	try {
+		descriptor = openSync(path, "r");
+	} catch {
+		return undefined;
+	}
+	try {
+		const buffer = Buffer.alloc(lastLineLength + 1);
+		const bytesRead = readSync(descriptor, buffer, 0, buffer.length, Math.max(0, stat.size - buffer.length));
+		if (bytesRead <= 0) return undefined;
+		const text = buffer
+			.toString("utf8", 0, bytesRead)
+			.replace(/^[\n\r]+/, "")
+			.replace(/[\n\r]+$/, "");
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(text);
+		} catch {
+			return undefined;
+		}
+		const record = parsed as Record<string, unknown>;
+		if (!isNonEmptyString(record.prevHash)) return undefined;
+		return { prevHash: record.prevHash, text };
+	} finally {
+		closeSync(descriptor);
+	}
+}
 function statIdentity(path: string): { readonly size: number; readonly mtimeMs: number } | undefined {
 	if (!existsSync(path)) return undefined;
 	const stat = statSync(path);
@@ -889,12 +969,16 @@ const GENERATION_KEY_OFFSET = JSON.stringify({
 	version: 2,
 	generation: "",
 }).indexOf('"generation"');
-/** Finds the byte offset of the TOP-LEVEL generation key in a parsed
- * document by scanning the raw text with container-depth tracking: a nested
- * `observations.generation` carrying the same value must never shadow the
- * top-level key, otherwise the per-mutation window read would verify the
- * wrong occurrence and miss a same-stat top-level replacement. */
-export function findGenerationOffset(raw: string, generation: string): number | undefined {
+/** Finds the TOP-LEVEL generation key by scanning the raw text with
+ * container-depth tracking (a nested `observations.generation` carrying the
+ * same value must never shadow the top-level key). Returns the key's BYTE
+ * offset and the full byte length of the serialized span (key, any whitespace,
+ * colon, quoted value), so the per-mutation read window covers the complete
+ * value regardless of an external writer's whitespace formatting. */
+export function findGenerationOffset(
+	raw: string,
+	generation: string,
+): { readonly offset: number; readonly spanLength: number } | undefined {
 	let depth = 0;
 	let inString = false;
 	let escaped = false;
@@ -910,11 +994,17 @@ export function findGenerationOffset(raw: string, generation: string): number | 
 			// Only depth-1 strings are top-level keys (the document's top-level
 			// values are never the literal string "generation").
 			if (depth === 1 && raw.slice(index + 1).startsWith('generation"')) {
-				const match = /^\s*:\s*"([^"]*)"/.exec(raw.slice(index + '"generation"'.length));
+				const after = raw.slice(index + '"generation"'.length);
+				const match = /^\s*:\s*"([^"]*)"/.exec(after);
 				// The offset must be a BYTE offset (readSync interprets it as such)
 				// while this scan counts UTF-16 code units; convert through the
-				// byte length of the preceding text.
-				if (match !== null && match[1] === generation) return Buffer.byteLength(raw.slice(0, index), "utf8");
+				// byte length of the preceding text. The span length is the key plus
+				// the matched serialization (whitespace included).
+				if (match !== null && match[1] === generation)
+					return {
+						offset: Buffer.byteLength(raw.slice(0, index), "utf8"),
+						spanLength: Buffer.byteLength('"generation"' + match[0], "utf8"),
+					};
 			}
 			inString = true;
 			continue;
@@ -924,11 +1014,23 @@ export function findGenerationOffset(raw: string, generation: string): number | 
 	}
 	return undefined;
 }
-/** Reads a bounded window at the cached generation offset and extracts the
- * generation value; undefined when the read fails or the window no longer
- * carries the generation key (the caller treats that as a mismatch, which is
+/** Resolves the cached identity fields (generation, offset, span length) for a
+ * document whose raw text was just parsed. */
+function generationSpanFromDocument(
+	raw: string,
+	generation: string,
+): { readonly generation: string; readonly generationOffset?: number; readonly generationSpanLength?: number } {
+	const found = findGenerationOffset(raw, generation);
+	return {
+		generation,
+		...(found === undefined ? {} : { generationOffset: found.offset, generationSpanLength: found.spanLength }),
+	};
+}
+/** Reads exactly the cached serialized span at the cached byte offset and
+ * extracts the generation value; undefined when the read fails or the window
+ * no longer carries the key (the caller treats that as a mismatch, which is
  * fail-safe). */
-function readGenerationAtOffset(path: string, offset: number, valueLength: number): string | undefined {
+function readGenerationAtOffset(path: string, offset: number, spanLength: number): string | undefined {
 	let descriptor: number;
 	try {
 		descriptor = openSync(path, "r");
@@ -936,10 +1038,7 @@ function readGenerationAtOffset(path: string, offset: number, valueLength: numbe
 		return undefined;
 	}
 	try {
-		// The serialized form is "generation":"<value>" (key + quotes + colon +
-		// value) plus a small whitespace slack, so the window is sized for the
-		// cached value rather than a fixed prefix.
-		const buffer = Buffer.alloc('"generation":""'.length + valueLength + 8);
+		const buffer = Buffer.alloc(spanLength);
 		const bytesRead = readSync(descriptor, buffer, 0, buffer.length, offset);
 		if (bytesRead <= 0) return undefined;
 		const match = /^"generation"\s*:\s*"([^"]*)"/.exec(buffer.toString("utf8", 0, bytesRead));

@@ -620,7 +620,7 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				.sort(),
 		).toEqual(["chat-1", "chat-3"]);
 	});
-	test("keeps the stat fast path for same-stat WAL replacements and replays them at boot", () => {
+	test("reloads a live authority when the WAL is replaced with a same-size same-mtime document", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-live-wal-swap-")), "mappings.json");
 		const walPath = `${filePath}.wal`;
 		const authority = new FileSessionAuthority(filePath);
@@ -629,11 +629,9 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		expect(existsSync(walPath)).toBe(true);
 
 		// Replace the WAL with different valid contents (the delta now names
-		// chat-9) while preserving the byte length and the mtime: the per-turn
-		// fast path trusts the unchanged stat, so the append proceeds against the
-		// in-memory state and writes the next link under the stale chain digest;
-		// the next boot then fails closed on the broken link instead of silently
-		// replaying the replaced state.
+		// chat-9) while preserving the byte length and the mtime: the O(1)
+		// final-link chain check detects the tail replacement on the fast path, so
+		// the next mutation replays the replacement before appending.
 		const original = readFileSync(walPath, "utf8");
 		const replaced = original.replaceAll("chat-2", "chat-9");
 		expect(replaced.length).toBe(original.length);
@@ -648,8 +646,13 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				.entries()
 				.map(record => record.chatId)
 				.sort(),
-		).toEqual(["chat-1", "chat-2", "chat-3"]);
-		expect(() => new FileSessionAuthority(filePath)).toThrow("chain is broken");
+		).toEqual(["chat-1", "chat-3", "chat-9"]);
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-3", "chat-9"]);
 	});
 	test("fails closed when a WAL line before the tail is malformed", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-corruption-")), "mappings.json");
@@ -809,9 +812,10 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		const nestedIndex = raw.indexOf('"generation"');
 		expect(nestedIndex).toBeLessThan(topLevelIndex);
 
-		expect(findGenerationOffset(raw, "shadowed-same-value")).toBe(
-			Buffer.byteLength(raw.slice(0, topLevelIndex), "utf8"),
-		);
+		expect(findGenerationOffset(raw, "shadowed-same-value")).toEqual({
+			offset: Buffer.byteLength(raw.slice(0, topLevelIndex), "utf8"),
+			spanLength: Buffer.byteLength('"generation":"shadowed-same-value"', "utf8"),
+		});
 	});
 	test("compacts a replayed legacy WAL before the first append", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-legacy-wal-upgrade-")), "mappings.json");
