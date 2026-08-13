@@ -56,11 +56,19 @@ export function replayCompletedWorkflowGateReply(
 		const gate = pendingWorkflowGateFromEvent(event);
 		return gate !== null && workflowGateOperationHash(turn, gate) === priorOperation.detail;
 	});
-	// A replayed gate that was superseded by a REGULAR (non-gate) turn no longer
-	// carries its gate event on the record; the durable detail hash still binds
-	// the operation to the answered gate, so accept the replay when the result
-	// binding checks above already passed.
-	if (!matchesIngress && (priorOperation.detail ?? "").length === 0)
+	// A still-CURRENT gate operation always carries its answered gate event on
+	// the record (gate events are carried across gate chains), so a replay whose
+	// payload no longer matches the durable detail binding is a conflicting
+	// ingress and must be rejected.
+	// A replayed gate SUPERSEDED by a REGULAR (non-gate) turn no longer carries
+	// its gate event on the record (only the current operation's events are
+	// retained); the durable detail hash still binds the operation to the
+	// answered gate, so accept that replay when the result binding checks above
+	// already passed and a detail binding was recorded.
+	if (
+		!matchesIngress &&
+		(recordMapping?.operationId === turn.userMessageId || (priorOperation.detail ?? "").length === 0)
+	)
 		throw new Error(
 			`GJC workflow gate operation ${turn.userMessageId} completed without a valid immutable result binding.`,
 		);
