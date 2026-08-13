@@ -211,9 +211,20 @@ export async function handleWorkflowGateReply(
 		}
 		const nextPendingGate = latestPendingWorkflowGate(result.events);
 		const responseText = nextPendingGate === null ? result.text : projectPendingWorkflowGateMessage(nextPendingGate);
-		const carriedGateEvents = markWorkflowGateAccepted(mapping.events ?? [], pendingGate.gateId).filter(
-			event => event.type === "workflow_gate",
+		// Bound the carried gate history: retain only the gate event just answered
+		// (needed to verify replays of THIS operation against its durable detail
+		// binding) plus any gates emitted by this reply; accepted gates from
+		// earlier chain steps are dropped, so a chain of N gates keeps O(1) gate
+		// payloads instead of N full schemas and options.
+		const answeredGateEvent = (mapping.events ?? []).find(
+			event => event.type === "workflow_gate" && pendingWorkflowGateFromEvent(event)?.gateId === pendingGate.gateId,
 		);
+		const carriedGateEvents =
+			answeredGateEvent === undefined
+				? []
+				: markWorkflowGateAccepted([answeredGateEvent], pendingGate.gateId).filter(
+						event => event.type === "workflow_gate",
+					);
 		const nextMapping = {
 			...mapping,
 			sessionFile: validateSessionFile(turn.project, result.sessionFile ?? existingSessionFile, sessionRoot),

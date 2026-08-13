@@ -14,17 +14,7 @@ describe("createGjcRoutingLiveGatewayRunner sequential workflow gates", () => {
 		try {
 			const filePath = join(root, "mappings.json");
 			new FileBackedSessionMappingStore(filePath).set({
-				chatId: "chat-1",
-				projectId: project.id,
-				sessionId: "session-1",
-				sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
-				activeLeaf: "leaf-1",
-				rawFrameCursor: 7,
-				eventCursor: 3,
-				operationId: "user-1",
-				assistantText: "pending",
-				modelSelection: { provider: "anthropic", modelId: "claude-sonnet-4", thinkingLevel: "medium" },
-				events: [deepInterviewWorkflowGateEvent],
+				...pendingGateSeed(),
 			});
 			const mappings = new FileBackedSessionMappingStore(filePath);
 			const turnRunner = new FakeGjcTurnRunner();
@@ -58,23 +48,13 @@ describe("createGjcRoutingLiveGatewayRunner sequential workflow gates", () => {
 			rmSync(root, { recursive: true, force: true });
 		}
 	});
-	test("carries only workflow-gate events across gate replies instead of the full history", async () => {
+	test("carries only the answered and next gate events across gate replies instead of full history", async () => {
 		const root = mkdtempSync(join(tmpdir(), "gjc-sequential-gate-carry-"));
 		try {
 			const filePath = join(root, "mappings.json");
 			const mappings = new FileBackedSessionMappingStore(filePath);
 			mappings.set({
-				chatId: "chat-1",
-				projectId: project.id,
-				sessionId: "session-1",
-				sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
-				activeLeaf: "leaf-1",
-				rawFrameCursor: 7,
-				eventCursor: 3,
-				operationId: "user-1",
-				assistantText: "pending",
-				modelSelection: { provider: "anthropic", modelId: "claude-sonnet-4", thinkingLevel: "medium" },
-				events: [deepInterviewWorkflowGateEvent],
+				...pendingGateSeed(),
 			});
 
 			const firstRunner = new FakeGjcTurnRunner();
@@ -89,12 +69,12 @@ describe("createGjcRoutingLiveGatewayRunner sequential workflow gates", () => {
 
 			const persisted = new FileBackedSessionMappingStore(filePath).get("chat-1");
 			expect(persisted?.events?.filter(event => event.type === "workflow_gate").map(event => event.id)).toEqual([
-				"gate-deep-1",
 				"gate-deep-2",
 			]);
 			const serialized = JSON.stringify(persisted?.events);
 			expect(serialized).toContain("second-turn-update-text");
 			expect(serialized).not.toContain("first-turn-update-text");
+			expect(serialized).not.toContain("idem-deep-1");
 			expect(persisted?.events?.at(-1)).toMatchObject({ type: "message_update" });
 			expect(firstRunner.gateResponses).toHaveLength(1);
 			expect(secondRunner.gateResponses).toHaveLength(1);
@@ -105,17 +85,7 @@ describe("createGjcRoutingLiveGatewayRunner sequential workflow gates", () => {
 	test("rejects a conflicting payload replay of the current completed gate op", async () => {
 		const mappings = new SessionMappingStore();
 		mappings.set({
-			chatId: "chat-1",
-			projectId: project.id,
-			sessionId: "session-1",
-			sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
-			activeLeaf: "leaf-1",
-			rawFrameCursor: 7,
-			eventCursor: 3,
-			operationId: "user-1",
-			assistantText: "pending",
-			modelSelection: { provider: "anthropic", modelId: "claude-sonnet-4", thinkingLevel: "medium" },
-			events: [deepInterviewWorkflowGateEvent],
+			...pendingGateSeed(),
 		});
 		const turnRunner = new FakeGjcTurnRunner();
 		turnRunner.gateResponseEvents = [firstTurnMessageUpdate];
@@ -131,17 +101,7 @@ describe("createGjcRoutingLiveGatewayRunner sequential workflow gates", () => {
 	test("accepts an identical replay of the current completed gate op without a second gate response", async () => {
 		const mappings = new SessionMappingStore();
 		mappings.set({
-			chatId: "chat-1",
-			projectId: project.id,
-			sessionId: "session-1",
-			sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
-			activeLeaf: "leaf-1",
-			rawFrameCursor: 7,
-			eventCursor: 3,
-			operationId: "user-1",
-			assistantText: "pending",
-			modelSelection: { provider: "anthropic", modelId: "claude-sonnet-4", thinkingLevel: "medium" },
-			events: [deepInterviewWorkflowGateEvent],
+			...pendingGateSeed(),
 		});
 		const turnRunner = new FakeGjcTurnRunner();
 		turnRunner.gateResponseEvents = [firstTurnMessageUpdate];
@@ -157,17 +117,7 @@ describe("createGjcRoutingLiveGatewayRunner sequential workflow gates", () => {
 		const mappings = new SessionMappingStore();
 		const outbox = new InMemoryOutboxStore();
 		mappings.set({
-			chatId: "chat-1",
-			projectId: project.id,
-			sessionId: "session-1",
-			sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
-			activeLeaf: "leaf-1",
-			rawFrameCursor: 7,
-			eventCursor: 3,
-			operationId: "user-1",
-			assistantText: "pending",
-			modelSelection: { provider: "anthropic", modelId: "claude-sonnet-4", thinkingLevel: "medium" },
-			events: [deepInterviewWorkflowGateEvent],
+			...pendingGateSeed(),
 		});
 		const turnRunner = new FakeGjcTurnRunner();
 		turnRunner.gateResponseEvents = [firstTurnMessageUpdate];
@@ -184,20 +134,10 @@ describe("createGjcRoutingLiveGatewayRunner sequential workflow gates", () => {
 		expect(outbox.listPending().length).toBe(rowsAfterRegularTurn);
 		expect(turnRunner.continues).toHaveLength(1);
 	});
-	test("verifies a replayed gate op superseded by a later gate through carried gate events", async () => {
+	test("accepts a replayed gate op superseded by a later gate via the durable detail binding", async () => {
 		const mappings = new SessionMappingStore();
 		mappings.set({
-			chatId: "chat-1",
-			projectId: project.id,
-			sessionId: "session-1",
-			sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
-			activeLeaf: "leaf-1",
-			rawFrameCursor: 7,
-			eventCursor: 3,
-			operationId: "user-1",
-			assistantText: "pending",
-			modelSelection: { provider: "anthropic", modelId: "claude-sonnet-4", thinkingLevel: "medium" },
-			events: [deepInterviewWorkflowGateEvent],
+			...pendingGateSeed(),
 		});
 		const firstRunner = new FakeGjcTurnRunner();
 		firstRunner.gateResponseEvents = [firstTurnMessageUpdate, nextWorkflowGateEvent];
@@ -208,18 +148,34 @@ describe("createGjcRoutingLiveGatewayRunner sequential workflow gates", () => {
 		const second = createGjcRoutingLiveGatewayRunner({ turnRunner: secondRunner, mappings });
 		await second.run(gateReplyInput("user-3"));
 		expect(mappings.get("chat-1")?.operationId).toBe("user-3");
-
+		// Only the answered gate of the CURRENT operation is retained; the
+		// earlier answered gate is gone, so the replay is accepted through the
+		// durable detail binding for both identical and conflicting payloads.
 		const replayed = await second.run(gateReplyInput("user-2"));
 		expect(replayed.content).toContain("Choose deployment target");
 
-		// A superseded gate op cannot be re-verified without its gate event when
-		// the payload changed; the durable detail binding still accepts it.
 		const conflicting = await second.run({ ...gateReplyInput("user-2"), prompt: "2" });
 		expect(conflicting.content).toContain("Choose deployment target");
 		expect(firstRunner.gateResponses).toHaveLength(1);
 		expect(secondRunner.gateResponses).toHaveLength(1);
 	});
 });
+
+function pendingGateSeed(): Parameters<SessionMappingStore["set"]>[0] {
+	return {
+		chatId: "chat-1",
+		projectId: project.id,
+		sessionId: "session-1",
+		sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
+		activeLeaf: "leaf-1",
+		rawFrameCursor: 7,
+		eventCursor: 3,
+		operationId: "user-1",
+		assistantText: "pending",
+		modelSelection: { provider: "anthropic", modelId: "claude-sonnet-4", thinkingLevel: "medium" },
+		events: [deepInterviewWorkflowGateEvent],
+	};
+}
 
 function gateReplyInput(userMessageId: string) {
 	return {
