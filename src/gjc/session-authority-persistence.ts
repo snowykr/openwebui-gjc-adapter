@@ -16,6 +16,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { dirname } from "node:path";
+import { pendingWorkflowGateFromEvent } from "../projection/workflow-gates";
 import { AuthorityMutationLock } from "./session-authority-file";
 import { SessionAuthority } from "./session-authority-store";
 import type {
@@ -1040,20 +1041,32 @@ export function walBindingForBase(walPath: string, basePath: string): "none" | "
 		...(generation === undefined ? {} : { generation }),
 	};
 	if (!isWalHeaderBoundToBase(header, identity)) return "stale";
-	// A CURRENT WAL must contain at least one fully replayable delta; a
-	// header-only WAL (an interrupted first append) carries no applicable
-	// mutations and must not trigger a compaction that would churn the source
-	// digest and degrade an intact migration.
-	const hasReplayableDelta = lines.slice(1).some(line => {
+	// A CURRENT WAL must contain at least one fully replayable delta. Only a
+	// genuinely header-only WAL (no delta lines) or an unterminated torn tail is
+	// safe to ignore; a malformed newline-terminated delta is corruption that
+	// replay would reject, so it must fail closed instead of letting migration
+	// silently omit the acknowledged mutation.
+	const parts = contents.split("\n");
+	const hasTrailingNewline = parts.length > 0 && parts[parts.length - 1] === "";
+	const deltaLines = lines.slice(1);
+	if (deltaLines.length === 0) return "stale";
+	let sawValidDelta = false;
+	for (let index = 0; index < deltaLines.length; index += 1) {
+		const line = deltaLines[index]!;
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(line);
 		} catch {
-			return false;
+			if (index === deltaLines.length - 1 && !hasTrailingNewline) break;
+			return "malformed";
 		}
-		return isWalDelta(parsed);
-	});
-	return hasReplayableDelta ? "current" : "stale";
+		if (!isWalDelta(parsed)) {
+			if (index === deltaLines.length - 1 && !hasTrailingNewline) break;
+			return "malformed";
+		}
+		sawValidDelta = true;
+	}
+	return sawValidDelta ? "current" : "stale";
 }
 /** The compact single-line document this instance writes always places the
  * top-level generation key at a fixed byte offset. */
@@ -1258,6 +1271,28 @@ function normalizeOperationResult(operation: SessionOperation): SessionOperation
 }
 function normalizeResult(result: SessionOperationResult): SessionOperationResult {
 	if (result.events === undefined) return result;
+	// Legacy workflow-gate results (written before the compact gate binding
+	// existed) may rely on their retained events as the only evidence
+	// authenticating the answered gate once the record mapping has advanced.
+	// Synthesize a compact gate binding from the answered gate event before
+	// stripping the events, so a superseded replay can still recompute the
+	// request hash instead of throwing.
+	if (result.gate === undefined && result.events.some(event => event.type === "workflow_gate")) {
+		const gateEvent = result.events.find(event => event.type === "workflow_gate");
+		const gate = gateEvent === undefined ? null : pendingWorkflowGateFromEvent(gateEvent);
+		if (gate !== null) {
+			const { events: _events, ...withoutEvents } = result;
+			return {
+				...withoutEvents,
+				gate: {
+					gateId: gate.gateId,
+					...(gate.commandId === undefined || gate.turnId === undefined || gate.sessionId === undefined
+						? {}
+						: { commandId: gate.commandId, turnId: gate.turnId, sessionId: gate.sessionId }),
+				},
+			};
+		}
+	}
 	const { events: _events, ...withoutEvents } = result;
 	return withoutEvents;
 }

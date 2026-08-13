@@ -2001,6 +2001,63 @@ describe("session authority pre-store migration", () => {
 			expect(new FileSessionAuthority(destinationPath).entries()).toHaveLength(2);
 		});
 	});
+	test("treats a malformed current-WAL delta as corruption", () => {
+		withRoot((root, sourcePath) => {
+			const destinationPath = join(root, "relocated", "authority.json");
+			const source = new FileSessionAuthority(sourcePath);
+			source.set({
+				chatId: "chat-1",
+				projectId: "project-1",
+				sessionId: "session-1",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-1",
+			});
+			source.set({
+				chatId: "chat-2",
+				projectId: "project-1",
+				sessionId: "session-2",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-2",
+			});
+			const first = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [sourcePath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+			expect(first.status).toBe("committed");
+			expect(existsSync(`${sourcePath}.wal`)).toBe(false);
+
+			// A valid current header with a MALFORMED newline-terminated delta:
+			// replay would reject this as corruption, so migration must fail closed
+			// instead of silently omitting the acknowledged mutation.
+			const stat = statSync(sourcePath);
+			const baseDoc = JSON.parse(readFileSync(sourcePath, "utf8")) as Record<string, unknown>;
+			writeFileSync(
+				`${sourcePath}.wal`,
+				`${JSON.stringify({
+					kind: "openwebui-gjc-session-authority-wal",
+					version: 2,
+					base: { size: stat.size, mtimeMs: stat.mtimeMs, generation: baseDoc.generation },
+					prevHash: "openwebui-gjc-session-authority-wal:v2",
+				})}\n{"corrupt":\n`,
+			);
+
+			const second = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [sourcePath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+
+			expect(second.status).toBe("degraded");
+			expect(second.reason).toContain("unreadable or malformed");
+		});
+	});
 	test("ignores a stale WAL when recognizing a committed migration", () => {
 		withRoot((root, sourcePath) => {
 			const destinationPath = join(root, "relocated", "authority.json");

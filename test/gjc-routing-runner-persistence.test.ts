@@ -645,6 +645,56 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		).toThrow("chain is broken");
 		expect(() => new FileSessionAuthority(filePath)).toThrow("chain is broken");
 	});
+	test("preserves legacy gate evidence as a compact binding during compaction", () => {
+		class SmallThresholdCompactingAuthority extends FileSessionAuthority {
+			protected override walCompactionThresholdBytes = 1024;
+		}
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-legacy-gate-binding-")), "mappings.json");
+		const authority = new SmallThresholdCompactingAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		// A legacy completed gate operation whose result carries the answered
+		// gate event as its only evidence and has NO compact gate binding.
+		const legacyGateResult = {
+			kind: "control" as const,
+			assistantText: "gate answered",
+			events: [
+				{
+					type: "workflow_gate",
+					id: "gate-1",
+					payload: {
+						gateId: "gate-1",
+						commandId: "command-1",
+						turnId: "turn-1",
+						sessionId: "session-1",
+					},
+				},
+			],
+			mapping: {
+				chatId: "chat-1",
+				projectId: project.id,
+				sessionId: "session-1",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-gate",
+			},
+		};
+		authority.beginOperation("chat-1", { id: "user-gate", kind: "gate", detail: "gate-hash" });
+		authority.transitionOperation("chat-1", "user-gate", "complete", "gate-hash", legacyGateResult);
+		// A padded mutation crosses the small threshold and triggers compaction.
+		authority.set({
+			...mappingInput(mediumSelection),
+			chatId: "chat-1",
+			operationId: "user-2",
+			assistantText: `${padding}turn-2`,
+		});
+
+		const persisted = readFileSync(filePath, "utf8");
+		// The legacy gate op's events were stripped (the event type and its id are
+		// gone) and a compact gate binding was synthesized in their place.
+		expect(persisted).not.toContain('"type":"workflow_gate"');
+		expect(persisted).toContain('"gateId":"gate-1"');
+		expect(persisted).toContain('"commandId":"command-1"');
+	});
 	test("fails closed on a malformed WAL header", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-malformed-header-")), "mappings.json");
 		const walPath = `${filePath}.wal`;
