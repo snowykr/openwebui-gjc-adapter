@@ -621,9 +621,12 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		).toEqual(["chat-1", "chat-3"]);
 	});
 	test("reloads a live authority when the WAL is replaced with a same-size same-mtime document", () => {
+		class EveryMutationVerifyAuthority extends FailingFileSessionAuthority {
+			protected override walFullVerifyInterval = 1;
+		}
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-live-wal-swap-")), "mappings.json");
 		const walPath = `${filePath}.wal`;
-		const authority = new FileSessionAuthority(filePath);
+		const authority = new EveryMutationVerifyAuthority(filePath);
 		authority.set(mappingInput(mediumSelection));
 		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
 		expect(existsSync(walPath)).toBe(true);

@@ -88,7 +88,15 @@ export class SessionAuthorityDurabilityError extends Error {
 export class FileSessionAuthority extends SessionAuthority {
 	#baseIdentity: BaseIdentity | undefined = undefined;
 	#walIdentity: WalIdentity | undefined = undefined;
+	/** Mutations since the last full WAL chain verification; unchanged-stat
+	 * mutations below the interval trust the incrementally maintained chain, so
+	 * per-turn work stays bounded while the prefix is re-authenticated in full
+	 * at the interval, on every reload, and at boot. */
+	#mutationsSinceFullVerify = 0;
 	protected walCompactionThresholdBytes = WAL_COMPACTION_THRESHOLD_BYTES;
+	/** Number of unchanged-stat mutations to trust the incremental chain before
+	 * re-verifying the full on-disk prefix (amortizes the O(WAL) scan). */
+	protected walFullVerifyInterval = 64;
 
 	/** When the caller already holds the authority mutation lock (which is not
 	 * reentrant), pass it in so the boot-time replay/compaction stays inside the
@@ -357,6 +365,13 @@ export class FileSessionAuthority extends SessionAuthority {
 		const wal = this.#walIdentity;
 		if (wal === undefined) return true;
 		if (wal.version === WAL_VERSION) {
+			this.#mutationsSinceFullVerify += 1;
+			// Trust the incrementally maintained chain for unchanged-stat mutations
+			// below the interval, and re-verify the full on-disk prefix at the
+			// interval (and on every reload/boot), so per-turn I/O is bounded while
+			// the prefix remains authenticated.
+			if (this.#mutationsSinceFullVerify < this.walFullVerifyInterval) return true;
+			this.#mutationsSinceFullVerify = 0;
 			const verified = this.verifyWalChainOnDisk();
 			return verified !== undefined && verified.digest === wal.digest;
 		}
@@ -794,6 +809,7 @@ export class FileSessionAuthority extends SessionAuthority {
 		}
 		if (digest === undefined) return false;
 		this.#walIdentity = { ...statIdentity(walPath)!, digest, lastLineLength, version: WAL_VERSION };
+		this.#mutationsSinceFullVerify = 0;
 		return "chained";
 	}
 	/** Reloads memory from the durable base and WAL so in-memory state matches
@@ -867,6 +883,7 @@ export class FileSessionAuthority extends SessionAuthority {
 		const walPath = this.walPath;
 		if (existsSync(walPath)) unlinkSync(walPath);
 		this.#walIdentity = undefined;
+		this.#mutationsSinceFullVerify = 0;
 	}
 	private resetWalFile(): void {
 		this.dropWalFile();
@@ -1010,7 +1027,7 @@ export function findGenerationOffset(
 				if (match !== null && match[1] === generation)
 					return {
 						offset: Buffer.byteLength(raw.slice(0, index), "utf8"),
-						spanLength: Buffer.byteLength('"generation"' + match[0], "utf8"),
+						spanLength: Buffer.byteLength(`"generation"${match[0]}`, "utf8"),
 					};
 			}
 			inString = true;
