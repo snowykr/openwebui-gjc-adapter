@@ -616,6 +616,95 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				.sort(),
 		).toEqual(["chat-1", "chat-3"]);
 	});
+	test("finds the base generation regardless of its position in the document", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-generation-position-")), "mappings.json");
+		const authority = new FileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+
+		// Rewrite the document (before any WAL exists) with the generation moved
+		// AFTER the mappings array: an external writer may reformat or reorder
+		// without changing semantics, and the live verification must still find
+		// the generation without re-reading and re-parsing the whole base.
+		const parsed = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
+		const generation = parsed.generation;
+		delete parsed.generation;
+		parsed.generation = generation;
+		writeFileSync(filePath, `${JSON.stringify(parsed)}\n`);
+
+		const live = new FileSessionAuthority(filePath);
+		live.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+
+		// The mutation appended to the WAL (no forced reload/compaction), so the
+		// WAL exists and the acknowledged mutation survives a restart.
+		expect(existsSync(`${filePath}.wal`)).toBe(true);
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2"]);
+	});
+	class RecoveryDirectoryFailingFileSessionAuthority extends FailingFileSessionAuthority {
+		syncCalls = 0;
+		postWriteFailure: Error | undefined;
+
+		protected override appendWal(
+			records: readonly SessionAuthorityRecord[],
+			provisional: readonly { readonly key: string; readonly operation: ProvisionalSessionOperation }[],
+		): void {
+			// walFailure stays unset so the real append runs and writes the
+			// complete first delta; the failure is then reported the way the real
+			// append catch does, invoking the real recovery (unlink + directory
+			// sync) with the pre-append identity (undefined for the first WAL).
+			super.appendWal(records, provisional);
+			if (this.postWriteFailure !== undefined) {
+				this.recoverFailedWalAppend(undefined);
+				throw this.postWriteFailure;
+			}
+		}
+
+		protected override syncDirectory(): void {
+			this.syncCalls += 1;
+			// Call 1 is the WAL creation sync inside appendWal; call 2 is the
+			// recovery's directory sync after the unlink.
+			if (this.syncCalls === 2 && this.failure !== undefined) throw this.failure;
+			super.syncDirectory();
+		}
+	}
+	test("surfaces uncertain durability when the directory sync after a failed new WAL unlink fails", () => {
+		const filePath = join(
+			mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-unlink-sync-failure-")),
+			"mappings.json",
+		);
+		const authority = new RecoveryDirectoryFailingFileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.syncCalls = 0;
+		authority.postWriteFailure = new Error("injected append failure after a complete write");
+		authority.failure = new Error("injected directory sync failure");
+
+		let error: unknown;
+		try {
+			authority.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+		} catch (caught) {
+			error = caught;
+		}
+
+		expect(error).toBeInstanceOf(SessionAuthorityDurabilityError);
+		// The deletion durability is unverified, so memory and boot both fall back
+		// to the base-visible state instead of retrying a possibly-replayed write.
+		expect(
+			authority
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1"]);
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1"]);
+	});
 	test("a fresh authority sees a WAL-append mutation before any compaction", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-replay-")), "mappings.json");
 		const authority = new FileSessionAuthority(filePath);

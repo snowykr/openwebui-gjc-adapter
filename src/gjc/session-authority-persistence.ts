@@ -500,6 +500,16 @@ export class FileSessionAuthority extends SessionAuthority {
 				this.reloadDurableState();
 				throw new SessionAuthorityDurabilityError(this.filePath, error);
 			}
+			try {
+				// The directory entry removal must be durable before the rollback is
+				// reported: a crash before this sync could resurrect the deleted WAL
+				// and replay a delta whose caller received an ordinary failure.
+				this.syncDirectory();
+			} catch (error) {
+				this.#walIdentity = undefined;
+				this.reloadDurableState();
+				throw new SessionAuthorityDurabilityError(this.filePath, error);
+			}
 			this.#walIdentity = undefined;
 			return;
 		}
@@ -582,12 +592,14 @@ function statIdentity(path: string): { readonly size: number; readonly mtimeMs: 
 	const stat = statSync(path);
 	return { size: stat.size, mtimeMs: stat.mtimeMs };
 }
-/** Reads the base document's generation from a small prefix (the compact
- * single-line document carries it immediately after the version field), so the
- * live per-mutation verification stays cheap instead of re-reading the whole
- * authority. Returns undefined when the file is unreadable or has no
- * generation (legacy bases); the caller treats that as a mismatch when a
- * generation is expected, which is fail-safe. */
+/** Streams the base document and extracts the TOP-LEVEL generation value
+ * without assuming JSON property order or a fixed prefix size. The document is
+ * scanned in bounded chunks while tracking container depth and string state,
+ * so a generation placed after a large mappings array (or reordered by an
+ * external writer) is still found without ever reading the whole file at once.
+ * Returns undefined when the file is unreadable or has no top-level generation
+ * (legacy bases); the caller treats that as a mismatch when a generation is
+ * expected, which is fail-safe. */
 function readBaseGeneration(path: string): string | undefined {
 	let descriptor: number;
 	try {
@@ -596,10 +608,83 @@ function readBaseGeneration(path: string): string | undefined {
 		return undefined;
 	}
 	try {
-		const buffer = Buffer.alloc(512);
-		const bytesRead = readSync(descriptor, buffer, 0, buffer.length, 0);
-		const match = /"generation"\s*:\s*"([^"]+)"/.exec(buffer.toString("utf8", 0, bytesRead));
-		return match?.[1];
+		const buffer = Buffer.alloc(64 * 1024);
+		let offset = 0;
+		let depth = 0;
+		let inString = false;
+		let escaped = false;
+		let collectingValue = false;
+		let afterKeyColon = false;
+		const keyBytes: number[] = [];
+		const valueBytes: number[] = [];
+		let chunkSize = 4096;
+		while (true) {
+			const bytesRead = readSync(descriptor, buffer, 0, Math.min(chunkSize, buffer.length), offset);
+			if (bytesRead <= 0) break;
+			for (let index = 0; index < bytesRead; index += 1) {
+				const byte = buffer[index]!;
+				if (inString) {
+					if (escaped) {
+						escaped = false;
+					} else if (byte === 0x5c) {
+						escaped = true;
+					} else if (byte === 0x22) {
+						inString = false;
+						if (collectingValue) {
+							collectingValue = false;
+							if (Buffer.from(keyBytes).toString("utf8") === "generation")
+								return Buffer.from(valueBytes).toString("utf8");
+						}
+						afterKeyColon = false;
+					} else if (depth === 1 && collectingValue) {
+						valueBytes.push(byte);
+					} else if (depth === 1) {
+						keyBytes.push(byte);
+					}
+					continue;
+				}
+				if (byte === 0x22) {
+					// A root-level string starts: either a key or the value after a
+					// colon. Nested strings (depth >= 2) are ignored entirely.
+					inString = true;
+					if (depth === 1 && afterKeyColon) {
+						collectingValue = true;
+						valueBytes.length = 0;
+					} else if (depth === 1) {
+						collectingValue = false;
+						keyBytes.length = 0;
+					}
+					continue;
+				}
+				if (byte === 0x7b || byte === 0x5b) {
+					depth += 1;
+					afterKeyColon = false;
+					continue;
+				}
+				if (byte === 0x7d || byte === 0x5d) {
+					depth = Math.max(0, depth - 1);
+					afterKeyColon = false;
+					continue;
+				}
+				if (byte === 0x3a && depth === 1) {
+					afterKeyColon = true;
+					collectingValue = false;
+					continue;
+				}
+				if (byte === 0x2c) {
+					afterKeyColon = false;
+					continue;
+				}
+				if (afterKeyColon) {
+					// A root-level scalar (number/bool/null) value token; it cannot
+					// be the generation, so stop treating the colon as pending.
+					afterKeyColon = false;
+				}
+			}
+			offset += bytesRead;
+			chunkSize = buffer.length;
+		}
+		return undefined;
 	} finally {
 		closeSync(descriptor);
 	}
