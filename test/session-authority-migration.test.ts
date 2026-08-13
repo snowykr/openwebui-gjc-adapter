@@ -2058,6 +2058,70 @@ describe("session authority pre-store migration", () => {
 			expect(second.reason).toContain("unreadable or malformed");
 		});
 	});
+	test("ignores an unterminated valid-JSON WAL tail when recognizing a committed migration", () => {
+		withRoot((root, sourcePath) => {
+			const destinationPath = join(root, "relocated", "authority.json");
+			const source = new FileSessionAuthority(sourcePath);
+			source.set({
+				chatId: "chat-1",
+				projectId: "project-1",
+				sessionId: "session-1",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-1",
+			});
+			source.set({
+				chatId: "chat-2",
+				projectId: "project-1",
+				sessionId: "session-2",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-2",
+			});
+			const first = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [sourcePath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+			expect(first.status).toBe("committed");
+			expect(existsSync(`${sourcePath}.wal`)).toBe(false);
+
+			// A crash leaves a valid current header plus a valid-JSON delta WITHOUT
+			// its terminating newline: replay treats the tail as an uncommitted torn
+			// write, so migration must not count it as replayable and must keep the
+			// committed shortcut (otherwise compaction would churn the source digest).
+			const stat = statSync(sourcePath);
+			const baseDoc = JSON.parse(readFileSync(sourcePath, "utf8")) as Record<string, unknown>;
+			const header = JSON.stringify({
+				kind: "openwebui-gjc-session-authority-wal",
+				version: 2,
+				base: { size: stat.size, mtimeMs: stat.mtimeMs, generation: baseDoc.generation },
+				prevHash: "openwebui-gjc-session-authority-wal:v2",
+			});
+			const tornDelta = JSON.stringify({
+				kind: "openwebui-gjc-session-authority-wal",
+				version: 2,
+				records: [],
+				provisional: [],
+				prevHash: "torn-prev-hash",
+				head: "torn-head",
+			});
+			writeFileSync(`${sourcePath}.wal`, `${header}\n${tornDelta}`);
+
+			const second = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [sourcePath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+
+			expect(second.status).toBe("not_needed");
+			expect(new FileSessionAuthority(destinationPath).entries()).toHaveLength(2);
+		});
+	});
 	test("ignores a stale WAL when recognizing a committed migration", () => {
 		withRoot((root, sourcePath) => {
 			const destinationPath = join(root, "relocated", "authority.json");

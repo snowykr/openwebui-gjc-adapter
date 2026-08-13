@@ -1053,17 +1053,18 @@ export function walBindingForBase(walPath: string, basePath: string): "none" | "
 	let sawValidDelta = false;
 	for (let index = 0; index < deltaLines.length; index += 1) {
 		const line = deltaLines[index]!;
+		// An unterminated final line is a torn tail that replay treats as
+		// uncommitted, even when it parses as valid JSON; exclude it from the
+		// replayable count so a crash-leftover cannot bypass the committed
+		// shortcut and trigger a compaction that churns the source digest.
+		if (index === deltaLines.length - 1 && !hasTrailingNewline) break;
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(line);
 		} catch {
-			if (index === deltaLines.length - 1 && !hasTrailingNewline) break;
 			return "malformed";
 		}
-		if (!isWalDelta(parsed)) {
-			if (index === deltaLines.length - 1 && !hasTrailingNewline) break;
-			return "malformed";
-		}
+		if (!isWalDelta(parsed)) return "malformed";
 		sawValidDelta = true;
 	}
 	return sawValidDelta ? "current" : "stale";
