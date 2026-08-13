@@ -67,6 +67,12 @@ type BaseIdentity = {
 	 * colon + quoted value), so the per-mutation read window covers the complete
 	 * value regardless of an external writer's formatting. */
 	readonly generationSpanLength?: number;
+	/** SHA-256 of the base document bytes, computed at load/persist time and
+	 * bound into the WAL header: an external rewrite that preserves generation,
+	 * size, and mtime still changes the digest, so the stale WAL is discarded at
+	 * boot instead of being replayed over the edited base (which would silently
+	 * revert the operator's change). */
+	readonly digest?: string;
 };
 type WalIdentity = {
 	readonly size: number;
@@ -444,6 +450,7 @@ export class FileSessionAuthority extends SessionAuthority {
 				? undefined
 				: {
 						...stat,
+						digest: createHash("sha256").update(rawDocument).digest("hex"),
 						...(typeof document.generation === "string"
 							? generationSpanFromDocument(rawDocument, document.generation)
 							: {}),
@@ -473,18 +480,15 @@ export class FileSessionAuthority extends SessionAuthority {
 		// collision-resistant: a timestamp-preserving external replacement of the
 		// base can never replay stale deltas against it.
 		const nextGeneration = randomUUID();
+		const writtenDocument = `${JSON.stringify({
+			kind: "openwebui-gjc-session-authority",
+			version: SESSION_AUTHORITY_VERSION,
+			generation: nextGeneration,
+			mappings: normalizedMappings,
+			provisionalOperations: normalizedProvisional,
+		})}\n`;
 		try {
-			writeFileSync(
-				descriptor,
-				`${JSON.stringify({
-					kind: "openwebui-gjc-session-authority",
-					version: SESSION_AUTHORITY_VERSION,
-					generation: nextGeneration,
-					mappings: normalizedMappings,
-					provisionalOperations: normalizedProvisional,
-				})}\n`,
-				"utf8",
-			);
+			writeFileSync(descriptor, writtenDocument, "utf8");
 			fsyncSync(descriptor);
 		} finally {
 			closeSync(descriptor);
@@ -534,7 +538,7 @@ export class FileSessionAuthority extends SessionAuthority {
 		// deltas stay compact (no stripped event arrays are re-introduced).
 		this.replaceAllWithReferences(normalizedMappings, normalizedProvisional);
 		try {
-			this.refreshBaseIdentity(nextGeneration);
+			this.refreshBaseIdentity(nextGeneration, createHash("sha256").update(writtenDocument).digest("hex"));
 		} catch (error) {
 			// The base was renamed, directory-synced, and the WAL removed before
 			// this point, so the mutation is committed; a failed base stat refresh
@@ -556,9 +560,10 @@ export class FileSessionAuthority extends SessionAuthority {
 	 * separated so the post-commit failure handling can guard it. The generation
 	 * offset is deterministic for documents this instance writes (the compact
 	 * single-line layout always places the generation key at the same byte). */
-	protected refreshBaseIdentity(nextGeneration: string): void {
+	protected refreshBaseIdentity(nextGeneration: string, digest: string): void {
 		this.#baseIdentity = {
 			...statIdentity(this.filePath)!,
+			digest,
 			generation: nextGeneration,
 			generationOffset: GENERATION_KEY_OFFSET,
 			generationSpanLength: Buffer.byteLength(`"generation":"${nextGeneration}"`, "utf8"),
@@ -1028,16 +1033,20 @@ export function walBindingForBase(walPath: string, basePath: string): "none" | "
 	const stat = statIdentity(basePath);
 	if (stat === undefined) return "stale";
 	let generation: string | undefined;
+	let digest: string | undefined;
 	try {
 		const raw = readFileSync(basePath, "utf8");
 		const document: unknown = JSON.parse(raw);
+		digest = createHash("sha256").update(raw).digest("hex");
 		if (isAuthorityDocument(document) && typeof (document as Record<string, unknown>).generation === "string")
 			generation = (document as Record<string, unknown>).generation as string;
 	} catch {
 		generation = undefined;
+		digest = undefined;
 	}
 	const identity: BaseIdentity = {
 		...stat,
+		...(digest === undefined ? {} : { digest }),
 		...(generation === undefined ? {} : { generation }),
 	};
 	if (!isWalHeaderBoundToBase(header, identity)) return "stale";
@@ -1184,7 +1193,14 @@ function isWalHeaderBoundToBase(value: unknown, base: BaseIdentity | undefined):
 	// generation, so a timestamp-preserving external replacement with the same
 	// byte length cannot replay stale deltas over it. Legacy stat-only WALs
 	// (and bases that predate generations) remain bound by the stat fields.
-	return base.generation === undefined ? recorded.generation === undefined : recorded.generation === base.generation;
+	if (base.generation === undefined ? recorded.generation !== undefined : recorded.generation !== base.generation)
+		return false;
+	// When the cached identity and the header both carry a content digest,
+	// require them to match too: an external rewrite that preserves generation,
+	// size, and mtime still changes the digest, so a stale WAL is discarded
+	// instead of being replayed over the edited base.
+	if (base.digest !== undefined && isNonEmptyString(recorded.digest)) return recorded.digest === base.digest;
+	return true;
 }
 function isWalHeader(value: unknown, base: BaseIdentity | undefined): boolean {
 	return isWalHeaderShape(value) && isWalHeaderBoundToBase(value, base);

@@ -711,6 +711,40 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		expect(() => new FileSessionAuthority(filePath)).toThrow("header is malformed");
 		expect(existsSync(walPath)).toBe(true);
 	});
+	test("discards the WAL when the base is edited in place preserving generation, size, and mtime", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-base-edit-preserve-")), "mappings.json");
+		const walPath = `${filePath}.wal`;
+		const authority = new FileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+		expect(existsSync(walPath)).toBe(true);
+
+		// An external tool parses and rewrites the base IN PLACE, keeping the
+		// same generation value, byte length, and mtime, but changing content
+		// (e.g. an operator edit to the session ids).
+		const original = readFileSync(filePath, "utf8");
+		const rewritten = original.replaceAll("session-1", "session-9");
+		expect(rewritten.length).toBe(original.length);
+		const mtimeMs = statSync(filePath).mtimeMs;
+		writeFileSync(filePath, rewritten);
+		utimesSync(filePath, mtimeMs / 1000, mtimeMs / 1000);
+
+		// Boot must discard the stale WAL (content digest mismatch) instead of
+		// replaying it over the edited base and silently reverting the edit.
+		const booted = new FileSessionAuthority(filePath);
+		expect(
+			booted
+				.entries()
+				.map(record => record.sessionId)
+				.sort(),
+		).toEqual(["session-9"]);
+		expect(
+			booted
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1"]);
+	});
 	test("fails closed when a WAL line before the tail is malformed", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-corruption-")), "mappings.json");
 		const walPath = `${filePath}.wal`;
@@ -1189,9 +1223,9 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		baseStatFailure: Error | undefined;
 		protected override walCompactionThresholdBytes = 1024;
 
-		protected override refreshBaseIdentity(nextGeneration: string): void {
+		protected override refreshBaseIdentity(nextGeneration: string, digest: string): void {
 			if (this.baseStatFailure !== undefined) throw this.baseStatFailure;
-			super.refreshBaseIdentity(nextGeneration);
+			super.refreshBaseIdentity(nextGeneration, digest);
 		}
 	}
 	test("keeps the durability classification when the final base stat fails", () => {
