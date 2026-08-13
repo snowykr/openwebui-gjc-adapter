@@ -67,8 +67,10 @@ type WalIdentity = {
 	readonly size: number;
 	readonly mtimeMs: number;
 	readonly digest: string;
-	/** Byte length of the last line's JSON text; present for chained v2 WALs,
-	 * absent for legacy v1 WALs (sample-based identity). */
+	/** 2 for chained WALs (per-line hashes); 1 for legacy stat/sample-bound WALs
+	 * that must be compacted before the next append. */
+	readonly version: 1 | 2;
+	/** Byte length of the last line's JSON text; present for chained v2 WALs. */
 	readonly lastLineLength?: number;
 };
 
@@ -348,15 +350,59 @@ export class FileSessionAuthority extends SessionAuthority {
 	private walDigestMatchesDisk(): boolean {
 		const wal = this.#walIdentity;
 		if (wal === undefined) return true;
-		if (wal.lastLineLength !== undefined) {
-			// Chained v2 identity: reading the last line re-verifies a hash that
-			// cryptographically covers EVERY delta line, at O(last-line) cost
-			// instead of re-hashing the whole WAL.
-			const lastLine = walLastLine(this.walPath, wal.lastLineLength);
-			if (lastLine === undefined) return false;
-			return lineChainHash(lastLine.prevHash, lastLine.text) === wal.digest;
+		if (wal.version === WAL_VERSION) {
+			// Re-verify the FULL chain from the on-disk bytes: trusting only the
+			// final link would be self-referential (both its prevHash and text come
+			// from the unchanged last line) and would miss an interior delta
+			// replacement. The WAL is bounded by the compaction threshold, so this
+			// is O(WAL) per mutation, not O(base).
+			const verified = this.verifyWalChainOnDisk();
+			return verified !== undefined && verified.digest === wal.digest;
 		}
 		return walSampleDigestFromFile(this.walPath) === wal.digest;
+	}
+	/** Streams the WAL and verifies every chained link (header + deltas) against
+	 * the on-disk bytes; returns the final chain digest, or undefined when any
+	 * link is broken, unreadable, or the tail is torn (the caller then reloads
+	 * and replayWal fails closed or compacts the valid prefix). */
+	private verifyWalChainOnDisk(): { readonly digest: string } | undefined {
+		let contents: string;
+		try {
+			contents = readFileSync(this.walPath, "utf8");
+		} catch {
+			return undefined;
+		}
+		const parts = contents.split("\n");
+		const hasTrailingNewline = parts.length > 0 && parts[parts.length - 1] === "";
+		const lines = parts.filter(line => line.length > 0);
+		if (lines.length === 0) return undefined;
+		let header: unknown;
+		try {
+			header = JSON.parse(lines[0]!);
+		} catch {
+			return undefined;
+		}
+		if (!isWalHeader(header, this.#baseIdentity) || (header as Record<string, unknown>).version !== WAL_VERSION)
+			return undefined;
+		let expectedChain = WAL_CHAIN_SEED;
+		for (let index = 0; index < lines.length; index += 1) {
+			const line = lines[index]!;
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(line);
+			} catch {
+				if (index === lines.length - 1 && !hasTrailingNewline) return undefined;
+				return undefined;
+			}
+			const record = parsed as Record<string, unknown>;
+			if (index === 0) {
+				if (!isNonEmptyString(record.prevHash) || record.prevHash !== expectedChain) return undefined;
+			} else if (!isWalDelta(parsed) || !isNonEmptyString(record.prevHash) || record.prevHash !== expectedChain) {
+				return undefined;
+			}
+			expectedChain = lineChainHash(record.prevHash, line);
+		}
+		return { digest: expectedChain };
 	}
 	protected load(): void {
 		if (!existsSync(this.filePath)) {
@@ -593,8 +639,8 @@ export class FileSessionAuthority extends SessionAuthority {
 		}
 		this.replaceAllWithReferences([...records.values()], [...provisional.values()]);
 		this.#walIdentity = chained
-			? { ...statIdentity(walPath)!, digest: expectedChain, lastLineLength }
-			: { ...statIdentity(walPath)!, digest: walSampleDigestFromContents(contents) };
+			? { ...statIdentity(walPath)!, digest: expectedChain, lastLineLength, version: WAL_VERSION }
+			: { ...statIdentity(walPath)!, digest: walSampleDigestFromContents(contents), version: WAL_LEGACY_VERSION };
 		this.clearDirtyJournal();
 		return { trailingGarbage };
 	}
@@ -602,6 +648,14 @@ export class FileSessionAuthority extends SessionAuthority {
 		records: readonly SessionAuthorityRecord[],
 		provisional: readonly { readonly key: string; readonly operation: ProvisionalSessionOperation }[],
 	): void {
+		if (this.#walIdentity !== undefined && this.#walIdentity.version === WAL_LEGACY_VERSION) {
+			// A legacy v1 WAL was replayed (e.g. at startup) and still carries a
+			// bounded sample identity; compact it into the base before the first
+			// v2 append so the WAL becomes chain-covered from its first line
+			// instead of remaining sample-bound until the compaction threshold.
+			this.persist();
+			return;
+		}
 		const walPath = this.walPath;
 		let created = false;
 		if (this.#walIdentity === undefined) {
@@ -695,7 +749,7 @@ export class FileSessionAuthority extends SessionAuthority {
 	protected refreshWalIdentity(writtenDigest: string, lastLineLength: number): void {
 		const stat = statIdentity(this.walPath);
 		if (stat === undefined) throw new Error("WAL stat cannot be refreshed after a write");
-		this.#walIdentity = { ...stat, digest: writtenDigest, lastLineLength };
+		this.#walIdentity = { ...stat, digest: writtenDigest, lastLineLength, version: WAL_VERSION };
 	}
 	/** Reads an existing WAL, validates its header against the current base, and
 	 * adopts it: "chained" seeds the identity by verifying every v2 chain link;
@@ -736,7 +790,7 @@ export class FileSessionAuthority extends SessionAuthority {
 			lastLineLength = Buffer.byteLength(line, "utf8");
 		}
 		if (digest === undefined) return false;
-		this.#walIdentity = { ...statIdentity(walPath)!, digest, lastLineLength };
+		this.#walIdentity = { ...statIdentity(walPath)!, digest, lastLineLength, version: WAL_VERSION };
 		return "chained";
 	}
 	/** Reloads memory from the durable base and WAL so in-memory state matches
@@ -899,45 +953,6 @@ function walSampleDigestFromFile(path: string): string | undefined {
  * plus the line terminator) and returns its prevHash and exact text, so the
  * per-mutation chain verification covers every delta without re-reading the
  * whole WAL. */
-function walLastLine(
-	path: string,
-	lastLineLength: number,
-): { readonly prevHash: string; readonly text: string } | undefined {
-	let stat: { readonly size: number };
-	try {
-		stat = statSync(path);
-	} catch {
-		return undefined;
-	}
-	const readLength = lastLineLength + 1;
-	if (stat.size < lastLineLength) return undefined;
-	let descriptor: number;
-	try {
-		descriptor = openSync(path, "r");
-	} catch {
-		return undefined;
-	}
-	try {
-		const buffer = Buffer.alloc(readLength);
-		const bytesRead = readSync(descriptor, buffer, 0, buffer.length, Math.max(0, stat.size - readLength));
-		if (bytesRead <= 0) return undefined;
-		const text = buffer
-			.toString("utf8", 0, bytesRead)
-			.replace(/^[\n\r]+/, "")
-			.replace(/[\n\r]+$/, "");
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(text);
-		} catch {
-			return undefined;
-		}
-		const record = parsed as Record<string, unknown>;
-		if (!isNonEmptyString(record.prevHash)) return undefined;
-		return { prevHash: record.prevHash, text };
-	} finally {
-		closeSync(descriptor);
-	}
-}
 function statIdentity(path: string): { readonly size: number; readonly mtimeMs: number } | undefined {
 	if (!existsSync(path)) return undefined;
 	const stat = statSync(path);

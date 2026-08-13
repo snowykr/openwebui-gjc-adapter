@@ -817,6 +817,52 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			Buffer.byteLength(raw.slice(0, topLevelIndex), "utf8"),
 		);
 	});
+	test("compacts a replayed legacy WAL before the first append", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-legacy-wal-upgrade-")), "mappings.json");
+		const authority = new FileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+
+		// Build a legacy v1 WAL beside a generation-less base (as an older
+		// release would have written it).
+		const baseDoc = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
+		delete baseDoc.generation;
+		const rec1 = authority.entries()[0]!;
+		const rec2 = {
+			...JSON.parse(JSON.stringify(rec1)),
+			chatId: "chat-2",
+			operationId: "user-2",
+			header: { ...rec1.header, chatId: "chat-2" },
+			journal: [{ ...rec1.journal[0]!, id: "user-2", ingressId: "user-2" }],
+		};
+		writeFileSync(filePath, JSON.stringify(baseDoc));
+		const stat = statSync(filePath);
+		const legacyHeader = {
+			kind: "openwebui-gjc-session-authority-wal",
+			version: 1,
+			base: { size: stat.size, mtimeMs: stat.mtimeMs },
+		};
+		const legacyDelta = {
+			kind: "openwebui-gjc-session-authority-wal",
+			version: 1,
+			records: [rec2],
+			provisional: [],
+		};
+		writeFileSync(`${filePath}.wal`, `${JSON.stringify(legacyHeader)}\n${JSON.stringify(legacyDelta)}\n`);
+
+		// The replay seeds a legacy sample identity; the next mutation must
+		// compact it into the base before appending, so the WAL becomes
+		// chain-covered instead of staying sample-bound.
+		const live = new FileSessionAuthority(filePath);
+		live.set({ ...mappingInput(mediumSelection), chatId: "chat-3", operationId: "user-3" });
+
+		expect(existsSync(`${filePath}.wal`)).toBe(false);
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2", "chat-3"]);
+	});
 	test("upgrades a generation-less base before the first WAL append", () => {
 		const filePath = join(
 			mkdtempSync(join(tmpdir(), "gjc-session-authority-generation-less-upgrade-")),
