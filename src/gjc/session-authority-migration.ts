@@ -210,7 +210,13 @@ function candidateMigrationAlreadyCommitted(
 	stateRoot: string,
 	destinationPath: string,
 ): boolean {
+	let lock: ReturnType<typeof AuthorityMutationLock.acquire> | undefined;
 	try {
+		// Hold the source authority mutation lock through the WAL-existence and
+		// digest checks: a concurrent mutation must not append its first WAL
+		// between the check and the skip decision, or the candidate would be
+		// skipped while the destination lacks the newly acknowledged mutation.
+		lock = AuthorityMutationLock.acquire(sourcePath);
 		const paths = migrationPaths(sourcePath, stateRoot, destinationPath);
 		const checkpointState = readCheckpoint(paths.checkpointPath);
 		const checkpoint = checkpointState.value;
@@ -241,6 +247,8 @@ function candidateMigrationAlreadyCommitted(
 		);
 	} catch {
 		return false;
+	} finally {
+		lock?.release();
 	}
 }
 function runMigration(
