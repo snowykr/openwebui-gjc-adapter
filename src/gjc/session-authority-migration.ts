@@ -235,7 +235,7 @@ function candidateMigrationAlreadyCommitted(
 		// mutations and must not force a rewrite, while a malformed header fails
 		// closed.
 		const walBinding = walBindingForBase(`${sourcePath}.wal`, sourcePath);
-		if (walBinding === "malformed") throw new Error("authority WAL header is malformed");
+		if (walBinding === "malformed") throw new Error("authority WAL is unreadable or malformed");
 		if (walBinding === "current") return false;
 		const sourceBytes = readFileIfPresent(sourcePath);
 		const recoveryBytes = readFileIfPresent(checkpoint.sourceRecoveryPath);
@@ -303,7 +303,7 @@ function runMigration(
 				// carries no applicable mutations and rewriting the base would only
 				// churn its digest.
 				const walBinding = walBindingForBase(`${sourcePath}.wal`, sourcePath);
-				if (walBinding === "malformed") throw new Error("authority WAL header is malformed");
+				if (walBinding === "malformed") throw new Error("authority WAL is unreadable or malformed");
 				if (walBinding === "current") compactAuthorityForRelocation(sourcePath, lock);
 				sourceBytes = readFileSync(sourcePath);
 			} finally {

@@ -7,6 +7,7 @@ import {
 	mkdtempSync,
 	readFileSync,
 	rmSync,
+	statSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
@@ -1899,6 +1900,104 @@ describe("session authority pre-store migration", () => {
 			// The relocated document carries the WAL-committed chat-2 mutation.
 			const relocated = readFileSync(destinationPath, "utf8");
 			expect(relocated).toContain("chat-2");
+			expect(new FileSessionAuthority(destinationPath).entries()).toHaveLength(2);
+		});
+	});
+	test("fails closed when the source WAL cannot be read", () => {
+		withRoot((root, sourcePath) => {
+			const destinationPath = join(root, "relocated", "authority.json");
+			const source = new FileSessionAuthority(sourcePath);
+			source.set({
+				chatId: "chat-1",
+				projectId: "project-1",
+				sessionId: "session-1",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-1",
+			});
+			source.set({
+				chatId: "chat-2",
+				projectId: "project-1",
+				sessionId: "session-2",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-2",
+			});
+			expect(existsSync(`${sourcePath}.wal`)).toBe(true);
+			chmodSync(`${sourcePath}.wal`, 0o000);
+
+			// An unreadable WAL must fail closed instead of being treated as
+			// absent (which would silently omit the WAL-only mutation).
+			const result = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [sourcePath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+
+			expect(result.status).toBe("degraded");
+			expect(result.reason).toContain("unreadable or malformed");
+		});
+	});
+	test("ignores a header-only WAL when recognizing a committed migration", () => {
+		withRoot((root, sourcePath) => {
+			const destinationPath = join(root, "relocated", "authority.json");
+			const source = new FileSessionAuthority(sourcePath);
+			source.set({
+				chatId: "chat-1",
+				projectId: "project-1",
+				sessionId: "session-1",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-1",
+			});
+			source.set({
+				chatId: "chat-2",
+				projectId: "project-1",
+				sessionId: "session-2",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-2",
+			});
+			const first = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [sourcePath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+			expect(first.status).toBe("committed");
+			expect(existsSync(`${sourcePath}.wal`)).toBe(false);
+
+			// An interrupted first append leaves a VALID CURRENT header but no
+			// delta: it carries no applicable mutations, so it must not bypass the
+			// committed-candidate shortcut or trigger a source rewrite.
+			const stat = statSync(sourcePath);
+			const baseDoc = JSON.parse(readFileSync(sourcePath, "utf8")) as Record<string, unknown>;
+			writeFileSync(
+				`${sourcePath}.wal`,
+				`${JSON.stringify({
+					kind: "openwebui-gjc-session-authority-wal",
+					version: 2,
+					base: {
+						size: stat.size,
+						mtimeMs: stat.mtimeMs,
+						generation: baseDoc.generation,
+					},
+					prevHash: "openwebui-gjc-session-authority-wal:v2",
+				})}\n`,
+			);
+
+			const second = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [sourcePath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+
+			expect(second.status).toBe("not_needed");
 			expect(new FileSessionAuthority(destinationPath).entries()).toHaveLength(2);
 		});
 	});
