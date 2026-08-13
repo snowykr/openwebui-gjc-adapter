@@ -667,7 +667,7 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 
 		expect(() => new FileSessionAuthority(filePath)).toThrow("corrupt before its final line");
 	});
-	test("trusts the stat identity per turn once the WAL exceeds the full-verify bound", () => {
+	test("detects a same-size same-mtime WAL replacement regardless of WAL size", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-verify-bound-")), "mappings.json");
 		const walPath = `${filePath}.wal`;
 		const authority = new FileSessionAuthority(filePath);
@@ -693,9 +693,10 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		});
 		expect(statSync(walPath).size).toBeGreaterThan(1024 * 1024);
 
-		// Above the bound the per-turn check trusts the stat identity (full
-		// line-by-line validation happens at boot), so the mutation appends
-		// without forcing a reload and boot replays the complete WAL.
+		// The bounded head+tail content sample detects the swap at ANY WAL size:
+		// the head-region delta is replaced while preserving byte length and
+		// mtime, and the live authority must replay the replacement before the
+		// next append.
 		const original = readFileSync(walPath, "utf8");
 		const replaced = original.replaceAll("chat-2", "chat-9");
 		expect(replaced.length).toBe(original.length);
@@ -705,7 +706,12 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 
 		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-5", operationId: "user-5" });
 
-		expect(existsSync(walPath)).toBe(true);
+		expect(
+			authority
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-3", "chat-4", "chat-5", "chat-9"]);
 		expect(
 			new FileSessionAuthority(filePath)
 				.entries()

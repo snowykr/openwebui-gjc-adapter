@@ -1,4 +1,4 @@
-import { createHash, type Hash, randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
 	closeSync,
 	constants,
@@ -42,12 +42,16 @@ import {
 const WAL_KIND = "openwebui-gjc-session-authority-wal" as const;
 const WAL_VERSION = 1 as const;
 const WAL_COMPACTION_THRESHOLD_BYTES = 32 * 1024 * 1024;
-/** WALs up to this size are cheap to fully re-verify per mutation; beyond it,
- * per-turn verification trusts the stat identity and the boot replay validates
- * every line. */
-const WAL_FULL_VERIFY_THRESHOLD_BYTES = 1024 * 1024;
 
-type BaseIdentity = { readonly size: number; readonly mtimeMs: number; readonly generation?: string };
+type BaseIdentity = {
+	readonly size: number;
+	readonly mtimeMs: number;
+	readonly generation?: string;
+	/** Byte offset of the top-level generation key in the base document, cached
+	 * so the live per-mutation verification reads a bounded window instead of
+	 * scanning the whole document. */
+	readonly generationOffset?: number;
+};
 
 export class SessionAuthorityDurabilityError extends Error {
 	constructor(filePath: string, cause: unknown) {
@@ -59,19 +63,21 @@ export class SessionAuthorityDurabilityError extends Error {
 export class FileSessionAuthority extends SessionAuthority {
 	#baseIdentity: BaseIdentity | undefined = undefined;
 	#walIdentity: { readonly size: number; readonly mtimeMs: number; readonly digest: string } | undefined = undefined;
-	/** Incremental hash of the WAL content as this instance knows it, so appends
-	 * can extend the digest in O(delta) instead of re-hashing the whole file. */
-	#walHasher: Hash | undefined = undefined;
 	protected walCompactionThresholdBytes = WAL_COMPACTION_THRESHOLD_BYTES;
 
-	constructor(private readonly filePath: string) {
+	/** When the caller already holds the authority mutation lock (which is not
+	 * reentrant), pass it in so the boot-time replay/compaction stays inside the
+	 * caller's critical section instead of deadlocking on a second acquire. */
+	constructor(
+		private readonly filePath: string,
+		lock?: ReturnType<typeof AuthorityMutationLock.acquire>,
+	) {
 		super();
-		const lock = AuthorityMutationLock.acquire(this.filePath);
+		const held = lock ?? AuthorityMutationLock.acquire(this.filePath);
 		try {
 			if (!existsSync(this.filePath)) {
 				this.#baseIdentity = undefined;
 				this.#walIdentity = undefined;
-				this.#walHasher = undefined;
 				this.dropWalFile();
 				return;
 			}
@@ -84,7 +90,7 @@ export class FileSessionAuthority extends SessionAuthority {
 				this.persist();
 			}
 		} finally {
-			lock.release();
+			if (lock === undefined) held.release();
 		}
 	}
 	override set(input: SessionAuthorityInput): SessionAuthorityRecord {
@@ -247,14 +253,17 @@ export class FileSessionAuthority extends SessionAuthority {
 	/** Exposed for relocation/migration: replays a valid WAL beside the base and
 	 * rewrites the base with the complete acknowledged state (fresh generation,
 	 * WAL truncated), so a subsequent copy of the base file carries every
-	 * WAL-committed mutation instead of losing it. */
-	public compactForRelocation(): void {
-		const lock = AuthorityMutationLock.acquire(this.filePath);
+	 * WAL-committed mutation instead of losing it. When the caller already holds
+	 * the source authority mutation lock (which is not reentrant), pass it in so
+	 * the compaction and the caller's snapshot read stay inside the same
+	 * critical section. */
+	public compactForRelocation(lock?: ReturnType<typeof AuthorityMutationLock.acquire>): void {
+		const held = lock ?? AuthorityMutationLock.acquire(this.filePath);
 		try {
 			this.verifyAgainstDisk();
 			this.persist();
 		} finally {
-			lock.release();
+			if (lock === undefined) held.release();
 		}
 	}
 	/** Restores the pre-mutation state from a shallow reference snapshot and
@@ -295,25 +304,26 @@ export class FileSessionAuthority extends SessionAuthority {
 	 * generation, not only size/mtime: a timestamp-preserving same-size external
 	 * replacement while this instance is running would otherwise keep appending
 	 * under the stale generation and the WAL would be rejected (and the
-	 * acknowledged mutation silently lost) at the next boot. */
+	 * acknowledged mutation silently lost) at the next boot. The generation's
+	 * byte offset is cached at load/persist time, so the per-mutation read is a
+	 * bounded window instead of a whole-document scan even when an external
+	 * writer reorders the document. */
 	private baseGenerationMatchesDisk(): boolean {
 		const base = this.#baseIdentity;
-		if (base === undefined) return true;
-		return readBaseGeneration(this.filePath) === (base.generation ?? undefined);
+		if (base === undefined || base.generation === undefined || base.generationOffset === undefined) return true;
+		return readGenerationAtOffset(this.filePath, base.generationOffset) === base.generation;
 	}
 	/** The cached WAL state is bound to the WAL's CONTENT, not only its stat
 	 * identity: a replacement with different valid contents that preserves byte
 	 * length and mtime must be replayed before the next mutation is appended,
 	 * otherwise the append would be acknowledged against a state that a restart
-	 * never replays. Full-content verification is bounded: while the WAL is
-	 * small the digest is cheap, and larger WALs rely on the stat identity per
-	 * turn with the full line-by-line replay validation at boot/compaction, so
-	 * per-turn I/O never grows toward the compaction threshold. */
+	 * never replays. The identity is a bounded head+tail content sample, so the
+	 * check stays O(1) at every WAL size instead of re-reading the whole file
+	 * per mutation (the full line-by-line validation still runs at boot). */
 	private walDigestMatchesDisk(): boolean {
 		const wal = this.#walIdentity;
 		if (wal === undefined) return true;
-		if (wal.size > WAL_FULL_VERIFY_THRESHOLD_BYTES) return true;
-		return walFileDigest(this.walPath) === wal.digest;
+		return walSampleDigestFromFile(this.walPath) === wal.digest;
 	}
 	protected load(): void {
 		if (!existsSync(this.filePath)) {
@@ -322,8 +332,10 @@ export class FileSessionAuthority extends SessionAuthority {
 			return;
 		}
 		let document: unknown;
+		let rawDocument = "";
 		try {
-			document = JSON.parse(readFileSync(this.filePath, "utf8"));
+			rawDocument = readFileSync(this.filePath, "utf8");
+			document = JSON.parse(rawDocument);
 		} catch (error) {
 			throw new SessionAuthorityLoadError(this.filePath, "authority JSON is unreadable", error);
 		}
@@ -346,7 +358,12 @@ export class FileSessionAuthority extends SessionAuthority {
 				? undefined
 				: {
 						...stat,
-						...(typeof document.generation === "string" ? { generation: document.generation } : {}),
+						...(typeof document.generation === "string"
+							? {
+									generation: document.generation,
+									generationOffset: findGenerationOffset(rawDocument, document.generation),
+								}
+							: {}),
 					};
 		this.clearDirtyJournal();
 	}
@@ -394,7 +411,6 @@ export class FileSessionAuthority extends SessionAuthority {
 			this.syncDirectory();
 		} catch (error) {
 			this.#walIdentity = undefined;
-			this.#walHasher = undefined;
 			try {
 				this.load();
 			} catch (loadError) {
@@ -421,7 +437,6 @@ export class FileSessionAuthority extends SessionAuthority {
 			// durability instead of letting mutate() restore a pre-mutation snapshot
 			// (a retry could then conflict with or duplicate the committed write).
 			this.#walIdentity = undefined;
-			this.#walHasher = undefined;
 			try {
 				this.load();
 			} catch (loadError) {
@@ -455,9 +470,15 @@ export class FileSessionAuthority extends SessionAuthority {
 		this.clearDirtyJournal();
 	}
 	/** Refreshes the cached base identity (stat + generation) after a rewrite;
-	 * separated so the post-commit failure handling can guard it. */
+	 * separated so the post-commit failure handling can guard it. The generation
+	 * offset is deterministic for documents this instance writes (the compact
+	 * single-line layout always places the generation key at the same byte). */
 	protected refreshBaseIdentity(nextGeneration: string): void {
-		this.#baseIdentity = { ...statIdentity(this.filePath)!, generation: nextGeneration };
+		this.#baseIdentity = {
+			...statIdentity(this.filePath)!,
+			generation: nextGeneration,
+			generationOffset: GENERATION_KEY_OFFSET,
+		};
 	}
 	protected syncDirectory(): void {
 		const directory = openSync(dirname(this.filePath), "r");
@@ -521,8 +542,7 @@ export class FileSessionAuthority extends SessionAuthority {
 			for (const item of delta.provisional) provisional.set(item.key, item.operation);
 		}
 		this.replaceAllWithReferences([...records.values()], [...provisional.values()]);
-		this.#walHasher = createHash("sha256").update(contents);
-		this.#walIdentity = { ...statIdentity(walPath)!, digest: this.#walHasher.copy().digest("hex") };
+		this.#walIdentity = { ...statIdentity(walPath)!, digest: walSampleDigestFromContents(contents) };
 		this.clearDirtyJournal();
 		return { trailingGarbage };
 	}
@@ -534,7 +554,7 @@ export class FileSessionAuthority extends SessionAuthority {
 		let created = false;
 		if (this.#walIdentity === undefined) {
 			if (this.adoptExistingWal(walPath)) {
-				// adopted: identity + hasher seeded
+				// adopted: identity (stat + content sample) seeded
 			} else {
 				if (existsSync(walPath)) unlinkSync(walPath);
 				created = true;
@@ -558,17 +578,9 @@ export class FileSessionAuthority extends SessionAuthority {
 				if (created) {
 					const headerLine = `${JSON.stringify(walHeader(this.#baseIdentity))}\n`;
 					writeFileSync(descriptor, headerLine, "utf8");
-					this.#walHasher = createHash("sha256").update(headerLine);
-				} else if (this.#walHasher === undefined) {
-					// Defensive: the hasher should always be seeded alongside the
-					// identity; re-seed from the current file when it is not.
-					const existing = walFileHash(this.walPath);
-					if (existing === undefined) throw new Error("WAL content cannot be read before appending");
-					this.#walHasher = existing;
 				}
 				const deltaLine = `${JSON.stringify(walDelta(records, provisional))}\n`;
 				writeFileSync(descriptor, deltaLine, "utf8");
-				this.#walHasher.update(deltaLine);
 				fsyncSync(descriptor);
 			} finally {
 				closeSync(descriptor);
@@ -585,7 +597,6 @@ export class FileSessionAuthority extends SessionAuthority {
 					this.refreshWalIdentity();
 				} catch (identityError) {
 					this.#walIdentity = undefined;
-					this.#walHasher = undefined;
 					this.reloadDurableState();
 					throw new SessionAuthorityDurabilityError(this.filePath, identityError);
 				}
@@ -600,20 +611,23 @@ export class FileSessionAuthority extends SessionAuthority {
 			// would then restore the pre-mutation snapshot while a restart replays
 			// the committed delta, and the caller could retry the operation).
 			this.#walIdentity = undefined;
-			this.#walHasher = undefined;
 			this.reloadDurableState();
 			throw new SessionAuthorityDurabilityError(this.filePath, error);
 		}
 	}
-	/** Refreshes the cached WAL identity (stat + content digest) after a write;
-	 * only called once the WAL content is fully known. */
+	/** Refreshes the cached WAL identity (stat + bounded head+tail content
+	 * sample) after a write; only called once the WAL content is fully known. */
 	protected refreshWalIdentity(): void {
-		this.#walIdentity = { ...statIdentity(this.walPath)!, digest: this.#walHasher!.copy().digest("hex") };
+		const stat = statIdentity(this.walPath);
+		if (stat === undefined) throw new Error("WAL stat cannot be refreshed after a write");
+		const digest = walSampleDigestFromFile(this.walPath);
+		if (digest === undefined) throw new Error("WAL content sample cannot be refreshed after a write");
+		this.#walIdentity = { ...stat, digest };
 	}
 	/** Reads an existing WAL, validates its header against the current base, and
-	 * adopts it as the live identity (stat + content digest + incremental
-	 * hasher). Returns false when the WAL is unreadable, has no valid header, or
-	 * does not match the base identity. */
+	 * adopts it as the live identity (stat + bounded head+tail content sample).
+	 * Returns false when the WAL is unreadable, has no valid header, or does not
+	 * match the base identity. */
 	private adoptExistingWal(walPath: string): boolean {
 		let contents: string;
 		try {
@@ -630,8 +644,7 @@ export class FileSessionAuthority extends SessionAuthority {
 			return false;
 		}
 		if (!isWalHeader(header, this.#baseIdentity)) return false;
-		this.#walHasher = createHash("sha256").update(contents);
-		this.#walIdentity = { ...statIdentity(walPath)!, digest: this.#walHasher.copy().digest("hex") };
+		this.#walIdentity = { ...statIdentity(walPath)!, digest: walSampleDigestFromContents(contents) };
 		return true;
 	}
 	/** Reloads memory from the durable base and WAL so in-memory state matches
@@ -645,7 +658,6 @@ export class FileSessionAuthority extends SessionAuthority {
 			else this.#walIdentity = undefined;
 		} catch (error) {
 			this.#walIdentity = undefined;
-			this.#walHasher = undefined;
 			throw new SessionAuthorityDurabilityError(this.filePath, error);
 		}
 	}
@@ -661,7 +673,6 @@ export class FileSessionAuthority extends SessionAuthority {
 				// state and surface uncertain durability so callers do not retry an
 				// operation that boot will consider committed.
 				this.#walIdentity = undefined;
-				this.#walHasher = undefined;
 				this.reloadDurableState();
 				throw new SessionAuthorityDurabilityError(this.filePath, error);
 			}
@@ -672,18 +683,15 @@ export class FileSessionAuthority extends SessionAuthority {
 				this.syncDirectory();
 			} catch (error) {
 				this.#walIdentity = undefined;
-				this.#walHasher = undefined;
 				this.reloadDurableState();
 				throw new SessionAuthorityDurabilityError(this.filePath, error);
 			}
 			this.#walIdentity = undefined;
-			this.#walHasher = undefined;
 			return;
 		}
 		try {
 			if (!existsSync(walPath)) {
 				this.#walIdentity = undefined;
-				this.#walHasher = undefined;
 				return;
 			}
 			const descriptor = openSync(walPath, "r+");
@@ -697,15 +705,13 @@ export class FileSessionAuthority extends SessionAuthority {
 			} finally {
 				closeSync(descriptor);
 			}
-			const rolledBack = walFileHash(walPath);
-			if (rolledBack === undefined) throw new Error("WAL rollback content cannot be re-read");
-			this.#walHasher = rolledBack;
-			this.#walIdentity = { ...previousStat, digest: rolledBack.copy().digest("hex") };
+			const rolledBackDigest = walSampleDigestFromFile(walPath);
+			if (rolledBackDigest === undefined) throw new Error("WAL rollback content cannot be re-read");
+			this.#walIdentity = { ...previousStat, digest: rolledBackDigest };
 		} catch (error) {
 			// A complete delta may remain replayable despite the reported append
 			// error; reload the WAL-visible state and surface uncertain durability.
 			this.#walIdentity = undefined;
-			this.#walHasher = undefined;
 			this.reloadDurableState();
 			throw new SessionAuthorityDurabilityError(this.filePath, error);
 		}
@@ -714,7 +720,6 @@ export class FileSessionAuthority extends SessionAuthority {
 		const walPath = this.walPath;
 		if (existsSync(walPath)) unlinkSync(walPath);
 		this.#walIdentity = undefined;
-		this.#walHasher = undefined;
 	}
 	private resetWalFile(): void {
 		this.dropWalFile();
@@ -760,9 +765,26 @@ export class FileSessionAuthority extends SessionAuthority {
 	}
 }
 
-/** Streams a file through SHA-256 in bounded chunks; undefined when the file
- * is unreadable. */
-function walFileHash(path: string): Hash | undefined {
+const WAL_SAMPLE_BYTES = 8 * 1024;
+/** Bounded head+tail content sample of the WAL: cheap enough to re-verify on
+ * every mutation at any WAL size, while still binding the cached identity to
+ * the content (a same-size timestamp-preserving replacement that differs in
+ * the sampled regions is detected before the next append; the full
+ * line-by-line validation still runs at boot). */
+function walSampleDigestFromContents(contents: string): string {
+	const hash = createHash("sha256");
+	hash.update(String(contents.length));
+	hash.update(contents.slice(0, WAL_SAMPLE_BYTES));
+	if (contents.length > WAL_SAMPLE_BYTES) hash.update(contents.slice(contents.length - WAL_SAMPLE_BYTES));
+	return hash.digest("hex");
+}
+function walSampleDigestFromFile(path: string): string | undefined {
+	let stat: { readonly size: number };
+	try {
+		stat = statSync(path);
+	} catch {
+		return undefined;
+	}
 	let descriptor: number;
 	try {
 		descriptor = openSync(path, "r");
@@ -771,21 +793,19 @@ function walFileHash(path: string): Hash | undefined {
 	}
 	try {
 		const hash = createHash("sha256");
-		const buffer = Buffer.alloc(64 * 1024);
-		let offset = 0;
-		while (true) {
-			const bytesRead = readSync(descriptor, buffer, 0, buffer.length, offset);
-			if (bytesRead <= 0) break;
-			hash.update(buffer.subarray(0, bytesRead));
-			offset += bytesRead;
+		hash.update(String(stat.size));
+		const head = Buffer.alloc(WAL_SAMPLE_BYTES);
+		const headBytes = readSync(descriptor, head, 0, head.length, 0);
+		hash.update(head.subarray(0, Math.max(0, headBytes)));
+		if (stat.size > WAL_SAMPLE_BYTES) {
+			const tail = Buffer.alloc(WAL_SAMPLE_BYTES);
+			const tailBytes = readSync(descriptor, tail, 0, tail.length, stat.size - WAL_SAMPLE_BYTES);
+			hash.update(tail.subarray(0, Math.max(0, tailBytes)));
 		}
-		return hash;
+		return hash.digest("hex");
 	} finally {
 		closeSync(descriptor);
 	}
-}
-function walFileDigest(path: string): string | undefined {
-	return walFileHash(path)?.digest("hex");
 }
 function statIdentity(path: string): { readonly size: number; readonly mtimeMs: number } | undefined {
 	if (!existsSync(path)) return undefined;
@@ -794,19 +814,43 @@ function statIdentity(path: string): { readonly size: number; readonly mtimeMs: 
 }
 /** Compacts an authority in place (replays a valid WAL into the base, then
  * rewrites it with a fresh generation and truncates the WAL), so relocation or
- * migration can copy the base file without losing WAL-committed mutations. */
-export function compactAuthorityForRelocation(filePath: string): void {
-	new FileSessionAuthority(filePath).compactForRelocation();
+ * migration can copy the base file without losing WAL-committed mutations.
+ * When the caller already holds the source authority mutation lock, pass it in
+ * so the compaction and the snapshot read stay inside the same critical
+ * section (the lock is not reentrant). */
+export function compactAuthorityForRelocation(
+	filePath: string,
+	lock?: ReturnType<typeof AuthorityMutationLock.acquire>,
+): void {
+	new FileSessionAuthority(filePath, lock).compactForRelocation(lock);
 }
-/** Streams the base document and extracts the TOP-LEVEL generation value
- * without assuming JSON property order or a fixed prefix size. The document is
- * scanned in bounded chunks while tracking container depth and string state,
- * so a generation placed after a large mappings array (or reordered by an
- * external writer) is still found without ever reading the whole file at once.
- * Returns undefined when the file is unreadable or has no top-level generation
- * (legacy bases); the caller treats that as a mismatch when a generation is
- * expected, which is fail-safe. */
-function readBaseGeneration(path: string): string | undefined {
+/** The compact single-line document this instance writes always places the
+ * top-level generation key at a fixed byte offset. */
+const GENERATION_KEY_OFFSET = JSON.stringify({
+	kind: "openwebui-gjc-session-authority",
+	version: 2,
+	generation: "",
+}).indexOf('"generation"');
+/** Finds the byte offset of the top-level generation key in a parsed document
+ * by matching an occurrence whose value equals the known generation (nested
+ * "generation" keys in observations cannot collide because their values
+ * differ). Used at load time for externally written documents, so the live
+ * per-mutation verification can read a bounded window at the cached offset
+ * instead of scanning the whole document. */
+function findGenerationOffset(raw: string, generation: string): number | undefined {
+	let index = raw.indexOf('"generation"');
+	while (index >= 0) {
+		const match = /^\s*:\s*"([^"]*)"/.exec(raw.slice(index + '"generation"'.length));
+		if (match !== null && match[1] === generation) return index;
+		index = raw.indexOf('"generation"', index + 1);
+	}
+	return undefined;
+}
+/** Reads a bounded window at the cached generation offset and extracts the
+ * generation value; undefined when the read fails or the window no longer
+ * carries the generation key (the caller treats that as a mismatch, which is
+ * fail-safe). */
+function readGenerationAtOffset(path: string, offset: number): string | undefined {
 	let descriptor: number;
 	try {
 		descriptor = openSync(path, "r");
@@ -814,87 +858,11 @@ function readBaseGeneration(path: string): string | undefined {
 		return undefined;
 	}
 	try {
-		const buffer = Buffer.alloc(64 * 1024);
-		let offset = 0;
-		let depth = 0;
-		let inString = false;
-		let escaped = false;
-		let collectingValue = false;
-		let afterKeyColon = false;
-		const keyBytes: number[] = [];
-		const valueBytes: number[] = [];
-		let chunkSize = 4096;
-		while (true) {
-			const bytesRead = readSync(descriptor, buffer, 0, Math.min(chunkSize, buffer.length), offset);
-			if (bytesRead <= 0) break;
-			for (let index = 0; index < bytesRead; index += 1) {
-				const byte = buffer[index]!;
-				if (inString) {
-					if (escaped) {
-						escaped = false;
-					} else if (byte === 0x5c) {
-						escaped = true;
-					} else if (byte === 0x22) {
-						inString = false;
-						if (collectingValue) {
-							collectingValue = false;
-							if (Buffer.from(keyBytes).toString("utf8") === "generation")
-								return Buffer.from(valueBytes).toString("utf8");
-						}
-						afterKeyColon = false;
-					} else if (depth === 1 && collectingValue) {
-						valueBytes.push(byte);
-					} else if (depth === 1) {
-						keyBytes.push(byte);
-					}
-					continue;
-				}
-				// Whitespace outside strings is insignificant: it must never clear
-				// the pending key-colon state (an external writer may emit formatted
-				// JSON such as `"generation": "uuid"`).
-				if (byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d) continue;
-				if (byte === 0x22) {
-					// A root-level string starts: either a key or the value after a
-					// colon. Nested strings (depth >= 2) are ignored entirely.
-					inString = true;
-					if (depth === 1 && afterKeyColon) {
-						collectingValue = true;
-						valueBytes.length = 0;
-					} else if (depth === 1) {
-						collectingValue = false;
-						keyBytes.length = 0;
-					}
-					continue;
-				}
-				if (byte === 0x7b || byte === 0x5b) {
-					depth += 1;
-					afterKeyColon = false;
-					continue;
-				}
-				if (byte === 0x7d || byte === 0x5d) {
-					depth = Math.max(0, depth - 1);
-					afterKeyColon = false;
-					continue;
-				}
-				if (byte === 0x3a && depth === 1) {
-					afterKeyColon = true;
-					collectingValue = false;
-					continue;
-				}
-				if (byte === 0x2c) {
-					afterKeyColon = false;
-					continue;
-				}
-				if (afterKeyColon) {
-					// A root-level scalar (number/bool/null) value token; it cannot
-					// be the generation, so stop treating the colon as pending.
-					afterKeyColon = false;
-				}
-			}
-			offset += bytesRead;
-			chunkSize = buffer.length;
-		}
-		return undefined;
+		const buffer = Buffer.alloc(256);
+		const bytesRead = readSync(descriptor, buffer, 0, buffer.length, offset);
+		if (bytesRead <= 0) return undefined;
+		const match = /^"generation"\s*:\s*"([^"]*)"/.exec(buffer.toString("utf8", 0, bytesRead));
+		return match?.[1];
 	} finally {
 		closeSync(descriptor);
 	}

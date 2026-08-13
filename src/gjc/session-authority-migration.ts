@@ -271,6 +271,7 @@ function runMigration(
 	}
 
 	const sourceExists = existsSync(sourcePath);
+	let sourceBytes: Buffer | undefined;
 	if (sourceExists) {
 		// A v2 authority whose latest acknowledged mutations exist only in its
 		// WAL must be compacted (WAL replayed into the base, WAL truncated)
@@ -278,12 +279,23 @@ function runMigration(
 		// committed state instead of silently losing WAL-only mutations. Only
 		// fully valid v2 documents are compacted; anything else is left for the
 		// migration flow's own classification (and an unreadable WAL fails the
-		// preflight loudly instead of losing mutations silently).
+		// preflight loudly instead of losing mutations silently). The source
+		// authority mutation lock is held across the compaction AND the snapshot
+		// read, so a concurrent mutation cannot append a delta that the copied
+		// bytes would omit while the migration reports success.
 		const probe = parseJson(readFileSync(sourcePath));
-		if (probe.ok && isAuthorityDocument(probe.value) && existsSync(`${sourcePath}.wal`))
-			compactAuthorityForRelocation(sourcePath);
+		if (probe.ok && isAuthorityDocument(probe.value)) {
+			const lock = AuthorityMutationLock.acquire(sourcePath);
+			try {
+				if (existsSync(`${sourcePath}.wal`)) compactAuthorityForRelocation(sourcePath, lock);
+				sourceBytes = readFileSync(sourcePath);
+			} finally {
+				lock.release();
+			}
+		} else {
+			sourceBytes = readFileSync(sourcePath);
+		}
 	}
-	const sourceBytes = sourceExists ? readFileSync(sourcePath) : undefined;
 	const sourceSha256 = sourceBytes === undefined ? undefined : digest(sourceBytes);
 	const manifestState = readManifest(paths.auditPath);
 	let retryingOrphanedProvisionalCheckpoint = false;
