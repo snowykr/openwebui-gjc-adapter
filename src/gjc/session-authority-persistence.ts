@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
 	closeSync,
 	constants,
@@ -42,6 +43,8 @@ const WAL_KIND = "openwebui-gjc-session-authority-wal" as const;
 const WAL_VERSION = 1 as const;
 const WAL_COMPACTION_THRESHOLD_BYTES = 32 * 1024 * 1024;
 
+type BaseIdentity = { readonly size: number; readonly mtimeMs: number; readonly generation?: string };
+
 export class SessionAuthorityDurabilityError extends Error {
 	constructor(filePath: string, cause: unknown) {
 		super(`Session authority durability is uncertain after replacing ${filePath}.`, { cause });
@@ -50,8 +53,9 @@ export class SessionAuthorityDurabilityError extends Error {
 }
 
 export class FileSessionAuthority extends SessionAuthority {
-	#baseIdentity: { readonly size: number; readonly mtimeMs: number } | undefined = undefined;
+	#baseIdentity: BaseIdentity | undefined = undefined;
 	#walIdentity: { readonly size: number; readonly mtimeMs: number } | undefined = undefined;
+	protected walCompactionThresholdBytes = WAL_COMPACTION_THRESHOLD_BYTES;
 
 	constructor(private readonly filePath: string) {
 		super();
@@ -217,9 +221,12 @@ export class FileSessionAuthority extends SessionAuthority {
 							this.persist();
 						} catch (error) {
 							if (error instanceof SessionAuthorityDurabilityError) throw error;
-							this.replaceAll(records, provisionalOperations);
-							this.clearDirtyJournal();
-							throw error;
+							// The mutation was already appended and fsynced to the WAL, so it is
+							// durable; reload the WAL-visible state and surface uncertain
+							// durability instead of rolling back to a snapshot that boot will
+							// not reproduce (a retry could then conflict or duplicate).
+							this.reloadDurableState();
+							throw new SessionAuthorityDurabilityError(this.filePath, error);
 						}
 					}
 				}
@@ -262,7 +269,14 @@ export class FileSessionAuthority extends SessionAuthority {
 		)
 			throw new SessionAuthorityLoadError(this.filePath, "authority document is not a valid v2 authority");
 		this.replaceAll(document.mappings, document.provisionalOperations ?? []);
-		this.#baseIdentity = statIdentity(this.filePath);
+		const stat = statIdentity(this.filePath);
+		this.#baseIdentity =
+			stat === undefined
+				? undefined
+				: {
+						...stat,
+						...(typeof document.generation === "string" ? { generation: document.generation } : {}),
+					};
 		this.clearDirtyJournal();
 	}
 	protected persist(): void {
@@ -277,12 +291,17 @@ export class FileSessionAuthority extends SessionAuthority {
 		mkdirSync(dirname(this.filePath), { recursive: true });
 		const temporary = `${this.filePath}.tmp-${process.pid}-${Date.now()}`;
 		const descriptor = openSync(temporary, "wx", 0o600);
+		// A fresh generation on every rewrite makes WAL applicability
+		// collision-resistant: a timestamp-preserving external replacement of the
+		// base can never replay stale deltas against it.
+		const nextGeneration = randomUUID();
 		try {
 			writeFileSync(
 				descriptor,
 				`${JSON.stringify({
 					kind: "openwebui-gjc-session-authority",
 					version: SESSION_AUTHORITY_VERSION,
+					generation: nextGeneration,
 					mappings: mappings.map(normalizeRecordForPersistence),
 					provisionalOperations: provisionalOperations.map(normalizeProvisionalForPersistence),
 				})}\n`,
@@ -305,8 +324,18 @@ export class FileSessionAuthority extends SessionAuthority {
 			}
 			throw new SessionAuthorityDurabilityError(this.filePath, error);
 		}
-		this.resetWalFile();
-		this.#baseIdentity = statIdentity(this.filePath);
+		try {
+			this.resetWalFile();
+		} catch (error) {
+			// The base was renamed and directory-synced before this point, so the
+			// mutation is committed; reload the visible state and surface uncertain
+			// durability instead of letting mutate() restore a pre-mutation snapshot
+			// (a retry could then conflict with or duplicate the committed write).
+			this.load();
+			this.#walIdentity = undefined;
+			throw new SessionAuthorityDurabilityError(this.filePath, error);
+		}
+		this.#baseIdentity = { ...statIdentity(this.filePath)!, generation: nextGeneration };
 		this.clearDirtyJournal();
 	}
 	protected syncDirectory(): void {
@@ -336,7 +365,7 @@ export class FileSessionAuthority extends SessionAuthority {
 		} catch {
 			header = undefined;
 		}
-		if (!isWalHeader(header, statIdentity(this.filePath))) {
+		if (!isWalHeader(header, this.#baseIdentity)) {
 			this.dropWalFile();
 			return { trailingGarbage: false };
 		}
@@ -385,8 +414,7 @@ export class FileSessionAuthority extends SessionAuthority {
 		try {
 			descriptor = openSync(walPath, "a", 0o600);
 			try {
-				if (created)
-					writeFileSync(descriptor, `${JSON.stringify(walHeader(statIdentity(this.filePath)))}\n`, "utf8");
+				if (created) writeFileSync(descriptor, `${JSON.stringify(walHeader(this.#baseIdentity))}\n`, "utf8");
 				writeFileSync(descriptor, `${JSON.stringify(walDelta(records, provisional))}\n`, "utf8");
 				fsyncSync(descriptor);
 			} finally {
@@ -421,15 +449,30 @@ export class FileSessionAuthority extends SessionAuthority {
 		} catch {
 			return false;
 		}
-		return isWalHeader(header, statIdentity(this.filePath));
+		return isWalHeader(header, this.#baseIdentity);
 	}
-	private recoverFailedWalAppend(previousStat: { readonly size: number; readonly mtimeMs: number } | undefined): void {
+	/** Reloads memory from the durable base and WAL so in-memory state matches
+	 * what boot will replay; used when a durability failure leaves the committed
+	 * state uncertain. */
+	private reloadDurableState(): void {
+		this.load();
+		if (existsSync(this.walPath)) this.replayWal();
+		else this.#walIdentity = undefined;
+	}
+	protected recoverFailedWalAppend(
+		previousStat: { readonly size: number; readonly mtimeMs: number } | undefined,
+	): void {
 		const walPath = this.walPath;
 		if (previousStat === undefined) {
 			try {
 				if (existsSync(walPath)) unlinkSync(walPath);
-			} catch {
-				// Best effort; a stale partial WAL is discarded at the next boot stat check.
+			} catch (error) {
+				// The WAL may hold a complete replayable delta; reload the WAL-visible
+				// state and surface uncertain durability so callers do not retry an
+				// operation that boot will consider committed.
+				this.#walIdentity = undefined;
+				this.reloadDurableState();
+				throw new SessionAuthorityDurabilityError(this.filePath, error);
 			}
 			this.#walIdentity = undefined;
 			return;
@@ -446,8 +489,12 @@ export class FileSessionAuthority extends SessionAuthority {
 				closeSync(descriptor);
 			}
 			this.#walIdentity = previousStat;
-		} catch {
-			// Best effort; boot replay tolerates a trailing partial line.
+		} catch (error) {
+			// A complete delta may remain replayable despite the reported append
+			// error; reload the WAL-visible state and surface uncertain durability.
+			this.#walIdentity = undefined;
+			this.reloadDurableState();
+			throw new SessionAuthorityDurabilityError(this.filePath, error);
 		}
 	}
 	private dropWalFile(): void {
@@ -460,7 +507,7 @@ export class FileSessionAuthority extends SessionAuthority {
 		this.syncDirectory();
 	}
 	private walOversized(): boolean {
-		return this.#walIdentity !== undefined && this.#walIdentity.size > WAL_COMPACTION_THRESHOLD_BYTES;
+		return this.#walIdentity !== undefined && this.#walIdentity.size > this.walCompactionThresholdBytes;
 	}
 	private hasPendingOperations(): boolean {
 		return (
@@ -511,19 +558,20 @@ function sameStatIdentity(
 	if (left === undefined || right === undefined) return left === right;
 	return left.size === right.size && left.mtimeMs === right.mtimeMs;
 }
-function walHeader(base: { readonly size: number; readonly mtimeMs: number } | undefined): unknown {
+function walHeader(base: BaseIdentity | undefined): unknown {
 	return { kind: WAL_KIND, version: WAL_VERSION, base };
 }
-function isWalHeader(value: unknown, base: { readonly size: number; readonly mtimeMs: number } | undefined): boolean {
+function isWalHeader(value: unknown, base: BaseIdentity | undefined): boolean {
 	if (typeof value !== "object" || value === null || base === undefined) return false;
 	const header = value as Record<string, unknown>;
-	return (
-		header.kind === WAL_KIND &&
-		header.version === WAL_VERSION &&
-		isRecord(header.base) &&
-		header.base.size === base.size &&
-		header.base.mtimeMs === base.mtimeMs
-	);
+	if (header.kind !== WAL_KIND || header.version !== WAL_VERSION || !isRecord(header.base)) return false;
+	const recorded = header.base as Record<string, unknown>;
+	if (recorded.size !== base.size || recorded.mtimeMs !== base.mtimeMs) return false;
+	// A generation-bearing base requires the header to carry the same
+	// generation, so a timestamp-preserving external replacement with the same
+	// byte length cannot replay stale deltas over it. Legacy stat-only WALs
+	// (and bases that predate generations) remain bound by the stat fields.
+	return base.generation === undefined ? recorded.generation === undefined : recorded.generation === base.generation;
 }
 function walDelta(
 	records: readonly SessionAuthorityRecord[],
@@ -595,15 +643,20 @@ function normalizeResult(result: SessionOperationResult): SessionOperationResult
 function isAuthorityDocument(value: unknown): value is {
 	kind: string;
 	version: number;
+	generation?: string;
 	mappings: SessionAuthorityRecord[];
 	provisionalOperations?: ProvisionalSessionOperation[];
 } {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const document = value as Record<string, unknown>;
 	return (
-		Object.keys(document).every(key => ["kind", "version", "mappings", "provisionalOperations"].includes(key)) &&
+		Object.keys(document).every(key =>
+			["kind", "version", "generation", "mappings", "provisionalOperations"].includes(key),
+		) &&
 		document.kind === "openwebui-gjc-session-authority" &&
 		document.version === SESSION_AUTHORITY_VERSION &&
+		(document.generation === undefined ||
+			(typeof document.generation === "string" && document.generation.length > 0)) &&
 		Array.isArray(document.mappings) &&
 		document.mappings.every(isV2Record) &&
 		(document.provisionalOperations === undefined ||

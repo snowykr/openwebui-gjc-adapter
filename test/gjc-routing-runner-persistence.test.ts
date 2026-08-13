@@ -9,6 +9,7 @@ import {
 	rmSync,
 	statSync,
 	unlinkSync,
+	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -399,6 +400,190 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				.map(record => record.chatId)
 				.sort(),
 		).toEqual(["chat-1", `${phase}-chat`]);
+	});
+	class SmallThresholdFailingFileSessionAuthority extends FailingFileSessionAuthority {
+		protected override walCompactionThresholdBytes = 1024;
+	}
+	class WALResetFailingFileSessionAuthority extends FailingFileSessionAuthority {
+		syncCalls = 0;
+
+		protected override syncDirectory(): void {
+			this.syncCalls += 1;
+			// The first call follows the successful rename inside persist(); the
+			// second is resetWalFile's directory sync after the WAL truncation.
+			if (this.syncCalls === 2 && this.failure !== undefined) throw this.failure;
+			super.syncDirectory();
+		}
+	}
+	class SmallThresholdWALResetFailingFileSessionAuthority extends WALResetFailingFileSessionAuthority {
+		protected override walCompactionThresholdBytes = 1024;
+	}
+	class FailedRollbackFileSessionAuthority extends FailingFileSessionAuthority {
+		readonly durabilityPath: string;
+		postWriteFailure: Error | undefined;
+
+		constructor(filePath: string) {
+			super(filePath);
+			this.durabilityPath = filePath;
+		}
+
+		protected override appendWal(
+			records: readonly SessionAuthorityRecord[],
+			provisional: readonly { readonly key: string; readonly operation: ProvisionalSessionOperation }[],
+		): void {
+			// walFailure stays unset so the real append runs; the failure is only
+			// reported AFTER the complete delta was written and fsynced (e.g. a
+			// failing close) with an unverifiable rollback, so the contract must
+			// surface uncertain durability and retain the WAL-visible state.
+			super.appendWal(records, provisional);
+			if (this.postWriteFailure !== undefined) {
+				this.postWriteFailure = new Error("injected rollback failure");
+				throw new SessionAuthorityDurabilityError(this.durabilityPath, this.postWriteFailure);
+			}
+		}
+	}
+
+	const padding = "x".repeat(2048);
+	test("surfaces uncertain durability when compaction fails after the WAL append", () => {
+		const filePath = join(
+			mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-compaction-failure-")),
+			"mappings.json",
+		);
+		const authority = new SmallThresholdFailingFileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.failure = new Error("injected compaction failure");
+
+		let error: unknown;
+		try {
+			authority.set({
+				...mappingInput(mediumSelection),
+				chatId: "chat-2",
+				operationId: "user-2",
+				assistantText: `${padding}turn-2`,
+			});
+		} catch (caught) {
+			error = caught;
+		}
+
+		expect(error).toBeInstanceOf(SessionAuthorityDurabilityError);
+		// The mutation was already WAL-committed; memory retains the WAL-visible
+		// state instead of rolling back to a pre-mutation snapshot.
+		expect(
+			authority
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2"]);
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2"]);
+	});
+	test("treats a post-rewrite WAL reset failure as a durability error", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-reset-failure-")), "mappings.json");
+		const authority = new SmallThresholdWALResetFailingFileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.failure = new Error("injected WAL reset failure");
+
+		let error: unknown;
+		try {
+			authority.set({
+				...mappingInput(mediumSelection),
+				chatId: "chat-2",
+				operationId: "user-2",
+				assistantText: `${padding}turn-2`,
+			});
+		} catch (caught) {
+			error = caught;
+		}
+
+		expect(error).toBeInstanceOf(SessionAuthorityDurabilityError);
+		// The base was renamed before the reset failure, so the mutation is
+		// committed and memory retains it instead of rolling back.
+		expect(
+			authority
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2"]);
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2"]);
+	});
+	test("surfaces uncertain durability when WAL rollback recovery fails", () => {
+		const filePath = join(
+			mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-rollback-failure-")),
+			"mappings.json",
+		);
+		const authority = new FailedRollbackFileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.postWriteFailure = new Error("injected append failure after a complete write");
+
+		let error: unknown;
+		try {
+			authority.set({
+				...mappingInput(mediumSelection),
+				chatId: "chat-2",
+				operationId: "user-2",
+				assistantText: `${padding}turn-2`,
+			});
+		} catch (caught) {
+			error = caught;
+		}
+
+		expect(error).toBeInstanceOf(SessionAuthorityDurabilityError);
+		// The complete delta remains replayable; memory and boot both retain the
+		// WAL-visible state so a retry cannot duplicate a committed operation.
+		expect(
+			authority
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2"]);
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2"]);
+	});
+	test("discards a stale WAL when the base is replaced with a same-size same-mtime document", () => {
+		const filePath = join(
+			mkdtempSync(join(tmpdir(), "gjc-session-authority-stale-wal-generation-")),
+			"mappings.json",
+		);
+		const authority = new FileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+		expect(existsSync(`${filePath}.wal`)).toBe(true);
+
+		// Replace the base with a same-size document whose mtime is preserved
+		// (e.g. cp -p / restore tooling) but whose content and generation differ.
+		const original = readFileSync(filePath, "utf8");
+		const replaced = JSON.parse(original) as Record<string, unknown> & {
+			mappings: { readonly chatId: string }[];
+		};
+		replaced.mappings = replaced.mappings.slice(0, 1);
+		replaced.generation = "replacement-generation";
+		const bytes = Buffer.from(`${JSON.stringify(replaced).padEnd(original.length - 1)}\n`, "utf8");
+		expect(bytes.length).toBe(original.length);
+		const mtimeMs = statSync(filePath).mtimeMs;
+		writeFileSync(filePath, bytes);
+		utimesSync(filePath, mtimeMs / 1000, mtimeMs / 1000);
+
+		// The stat identity is unchanged, but the generation differs: the stale
+		// WAL must be discarded and the replacement must win.
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1"]);
 	});
 	test("a fresh authority sees a WAL-append mutation before any compaction", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-replay-")), "mappings.json");
