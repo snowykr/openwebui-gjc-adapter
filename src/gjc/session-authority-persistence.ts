@@ -9,6 +9,7 @@ import {
 	mkdirSync,
 	openSync,
 	readFileSync,
+	readSync,
 	renameSync,
 	statSync,
 	unlinkSync,
@@ -175,15 +176,18 @@ export class FileSessionAuthority extends SessionAuthority {
 		const lock = AuthorityMutationLock.acquire(this.filePath);
 		try {
 			this.verifyAgainstDisk();
-			const records = this.entries();
-			const provisionalOperations = this.provisionalEntries();
+			// Shallow rollback snapshot: the journal stores new record/provisional
+			// objects on every mutation (copy-on-write), so the pre-mutation values
+			// stay intact by reference without deep-copying the whole authority
+			// document on every mutation (the O(total-size) allocation that the
+			// incremental persistence is meant to remove).
+			const rollback = this.snapshotJournalForRollback();
 			let result: T;
 			try {
 				result = mutation();
 			} catch (error) {
 				if (error instanceof SessionAuthorityDurabilityError) throw error;
-				this.replaceAll(records, provisionalOperations);
-				this.clearDirtyJournal();
+				this.restoreRollbackSnapshot(rollback);
 				throw error;
 			}
 			if (this.journalNeedsCompaction()) {
@@ -191,8 +195,7 @@ export class FileSessionAuthority extends SessionAuthority {
 					this.persist();
 				} catch (error) {
 					if (error instanceof SessionAuthorityDurabilityError) throw error;
-					this.replaceAll(records, provisionalOperations);
-					this.clearDirtyJournal();
+					this.restoreRollbackSnapshot(rollback);
 					throw error;
 				}
 			} else if (this.hasDirtyJournal()) {
@@ -203,8 +206,7 @@ export class FileSessionAuthority extends SessionAuthority {
 						this.persist();
 					} catch (error) {
 						if (error instanceof SessionAuthorityDurabilityError) throw error;
-						this.replaceAll(records, provisionalOperations);
-						this.clearDirtyJournal();
+						this.restoreRollbackSnapshot(rollback);
 						throw error;
 					}
 				} else {
@@ -212,8 +214,7 @@ export class FileSessionAuthority extends SessionAuthority {
 						this.appendWal(dirtyRecords, dirtyProvisional);
 					} catch (error) {
 						if (error instanceof SessionAuthorityDurabilityError) throw error;
-						this.replaceAll(records, provisionalOperations);
-						this.clearDirtyJournal();
+						this.restoreRollbackSnapshot(rollback);
 						throw error;
 					}
 					if (this.walOversized()) {
@@ -236,13 +237,38 @@ export class FileSessionAuthority extends SessionAuthority {
 			lock.release();
 		}
 	}
+	/** Restores the pre-mutation state from a shallow reference snapshot and
+	 * clears the dirty markers, so a failed (non-durable) mutation leaves memory
+	 * exactly as it was at mutation entry. */
+	private restoreRollbackSnapshot(rollback: {
+		readonly records: ReadonlyMap<string, SessionAuthorityRecord>;
+		readonly provisional: ReadonlyMap<string, ProvisionalSessionOperation>;
+	}): void {
+		this.replaceAll([...rollback.records.values()], [...rollback.provisional.values()]);
+		this.clearDirtyJournal();
+	}
 	private verifyAgainstDisk(): void {
 		const baseStat = statIdentity(this.filePath);
 		const walStat = statIdentity(this.walPath);
-		if (sameStatIdentity(baseStat, this.#baseIdentity) && sameStatIdentity(walStat, this.#walIdentity)) return;
+		if (
+			sameStatIdentity(baseStat, this.#baseIdentity) &&
+			sameStatIdentity(walStat, this.#walIdentity) &&
+			this.baseGenerationMatchesDisk()
+		)
+			return;
 		this.load();
 		if (walStat !== undefined) this.replayWal();
 		else this.#walIdentity = undefined;
+	}
+	/** The live verification path must also confirm the collision-resistant base
+	 * generation, not only size/mtime: a timestamp-preserving same-size external
+	 * replacement while this instance is running would otherwise keep appending
+	 * under the stale generation and the WAL would be rejected (and the
+	 * acknowledged mutation silently lost) at the next boot. */
+	private baseGenerationMatchesDisk(): boolean {
+		const base = this.#baseIdentity;
+		if (base === undefined) return true;
+		return readBaseGeneration(this.filePath) === (base.generation ?? undefined);
 	}
 	private load(): void {
 		if (!existsSync(this.filePath)) {
@@ -485,6 +511,11 @@ export class FileSessionAuthority extends SessionAuthority {
 			const descriptor = openSync(walPath, "r+");
 			try {
 				ftruncateSync(descriptor, previousStat.size);
+				// The truncation must be durable BEFORE the rollback is reported: a
+				// crash after an fsynced append but before this fsync could otherwise
+				// preserve the complete delta and replay an operation whose caller
+				// received an ordinary failure and retried.
+				fsyncSync(descriptor);
 			} finally {
 				closeSync(descriptor);
 			}
@@ -550,6 +581,28 @@ function statIdentity(path: string): { readonly size: number; readonly mtimeMs: 
 	if (!existsSync(path)) return undefined;
 	const stat = statSync(path);
 	return { size: stat.size, mtimeMs: stat.mtimeMs };
+}
+/** Reads the base document's generation from a small prefix (the compact
+ * single-line document carries it immediately after the version field), so the
+ * live per-mutation verification stays cheap instead of re-reading the whole
+ * authority. Returns undefined when the file is unreadable or has no
+ * generation (legacy bases); the caller treats that as a mismatch when a
+ * generation is expected, which is fail-safe. */
+function readBaseGeneration(path: string): string | undefined {
+	let descriptor: number;
+	try {
+		descriptor = openSync(path, "r");
+	} catch {
+		return undefined;
+	}
+	try {
+		const buffer = Buffer.alloc(512);
+		const bytesRead = readSync(descriptor, buffer, 0, buffer.length, 0);
+		const match = /"generation"\s*:\s*"([^"]+)"/.exec(buffer.toString("utf8", 0, bytesRead));
+		return match?.[1];
+	} finally {
+		closeSync(descriptor);
+	}
 }
 function sameStatIdentity(
 	left: { readonly size: number; readonly mtimeMs: number } | undefined,

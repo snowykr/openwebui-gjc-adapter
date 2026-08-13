@@ -469,6 +469,16 @@ export class SessionAuthorityJournal {
 		}
 		this.#forceCompaction = true;
 	}
+	/** Shallow rollback snapshot: every mutation stores NEW record/provisional
+	 * objects (copy-on-write), so retaining the current values by reference is
+	 * sufficient to restore the pre-mutation state on failure without
+	 * deep-copying the whole authority document on every mutation. */
+	snapshotReferences(): {
+		readonly records: ReadonlyMap<string, SessionAuthorityRecord>;
+		readonly provisional: ReadonlyMap<string, ProvisionalSessionOperation>;
+	} {
+		return { records: new Map(this.records), provisional: new Map(this.provisional) };
+	}
 	takeDirtyRecords(): readonly SessionAuthorityRecord[] {
 		const records = [...this.#dirtyRecords].flatMap(chatId => {
 			const record = this.records.get(chatId);

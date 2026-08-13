@@ -585,6 +585,37 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				.sort(),
 		).toEqual(["chat-1"]);
 	});
+	test("reloads a live authority when the base generation changes behind its back", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-live-generation-")), "mappings.json");
+		const authority = new FileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+		expect(existsSync(`${filePath}.wal`)).toBe(true);
+
+		// Swap the base behind the running instance's back with a same-size,
+		// timestamp-preserved document carrying a different generation.
+		const original = readFileSync(filePath, "utf8");
+		const replaced = JSON.parse(original) as Record<string, unknown> & {
+			mappings: { readonly chatId: string }[];
+		};
+		replaced.mappings = replaced.mappings.slice(0, 1);
+		replaced.generation = "live-replacement-generation";
+		const bytes = Buffer.from(`${JSON.stringify(replaced).padEnd(original.length - 1)}\n`, "utf8");
+		expect(bytes.length).toBe(original.length);
+		const mtimeMs = statSync(filePath).mtimeMs;
+		writeFileSync(filePath, bytes);
+		utimesSync(filePath, mtimeMs / 1000, mtimeMs / 1000);
+
+		// The next mutation must detect the generation change, reload, and append
+		// under the replacement generation so the acknowledged mutation survives.
+		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-3", operationId: "user-3" });
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-3"]);
+	});
 	test("a fresh authority sees a WAL-append mutation before any compaction", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-replay-")), "mappings.json");
 		const authority = new FileSessionAuthority(filePath);

@@ -1832,6 +1832,22 @@ describe("session authority pre-store migration", () => {
 			expect(readFileSync(result.quarantinePath!)).toEqual(original);
 		});
 	});
+	test("accepts a scoped v2 document carrying the WAL base generation", () => {
+		withRoot((root, sourcePath) => {
+			const document = scopedV2Document();
+			document.generation = "base-generation-uuid";
+			writeFileSync(sourcePath, `${JSON.stringify(document)}\n`);
+
+			const result = preflightSessionAuthorityMigration({
+				sourcePath,
+				stateRoot: root,
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+
+			expect(result.status).toBe("not_needed");
+		});
+	});
 	test("preserves source evidence when the checkpoint path is unreadable", () => {
 		withRoot((root, sourcePath) => {
 			const sourceBytes = Buffer.from(JSON.stringify(legacyDocument()));

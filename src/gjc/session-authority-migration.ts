@@ -1806,7 +1806,11 @@ function parseLegacyDocument(value: unknown): LegacyDocument | undefined {
 			Array.isArray(value.mappings) &&
 			value.mappings.every(item => !hasScopeMetadata(item)));
 	if (!legacyShape) return undefined;
-	if (Object.keys(value).some(key => !["kind", "version", "mappings", "provisionalOperations"].includes(key)))
+	if (
+		Object.keys(value).some(
+			key => !["kind", "version", "generation", "mappings", "provisionalOperations"].includes(key),
+		)
+	)
 		return undefined;
 	if (!Array.isArray(value.mappings)) return undefined;
 	if (value.provisionalOperations !== undefined && !Array.isArray(value.provisionalOperations)) return undefined;
@@ -1828,7 +1832,9 @@ function isAuthorityDocument(value: unknown): value is {
 	return (
 		value.kind === "openwebui-gjc-session-authority" &&
 		value.version === SESSION_AUTHORITY_VERSION &&
-		Object.keys(value).every(key => ["kind", "version", "mappings", "provisionalOperations"].includes(key)) &&
+		Object.keys(value).every(key =>
+			["kind", "version", "generation", "mappings", "provisionalOperations"].includes(key),
+		) &&
 		Array.isArray(value.mappings) &&
 		value.mappings.every(isV2Record) &&
 		(value.provisionalOperations === undefined ||
@@ -1846,7 +1852,9 @@ function isV2AuthorityContainer(value: unknown): value is {
 		isObject(value) &&
 		value.kind === "openwebui-gjc-session-authority" &&
 		value.version === SESSION_AUTHORITY_VERSION &&
-		Object.keys(value).every(key => ["kind", "version", "mappings", "provisionalOperations"].includes(key)) &&
+		Object.keys(value).every(key =>
+			["kind", "version", "generation", "mappings", "provisionalOperations"].includes(key),
+		) &&
 		Array.isArray(value.mappings)
 	);
 }

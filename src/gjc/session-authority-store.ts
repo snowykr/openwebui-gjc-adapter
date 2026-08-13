@@ -155,6 +155,12 @@ export class SessionAuthority {
 	}[] {
 		return this.#journal.takeDirtyProvisional();
 	}
+	protected snapshotJournalForRollback(): {
+		readonly records: ReadonlyMap<string, SessionAuthorityRecord>;
+		readonly provisional: ReadonlyMap<string, ProvisionalSessionOperation>;
+	} {
+		return this.#journal.snapshotReferences();
+	}
 	protected hasDirtyJournal(): boolean {
 		return this.#journal.hasDirty;
 	}
