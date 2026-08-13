@@ -261,8 +261,18 @@ export class FileSessionAuthority extends SessionAuthority {
 		)
 			return;
 		this.load();
-		if (walStat !== undefined) this.replayWal();
-		else this.#walIdentity = undefined;
+		if (walStat !== undefined) {
+			const replayed = this.replayWal();
+			// Mirror the constructor: when the replayed WAL ends in a partial
+			// (crash-truncated) line, compact the valid prefix immediately, so the
+			// next mutation is not appended past garbage that the next boot would
+			// stop replaying at (which would silently drop the acknowledged
+			// mutation).
+			if (replayed.trailingGarbage) {
+				if (this.hasPendingOperations()) this.reconcileRestart();
+				this.persist();
+			}
+		} else this.#walIdentity = undefined;
 	}
 	/** The live verification path must also confirm the collision-resistant base
 	 * generation, not only size/mtime: a timestamp-preserving same-size external
@@ -508,11 +518,34 @@ export class FileSessionAuthority extends SessionAuthority {
 			try {
 				this.syncDirectory();
 			} catch (error) {
-				this.#walIdentity = { ...statIdentity(walPath)!, digest: this.#walHasher!.copy().digest("hex") };
+				try {
+					this.refreshWalIdentity();
+				} catch (identityError) {
+					this.#walIdentity = undefined;
+					this.#walHasher = undefined;
+					this.reloadDurableState();
+					throw new SessionAuthorityDurabilityError(this.filePath, identityError);
+				}
 				throw new SessionAuthorityDurabilityError(this.filePath, error);
 			}
 		}
-		this.#walIdentity = { ...statIdentity(walPath)!, digest: this.#walHasher!.copy().digest("hex") };
+		try {
+			this.refreshWalIdentity();
+		} catch (error) {
+			// The delta was already written and fsynced; a failure to refresh the
+			// cached identity must not escape as an ordinary append failure (mutate
+			// would then restore the pre-mutation snapshot while a restart replays
+			// the committed delta, and the caller could retry the operation).
+			this.#walIdentity = undefined;
+			this.#walHasher = undefined;
+			this.reloadDurableState();
+			throw new SessionAuthorityDurabilityError(this.filePath, error);
+		}
+	}
+	/** Refreshes the cached WAL identity (stat + content digest) after a write;
+	 * only called once the WAL content is fully known. */
+	protected refreshWalIdentity(): void {
+		this.#walIdentity = { ...statIdentity(this.walPath)!, digest: this.#walHasher!.copy().digest("hex") };
 	}
 	/** Reads an existing WAL, validates its header against the current base, and
 	 * adopts it as the live identity (stat + content digest + incremental

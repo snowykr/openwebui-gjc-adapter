@@ -750,6 +750,75 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				.sort(),
 		).toEqual(["chat-1"]);
 	});
+	test("compacts the valid WAL prefix on a live reload before appending past garbage", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-live-wal-garbage-")), "mappings.json");
+		const walPath = `${filePath}.wal`;
+		const authority = new FileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+		expect(existsSync(walPath)).toBe(true);
+
+		// Another process crashed midway through an append: a partial JSON line
+		// remains at the end of the WAL.
+		appendFileSync(
+			walPath,
+			'{"kind":"openwebui-gjc-session-authority-wal","version":1,"records":[{"chatId":"chat-pa',
+			"utf8",
+		);
+
+		// The live instance detects the change on its next mutation, compacts the
+		// valid prefix, and appends to a fresh WAL, so the acknowledged mutation
+		// survives the next boot instead of being dropped at the malformed line.
+		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-3", operationId: "user-3" });
+
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2", "chat-3"]);
+		expect(readFileSync(walPath, "utf8")).not.toContain("chat-pa");
+	});
+	class IdentityRefreshFailingFileSessionAuthority extends FailingFileSessionAuthority {
+		identityFailure: Error | undefined;
+
+		protected override refreshWalIdentity(): void {
+			if (this.identityFailure !== undefined) throw this.identityFailure;
+			super.refreshWalIdentity();
+		}
+	}
+	test("classifies a post-fsync identity refresh failure as a durability error", () => {
+		const filePath = join(
+			mkdtempSync(join(tmpdir(), "gjc-session-authority-identity-refresh-failure-")),
+			"mappings.json",
+		);
+		const authority = new IdentityRefreshFailingFileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.identityFailure = new Error("injected identity refresh failure");
+
+		let error: unknown;
+		try {
+			authority.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+		} catch (caught) {
+			error = caught;
+		}
+
+		expect(error).toBeInstanceOf(SessionAuthorityDurabilityError);
+		// The delta was fsynced before the identity refresh failed: memory and
+		// boot both retain the WAL-visible state instead of rolling back.
+		expect(
+			authority
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2"]);
+		expect(
+			new FileSessionAuthority(filePath)
+				.entries()
+				.map(record => record.chatId)
+				.sort(),
+		).toEqual(["chat-1", "chat-2"]);
+	});
 	class ReloadFailingFileSessionAuthority extends FailingFileSessionAuthority {
 		loadFailure: Error | undefined;
 		protected override walCompactionThresholdBytes = 1024;
