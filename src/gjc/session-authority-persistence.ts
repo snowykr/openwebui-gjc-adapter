@@ -348,19 +348,61 @@ export class FileSessionAuthority extends SessionAuthority {
 			readGenerationAtOffset(this.filePath, base.generationOffset, base.generationSpanLength) === base.generation
 		);
 	}
-	/** Binds the cached WAL state to a collision-resistant identity checked in
-	 * O(last-line) on the fast path: the final chained link covers the tail and
-	 * whole-file replacements (a same-size same-mtime swap), while an interior
-	 * delta change is caught by the full chain verification on the next reload
-	 * or boot, which fails closed on the broken link. */
+	/** Binds the cached WAL state to a collision-resistant identity that
+	 * authenticates the on-disk prefix: every chained link is verified from the
+	 * bytes before the append is acknowledged, so an interior delta replacement
+	 * is detected live rather than only at boot. The WAL is bounded by the
+	 * compaction threshold, so this is O(WAL) per mutation, not O(base). */
 	private walDigestMatchesDisk(): boolean {
 		const wal = this.#walIdentity;
 		if (wal === undefined) return true;
-		if (wal.version === WAL_VERSION && wal.lastLineLength !== undefined) {
-			const lastLine = walLastLine(this.walPath, wal.lastLineLength);
-			return lastLine !== undefined && lineChainHash(lastLine.prevHash, lastLine.text) === wal.digest;
+		if (wal.version === WAL_VERSION) {
+			const verified = this.verifyWalChainOnDisk();
+			return verified !== undefined && verified.digest === wal.digest;
 		}
 		return walSampleDigestFromFile(this.walPath) === wal.digest;
+	}
+	/** Streams the WAL and verifies every chained link (header + deltas) against
+	 * the on-disk bytes; returns the final chain digest, or undefined when any
+	 * link is broken, unreadable, or the tail is torn (the caller then reloads
+	 * and replayWal fails closed or compacts the valid prefix). */
+	private verifyWalChainOnDisk(): { readonly digest: string } | undefined {
+		let contents: string;
+		try {
+			contents = readFileSync(this.walPath, "utf8");
+		} catch {
+			return undefined;
+		}
+		const parts = contents.split("\n");
+		const hasTrailingNewline = parts.length > 0 && parts[parts.length - 1] === "";
+		const lines = parts.filter(line => line.length > 0);
+		if (lines.length === 0) return undefined;
+		let header: unknown;
+		try {
+			header = JSON.parse(lines[0]!);
+		} catch {
+			return undefined;
+		}
+		if (!isWalHeader(header, this.#baseIdentity) || (header as Record<string, unknown>).version !== WAL_VERSION)
+			return undefined;
+		let expectedChain = WAL_CHAIN_SEED;
+		for (let index = 0; index < lines.length; index += 1) {
+			const line = lines[index]!;
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(line);
+			} catch {
+				return undefined;
+			}
+			const record = parsed as Record<string, unknown>;
+			if (index === 0) {
+				if (!isNonEmptyString(record.prevHash) || record.prevHash !== expectedChain) return undefined;
+			} else if (!isWalDelta(parsed) || !isNonEmptyString(record.prevHash) || record.prevHash !== expectedChain) {
+				return undefined;
+			}
+			expectedChain = lineChainHash(record.prevHash, line);
+		}
+		return { digest: expectedChain };
 	}
 	protected load(): void {
 		if (!existsSync(this.filePath)) {
@@ -630,19 +672,22 @@ export class FileSessionAuthority extends SessionAuthority {
 				created = true;
 			}
 		}
-		if (
-			created &&
-			(this.#baseIdentity?.generation === undefined || this.#baseIdentity?.generationOffset === undefined)
-		) {
+		// A generation PRESENT but with no serialized offset (e.g. an escaped JSON
+		// key) cannot be verified per-mutation; upgrade it to the standard layout
+		// regardless of whether the WAL was adopted or newly created, so a replayed
+		// existing WAL cannot leave the base stuck reloading on every turn.
+		if (this.#baseIdentity?.generation !== undefined && this.#baseIdentity.generationOffset === undefined) {
+			this.persist();
+			return;
+		}
+		if (created && this.#baseIdentity?.generation === undefined) {
 			// A generation-less base (pre-upgrade v2 documents, or migration
-			// output) or a base whose generation offset cannot be matched in its
-			// raw representation (e.g. escaped JSON keys) must be rewritten with a
-			// fresh generation in the standard layout BEFORE the first WAL append:
-			// otherwise the WAL would be bound by stat only, or the per-mutation
-			// generation check would be disabled and a timestamp-preserving restore
-			// could replay stale deltas over the replacement. Persisting writes the
-			// full current state (including this mutation) with a deterministic
-			// generation offset, so the append is never made under a weak identity.
+			// output) must be rewritten with a fresh generation in the standard
+			// layout BEFORE the first WAL append: otherwise the WAL would be bound
+			// by stat only and a timestamp-preserving restore could replay stale
+			// deltas over the replacement. Persisting writes the full current state
+			// (including this mutation) with a deterministic generation offset, so
+			// the append is never made under a weak identity.
 			this.persist();
 			return;
 		}
@@ -901,46 +946,6 @@ function walSampleDigestFromFile(path: string): string | undefined {
 			hash.update(tail.subarray(0, Math.max(0, tailBytes)));
 		}
 		return hash.digest("hex");
-	} finally {
-		closeSync(descriptor);
-	}
-}
-/** Reads the final chained line of a v2 WAL (bounded to its known byte length
- * plus one terminator byte) and returns its prevHash and exact text. */
-function walLastLine(
-	path: string,
-	lastLineLength: number,
-): { readonly prevHash: string; readonly text: string } | undefined {
-	let stat: { readonly size: number };
-	try {
-		stat = statSync(path);
-	} catch {
-		return undefined;
-	}
-	if (stat.size < lastLineLength) return undefined;
-	let descriptor: number;
-	try {
-		descriptor = openSync(path, "r");
-	} catch {
-		return undefined;
-	}
-	try {
-		const buffer = Buffer.alloc(lastLineLength + 1);
-		const bytesRead = readSync(descriptor, buffer, 0, buffer.length, Math.max(0, stat.size - buffer.length));
-		if (bytesRead <= 0) return undefined;
-		const text = buffer
-			.toString("utf8", 0, bytesRead)
-			.replace(/^[\n\r]+/, "")
-			.replace(/[\n\r]+$/, "");
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(text);
-		} catch {
-			return undefined;
-		}
-		const record = parsed as Record<string, unknown>;
-		if (!isNonEmptyString(record.prevHash)) return undefined;
-		return { prevHash: record.prevHash, text };
 	} finally {
 		closeSync(descriptor);
 	}
