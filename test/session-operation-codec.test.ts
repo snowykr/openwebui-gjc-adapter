@@ -51,4 +51,29 @@ describe("session operation codec", () => {
 		});
 		expect(JSON.stringify(result)).not.toContain("tool_start");
 	});
+
+	test("operationResult binds a compact gate identity without the gate payload", () => {
+		const result = operationResult(
+			"control",
+			{
+				chatId: "chat-1",
+				projectId: "project-1",
+				sessionId: "session-1",
+				rawFrameCursor: 1,
+				eventCursor: 2,
+				operationId: "op-1",
+				assistantText: "done",
+				events: [],
+			},
+			{ gateId: "gate-1", commandId: "command-1", turnId: "turn-1", sessionId: "session-1" },
+		);
+
+		expect(result.gate).toEqual({
+			gateId: "gate-1",
+			commandId: "command-1",
+			turnId: "turn-1",
+			sessionId: "session-1",
+		});
+		expect(JSON.stringify(result)).not.toContain("schemaHash");
+	});
 });

@@ -104,9 +104,17 @@ export function scopedSessionMappingStore(
 			detail: string,
 			mapping: SessionMapping,
 			kind: Parameters<SessionMappingStore["completeOperationWithMapping"]>[4],
+			gate?: Parameters<SessionMappingStore["completeOperationWithMapping"]>[5],
 		) => {
 			requireChat(actual);
-			return mappings.completeOperationWithMappingScoped(scope, operationId, detail, withPrincipal(mapping), kind);
+			return mappings.completeOperationWithMappingScoped(
+				scope,
+				operationId,
+				detail,
+				withPrincipal(mapping),
+				kind,
+				gate,
+			);
 		},
 		provisionalOperation: (actual: string, ingressId: string) => {
 			requireChat(actual);

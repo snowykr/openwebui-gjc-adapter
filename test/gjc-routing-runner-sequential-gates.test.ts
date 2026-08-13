@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FileBackedSessionMappingStore, SessionMappingStore } from "../src/gjc/session-router";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
+import { workflowGateOperationHash } from "../src/live/workflow-gate-turn-utils";
+import { replayCompletedWorkflowGateReply } from "../src/live/workflow-gate-turns";
 import { InMemoryOutboxStore } from "../src/state/outbox";
 import { deepInterviewWorkflowGateEvent, FakeGjcTurnRunner, project } from "./gjc-routing-runner-fixtures";
 
@@ -113,28 +115,46 @@ describe("createGjcRoutingLiveGatewayRunner sequential workflow gates", () => {
 		expect(replayed.content).toBe("workflow gate accepted");
 		expect(turnRunner.gateResponses).toHaveLength(1);
 	});
-	test("accepts a replayed gate op superseded by a regular turn without re-enqueueing rows", async () => {
-		const mappings = new SessionMappingStore();
-		const outbox = new InMemoryOutboxStore();
-		mappings.set({
-			...pendingGateSeed(),
-		});
-		const turnRunner = new FakeGjcTurnRunner();
-		turnRunner.gateResponseEvents = [firstTurnMessageUpdate];
-		const gateway = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings, outbox });
-		await gateway.run(gateReplyInput("user-2"));
+	test("verifies a replayed gate op superseded by a regular turn through the persisted compact binding", async () => {
+		const root = mkdtempSync(join(tmpdir(), "gjc-sequential-gate-superseded-regular-"));
+		try {
+			const filePath = join(root, "mappings.json");
+			const outbox = new InMemoryOutboxStore();
+			const mappings = new FileBackedSessionMappingStore(filePath);
+			mappings.set({
+				...pendingGateSeed(),
+			});
+			const turnRunner = new FakeGjcTurnRunner();
+			turnRunner.gateResponseEvents = [firstTurnMessageUpdate];
+			const gateway = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings, outbox });
+			await gateway.run(gateReplyInput("user-2"));
 
-		await gateway.run({ ...gateReplyInput("user-3"), prompt: "regular follow-up" });
-		expect(mappings.get("chat-1")?.operationId).toBe("user-3");
-		const rowsAfterRegularTurn = outbox.listPending().length;
+			await gateway.run({ ...gateReplyInput("user-3"), prompt: "regular follow-up" });
+			expect(mappings.get("chat-1")?.operationId).toBe("user-3");
+			const rowsAfterRegularTurn = outbox.listPending().length;
 
-		const replayed = await gateway.run(gateReplyInput("user-2"));
+			// A restart reloads the persisted authority, including the compact
+			// gate binding on the completed operation's result.
+			const restarted = createGjcRoutingLiveGatewayRunner({
+				turnRunner: new FakeGjcTurnRunner(),
+				mappings: new FileBackedSessionMappingStore(filePath),
+				outbox,
+			});
+			const replayed = await restarted.run(gateReplyInput("user-2"));
+			expect(replayed.content).toBe("workflow gate accepted");
+			expect(outbox.listPending().length).toBe(rowsAfterRegularTurn);
 
-		expect(replayed.content).toBe("workflow gate accepted");
-		expect(outbox.listPending().length).toBe(rowsAfterRegularTurn);
-		expect(turnRunner.continues).toHaveLength(1);
+			// A conflicting payload for the superseded gate op is rejected: the
+			// recomputed request hash no longer matches the durable detail.
+			await expect(restarted.run({ ...gateReplyInput("user-2"), prompt: "2" })).rejects.toThrow(
+				"completed without a valid immutable result binding",
+			);
+			expect(turnRunner.continues).toHaveLength(1);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
-	test("accepts a replayed gate op superseded by a later gate via the durable detail binding", async () => {
+	test("verifies a replayed gate op superseded by a later gate through the compact binding", async () => {
 		const mappings = new SessionMappingStore();
 		mappings.set({
 			...pendingGateSeed(),
@@ -149,15 +169,54 @@ describe("createGjcRoutingLiveGatewayRunner sequential workflow gates", () => {
 		await second.run(gateReplyInput("user-3"));
 		expect(mappings.get("chat-1")?.operationId).toBe("user-3");
 		// Only the answered gate of the CURRENT operation is retained; the
-		// earlier answered gate is gone, so the replay is accepted through the
-		// durable detail binding for both identical and conflicting payloads.
+		// earlier answered gate is gone, but the compact binding on the completed
+		// operation's result still verifies identical replays...
 		const replayed = await second.run(gateReplyInput("user-2"));
 		expect(replayed.content).toContain("Choose deployment target");
 
-		const conflicting = await second.run({ ...gateReplyInput("user-2"), prompt: "2" });
-		expect(conflicting.content).toContain("Choose deployment target");
+		// ...and rejects conflicting payloads instead of silently returning the
+		// old success.
+		await expect(second.run({ ...gateReplyInput("user-2"), prompt: "2" })).rejects.toThrow(
+			"completed without a valid immutable result binding",
+		);
 		expect(firstRunner.gateResponses).toHaveLength(1);
 		expect(secondRunner.gateResponses).toHaveLength(1);
+	});
+	test("verifies a replayed legacy gate op through its retained result events", () => {
+		const mappings = new SessionMappingStore();
+		const turnRunner = new FakeGjcTurnRunner();
+		mappings.set({
+			...pendingGateSeed(),
+		});
+		// A legacy completed gate op: the journal result still carries the full
+		// event stream (no compact binding) and the record has moved on.
+		const hash = workflowGateOperationHash(gateReplyInput("user-2"), {
+			gateId: "gate-deep-1",
+			commandId: "command-1",
+			turnId: "turn-1",
+			sessionId: "session-1",
+		});
+		mappings.beginOperation("chat-1", { id: "user-2", kind: "gate", ingressId: "user-2", detail: hash });
+		mappings.transitionOperation("chat-1", "user-2", "complete", hash, {
+			kind: "control",
+			assistantText: "legacy gate accepted",
+			events: [deepInterviewWorkflowGateEvent],
+			mapping: {
+				chatId: "chat-1",
+				projectId: project.id,
+				sessionId: "session-1",
+				rawFrameCursor: 7,
+				eventCursor: 3,
+				operationId: "user-2",
+			},
+		});
+		mappings.set({ ...pendingGateSeed(), operationId: "user-3", events: [{ type: "assistant", text: "regular" }] });
+
+		const replayed = replayCompletedWorkflowGateReply({ turnRunner, mappings }, gateReplyInput("user-2"));
+		expect(replayed?.content).toBe("legacy gate accepted");
+		expect(() =>
+			replayCompletedWorkflowGateReply({ turnRunner, mappings }, { ...gateReplyInput("user-2"), prompt: "2" }),
+		).toThrow("completed without a valid immutable result binding");
 	});
 });
 

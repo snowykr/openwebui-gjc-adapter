@@ -6,6 +6,7 @@ import type {
 	SessionAuthorityInput,
 	SessionAuthorityRecord,
 	SessionOperation,
+	SessionOperationGateBinding,
 	SessionOperationResult,
 } from "./session-authority-types";
 import { isRecord } from "./session-authority-validation-primitives";
@@ -79,6 +80,7 @@ export function legacyCloseIngressId(operationId: string, mapping: SessionOperat
 export function operationResult(
 	kind: "turn" | "control" | "close",
 	mapping: SessionOperationMapping,
+	gate?: SessionOperationGateBinding,
 ): SessionOperationResult {
 	return {
 		kind,
@@ -97,6 +99,7 @@ export function operationResult(
 			...(mapping.attachment === undefined ? {} : { attachment: copyAttachment(mapping.attachment) }),
 		},
 		...(kind === "close" ? { correlation: { closeStatus: "closed" } } : {}),
+		...(gate === undefined ? {} : { gate }),
 	};
 }
 

@@ -13,6 +13,7 @@ import type {
 	SessionAuthorityRecord,
 	SessionAuthorityTargetIdentity,
 	SessionAuthorityTombstone,
+	SessionOperationGateBinding,
 } from "./session-authority-types";
 import { copySessionMapping } from "./session-mapping-copy";
 import type { SessionMapping, SessionMappingScope } from "./session-mapping-store";
@@ -319,9 +320,10 @@ export class SessionMappingStore {
 		detail: string,
 		mapping: SessionMapping,
 		kind: "turn" | "control" | "close",
+		gate?: SessionOperationGateBinding,
 	): SessionMapping {
 		assertLegacyKeyAvailable(this.authority, chatId);
-		const result = operationResult(kind, { ...mapping, operationId });
+		const result = operationResult(kind, { ...mapping, operationId }, gate);
 		const resultWithCloseGeneration =
 			kind === "close"
 				? {
@@ -345,11 +347,12 @@ export class SessionMappingStore {
 		detail: string,
 		mapping: SessionMapping,
 		kind: "turn" | "control" | "close",
+		gate?: SessionOperationGateBinding,
 	): SessionMapping {
 		const canonicalScope = canonicalScopeFor(scope);
 		assertScopedKeyAvailable(this.authority, canonicalScope);
 		const authorityMapping = authorityInputForScope(canonicalScope, mapping);
-		const result = operationResult(kind, { ...authorityMapping, operationId });
+		const result = operationResult(kind, { ...authorityMapping, operationId }, gate);
 		const resultWithCloseGeneration =
 			kind === "close"
 				? {
