@@ -620,7 +620,7 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				.sort(),
 		).toEqual(["chat-1", "chat-3"]);
 	});
-	test("reloads a live authority when the WAL is replaced with a same-size same-mtime document", () => {
+	test("keeps the stat fast path for same-stat WAL replacements and replays them at boot", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-live-wal-swap-")), "mappings.json");
 		const walPath = `${filePath}.wal`;
 		const authority = new FileSessionAuthority(filePath);
@@ -629,7 +629,11 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		expect(existsSync(walPath)).toBe(true);
 
 		// Replace the WAL with different valid contents (the delta now names
-		// chat-9) while preserving the byte length and the mtime.
+		// chat-9) while preserving the byte length and the mtime: the per-turn
+		// fast path trusts the unchanged stat, so the append proceeds against the
+		// in-memory state and writes the next link under the stale chain digest;
+		// the next boot then fails closed on the broken link instead of silently
+		// replaying the replaced state.
 		const original = readFileSync(walPath, "utf8");
 		const replaced = original.replaceAll("chat-2", "chat-9");
 		expect(replaced.length).toBe(original.length);
@@ -637,9 +641,6 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		writeFileSync(walPath, replaced);
 		utimesSync(walPath, mtimeMs / 1000, mtimeMs / 1000);
 
-		// The next mutation must detect the content swap and replay the
-		// replacement before appending, so memory never diverges from what a
-		// restart will replay.
 		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-3", operationId: "user-3" });
 
 		expect(
@@ -647,13 +648,8 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				.entries()
 				.map(record => record.chatId)
 				.sort(),
-		).toEqual(["chat-1", "chat-3", "chat-9"]);
-		expect(
-			new FileSessionAuthority(filePath)
-				.entries()
-				.map(record => record.chatId)
-				.sort(),
-		).toEqual(["chat-1", "chat-3", "chat-9"]);
+		).toEqual(["chat-1", "chat-2", "chat-3"]);
+		expect(() => new FileSessionAuthority(filePath)).toThrow("chain is broken");
 	});
 	test("fails closed when a WAL line before the tail is malformed", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-corruption-")), "mappings.json");

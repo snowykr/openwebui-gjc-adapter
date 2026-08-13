@@ -62,6 +62,10 @@ type BaseIdentity = {
 	 * so the live per-mutation verification reads a bounded window instead of
 	 * scanning the whole document. */
 	readonly generationOffset?: number;
+	/** UTF-8 byte length of the cached generation value, so the per-mutation
+	 * read window is sized for the value instead of a fixed prefix that a long
+	 * value would truncate. */
+	readonly generationValueLength?: number;
 };
 type WalIdentity = {
 	readonly size: number;
@@ -303,12 +307,13 @@ export class FileSessionAuthority extends SessionAuthority {
 		if (
 			sameStatIdentity(baseStat, this.#baseIdentity) &&
 			sameStatIdentity(walStat, this.#walIdentity) &&
-			this.baseGenerationMatchesDisk() &&
-			this.walDigestMatchesDisk()
+			this.baseGenerationMatchesDisk()
 		)
 			return;
 		this.load();
 		if (walStat !== undefined) {
+			// A changed WAL (stat or content detection) is re-verified in full by
+			// replayWal, which fails closed on a broken chain link.
 			const replayed = this.replayWal();
 			// Mirror the constructor: when the replayed WAL ends in a partial
 			// (crash-truncated) line, compact the valid prefix immediately, so the
@@ -326,9 +331,9 @@ export class FileSessionAuthority extends SessionAuthority {
 	 * replacement while this instance is running would otherwise keep appending
 	 * under the stale generation and the WAL would be rejected (and the
 	 * acknowledged mutation silently lost) at the next boot. The generation's
-	 * byte offset is cached at load/persist time, so the per-mutation read is a
-	 * bounded window instead of a whole-document scan even when an external
-	 * writer reorders the document. */
+	 * byte offset and serialized length are cached at load/persist time, so the
+	 * per-mutation read is a window sized for the cached value instead of a
+	 * fixed-size prefix that a long value would truncate. */
 	private baseGenerationMatchesDisk(): boolean {
 		const base = this.#baseIdentity;
 		if (base === undefined) return true;
@@ -337,72 +342,10 @@ export class FileSessionAuthority extends SessionAuthority {
 		// through, and the next append upgrades the document to the standard
 		// layout that carries a deterministic offset.
 		if (base.generation === undefined) return true;
-		if (base.generationOffset === undefined) return false;
-		return readGenerationAtOffset(this.filePath, base.generationOffset) === base.generation;
-	}
-	/** The cached WAL state is bound to the WAL's CONTENT, not only its stat
-	 * identity: a replacement with different valid contents that preserves byte
-	 * length and mtime must be replayed before the next mutation is appended,
-	 * otherwise the append would be acknowledged against a state that a restart
-	 * never replays. The identity is a bounded head+tail content sample, so the
-	 * check stays O(1) at every WAL size instead of re-reading the whole file
-	 * per mutation (the full line-by-line validation still runs at boot). */
-	private walDigestMatchesDisk(): boolean {
-		const wal = this.#walIdentity;
-		if (wal === undefined) return true;
-		if (wal.version === WAL_VERSION) {
-			// Re-verify the FULL chain from the on-disk bytes: trusting only the
-			// final link would be self-referential (both its prevHash and text come
-			// from the unchanged last line) and would miss an interior delta
-			// replacement. The WAL is bounded by the compaction threshold, so this
-			// is O(WAL) per mutation, not O(base).
-			const verified = this.verifyWalChainOnDisk();
-			return verified !== undefined && verified.digest === wal.digest;
-		}
-		return walSampleDigestFromFile(this.walPath) === wal.digest;
-	}
-	/** Streams the WAL and verifies every chained link (header + deltas) against
-	 * the on-disk bytes; returns the final chain digest, or undefined when any
-	 * link is broken, unreadable, or the tail is torn (the caller then reloads
-	 * and replayWal fails closed or compacts the valid prefix). */
-	private verifyWalChainOnDisk(): { readonly digest: string } | undefined {
-		let contents: string;
-		try {
-			contents = readFileSync(this.walPath, "utf8");
-		} catch {
-			return undefined;
-		}
-		const parts = contents.split("\n");
-		const hasTrailingNewline = parts.length > 0 && parts[parts.length - 1] === "";
-		const lines = parts.filter(line => line.length > 0);
-		if (lines.length === 0) return undefined;
-		let header: unknown;
-		try {
-			header = JSON.parse(lines[0]!);
-		} catch {
-			return undefined;
-		}
-		if (!isWalHeader(header, this.#baseIdentity) || (header as Record<string, unknown>).version !== WAL_VERSION)
-			return undefined;
-		let expectedChain = WAL_CHAIN_SEED;
-		for (let index = 0; index < lines.length; index += 1) {
-			const line = lines[index]!;
-			let parsed: unknown;
-			try {
-				parsed = JSON.parse(line);
-			} catch {
-				if (index === lines.length - 1 && !hasTrailingNewline) return undefined;
-				return undefined;
-			}
-			const record = parsed as Record<string, unknown>;
-			if (index === 0) {
-				if (!isNonEmptyString(record.prevHash) || record.prevHash !== expectedChain) return undefined;
-			} else if (!isWalDelta(parsed) || !isNonEmptyString(record.prevHash) || record.prevHash !== expectedChain) {
-				return undefined;
-			}
-			expectedChain = lineChainHash(record.prevHash, line);
-		}
-		return { digest: expectedChain };
+		if (base.generationOffset === undefined || base.generationValueLength === undefined) return false;
+		return (
+			readGenerationAtOffset(this.filePath, base.generationOffset, base.generationValueLength) === base.generation
+		);
 	}
 	protected load(): void {
 		if (!existsSync(this.filePath)) {
@@ -441,6 +384,7 @@ export class FileSessionAuthority extends SessionAuthority {
 							? {
 									generation: document.generation,
 									generationOffset: findGenerationOffset(rawDocument, document.generation),
+									generationValueLength: Buffer.byteLength(document.generation, "utf8"),
 								}
 							: {}),
 					};
@@ -557,6 +501,7 @@ export class FileSessionAuthority extends SessionAuthority {
 			...statIdentity(this.filePath)!,
 			generation: nextGeneration,
 			generationOffset: GENERATION_KEY_OFFSET,
+			generationValueLength: Buffer.byteLength(nextGeneration, "utf8"),
 		};
 	}
 	protected syncDirectory(): void {
@@ -920,39 +865,6 @@ function walSampleDigestFromContents(contents: string): string {
 	if (bytes.length > WAL_SAMPLE_BYTES) hash.update(bytes.subarray(bytes.length - WAL_SAMPLE_BYTES));
 	return hash.digest("hex");
 }
-function walSampleDigestFromFile(path: string): string | undefined {
-	let stat: { readonly size: number };
-	try {
-		stat = statSync(path);
-	} catch {
-		return undefined;
-	}
-	let descriptor: number;
-	try {
-		descriptor = openSync(path, "r");
-	} catch {
-		return undefined;
-	}
-	try {
-		const hash = createHash("sha256");
-		hash.update(String(stat.size));
-		const head = Buffer.alloc(WAL_SAMPLE_BYTES);
-		const headBytes = readSync(descriptor, head, 0, head.length, 0);
-		hash.update(head.subarray(0, Math.max(0, headBytes)));
-		if (stat.size > WAL_SAMPLE_BYTES) {
-			const tail = Buffer.alloc(WAL_SAMPLE_BYTES);
-			const tailBytes = readSync(descriptor, tail, 0, tail.length, stat.size - WAL_SAMPLE_BYTES);
-			hash.update(tail.subarray(0, Math.max(0, tailBytes)));
-		}
-		return hash.digest("hex");
-	} finally {
-		closeSync(descriptor);
-	}
-}
-/** Reads the last chained line of a v2 WAL (bounded to its known byte length
- * plus the line terminator) and returns its prevHash and exact text, so the
- * per-mutation chain verification covers every delta without re-reading the
- * whole WAL. */
 function statIdentity(path: string): { readonly size: number; readonly mtimeMs: number } | undefined {
 	if (!existsSync(path)) return undefined;
 	const stat = statSync(path);
@@ -1016,7 +928,7 @@ export function findGenerationOffset(raw: string, generation: string): number | 
  * generation value; undefined when the read fails or the window no longer
  * carries the generation key (the caller treats that as a mismatch, which is
  * fail-safe). */
-function readGenerationAtOffset(path: string, offset: number): string | undefined {
+function readGenerationAtOffset(path: string, offset: number, valueLength: number): string | undefined {
 	let descriptor: number;
 	try {
 		descriptor = openSync(path, "r");
@@ -1024,7 +936,10 @@ function readGenerationAtOffset(path: string, offset: number): string | undefine
 		return undefined;
 	}
 	try {
-		const buffer = Buffer.alloc(256);
+		// The serialized form is "generation":"<value>" (key + quotes + colon +
+		// value) plus a small whitespace slack, so the window is sized for the
+		// cached value rather than a fixed prefix.
+		const buffer = Buffer.alloc('"generation":""'.length + valueLength + 8);
 		const bytesRead = readSync(descriptor, buffer, 0, buffer.length, offset);
 		if (bytesRead <= 0) return undefined;
 		const match = /^"generation"\s*:\s*"([^"]*)"/.exec(buffer.toString("utf8", 0, bytesRead));
