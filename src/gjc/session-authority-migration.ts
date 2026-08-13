@@ -222,6 +222,11 @@ function candidateMigrationAlreadyCommitted(
 			!checkpointMatchesRequest(checkpoint, sourcePath, adminPrincipalId, paths)
 		)
 			return false;
+		// A source WAL may carry acknowledged mutations that exist only beside
+		// the retained old path; the candidate is not "already committed" until
+		// those are merged into the destination (runMigration compacts the
+		// validated WAL into the base before converting).
+		if (existsSync(`${sourcePath}.wal`)) return false;
 		const sourceBytes = readFileIfPresent(sourcePath);
 		const recoveryBytes = readFileIfPresent(checkpoint.sourceRecoveryPath);
 		const destinationBytes = readFileIfPresent(destinationPath);

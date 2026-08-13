@@ -1902,6 +1902,67 @@ describe("session authority pre-store migration", () => {
 			expect(new FileSessionAuthority(destinationPath).entries()).toHaveLength(2);
 		});
 	});
+	test("merges a candidate's WAL-only mutations after a committed migration", () => {
+		withRoot((root, sourcePath) => {
+			const destinationPath = join(root, "relocated", "authority.json");
+			const source = new FileSessionAuthority(sourcePath);
+			source.set({
+				chatId: "chat-1",
+				projectId: "project-1",
+				sessionId: "session-1",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-1",
+			});
+			source.set({
+				chatId: "chat-2",
+				projectId: "project-1",
+				sessionId: "session-2",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-2",
+			});
+			const first = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [sourcePath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+			expect(first.status).toBe("committed");
+			// The first migration compacted the source WAL into the base.
+			expect(existsSync(`${sourcePath}.wal`)).toBe(false);
+			expect(new FileSessionAuthority(destinationPath).entries()).toHaveLength(2);
+
+			// The retained old path later acknowledges a mutation that exists only
+			// in its WAL.
+			source.set({
+				chatId: "chat-3",
+				projectId: "project-1",
+				sessionId: "session-3",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-3",
+			});
+			expect(existsSync(`${sourcePath}.wal`)).toBe(true);
+
+			// The committed-candidate shortcut must not skip: the WAL-only mutation
+			// is compacted into the source base (never silently lost), and the
+			// destination divergence is surfaced loudly.
+			const second = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [sourcePath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+			expect(second.status).toBe("degraded");
+			expect(second.reason).toContain("destination does not match");
+			expect(readFileSync(sourcePath, "utf8")).toContain("chat-3");
+			expect(existsSync(`${sourcePath}.wal`)).toBe(false);
+			expect(new FileSessionAuthority(destinationPath).entries()).toHaveLength(2);
+		});
+	});
 	test("preserves source evidence when the checkpoint path is unreadable", () => {
 		withRoot((root, sourcePath) => {
 			const sourceBytes = Buffer.from(JSON.stringify(legacyDocument()));
