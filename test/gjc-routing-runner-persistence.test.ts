@@ -645,6 +645,63 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		).toThrow("chain is broken");
 		expect(() => new FileSessionAuthority(filePath)).toThrow("chain is broken");
 	});
+	test("preserves events for an ambiguous legacy gate chain during compaction", () => {
+		class SmallThresholdCompactingAuthority extends FileSessionAuthority {
+			protected override walCompactionThresholdBytes = 1024;
+		}
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-legacy-gate-chain-")), "mappings.json");
+		const authority = new SmallThresholdCompactingAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		// A legacy completed gate operation from a SEQUENTIAL chain: its events
+		// begin with a gate accepted by an EARLIER operation, followed by the gate
+		// this operation answered. The answered gate is ambiguous, so the events
+		// must be preserved (not stripped and bound to the wrong gate).
+		const legacyChainResult = {
+			kind: "control" as const,
+			assistantText: "gate answered",
+			events: [
+				{
+					type: "workflow_gate",
+					id: "gate-earlier",
+					payload: {
+						gateId: "gate-earlier",
+						commandId: "c-e",
+						turnId: "t-e",
+						sessionId: "s-e",
+						status: "accepted",
+					},
+				},
+				{
+					type: "workflow_gate",
+					id: "gate-answered",
+					payload: { gateId: "gate-answered", commandId: "c-a", turnId: "t-a", sessionId: "s-a" },
+				},
+			],
+			mapping: {
+				chatId: "chat-1",
+				projectId: project.id,
+				sessionId: "session-1",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-gate",
+			},
+		};
+		authority.beginOperation("chat-1", { id: "user-gate", kind: "gate", detail: "gate-hash" });
+		authority.transitionOperation("chat-1", "user-gate", "complete", "gate-hash", legacyChainResult);
+		authority.set({
+			...mappingInput(mediumSelection),
+			chatId: "chat-1",
+			operationId: "user-2",
+			assistantText: `${padding}turn-2`,
+		});
+
+		const persisted = readFileSync(filePath, "utf8");
+		// The ambiguous chain kept its events (the answered gate stays verifiable
+		// by the legacy replay path) and no binding was synthesized.
+		expect(persisted).toContain('"type":"workflow_gate"');
+		expect(persisted).toContain('"gateId":"gate-answered"');
+		expect(persisted).toContain('"gateId":"gate-earlier"');
+	});
 	test("preserves legacy gate evidence as a compact binding during compaction", () => {
 		class SmallThresholdCompactingAuthority extends FileSessionAuthority {
 			protected override walCompactionThresholdBytes = 1024;

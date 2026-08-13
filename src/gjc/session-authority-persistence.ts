@@ -1288,27 +1288,32 @@ function normalizeOperationResult(operation: SessionOperation): SessionOperation
 }
 function normalizeResult(result: SessionOperationResult): SessionOperationResult {
 	if (result.events === undefined) return result;
+	const gateEvents = result.events.filter(event => event.type === "workflow_gate");
 	// Legacy workflow-gate results (written before the compact gate binding
 	// existed) may rely on their retained events as the only evidence
 	// authenticating the answered gate once the record mapping has advanced.
-	// Synthesize a compact gate binding from the answered gate event before
-	// stripping the events, so a superseded replay can still recompute the
-	// request hash instead of throwing.
-	if (result.gate === undefined && result.events.some(event => event.type === "workflow_gate")) {
-		const gateEvent = result.events.find(event => event.type === "workflow_gate");
-		const gate = gateEvent === undefined ? null : pendingWorkflowGateFromEvent(gateEvent);
-		if (gate !== null) {
-			const { events: _events, ...withoutEvents } = result;
-			return {
-				...withoutEvents,
-				gate: {
-					gateId: gate.gateId,
-					...(gate.commandId === undefined || gate.turnId === undefined || gate.sessionId === undefined
-						? {}
-						: { commandId: gate.commandId, turnId: gate.turnId, sessionId: gate.sessionId }),
-				},
-			};
+	// Synthesize a compact gate binding ONLY when the answered gate is
+	// unambiguous (a single workflow-gate event): in a sequential chain the
+	// events can begin with gates accepted by EARLIER operations, and taking
+	// the first would bind the wrong gate. When ambiguous, preserve the events
+	// so the legacy replay path can still verify against them.
+	if (result.gate === undefined && gateEvents.length > 0) {
+		if (gateEvents.length === 1) {
+			const gate = pendingWorkflowGateFromEvent(gateEvents[0]!);
+			if (gate !== null) {
+				const { events: _events, ...withoutEvents } = result;
+				return {
+					...withoutEvents,
+					gate: {
+						gateId: gate.gateId,
+						...(gate.commandId === undefined || gate.turnId === undefined || gate.sessionId === undefined
+							? {}
+							: { commandId: gate.commandId, turnId: gate.turnId, sessionId: gate.sessionId }),
+					},
+				};
+			}
 		}
+		return result;
 	}
 	const { events: _events, ...withoutEvents } = result;
 	return withoutEvents;
