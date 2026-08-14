@@ -182,8 +182,22 @@ async function assertNoSymlinkComponents(root: string, filePath: string): Promis
 	for (let index = 0; index < segments.length; index += 1) {
 		current = `${current}${sep}${segments[index]}`;
 		const stats = await lstat(current);
-		if (stats.isSymbolicLink())
-			throw corruptFile(filePath, `GJC session candidate path contains a symlink: ${current}`);
+		if (stats.isSymbolicLink()) {
+			// Mirror the ELOOP errno a symlinked path would produce when the
+			// descriptor is reopened, so callers (coldResume) keep reporting the
+			// same failure signature for a path swapped after being opened.
+			const errno = Object.assign(new Error(`ELOOP: too many levels of symbolic links, lstat '${current}'`), {
+				code: "ELOOP",
+				errno: -62,
+				syscall: "lstat",
+				path: current,
+			});
+			throw new GjcSessionLoadError(
+				filePath,
+				[{ code: "corrupt_session_file", message: errno.message, filePath }],
+				errno,
+			);
+		}
 		if (index < segments.length - 1 && !stats.isDirectory())
 			throw corruptFile(filePath, `GJC session candidate path contains a non-directory entry: ${current}`);
 	}
