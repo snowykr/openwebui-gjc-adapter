@@ -553,7 +553,15 @@ function boundedEnumPrefix(values: readonly unknown[]): string {
 	const parts: string[] = [];
 	for (const value of values) {
 		const part = String(value);
-		const extra = parts.length === 0 ? part.length : part.length + 2;
+		if (parts.length === 0) {
+			// The first value may alone exceed the window; retain the portion that
+			// fits (boundedText() of the assembled message would show the prefix)
+			// instead of dropping the oversized value and changing the hash.
+			parts.push(part.length <= limit ? part : part.slice(0, limit));
+			length += Math.min(part.length, limit);
+			continue;
+		}
+		const extra = part.length + 2;
 		if (length + extra > limit) break;
 		parts.push(part);
 		length += extra;

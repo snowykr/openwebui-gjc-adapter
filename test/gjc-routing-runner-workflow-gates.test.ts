@@ -162,6 +162,36 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 		expect(description!).toContain("option-0");
 		expect(description!).not.toContain("option-9999");
 	});
+	test("keeps the oversized first enum value's prefix in the gate prompt", () => {
+		// A first enum value that alone exceeds the window must retain its
+		// prefix (boundedText of the assembled message would show it); dropping
+		// it would change the payload hash across the streaming change.
+		const oversized = "x".repeat(100);
+		const projected = projectTurnEvents(
+			[
+				{
+					type: "workflow_gate",
+					id: "gate-enum-first-1",
+					payload: {
+						gateId: "gate-enum-first-1",
+						schemaHash: "sha256:enum-first",
+						idempotencyKey: "idem-enum-first-1",
+						boundUserMessageId: null,
+						status: "pending",
+						schema: { enum: [oversized] },
+					},
+				},
+			],
+			"gjc/anthropic/claude-sonnet-4:medium",
+		);
+		const description = projected
+			.map(event => (event as { data?: { description?: string } }).data?.description)
+			.find(value => value?.includes("workflow gate pending"));
+		expect(description).toBeDefined();
+		expect(description!.length).toBeLessThanOrEqual(80);
+		expect(description!).toContain("Choose one of: " + "x".repeat(20));
+		expect(description!).not.toContain("Choose one of: " + "x".repeat(80));
+	});
 	test("preserves the authenticated principal for workflow gate publication and replay after restart", async () => {
 		const root = mkdtempSync(join(tmpdir(), "gjc-workflow-gate-projection-"));
 		const mappingFile = join(root, "mappings.json");

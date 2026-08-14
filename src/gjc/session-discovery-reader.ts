@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
 import { type FileHandle, lstat, open, realpath } from "node:fs/promises";
-import { basename, dirname, isAbsolute, relative, sep } from "node:path";
+import { dirname, isAbsolute, relative, sep } from "node:path";
 import type { SessionEntry, SessionHeader } from "@gajae-code/coding-agent";
 import { GjcSessionLoadError, type LoadedGjcSessionFile } from "./session-loader-contract";
 import { decodeSessionEntry, decodeSessionHeader } from "./session-transcript-decoder";
@@ -169,18 +169,28 @@ async function assertHeldDescriptorContained(root: string, filePath: string, han
  * device/inode identity comparison.
  */
 async function assertNoSymlinkComponents(root: string, filePath: string): Promise<void> {
-	// Resolve the parent through realpath so a platform-equivalent spelling
-	// (macOS /var -> /private/var) cannot make a legitimate in-root candidate
-	// look like it escaped; the terminal file name is appended unchanged.
-	const parent = await realpath(dirname(filePath));
-	const canonicalCandidate = `${parent}${sep}${basename(filePath)}`;
-	const fromRoot = relative(root, canonicalCandidate);
-	if (fromRoot === "" || fromRoot.startsWith("..") || isAbsolute(fromRoot))
-		throw corruptFile(filePath, "outside root");
+	// Walk the ORIGINAL path components (not a realpath-resolved parent): a
+	// component that is a symlink initially resolving inside root would be
+	// erased by realpath before the lstat walk, so the symlink-free
+	// precondition for skipping descriptor containment would not be
+	// established. Verify the canonical parent stays inside the canonical
+	// root, then lstat each ORIGINAL segment (from the root down) so a symlink
+	// swapped in before open() is rejected.
+	const parent = dirname(filePath);
+	const resolvedParent = await realpath(parent);
+	if (!isContained(root, resolvedParent)) throw corruptFile(filePath, "outside root");
+	// How many segments of the ORIGINAL path belong to the root prefix? The
+	// canonical parent may be spelled differently (macOS /var -> /private/var),
+	// so compute the root-relative depth from the canonical forms, then apply
+	// that depth to the original path's segments.
+	const fromRoot = relative(root, resolvedParent);
+	const depthUnderRoot = fromRoot === "." ? 0 : fromRoot.split(sep).filter(segment => segment.length > 0).length;
+	const pathSegments = filePath.split(sep).filter(segment => segment.length > 0);
+	const rootPrefixLength = pathSegments.length - depthUnderRoot - 1;
+	if (rootPrefixLength < 0) throw corruptFile(filePath, "outside root");
 	let current = root;
-	const segments = fromRoot.split(sep).filter(segment => segment.length > 0);
-	for (let index = 0; index < segments.length; index += 1) {
-		current = `${current}${sep}${segments[index]}`;
+	for (let index = rootPrefixLength; index < pathSegments.length; index += 1) {
+		current = `${current}${sep}${pathSegments[index]}`;
 		const stats = await lstat(current);
 		if (stats.isSymbolicLink()) {
 			// Mirror the ELOOP errno a symlinked path would produce when the
@@ -198,7 +208,7 @@ async function assertNoSymlinkComponents(root: string, filePath: string): Promis
 				errno,
 			);
 		}
-		if (index < segments.length - 1 && !stats.isDirectory())
+		if (index < pathSegments.length - 1 && !stats.isDirectory())
 			throw corruptFile(filePath, `GJC session candidate path contains a non-directory entry: ${current}`);
 	}
 }
