@@ -754,6 +754,12 @@ function mappingFromRecordShallow(record: SessionAuthorityRecord): SessionMappin
 	} = record;
 	return {
 		...mapping,
+		// The returned mapping shares the record's event objects by reference
+		// (this is the copy-free boot synthesis view), but the ARRAY itself is a
+		// fresh copy so a consumer cannot push/splice onto the durable record's
+		// event list without dirty tracking. The shared event objects must not be
+		// mutated (documented internal contract).
+		...(mapping.events === undefined ? {} : { events: [...mapping.events] }),
 		chatId: storedScope?.chatId ?? mapping.chatId,
 		...(storedScope === undefined ? {} : { principalId: storedScope.principalId }),
 	};

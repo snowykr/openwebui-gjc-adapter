@@ -26,6 +26,10 @@ export class SessionAuthority {
 	 * Read-only view of the live records; callers must not mutate the returned
 	 * records or their nested event payloads.
 	 */
+	/** @internal Boot-synthesis-only no-copy view of the journal's records.
+	 * Returns the ACTUAL record objects (shared by reference): consumers must
+	 * never mutate them or their nested payloads, or they would modify durable
+	 * state without dirty tracking. Public copy-returning access is entries(). */
 	records(): readonly SessionAuthorityRecord[] {
 		return [...this.#journal.records.values()];
 	}
