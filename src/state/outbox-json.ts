@@ -166,7 +166,12 @@ export function streamPlainObjectHead(value: Record<string, unknown>, emit: (chu
 		if (entry === undefined || typeof entry === "function" || typeof entry === "symbol") continue;
 		if (wrote) emit(",");
 		wrote = true;
-		emit(JSON.stringify(key));
+		// A property name is unbounded like any other string; emit the quoted
+		// and escaped key incrementally so a large key never materializes as an
+		// additional string.
+		emit('"');
+		streamEscapedJsonString(key, emit);
+		emit('"');
 		emit(":");
 		streamPlainJsonResolved(entry, emit);
 	}
@@ -240,17 +245,17 @@ export function hashCanonicalStream(produce: (emit: (chunk: string) => void) => 
 	const descriptor = openSync(spoolPath, "wx", 0o600);
 	let length = 0;
 	try {
-		produce(chunk => {
-			// The lineage prefix is the sum of chunk.length (UTF-16 code units,
-			// matching the previous in-memory spool) so persisted hashes stay
-			// byte-identical; the file stores the UTF-8 bytes for re-reading.
-			length += chunk.length;
-			writeSync(descriptor, Buffer.from(chunk, "utf8"));
-		});
-	} finally {
-		closeSync(descriptor);
-	}
-	try {
+		try {
+			produce(chunk => {
+				// The lineage prefix is the sum of chunk.length (UTF-16 code units,
+				// matching the previous in-memory spool) so persisted hashes stay
+				// byte-identical; the file stores the UTF-8 bytes for re-reading.
+				length += chunk.length;
+				writeSync(descriptor, Buffer.from(chunk, "utf8"));
+			});
+		} finally {
+			closeSync(descriptor);
+		}
 		const hasher = new Bun.CryptoHasher("sha256");
 		hasher.update(`${length}:`);
 		const reader = openSync(spoolPath, "r");
@@ -267,6 +272,9 @@ export function hashCanonicalStream(produce: (emit: (chunk: string) => void) => 
 		hasher.update(";");
 		return hasher.digest("hex");
 	} finally {
+		// Always remove the spool, including when the producer or a write
+		// fails (e.g. /tmp fills while hashing an oversized mapping): a partial
+		// file must not accumulate across repeated startup attempts.
 		rmSync(directory, { recursive: true, force: true });
 	}
 }
