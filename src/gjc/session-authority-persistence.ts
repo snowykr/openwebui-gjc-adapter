@@ -137,21 +137,32 @@ export class FileSessionAuthority extends SessionAuthority {
 			let trailingGarbage = false;
 			if (existsSync(this.walPath)) trailingGarbage = this.replayWal().trailingGarbage;
 			const pendingOperations = this.hasPendingOperations();
+			const needsRecovery = trailingGarbage || this.walOversized() || pendingOperations;
+			const oversizedNotNormalized =
+				originalBaseBytes > AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES && !this.#normalized;
 			let bootRewrote = false;
-			if (trailingGarbage || this.walOversized() || pendingOperations) {
+			if (needsRecovery) {
 				if (pendingOperations) super.reconcileRestart(false);
-				this.persist();
-				// A recovery persist rewrote the document; if it was oversized, that
-				// IS the boot compaction (report it from the original size).
-				bootRewrote = originalBaseBytes > AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES;
-			}
-			if (originalBaseBytes > AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES && !this.#normalized) {
-				// No persist has happened during this boot yet (the marker is still
-				// the value loaded from a legacy document): perform the
-				// reference-based compaction (normalization drops legacy result
-				// event arrays by reference, no deep copy, and the live journal is
-				// replaced with the normalized records). The persisted `normalized`
-				// marker prevents re-running this on every boot.
+				if (oversizedNotNormalized) {
+					// Recovery AND an oversized legacy base: write through the
+					// reference-based compaction (reconcileRestart(false) already
+					// updated the journal in place, and compactFromReferences
+					// normalizes from the internal reference view without the
+					// entries() deep copy of every event payload) instead of
+					// persist(), so a 1 GiB-class authority cannot exhaust boot
+					// memory during recovery.
+					this.compactFromReferences();
+					bootRewrote = true;
+				} else {
+					this.persist();
+					bootRewrote = originalBaseBytes > AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES;
+				}
+			} else if (oversizedNotNormalized) {
+				// No recovery needed but the legacy base is oversized: reference-based
+				// compaction (normalization drops legacy result event arrays by
+				// reference, no deep copy, and the live journal is replaced with the
+				// normalized records). The persisted `normalized` marker prevents
+				// re-running this on every boot.
 				this.compactFromReferences();
 				bootRewrote = true;
 			}
