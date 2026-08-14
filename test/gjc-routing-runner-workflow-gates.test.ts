@@ -16,7 +16,7 @@ import type {
 	GjcTurnResult,
 } from "../src/gjc/turn-runner";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
-import { synthesizeProjectionRows } from "../src/live/workflow-gate-projection";
+import { projectTurnEvents, synthesizeProjectionRows } from "../src/live/workflow-gate-projection";
 import { InMemoryOutboxStore } from "../src/state/outbox";
 import {
 	decisionWorkflowGateEvent,
@@ -69,6 +69,42 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 			expectedSessionId: "session-1",
 			expectedCwd: project.cwd,
 		});
+	});
+	test("bounds oversized gate fields before projecting the gate label", () => {
+		// projectPendingWorkflowGateMessage() concatenates the prompt and every
+		// option before boundedText() truncates; a retained gate with a
+		// payload-sized prompt would allocate that whole string during boot
+		// projection. The projected label must equal boundedText() applied to the
+		// full message while never materializing the full message itself.
+		const hugePrompt = "x".repeat(10_000);
+		const hugeLabel = "y".repeat(10_000);
+		const projected = projectTurnEvents(
+			[
+				{
+					type: "workflow_gate",
+					id: "gate-huge-1",
+					payload: {
+						gateId: "gate-huge-1",
+						schemaHash: "sha256:huge",
+						idempotencyKey: "idem-huge-1",
+						boundUserMessageId: null,
+						status: "pending",
+						context: { prompt: hugePrompt },
+						options: [{ label: hugeLabel, value: hugeLabel }],
+					},
+				},
+			],
+			"gjc/anthropic/claude-sonnet-4:medium",
+		);
+		const description = projected
+			.map(event => (event as { data?: { description?: string } }).data?.description)
+			.find(value => value?.includes("workflow gate pending"));
+		expect(description).toBeDefined();
+		// The projected label is boundedText() of the assembled message; the
+		// huge fields must not leak past the 80-char truncation.
+		expect(description!.length).toBeLessThanOrEqual(80);
+		expect(description!).not.toContain("x".repeat(80));
+		expect(description!).not.toContain("y".repeat(80));
 	});
 	test("preserves the authenticated principal for workflow gate publication and replay after restart", async () => {
 		const root = mkdtempSync(join(tmpdir(), "gjc-workflow-gate-projection-"));

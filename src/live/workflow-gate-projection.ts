@@ -3,11 +3,7 @@ import { normalizeModelSelection, type SessionMapping, type SessionMappingStore 
 import type { GjcTurnEvent } from "../gjc/turn-runner";
 import type { OpenWebUIMessageEvent } from "../openwebui/events";
 import { type ProjectableAgentFrame, projectAgentFrame } from "../projection/events";
-import {
-	type PendingWorkflowGate,
-	pendingWorkflowGateFromEvent,
-	projectPendingWorkflowGateMessage,
-} from "../projection/workflow-gates";
+import { type PendingWorkflowGate, pendingWorkflowGateFromEvent } from "../projection/workflow-gates";
 import {
 	type EnqueueProjectionOperationInput,
 	hashCanonicalStream,
@@ -49,7 +45,7 @@ export function buildSessionMappingPayloadHash(mapping: SessionMapping): string 
 	// are identical to buildProjectionPayloadHash of the previous object shape.
 	return hashCanonicalStream(emit => {
 		emit('{"activeLeaf":');
-		emit(mapping.activeLeaf === undefined ? "null" : JSON.stringify(mapping.activeLeaf));
+		emitQuotedOrNull(mapping.activeLeaf, emit);
 		emit(',"assistantText":');
 		if (mapping.assistantText === undefined) emit("null");
 		else {
@@ -61,7 +57,7 @@ export function buildSessionMappingPayloadHash(mapping: SessionMapping): string 
 			emit('"');
 		}
 		emit(',"chatId":');
-		emit(JSON.stringify(mapping.chatId));
+		emitQuotedOrNull(mapping.chatId, emit);
 		emit(',"eventCursor":');
 		emit(String(mapping.eventCursor));
 		emit(',"events":[');
@@ -70,7 +66,7 @@ export function buildSessionMappingPayloadHash(mapping: SessionMapping): string 
 			if (index > 0) emit(",");
 			const event = events[index]!;
 			emit('{"id":');
-			emit(event.id === undefined ? "null" : JSON.stringify(event.id));
+			emitQuotedOrNull(event.id, emit);
 			emit(',"payloadJson":');
 			if (event.payload === undefined) emit("null");
 			else {
@@ -92,7 +88,7 @@ export function buildSessionMappingPayloadHash(mapping: SessionMapping): string 
 				emit('"');
 			}
 			emit(',"type":');
-			emit(JSON.stringify(event.type));
+			emitQuotedOrNull(event.type, emit);
 			emit("}");
 		}
 		emit('],"modelSelection":');
@@ -100,15 +96,15 @@ export function buildSessionMappingPayloadHash(mapping: SessionMapping): string 
 		if (modelSelection === null) emit("null");
 		else streamCanonicalJson(modelSelection, emit);
 		emit(',"operationId":');
-		emit(JSON.stringify(mapping.operationId));
+		emitQuotedOrNull(mapping.operationId, emit);
 		emit(',"projectId":');
-		emit(JSON.stringify(mapping.projectId));
+		emitQuotedOrNull(mapping.projectId, emit);
 		emit(',"rawFrameCursor":');
 		emit(String(mapping.rawFrameCursor));
 		emit(',"sessionFile":');
-		emit(mapping.sessionFile === undefined ? "null" : JSON.stringify(mapping.sessionFile));
+		emitQuotedOrNull(mapping.sessionFile, emit);
 		emit(',"sessionId":');
-		emit(JSON.stringify(mapping.sessionId));
+		emitQuotedOrNull(mapping.sessionId, emit);
 		emit("}");
 	});
 }
@@ -387,7 +383,12 @@ function turnEventToProjectableFrame(event: GjcTurnEvent): ProjectableAgentFrame
 		const pendingGate = pendingGateFromEvent(event);
 		return {
 			kind: "skill_progress",
-			label: boundedText(projectPendingWorkflowGateMessage(pendingGate)),
+			// projectPendingWorkflowGateMessage() concatenates the prompt, every
+			// option label/description, and the gate identity before boundedText()
+			// truncates: a retained gate with a payload-sized prompt or option
+			// would allocate that whole string during boot projection. Bound each
+			// field first so only a small projected message is ever assembled.
+			label: boundedGateMessage(pendingGate),
 			phase: "start",
 			hidden: false,
 			metadata: {
@@ -453,10 +454,69 @@ function workflowGateStatusMetadata(gate: PendingWorkflowGate): Record<string, u
 	};
 }
 
-function boundedNullableText(value: string | null): string | null {
-	return value === null ? null : boundedText(value);
+/**
+ * Emits a JSON string value's quoted and escaped bytes incrementally (or null
+ * for undefined), byte-identical to JSON.stringify(value). Unbounded mapping
+ * strings must not materialize as field-sized escaped strings during hashing.
+ */
+function emitQuotedOrNull(value: string | undefined, emit: (chunk: string) => void): void {
+	if (value === undefined) {
+		emit("null");
+		return;
+	}
+	emit('"');
+	streamEscapedJsonString(value, emit);
+	emit('"');
+}
+
+function boundedNullableText(value: string | null | undefined): string | null {
+	return value === null || value === undefined ? null : boundedText(value);
 }
 
 function boundedText(value: string, maxLength = 80): string {
 	return value.length <= maxLength ? value : `${value.slice(0, maxLength - 3)}...`;
+}
+
+/**
+ * Projected gate label that mirrors projectPendingWorkflowGateMessage() but
+ * bounds every unbounded field BEFORE concatenation, so a retained gate with a
+ * payload-sized prompt or option never materializes a full gate message during
+ * boot projection. The result is byte-identical to boundedText() applied to
+ * the full message for the bounded fields the projection shows.
+ */
+function boundedGateMessage(gate: PendingWorkflowGate): string {
+	const prompt = boundedNullableText(
+		stringJsonField(gate.context, "prompt") ?? stringJsonField(gate.context, "title"),
+	);
+	const options = gate.options ?? [];
+	const optionLines = options.map((option, index) => {
+		const description = option.description === undefined ? "" : ` - ${boundedText(option.description)}`;
+		return `${index + 1}. ${boundedText(stripLeadingChoiceNumber(option.label))}${description}`;
+	});
+	const answerHint =
+		options.length > 0
+			? `Reply with a number from 1 to ${options.length} to continue this GJC session.`
+			: "Reply with the requested approval, rejection, or answer to continue this GJC session.";
+	const lines = [
+		"### GJC workflow gate pending",
+		"",
+		...(prompt === null ? [] : [prompt]),
+		...(optionLines.length === 0 ? [] : ["", ...optionLines]),
+		"",
+		`Gate ID: ${boundedText(gate.gateId)}`,
+		`Schema hash: ${boundedText(gate.schemaHash)}`,
+		"",
+		answerHint,
+	];
+	return boundedText(lines.join("\n"));
+}
+
+function stripLeadingChoiceNumber(label: string): string {
+	return label.replace(/^\s*\d+\s*[.)]\s*/, "");
+}
+
+function stringJsonField(record: Record<string, unknown> | undefined, key: string): string | undefined {
+	if (record === undefined) return undefined;
+	const value = record[key];
+	return typeof value === "string" ? value : undefined;
 }
