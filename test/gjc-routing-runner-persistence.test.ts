@@ -907,6 +907,44 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			rmSync(directory, { recursive: true, force: true });
 		}
 	});
+	test("does not rewrite a second time when recovery persists first", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-recovery-then-compaction-"));
+		const filePath = join(directory, "mappings.json");
+		try {
+			// An oversized legacy document with a pending operation: the recovery
+			// branch persists (writing a normalized base) before the oversized
+			// condition; the in-memory normalized marker must prevent a second
+			// full rewrite, so the file is written exactly once during boot.
+			const oversized = oversizedAuthorityJson(70 * 1024 * 1024);
+			const document = JSON.parse(oversized.json) as Record<string, unknown>;
+			const mappings = document.mappings as Array<Record<string, unknown>>;
+			const record = mappings[0]!;
+			const journal = record.journal as Array<Record<string, unknown>>;
+			journal.push({
+				id: "pending-op",
+				kind: "prompt",
+				state: "pending",
+				startedAt: "2026-01-01T00:00:00.000Z",
+			});
+			writeFileSync(filePath, JSON.stringify(document));
+			const originalBytes = statSync(filePath).size;
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			// The recovery persist already normalized the base (the marker is set in
+			// memory), so the oversized condition does NOT rewrite it a second time,
+			// but the compaction is still reported from the original size.
+			expect(store.bootCompaction?.beforeBytes).toBe(originalBytes);
+			expect(statSync(filePath).size).toBeLessThan(originalBytes);
+			expect(statSync(filePath).size).toBeLessThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			// A second boot is also stable.
+			const stableBytes = statSync(filePath).size;
+			new FileBackedSessionMappingStore(filePath);
+			expect(statSync(filePath).size).toBe(stableBytes);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
 	test("fails closed on a malformed WAL header", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-malformed-header-")), "mappings.json");
 		const walPath = `${filePath}.wal`;

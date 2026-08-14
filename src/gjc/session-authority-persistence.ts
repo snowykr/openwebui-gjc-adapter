@@ -141,17 +141,18 @@ export class FileSessionAuthority extends SessionAuthority {
 				if (pendingOperations) super.reconcileRestart();
 				this.persist();
 			}
-			const beforeBytes = statIdentity(this.filePath)?.size ?? 0;
-			if (originalBaseBytes > AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES && !this.#normalized) {
-				// Compaction from the internal reference view: normalization drops
-				// legacy result event arrays by reference (no deep copy of every
-				// event payload), the compact base is written, and the live journal
-				// is replaced with the normalized records, so a 1 GiB-class legacy
-				// document is shrunk in one bounded step without a second
-				// full-document allocation. The persisted `normalized` marker
-				// prevents re-running this on every boot for an authority that
-				// legitimately stays above the threshold.
-				this.compactFromReferences();
+			if (originalBaseBytes > AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES) {
+				if (!this.#normalized) {
+					// No persist has happened during this boot yet: perform the
+					// reference-based compaction (normalization drops legacy result
+					// event arrays by reference, no deep copy, and the live journal
+					// is replaced with the normalized records). The persisted
+					// `normalized` marker prevents re-running this on every boot.
+					this.compactFromReferences();
+				}
+				// Report the compaction whenever startup rewrote an oversized
+				// document: either compactFromReferences just rewrote it, or the
+				// recovery persist already normalized it (marker set above).
 				this.recordBootCompaction(originalBaseBytes);
 			}
 		} finally {
@@ -597,6 +598,11 @@ export class FileSessionAuthority extends SessionAuthority {
 			}
 			throw new SessionAuthorityDurabilityError(this.filePath, error);
 		}
+		// The persisted document is always the normalized form, so the in-memory
+		// marker must be set here too: when the recovery branch persisted first
+		// (pending/garbage/oversized-WAL) and the base is still oversized, the
+		// subsequent boot-compaction condition must not rewrite it a second time.
+		this.#normalized = true;
 		this.clearDirtyJournal();
 	}
 	/** Boot-only compaction from the internal reference view: no deep copy of
