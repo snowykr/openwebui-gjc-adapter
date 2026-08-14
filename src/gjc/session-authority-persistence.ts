@@ -1690,7 +1690,16 @@ function normalizeOperationResult(operation: SessionOperation): SessionOperation
 }
 function normalizeResult(result: SessionOperationResult): SessionOperationResult {
 	if (result.events === undefined) return result;
-	const gateEvents = result.events.filter(event => event.type === "workflow_gate");
+	// Only zero/one/many gates matter below; scanning every workflow-gate
+	// event into a filtered array would allocate a second reference array for
+	// a gate-heavy legacy authority. Collect at most the first two.
+	const gateEvents: Array<NonNullable<SessionOperationResult["events"]>[number]> = [];
+	for (const event of result.events) {
+		if (event.type === "workflow_gate") {
+			gateEvents.push(event);
+			if (gateEvents.length >= 2) break;
+		}
+	}
 	// Legacy workflow-gate results (written before the compact gate binding
 	// existed) may rely on their retained events as the only evidence
 	// authenticating the answered gate once the record mapping has advanced.
