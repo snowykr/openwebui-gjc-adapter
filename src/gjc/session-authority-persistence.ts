@@ -143,19 +143,18 @@ export class FileSessionAuthority extends SessionAuthority {
 			let bootRewrote = false;
 			if (needsRecovery) {
 				if (pendingOperations) super.reconcileRestart(false);
-				if (oversizedNotNormalized) {
-					// Recovery AND an oversized legacy base: write through the
-					// reference-based compaction (reconcileRestart(false) already
-					// updated the journal in place, and compactFromReferences
-					// normalizes from the internal reference view without the
-					// entries() deep copy of every event payload) instead of
-					// persist(), so a 1 GiB-class authority cannot exhaust boot
-					// memory during recovery.
+				if (originalBaseBytes > AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES) {
+					// Oversized recovery (normalized or legacy): write through the
+					// reference-based writer, never persist()'s entries() deep copy
+					// of every retained event payload. For a legacy base the
+					// normalization drops result events; for an already-normalized
+					// oversized base it is a no-op normalization that still writes
+					// from the reference view (no document-sized allocation) and
+					// keeps the marker.
 					this.compactFromReferences();
 					bootRewrote = true;
 				} else {
 					this.persist();
-					bootRewrote = originalBaseBytes > AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES;
 				}
 			} else if (oversizedNotNormalized) {
 				// No recovery needed but the legacy base is oversized: reference-based

@@ -945,6 +945,40 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			rmSync(directory, { recursive: true, force: true });
 		}
 	});
+	test("routes oversized normalized recovery through the reference writer", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-normalized-recovery-"));
+		const filePath = join(directory, "mappings.json");
+		try {
+			// A legitimately oversized NORMALIZED authority (marker set) with a
+			// pending operation: recovery must still write through the
+			// reference-based writer (no entries() deep copy of retained events),
+			// persist the reconciled state, and stay stable on later boots.
+			const oversized = oversizedAuthorityJson(70 * 1024 * 1024);
+			const document = JSON.parse(oversized.json) as Record<string, unknown>;
+			document.normalized = true;
+			const mappings = document.mappings as Array<Record<string, unknown>>;
+			const record = mappings[0]!;
+			const journal = record.journal as Array<Record<string, unknown>>;
+			journal.push({
+				id: "pending-op",
+				kind: "prompt",
+				state: "pending",
+				startedAt: "2026-01-01T00:00:00.000Z",
+			});
+			writeFileSync(filePath, JSON.stringify(document));
+			const originalBytes = statSync(filePath).size;
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			// Recovery persisted the reconciled state (reported from the original
+			// size) without a second rewrite, and a later boot is stable.
+			expect(store.bootCompaction?.beforeBytes).toBe(originalBytes);
+			const stableBytes = statSync(filePath).size;
+			new FileBackedSessionMappingStore(filePath);
+			expect(statSync(filePath).size).toBe(stableBytes);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
 	test("fails closed on a malformed WAL header", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-malformed-header-")), "mappings.json");
 		const walPath = `${filePath}.wal`;
