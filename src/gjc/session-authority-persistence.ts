@@ -1496,13 +1496,18 @@ type ChunkSink = (chunk: string) => void;
 
 /** Streams a record's retained event array element by element (peak bounded by
  * the largest single event) so a 1 GiB sequential-gate record never
- * materializes a record-sized string on top of the parsed authority. */
+ * materializes a record-sized string on top of the parsed authority. Each
+ * event is serialized through the incremental plain-JSON writer too, so a
+ * single very large retained event (a 1 GiB-class tool or workflow payload) is
+ * itself streamed instead of being materialized whole by an eager
+ * JSON.stringify call. The emitted bytes are byte-identical to
+ * JSON.stringify of the same event array. */
 function streamEvents(events: readonly unknown[] | undefined, emit: ChunkSink): void {
 	if (events === undefined || events.length === 0) return;
 	emit(',"events":[');
 	for (let index = 0; index < events.length; index += 1) {
 		if (index > 0) emit(",");
-		emit(JSON.stringify(events[index]));
+		streamPlainJson(events[index], emit);
 	}
 	emit("]");
 }

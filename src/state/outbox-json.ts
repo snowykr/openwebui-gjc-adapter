@@ -220,17 +220,23 @@ function streamPlainJsonResolved(value: unknown, emit: (chunk: string) => void):
 }
 
 /** Hashes a canonical serialization produced by a caller-supplied streaming
- * emitter without ever materializing the whole serialization: pass 1 measures
- * the byte length (the lineage hash prefix), pass 2 streams the bytes into the
- * hash. The emitter must be deterministic so both passes agree. */
+ * emitter without ever materializing the whole serialization: the producer
+ * runs once into a compact byte spool, whose length is hashed as the lineage
+ * prefix and whose bytes are then hashed directly. Snapshotting the emitted
+ * bytes means effectful JSON values (a stateful toJSON or getter) are
+ * evaluated exactly once, so the measured length always describes exactly the
+ * bytes that are hashed; the later WAL JSON.stringify round trip can then
+ * never disagree with the stored hash. The spool holds the serialization in
+ * memory, so callers must bound it (projection payloads do), and its peak is
+ * the serialization size rather than a per-pass re-evaluation. */
 export function hashCanonicalStream(produce: (emit: (chunk: string) => void) => void): string {
+	const chunks: string[] = [];
+	produce(chunk => chunks.push(chunk));
 	const hasher = new Bun.CryptoHasher("sha256");
 	let length = 0;
-	produce(chunk => {
-		length += chunk.length;
-	});
+	for (const chunk of chunks) length += chunk.length;
 	hasher.update(`${length}:`);
-	produce(chunk => hasher.update(chunk));
+	for (const chunk of chunks) hasher.update(chunk);
 	hasher.update(";");
 	return hasher.digest("hex");
 }

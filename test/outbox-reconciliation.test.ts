@@ -18,6 +18,7 @@ import { resolveAllowedRoots } from "../src/security/paths";
 import {
 	buildProjectionPayloadHash,
 	FileBackedOutboxStore,
+	hashCanonicalStream,
 	InMemoryOutboxStore,
 	nodeOutboxFileSystem,
 	type OutboxFileSystem,
@@ -130,6 +131,31 @@ describe("InMemoryOutboxStore", () => {
 			streamPlainJson(sample, chunk => (streamed += chunk));
 			expect(streamed).toBe(JSON.stringify(sample));
 		}
+	});
+
+	test("hashes canonical stream bytes with a single evaluation of effectful JSON values", () => {
+		// hashCanonicalStream must snapshot the producer's emitted bytes instead
+		// of running the producer twice: a stateful toJSON or getter evaluated
+		// once for measuring and again for hashing could describe different
+		// bytes than the WAL JSON.stringify round trip later reproduces, and the
+		// stored hash would then fail startup synthesis.
+		let evaluations = 0;
+		const stateful = {
+			toJSON() {
+				evaluations += 1;
+				return "deterministic-serialization";
+			},
+		};
+		const hash = hashCanonicalStream(emit => streamPlainJson({ stateful }, emit));
+		// The old two-pass implementation invoked the producer twice (once to
+		// measure, once to hash), so a stateful toJSON could be evaluated more
+		// than once; the snapshot must evaluate it exactly once.
+		expect(evaluations).toBe(1);
+		// JSON.stringify also invokes toJSON, but because the serialization is
+		// deterministic the byte stream it hashes is identical to the one
+		// streamed through streamPlainJson.
+		const direct = hashCanonicalStream(emit => emit(JSON.stringify({ stateful })));
+		expect(hash).toBe(direct);
 	});
 });
 

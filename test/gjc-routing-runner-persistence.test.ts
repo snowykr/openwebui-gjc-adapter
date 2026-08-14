@@ -1481,6 +1481,57 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			rmSync(directory, { recursive: true, force: true });
 		}
 	});
+	test("streams a single large retained event through boot compaction byte-identically", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-single-event-"));
+		const filePath = join(directory, "mappings.json");
+		const walPath = `${filePath}.wal`;
+		try {
+			const writer = new FileSessionAuthority(filePath);
+			writer.set(mappingInput(mediumSelection));
+			writer.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+			expect(statSync(filePath).size).toBeLessThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const lines = readFileSync(walPath, "utf8").trimEnd().split("\n");
+			const lastHead = (JSON.parse(lines[lines.length - 1]!) as { readonly head: string }).head;
+			const chunk = "x".repeat(512 * 1024);
+			// One retained event whose payload alone dominates the authority: an
+			// eager JSON.stringify(event) would materialize another
+			// payload-sized string, so the event must stream through the
+			// incremental plain-JSON writer instead.
+			const singleEvent = {
+				type: "tool" as const,
+				text: "tool-0",
+				id: "event-0",
+				payload: { toolCallId: "tool-0", transcript: `${chunk.repeat(140)}\n"quoted"\\slash\u0001 tail` },
+			};
+			const document = validAuthorityDocument();
+			document.provisionalOperations = [];
+			const record = document.mappings[0];
+			record.events = [singleEvent];
+			record.journal = [];
+			record.operationId = "operation-1";
+			const body = {
+				kind: "openwebui-gjc-session-authority-wal",
+				version: 2,
+				records: [record],
+				provisional: [],
+				prevHash: lastHead,
+			};
+			const head = createHash("sha256").update(lastHead).update("\n").update(JSON.stringify(body)).digest("hex");
+			appendFileSync(walPath, `${JSON.stringify({ ...body, head })}\n`);
+			expect(statSync(walPath).size).toBeGreaterThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			expect(store.bootCompaction?.beforeBytes).toBeGreaterThan(0);
+			const reloaded = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
+			const mapping = (reloaded.mappings as Array<Record<string, unknown>>)[0]!;
+			const events = mapping.events as Array<Record<string, unknown>>;
+			expect(events).toHaveLength(1);
+			expect((events[0]!.payload as Record<string, unknown>).transcript).toBe(singleEvent.payload.transcript);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
 	test("streams large record assistantText and observations through boot compaction byte-identically", () => {
 		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-large-fields-"));
 		const filePath = join(directory, "mappings.json");
