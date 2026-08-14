@@ -42,9 +42,10 @@ function enqueueChatOperation(store: OutboxStore, operationId = "op-1", principa
 }
 
 describe("InMemoryOutboxStore", () => {
-	test("rejects a same-ID enqueue with a different immutable payload", () => {
+	test("rejects a same-ID enqueue with a different payload only while it is applying", () => {
 		const store = new InMemoryOutboxStore();
 		enqueueChatOperation(store);
+		store.markApplying({ chatId: "chat-1", operationId: "op-1" });
 
 		expect(() =>
 			store.enqueue({
@@ -57,6 +58,28 @@ describe("InMemoryOutboxStore", () => {
 				now: new Date("2026-07-08T00:01:00.000Z"),
 			}),
 		).toThrow("Projection operation ID conflict: op-1");
+		expect(store.listPending()).toHaveLength(0);
+	});
+	test("supersedes an applied same-ID row whose projection payload evolved", () => {
+		const store = new InMemoryOutboxStore();
+		enqueueChatOperation(store);
+		store.markApplied({ chatId: "chat-1", operationId: "op-1" });
+
+		const superseded = store.enqueue({
+			operationId: "op-1",
+			ownerUserId: "user-1",
+			projectId: "project-1",
+			chatId: "chat-1",
+			kind: "chat",
+			payloadHash: buildProjectionPayloadHash({ title: "Evolved" }),
+			now: new Date("2026-07-08T00:01:00.000Z"),
+		});
+
+		expect(superseded).toMatchObject({
+			operationId: "op-1",
+			state: "pending",
+			payloadHash: buildProjectionPayloadHash({ title: "Evolved" }),
+		});
 		expect(store.listPending()).toHaveLength(1);
 	});
 

@@ -51,7 +51,11 @@ function thinkingFrame(event: GjcTurnEvent): ProjectableAgentFrame | undefined {
 		case "thinking_start":
 			return skillFrame("Thinking started", "start");
 		case "thinking_delta":
-			return skillFrame("Thinking in progress", "progress");
+			// Thinking deltas stream token-by-token; projecting each one as a
+			// status event floods OpenWebUI with repeated "Thinking in progress"
+			// lines. The raw thinking text is delivered through the assistant
+			// message content instead (see thinkingDetailsFromEvents).
+			return undefined;
 		case "reasoning_summary_delta": {
 			const delta = textField(assistant ?? {}, "delta")?.trim();
 			return delta === undefined || delta.length === 0
@@ -108,6 +112,83 @@ function skillFrame(label: string, phase: "start" | "progress" | "end"): Project
 
 function subagentFrame(label: string): ProjectableAgentFrame {
 	return { kind: "subagent_progress", label, phase: "progress" };
+}
+
+export const THINKING_DETAILS_OPEN = "<details>\n<summary>Thinking</summary>\n\n";
+export const THINKING_DETAILS_CLOSE = "\n</details>\n\n";
+
+/**
+ * Reconstructs the raw thinking text from streamed `thinking_delta` events so
+ * OpenWebUI can render the actual reasoning instead of a generic status line.
+ */
+export function thinkingTextFromEvents(events: readonly GjcTurnEvent[]): string {
+	let text = "";
+	for (const event of events) {
+		if (event.type !== "message_update") continue;
+		const assistant = recordPayload(event, "assistantMessageEvent");
+		if (assistant === undefined) continue;
+		if (textField(assistant, "type") !== "thinking_delta") continue;
+		const delta = textField(assistant, "delta") ?? textField(assistant, "text");
+		if (delta !== undefined) text += delta;
+	}
+	return text;
+}
+
+/**
+ * Composes the assistant content while preserving the streamed phase order:
+ * thinking blocks appear interleaved with answer text exactly as the turn
+ * emitted them (`thinking1 → answer1 → thinking2 → answer2`), so OpenWebUI
+ * renders each `<details>` block at its position instead of merging them.
+ */
+export function composeThinkingAssistantContent(text: string, events: readonly GjcTurnEvent[]): string {
+	let out = "";
+	let thinkingBlocks = "";
+	let thinkingOpen = false;
+	let streamedText = "";
+	const openThinking = (): void => {
+		if (thinkingOpen) return;
+		// A `<details>` block must sit at a markdown block boundary; opening it
+		// right after answer text would be swallowed into the preceding
+		// paragraph and render as literal HTML.
+		if (out.length > 0) out += "\n\n";
+		out += THINKING_DETAILS_OPEN;
+		thinkingBlocks += THINKING_DETAILS_OPEN;
+		thinkingOpen = true;
+	};
+	const closeThinking = (): void => {
+		if (!thinkingOpen) return;
+		out += THINKING_DETAILS_CLOSE;
+		thinkingBlocks += THINKING_DETAILS_CLOSE;
+		thinkingOpen = false;
+	};
+	for (const event of events) {
+		if (event.type !== "message_update") continue;
+		const assistant = recordPayload(event, "assistantMessageEvent");
+		if (assistant === undefined) continue;
+		const type = textField(assistant, "type");
+		if (type === "thinking_delta") {
+			const delta = textField(assistant, "delta") ?? textField(assistant, "text");
+			if (delta === undefined || delta.length === 0) continue;
+			openThinking();
+			out += delta;
+			thinkingBlocks += delta;
+		} else if (type === "text_delta") {
+			const delta = textField(assistant, "delta") ?? textField(assistant, "text");
+			if (delta === undefined || delta.length === 0) continue;
+			closeThinking();
+			out += delta;
+			streamedText += delta;
+		}
+	}
+	closeThinking();
+	if (streamedText === text) return out;
+	if (text.startsWith(streamedText)) return out + text.slice(streamedText.length);
+	// Divergence: the streamed text deltas were provisional and do not prefix
+	// the finalized assistant text (for example a provider correction such as
+	// "draft" -> "final"). Never concatenate both, which would render
+	// "draftfinal"; use the finalized answer after the thinking blocks. The
+	// streamed delivery path surfaces the mismatch through finish().
+	return thinkingBlocks.length === 0 ? text : `${thinkingBlocks}${text}`;
 }
 
 function safeToolName(event: GjcTurnEvent): string | undefined {

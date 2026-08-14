@@ -16,6 +16,7 @@ import {
 	assertSameEnqueueIdentity,
 	canonicalProjectionOperationKey,
 	copyOperation,
+	createPendingProjectionOperation,
 	type EnqueueProjectionOperationInput,
 	normalizeProjectionPrincipalId,
 	OUTBOX_DOCUMENT_VERSION,
@@ -24,6 +25,7 @@ import {
 	type ProjectionOperation,
 	type ProjectionOperationReference,
 	parsePersistedOutboxDocument,
+	sameKeyEnqueueDisposition,
 	toTimestamp,
 } from "./outbox-types";
 
@@ -60,24 +62,31 @@ export class FileBackedOutboxStore implements OutboxStore {
 				: { ...input, ...(principalId === undefined ? {} : { principalId }) };
 		const existing = this.operations.get(key);
 		if (existing !== undefined) {
+			const disposition = sameKeyEnqueueDisposition(existing, normalizedInput);
+			if (disposition === "idempotent") return copyOperation(existing);
+			if (disposition === "supersede") {
+				const operation = createPendingProjectionOperation(
+					normalizedInput,
+					operationId,
+					principalId,
+					toTimestamp(normalizedInput.now),
+				);
+				const candidate = this.copyOperations();
+				candidate.set(key, operation);
+				this.persist(candidate);
+				this.operations = candidate;
+				return copyOperation(operation);
+			}
 			assertSameEnqueueIdentity(existing, normalizedInput);
 			return copyOperation(existing);
 		}
 
-		const timestamp = toTimestamp(input.now);
-		const operation: ProjectionOperation = {
+		const operation = createPendingProjectionOperation(
+			normalizedInput,
 			operationId,
-			...(principalId === undefined ? {} : { principalId }),
-			ownerUserId: input.ownerUserId,
-			projectId: input.projectId,
-			chatId: input.chatId,
-			kind: input.kind,
-			state: "pending",
-			payloadHash: input.payloadHash,
-			attempts: 0,
-			createdAt: timestamp,
-			updatedAt: timestamp,
-		};
+			principalId,
+			toTimestamp(input.now),
+		);
 		const candidate = this.copyOperations();
 		candidate.set(key, operation);
 		this.persist(candidate);

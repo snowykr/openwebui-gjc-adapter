@@ -10,6 +10,7 @@ import {
 	publishRecoveredAcknowledgedSuccessor,
 } from "./gjc-routing-successor-recovery";
 import { formatCanonicalModelId } from "./models";
+import { composeThinkingAssistantContent } from "./session-event-frames";
 import { ensureProjectionRows, projectTurnEvents, replayCompletedWorkflowGateReply } from "./workflow-gate-turns";
 
 export interface RoutingOperationReplayDependencies {
@@ -63,8 +64,12 @@ export async function replayRoutingOperation(
 				isCurrentReplay ? (recordMapping!.events ?? []) : (result.events ?? []),
 				selection === undefined ? undefined : formatCanonicalModelId(selection),
 			);
+			const assistantContent = composeThinkingAssistantContent(
+				result.assistantText,
+				isCurrentReplay ? (recordMapping!.events ?? []) : (result.events ?? []),
+			);
 			return withCanonicalModel(
-				events.length === 0 ? { content: result.assistantText } : { content: result.assistantText, events },
+				events.length === 0 ? { content: assistantContent } : { content: assistantContent, events },
 				selection,
 			);
 		});

@@ -247,6 +247,114 @@ describe("createGjcRoutingLiveGatewayRunner", () => {
 		await expect(runner.run(turn)).rejects.toThrow("requires reconciliation");
 		expect(turnRunner.calls).toBe(1);
 	});
+	test("keeps control replies idempotent between live and replay", async () => {
+		const mappings = new SessionMappingStore();
+		mappings.set({
+			chatId: "chat-control",
+			projectId: project.id,
+			sessionId: "predecessor",
+			sessionFile: "/workspace/project/.gjc/sessions/predecessor.jsonl",
+			operationId: "prior",
+			rawFrameCursor: 0,
+			eventCursor: 0,
+		});
+		let calls = 0;
+		class ThinkingControlRunner extends FakeGjcTurnRunner {
+			async runControl(): Promise<GjcControlResult> {
+				calls += 1;
+				return {
+					result: {
+						text: "control answer",
+						events: [
+							{
+								type: "message_update",
+								payload: { assistantMessageEvent: { type: "thinking_delta", text: "ctl-think" } },
+							},
+							{
+								type: "message_update",
+								payload: { assistantMessageEvent: { type: "text_delta", text: "control " } },
+							},
+						],
+						sessionFile: "/workspace/project/.gjc/sessions/predecessor.jsonl",
+						rawFrameCursor: 1,
+						eventCursor: 1,
+					},
+					sessionId: "predecessor",
+					sessionFile: "/workspace/project/.gjc/sessions/predecessor.jsonl",
+					attachment: attachmentProof({ cwd: project.cwd, sessionId: "predecessor" }),
+				};
+			}
+		}
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner: new ThinkingControlRunner(), mappings });
+		const turn: LiveGatewayRunnerInput = {
+			project,
+			prompt: "",
+			chatId: "chat-control",
+			messageId: "assistant-control",
+			userMessageId: "control-1",
+			userMessageParentId: "prior",
+			continued: true,
+			control: { operation: "follow_up" },
+		};
+		const live = await runner.run(turn);
+		const replayed = await runner.run(turn);
+		expect(live.content).toBe(
+			"<details>\n<summary>Thinking</summary>\n\nctl-think\n</details>\n\n" + "control answer",
+		);
+		expect(replayed.content).toBe(live.content);
+		expect(calls).toBe(1);
+	});
+	test("keeps no-result control replies identical on replay without predecessor thinking", async () => {
+		const mappings = new SessionMappingStore();
+		mappings.set({
+			chatId: "chat-control",
+			projectId: project.id,
+			sessionId: "predecessor",
+			sessionFile: "/workspace/project/.gjc/sessions/predecessor.jsonl",
+			operationId: "prior",
+			rawFrameCursor: 0,
+			eventCursor: 0,
+			assistantText: "predecessor text",
+			events: [
+				{
+					type: "message_update",
+					payload: { assistantMessageEvent: { type: "thinking_delta", text: "old-think" } },
+				},
+			],
+		});
+		let calls = 0;
+		class NoResultControlRunner extends FakeGjcTurnRunner {
+			async runControl(): Promise<GjcControlResult> {
+				calls += 1;
+				return {
+					sessionId: "predecessor",
+					sessionFile: "/workspace/project/.gjc/sessions/predecessor.jsonl",
+					attachment: attachmentProof({ cwd: project.cwd, sessionId: "predecessor" }),
+				};
+			}
+		}
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner: new NoResultControlRunner(), mappings });
+		const turn: LiveGatewayRunnerInput = {
+			project,
+			prompt: "",
+			chatId: "chat-control",
+			messageId: "assistant-control",
+			userMessageId: "control-abort",
+			userMessageParentId: "prior",
+			continued: true,
+			control: { operation: "abort" },
+		};
+		const live = await runner.run(turn);
+		const replayed = await runner.run(turn);
+		expect(live.content).toBe("predecessor text");
+		expect(replayed.content).toBe(live.content);
+		expect(replayed.content).not.toContain("old-think");
+		// The durable mapping and completed operation result must both record
+		// the control's own (empty) events so projection payloads stay aligned.
+		expect(mappings.get("chat-control")?.events ?? []).toEqual([]);
+		expect(mappings.operation("chat-control", "control-abort")?.result?.events ?? []).toEqual([]);
+		expect(calls).toBe(1);
+	});
 	test("keeps source authority when the first destination turn fails", async () => {
 		const mappings = new SessionMappingStore();
 		const turnRunner = new FakeGjcTurnRunner();

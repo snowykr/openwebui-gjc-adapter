@@ -22,6 +22,7 @@ import {
 import type { ModelReader, ModelReaderFactory } from "./model-reader";
 import { modelSelectionError } from "./model-selection-errors";
 import { formatCanonicalModelId } from "./models";
+import { composeThinkingAssistantContent, THINKING_DETAILS_CLOSE, THINKING_DETAILS_OPEN } from "./session-event-frames";
 import {
 	ensureProjectionRows,
 	handleWorkflowGateReply,
@@ -122,10 +123,11 @@ export function createGjcRoutingLiveGatewayRunner(
 			) {
 				const selection = assertBoundRequest(existing, requestedModelId, "duplicate");
 				const events = projectTurnEvents(existing.events ?? [], formatCanonicalModelId(selection));
-				const result =
-					events.length === 0
-						? { content: existing.assistantText ?? "" }
-						: { content: existing.assistantText ?? "", events };
+				const assistantContent = composeThinkingAssistantContent(
+					existing.assistantText ?? "",
+					existing.events ?? [],
+				);
+				const result = events.length === 0 ? { content: assistantContent } : { content: assistantContent, events };
 				return withCanonicalModel(result, selection);
 			}
 			if (turn.control !== undefined && isSameProject(existing, turn))
@@ -151,15 +153,33 @@ export function createGjcRoutingLiveGatewayRunner(
 					recoveryAttachment: boundMapping.attachment,
 				};
 				if (turn.onLiveEvents === undefined) {
+					const rawGateEvents: import("../gjc/turn-runner").GjcTurnEvent[] = [];
 					gateReplyResult = await input.turnRunner.withLifecyclePublication(gateAddress, lifecycle =>
-						handleWorkflowGateReply({ ...input, mappings: scopedMappings }, turn, boundMapping, lifecycle),
+						handleWorkflowGateReply(
+							{ ...input, mappings: scopedMappings },
+							turn,
+							boundMapping,
+							lifecycle,
+							event => {
+								rawGateEvents.push(event);
+							},
+						),
 					);
+					if (gateReplyResult !== null && typeof gateReplyResult.content === "string") {
+						gateReplyResult = {
+							...gateReplyResult,
+							content: composeThinkingAssistantContent(gateReplyResult.content, rawGateEvents),
+						};
+					}
 				} else {
 					const queue = new LiveChunkQueue();
 					let activityStarted = false;
 					let observedNativeLifecycle = false;
 					let leaseFailed = false;
+					let thinkingDetailsOpen = false;
+					let streamedAnything = false;
 					const terminalEvents: ReturnType<typeof projectTurnEvents>[number][] = [];
+					const observedRawEvents: import("../gjc/turn-runner").GjcTurnEvent[] = [];
 					let resolveActivity!: () => void;
 					let rejectActivity!: (error: unknown) => void;
 					const firstActivity = new Promise<void>((resolve, reject) => {
@@ -171,7 +191,24 @@ export function createGjcRoutingLiveGatewayRunner(
 						activityStarted = true;
 						resolveActivity();
 					};
+					const closeThinkingDetails = async (): Promise<void> => {
+						if (!thinkingDetailsOpen) return;
+						await queue.push(THINKING_DETAILS_CLOSE);
+						streamedAnything = true;
+						thinkingDetailsOpen = false;
+					};
+					const openThinkingDetails = async (): Promise<void> => {
+						if (thinkingDetailsOpen) return;
+						// A `<details>` block must sit at a markdown block boundary;
+						// opening it right after streamed answer text would render as
+						// literal HTML inside the preceding paragraph.
+						if (streamedAnything) await queue.push("\n\n");
+						await queue.push(THINKING_DETAILS_OPEN);
+						streamedAnything = true;
+						thinkingDetailsOpen = true;
+					};
 					const observer = async (event: import("../gjc/turn-runner").GjcTurnEvent) => {
+						observedRawEvents.push(event);
 						if (isNativeLifecycleEvent(event.type)) observedNativeLifecycle = true;
 						if (event.type !== "agent_failed") markActivityStarted();
 						const payload = isRecord(event.payload) ? event.payload : undefined;
@@ -179,14 +216,29 @@ export function createGjcRoutingLiveGatewayRunner(
 							payload !== undefined && isRecord(payload.assistantMessageEvent)
 								? payload.assistantMessageEvent
 								: undefined;
+						if (event.type === "message_update" && assistant?.type === "thinking_delta") {
+							const delta =
+								typeof assistant.delta === "string"
+									? assistant.delta
+									: typeof assistant.text === "string"
+										? assistant.text
+										: undefined;
+							if (delta === undefined || delta.length === 0) return;
+							await openThinkingDetails();
+							await queue.push(delta);
+							return;
+						}
 						if (
 							event.type === "message_update" &&
 							assistant?.type === "text_delta" &&
 							(typeof assistant.delta === "string" || typeof assistant.text === "string")
 						) {
-							await queue.push(
-								typeof assistant.delta === "string" ? assistant.delta : (assistant.text as string),
-							);
+							const delta = typeof assistant.delta === "string" ? assistant.delta : (assistant.text as string);
+							if (delta.length > 0) {
+								await closeThinkingDetails();
+								await queue.push(delta);
+								streamedAnything = true;
+							}
 							return;
 						}
 						const projected = projectTurnEvents(
@@ -225,7 +277,8 @@ export function createGjcRoutingLiveGatewayRunner(
 							if (result === null) throw new Error("Pending workflow gate disappeared before its reply.");
 							const completionEvents = observedNativeLifecycle ? terminalEvents : (result.events ?? []);
 							if (completionEvents.length > 0) await deliverLiveEvents(turn, completionEvents);
-							await queue.finish(result.content ?? "");
+							await closeThinkingDetails();
+							await queue.finish(composeThinkingAssistantContent(result.content ?? "", observedRawEvents));
 						})
 						.catch(error => {
 							if (!activityStarted) rejectActivity(error);
@@ -272,10 +325,11 @@ export function createGjcRoutingLiveGatewayRunner(
 						? undefined
 						: formatCanonicalModelId(result.mapping.modelSelection),
 				);
+				const assistantContent = composeThinkingAssistantContent(result.assistantText, result.events);
 				const response =
 					projectedEvents.length > 0
-						? { content: result.assistantText, events: projectedEvents }
-						: { content: result.assistantText };
+						? { content: assistantContent, events: projectedEvents }
+						: { content: assistantContent };
 				return withCanonicalModel(response, result.mapping.modelSelection);
 			}
 			beginReassignment();
@@ -284,6 +338,8 @@ export function createGjcRoutingLiveGatewayRunner(
 			let observedNativeLifecycle = false;
 			let agentStartDelivered = false;
 			let leaseFailed = false;
+			let thinkingDetailsOpen = false;
+			let streamedAnything = false;
 			let resolveActivity!: () => void;
 			let rejectActivity!: (error: unknown) => void;
 			const firstActivity = new Promise<void>((resolve, reject) => {
@@ -294,6 +350,22 @@ export function createGjcRoutingLiveGatewayRunner(
 				if (activityStarted) return;
 				activityStarted = true;
 				resolveActivity();
+			};
+			const closeThinkingDetails = async (): Promise<void> => {
+				if (!thinkingDetailsOpen) return;
+				await queue.push(THINKING_DETAILS_CLOSE);
+				streamedAnything = true;
+				thinkingDetailsOpen = false;
+			};
+			const openThinkingDetails = async (): Promise<void> => {
+				if (thinkingDetailsOpen) return;
+				// A `<details>` block must sit at a markdown block boundary;
+				// opening it right after streamed answer text would render as
+				// literal HTML inside the preceding paragraph.
+				if (streamedAnything) await queue.push("\n\n");
+				await queue.push(THINKING_DETAILS_OPEN);
+				streamedAnything = true;
+				thinkingDetailsOpen = true;
 			};
 			const backgroundRoute = routeGjcTurn({
 				...(principalId === undefined ? {} : { principalId }),
@@ -321,6 +393,18 @@ export function createGjcRoutingLiveGatewayRunner(
 							: undefined;
 					const assistantType =
 						assistant !== undefined && typeof assistant.type === "string" ? assistant.type : undefined;
+					if (event.type === "message_update" && assistantType === "thinking_delta") {
+						const delta =
+							typeof assistant?.delta === "string"
+								? assistant.delta
+								: typeof assistant?.text === "string"
+									? assistant.text
+									: undefined;
+						if (delta === undefined || delta.length === 0) return;
+						await openThinkingDetails();
+						await queue.push(delta);
+						return;
+					}
 					if (event.type === "message_update" && assistantType === "text_delta") {
 						const delta =
 							typeof assistant?.delta === "string"
@@ -328,7 +412,11 @@ export function createGjcRoutingLiveGatewayRunner(
 								: typeof assistant?.text === "string"
 									? assistant.text
 									: undefined;
-						if (delta !== undefined) await queue.push(delta);
+						if (delta !== undefined && delta.length > 0) {
+							await closeThinkingDetails();
+							await queue.push(delta);
+							streamedAnything = true;
+						}
 						return;
 					}
 					const projected = projectTurnEvents(
@@ -370,7 +458,8 @@ export function createGjcRoutingLiveGatewayRunner(
 								: result.events.filter(event => !(agentStartDelivered && event.type === "agent_start"));
 					const projected = projectTurnEvents(completionEvents, canonicalModel);
 					if (projected.length > 0) await deliverLiveEvents(turn, projected);
-					await queue.finish(result.assistantText);
+					await closeThinkingDetails();
+					await queue.finish(composeThinkingAssistantContent(result.assistantText, result.events));
 				})
 				.catch(error => {
 					let mappedError: unknown = isModelSelectionApplyFailure(error)

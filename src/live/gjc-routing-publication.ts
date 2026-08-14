@@ -31,8 +31,13 @@ export async function publishControlMapping(
 					: {
 							rawFrameCursor: applied.result.rawFrameCursor,
 							eventCursor: applied.result.eventCursor,
-							events: applied.result.events,
 						}),
+				// The mapping (and therefore the completed operation result)
+				// records only the events the control itself produced; no-result
+				// controls (abort, steer, action_reply, session.new) replace the
+				// predecessor events with an empty set, keeping the durable
+				// result, projection payloads, and replay composition consistent.
+				events: applied.result?.events ?? [],
 			},
 			"control",
 		);

@@ -53,6 +53,54 @@ export class ProjectionObsoleteError extends Error {
 		this.name = "ProjectionObsoleteError";
 	}
 }
+
+export type SameKeyEnqueueDisposition = "idempotent" | "supersede" | "conflict";
+
+/**
+ * Decides how a same-key re-enqueue is handled. An identical immutable payload
+ * replays idempotently. A different payload for the same logical operation is a
+ * conflict only while the row is mid-application (applying): the reconciler is
+ * actively writing the old content, so swapping it under the writer is unsafe.
+ * Every other state supersedes with the current payload because the operation's
+ * projection content legitimately evolved (for example a new adapter version
+ * changed how the payload is projected) and the mapping store is the
+ * authoritative source of what must be projected.
+ */
+export function sameKeyEnqueueDisposition(
+	existing: ProjectionOperation,
+	input: EnqueueProjectionOperationInput,
+): SameKeyEnqueueDisposition {
+	const identityMatches =
+		existing.ownerUserId === input.ownerUserId &&
+		existing.projectId === input.projectId &&
+		existing.chatId === input.chatId &&
+		existing.kind === input.kind &&
+		existing.principalId === normalizeProjectionPrincipalId(input.principalId);
+	if (!identityMatches) return "conflict";
+	if (existing.payloadHash === input.payloadHash) return "idempotent";
+	return existing.state === "applying" ? "conflict" : "supersede";
+}
+
+export function createPendingProjectionOperation(
+	input: EnqueueProjectionOperationInput,
+	operationId: string,
+	principalId: string | undefined,
+	timestamp: string,
+): ProjectionOperation {
+	return {
+		operationId,
+		...(principalId === undefined ? {} : { principalId }),
+		ownerUserId: input.ownerUserId,
+		projectId: input.projectId,
+		chatId: input.chatId,
+		kind: input.kind,
+		state: "pending",
+		payloadHash: input.payloadHash,
+		attempts: 0,
+		createdAt: timestamp,
+		updatedAt: timestamp,
+	};
+}
 export interface OutboxStore {
 	enqueue(input: EnqueueProjectionOperationInput): ProjectionOperation;
 	markApplying(reference: ProjectionOperationReference, now?: Date): ProjectionOperation;

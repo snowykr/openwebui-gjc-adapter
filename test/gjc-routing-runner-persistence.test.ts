@@ -29,6 +29,7 @@ import type {
 	GjcLifecyclePublicationAddress,
 	GjcLifecycleTestBarrierHook,
 	GjcLifecycleTransaction,
+	GjcTurnEvent,
 	GjcTurnRunner,
 } from "../src/gjc/turn-runner";
 import type { LiveGatewayRunnerInput } from "../src/live/chat-completions";
@@ -3595,7 +3596,6 @@ test("promotes a delayed acknowledged session.new successor after restart", asyn
 		fixture.dispose();
 	}
 });
-
 test.each(["duplicate", "descriptor replacement"] as const)(
 	"does not promote an acknowledged session.new successor after restart on %s",
 	async failure => {
@@ -3689,13 +3689,17 @@ test.each(["duplicate", "invalid"] as const)(
 	},
 );
 
-function setupAcknowledgedSessionNewFixture(transcript: "absent" | "valid" | "duplicate" | "invalid") {
+function setupAcknowledgedSessionNewFixture(
+	transcript: "absent" | "valid" | "duplicate" | "invalid",
+	predecessorEvents: readonly GjcTurnEvent[] = [],
+) {
 	const root = mkdtempSync(join(tmpdir(), "gjc-session-new-ack-"));
 	const sessionRoot = join(root, ".gjc", "sessions");
 	const endpointRoot = join(root, ".gjc", "state", "sdk");
 	const mappingFile = join(root, "mappings.json");
 	const predecessorPath = join(sessionRoot, "sdk-session-created.jsonl");
 	const successorPath = join(sessionRoot, "sdk-session-new.jsonl");
+	const successorEndpointPath = join(endpointRoot, "sdk-session-new.json");
 	const server = startSdkFixtureServer("controls", root);
 	let barrierHits = 0;
 	mkdirSync(endpointRoot, { recursive: true });
@@ -3715,6 +3719,7 @@ function setupAcknowledgedSessionNewFixture(transcript: "absent" | "valid" | "du
 		sessionId: "sdk-session-created",
 		sessionFile: predecessorPath,
 		operationId: "predecessor",
+		...(predecessorEvents.length === 0 ? {} : { events: predecessorEvents }),
 	});
 	const barrier: GjcLifecycleTestBarrierHook = (phase, evidence) => {
 		if (phase !== "post_ack_pre_transcript") return;
@@ -3780,7 +3785,8 @@ function setupAcknowledgedSessionNewFixture(transcript: "absent" | "valid" | "du
 		mappingFile,
 		root,
 		successorCopyPath: join(sessionRoot, "sdk-session-new-copy.jsonl"),
-		successorEndpointPath: join(endpointRoot, "sdk-session-new.json"),
+		successorEndpointPath,
+
 		predecessorPath,
 		successorPath,
 		server,

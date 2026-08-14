@@ -3,7 +3,7 @@ import { ensureSdkSessionFile } from "../gjc/session-file";
 import type { SessionMapping, SessionMappingStore } from "../gjc/session-router";
 import { validateSessionFile } from "../gjc/session-router";
 import { scopedSessionMappingStore } from "../gjc/session-turn-router";
-import type { GjcLifecycleTransaction, GjcTurnEventObserver } from "../gjc/turn-runner";
+import type { GjcLifecycleTransaction, GjcTurnEvent, GjcTurnEventObserver } from "../gjc/turn-runner";
 import {
 	answerFromWorkflowGateReply,
 	type PendingWorkflowGate,
@@ -16,6 +16,7 @@ import type { OutboxStore } from "../state/outbox";
 import { type LiveGatewayRunnerInput, type LiveGatewayRunnerResult, WorkflowGateReplyError } from "./chat-completions";
 import type { GjcSessionTurnRunner } from "./gjc-routing-runner";
 import { formatCanonicalModelId } from "./models";
+import { composeThinkingAssistantContent } from "./session-event-frames";
 import { ensureProjectionRows, projectTurnEvents } from "./workflow-gate-projection";
 import {
 	markWorkflowGateAccepted,
@@ -79,7 +80,34 @@ export function replayCompletedWorkflowGateReply(
 		);
 	if (recordMapping !== undefined && recordMapping.operationId === turn.userMessageId)
 		ensureProjectionRows(input.outbox, recordMapping, projectionOwnerUserId, principalId);
-	return { content: result.assistantText };
+	return {
+		content: composeThinkingAssistantContent(
+			result.assistantText,
+			gateReplyEvents(recordMapping?.events ?? result.events),
+		),
+	};
+}
+/**
+ * The persisted gate operation events are the accepted preflight history
+ * (which ends with the accepted workflow-gate event) followed by the gate
+ * answer's own events. Content composition must use only the answer events so
+ * older thinking from the turn that opened the gate is not replayed into the
+ * gate answer.
+ */
+function gateReplyEvents(events: readonly GjcTurnEvent[] | undefined): readonly GjcTurnEvent[] {
+	if (events === undefined) return [];
+	let lastAcceptedGate = -1;
+	for (let index = 0; index < events.length; index += 1) {
+		const event = events[index];
+		if (
+			event?.type === "workflow_gate" &&
+			typeof event.payload?.status === "string" &&
+			event.payload.status === "accepted"
+		) {
+			lastAcceptedGate = index;
+		}
+	}
+	return lastAcceptedGate === -1 ? events : events.slice(lastAcceptedGate + 1);
 }
 export async function handleWorkflowGateReply(
 	input: WorkflowGateTurnDependencies,

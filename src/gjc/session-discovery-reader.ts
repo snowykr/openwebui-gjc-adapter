@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
 import { type FileHandle, open, realpath } from "node:fs/promises";
-import { dirname, isAbsolute, relative } from "node:path";
+import { dirname, isAbsolute, relative, sep } from "node:path";
 import type { SessionEntry, SessionHeader } from "@gajae-code/coding-agent";
 import { GjcSessionLoadError, type LoadedGjcSessionFile } from "./session-loader-contract";
 import { decodeSessionEntry, decodeSessionHeader } from "./session-transcript-decoder";
@@ -143,9 +143,15 @@ async function canonicalSessionRoot(sessionRoot: string): Promise<string> {
 }
 
 async function assertHeldDescriptorContained(root: string, filePath: string, handle: FileHandle): Promise<void> {
-	const heldPath = await realpath(`/proc/self/fd/${handle.fd}`);
-	if (!isContained(root, heldPath))
-		throw corruptFile(filePath, `GJC session candidate escapes session root through a symlink: ${filePath}`);
+	// On Linux the held descriptor's real path proves the candidate did not
+	// escape the session root through a symlink opened before the lstat check.
+	// Portable platforms lack /proc; the pre-open realpath containment check
+	// plus the post-open stat identity check below still bound the candidate.
+	if (process.platform === "linux") {
+		const heldPath = await realpath(`/proc/self/fd/${handle.fd}`);
+		if (!isContained(root, heldPath))
+			throw corruptFile(filePath, `GJC session candidate escapes session root through a symlink: ${filePath}`);
+	}
 }
 
 async function assertRealpathContained(root: string, filePath: string): Promise<void> {
@@ -155,6 +161,10 @@ async function assertRealpathContained(root: string, filePath: string): Promise<
 }
 
 function isContained(root: string, candidate: string): boolean {
+	// Component-based containment: relative() emits `..\` on Windows and `../`
+	// elsewhere, so testing only a forward-slash prefix would let a traversal
+	// candidate outside the root pass on Windows.
 	const fromRoot = relative(root, candidate);
-	return fromRoot === "" || (!fromRoot.startsWith(`..${"/"}`) && fromRoot !== ".." && !isAbsolute(fromRoot));
+	if (fromRoot === "" || fromRoot === ".") return true;
+	return !fromRoot.startsWith("..") && !isAbsolute(fromRoot) && !fromRoot.split(sep).includes("..");
 }
