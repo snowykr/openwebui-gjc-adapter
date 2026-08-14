@@ -179,17 +179,10 @@ export async function handleWorkflowGateReply(
 				`GJC workflow gate operation ${turn.userMessageId} completed without a valid immutable result binding.`,
 			);
 		}
-		ensureProjectionRows(
-			input.outbox,
-			{
-				...priorOperation.result.mapping,
-				operationId: turn.userMessageId,
-				assistantText: priorOperation.result.assistantText,
-				events: priorOperation.result.events,
-			},
-			projectionOwnerUserId,
-			principalId,
-		);
+		// The completed operation's rows were enqueued at completion from the
+		// published record mapping; only re-enqueue when it is still current.
+		if (mapping.operationId === turn.userMessageId)
+			ensureProjectionRows(input.outbox, mapping, projectionOwnerUserId, principalId);
 		return { content: priorOperation.result.assistantText };
 	}
 	if (
@@ -251,6 +244,11 @@ export async function handleWorkflowGateReply(
 		}
 		const nextPendingGate = latestPendingWorkflowGate(result.events);
 		const responseText = nextPendingGate === null ? result.text : projectPendingWorkflowGateMessage(nextPendingGate);
+		// Bound the carried gate history: retain only the gate event just answered
+		// (needed to verify replays of THIS operation against its durable detail
+		// binding) plus any gates emitted by this reply; accepted gates from
+		// earlier chain steps are dropped, so a chain of N gates keeps O(1) gate
+		// payloads instead of N full schemas and options.
 		const answeredGateEvent = (mapping.events ?? []).find(
 			event => event.type === "workflow_gate" && pendingWorkflowGateFromEvent(event)?.gateId === pendingGate.gateId,
 		);
