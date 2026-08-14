@@ -100,6 +100,11 @@ export class SessionAuthorityDurabilityError extends Error {
 export class FileSessionAuthority extends SessionAuthority {
 	#baseIdentity: BaseIdentity | undefined = undefined;
 	#walIdentity: WalIdentity | undefined = undefined;
+	/** Set when the loaded base document is already in the normalized form this
+	 * instance writes (a `normalized: true` marker persisted at compaction): an
+	 * oversized base that cannot shrink below the threshold must not be
+	 * rewritten again on every boot. */
+	#normalized = false;
 	protected walCompactionThresholdBytes = WAL_COMPACTION_THRESHOLD_BYTES;
 	/**
 	 * Base-class-owned so a subclass capture written during the constructor
@@ -132,8 +137,16 @@ export class FileSessionAuthority extends SessionAuthority {
 				this.persist();
 			}
 			const beforeBytes = statIdentity(this.filePath)?.size ?? 0;
-			if (beforeBytes > AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES) {
-				this.persist();
+			if (beforeBytes > AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES && !this.#normalized) {
+				// Compaction from the internal reference view: normalization drops
+				// legacy result event arrays by reference (no deep copy of every
+				// event payload), the compact base is written, and the live journal
+				// is replaced with the normalized records, so a 1 GiB-class legacy
+				// document is shrunk in one bounded step without a second
+				// full-document allocation. The persisted `normalized` marker
+				// prevents re-running this on every boot for an authority that
+				// legitimately stays above the threshold.
+				this.compactFromReferences();
 				this.recordBootCompaction(beforeBytes);
 			}
 		} finally {
@@ -459,6 +472,7 @@ export class FileSessionAuthority extends SessionAuthority {
 		)
 			throw new SessionAuthorityLoadError(this.filePath, "authority document is not a valid v2 authority");
 		this.replaceAllWithReferences(document.mappings, document.provisionalOperations ?? []);
+		this.#normalized = (document as Record<string, unknown>).normalized === true;
 		const stat = statIdentity(this.filePath);
 		this.#baseIdentity =
 			stat === undefined
@@ -507,6 +521,7 @@ export class FileSessionAuthority extends SessionAuthority {
 			kind: "openwebui-gjc-session-authority",
 			version: SESSION_AUTHORITY_VERSION,
 			generation: nextGeneration,
+			normalized: true,
 			mappings: normalizedMappings,
 			provisionalOperations: normalizedProvisional,
 		})}\n`;
@@ -577,6 +592,90 @@ export class FileSessionAuthority extends SessionAuthority {
 			}
 			throw new SessionAuthorityDurabilityError(this.filePath, error);
 		}
+		this.clearDirtyJournal();
+	}
+	/** Boot-only compaction from the internal reference view: no deep copy of
+	 * every record/event payload happens (the legacy result events are dropped
+	 * by reference during normalization), the compact base is written with the
+	 * `normalized` marker, and the live journal is replaced with the normalized
+	 * records so the oversized legacy state does not stay resident. */
+	private compactFromReferences(): void {
+		const raw = this.rawJournalEntries();
+		const mappings = [...raw.records.values()];
+		const provisionalOperations = [...raw.provisional.values()];
+		if (
+			!mappings.every(isV2Record) ||
+			!provisionalOperations.every(isProvisionalOperation) ||
+			!isAuthorityDocumentRelationallyValid(mappings, provisionalOperations)
+		)
+			throw new Error("Refusing to persist an invalid v2 session authority.");
+		const normalizedMappings = mappings.map(normalizeRecordForPersistence);
+		const normalizedProvisional = provisionalOperations.map(normalizeProvisionalForPersistence);
+		mkdirSync(dirname(this.filePath), { recursive: true });
+		const temporary = `${this.filePath}.tmp-${process.pid}-${Date.now()}`;
+		const descriptor = openSync(temporary, "wx", 0o600);
+		const nextGeneration = randomUUID();
+		const writtenDocument = `${JSON.stringify({
+			kind: "openwebui-gjc-session-authority",
+			version: SESSION_AUTHORITY_VERSION,
+			generation: nextGeneration,
+			normalized: true,
+			mappings: normalizedMappings,
+			provisionalOperations: normalizedProvisional,
+		})}\n`;
+		try {
+			writeFileSync(descriptor, writtenDocument, "utf8");
+			fsyncSync(descriptor);
+		} finally {
+			closeSync(descriptor);
+		}
+		renameSync(temporary, this.filePath);
+		try {
+			this.syncDirectory();
+		} catch (error) {
+			this.#walIdentity = undefined;
+			try {
+				this.load();
+			} catch (loadError) {
+				throw new SessionAuthorityDurabilityError(
+					this.filePath,
+					new AggregateError([error, loadError], "authority reload failed after the base replacement"),
+				);
+			}
+			throw new SessionAuthorityDurabilityError(this.filePath, error);
+		}
+		try {
+			this.resetWalFile();
+		} catch (error) {
+			this.#walIdentity = undefined;
+			try {
+				this.load();
+			} catch (loadError) {
+				throw new SessionAuthorityDurabilityError(
+					this.filePath,
+					new AggregateError([error, loadError], "authority reload failed after the WAL reset"),
+				);
+			}
+			throw new SessionAuthorityDurabilityError(this.filePath, error);
+		}
+		// The normalized records become the live journal state so the oversized
+		// legacy events are not retained in memory and later WAL deltas stay
+		// compact.
+		this.replaceAllWithReferences(normalizedMappings, normalizedProvisional);
+		try {
+			this.refreshBaseIdentity(nextGeneration, createHash("sha256").update(writtenDocument).digest("hex"));
+		} catch (error) {
+			try {
+				this.load();
+			} catch (loadError) {
+				throw new SessionAuthorityDurabilityError(
+					this.filePath,
+					new AggregateError([error, loadError], "authority reload failed after the base replacement"),
+				);
+			}
+			throw new SessionAuthorityDurabilityError(this.filePath, error);
+		}
+		this.#normalized = true;
 		this.clearDirtyJournal();
 	}
 	/** Refreshes the cached base identity (stat + generation) after a rewrite;
@@ -1393,7 +1492,7 @@ export function isAuthorityDocument(value: unknown): value is {
 	const document = value as Record<string, unknown>;
 	return (
 		Object.keys(document).every(key =>
-			["kind", "version", "generation", "mappings", "provisionalOperations"].includes(key),
+			["kind", "version", "generation", "normalized", "mappings", "provisionalOperations"].includes(key),
 		) &&
 		document.kind === "openwebui-gjc-session-authority" &&
 		document.version === SESSION_AUTHORITY_VERSION &&

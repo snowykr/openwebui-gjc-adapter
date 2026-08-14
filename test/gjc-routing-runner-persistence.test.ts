@@ -853,6 +853,31 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				.sort(),
 		).toEqual(["chat-1", "chat-2", "chat-3"]);
 	});
+	test("does not recompact an already-normalized oversized authority on later boots", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-boot-compaction-once-"));
+		const filePath = join(directory, "mappings.json");
+		try {
+			// A normalized oversized document (written by our own persist, so it
+			// carries the marker): many mappings keep it above the threshold but
+			// no legacy normalization is needed, so later boots must not rewrite
+			// it again.
+			const oversized = oversizedAuthorityJson(70 * 1024 * 1024);
+			const document = JSON.parse(oversized.json) as Record<string, unknown>;
+			document.normalized = true;
+			writeFileSync(filePath, JSON.stringify(document));
+			const firstBytes = statSync(filePath).size;
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			expect(store.bootCompaction).toBeUndefined();
+			expect(statSync(filePath).size).toBe(firstBytes);
+
+			// A second boot also leaves the file untouched.
+			new FileBackedSessionMappingStore(filePath);
+			expect(statSync(filePath).size).toBe(firstBytes);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
 	test("fails closed on a malformed WAL header", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-malformed-header-")), "mappings.json");
 		const walPath = `${filePath}.wal`;
