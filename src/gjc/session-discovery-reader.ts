@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
 import { type FileHandle, open, realpath } from "node:fs/promises";
-import { dirname, isAbsolute, relative } from "node:path";
+import { dirname, isAbsolute, relative, sep } from "node:path";
 import type { SessionEntry, SessionHeader } from "@gajae-code/coding-agent";
 import { GjcSessionLoadError, type LoadedGjcSessionFile } from "./session-loader-contract";
 import { decodeSessionEntry, decodeSessionHeader } from "./session-transcript-decoder";
@@ -161,6 +161,10 @@ async function assertRealpathContained(root: string, filePath: string): Promise<
 }
 
 function isContained(root: string, candidate: string): boolean {
+	// Component-based containment: relative() emits `..\` on Windows and `../`
+	// elsewhere, so testing only a forward-slash prefix would let a traversal
+	// candidate outside the root pass on Windows.
 	const fromRoot = relative(root, candidate);
-	return fromRoot === "" || (!fromRoot.startsWith(`..${"/"}`) && fromRoot !== ".." && !isAbsolute(fromRoot));
+	if (fromRoot === "" || fromRoot === ".") return true;
+	return !fromRoot.startsWith("..") && !isAbsolute(fromRoot) && !fromRoot.split(sep).includes("..");
 }
