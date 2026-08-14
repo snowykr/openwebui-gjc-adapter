@@ -51,7 +51,15 @@ export function buildSessionMappingPayloadHash(mapping: SessionMapping): string 
 		emit('{"activeLeaf":');
 		emit(mapping.activeLeaf === undefined ? "null" : JSON.stringify(mapping.activeLeaf));
 		emit(',"assistantText":');
-		emit(mapping.assistantText === undefined ? "null" : JSON.stringify(mapping.assistantText));
+		if (mapping.assistantText === undefined) emit("null");
+		else {
+			// A large persisted response must not materialize an assistant-sized
+			// string on each hashing pass: emit the quoted and escaped value
+			// incrementally, byte-identical to JSON.stringify(mapping.assistantText).
+			emit('"');
+			streamEscapedJsonString(mapping.assistantText, emit);
+			emit('"');
+		}
 		emit(',"chatId":');
 		emit(JSON.stringify(mapping.chatId));
 		emit(',"eventCursor":');

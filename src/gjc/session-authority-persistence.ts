@@ -17,6 +17,7 @@ import {
 } from "node:fs";
 import { dirname } from "node:path";
 import { pendingWorkflowGateFromEvent } from "../projection/workflow-gates";
+import { streamEscapedJsonString, streamPlainJson } from "../state/outbox-json";
 import { AuthorityMutationLock } from "./session-authority-file";
 import { SessionAuthority } from "./session-authority-store";
 import type {
@@ -1509,8 +1510,17 @@ function streamEvents(events: readonly unknown[] | undefined, emit: ChunkSink): 
  * operations (streaming any retained result events per element), the retained
  * events, and a recursively retained prior tombstone's events per element. */
 function streamTombstone(tombstone: SessionAuthorityTombstone, emit: ChunkSink): void {
-	const { events: _tombstoneEvents, journal, prior: priorTombstone, ...rest } = tombstone;
+	const { events: _tombstoneEvents, journal, prior: priorTombstone, assistantText, observations, ...rest } = tombstone;
 	emit(JSON.stringify(rest).slice(0, -1));
+	if (assistantText !== undefined) {
+		emit(',"assistantText":"');
+		streamEscapedJsonString(assistantText, emit);
+		emit('"');
+	}
+	if (observations !== undefined) {
+		emit(',"observations":');
+		streamPlainJson(observations, emit);
+	}
 	emit(',"journal":[');
 	for (let index = 0; index < journal.length; index += 1) {
 		if (index > 0) emit(",");
@@ -1548,8 +1558,13 @@ function streamJournalOperation(operation: SessionOperation, emit: ChunkSink): v
 	emit(JSON.stringify(rest).slice(0, -1));
 	if (result !== undefined) {
 		emit(',"result":');
-		const { events, ...resultRest } = result;
+		const { events, assistantText, ...resultRest } = result;
 		emit(JSON.stringify(resultRest).slice(0, -1));
+		if (assistantText !== undefined) {
+			emit(',"assistantText":"');
+			streamEscapedJsonString(assistantText, emit);
+			emit('"');
+		}
 		streamEvents(events, emit);
 		emit("}");
 	}
@@ -1560,8 +1575,17 @@ function streamJournalOperation(operation: SessionOperation, emit: ChunkSink): v
  * level, inside any reassignment tombstones, and inside normalized journal
  * results) element by element. */
 function streamRecord(record: SessionAuthorityRecord, emit: ChunkSink): void {
-	const { events: _events, reassignment: _reassignment, journal, ...rest } = record;
+	const { events: _events, reassignment: _reassignment, journal, assistantText, observations, ...rest } = record;
 	emit(JSON.stringify(rest).slice(0, -1));
+	if (assistantText !== undefined) {
+		emit(',"assistantText":"');
+		streamEscapedJsonString(assistantText, emit);
+		emit('"');
+	}
+	if (observations !== undefined) {
+		emit(',"observations":');
+		streamPlainJson(observations, emit);
+	}
 	// journal is a required v2 record field: always serialize it, including the
 	// empty array (isV2Record requires journal to be an array, so omitting it
 	// would make the next boot reject the rewritten base).
@@ -1585,8 +1609,13 @@ function streamProvisional(operation: ProvisionalSessionOperation, emit: ChunkSi
 	emit(JSON.stringify(rest).slice(0, -1));
 	if (result !== undefined) {
 		emit(',"result":');
-		const { events, ...resultRest } = result;
+		const { events, assistantText, ...resultRest } = result;
 		emit(JSON.stringify(resultRest).slice(0, -1));
+		if (assistantText !== undefined) {
+			emit(',"assistantText":"');
+			streamEscapedJsonString(assistantText, emit);
+			emit('"');
+		}
 		streamEvents(events, emit);
 		emit("}");
 	}

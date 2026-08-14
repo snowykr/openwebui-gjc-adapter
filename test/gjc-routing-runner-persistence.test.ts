@@ -1132,6 +1132,37 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		streamPlainJson(payload, chunk => streamEscapedJsonString(chunk, fragment => (streamed += fragment)));
 		expect(streamed).toBe(JSON.stringify(JSON.stringify(payload)).slice(1, -1));
 	});
+	test("hashes a large assistantText byte-identically to whole-string canonicalization", () => {
+		// A large persisted response must not materialize an assistant-sized
+		// string on each projection hashing pass; the streamed escape must stay
+		// byte-identical to JSON.stringify so stored outbox rows keep matching.
+		const bigText = `${"x".repeat(1024 * 1024)}\n"quoted"\\slash\u0001\uD800 tail`;
+		const mapping: SessionMapping = {
+			...mappingInput(mediumSelection),
+			chatId: "chat-1",
+			assistantText: bigText,
+			events: [],
+		};
+		const legacyShape = {
+			chatId: mapping.chatId,
+			projectId: mapping.projectId,
+			sessionId: mapping.sessionId,
+			sessionFile: mapping.sessionFile ?? null,
+			activeLeaf: mapping.activeLeaf ?? null,
+			rawFrameCursor: mapping.rawFrameCursor,
+			eventCursor: mapping.eventCursor,
+			operationId: mapping.operationId,
+			assistantText: mapping.assistantText ?? null,
+			modelSelection: normalizeModelSelection(mapping.modelSelection) ?? null,
+			events: (mapping.events ?? []).map(event => ({
+				type: event.type,
+				text: event.text ?? null,
+				id: event.id ?? null,
+				payloadJson: event.payload === undefined ? null : JSON.stringify(event.payload),
+			})),
+		};
+		expect(buildSessionMappingPayloadHash(mapping)).toBe(buildProjectionPayloadHash(legacyShape));
+	});
 	test("routes a CJK-heavy WAL recovery by UTF-8 bytes through the reference writer", () => {
 		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-cjk-"));
 		const filePath = join(directory, "mappings.json");
@@ -1446,6 +1477,67 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			)?.events;
 			expect(Array.isArray(tombstoneEvents)).toBe(true);
 			expect((tombstoneEvents as unknown[]).length).toBe(140);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+	test("streams large record assistantText and observations through boot compaction byte-identically", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-large-fields-"));
+		const filePath = join(directory, "mappings.json");
+		const walPath = `${filePath}.wal`;
+		try {
+			const writer = new FileSessionAuthority(filePath);
+			writer.set(mappingInput(mediumSelection));
+			writer.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+			expect(statSync(filePath).size).toBeLessThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const lines = readFileSync(walPath, "utf8").trimEnd().split("\n");
+			const lastHead = (JSON.parse(lines[lines.length - 1]!) as { readonly head: string }).head;
+			const chunk = "x".repeat(512 * 1024);
+			// assistantText and observations are unbounded record fields: the
+			// compaction writer must serialize them incrementally (no
+			// payload-sized eager string) while remaining byte-identical, so the
+			// rewritten base round-trips exactly. Two 33 MiB copies (record
+			// assistantText + nested observations value) push the delta over the
+			// 64 MiB compaction threshold.
+			const bigText = `${chunk.repeat(66)}\n"quoted"\\backslash\u0001\uD800 tail`;
+			const observations = {
+				__gjcSessionMappingScope: { chatId: "chat-1", projectId: project.id },
+				nested: { deep: [1, null, { value: bigText }] },
+			};
+			const document = validAuthorityDocument();
+			document.provisionalOperations = [];
+			const record = document.mappings[0];
+			record.assistantText = bigText;
+			record.observations = observations;
+			record.journal = [
+				{
+					...record.journal[0]!,
+					result: {
+						...record.journal[0]!.result!,
+						assistantText: bigText,
+					},
+				},
+			];
+			const body = {
+				kind: "openwebui-gjc-session-authority-wal",
+				version: 2,
+				records: [record],
+				provisional: [],
+				prevHash: lastHead,
+			};
+			const head = createHash("sha256").update(lastHead).update("\n").update(JSON.stringify(body)).digest("hex");
+			appendFileSync(walPath, `${JSON.stringify({ ...body, head })}\n`);
+			expect(statSync(walPath).size).toBeGreaterThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			expect(store.bootCompaction?.beforeBytes).toBeGreaterThan(0);
+			const reloaded = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
+			const mapping = (reloaded.mappings as Array<Record<string, unknown>>)[0]!;
+			expect(mapping.assistantText).toBe(bigText);
+			expect(mapping.observations).toEqual(observations);
+			const result = (mapping.journal as Array<Record<string, unknown>>)[0]!.result as Record<string, unknown>;
+			expect(result.assistantText).toBe(bigText);
 		} finally {
 			rmSync(directory, { recursive: true, force: true });
 		}
