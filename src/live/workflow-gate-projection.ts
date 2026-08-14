@@ -128,22 +128,15 @@ export function synthesizeProjectionRows(
 					})()
 				: mappings.operationStateReferenceScoped({ principalId, chatId: mapping.chatId }, mapping.operationId);
 		if (operation?.state !== "complete" || operation.resultOperationId !== mapping.operationId) continue;
-		// Avoid recomputing the projection payload hashes (which stringify every
-		// retained event payload) for rows whose immutable identity is already
-		// present: the completion-time enqueue already created them, so boot
-		// synthesis for an oversized record-level event array should not allocate
-		// event-sized strings just to discover the dedupe.
-		const owner = principalId ?? ownerUserId;
-		const mappingRowExists =
-			outbox.get({ principalId, chatId: mapping.chatId, operationId: mapping.operationId }) !== undefined;
-		const eventRowExists =
-			outbox.get({ principalId, chatId: mapping.chatId, operationId: `${mapping.operationId}:event` }) !== undefined;
-		if (!mappingRowExists || !eventRowExists) {
-			for (const row of expectedProjectionRows(mapping, owner, principalId)) {
-				if (outbox.get({ principalId, chatId: mapping.chatId, operationId: row.operationId! }) === undefined)
-					outbox.enqueue(row);
-			}
-		}
+		// Always enqueue: the outbox's assertSameEnqueueIdentity compares the
+		// existing row's immutable owner/project/kind/payloadHash against the
+		// freshly computed one, so a row left stale by a checkpoint mismatch
+		// (authority and outbox restored from different points) is rejected
+		// instead of silently accepted. The payload hash is computed with the
+		// streaming canonical serializer (peak bounded by a single event), so
+		// this does not recreate the oversized allocation the no-copy iterator
+		// avoids.
+		for (const row of expectedProjectionRows(mapping, principalId ?? ownerUserId, principalId)) outbox.enqueue(row);
 	}
 }
 

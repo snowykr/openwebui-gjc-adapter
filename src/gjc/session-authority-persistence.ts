@@ -656,26 +656,54 @@ export class FileSessionAuthority extends SessionAuthority {
 			buffer += chunk;
 			if (buffer.length > 1024 * 1024) flush();
 		};
-		// Serialize a record with the retained events array streamed element by
-		// element: a 1 GiB sequential-gate record (whose workflow-gate events
-		// normalization must preserve) must not materialize a record-sized string
-		// on top of the parsed authority. The non-event fields are small and
-		// serialized as one chunk; the events array is written per event (peak
-		// bounded by the largest single event).
-		const streamRecord = (record: SessionAuthorityRecord) => {
-			const { events: _events, ...rest } = record;
-			writeChunk(JSON.stringify(rest).slice(0, -1));
-			const events = record.events;
-			if (events === undefined || events.length === 0) {
-				writeChunk("}");
-				return;
-			}
+		// Serialize a record (or tombstone) with retained event arrays streamed
+		// element by element: a 1 GiB sequential-gate record (whose workflow-gate
+		// events normalization must preserve) must not materialize a record-sized
+		// string on top of the parsed authority. The top-level events AND the
+		// events retained inside reassignment tombstones (sourceTombstone / prior
+		// chain) are written per event (peak bounded by the largest single event);
+		// the small non-event fields are serialized as one chunk each.
+		const streamEvents = (events: readonly unknown[] | undefined) => {
+			if (events === undefined || events.length === 0) return;
 			writeChunk(',"events":[');
 			for (let index = 0; index < events.length; index += 1) {
 				if (index > 0) writeChunk(",");
 				writeChunk(JSON.stringify(events[index]));
 			}
-			writeChunk("]}");
+			writeChunk("]");
+		};
+		const streamTombstone = (tombstone: SessionAuthorityTombstone) => {
+			const { events: _tombstoneEvents, prior: priorTombstone, ...rest } = tombstone;
+			writeChunk(JSON.stringify(rest).slice(0, -1));
+			streamEvents(tombstone.events);
+			if (priorTombstone !== undefined) {
+				writeChunk(',"prior":');
+				streamTombstone(priorTombstone);
+			}
+			writeChunk("}");
+		};
+		const streamReassignment = (reassignment: SessionAuthorityReassignment) => {
+			const { sourceTombstone, priorTombstone, ...rest } = reassignment;
+			writeChunk(JSON.stringify(rest).slice(0, -1));
+			if (sourceTombstone !== undefined) {
+				writeChunk(',"sourceTombstone":');
+				streamTombstone(sourceTombstone);
+			}
+			if (priorTombstone !== undefined) {
+				writeChunk(',"priorTombstone":');
+				streamTombstone(priorTombstone);
+			}
+			writeChunk("}");
+		};
+		const streamRecord = (record: SessionAuthorityRecord) => {
+			const { events: _events, reassignment: _reassignment, ...rest } = record;
+			writeChunk(JSON.stringify(rest).slice(0, -1));
+			streamEvents(record.events);
+			if (record.reassignment !== undefined) {
+				writeChunk(',"reassignment":');
+				streamReassignment(record.reassignment);
+			}
+			writeChunk("}");
 		};
 		writeChunk('{"kind":"openwebui-gjc-session-authority","version":');
 		writeChunk(`${SESSION_AUTHORITY_VERSION},"generation":`);
