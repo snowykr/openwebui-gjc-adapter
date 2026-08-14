@@ -101,8 +101,6 @@ export class FileSessionAuthority extends SessionAuthority {
 	#baseIdentity: BaseIdentity | undefined = undefined;
 	#walIdentity: WalIdentity | undefined = undefined;
 	protected walCompactionThresholdBytes = WAL_COMPACTION_THRESHOLD_BYTES;
-	#baseIdentity: { readonly size: number; readonly mtimeMs: number } | undefined = undefined;
-	#walIdentity: { readonly size: number; readonly mtimeMs: number } | undefined = undefined;
 	/**
 	 * Base-class-owned so a subclass capture written during the constructor
 	 * survives field initialization (subclass fields run after `super()`).

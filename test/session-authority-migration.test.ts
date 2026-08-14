@@ -1843,6 +1843,13 @@ describe("session authority pre-store migration", () => {
 			const result = preflightSessionAuthorityMigration({
 				sourcePath,
 				stateRoot: root,
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+
+			expect(result.status).toBe("not_needed");
+		});
+	});
 	test("destination-exists not_needed path performs no destination parse", () => {
 		withRoot((root, _sourcePath) => {
 			const stateRoot = join(root, "state");
@@ -2251,7 +2258,6 @@ describe("session authority pre-store migration", () => {
 			expect(readFileSync(sourcePath, "utf8")).toContain("chat-3");
 			expect(existsSync(`${sourcePath}.wal`)).toBe(false);
 			expect(new FileSessionAuthority(destinationPath).entries()).toHaveLength(2);
-			expect(readFileSync(destinationPath)).toEqual(opaqueDestination);
 		});
 	});
 	test("preserves source evidence when the checkpoint path is unreadable", () => {

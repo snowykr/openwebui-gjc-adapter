@@ -1660,7 +1660,11 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				sessionId: "session-1",
 				operationId: "operation-1",
 			});
-			expect(store.operation("chat-1", "operation-1")?.result?.events).toHaveLength(oversized.eventCount);
+			// Compaction rewrites the in-memory journal to the normalized records
+			// (consistent with the persisted file), so the legacy result events are
+			// stripped there too; the record and its assistant text survive.
+			expect(store.operation("chat-1", "operation-1")?.result?.events).toBeUndefined();
+			expect(store.operation("chat-1", "operation-1")?.result?.assistantText).toBe("done");
 
 			const secondBootBytes = statSync(filePath).size;
 			const booted = new FileSessionAuthority(filePath);
