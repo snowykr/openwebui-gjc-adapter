@@ -138,7 +138,7 @@ export class FileSessionAuthority extends SessionAuthority {
 			if (existsSync(this.walPath)) trailingGarbage = this.replayWal().trailingGarbage;
 			const pendingOperations = this.hasPendingOperations();
 			if (trailingGarbage || this.walOversized() || pendingOperations) {
-				if (pendingOperations) super.reconcileRestart();
+				if (pendingOperations) super.reconcileRestart(false);
 				this.persist();
 			}
 			if (originalBaseBytes > AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES) {

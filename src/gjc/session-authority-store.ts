@@ -150,8 +150,8 @@ export class SessionAuthority {
 		this.transitionOperation(chatId, operationId, "complete", detail, result);
 		return this.upsert(mapping);
 	}
-	reconcileRestart(): readonly SessionAuthorityRecord[] {
-		return this.#journal.reconcile();
+	reconcileRestart(copyResults = true): readonly SessionAuthorityRecord[] {
+		return this.#journal.reconcile(copyResults);
 	}
 	protected takeDirtyRecords(): readonly SessionAuthorityRecord[] {
 		return this.#journal.takeDirtyRecords();

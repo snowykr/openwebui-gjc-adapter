@@ -450,8 +450,14 @@ export class SessionAuthorityJournal {
 		this.setRecord(chatId, next);
 		return copy(next);
 	}
-	reconcile(): readonly SessionAuthorityRecord[] {
-		return reconcileSessionAuthority(this.records, this.provisional, this.#dirtyRecords, this.#dirtyProvisional);
+	reconcile(copyResults = true): readonly SessionAuthorityRecord[] {
+		return reconcileSessionAuthority(
+			this.records,
+			this.provisional,
+			this.#dirtyRecords,
+			this.#dirtyProvisional,
+			copyResults,
+		);
 	}
 	replace(records: readonly SessionAuthorityRecord[], provisional: readonly ProvisionalSessionOperation[] = []): void {
 		if (!isAuthorityDocumentRelationallyValid(records, provisional))
