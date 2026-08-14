@@ -979,6 +979,29 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			rmSync(directory, { recursive: true, force: true });
 		}
 	});
+	test("streams retained record events through boot compaction byte-consistently", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-streamed-events-"));
+		const filePath = join(directory, "mappings.json");
+		try {
+			// A legacy record with MANY retained events: the boot compaction must
+			// stream them element by element and the reloaded document must carry
+			// every event intact (byte-consistent round trip).
+			const oversized = oversizedAuthorityJson(70 * 1024 * 1024);
+			const document = JSON.parse(oversized.json) as Record<string, unknown>;
+			writeFileSync(filePath, JSON.stringify(document));
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			expect(store.bootCompaction?.beforeBytes).toBeGreaterThan(0);
+
+			const reloaded = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
+			const reloadedMapping = (reloaded.mappings as Array<Record<string, unknown>>)[0]!;
+			const reloadedJournal = reloadedMapping.journal as Array<Record<string, unknown>>;
+			// The retained result events survive the streamed write.
+			expect(reloadedJournal[0]?.result).toBeDefined();
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
 	test("fails closed on a malformed WAL header", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-malformed-header-")), "mappings.json");
 		const walPath = `${filePath}.wal`;

@@ -656,13 +656,34 @@ export class FileSessionAuthority extends SessionAuthority {
 			buffer += chunk;
 			if (buffer.length > 1024 * 1024) flush();
 		};
+		// Serialize a record with the retained events array streamed element by
+		// element: a 1 GiB sequential-gate record (whose workflow-gate events
+		// normalization must preserve) must not materialize a record-sized string
+		// on top of the parsed authority. The non-event fields are small and
+		// serialized as one chunk; the events array is written per event (peak
+		// bounded by the largest single event).
+		const streamRecord = (record: SessionAuthorityRecord) => {
+			const { events: _events, ...rest } = record;
+			writeChunk(JSON.stringify(rest).slice(0, -1));
+			const events = record.events;
+			if (events === undefined || events.length === 0) {
+				writeChunk("}");
+				return;
+			}
+			writeChunk(',"events":[');
+			for (let index = 0; index < events.length; index += 1) {
+				if (index > 0) writeChunk(",");
+				writeChunk(JSON.stringify(events[index]));
+			}
+			writeChunk("]}");
+		};
 		writeChunk('{"kind":"openwebui-gjc-session-authority","version":');
 		writeChunk(`${SESSION_AUTHORITY_VERSION},"generation":`);
 		writeChunk(JSON.stringify(nextGeneration));
 		writeChunk(',"normalized":true,"mappings":[');
 		for (let index = 0; index < normalizedMappings.length; index += 1) {
 			if (index > 0) writeChunk(",");
-			writeChunk(JSON.stringify(normalizedMappings[index]));
+			streamRecord(normalizedMappings[index]);
 		}
 		writeChunk('],"provisionalOperations":[');
 		for (let index = 0; index < normalizedProvisional.length; index += 1) {
