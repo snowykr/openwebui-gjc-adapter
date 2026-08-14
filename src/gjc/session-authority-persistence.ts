@@ -1071,12 +1071,17 @@ export class FileSessionAuthority extends SessionAuthority {
 		return this.#walIdentity !== undefined && this.#walIdentity.size > this.walCompactionThresholdBytes;
 	}
 	private hasPendingOperations(): boolean {
+		// Inspect through the internal reference view: entries() deep-copies every
+		// record and event payload, and this check runs BEFORE the oversized boot
+		// compaction — a 1 GiB-class document must not allocate a second
+		// document-sized object just to look for pending operations.
+		const raw = this.rawJournalEntries();
 		return (
-			this.entries().some(
+			[...raw.records.values()].some(
 				record =>
 					record.reassignment?.state === "pending" ||
 					record.journal.some(operation => operation.state === "pending"),
-			) || this.provisionalEntries().some(operation => operation.state === "pending")
+			) || [...raw.provisional.values()].some(operation => operation.state === "pending")
 		);
 	}
 	private get walPath(): string {
