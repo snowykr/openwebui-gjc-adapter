@@ -58,8 +58,9 @@ export function replayCompletedWorkflowGateReply(
 		return gate !== null && workflowGateOperationHash(turn, gate) === priorOperation.detail;
 	});
 	// The completed operation's own result may still carry the gate event in
-	// legacy documents; recompute the request hash from it as well.
-	const matchesLegacyResult = result.events.some(event => {
+	// legacy documents (before compaction strips result event arrays); recompute
+	// the request hash from it as well.
+	const matchesLegacyResult = (result.events ?? []).some(event => {
 		if (event.type !== "workflow_gate") return false;
 		const gate = pendingWorkflowGateFromEvent(event);
 		return gate !== null && workflowGateOperationHash(turn, gate) === priorOperation.detail;

@@ -11,7 +11,7 @@ import type { GjcTurnEvent } from "./turn-runner";
 export function copyOperationResult(result: SessionOperationResult): SessionOperationResult {
 	return {
 		...result,
-		events: copyEvents(result.events),
+		...(result.events === undefined ? {} : { events: copyEvents(result.events) }),
 		mapping: {
 			...result.mapping,
 			...(result.mapping.modelSelection === undefined

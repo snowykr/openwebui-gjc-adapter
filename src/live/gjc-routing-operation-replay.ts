@@ -60,7 +60,7 @@ export async function replayRoutingOperation(
 		return replayWithLifecyclePublication(input.turnRunner, turn, result.mapping, async () => {
 			if (isCurrentReplay) ensureProjectionRows(input.outbox, recordMapping!, projectionOwnerUserId, principalId);
 			const events = projectTurnEvents(
-				isCurrentReplay ? (recordMapping!.events ?? []) : result.events,
+				isCurrentReplay ? (recordMapping!.events ?? []) : (result.events ?? []),
 				selection === undefined ? undefined : formatCanonicalModelId(selection),
 			);
 			return withCanonicalModel(
