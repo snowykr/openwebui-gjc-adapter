@@ -133,6 +133,35 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 		expect(description).toBeDefined();
 		expect(description!).toContain("Answer with the requested text for this workfl");
 	});
+	test("bounds a huge schema enum in the gate prompt fallback", () => {
+		// A large enum must not be joined whole before the label truncates;
+		// only the bounded prefix is projected.
+		const hugeEnum = Array.from({ length: 10_000 }, (_, index) => `option-${index}`);
+		const projected = projectTurnEvents(
+			[
+				{
+					type: "workflow_gate",
+					id: "gate-enum-1",
+					payload: {
+						gateId: "gate-enum-1",
+						schemaHash: "sha256:enum",
+						idempotencyKey: "idem-enum-1",
+						boundUserMessageId: null,
+						status: "pending",
+						schema: { enum: hugeEnum },
+					},
+				},
+			],
+			"gjc/anthropic/claude-sonnet-4:medium",
+		);
+		const description = projected
+			.map(event => (event as { data?: { description?: string } }).data?.description)
+			.find(value => value?.includes("workflow gate pending"));
+		expect(description).toBeDefined();
+		expect(description!.length).toBeLessThanOrEqual(80);
+		expect(description!).toContain("option-0");
+		expect(description!).not.toContain("option-9999");
+	});
 	test("preserves the authenticated principal for workflow gate publication and replay after restart", async () => {
 		const root = mkdtempSync(join(tmpdir(), "gjc-workflow-gate-projection-"));
 		const mappingFile = join(root, "mappings.json");

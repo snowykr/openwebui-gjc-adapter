@@ -256,7 +256,7 @@ export function hashCanonicalStream(produce: (emit: (chunk: string) => void) => 
 				// matching the previous in-memory spool) so persisted hashes stay
 				// byte-identical; the file stores the UTF-8 bytes for re-reading.
 				length += chunk.length;
-				writeSync(descriptor, Buffer.from(chunk, "utf8"));
+				writeSyncAll(descriptor, Buffer.from(chunk, "utf8"));
 			});
 		} finally {
 			closeSync(descriptor);
@@ -281,5 +281,20 @@ export function hashCanonicalStream(produce: (emit: (chunk: string) => void) => 
 		// fails (e.g. /tmp fills while hashing an oversized mapping): a partial
 		// file must not accumulate across repeated startup attempts.
 		rmSync(directory, { recursive: true, force: true });
+	}
+}
+
+/**
+ * Writes an entire buffer, looping over short writes (a filesystem quota or
+ * other condition can return fewer bytes than requested). Ignoring the return
+ * value would leave the spool shorter than the counted lineage length and the
+ * digest would differ from the next startup's hash, rejecting a stored row.
+ */
+function writeSyncAll(descriptor: number, buffer: Buffer): void {
+	let offset = 0;
+	while (offset < buffer.length) {
+		const written = writeSync(descriptor, buffer, offset, buffer.length - offset);
+		if (written <= 0) throw new Error("Short write to the hash spool made no progress");
+		offset += written;
 	}
 }

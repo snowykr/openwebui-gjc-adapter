@@ -535,10 +535,30 @@ function boundedGatePrompt(gate: PendingWorkflowGate): string | undefined {
 	const prompt = stringJsonField(gate.context, "prompt") ?? stringJsonField(gate.context, "title");
 	if (prompt !== undefined) return prompt;
 	const schema = gate.schema;
-	if (schema.enum !== undefined) return `Choose one of: ${schema.enum.map(String).join(", ")}`;
+	if (schema.enum !== undefined) {
+		// A huge enum must not materialize as one joined string before the
+		// label is truncated; build only the prefix boundedText() will show.
+		const enumPrefix = boundedEnumPrefix(schema.enum);
+		return `Choose one of: ${enumPrefix}`;
+	}
 	if (schema.type === "boolean") return "Answer true/false for this approval gate.";
 	if (schema.type === "string") return "Answer with the requested text for this workflow gate.";
 	return "Answer this workflow gate using the requested structured values.";
+}
+
+/** Joins at most enough enum values to exceed the bounded label window. */
+function boundedEnumPrefix(values: readonly unknown[]): string {
+	const limit = 80;
+	let length = 0;
+	const parts: string[] = [];
+	for (const value of values) {
+		const part = String(value);
+		const extra = parts.length === 0 ? part.length : part.length + 2;
+		if (length + extra > limit) break;
+		parts.push(part);
+		length += extra;
+	}
+	return parts.join(", ");
 }
 
 function stripLeadingChoiceNumber(label: string): string {

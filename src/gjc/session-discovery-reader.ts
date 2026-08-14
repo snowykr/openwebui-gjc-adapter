@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
-import { type FileHandle, open, realpath } from "node:fs/promises";
-import { dirname, isAbsolute, relative, sep } from "node:path";
+import { type FileHandle, lstat, open, realpath } from "node:fs/promises";
+import { basename, dirname, isAbsolute, relative, sep } from "node:path";
 import type { SessionEntry, SessionHeader } from "@gajae-code/coding-agent";
 import { GjcSessionLoadError, type LoadedGjcSessionFile } from "./session-loader-contract";
 import { decodeSessionEntry, decodeSessionHeader } from "./session-transcript-decoder";
@@ -13,6 +13,12 @@ export async function loadHeldGjcSessionFile(sessionRoot: string, filePath: stri
 	let handle: FileHandle | undefined;
 	try {
 		const root = await canonicalSessionRoot(sessionRoot);
+		// Reject any symlink in the path BEFORE opening: a non-Linux host has no
+		// /proc/self/fd descriptor proof, so an intermediate symlink swapped in
+		// before open() would let the held descriptor escape the root while the
+		// post-open pathname checks still pass (TOCTOU). Every component must be
+		// a real directory (or the terminal file) with no symlink.
+		await assertNoSymlinkComponents(root, filePath);
 		await assertRealpathContained(root, filePath);
 		handle = await open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
 		await assertHeldDescriptorContained(root, filePath, handle);
@@ -145,12 +151,41 @@ async function canonicalSessionRoot(sessionRoot: string): Promise<string> {
 async function assertHeldDescriptorContained(root: string, filePath: string, handle: FileHandle): Promise<void> {
 	// On Linux the held descriptor's real path proves the candidate did not
 	// escape the session root through a symlink opened before the lstat check.
-	// Portable platforms lack /proc; the pre-open realpath containment check
-	// plus the post-open stat identity check below still bound the candidate.
+	// Portable platforms lack /proc; assertNoSymlinkComponents() ran before
+	// open() so every path component was verified real and symlink-free, and
+	// the post-open stat identity check below still bounds the candidate.
 	if (process.platform === "linux") {
 		const heldPath = await realpath(`/proc/self/fd/${handle.fd}`);
 		if (!isContained(root, heldPath))
 			throw corruptFile(filePath, `GJC session candidate escapes session root through a symlink: ${filePath}`);
+	}
+}
+
+/**
+ * Verifies every path component from the root down to the file is a real
+ * directory (or the terminal file) with no symlink, closing the descriptor-proof
+ * gap on platforms without /proc/self/fd. A component swapped for a symlink
+ * between this check and open() is caught by the post-open realpath and the
+ * device/inode identity comparison.
+ */
+async function assertNoSymlinkComponents(root: string, filePath: string): Promise<void> {
+	// Resolve the parent through realpath so a platform-equivalent spelling
+	// (macOS /var -> /private/var) cannot make a legitimate in-root candidate
+	// look like it escaped; the terminal file name is appended unchanged.
+	const parent = await realpath(dirname(filePath));
+	const canonicalCandidate = `${parent}${sep}${basename(filePath)}`;
+	const fromRoot = relative(root, canonicalCandidate);
+	if (fromRoot === "" || fromRoot.startsWith("..") || isAbsolute(fromRoot))
+		throw corruptFile(filePath, "outside root");
+	let current = root;
+	const segments = fromRoot.split(sep).filter(segment => segment.length > 0);
+	for (let index = 0; index < segments.length; index += 1) {
+		current = `${current}${sep}${segments[index]}`;
+		const stats = await lstat(current);
+		if (stats.isSymbolicLink())
+			throw corruptFile(filePath, `GJC session candidate path contains a symlink: ${current}`);
+		if (index < segments.length - 1 && !stats.isDirectory())
+			throw corruptFile(filePath, `GJC session candidate path contains a non-directory entry: ${current}`);
 	}
 }
 
