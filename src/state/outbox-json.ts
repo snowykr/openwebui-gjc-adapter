@@ -130,12 +130,57 @@ export function streamEscapedJsonString(raw: string, emit: (chunk: string) => vo
 	flush();
 }
 
+/** Resolves a value the way JSON.stringify's SerializeJSONProperty does:
+ * callable toJSON is invoked with the property key (the root uses ""), and
+ * boxed Number/String/Boolean objects are unwrapped to their primitive
+ * value. Non-object values pass through unchanged. Resolution happens at most
+ * once per level, matching JSON.stringify (a toJSON result is serialized
+ * directly without re-invoking its own toJSON). */
+function resolveJsonValue(value: unknown, key: string): unknown {
+	if (value !== null && typeof value === "object") {
+		const toJSON = (value as { toJSON?: (k: string) => unknown }).toJSON;
+		if (typeof toJSON === "function") return toJSON.call(value, key);
+		if (value instanceof Number) return Number(value);
+		if (value instanceof String) return String(value);
+		if (value instanceof Boolean) return value.valueOf();
+	}
+	return value;
+}
+
+/** Emits an object's serialized head (the opening brace and every
+ * "key":value entry, WITHOUT the closing brace) using the same
+ * JSON.stringify semantics as streamPlainJson: toJSON is invoked per value
+ * with its key, boxed primitives are unwrapped, undefined/function/symbol
+ * values are skipped, and non-finite numbers become null. Values are emitted
+ * incrementally, so an unbounded string field never materializes whole. The
+ * caller appends the trailing "}" (plus any fields it interleaves). */
+export function streamPlainObjectHead(value: Record<string, unknown>, emit: (chunk: string) => void): void {
+	emit("{");
+	let wrote = false;
+	for (const [key, entry0] of Object.entries(value)) {
+		const entry = resolveJsonValue(entry0, key);
+		if (entry === undefined || typeof entry === "function" || typeof entry === "symbol") continue;
+		if (wrote) emit(",");
+		wrote = true;
+		emit(JSON.stringify(key));
+		emit(":");
+		streamPlainJsonResolved(entry, emit);
+	}
+}
+
 /** Emits the same serialization as JSON.stringify(value) (insertion-ordered
- * object keys, undefined/function/symbol object values skipped, array holes
- * and NaN/Infinity as null), but chunk by chunk so the caller never holds the
- * whole serialization in memory at once. toJSON is intentionally not invoked;
- * payloads are plain OpenWebUI data. */
+ * object keys, toJSON invoked with the property key, boxed primitives
+ * unwrapped, undefined/function/symbol object values skipped, array holes and
+ * NaN/Infinity as null), but chunk by chunk so the caller never holds the
+ * whole serialization in memory at once. A value whose toJSON returns
+ * undefined at the root emits "null" (JSON.stringify emits no output there;
+ * projection payloads never hit that case). */
 export function streamPlainJson(value: unknown, emit: (chunk: string) => void): void {
+	streamPlainJsonResolved(resolveJsonValue(value, ""), emit);
+}
+
+/** Serializes an already-resolved value; see streamPlainJson. */
+function streamPlainJsonResolved(value: unknown, emit: (chunk: string) => void): void {
 	if (value === null) {
 		emit("null");
 		return;
@@ -146,7 +191,11 @@ export function streamPlainJson(value: unknown, emit: (chunk: string) => void): 
 		emit('"');
 		return;
 	}
-	if (typeof value === "number" || typeof value === "boolean") {
+	if (typeof value === "number") {
+		emit(Number.isFinite(value) ? JSON.stringify(value) : "null");
+		return;
+	}
+	if (typeof value === "boolean") {
 		emit(JSON.stringify(value));
 		return;
 	}
@@ -159,23 +208,14 @@ export function streamPlainJson(value: unknown, emit: (chunk: string) => void): 
 		emit("[");
 		for (let index = 0; index < value.length; index += 1) {
 			if (index > 0) emit(",");
-			const item = value[index];
+			const item = resolveJsonValue(value[index], String(index));
 			if (item === undefined || typeof item === "function" || typeof item === "symbol") emit("null");
-			else streamPlainJson(item, emit);
+			else streamPlainJsonResolved(item, emit);
 		}
 		emit("]");
 		return;
 	}
-	emit("{");
-	let wrote = false;
-	for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-		if (entry === undefined || typeof entry === "function" || typeof entry === "symbol") continue;
-		if (wrote) emit(",");
-		wrote = true;
-		emit(JSON.stringify(key));
-		emit(":");
-		streamPlainJson(entry, emit);
-	}
+	streamPlainObjectHead(value as Record<string, unknown>, emit);
 	emit("}");
 }
 

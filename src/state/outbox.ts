@@ -18,6 +18,7 @@ export {
 	streamCanonicalJson,
 	streamEscapedJsonString,
 	streamPlainJson,
+	streamPlainObjectHead,
 } from "./outbox-json";
 export type {
 	EnqueueProjectionOperationInput,

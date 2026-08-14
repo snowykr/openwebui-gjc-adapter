@@ -22,6 +22,7 @@ import {
 	nodeOutboxFileSystem,
 	type OutboxFileSystem,
 	type OutboxStore,
+	streamPlainJson,
 } from "../src/state/outbox";
 import { reconcilePendingOperations } from "../src/state/reconciler";
 import { messageEntry, writeSessionFile } from "./session-sync-fixtures";
@@ -104,6 +105,31 @@ describe("InMemoryOutboxStore", () => {
 		expect(left).toBe(right);
 		expect(left).toHaveLength(64);
 		expect(left).not.toBe(buildProjectionPayloadHash({ chatId: "chat-2" }));
+	});
+
+	test("streams plain JSON byte-identically to JSON.stringify including toJSON and non-finite numbers", () => {
+		// streamPlainJson is used for event payload hashing: a value whose
+		// serialization differs from JSON.stringify (a Date/boxed primitive via
+		// toJSON, or NaN/Infinity) would hash differently before persistence
+		// than after the WAL's JSON.stringify/parse round trip, making startup
+		// synthesis reject a valid stored row.
+		const samples: unknown[] = [
+			{ when: new Date("2026-01-01T00:00:00.000Z") },
+			[new Date("2026-01-01T00:00:00.000Z"), 1],
+			{ a: NaN, b: Infinity, c: -Infinity },
+			[NaN, Infinity],
+			{ n: new Number(5), s: new String("x"), b: new Boolean(false) },
+			{ custom: { toJSON: () => "serialized", other: 1 } },
+			{ keyed: { toJSON: (key: string) => `k=${key}` } },
+			{ chain: { toJSON: () => ({ toJSON: () => "double", v: 1 }) } },
+			{ deep: { inner: new Date(0) } },
+			{ holes: Array(3) },
+		];
+		for (const sample of samples) {
+			let streamed = "";
+			streamPlainJson(sample, chunk => (streamed += chunk));
+			expect(streamed).toBe(JSON.stringify(sample));
+		}
 	});
 });
 

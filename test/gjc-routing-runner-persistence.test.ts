@@ -1542,6 +1542,60 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			rmSync(directory, { recursive: true, force: true });
 		}
 	});
+	test("streams unbounded operation detail and result correlation through boot compaction byte-identically", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-detail-correlation-"));
+		const filePath = join(directory, "mappings.json");
+		const walPath = `${filePath}.wal`;
+		try {
+			const writer = new FileSessionAuthority(filePath);
+			writer.set(mappingInput(mediumSelection));
+			writer.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+			expect(statSync(filePath).size).toBeLessThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const lines = readFileSync(walPath, "utf8").trimEnd().split("\n");
+			const lastHead = (JSON.parse(lines[lines.length - 1]!) as { readonly head: string }).head;
+			const chunk = "x".repeat(512 * 1024);
+			// SessionOperation.detail and a string-valued result.correlation are
+			// unbounded by validation but were still eagerly materialized inside
+			// JSON.stringify(rest)/JSON.stringify(resultRest): the remaining
+			// object metadata must stream too, byte-identically, so an oversized
+			// valid authority does not allocate a payload-sized string again.
+			const bigDetail = `${chunk.repeat(66)}\n"quoted"\\backslash\u0001 tail`;
+			const bigCorrelationValue = `${chunk.repeat(66)}\ncorrelation-value`;
+			const document = validAuthorityDocument();
+			document.provisionalOperations = [];
+			const record = document.mappings[0];
+			record.journal[0]!.detail = bigDetail;
+			record.journal[0]!.result!.correlation = {
+				closeStatus: "closed",
+				mappingOperationId: bigCorrelationValue,
+			};
+			const body = {
+				kind: "openwebui-gjc-session-authority-wal",
+				version: 2,
+				records: [record],
+				provisional: [],
+				prevHash: lastHead,
+			};
+			const head = createHash("sha256").update(lastHead).update("\n").update(JSON.stringify(body)).digest("hex");
+			appendFileSync(walPath, `${JSON.stringify({ ...body, head })}\n`);
+			expect(statSync(walPath).size).toBeGreaterThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			expect(store.bootCompaction?.beforeBytes).toBeGreaterThan(0);
+			const reloaded = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
+			const mapping = (reloaded.mappings as Array<Record<string, unknown>>)[0]!;
+			const operation = (mapping.journal as Array<Record<string, unknown>>)[0]!;
+			expect(operation.detail).toBe(bigDetail);
+			const result = operation.result as Record<string, unknown>;
+			expect(result.correlation).toEqual({
+				closeStatus: "closed",
+				mappingOperationId: bigCorrelationValue,
+			});
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
 	test("fails closed on a malformed WAL header", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-malformed-header-")), "mappings.json");
 		const walPath = `${filePath}.wal`;
