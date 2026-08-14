@@ -82,7 +82,15 @@ export function buildSessionMappingPayloadHash(mapping: SessionMapping): string 
 				emit('"');
 			}
 			emit(',"text":');
-			emit(event.text === undefined ? "null" : JSON.stringify(event.text));
+			if (event.text === undefined) emit("null");
+			else {
+				// A retained event text is unbounded; emit the quoted and escaped
+				// value incrementally so a 1 GiB-class assistant/tool event does not
+				// materialize a text-sized string on each hashing pass.
+				emit('"');
+				streamEscapedJsonString(event.text, emit);
+				emit('"');
+			}
 			emit(',"type":');
 			emit(JSON.stringify(event.type));
 			emit("}");

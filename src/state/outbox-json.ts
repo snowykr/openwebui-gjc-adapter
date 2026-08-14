@@ -1,3 +1,7 @@
+import { mkdtempSync, openSync, readSync, closeSync, rmSync, writeSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+
 type CanonicalJsonValue =
 	| null
 	| boolean
@@ -226,17 +230,43 @@ function streamPlainJsonResolved(value: unknown, emit: (chunk: string) => void):
  * bytes means effectful JSON values (a stateful toJSON or getter) are
  * evaluated exactly once, so the measured length always describes exactly the
  * bytes that are hashed; the later WAL JSON.stringify round trip can then
- * never disagree with the stored hash. The spool holds the serialization in
- * memory, so callers must bound it (projection payloads do), and its peak is
- * the serialization size rather than a per-pass re-evaluation. */
+ * never disagree with the stored hash. The producer's bytes are spooled to a
+ * temp file so the heap stays bounded: a 1 GiB-class authority never
+ * materializes a document-sized in-memory snapshot, and the file is removed
+ * before returning. */
 export function hashCanonicalStream(produce: (emit: (chunk: string) => void) => void): string {
-	const chunks: string[] = [];
-	produce(chunk => chunks.push(chunk));
-	const hasher = new Bun.CryptoHasher("sha256");
+	const directory = mkdtempSync(join(tmpdir(), "gjc-hash-spool-"));
+	const spoolPath = join(directory, "spool");
+	const descriptor = openSync(spoolPath, "wx", 0o600);
 	let length = 0;
-	for (const chunk of chunks) length += chunk.length;
-	hasher.update(`${length}:`);
-	for (const chunk of chunks) hasher.update(chunk);
-	hasher.update(";");
-	return hasher.digest("hex");
+	try {
+		produce(chunk => {
+			// The lineage prefix is the sum of chunk.length (UTF-16 code units,
+			// matching the previous in-memory spool) so persisted hashes stay
+			// byte-identical; the file stores the UTF-8 bytes for re-reading.
+			length += chunk.length;
+			writeSync(descriptor, Buffer.from(chunk, "utf8"));
+		});
+	} finally {
+		closeSync(descriptor);
+	}
+	try {
+		const hasher = new Bun.CryptoHasher("sha256");
+		hasher.update(`${length}:`);
+		const reader = openSync(spoolPath, "r");
+		try {
+			const buffer = Buffer.allocUnsafe(64 * 1024);
+			for (;;) {
+				const read = readSync(reader, buffer, 0, buffer.length, null);
+				if (read <= 0) break;
+				hasher.update(buffer.subarray(0, read));
+			}
+		} finally {
+			closeSync(reader);
+		}
+		hasher.update(";");
+		return hasher.digest("hex");
+	} finally {
+		rmSync(directory, { recursive: true, force: true });
+	}
 }
