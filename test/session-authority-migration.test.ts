@@ -7,6 +7,7 @@ import {
 	mkdtempSync,
 	readFileSync,
 	rmSync,
+	statSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
@@ -17,6 +18,7 @@ import {
 	preflightSessionAuthorityMigration,
 	preflightSessionAuthorityMigrationCandidates,
 } from "../src/gjc/session-authority-migration";
+import { FileSessionAuthority } from "../src/gjc/session-authority-persistence";
 
 const NOW = () => "2026-01-01T00:00:00.000Z";
 
@@ -1830,6 +1832,411 @@ describe("session authority pre-store migration", () => {
 			expect(readFileSync(sourcePath)).toEqual(original);
 			expect(readFileSync(auditPath)).toEqual(malformedManifest);
 			expect(readFileSync(result.quarantinePath!)).toEqual(original);
+		});
+	});
+	test("accepts a scoped v2 document carrying the WAL base generation", () => {
+		withRoot((root, sourcePath) => {
+			const document = scopedV2Document();
+			document.generation = "base-generation-uuid";
+			writeFileSync(sourcePath, `${JSON.stringify(document)}\n`);
+
+			const result = preflightSessionAuthorityMigration({
+				sourcePath,
+				stateRoot: root,
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+
+			expect(result.status).toBe("not_needed");
+		});
+	});
+	test("degrades a scoped v2 document with an invalid generation value during preflight", () => {
+		withRoot((root, sourcePath) => {
+			const document = scopedV2Document();
+			document.generation = 42;
+			writeFileSync(sourcePath, `${JSON.stringify(document)}\n`);
+
+			const result = preflightSessionAuthorityMigration({
+				sourcePath,
+				stateRoot: root,
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+
+			expect(result.status).toBe("degraded");
+		});
+	});
+	test("relocates a v2 authority including its WAL-committed mutations", () => {
+		withRoot((root, sourcePath) => {
+			const source = new FileSessionAuthority(sourcePath);
+			source.set({
+				chatId: "chat-1",
+				projectId: "project-1",
+				sessionId: "session-1",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-1",
+			});
+			source.set({
+				chatId: "chat-2",
+				projectId: "project-1",
+				sessionId: "session-2",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-2",
+			});
+			expect(existsSync(`${sourcePath}.wal`)).toBe(true);
+
+			const destinationPath = join(root, "relocated", "authority.json");
+			const result = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [sourcePath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+
+			expect(result.status).toBe("committed");
+			// The relocated document carries the WAL-committed chat-2 mutation.
+			const relocated = readFileSync(destinationPath, "utf8");
+			expect(relocated).toContain("chat-2");
+			expect(new FileSessionAuthority(destinationPath).entries()).toHaveLength(2);
+		});
+	});
+	test("fails closed when the source WAL cannot be read", () => {
+		withRoot((root, sourcePath) => {
+			const destinationPath = join(root, "relocated", "authority.json");
+			const source = new FileSessionAuthority(sourcePath);
+			source.set({
+				chatId: "chat-1",
+				projectId: "project-1",
+				sessionId: "session-1",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-1",
+			});
+			source.set({
+				chatId: "chat-2",
+				projectId: "project-1",
+				sessionId: "session-2",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-2",
+			});
+			expect(existsSync(`${sourcePath}.wal`)).toBe(true);
+			chmodSync(`${sourcePath}.wal`, 0o000);
+
+			// An unreadable WAL must fail closed instead of being treated as
+			// absent (which would silently omit the WAL-only mutation).
+			const result = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [sourcePath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+
+			expect(result.status).toBe("degraded");
+			expect(result.reason).toContain("unreadable or malformed");
+		});
+	});
+	test("ignores a header-only WAL when recognizing a committed migration", () => {
+		withRoot((root, sourcePath) => {
+			const destinationPath = join(root, "relocated", "authority.json");
+			const source = new FileSessionAuthority(sourcePath);
+			source.set({
+				chatId: "chat-1",
+				projectId: "project-1",
+				sessionId: "session-1",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-1",
+			});
+			source.set({
+				chatId: "chat-2",
+				projectId: "project-1",
+				sessionId: "session-2",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-2",
+			});
+			const first = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [sourcePath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+			expect(first.status).toBe("committed");
+			expect(existsSync(`${sourcePath}.wal`)).toBe(false);
+
+			// An interrupted first append leaves a VALID CURRENT header but no
+			// delta: it carries no applicable mutations, so it must not bypass the
+			// committed-candidate shortcut or trigger a source rewrite.
+			const stat = statSync(sourcePath);
+			const baseDoc = JSON.parse(readFileSync(sourcePath, "utf8")) as Record<string, unknown>;
+			writeFileSync(
+				`${sourcePath}.wal`,
+				`${JSON.stringify({
+					kind: "openwebui-gjc-session-authority-wal",
+					version: 2,
+					base: {
+						size: stat.size,
+						mtimeMs: stat.mtimeMs,
+						generation: baseDoc.generation,
+					},
+					prevHash: "openwebui-gjc-session-authority-wal:v2",
+				})}\n`,
+			);
+
+			const second = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [sourcePath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+
+			expect(second.status).toBe("not_needed");
+			expect(new FileSessionAuthority(destinationPath).entries()).toHaveLength(2);
+		});
+	});
+	test("treats a malformed current-WAL delta as corruption", () => {
+		withRoot((root, sourcePath) => {
+			const destinationPath = join(root, "relocated", "authority.json");
+			const source = new FileSessionAuthority(sourcePath);
+			source.set({
+				chatId: "chat-1",
+				projectId: "project-1",
+				sessionId: "session-1",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-1",
+			});
+			source.set({
+				chatId: "chat-2",
+				projectId: "project-1",
+				sessionId: "session-2",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-2",
+			});
+			const first = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [sourcePath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+			expect(first.status).toBe("committed");
+			expect(existsSync(`${sourcePath}.wal`)).toBe(false);
+
+			// A valid current header with a MALFORMED newline-terminated delta:
+			// replay would reject this as corruption, so migration must fail closed
+			// instead of silently omitting the acknowledged mutation.
+			const stat = statSync(sourcePath);
+			const baseDoc = JSON.parse(readFileSync(sourcePath, "utf8")) as Record<string, unknown>;
+			writeFileSync(
+				`${sourcePath}.wal`,
+				`${JSON.stringify({
+					kind: "openwebui-gjc-session-authority-wal",
+					version: 2,
+					base: { size: stat.size, mtimeMs: stat.mtimeMs, generation: baseDoc.generation },
+					prevHash: "openwebui-gjc-session-authority-wal:v2",
+				})}\n{"corrupt":\n`,
+			);
+
+			const second = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [sourcePath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+
+			expect(second.status).toBe("degraded");
+			expect(second.reason).toContain("unreadable or malformed");
+		});
+	});
+	test("ignores an unterminated valid-JSON WAL tail when recognizing a committed migration", () => {
+		withRoot((root, sourcePath) => {
+			const destinationPath = join(root, "relocated", "authority.json");
+			const source = new FileSessionAuthority(sourcePath);
+			source.set({
+				chatId: "chat-1",
+				projectId: "project-1",
+				sessionId: "session-1",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-1",
+			});
+			source.set({
+				chatId: "chat-2",
+				projectId: "project-1",
+				sessionId: "session-2",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-2",
+			});
+			const first = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [sourcePath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+			expect(first.status).toBe("committed");
+			expect(existsSync(`${sourcePath}.wal`)).toBe(false);
+
+			// A crash leaves a valid current header plus a valid-JSON delta WITHOUT
+			// its terminating newline: replay treats the tail as an uncommitted torn
+			// write, so migration must not count it as replayable and must keep the
+			// committed shortcut (otherwise compaction would churn the source digest).
+			const stat = statSync(sourcePath);
+			const baseDoc = JSON.parse(readFileSync(sourcePath, "utf8")) as Record<string, unknown>;
+			const header = JSON.stringify({
+				kind: "openwebui-gjc-session-authority-wal",
+				version: 2,
+				base: { size: stat.size, mtimeMs: stat.mtimeMs, generation: baseDoc.generation },
+				prevHash: "openwebui-gjc-session-authority-wal:v2",
+			});
+			const tornDelta = JSON.stringify({
+				kind: "openwebui-gjc-session-authority-wal",
+				version: 2,
+				records: [],
+				provisional: [],
+				prevHash: "torn-prev-hash",
+				head: "torn-head",
+			});
+			writeFileSync(`${sourcePath}.wal`, `${header}\n${tornDelta}`);
+
+			const second = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [sourcePath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+
+			expect(second.status).toBe("not_needed");
+			expect(new FileSessionAuthority(destinationPath).entries()).toHaveLength(2);
+		});
+	});
+	test("ignores a stale WAL when recognizing a committed migration", () => {
+		withRoot((root, sourcePath) => {
+			const destinationPath = join(root, "relocated", "authority.json");
+			const source = new FileSessionAuthority(sourcePath);
+			source.set({
+				chatId: "chat-1",
+				projectId: "project-1",
+				sessionId: "session-1",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-1",
+			});
+			source.set({
+				chatId: "chat-2",
+				projectId: "project-1",
+				sessionId: "session-2",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-2",
+			});
+			const first = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [sourcePath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+			expect(first.status).toBe("committed");
+			expect(existsSync(`${sourcePath}.wal`)).toBe(false);
+
+			// A crash after base compaction leaves a stale WAL beside the source,
+			// bound to a PREVIOUS base (size/mtime 0). It carries no applicable
+			// mutations, so the committed-candidate check must ignore it instead of
+			// forcing a rewrite that would change the source digest and degrade the
+			// otherwise intact migration.
+			writeFileSync(
+				`${sourcePath}.wal`,
+				`${JSON.stringify({
+					kind: "openwebui-gjc-session-authority-wal",
+					version: 1,
+					base: { size: 0, mtimeMs: 0 },
+				})}\n`,
+			);
+
+			const second = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [sourcePath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+
+			expect(second.status).toBe("not_needed");
+			expect(new FileSessionAuthority(destinationPath).entries()).toHaveLength(2);
+		});
+	});
+	test("merges a candidate's WAL-only mutations after a committed migration", () => {
+		withRoot((root, sourcePath) => {
+			const destinationPath = join(root, "relocated", "authority.json");
+			const source = new FileSessionAuthority(sourcePath);
+			source.set({
+				chatId: "chat-1",
+				projectId: "project-1",
+				sessionId: "session-1",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-1",
+			});
+			source.set({
+				chatId: "chat-2",
+				projectId: "project-1",
+				sessionId: "session-2",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-2",
+			});
+			const first = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [sourcePath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+			expect(first.status).toBe("committed");
+			// The first migration compacted the source WAL into the base.
+			expect(existsSync(`${sourcePath}.wal`)).toBe(false);
+			expect(new FileSessionAuthority(destinationPath).entries()).toHaveLength(2);
+
+			// The retained old path later acknowledges a mutation that exists only
+			// in its WAL.
+			source.set({
+				chatId: "chat-3",
+				projectId: "project-1",
+				sessionId: "session-3",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "user-3",
+			});
+			expect(existsSync(`${sourcePath}.wal`)).toBe(true);
+
+			// The committed-candidate shortcut must not skip: the WAL-only mutation
+			// is compacted into the source base (never silently lost), and the
+			// destination divergence is surfaced loudly.
+			const second = preflightSessionAuthorityMigrationCandidates({
+				candidateSourcePaths: [sourcePath],
+				destinationPath,
+				stateRoot: join(root, "state"),
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+			expect(second.status).toBe("degraded");
+			expect(second.reason).toContain("destination does not match");
+			expect(readFileSync(sourcePath, "utf8")).toContain("chat-3");
+			expect(existsSync(`${sourcePath}.wal`)).toBe(false);
+			expect(new FileSessionAuthority(destinationPath).entries()).toHaveLength(2);
 		});
 	});
 	test("preserves source evidence when the checkpoint path is unreadable", () => {

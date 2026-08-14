@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { DEFAULT_TURN_TIMEOUT_MS } from "../src/config";
@@ -153,7 +153,69 @@ export class RealSelectionHarness {
 	}
 
 	async mappingBytes(): Promise<string> {
-		return readFile(path.join(this.root, "sessions", "openwebui-session-mappings.json"), "utf8");
+		const merged = await this.readAuthorityMerged();
+		if (merged === undefined) throw new Error("Session authority base document is missing");
+		return JSON.stringify(merged, null, 2);
+	}
+
+	async readAuthorityMerged(): Promise<Record<string, unknown> | undefined> {
+		const file = path.join(this.root, "sessions", "openwebui-session-mappings.json");
+		let base: Record<string, unknown>;
+		try {
+			base = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
+		} catch (error) {
+			if (isMissingFile(error)) return undefined;
+			throw error;
+		}
+		const walPath = `${file}.wal`;
+		let walBytes: string;
+		try {
+			walBytes = await readFile(walPath, "utf8");
+		} catch (error) {
+			if (isMissingFile(error)) return base;
+			throw error;
+		}
+		const lines = walBytes.split("\n").filter(line => line.length > 0);
+		if (lines.length === 0) return base;
+		let header: Record<string, unknown> | undefined;
+		try {
+			header = JSON.parse(lines[0]!) as Record<string, unknown>;
+		} catch {
+			return base;
+		}
+		const baseStat = await stat(file);
+		const recordedBase = isRecord(header.base) ? header.base : undefined;
+		if (recordedBase?.size !== baseStat.size || recordedBase?.mtimeMs !== baseStat.mtimeMs) return base;
+		const records = new Map<string, Record<string, unknown>>();
+		const provisional = new Map<string, Record<string, unknown>>();
+		for (const record of Array.isArray(base.mappings) ? base.mappings : []) {
+			if (isRecord(record) && typeof record.chatId === "string") records.set(record.chatId, record);
+		}
+		for (const operation of Array.isArray(base.provisionalOperations) ? base.provisionalOperations : []) {
+			if (isRecord(operation) && typeof operation.chatId === "string")
+				provisional.set(JSON.stringify([operation.chatId, operation.ingressId ?? operation.id]), operation);
+		}
+		for (const line of lines.slice(1)) {
+			let delta: Record<string, unknown> | undefined;
+			try {
+				delta = JSON.parse(line) as Record<string, unknown>;
+			} catch {
+				continue;
+			}
+			if (delta?.kind !== "openwebui-gjc-session-authority-wal") continue;
+			for (const record of Array.isArray(delta.records) ? delta.records : []) {
+				if (isRecord(record) && typeof record.chatId === "string") records.set(record.chatId, record);
+			}
+			for (const item of Array.isArray(delta.provisional) ? delta.provisional : []) {
+				if (isRecord(item) && typeof item.key === "string" && isRecord(item.operation))
+					provisional.set(item.key, item.operation);
+			}
+		}
+		return {
+			...base,
+			mappings: [...records.values()],
+			provisionalOperations: [...provisional.values()],
+		};
 	}
 
 	async mappingEntries(): Promise<readonly Record<string, unknown>[]> {
@@ -174,7 +236,7 @@ export class RealSelectionHarness {
 			outbox: parseOutbox(
 				await readOptional(path.join(this.root, "state", "openwebui-projection-outbox.json"), '{"operations":[]}'),
 			),
-			mapping: await readOptional(path.join(this.root, "sessions", "openwebui-session-mappings.json")),
+			mapping: JSON.stringify(await this.readAuthorityMerged(), null, 2),
 		};
 	}
 
@@ -195,8 +257,15 @@ export class RealSelectionHarness {
 	async removeModelBinding(chatId: string): Promise<void> {
 		const file = path.join(this.root, "sessions", "openwebui-session-mappings.json");
 		const scopedChatId = canonicalSessionMappingKey("owner-selection", chatId);
-		const document = parseMappingDocument(JSON.parse(await readFile(file, "utf8")), scopedChatId);
+		const merged = await this.readAuthorityMerged();
+		if (merged === undefined) throw new Error("Session authority base document is missing");
+		const document = parseMappingDocument(merged, scopedChatId);
 		await writeFile(file, JSON.stringify(document, null, 2), "utf8");
+		try {
+			await unlink(`${file}.wal`);
+		} catch (error) {
+			if (!isMissingFile(error)) throw error;
+		}
 	}
 	async removeOutboxOperations(chatId: string): Promise<void> {
 		const file = path.join(this.root, "state", "openwebui-projection-outbox.json");

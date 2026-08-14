@@ -5,6 +5,8 @@ import { provisionalKey } from "./session-operation-codec";
 export function reconcileSessionAuthority(
 	records: Map<string, SessionAuthorityRecord>,
 	provisional: Map<string, ProvisionalSessionOperation>,
+	dirtyRecords?: Set<string>,
+	dirtyProvisional?: Set<string>,
 ): readonly SessionAuthorityRecord[] {
 	const reconciled: SessionAuthorityRecord[] = [];
 	for (const record of records.values()) {
@@ -31,15 +33,18 @@ export function reconcileSessionAuthority(
 			...(reassignment === undefined ? {} : { reassignment }),
 		};
 		records.set(record.chatId, next);
+		dirtyRecords?.add(record.chatId);
 		reconciled.push(copy(next));
 	}
 	for (const operation of provisional.values()) {
 		if (operation.state !== "pending") continue;
-		provisional.set(provisionalKey(operation.chatId, operation.ingressId ?? operation.id), {
+		const key = provisionalKey(operation.chatId, operation.ingressId ?? operation.id);
+		provisional.set(key, {
 			...operation,
 			state: "uncertain",
 			detail: operation.detail ?? "restart before completion",
 		});
+		dirtyProvisional?.add(key);
 	}
 	return reconciled;
 }

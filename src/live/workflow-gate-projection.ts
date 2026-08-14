@@ -124,16 +124,7 @@ export function synthesizeProjectionRows(
 					})()
 				: mappings.operationScoped({ principalId, chatId: mapping.chatId }, mapping.operationId);
 		if (operation?.state !== "complete" || operation.result?.mapping.operationId !== mapping.operationId) continue;
-		ensureProjectionRows(
-			outbox,
-			{
-				...operation.result.mapping,
-				assistantText: operation.result.assistantText,
-				events: operation.result.events,
-			},
-			principalId ?? ownerUserId,
-			principalId,
-		);
+		ensureProjectionRows(outbox, mapping, principalId ?? ownerUserId, principalId);
 	}
 }
 
@@ -233,22 +224,7 @@ function projectionMapping(
 		if (recorded === undefined && principalId === adminPrincipalId && ownerIsConfiguredAdmin)
 			recorded = mappings.operation(operation.chatId, operationId);
 	}
-	if (recorded !== undefined) {
-		if (
-			recorded.state !== "complete" ||
-			recorded.result === undefined ||
-			recorded.result.mapping.operationId !== operationId
-		)
-			throw new Error(`Projection operation ${operation.operationId} has no completed durable result`);
-		const mapping = {
-			...recorded.result.mapping,
-			assistantText: recorded.result.assistantText,
-			events: recorded.result.events,
-		};
-		assertProjectionMappingPrincipalBinding(mapping, principalId, adminPrincipalId, operation.operationId);
-		return mapping;
-	}
-	const mapping =
+	const currentMapping =
 		principalId === undefined
 			? (() => {
 					const scoped =
@@ -266,6 +242,29 @@ function projectionMapping(
 							: undefined)
 					);
 				})();
+	if (recorded !== undefined) {
+		if (
+			recorded.state !== "complete" ||
+			recorded.result === undefined ||
+			recorded.result.mapping.operationId !== operationId
+		)
+			throw new Error(`Projection operation ${operation.operationId} has no completed durable result`);
+		// Only the CURRENT operation's events are retained on the record; a
+		// complete-but-superseded operation can no longer be reconstructed, so
+		// settle its rows as obsolete (the transcript-driven project sync covers
+		// final chat state).
+		if (currentMapping === undefined || currentMapping.operationId !== operationId)
+			throw new ProjectionObsoleteError(
+				`Projection operation ${operation.operationId} is superseded and no longer retained in the session authority`,
+			);
+		const mapping = {
+			...currentMapping,
+			assistantText: recorded.result.assistantText,
+		};
+		assertProjectionMappingPrincipalBinding(mapping, principalId, adminPrincipalId, operation.operationId);
+		return mapping;
+	}
+	const mapping = currentMapping;
 	if (mapping === undefined || mapping.operationId !== operationId)
 		throw new ProjectionObsoleteError(`Projection operation ${operation.operationId} has no durable session mapping`);
 	if (principalId !== undefined && mapping.principalId !== undefined && mapping.principalId !== principalId)

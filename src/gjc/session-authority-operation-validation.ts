@@ -173,11 +173,10 @@ function isSha256HexDigest(value: unknown): value is string {
 }
 function isOperationResult(value: unknown): value is SessionOperationResult {
 	if (
-		!hasOnlyKeys(value, ["kind", "assistantText", "events", "mapping", "correlation"]) ||
+		!hasOnlyKeys(value, ["kind", "assistantText", "events", "mapping", "correlation", "gate"]) ||
 		(value.kind !== "turn" && value.kind !== "control" && value.kind !== "close") ||
 		typeof value.assistantText !== "string" ||
-		!Array.isArray(value.events) ||
-		!value.events.every(isEvent) ||
+		(value.events !== undefined && (!Array.isArray(value.events) || !value.events.every(isEvent))) ||
 		!hasOnlyKeys(value.mapping, [
 			"chatId",
 			"projectId",
@@ -190,6 +189,16 @@ function isOperationResult(value: unknown): value is SessionOperationResult {
 			"modelSelection",
 			"attachment",
 		])
+	)
+		return false;
+	if (
+		value.gate !== undefined &&
+		(!isRecord(value.gate) ||
+			!hasOnlyKeys(value.gate, ["gateId", "commandId", "turnId", "sessionId"]) ||
+			!isNonEmptyString(value.gate.gateId) ||
+			(value.gate.commandId !== undefined && !isNonEmptyString(value.gate.commandId)) ||
+			(value.gate.turnId !== undefined && !isNonEmptyString(value.gate.turnId)) ||
+			(value.gate.sessionId !== undefined && !isNonEmptyString(value.gate.sessionId)))
 	)
 		return false;
 	const mapping = value.mapping;

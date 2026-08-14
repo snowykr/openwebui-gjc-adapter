@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalSessionMappingKey, SessionAuthority } from "../src/gjc/session-authority";
@@ -42,6 +42,46 @@ function memoryHarness(): StoreHarness {
 		},
 		cleanup: () => {},
 	};
+}
+
+function readAuthorityMerged(filePath: string): any {
+	const base = JSON.parse(readFileSync(filePath, "utf8"));
+	const walPath = `${filePath}.wal`;
+	let walBytes: string;
+	try {
+		walBytes = readFileSync(walPath, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return base;
+		throw error;
+	}
+	const lines = walBytes.split("\n").filter(line => line.length > 0);
+	if (lines.length === 0) return base;
+	let header: any;
+	try {
+		header = JSON.parse(lines[0]!);
+	} catch {
+		return base;
+	}
+	const baseStat = statSync(filePath);
+	if (header?.base?.size !== baseStat.size || header?.base?.mtimeMs !== baseStat.mtimeMs) return base;
+	const records = new Map<string, any>();
+	const provisional = new Map<string, any>();
+	for (const record of base.mappings ?? []) records.set(record.chatId, record);
+	for (const operation of base.provisionalOperations ?? [])
+		provisional.set(JSON.stringify([operation.chatId, operation.ingressId ?? operation.id]), operation);
+	for (const line of lines.slice(1)) {
+		let delta: any;
+		try {
+			delta = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (delta?.kind !== "openwebui-gjc-session-authority-wal") continue;
+		for (const record of delta.records ?? []) records.set(record.chatId, record);
+		for (const item of delta.provisional ?? [])
+			if (item?.key !== undefined) provisional.set(item.key, item.operation);
+	}
+	return { ...base, mappings: [...records.values()], provisionalOperations: [...provisional.values()] };
 }
 
 function fileHarness(): StoreHarness {
@@ -445,6 +485,34 @@ describe("session mapping store authority conformance", () => {
 		});
 	}
 });
+test("file retirement drops the retired record's event payloads from the persisted authority", () => {
+	const directory = mkdtempSync(join(tmpdir(), "gjc-retire-drops-events-"));
+	const filePath = join(directory, "authority.json");
+	const scope = { principalId: "alice", chatId: "chat-1" };
+	try {
+		const store = new FileBackedSessionMappingStore(filePath);
+		store.setScoped(scope, {
+			chatId: "chat-1",
+			projectId: "project-1",
+			sessionId: "session-1",
+			rawFrameCursor: 1,
+			eventCursor: 2,
+			operationId: "op-1",
+			assistantText: "done",
+			events: [{ type: "tool_start", id: "tool-1", payload: { marker: "retire-me-event-payload" } }],
+		});
+		expect(readFileSync(filePath, "utf8")).toContain("retire-me-event-payload");
+
+		store.retireScoped(scope);
+
+		const persisted = readFileSync(filePath, "utf8");
+		expect(persisted).not.toContain("retire-me-event-payload");
+		expect(JSON.parse(persisted).mappings[0]).not.toHaveProperty("events");
+		expect(store.getScoped(scope)).toBeUndefined();
+	} finally {
+		rmSync(directory, { recursive: true, force: true });
+	}
+});
 test("file rejects an invalid retained prior tombstone during a pending reassignment", () => {
 	const directory = mkdtempSync(join(tmpdir(), "gjc-mapping-prior-tombstone-"));
 	const filePath = join(directory, "authority.json");
@@ -476,7 +544,7 @@ test("file rejects an invalid retained prior tombstone during a pending reassign
 		});
 		store.beginProjectReassignment(source.chatId, target.projectId, "project-3");
 
-		const document = JSON.parse(readFileSync(filePath, "utf8"));
+		const document = readAuthorityMerged(filePath);
 		document.mappings[0].reassignment.priorTombstone.chatId = "other-chat";
 		writeFileSync(filePath, JSON.stringify(document));
 

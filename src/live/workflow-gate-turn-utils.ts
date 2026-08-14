@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { SessionMapping } from "../gjc/session-router";
-import { type PendingWorkflowGate, pendingWorkflowGateFromEvent } from "../projection/workflow-gates";
+import { pendingWorkflowGateFromEvent } from "../projection/workflow-gates";
 import type { LiveGatewayRunnerInput } from "./chat-completions";
 
 export function markWorkflowGateAccepted(
@@ -24,7 +24,14 @@ export function workflowGateResponseIdempotencyKey(chatId: string, userMessageId
 	return `${chatId}:${userMessageId}`;
 }
 
-export function workflowGateOperationHash(turn: LiveGatewayRunnerInput, gate: PendingWorkflowGate): string {
+export interface WorkflowGateIdentity {
+	readonly gateId: string;
+	readonly commandId?: string;
+	readonly turnId?: string;
+	readonly sessionId?: string;
+}
+
+export function workflowGateOperationHash(turn: LiveGatewayRunnerInput, gate: WorkflowGateIdentity): string {
 	return createHash("sha256")
 		.update(
 			JSON.stringify({

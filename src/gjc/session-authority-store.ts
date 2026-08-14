@@ -146,6 +146,42 @@ export class SessionAuthority {
 	reconcileRestart(): readonly SessionAuthorityRecord[] {
 		return this.#journal.reconcile();
 	}
+	protected takeDirtyRecords(): readonly SessionAuthorityRecord[] {
+		return this.#journal.takeDirtyRecords();
+	}
+	protected takeDirtyProvisional(): readonly {
+		readonly key: string;
+		readonly operation: ProvisionalSessionOperation;
+	}[] {
+		return this.#journal.takeDirtyProvisional();
+	}
+	protected snapshotJournalForRollback(): {
+		readonly records: ReadonlyMap<string, SessionAuthorityRecord>;
+		readonly provisional: ReadonlyMap<string, ProvisionalSessionOperation>;
+	} {
+		return this.#journal.snapshotReferences();
+	}
+	protected rawJournalEntries(): {
+		readonly records: ReadonlyMap<string, SessionAuthorityRecord>;
+		readonly provisional: ReadonlyMap<string, ProvisionalSessionOperation>;
+	} {
+		return this.#journal.rawEntries();
+	}
+	protected replaceAllWithReferences(
+		records: readonly SessionAuthorityRecord[],
+		provisional: readonly ProvisionalSessionOperation[] = [],
+	): void {
+		this.#journal.replaceReferences(records, provisional);
+	}
+	protected hasDirtyJournal(): boolean {
+		return this.#journal.hasDirty;
+	}
+	protected journalNeedsCompaction(): boolean {
+		return this.#journal.needsCompaction;
+	}
+	protected clearDirtyJournal(): void {
+		this.#journal.clearDirty();
+	}
 	protected replaceAll(
 		records: readonly SessionAuthorityRecord[],
 		provisional: readonly ProvisionalSessionOperation[] = [],

@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { AuthorityMutationLock } from "./session-authority-file";
+import { compactAuthorityForRelocation, walBindingForBase } from "./session-authority-persistence";
 import {
 	type ProvisionalSessionOperation,
 	SESSION_AUTHORITY_MIGRATION_VERSION,
@@ -209,7 +210,13 @@ function candidateMigrationAlreadyCommitted(
 	stateRoot: string,
 	destinationPath: string,
 ): boolean {
+	let lock: ReturnType<typeof AuthorityMutationLock.acquire> | undefined;
 	try {
+		// Hold the source authority mutation lock through the WAL-existence and
+		// digest checks: a concurrent mutation must not append its first WAL
+		// between the check and the skip decision, or the candidate would be
+		// skipped while the destination lacks the newly acknowledged mutation.
+		lock = AuthorityMutationLock.acquire(sourcePath);
 		const paths = migrationPaths(sourcePath, stateRoot, destinationPath);
 		const checkpointState = readCheckpoint(paths.checkpointPath);
 		const checkpoint = checkpointState.value;
@@ -221,6 +228,15 @@ function candidateMigrationAlreadyCommitted(
 			!checkpointMatchesRequest(checkpoint, sourcePath, adminPrincipalId, paths)
 		)
 			return false;
+		// A source WAL may carry acknowledged mutations that exist only beside
+		// the retained old path; the candidate is not "already committed" until
+		// those are merged into the destination. A stale WAL bound to a previous
+		// base (e.g. left by a crash after base compaction) carries no applicable
+		// mutations and must not force a rewrite, while a malformed header fails
+		// closed.
+		const walBinding = walBindingForBase(`${sourcePath}.wal`, sourcePath);
+		if (walBinding === "malformed") throw new Error("authority WAL is unreadable or malformed");
+		if (walBinding === "current") return false;
 		const sourceBytes = readFileIfPresent(sourcePath);
 		const recoveryBytes = readFileIfPresent(checkpoint.sourceRecoveryPath);
 		const destinationBytes = readFileIfPresent(destinationPath);
@@ -235,6 +251,8 @@ function candidateMigrationAlreadyCommitted(
 		);
 	} catch {
 		return false;
+	} finally {
+		lock?.release();
 	}
 }
 function runMigration(
@@ -265,7 +283,36 @@ function runMigration(
 	}
 
 	const sourceExists = existsSync(sourcePath);
-	const sourceBytes = sourceExists ? readFileSync(sourcePath) : undefined;
+	let sourceBytes: Buffer | undefined;
+	if (sourceExists) {
+		// A v2 authority whose latest acknowledged mutations exist only in its
+		// WAL must be compacted (WAL replayed into the base, WAL truncated)
+		// BEFORE the source is read, so relocation/migration copies the complete
+		// committed state instead of silently losing WAL-only mutations. Only
+		// fully valid v2 documents are compacted; anything else is left for the
+		// migration flow's own classification (and an unreadable WAL fails the
+		// preflight loudly instead of losing mutations silently). The source
+		// authority mutation lock is held across the compaction AND the snapshot
+		// read, so a concurrent mutation cannot append a delta that the copied
+		// bytes would omit while the migration reports success.
+		const probe = parseJson(readFileSync(sourcePath));
+		if (probe.ok && isAuthorityDocument(probe.value)) {
+			const lock = AuthorityMutationLock.acquire(sourcePath);
+			try {
+				// Compact only a CURRENT WAL: a stale WAL bound to a previous base
+				// carries no applicable mutations and rewriting the base would only
+				// churn its digest.
+				const walBinding = walBindingForBase(`${sourcePath}.wal`, sourcePath);
+				if (walBinding === "malformed") throw new Error("authority WAL is unreadable or malformed");
+				if (walBinding === "current") compactAuthorityForRelocation(sourcePath, lock);
+				sourceBytes = readFileSync(sourcePath);
+			} finally {
+				lock.release();
+			}
+		} else {
+			sourceBytes = readFileSync(sourcePath);
+		}
+	}
 	const sourceSha256 = sourceBytes === undefined ? undefined : digest(sourceBytes);
 	const manifestState = readManifest(paths.auditPath);
 	let retryingOrphanedProvisionalCheckpoint = false;
@@ -1806,7 +1853,11 @@ function parseLegacyDocument(value: unknown): LegacyDocument | undefined {
 			Array.isArray(value.mappings) &&
 			value.mappings.every(item => !hasScopeMetadata(item)));
 	if (!legacyShape) return undefined;
-	if (Object.keys(value).some(key => !["kind", "version", "mappings", "provisionalOperations"].includes(key)))
+	if (
+		Object.keys(value).some(
+			key => !["kind", "version", "generation", "mappings", "provisionalOperations"].includes(key),
+		)
+	)
 		return undefined;
 	if (!Array.isArray(value.mappings)) return undefined;
 	if (value.provisionalOperations !== undefined && !Array.isArray(value.provisionalOperations)) return undefined;
@@ -1828,7 +1879,10 @@ function isAuthorityDocument(value: unknown): value is {
 	return (
 		value.kind === "openwebui-gjc-session-authority" &&
 		value.version === SESSION_AUTHORITY_VERSION &&
-		Object.keys(value).every(key => ["kind", "version", "mappings", "provisionalOperations"].includes(key)) &&
+		Object.keys(value).every(key =>
+			["kind", "version", "generation", "mappings", "provisionalOperations"].includes(key),
+		) &&
+		(value.generation === undefined || (typeof value.generation === "string" && value.generation.length > 0)) &&
 		Array.isArray(value.mappings) &&
 		value.mappings.every(isV2Record) &&
 		(value.provisionalOperations === undefined ||
@@ -1846,7 +1900,10 @@ function isV2AuthorityContainer(value: unknown): value is {
 		isObject(value) &&
 		value.kind === "openwebui-gjc-session-authority" &&
 		value.version === SESSION_AUTHORITY_VERSION &&
-		Object.keys(value).every(key => ["kind", "version", "mappings", "provisionalOperations"].includes(key)) &&
+		Object.keys(value).every(key =>
+			["kind", "version", "generation", "mappings", "provisionalOperations"].includes(key),
+		) &&
+		(value.generation === undefined || (typeof value.generation === "string" && value.generation.length > 0)) &&
 		Array.isArray(value.mappings)
 	);
 }
