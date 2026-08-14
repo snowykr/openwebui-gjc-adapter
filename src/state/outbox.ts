@@ -12,7 +12,13 @@ import {
 } from "./outbox-types";
 
 export { FileBackedOutboxStore, nodeOutboxFileSystem } from "./file-outbox";
-export { buildProjectionPayloadHash } from "./outbox-json";
+export {
+	buildProjectionPayloadHash,
+	hashCanonicalStream,
+	streamCanonicalJson,
+	streamEscapedJsonString,
+	streamPlainJson,
+} from "./outbox-json";
 export type {
 	EnqueueProjectionOperationInput,
 	OutboxFileSystem,

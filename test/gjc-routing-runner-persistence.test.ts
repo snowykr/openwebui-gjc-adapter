@@ -24,7 +24,12 @@ import {
 	SessionAuthorityDurabilityError,
 } from "../src/gjc/session-authority-persistence";
 import type { ProvisionalSessionOperation, SessionAuthorityRecord } from "../src/gjc/session-authority-types";
-import { FileBackedSessionMappingStore, SessionMappingStore } from "../src/gjc/session-router";
+import {
+	FileBackedSessionMappingStore,
+	normalizeModelSelection,
+	type SessionMapping,
+	SessionMappingStore,
+} from "../src/gjc/session-router";
 import type {
 	GjcControlResult,
 	GjcLifecyclePublicationAddress,
@@ -37,6 +42,7 @@ import { createGjcRoutingLiveGatewayRunner, createPublicSdkGjcTurnRunner } from 
 import { synthesizeProjectionRows } from "../src/live/workflow-gate-projection";
 import { buildSessionMappingPayloadHash } from "../src/live/workflow-gate-turns";
 import { InMemoryOutboxStore } from "../src/state/outbox";
+import { buildProjectionPayloadHash, streamEscapedJsonString, streamPlainJson } from "../src/state/outbox-json";
 import { attachmentProof } from "./gjc-lifecycle-fixtures";
 import { FakeGjcTurnRunner, project } from "./gjc-routing-runner-fixtures";
 import type { SdkFixtureScenario, SdkFixtureServer } from "./gjc-sdk-v3-fixture-types";
@@ -1001,6 +1007,120 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		} finally {
 			rmSync(directory, { recursive: true, force: true });
 		}
+	});
+	test("routes a WAL-only oversized recovery through the reference writer", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-oversized-"));
+		const filePath = join(directory, "mappings.json");
+		const walPath = `${filePath}.wal`;
+		try {
+			// Small base: nothing requires boot compaction on its own.
+			const writer = new FileSessionAuthority(filePath);
+			writer.set(mappingInput(mediumSelection));
+			// A second mutation appends to a v2 WAL (the first write persists the
+			// base directly because the file does not exist yet).
+			writer.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+			expect(statSync(filePath).size).toBeLessThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			// A large delta fsynced just before the normal WAL threshold
+			// compaction: the WAL is oversized and must be replayed, but the
+			// ORIGINAL base is small, so the recovered authority (not the base)
+			// is what exceeds the boot compaction threshold. The recovery must
+			// route through the reference-based compaction writer instead of
+			// persist()'s deep copy of the replayed state.
+			const lines = readFileSync(walPath, "utf8").trimEnd().split("\n");
+			const lastHead = (JSON.parse(lines[lines.length - 1]!) as { readonly head: string }).head;
+			const chunk = "x".repeat(512 * 1024);
+			const events = Array.from({ length: 130 }, (_, index) => ({
+				type: "assistant" as const,
+				text: `event-${index}`,
+				payload: { transcript: `${chunk}-${index}` },
+			}));
+			const document = validAuthorityDocument();
+			document.provisionalOperations = [];
+			const record = document.mappings[0];
+			record.chatId = "chat-9";
+			record.header = { chatId: "chat-9", projectId: record.projectId, sessionId: record.sessionId };
+			record.operationId = "user-9";
+			record.events = events;
+			record.journal[0].id = "user-9";
+			record.journal[0].result.mapping = {
+				chatId: "chat-9",
+				projectId: record.projectId,
+				sessionId: record.sessionId,
+				rawFrameCursor: record.rawFrameCursor,
+				eventCursor: record.eventCursor,
+				operationId: "user-9",
+			};
+			const body = {
+				kind: "openwebui-gjc-session-authority-wal",
+				version: 2,
+				records: [record],
+				provisional: [],
+				prevHash: lastHead,
+			};
+			const head = createHash("sha256").update(lastHead).update("\n").update(JSON.stringify(body)).digest("hex");
+			appendFileSync(walPath, `${JSON.stringify({ ...body, head })}\n`);
+			expect(statSync(walPath).size).toBeGreaterThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			// The reference-based compaction ran (not persist()'s deep copy) and
+			// reported the rewrite.
+			expect(store.bootCompaction?.beforeBytes).toBeGreaterThan(0);
+			// The replayed large authority survived intact.
+			expect(store.get("chat-9")?.events).toHaveLength(130);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+	test("streams projection payload hashes byte-identically to whole-string canonicalization", () => {
+		// The boot synthesis hashes must stay byte-identical to the previous
+		// eager shape (JSON.stringify(event.payload) collected into a mapped
+		// array, then whole-string canonicalization) so stored outbox rows and
+		// persisted projection hashes keep matching across the streaming change.
+		const mapping: SessionMapping = {
+			...mappingInput(mediumSelection),
+			chatId: "chat-1",
+			events: [
+				{
+					type: "assistant",
+					text: "hi",
+					id: "e1",
+					payload: { transcript: [{ role: "assistant", content: "hi" }] },
+				},
+				{
+					type: "user",
+					text: "hello\nworld",
+					id: "e0",
+					payload: { transcript: [{ role: "user", content: "hello\nworld" }] },
+				},
+			],
+		};
+		const legacyShape = {
+			chatId: mapping.chatId,
+			projectId: mapping.projectId,
+			sessionId: mapping.sessionId,
+			sessionFile: mapping.sessionFile ?? null,
+			activeLeaf: mapping.activeLeaf ?? null,
+			rawFrameCursor: mapping.rawFrameCursor,
+			eventCursor: mapping.eventCursor,
+			operationId: mapping.operationId,
+			assistantText: mapping.assistantText ?? null,
+			modelSelection: normalizeModelSelection(mapping.modelSelection) ?? null,
+			events: (mapping.events ?? []).map(event => ({
+				type: event.type,
+				text: event.text ?? null,
+				id: event.id ?? null,
+				payloadJson: event.payload === undefined ? null : JSON.stringify(event.payload),
+			})),
+		};
+		expect(buildSessionMappingPayloadHash(mapping)).toBe(buildProjectionPayloadHash(legacyShape));
+
+		// streamPlainJson / streamEscapedJsonString must reproduce
+		// JSON.stringify and its string-value escape byte for byte.
+		const payload = { a: 'x"y', b: ["\n", "\u0001"], c: { d: "\u{1F600}" } };
+		let streamed = "";
+		streamPlainJson(payload, chunk => streamEscapedJsonString(chunk, fragment => (streamed += fragment)));
+		expect(streamed).toBe(JSON.stringify(JSON.stringify(payload)).slice(1, -1));
 	});
 	test("fails closed on a malformed WAL header", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-malformed-header-")), "mappings.json");

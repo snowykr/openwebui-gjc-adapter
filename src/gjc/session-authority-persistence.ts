@@ -143,14 +143,24 @@ export class FileSessionAuthority extends SessionAuthority {
 			let bootRewrote = false;
 			if (needsRecovery) {
 				if (pendingOperations) super.reconcileRestart(false);
-				if (originalBaseBytes > AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES) {
-					// Oversized recovery (normalized or legacy): write through the
-					// reference-based writer, never persist()'s entries() deep copy
-					// of every retained event payload. For a legacy base the
-					// normalization drops result events; for an already-normalized
-					// oversized base it is a no-op normalization that still writes
-					// from the reference view (no document-sized allocation) and
-					// keeps the marker.
+				// Oversized recovery (normalized or legacy): write through the
+				// reference-based writer, never persist()'s entries() deep copy
+				// of every retained event payload. The decision considers the
+				// ORIGINAL base size AND the size of the replayed live authority:
+				// a WAL below the compaction threshold can still recover to a
+				// document-sized authority (e.g. a large delta fsynced just
+				// before the normal threshold compaction), and that fall-through
+				// to persist() would recreate a document-sized allocation from
+				// the replayed state on every restart. For a legacy base the
+				// normalization drops result events; for an already-normalized
+				// oversized base it is a no-op normalization that still writes
+				// from the reference view (no document-sized allocation) and
+				// keeps the marker.
+				const recoveredAuthorityBytes = this.measureLiveAuthorityBytes();
+				if (
+					originalBaseBytes > AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES ||
+					recoveredAuthorityBytes > AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES
+				) {
 					this.compactFromReferences();
 					bootRewrote = true;
 				} else {
@@ -623,6 +633,22 @@ export class FileSessionAuthority extends SessionAuthority {
 	 * by reference during normalization), the compact base is written with the
 	 * `normalized` marker, and the live journal is replaced with the normalized
 	 * records so the oversized legacy state does not stay resident. */
+	/** Streaming byte length of the live authority's serialized form (records +
+	 * provisional) without materializing any document-sized string: the same
+	 * per-record streaming serializer the boot compaction writer uses, fed into
+	 * a counting sink. Used to route an oversized WAL-recovered authority
+	 * through the reference-based compaction writer instead of persist()'s
+	 * entries() deep copy. */
+	private measureLiveAuthorityBytes(): number {
+		const raw = this.rawJournalEntries();
+		let bytes = 0;
+		const count: ChunkSink = chunk => {
+			bytes += chunk.length;
+		};
+		for (const record of raw.records.values()) streamRecord(record, count);
+		for (const operation of raw.provisional.values()) streamProvisional(operation, count);
+		return bytes;
+	}
 	private compactFromReferences(): void {
 		const raw = this.rawJournalEntries();
 		const mappings = [...raw.records.values()];
@@ -643,7 +669,9 @@ export class FileSessionAuthority extends SessionAuthority {
 		// materialize another whole-document JavaScript string on top of the
 		// parsed authority: each record is stringified on its own (peak bounded
 		// by the largest single record) and flushed through a bounded buffer, with
-		// the content digest accumulated incrementally.
+		// the content digest accumulated incrementally. The record serializers
+		// are module-level so the same streaming bytes also serve the boot
+		// recovered-authority size measurement (measureLiveAuthorityBytes).
 		const contentHash = createHash("sha256");
 		let buffer = "";
 		const flush = () => {
@@ -652,58 +680,9 @@ export class FileSessionAuthority extends SessionAuthority {
 			contentHash.update(buffer);
 			buffer = "";
 		};
-		const writeChunk = (chunk: string) => {
+		const writeChunk: ChunkSink = chunk => {
 			buffer += chunk;
 			if (buffer.length > 1024 * 1024) flush();
-		};
-		// Serialize a record (or tombstone) with retained event arrays streamed
-		// element by element: a 1 GiB sequential-gate record (whose workflow-gate
-		// events normalization must preserve) must not materialize a record-sized
-		// string on top of the parsed authority. The top-level events AND the
-		// events retained inside reassignment tombstones (sourceTombstone / prior
-		// chain) are written per event (peak bounded by the largest single event);
-		// the small non-event fields are serialized as one chunk each.
-		const streamEvents = (events: readonly unknown[] | undefined) => {
-			if (events === undefined || events.length === 0) return;
-			writeChunk(',"events":[');
-			for (let index = 0; index < events.length; index += 1) {
-				if (index > 0) writeChunk(",");
-				writeChunk(JSON.stringify(events[index]));
-			}
-			writeChunk("]");
-		};
-		const streamTombstone = (tombstone: SessionAuthorityTombstone) => {
-			const { events: _tombstoneEvents, prior: priorTombstone, ...rest } = tombstone;
-			writeChunk(JSON.stringify(rest).slice(0, -1));
-			streamEvents(tombstone.events);
-			if (priorTombstone !== undefined) {
-				writeChunk(',"prior":');
-				streamTombstone(priorTombstone);
-			}
-			writeChunk("}");
-		};
-		const streamReassignment = (reassignment: SessionAuthorityReassignment) => {
-			const { sourceTombstone, priorTombstone, ...rest } = reassignment;
-			writeChunk(JSON.stringify(rest).slice(0, -1));
-			if (sourceTombstone !== undefined) {
-				writeChunk(',"sourceTombstone":');
-				streamTombstone(sourceTombstone);
-			}
-			if (priorTombstone !== undefined) {
-				writeChunk(',"priorTombstone":');
-				streamTombstone(priorTombstone);
-			}
-			writeChunk("}");
-		};
-		const streamRecord = (record: SessionAuthorityRecord) => {
-			const { events: _events, reassignment: _reassignment, ...rest } = record;
-			writeChunk(JSON.stringify(rest).slice(0, -1));
-			streamEvents(record.events);
-			if (record.reassignment !== undefined) {
-				writeChunk(',"reassignment":');
-				streamReassignment(record.reassignment);
-			}
-			writeChunk("}");
 		};
 		writeChunk('{"kind":"openwebui-gjc-session-authority","version":');
 		writeChunk(`${SESSION_AUTHORITY_VERSION},"generation":`);
@@ -711,7 +690,7 @@ export class FileSessionAuthority extends SessionAuthority {
 		writeChunk(',"normalized":true,"mappings":[');
 		for (let index = 0; index < normalizedMappings.length; index += 1) {
 			if (index > 0) writeChunk(",");
-			streamRecord(normalizedMappings[index]);
+			streamRecord(normalizedMappings[index], writeChunk);
 		}
 		writeChunk('],"provisionalOperations":[');
 		for (let index = 0; index < normalizedProvisional.length; index += 1) {
@@ -1507,6 +1486,78 @@ function isWalDelta(value: unknown): value is {
 function walDeltaBodyJson(delta: Record<string, unknown>): string {
 	const { head: _head, ...body } = delta;
 	return JSON.stringify(body);
+}
+
+/** Receives serialization chunks; used both by the boot compaction writer
+ * (writing through a bounded buffer) and by the recovered-authority size
+ * measurement (counting bytes). */
+type ChunkSink = (chunk: string) => void;
+
+/** Streams a record's retained event array element by element (peak bounded by
+ * the largest single event) so a 1 GiB sequential-gate record never
+ * materializes a record-sized string on top of the parsed authority. */
+function streamEvents(events: readonly unknown[] | undefined, emit: ChunkSink): void {
+	if (events === undefined || events.length === 0) return;
+	emit(',"events":[');
+	for (let index = 0; index < events.length; index += 1) {
+		if (index > 0) emit(",");
+		emit(JSON.stringify(events[index]));
+	}
+	emit("]");
+}
+/** Streams a tombstone: the small non-event fields as one chunk, the retained
+ * events (and a recursively retained prior tombstone's events) per element. */
+function streamTombstone(tombstone: SessionAuthorityTombstone, emit: ChunkSink): void {
+	const { events: _tombstoneEvents, prior: priorTombstone, ...rest } = tombstone;
+	emit(JSON.stringify(rest).slice(0, -1));
+	streamEvents(tombstone.events, emit);
+	if (priorTombstone !== undefined) {
+		emit(',"prior":');
+		streamTombstone(priorTombstone, emit);
+	}
+	emit("}");
+}
+/** Streams a reassignment: the small non-event fields as one chunk, then each
+ * retained tombstone (sourceTombstone and priorTombstone) recursively. */
+function streamReassignment(reassignment: SessionAuthorityReassignment, emit: ChunkSink): void {
+	const { sourceTombstone, priorTombstone, ...rest } = reassignment;
+	emit(JSON.stringify(rest).slice(0, -1));
+	if (sourceTombstone !== undefined) {
+		emit(',"sourceTombstone":');
+		streamTombstone(sourceTombstone, emit);
+	}
+	if (priorTombstone !== undefined) {
+		emit(',"priorTombstone":');
+		streamTombstone(priorTombstone, emit);
+	}
+	emit("}");
+}
+/** Streams a session authority record with the same per-record layout the
+ * persisted document uses: small fields first, then the retained events (top
+ * level and inside any reassignment tombstones) element by element. */
+function streamRecord(record: SessionAuthorityRecord, emit: ChunkSink): void {
+	const { events: _events, reassignment: _reassignment, ...rest } = record;
+	emit(JSON.stringify(rest).slice(0, -1));
+	streamEvents(record.events, emit);
+	if (record.reassignment !== undefined) {
+		emit(',"reassignment":');
+		streamReassignment(record.reassignment, emit);
+	}
+	emit("}");
+}
+/** Streams a provisional operation, streaming a large retained result event
+ * array element by element the same way streamRecord does. */
+function streamProvisional(operation: ProvisionalSessionOperation, emit: ChunkSink): void {
+	const { result, ...rest } = operation;
+	emit(JSON.stringify(rest).slice(0, -1));
+	if (result !== undefined) {
+		emit(',"result":');
+		const { events, ...resultRest } = result;
+		emit(JSON.stringify(resultRest).slice(0, -1));
+		streamEvents(events, emit);
+		emit("}");
+	}
+	emit("}");
 }
 function isNonEmptyString(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0;

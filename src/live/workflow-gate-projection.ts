@@ -9,11 +9,14 @@ import {
 	projectPendingWorkflowGateMessage,
 } from "../projection/workflow-gates";
 import {
-	buildProjectionPayloadHash,
 	type EnqueueProjectionOperationInput,
+	hashCanonicalStream,
 	type OutboxStore,
 	ProjectionObsoleteError,
 	type ProjectionOperation,
+	streamCanonicalJson,
+	streamEscapedJsonString,
+	streamPlainJson,
 } from "../state/outbox";
 import type { ProjectionOperationApplier } from "../state/reconciler";
 import { formatCanonicalModelId } from "./models";
@@ -39,28 +42,71 @@ export function projectTurnEvents(
 }
 
 export function buildSessionMappingPayloadHash(mapping: SessionMapping): string {
-	return buildProjectionPayloadHash({
-		chatId: mapping.chatId,
-		projectId: mapping.projectId,
-		sessionId: mapping.sessionId,
-		sessionFile: mapping.sessionFile ?? null,
-		activeLeaf: mapping.activeLeaf ?? null,
-		rawFrameCursor: mapping.rawFrameCursor,
-		eventCursor: mapping.eventCursor,
-		operationId: mapping.operationId,
-		assistantText: mapping.assistantText ?? null,
-		modelSelection: normalizeModelSelection(mapping.modelSelection) ?? null,
-		events: (mapping.events ?? []).map(event => ({
-			type: event.type,
-			text: event.text ?? null,
-			id: event.id ?? null,
-			payloadJson: event.payload === undefined ? null : JSON.stringify(event.payload),
-		})),
+	// Stream the canonical serialization instead of materializing the mapped
+	// event array (and its JSON.stringify(event.payload) strings) first: an
+	// oversized record-level event array must not allocate event-sized or
+	// document-sized strings on top of the parsed authority. The emitted bytes
+	// are identical to buildProjectionPayloadHash of the previous object shape.
+	return hashCanonicalStream(emit => {
+		emit('{"activeLeaf":');
+		emit(mapping.activeLeaf === undefined ? "null" : JSON.stringify(mapping.activeLeaf));
+		emit(',"assistantText":');
+		emit(mapping.assistantText === undefined ? "null" : JSON.stringify(mapping.assistantText));
+		emit(',"chatId":');
+		emit(JSON.stringify(mapping.chatId));
+		emit(',"eventCursor":');
+		emit(String(mapping.eventCursor));
+		emit(',"events":[');
+		const events = mapping.events ?? [];
+		for (let index = 0; index < events.length; index += 1) {
+			if (index > 0) emit(",");
+			const event = events[index]!;
+			emit('{"id":');
+			emit(event.id === undefined ? "null" : JSON.stringify(event.id));
+			emit(',"payloadJson":');
+			if (event.payload === undefined) emit("null");
+			else {
+				emit('"');
+				// The payloadJson value is JSON.stringify(event.payload): emit that
+				// serialization chunk by chunk and escape it in flight, so the whole
+				// payload never exists as one eager string either.
+				streamPlainJson(event.payload, chunk => streamEscapedJsonString(chunk, emit));
+				emit('"');
+			}
+			emit(',"text":');
+			emit(event.text === undefined ? "null" : JSON.stringify(event.text));
+			emit(',"type":');
+			emit(JSON.stringify(event.type));
+			emit("}");
+		}
+		emit('],"modelSelection":');
+		const modelSelection = normalizeModelSelection(mapping.modelSelection) ?? null;
+		if (modelSelection === null) emit("null");
+		else streamCanonicalJson(modelSelection, emit);
+		emit(',"operationId":');
+		emit(JSON.stringify(mapping.operationId));
+		emit(',"projectId":');
+		emit(JSON.stringify(mapping.projectId));
+		emit(',"rawFrameCursor":');
+		emit(String(mapping.rawFrameCursor));
+		emit(',"sessionFile":');
+		emit(mapping.sessionFile === undefined ? "null" : JSON.stringify(mapping.sessionFile));
+		emit(',"sessionId":');
+		emit(JSON.stringify(mapping.sessionId));
+		emit("}");
 	});
 }
 
 export function buildEventPayloadHash(events: readonly OpenWebUIMessageEvent[]): string {
-	return buildProjectionPayloadHash({ eventsJson: JSON.stringify(events) });
+	// The previous shape was { eventsJson: JSON.stringify(events) }: emit that
+	// string value without ever materializing the whole events JSON — the array
+	// serialization is streamed and escaped in flight, then wrapped in the
+	// eventsJson key so stored hashes stay byte-identical.
+	return hashCanonicalStream(emit => {
+		emit('{"eventsJson":"');
+		streamPlainJson(events, chunk => streamEscapedJsonString(chunk, emit));
+		emit('"}');
+	});
 }
 
 export function expectedProjectionRows(
