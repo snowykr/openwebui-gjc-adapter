@@ -14,6 +14,8 @@ interface LockSnapshot {
 
 const LOCK_FILE = ".openwebui-gjc-adapter.lock";
 const RECOVERY_ATTEMPTS = 3;
+/** Non-Linux platforms have no PID-reuse-safe start identity; liveness falls back to PID existence. */
+const PORTABLE_PROCESS_IDENTITY = "portable";
 
 /** A crash-recoverable, process-identity lock for one adapter runtime root. */
 export class RuntimeSingletonLock {
@@ -70,9 +72,19 @@ export class RuntimeSingletonLock {
 }
 
 async function currentOwner(): Promise<LockOwner> {
+	if (process.platform !== "linux") {
+		return { pid: process.pid, startTicks: PORTABLE_PROCESS_IDENTITY };
+	}
 	return { pid: process.pid, startTicks: await startTicks(process.pid) };
 }
 async function isLive(owner: LockOwner): Promise<boolean> {
+	if (process.platform !== "linux") {
+		try {
+			return portableProcessIsLive(owner.pid);
+		} catch (error) {
+			throw new Error("Unable to establish adapter runtime lock owner liveness", { cause: error });
+		}
+	}
 	try {
 		return (await startTicks(owner.pid)) === owner.startTicks;
 	} catch (error) {
@@ -80,7 +92,26 @@ async function isLive(owner: LockOwner): Promise<boolean> {
 		throw error;
 	}
 }
+/**
+ * Portable liveness only establishes whether a PID currently exists. A present
+ * PID is therefore always treated as live because portable platforms provide
+ * no safe PID-reuse identity.
+ */
+function portableProcessIsLive(pid: number): boolean {
+	if (!Number.isSafeInteger(pid) || pid < 1) throw new Error("Invalid adapter runtime lock owner PID");
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		if (isMissingProcess(error)) return false;
+		if (isNodeFsError(error, "EPERM")) return true;
+		throw error;
+	}
+}
 async function startTicks(pid: number): Promise<string> {
+	if (process.platform !== "linux") {
+		throw new Error("Adapter runtime lock process identity is unavailable on this platform");
+	}
 	if (!Number.isSafeInteger(pid) || pid < 1) throw new Error("Invalid lock owner PID");
 	const stat = await readFile(`/proc/${pid}/stat`, "utf8");
 	const closing = stat.lastIndexOf(")");
@@ -120,14 +151,19 @@ async function removeSnapshot(file: string, snapshot: LockSnapshot): Promise<voi
 	await unlink(file);
 }
 function isOwner(value: unknown): value is LockOwner {
+	const startTicksValid =
+		typeof (value as LockOwner).startTicks === "string" &&
+		(process.platform === "linux"
+			? /^\d+$/.test((value as LockOwner).startTicks)
+			: /^\d+$/.test((value as LockOwner).startTicks) ||
+				(value as LockOwner).startTicks === PORTABLE_PROCESS_IDENTITY);
 	return (
 		typeof value === "object" &&
 		value !== null &&
 		typeof (value as LockOwner).pid === "number" &&
 		Number.isSafeInteger((value as LockOwner).pid) &&
 		(value as LockOwner).pid > 0 &&
-		typeof (value as LockOwner).startTicks === "string" &&
-		/^\d+$/.test((value as LockOwner).startTicks)
+		startTicksValid
 	);
 }
 function sameOwner(left: LockOwner, right: LockOwner): boolean {
@@ -142,4 +178,7 @@ function isMissingProcess(error: unknown): boolean {
 		error !== null &&
 		((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ESRCH")
 	);
+}
+function isNodeFsError(error: unknown, code: string): boolean {
+	return typeof error === "object" && error !== null && (error as NodeJS.ErrnoException).code === code;
 }

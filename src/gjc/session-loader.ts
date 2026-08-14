@@ -1,5 +1,5 @@
 import { readdir, realpath } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { loadHeldGjcSessionFile } from "./session-discovery-reader";
 import { GjcSessionLoadError, type LoadedGjcSessionFile } from "./session-loader-contract";
 
@@ -107,7 +107,7 @@ export function validateGjcSessionPathWithinRoot(sessionRoot: string, filePath: 
 	if (
 		pathFromRoot.length === 0 ||
 		pathFromRoot === ".." ||
-		pathFromRoot.startsWith(`..${"/"}`) ||
+		pathFromRoot.split(sep).includes("..") ||
 		isAbsolute(pathFromRoot)
 	) {
 		throw new GjcSessionLoadError(filePath, [

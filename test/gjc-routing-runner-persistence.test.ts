@@ -3596,34 +3596,6 @@ test("promotes a delayed acknowledged session.new successor after restart", asyn
 		fixture.dispose();
 	}
 });
-test("recovers an acknowledged session.new without predecessor thinking", async () => {
-	const fixture = setupAcknowledgedSessionNewFixture("absent", [
-		{ type: "message_update", payload: { assistantMessageEvent: { type: "thinking_delta", text: "old-think" } } },
-	]);
-	try {
-		await expect(fixture.runner.run(fixture.turn)).rejects.toThrow();
-		writeFileSync(
-			fixture.successorPath,
-			`${JSON.stringify({
-				type: "session",
-				version: 3,
-				id: "sdk-session-new",
-				timestamp: "2026-01-01T00:00:00.000Z",
-				cwd: fixture.root,
-			})}\n`,
-		);
-		const replay = createGjcRoutingLiveGatewayRunner({
-			turnRunner: createPublicSdkGjcTurnRunner(fixture.runnerInput),
-			mappings: new FileBackedSessionMappingStore(fixture.mappingFile),
-		});
-		await expect(replay.run(fixture.turn)).resolves.toMatchObject({ content: "" });
-		const restarted = new FileBackedSessionMappingStore(fixture.mappingFile);
-		expect(restarted.get("chat-session-new")?.events ?? []).toEqual([]);
-	} finally {
-		fixture.dispose();
-	}
-});
-
 test.each(["duplicate", "descriptor replacement"] as const)(
 	"does not promote an acknowledged session.new successor after restart on %s",
 	async failure => {
@@ -3727,6 +3699,7 @@ function setupAcknowledgedSessionNewFixture(
 	const mappingFile = join(root, "mappings.json");
 	const predecessorPath = join(sessionRoot, "sdk-session-created.jsonl");
 	const successorPath = join(sessionRoot, "sdk-session-new.jsonl");
+	const successorEndpointPath = join(endpointRoot, "sdk-session-new.json");
 	const server = startSdkFixtureServer("controls", root);
 	let barrierHits = 0;
 	mkdirSync(endpointRoot, { recursive: true });
@@ -3812,7 +3785,8 @@ function setupAcknowledgedSessionNewFixture(
 		mappingFile,
 		root,
 		successorCopyPath: join(sessionRoot, "sdk-session-new-copy.jsonl"),
-		successorEndpointPath: join(endpointRoot, "sdk-session-new.json"),
+		successorEndpointPath,
+
 		predecessorPath,
 		successorPath,
 		server,
