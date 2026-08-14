@@ -129,6 +129,11 @@ export class FileSessionAuthority extends SessionAuthority {
 				return;
 			}
 			this.load();
+			// Capture the ORIGINAL base size before any recovery compaction below:
+			// a pending operation, trailing WAL garbage, or an oversized WAL can
+			// shrink the file, and the oversized decision and its health diagnostic
+			// must still reflect the pre-compaction document.
+			const originalBaseBytes = statIdentity(this.filePath)?.size ?? 0;
 			let trailingGarbage = false;
 			if (existsSync(this.walPath)) trailingGarbage = this.replayWal().trailingGarbage;
 			const pendingOperations = this.hasPendingOperations();
@@ -137,7 +142,7 @@ export class FileSessionAuthority extends SessionAuthority {
 				this.persist();
 			}
 			const beforeBytes = statIdentity(this.filePath)?.size ?? 0;
-			if (beforeBytes > AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES && !this.#normalized) {
+			if (originalBaseBytes > AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES && !this.#normalized) {
 				// Compaction from the internal reference view: normalization drops
 				// legacy result event arrays by reference (no deep copy of every
 				// event payload), the compact base is written, and the live journal
@@ -147,7 +152,7 @@ export class FileSessionAuthority extends SessionAuthority {
 				// prevents re-running this on every boot for an authority that
 				// legitimately stays above the threshold.
 				this.compactFromReferences();
-				this.recordBootCompaction(beforeBytes);
+				this.recordBootCompaction(originalBaseBytes);
 			}
 		} finally {
 			if (lock === undefined) held.release();

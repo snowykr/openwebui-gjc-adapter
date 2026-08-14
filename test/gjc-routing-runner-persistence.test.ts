@@ -878,6 +878,35 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			rmSync(directory, { recursive: true, force: true });
 		}
 	});
+	test("reports boot compaction from the original size even when recovery compacts first", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-boot-compaction-recovery-"));
+		const filePath = join(directory, "mappings.json");
+		try {
+			// An oversized legacy document that ALSO has a pending operation: the
+			// recovery branch persists first (shrinking the file), but the boot
+			// compaction diagnostic must still report the ORIGINAL oversized size.
+			const oversized = oversizedAuthorityJson(70 * 1024 * 1024);
+			const document = JSON.parse(oversized.json) as Record<string, unknown>;
+			const mappings = document.mappings as Array<Record<string, unknown>>;
+			const record = mappings[0]!;
+			const journal = record.journal as Array<Record<string, unknown>>;
+			journal.push({
+				id: "pending-op",
+				kind: "prompt",
+				state: "pending",
+				startedAt: "2026-01-01T00:00:00.000Z",
+			});
+			writeFileSync(filePath, JSON.stringify(document));
+			const originalBytes = statSync(filePath).size;
+			expect(originalBytes).toBeGreaterThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			expect(store.bootCompaction?.beforeBytes).toBe(originalBytes);
+			expect(store.bootCompaction?.afterBytes ?? 0).toBeLessThan(originalBytes);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
 	test("fails closed on a malformed WAL header", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-malformed-header-")), "mappings.json");
 		const walPath = `${filePath}.wal`;
