@@ -3,6 +3,7 @@ import type { Stats } from "node:fs";
 import { constants } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { resolveExistingOrProspectivePath as resolveCanonicalProspectivePath } from "./paths";
 
 const DIRECTORY_MODE = 0o700;
 const REGISTRY_MODE = 0o600;
@@ -692,7 +693,11 @@ async function assertResolvedPathInside(targetPath: string, rootPath: string, ph
 }
 
 async function assertNoUnsafeExistingPath(targetPath: string, rootPath: string, label: string): Promise<void> {
-	const relativePath = path.relative(rootPath, path.resolve(targetPath));
+	// Resolve the target through the same canonicalizer the registry uses so a
+	// symlink-equivalent spelling (macOS /var -> /private/var) cannot make a
+	// legitimate registry path look like it escaped the workspaces root.
+	const resolvedTarget = await resolveCanonicalProspectivePath(targetPath);
+	const relativePath = path.relative(rootPath, resolvedTarget);
 	if (relativePath === "" || relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
 		throw new Error(`User workspace ${label} path is outside workspaces root: ${targetPath}`);
 	}
@@ -703,7 +708,7 @@ async function assertNoUnsafeExistingPath(targetPath: string, rootPath: string, 
 			const stats = await fs.lstat(current);
 			if (stats.isSymbolicLink())
 				throw new Error(`User workspace ${label} path must not contain a symlink: ${current}`);
-			if (!stats.isDirectory() && current !== targetPath) {
+			if (!stats.isDirectory() && current !== resolvedTarget) {
 				throw new Error(`User workspace ${label} path contains a non-directory entry: ${current}`);
 			}
 		} catch (error) {

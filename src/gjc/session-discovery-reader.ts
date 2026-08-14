@@ -143,9 +143,15 @@ async function canonicalSessionRoot(sessionRoot: string): Promise<string> {
 }
 
 async function assertHeldDescriptorContained(root: string, filePath: string, handle: FileHandle): Promise<void> {
-	const heldPath = await realpath(`/proc/self/fd/${handle.fd}`);
-	if (!isContained(root, heldPath))
-		throw corruptFile(filePath, `GJC session candidate escapes session root through a symlink: ${filePath}`);
+	// On Linux the held descriptor's real path proves the candidate did not
+	// escape the session root through a symlink opened before the lstat check.
+	// Portable platforms lack /proc; the pre-open realpath containment check
+	// plus the post-open stat identity check below still bound the candidate.
+	if (process.platform === "linux") {
+		const heldPath = await realpath(`/proc/self/fd/${handle.fd}`);
+		if (!isContained(root, heldPath))
+			throw corruptFile(filePath, `GJC session candidate escapes session root through a symlink: ${filePath}`);
+	}
 }
 
 async function assertRealpathContained(root: string, filePath: string): Promise<void> {
