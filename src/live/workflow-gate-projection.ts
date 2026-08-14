@@ -503,31 +503,38 @@ function boundedGateMessage(gate: PendingWorkflowGate): string {
 	// outbox row.
 	const prompt = boundedNullableText(boundedGatePrompt(gate));
 	const options = gate.options ?? [];
-	// Build only enough of the message to determine the bounded label: with
-	// many individually small options, mapping and joining every line would
-	// allocate memory proportional to the whole gate even though only an
-	// 80-char prefix is returned.
-	const prefix = ["### GJC workflow gate pending", "", ...(prompt === null ? [] : [prompt])];
+	// Build only the prefix needed to determine the bounded label: once the
+	// accumulated lines exceed the 80-char window, later options cannot affect
+	// the result, so stop instead of constructing and retaining a line for
+	// every option (a many-option gate would otherwise allocate memory
+	// proportional to the whole gate).
+	const limit = 80;
+	const lines: string[] = ["### GJC workflow gate pending", "", ...(prompt === null ? [] : [prompt])];
+	let accumulated = lines.join("\n");
 	const answerHint =
 		options.length > 0
 			? `Reply with a number from 1 to ${options.length} to continue this GJC session.`
 			: "Reply with the requested approval, rejection, or answer to continue this GJC session.";
-	if (options.length > 0) {
-		prefix.push("");
+	if (options.length > 0 && accumulated.length <= limit) {
+		lines.push("");
+		accumulated += "\n";
 		for (let index = 0; index < options.length; index += 1) {
 			const option = options[index]!;
 			const description = option.description === undefined ? "" : ` - ${boundedText(option.description)}`;
-			prefix.push(`${index + 1}. ${boundedText(stripLeadingChoiceNumber(option.label))}${description}`);
+			const line = `${index + 1}. ${boundedText(stripLeadingChoiceNumber(option.label))}${description}`;
+			if (accumulated.length + line.length + 1 > limit) break;
+			lines.push(line);
+			accumulated += `\n${line}`;
 		}
 	}
-	prefix.push(
+	const tail = [
 		"",
 		`Gate ID: ${boundedText(gate.gateId)}`,
 		`Schema hash: ${boundedText(gate.schemaHash)}`,
 		"",
 		answerHint,
-	);
-	return boundedText(prefix.join("\n"));
+	];
+	return boundedText([...lines, ...tail].join("\n"));
 }
 
 /** Mirrors gatePrompt() from the workflow-gate projection module, but bounded. */
@@ -570,7 +577,11 @@ function boundedEnumPrefix(values: readonly unknown[]): string {
 }
 
 function stripLeadingChoiceNumber(label: string): string {
-	return label.replace(/^\s*\d+\s*[.)]\s*/, "");
+	// Match projectPendingWorkflowGateMessage()'s exact rule: a leading choice
+	// number is stripped only when whitespace follows the punctuation, so
+	// labels like "1.foo" or "1 . foo" keep their prefix and the projected
+	// payload hash stays byte-compatible across the streaming change.
+	return label.replace(/^\s*\d+[.)]\s+/, "");
 }
 
 function stringJsonField(record: Record<string, unknown> | undefined, key: string): string | undefined {
