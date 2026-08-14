@@ -1505,11 +1505,18 @@ function streamEvents(events: readonly unknown[] | undefined, emit: ChunkSink): 
 	}
 	emit("]");
 }
-/** Streams a tombstone: the small non-event fields as one chunk, the retained
- * events (and a recursively retained prior tombstone's events) per element. */
+/** Streams a tombstone: the small non-event fields as one chunk, the journal
+ * operations (streaming any retained result events per element), the retained
+ * events, and a recursively retained prior tombstone's events per element. */
 function streamTombstone(tombstone: SessionAuthorityTombstone, emit: ChunkSink): void {
-	const { events: _tombstoneEvents, prior: priorTombstone, ...rest } = tombstone;
+	const { events: _tombstoneEvents, journal, prior: priorTombstone, ...rest } = tombstone;
 	emit(JSON.stringify(rest).slice(0, -1));
+	emit(',"journal":[');
+	for (let index = 0; index < journal.length; index += 1) {
+		if (index > 0) emit(",");
+		streamJournalOperation(journal[index], emit);
+	}
+	emit("]");
 	streamEvents(tombstone.events, emit);
 	if (priorTombstone !== undefined) {
 		emit(',"prior":');
@@ -1555,14 +1562,15 @@ function streamJournalOperation(operation: SessionOperation, emit: ChunkSink): v
 function streamRecord(record: SessionAuthorityRecord, emit: ChunkSink): void {
 	const { events: _events, reassignment: _reassignment, journal, ...rest } = record;
 	emit(JSON.stringify(rest).slice(0, -1));
-	if (journal !== undefined && journal.length > 0) {
-		emit(',"journal":[');
-		for (let index = 0; index < journal.length; index += 1) {
-			if (index > 0) emit(",");
-			streamJournalOperation(journal[index], emit);
-		}
-		emit("]");
+	// journal is a required v2 record field: always serialize it, including the
+	// empty array (isV2Record requires journal to be an array, so omitting it
+	// would make the next boot reject the rewritten base).
+	emit(',"journal":[');
+	for (let index = 0; index < journal.length; index += 1) {
+		if (index > 0) emit(",");
+		streamJournalOperation(journal[index], emit);
 	}
+	emit("]");
 	streamEvents(record.events, emit);
 	if (record.reassignment !== undefined) {
 		emit(',"reassignment":');

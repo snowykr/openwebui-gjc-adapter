@@ -1273,6 +1273,183 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			rmSync(directory, { recursive: true, force: true });
 		}
 	});
+	test("preserves an empty journal through boot compaction so the rewritten base still validates", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-empty-journal-"));
+		const filePath = join(directory, "mappings.json");
+		const walPath = `${filePath}.wal`;
+		try {
+			const writer = new FileSessionAuthority(filePath);
+			writer.set(mappingInput(mediumSelection));
+			writer.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+			expect(statSync(filePath).size).toBeLessThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const lines = readFileSync(walPath, "utf8").trimEnd().split("\n");
+			const lastHead = (JSON.parse(lines[lines.length - 1]!) as { readonly head: string }).head;
+			const chunk = "x".repeat(512 * 1024);
+			// An empty journal is a REQUIRED v2 record field: isV2Record checks
+			// Array.isArray(journal) and hasOnlyKeys includes "journal", so a
+			// compaction writer that omits the field produces a base the next
+			// boot rejects. The oversized delta forces compaction to run.
+			const document = validAuthorityDocument();
+			document.provisionalOperations = [];
+			const record = document.mappings[0];
+			record.journal = [];
+			record.events = Array.from({ length: 140 }, (_, index) => ({
+				type: "assistant" as const,
+				text: `event-${index}`,
+				payload: { transcript: `${chunk}-${index}` },
+			}));
+			const body = {
+				kind: "openwebui-gjc-session-authority-wal",
+				version: 2,
+				records: [record],
+				provisional: [],
+				prevHash: lastHead,
+			};
+			const head = createHash("sha256").update(lastHead).update("\n").update(JSON.stringify(body)).digest("hex");
+			appendFileSync(walPath, `${JSON.stringify({ ...body, head })}\n`);
+			expect(statSync(walPath).size).toBeGreaterThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			expect(store.bootCompaction?.beforeBytes).toBeGreaterThan(0);
+			// The rewritten base must still parse and validate on the NEXT boot
+			// (the WAL was reset by compaction), so the empty journal field must
+			// be present.
+			const booted = new FileSessionAuthority(filePath);
+			expect(
+				booted
+					.entries()
+					.map(record => record.chatId)
+					.sort(),
+			).toEqual(["chat-1", "chat-2"]);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+	test("streams ambiguous multi-gate events retained inside a tombstone journal through boot compaction", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-tombstone-journal-"));
+		const filePath = join(directory, "mappings.json");
+		const walPath = `${filePath}.wal`;
+		try {
+			const writer = new FileSessionAuthority(filePath);
+			writer.set(mappingInput(mediumSelection));
+			writer.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+			expect(statSync(filePath).size).toBeLessThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const lines = readFileSync(walPath, "utf8").trimEnd().split("\n");
+			const lastHead = (JSON.parse(lines[lines.length - 1]!) as { readonly head: string }).head;
+			const chunk = "x".repeat(512 * 1024);
+			// Normalization preserves ambiguous results (multiple workflow-gate
+			// events) under journal[].result.events: the tombstone serializer
+			// must stream those per element instead of eager-serializing the
+			// whole tombstone journal.
+			const gateEvents = Array.from({ length: 140 }, (_, index) => ({
+				type: "workflow_gate" as const,
+				text: `event-${index}`,
+				payload: {
+					gateId: `gate-${index % 2}`,
+					schemaHash: `schema-${index % 2}`,
+					transcript: `${chunk}-${index}`,
+				},
+			}));
+			const document = validAuthorityDocument();
+			document.provisionalOperations = [];
+			const record = document.mappings[0];
+			// A committed reassignment moves the mapping INTO the target project: the
+			// record's projectId IS the target project, and the tombstone (frozen
+			// under the source project) keeps sourceProjectId === tombstone.projectId.
+			record.projectId = "project-target";
+			record.header = { ...record.header, projectId: "project-target" };
+			record.journal = [
+				{
+					id: "operation-2",
+					kind: "prompt",
+					state: "complete",
+					startedAt: record.createdAt,
+					completedAt: record.createdAt,
+					result: {
+						kind: "turn",
+						assistantText: "done",
+						events: gateEvents,
+						mapping: {
+							chatId: "chat-1",
+							projectId: "project-target",
+							sessionId: record.sessionId,
+							rawFrameCursor: record.rawFrameCursor,
+							eventCursor: record.eventCursor,
+							operationId: "operation-2",
+						},
+					},
+				},
+			];
+			record.operationId = "operation-2";
+			record.events = [];
+			record.reassignment = {
+				state: "committed",
+				sourceProjectId: project.id,
+				targetProjectId: "project-target",
+				startedAt: record.createdAt,
+				completedAt: record.createdAt,
+				sourceTombstone: {
+					version: 2,
+					chatId: "chat-1",
+					projectId: project.id, // frozen under the SOURCE project
+					sessionId: record.sessionId,
+					createdAt: record.createdAt,
+					header: { chatId: "chat-1", projectId: project.id, sessionId: record.sessionId },
+					rawFrameCursor: record.rawFrameCursor,
+					eventCursor: record.eventCursor,
+					operationId: "operation-1",
+					journal: [
+						{
+							id: "operation-1",
+							kind: "prompt",
+							state: "complete",
+							startedAt: record.createdAt,
+							completedAt: record.createdAt,
+							result: {
+								kind: "turn",
+								assistantText: "done",
+								events: gateEvents,
+								mapping: {
+									chatId: "chat-1",
+									projectId: project.id,
+									sessionId: record.sessionId,
+									rawFrameCursor: record.rawFrameCursor,
+									eventCursor: record.eventCursor,
+									operationId: "operation-1",
+								},
+							},
+						},
+					],
+					retiredAt: record.createdAt,
+				},
+			};
+			const body = {
+				kind: "openwebui-gjc-session-authority-wal",
+				version: 2,
+				records: [record],
+				provisional: [],
+				prevHash: lastHead,
+			};
+			const head = createHash("sha256").update(lastHead).update("\n").update(JSON.stringify(body)).digest("hex");
+			appendFileSync(walPath, `${JSON.stringify({ ...body, head })}\n`);
+			expect(statSync(walPath).size).toBeGreaterThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			expect(store.bootCompaction?.beforeBytes).toBeGreaterThan(0);
+			const reloaded = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
+			const mapping = (reloaded.mappings as Array<Record<string, unknown>>)[0]!;
+			const tombstone = (mapping.reassignment as Record<string, unknown>).sourceTombstone as Record<string, unknown>;
+			const tombstoneEvents = (
+				(tombstone.journal as Array<Record<string, unknown>>)[0]?.result as Record<string, unknown> | undefined
+			)?.events;
+			expect(Array.isArray(tombstoneEvents)).toBe(true);
+			expect((tombstoneEvents as unknown[]).length).toBe(140);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
 	test("fails closed on a malformed WAL header", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-malformed-header-")), "mappings.json");
 		const walPath = `${filePath}.wal`;
