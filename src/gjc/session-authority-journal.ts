@@ -184,6 +184,43 @@ export class SessionAuthorityJournal {
 			}
 		return undefined;
 	}
+	/** Copy-free operation state check for boot synthesis: returns the state and
+	 * the result mapping operationId (or the operation id when complete without
+	 * a result) WITHOUT deep-copying the record, its event payloads, or the
+	 * operation result. Callers that only need "is this operation complete and
+	 * current" avoid the document-sized allocation that lookupOperation()'s
+	 * copies would incur for oversized legacy records. */
+	operationStateReference(
+		chatId: string,
+		operationId: string,
+	): { readonly state: SessionOperationState; readonly resultOperationId?: string } | undefined {
+		const record = this.records.get(chatId);
+		if (record === undefined) return undefined;
+		const active = record.journal.find(
+			operation => operation.id === operationId || operation.ingressId === operationId,
+		);
+		if (active !== undefined) {
+			const resultOperationId =
+				active.result === undefined ? undefined : (active.result.mapping?.operationId ?? active.id);
+			return { state: active.state, ...(resultOperationId === undefined ? {} : { resultOperationId }) };
+		}
+		for (const root of reassignmentTombstoneRoots(record.reassignment))
+			for (
+				let tombstone: SessionAuthorityTombstone | undefined = root;
+				tombstone !== undefined;
+				tombstone = tombstone.prior
+			) {
+				const retired = tombstone.journal.find(
+					operation => operation.id === operationId || operation.ingressId === operationId,
+				);
+				if (retired !== undefined) {
+					const resultOperationId =
+						retired.result === undefined ? undefined : (retired.result.mapping?.operationId ?? retired.id);
+					return { state: retired.state, ...(resultOperationId === undefined ? {} : { resultOperationId }) };
+				}
+			}
+		return undefined;
+	}
 	lookupOperationAuthority(
 		chatId: string,
 		operationId: string,

@@ -110,20 +110,24 @@ export function synthesizeProjectionRows(
 	for (const mapping of mappings.mappingRecords()) {
 		const principalId = normalizePrincipalId(mapping.principalId);
 		if (principalId === undefined && configuredAdmin === undefined) continue;
+		// Reference-based operation state check: operation()/operationScoped()
+		// deep-copy the record (recursively cloning large event payloads) and
+		// then copy the result again, which for an oversized legacy record can
+		// recreate the document-sized allocation this boot path avoids.
 		const operation =
 			principalId === undefined
 				? (() => {
 						const scoped =
 							configuredAdmin === undefined
 								? undefined
-								: mappings.operationScoped(
+								: mappings.operationStateReferenceScoped(
 										{ principalId: configuredAdmin, chatId: mapping.chatId },
 										mapping.operationId,
 									);
-						return scoped ?? mappings.operation(mapping.chatId, mapping.operationId);
+						return scoped ?? mappings.operationStateReference(mapping.chatId, mapping.operationId);
 					})()
-				: mappings.operationScoped({ principalId, chatId: mapping.chatId }, mapping.operationId);
-		if (operation?.state !== "complete" || operation.result?.mapping.operationId !== mapping.operationId) continue;
+				: mappings.operationStateReferenceScoped({ principalId, chatId: mapping.chatId }, mapping.operationId);
+		if (operation?.state !== "complete" || operation.resultOperationId !== mapping.operationId) continue;
 		ensureProjectionRows(outbox, mapping, principalId ?? ownerUserId, principalId);
 	}
 }

@@ -63,6 +63,15 @@ export class SessionAuthority {
 	lookupOperation(chatId: string, operationId: string): SessionOperation | undefined {
 		return this.#journal.lookupOperation(chatId, operationId);
 	}
+	/** Copy-free operation state check for boot synthesis (see the journal
+	 * counterpart): avoids the document-sized copies that lookupOperation()
+	 * would incur for oversized legacy records. */
+	operationStateReference(
+		chatId: string,
+		operationId: string,
+	): { readonly state: SessionOperationState; readonly resultOperationId?: string } | undefined {
+		return this.#journal.operationStateReference(chatId, operationId);
+	}
 	lookupOperationAuthority(
 		chatId: string,
 		operationId: string,

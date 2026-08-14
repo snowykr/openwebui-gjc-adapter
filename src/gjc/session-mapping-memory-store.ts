@@ -216,6 +216,29 @@ export class SessionMappingStore {
 			? undefined
 			: this.authority.lookupOperation(chatId, operationId);
 	}
+	/** Copy-free operation state check (state + result mapping operationId)
+	 * without deep-copying the record, its event payloads, or the operation
+	 * result; used by boot projection synthesis to avoid document-sized
+	 * allocations for oversized legacy records. */
+	operationStateReference(
+		chatId: string,
+		operationId: string,
+	): { readonly state: SessionOperationState; readonly resultOperationId?: string } | undefined {
+		const record = this.authority.get(chatId);
+		return record === undefined || isRetiredRecord(record)
+			? undefined
+			: this.authority.operationStateReference(chatId, operationId);
+	}
+	operationStateReferenceScoped(
+		scope: SessionMappingScope,
+		operationId: string,
+	): { readonly state: SessionOperationState; readonly resultOperationId?: string } | undefined {
+		const canonicalScope = canonicalScopeFor(scope);
+		const record = this.authority.get(canonicalScope.key);
+		return record === undefined || !isScopedRecordFor(record, canonicalScope) || isRetiredRecord(record)
+			? undefined
+			: this.authority.operationStateReference(canonicalScope.key, operationId);
+	}
 	operationScoped(scope: SessionMappingScope, operationId: string): SessionOperation | undefined {
 		const canonicalScope = canonicalScopeFor(scope);
 		const record = this.authority.get(canonicalScope.key);
