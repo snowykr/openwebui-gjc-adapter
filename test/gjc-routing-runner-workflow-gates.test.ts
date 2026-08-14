@@ -106,6 +106,33 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 		expect(description!).not.toContain("x".repeat(80));
 		expect(description!).not.toContain("y".repeat(80));
 	});
+	test("preserves the schema-derived gate prompt fallback in the projected label", () => {
+		// A gate without context.prompt/title must keep projectPendingWorkflowGateMessage()'s
+		// schema fallback; dropping it would change the payload hash across an upgrade
+		// and make startup synthesis reject the stored outbox row.
+		const projected = projectTurnEvents(
+			[
+				{
+					type: "workflow_gate",
+					id: "gate-string-1",
+					payload: {
+						gateId: "gate-string-1",
+						schemaHash: "sha256:string",
+						idempotencyKey: "idem-string-1",
+						boundUserMessageId: null,
+						status: "pending",
+						schema: { type: "string" },
+					},
+				},
+			],
+			"gjc/anthropic/claude-sonnet-4:medium",
+		);
+		const description = projected
+			.map(event => (event as { data?: { description?: string } }).data?.description)
+			.find(value => value?.includes("workflow gate pending"));
+		expect(description).toBeDefined();
+		expect(description!).toContain("Answer with the requested text for this workfl");
+	});
 	test("preserves the authenticated principal for workflow gate publication and replay after restart", async () => {
 		const root = mkdtempSync(join(tmpdir(), "gjc-workflow-gate-projection-"));
 		const mappingFile = join(root, "mappings.json");

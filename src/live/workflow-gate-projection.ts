@@ -10,7 +10,6 @@ import {
 	type OutboxStore,
 	ProjectionObsoleteError,
 	type ProjectionOperation,
-	streamCanonicalJson,
 	streamEscapedJsonString,
 	streamPlainJson,
 } from "../state/outbox";
@@ -94,7 +93,19 @@ export function buildSessionMappingPayloadHash(mapping: SessionMapping): string 
 		emit('],"modelSelection":');
 		const modelSelection = normalizeModelSelection(mapping.modelSelection) ?? null;
 		if (modelSelection === null) emit("null");
-		else streamCanonicalJson(modelSelection, emit);
+		else {
+			// streamCanonicalJson() stringifies string leaves with eager
+			// JSON.stringify; provider/modelId are unbounded and could allocate a
+			// field-sized escaped string. Emit the fixed sorted-key shape with
+			// streamEscapedJsonString so the model-selection strings stream too.
+			emit('{"modelId":');
+			emitQuotedOrNull(modelSelection.modelId, emit);
+			emit(',"provider":');
+			emitQuotedOrNull(modelSelection.provider, emit);
+			emit(',"thinkingLevel":');
+			emitQuotedOrNull(modelSelection.thinkingLevel, emit);
+			emit("}");
+		}
 		emit(',"operationId":');
 		emitQuotedOrNull(mapping.operationId, emit);
 		emit(',"projectId":');
@@ -485,30 +496,49 @@ function boundedText(value: string, maxLength = 80): string {
  * the full message for the bounded fields the projection shows.
  */
 function boundedGateMessage(gate: PendingWorkflowGate): string {
-	const prompt = boundedNullableText(
-		stringJsonField(gate.context, "prompt") ?? stringJsonField(gate.context, "title"),
-	);
+	// Mirror projectPendingWorkflowGateMessage()'s prompt fallback (schema
+	// enum/type-derived) so a gate without context.prompt/title projects the
+	// same label before and after the streaming change; dropping the fallback
+	// would change the payload hash across an upgrade and reject the stored
+	// outbox row.
+	const prompt = boundedNullableText(boundedGatePrompt(gate));
 	const options = gate.options ?? [];
-	const optionLines = options.map((option, index) => {
-		const description = option.description === undefined ? "" : ` - ${boundedText(option.description)}`;
-		return `${index + 1}. ${boundedText(stripLeadingChoiceNumber(option.label))}${description}`;
-	});
+	// Build only enough of the message to determine the bounded label: with
+	// many individually small options, mapping and joining every line would
+	// allocate memory proportional to the whole gate even though only an
+	// 80-char prefix is returned.
+	const prefix = ["### GJC workflow gate pending", "", ...(prompt === null ? [] : [prompt])];
 	const answerHint =
 		options.length > 0
 			? `Reply with a number from 1 to ${options.length} to continue this GJC session.`
 			: "Reply with the requested approval, rejection, or answer to continue this GJC session.";
-	const lines = [
-		"### GJC workflow gate pending",
-		"",
-		...(prompt === null ? [] : [prompt]),
-		...(optionLines.length === 0 ? [] : ["", ...optionLines]),
+	if (options.length > 0) {
+		prefix.push("");
+		for (let index = 0; index < options.length; index += 1) {
+			const option = options[index]!;
+			const description = option.description === undefined ? "" : ` - ${boundedText(option.description)}`;
+			prefix.push(`${index + 1}. ${boundedText(stripLeadingChoiceNumber(option.label))}${description}`);
+		}
+	}
+	prefix.push(
 		"",
 		`Gate ID: ${boundedText(gate.gateId)}`,
 		`Schema hash: ${boundedText(gate.schemaHash)}`,
 		"",
 		answerHint,
-	];
-	return boundedText(lines.join("\n"));
+	);
+	return boundedText(prefix.join("\n"));
+}
+
+/** Mirrors gatePrompt() from the workflow-gate projection module, but bounded. */
+function boundedGatePrompt(gate: PendingWorkflowGate): string | undefined {
+	const prompt = stringJsonField(gate.context, "prompt") ?? stringJsonField(gate.context, "title");
+	if (prompt !== undefined) return prompt;
+	const schema = gate.schema;
+	if (schema.enum !== undefined) return `Choose one of: ${schema.enum.map(String).join(", ")}`;
+	if (schema.type === "boolean") return "Answer true/false for this approval gate.";
+	if (schema.type === "string") return "Answer with the requested text for this workflow gate.";
+	return "Answer this workflow gate using the requested structured values.";
 }
 
 function stripLeadingChoiceNumber(label: string): string {
