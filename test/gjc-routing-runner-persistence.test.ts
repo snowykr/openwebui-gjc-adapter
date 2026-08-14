@@ -1369,7 +1369,7 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 
 			const lines = readFileSync(walPath, "utf8").trimEnd().split("\n");
 			const lastHead = (JSON.parse(lines[lines.length - 1]!) as { readonly head: string }).head;
-			const chunk = "x".repeat(512 * 1024);
+			const chunk = "x".repeat(256 * 1024);
 			// Normalization preserves ambiguous results (multiple workflow-gate
 			// events) under journal[].result.events: the tombstone serializer
 			// must stream those per element instead of eager-serializing the
