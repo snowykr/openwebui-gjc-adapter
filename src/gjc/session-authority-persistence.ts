@@ -137,24 +137,27 @@ export class FileSessionAuthority extends SessionAuthority {
 			let trailingGarbage = false;
 			if (existsSync(this.walPath)) trailingGarbage = this.replayWal().trailingGarbage;
 			const pendingOperations = this.hasPendingOperations();
+			let bootRewrote = false;
 			if (trailingGarbage || this.walOversized() || pendingOperations) {
 				if (pendingOperations) super.reconcileRestart(false);
 				this.persist();
+				// A recovery persist rewrote the document; if it was oversized, that
+				// IS the boot compaction (report it from the original size).
+				bootRewrote = originalBaseBytes > AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES;
 			}
-			if (originalBaseBytes > AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES) {
-				if (!this.#normalized) {
-					// No persist has happened during this boot yet: perform the
-					// reference-based compaction (normalization drops legacy result
-					// event arrays by reference, no deep copy, and the live journal
-					// is replaced with the normalized records). The persisted
-					// `normalized` marker prevents re-running this on every boot.
-					this.compactFromReferences();
-				}
-				// Report the compaction whenever startup rewrote an oversized
-				// document: either compactFromReferences just rewrote it, or the
-				// recovery persist already normalized it (marker set above).
-				this.recordBootCompaction(originalBaseBytes);
+			if (originalBaseBytes > AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES && !this.#normalized) {
+				// No persist has happened during this boot yet (the marker is still
+				// the value loaded from a legacy document): perform the
+				// reference-based compaction (normalization drops legacy result
+				// event arrays by reference, no deep copy, and the live journal is
+				// replaced with the normalized records). The persisted `normalized`
+				// marker prevents re-running this on every boot.
+				this.compactFromReferences();
+				bootRewrote = true;
 			}
+			// Report the compaction ONLY when startup actually rewrote an oversized
+			// document (an already-normalized oversized base is left untouched).
+			if (bootRewrote) this.recordBootCompaction(originalBaseBytes);
 		} finally {
 			if (lock === undefined) held.release();
 		}
