@@ -161,8 +161,13 @@ function resolveJsonValue(value: unknown, key: string): unknown {
 export function streamPlainObjectHead(value: Record<string, unknown>, emit: (chunk: string) => void): void {
 	emit("{");
 	let wrote = false;
-	for (const [key, entry0] of Object.entries(value)) {
-		const entry = resolveJsonValue(entry0, key);
+	// Enumerate keys first, then read and serialize each value immediately:
+	// Object.entries() eagerly evaluates every enumerable getter up front,
+	// which diverges from JSON.stringify()'s per-property read-then-serialize
+	// order when an earlier getter mutates a later property (or its toJSON).
+	const keys = Object.keys(value);
+	for (const key of keys) {
+		const entry = resolveJsonValue(Reflect.get(value, key), key);
 		if (entry === undefined || typeof entry === "function" || typeof entry === "symbol") continue;
 		if (wrote) emit(",");
 		wrote = true;

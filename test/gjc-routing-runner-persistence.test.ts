@@ -5,6 +5,7 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
 	rmSync,
 	statSync,
@@ -13,7 +14,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { GjcRuntimeLocations, NormalizedModelSelection } from "../src/contracts";
 import type { PublicSdkSessionPort } from "../src/gjc/public-sdk-contract";
 import { PublicSdkSessionClient } from "../src/gjc/public-sdk-session-port";
@@ -2092,6 +2093,30 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				.map(record => record.chatId)
 				.sort(),
 		).toEqual(["chat-1"]);
+	});
+	test("removes the temporary compaction file after a failed persist", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-compaction-cleanup-")), "mappings.json");
+		const directory = dirname(filePath);
+		const authority = new SmallThresholdFailingFileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		// A failed persist must not leave an uncommitted temporary file behind:
+		// retried startups would otherwise accumulate abandoned authority files.
+		authority.failure = new Error("injected persist failure");
+		expect(() =>
+			authority.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" }),
+		).toThrow();
+		expect(readdirSync(directory).filter(name => name.includes(".tmp-"))).toEqual([]);
+	});
+	test("leaves no temporary compaction file after a committed rewrite", () => {
+		const filePath = join(
+			mkdtempSync(join(tmpdir(), "gjc-session-authority-compaction-cleanup-ok-")),
+			"mappings.json",
+		);
+		const directory = dirname(filePath);
+		const authority = new SmallThresholdFailingFileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+		expect(readdirSync(directory).filter(name => name.includes(".tmp-"))).toEqual([]);
 	});
 	test("compacts the valid WAL prefix on a live reload before appending past garbage", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-live-wal-garbage-")), "mappings.json");

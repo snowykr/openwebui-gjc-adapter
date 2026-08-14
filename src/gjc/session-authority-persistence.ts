@@ -665,47 +665,68 @@ export class FileSessionAuthority extends SessionAuthority {
 		mkdirSync(dirname(this.filePath), { recursive: true });
 		const temporary = `${this.filePath}.tmp-${process.pid}-${Date.now()}`;
 		const descriptor = openSync(temporary, "wx", 0o600);
+		let committed = false;
 		const nextGeneration = randomUUID();
-		// Serialize the document INCREMENTALLY so a 1 GiB-class authority does not
-		// materialize another whole-document JavaScript string on top of the
-		// parsed authority: each record is stringified on its own (peak bounded
-		// by the largest single record) and flushed through a bounded buffer, with
-		// the content digest accumulated incrementally. The record serializers
-		// are module-level so the same streaming bytes also serve the boot
-		// recovered-authority size measurement (measureLiveAuthorityBytes).
 		const contentHash = createHash("sha256");
-		let buffer = "";
-		const flush = () => {
-			if (buffer.length === 0) return;
-			writeFileSync(descriptor, buffer, "utf8");
-			contentHash.update(buffer);
-			buffer = "";
-		};
-		const writeChunk: ChunkSink = chunk => {
-			buffer += chunk;
-			if (buffer.length > 1024 * 1024) flush();
-		};
-		writeChunk('{"kind":"openwebui-gjc-session-authority","version":');
-		writeChunk(`${SESSION_AUTHORITY_VERSION},"generation":`);
-		writeChunk(JSON.stringify(nextGeneration));
-		writeChunk(',"normalized":true,"mappings":[');
-		for (let index = 0; index < normalizedMappings.length; index += 1) {
-			if (index > 0) writeChunk(",");
-			streamRecord(normalizedMappings[index], writeChunk);
-		}
-		writeChunk('],"provisionalOperations":[');
-		for (let index = 0; index < normalizedProvisional.length; index += 1) {
-			if (index > 0) writeChunk(",");
-			streamProvisional(normalizedProvisional[index], writeChunk);
-		}
-		writeChunk("]}\n");
-		flush();
 		try {
-			fsyncSync(descriptor);
+			// Serialize the document INCREMENTALLY so a 1 GiB-class authority does not
+			// materialize another whole-document JavaScript string on top of the
+			// parsed authority: each record is stringified on its own (peak bounded
+			// by the largest single record) and flushed through a bounded buffer, with
+			// the content digest accumulated incrementally. The record serializers
+			// are module-level so the same streaming bytes also serve the boot
+			// recovered-authority size measurement (measureLiveAuthorityBytes).
+			let buffer = "";
+			const flush = () => {
+				if (buffer.length === 0) return;
+				writeFileSync(descriptor, buffer, "utf8");
+				contentHash.update(buffer);
+				buffer = "";
+			};
+			const writeChunk: ChunkSink = chunk => {
+				buffer += chunk;
+				if (buffer.length > 1024 * 1024) flush();
+			};
+			writeChunk('{"kind":"openwebui-gjc-session-authority","version":');
+			writeChunk(`${SESSION_AUTHORITY_VERSION},"generation":`);
+			writeChunk(JSON.stringify(nextGeneration));
+			writeChunk(',"normalized":true,"mappings":[');
+			for (let index = 0; index < normalizedMappings.length; index += 1) {
+				if (index > 0) writeChunk(",");
+				streamRecord(normalizedMappings[index], writeChunk);
+			}
+			writeChunk('],"provisionalOperations":[');
+			for (let index = 0; index < normalizedProvisional.length; index += 1) {
+				if (index > 0) writeChunk(",");
+				streamProvisional(normalizedProvisional[index], writeChunk);
+			}
+			writeChunk("]}\n");
+			flush();
+			try {
+				fsyncSync(descriptor);
+			} finally {
+				closeSync(descriptor);
+			}
+			renameSync(temporary, this.filePath);
+			committed = true;
 		} finally {
-			closeSync(descriptor);
+			// A write failure (e.g. ENOSPC) must not leak the descriptor or a
+			// partially written authority file: close the descriptor and remove
+			// the uncommitted temporary so retried startups do not accumulate
+			// abandoned files.
+			try {
+				if (descriptor >= 0) closeSync(descriptor);
+			} catch {
+				// Already closed or never opened; the commit path closes it.
+			}
+			if (!committed) {
+				try {
+					unlinkSync(temporary);
+				} catch {
+					// The temporary was never created or already removed.
+				}
+			}
 		}
-		renameSync(temporary, this.filePath);
 		try {
 			this.syncDirectory();
 		} catch (error) {

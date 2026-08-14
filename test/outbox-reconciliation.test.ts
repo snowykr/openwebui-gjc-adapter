@@ -133,6 +133,28 @@ describe("InMemoryOutboxStore", () => {
 		}
 	});
 
+	test("streams object properties in JSON.stringify evaluation order", () => {
+		// Object.entries() eagerly reads every enumerable getter before any
+		// value is serialized, which diverges from JSON.stringify()'s
+		// per-property read-then-serialize order when an earlier getter mutates
+		// a later property. The streamed serialization must match JSON.stringify
+		// byte-for-byte so stored hashes agree with the WAL round trip.
+		const order: string[] = [];
+		const stateful = {
+			first: "a",
+			get second(): string {
+				order.push("read-second");
+				stateful.third = "mutated";
+				return "b";
+			},
+			third: "original",
+		};
+		let streamed = "";
+		streamPlainJson(stateful, chunk => (streamed += chunk));
+		expect(streamed).toBe(JSON.stringify(stateful));
+		expect(JSON.parse(streamed)).toMatchObject({ first: "a", second: "b", third: "mutated" });
+	});
+
 	test("hashes canonical stream bytes with a single evaluation of effectful JSON values", () => {
 		// hashCanonicalStream must snapshot the producer's emitted bytes instead
 		// of running the producer twice: a stateful toJSON or getter evaluated
