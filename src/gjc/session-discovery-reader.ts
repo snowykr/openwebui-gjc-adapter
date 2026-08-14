@@ -149,15 +149,38 @@ async function canonicalSessionRoot(sessionRoot: string): Promise<string> {
 }
 
 async function assertHeldDescriptorContained(root: string, filePath: string, handle: FileHandle): Promise<void> {
-	// On Linux the held descriptor's real path proves the candidate did not
-	// escape the session root through a symlink opened before the lstat check.
-	// Portable platforms lack /proc; assertNoSymlinkComponents() ran before
-	// open() so every path component was verified real and symlink-free, and
-	// the post-open stat identity check below still bounds the candidate.
 	if (process.platform === "linux") {
+		// On Linux the held descriptor's real path proves the candidate did not
+		// escape the session root through a symlink opened before the lstat check.
 		const heldPath = await realpath(`/proc/self/fd/${handle.fd}`);
 		if (!isContained(root, heldPath))
 			throw corruptFile(filePath, `GJC session candidate escapes session root through a symlink: ${filePath}`);
+		return;
+	}
+	// Portable hosts have no /proc/self/fd. Bind the held descriptor to the
+	// path it was opened through: reopening /dev/fd/<fd> yields the same file
+	// (same device/inode) as the descriptor, and that must equal the current
+	// path's identity. A directory swapped for an out-of-root symlink between
+	// the lstat walk and open() would make the path resolve to a different
+	// inode, so this closes the remaining race even without a pathname proof.
+	const held = await handle.stat();
+	const probe = await open(`/dev/fd/${handle.fd}`, constants.O_RDONLY | constants.O_NOFOLLOW).catch(() => null);
+	if (probe !== null) {
+		try {
+			const probeStat = await probe.stat();
+			if (probeStat.dev !== held.dev || probeStat.ino !== held.ino)
+				throw corruptFile(filePath, `GJC session candidate descriptor is not stable: ${filePath}`);
+		} finally {
+			await probe.close();
+		}
+	}
+	try {
+		const current = await lstat(filePath);
+		if (!current.isFile() || current.dev !== held.dev || current.ino !== held.ino)
+			throw corruptFile(filePath, `GJC session candidate changed after being opened: ${filePath}`);
+	} catch (error) {
+		if (error instanceof GjcSessionLoadError) throw error;
+		throw corruptFile(filePath, `GJC session candidate changed after being opened: ${filePath}`);
 	}
 }
 

@@ -7,6 +7,7 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
 	statSync,
 	unlinkSync,
@@ -3196,7 +3197,7 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		const filePath = join(root, "mappings.json");
 		const endpointRoot = join(root, ".gjc", "state", "sdk");
 		const predecessorPath = join(sessionRoot, "predecessor.jsonl");
-		const successorPath = join(sessionRoot, "successor.jsonl");
+		const successorPath = join(realpathSync(root), ".gjc", "sessions", "successor.jsonl");
 		writeFileSync(
 			predecessorPath,
 			`${JSON.stringify({ type: "session", version: 3, id: "predecessor", timestamp: "2026-01-01T00:00:00.000Z", cwd: root })}\n`,
@@ -4288,7 +4289,7 @@ test("applies released model selection responses across fresh and continuation t
 		await runner.run(firstTurn);
 		expect(checkedProvisionalPersistence).toBe(true);
 		const persisted = new FileBackedSessionMappingStore(mappingFile).get("same-session");
-		expect(persisted?.sessionFile).toMatch(new RegExp(`^${sessionRoot}/[^/]+\\.jsonl$`));
+		expect(persisted?.sessionFile).toMatch(new RegExp(`^${realpathSync(sessionRoot)}/[^/]+\\.jsonl$`));
 		expect(persisted?.sessionFile).toBeDefined();
 		await runner.run({
 			...firstTurn,
@@ -4575,7 +4576,7 @@ function setupAcknowledgedSessionNewFixture(transcript: "absent" | "valid" | "du
 	const endpointRoot = join(root, ".gjc", "state", "sdk");
 	const mappingFile = join(root, "mappings.json");
 	const predecessorPath = join(sessionRoot, "sdk-session-created.jsonl");
-	const successorPath = join(sessionRoot, "sdk-session-new.jsonl");
+	const successorPath = join(realpathSync(root), ".gjc", "sessions", "sdk-session-new.jsonl");
 	const server = startSdkFixtureServer("controls", root);
 	let barrierHits = 0;
 	mkdirSync(endpointRoot, { recursive: true });
@@ -4979,7 +4980,7 @@ function setupPublicSdkBranchFixture(scenario: SdkFixtureScenario, routingBarrie
 		runnerInput,
 		mappingFile,
 		project: branchProject,
-		successorPath: join(sessionRoot, "sdk-session-successor.jsonl"),
+		successorPath: join(realpathSync(root), ".gjc", "sessions", "sdk-session-successor.jsonl"),
 		turn: {
 			project: branchProject,
 			prompt: "branch successor",

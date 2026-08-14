@@ -3,6 +3,7 @@ import { normalizeModelSelection, type SessionMapping, type SessionMappingStore 
 import type { GjcTurnEvent } from "../gjc/turn-runner";
 import type { OpenWebUIMessageEvent } from "../openwebui/events";
 import { type ProjectableAgentFrame, projectAgentFrame } from "../projection/events";
+import { jsonValueFromUnknown } from "../projection/workflow-gate-schema-parse";
 import { type PendingWorkflowGate, pendingWorkflowGateFromEvent } from "../projection/workflow-gates";
 import {
 	type EnqueueProjectionOperationInput,
@@ -398,8 +399,10 @@ function turnEventToProjectableFrame(event: GjcTurnEvent): ProjectableAgentFrame
 			// option label/description, and the gate identity before boundedText()
 			// truncates: a retained gate with a payload-sized prompt or option
 			// would allocate that whole string during boot projection. Bound each
-			// field first so only a small projected message is ever assembled.
-			label: boundedGateMessage(pendingGate),
+			// field first (parsed straight from the raw payload, without the
+			// full options/schema normalization) so only a small projected
+			// message is ever assembled.
+			label: boundedGateMessage(event),
 			phase: "start",
 			hidden: false,
 			metadata: {
@@ -495,62 +498,95 @@ function boundedText(value: string, maxLength = 80): string {
  * boot projection. The result is byte-identical to boundedText() applied to
  * the full message for the bounded fields the projection shows.
  */
-function boundedGateMessage(gate: PendingWorkflowGate): string {
-	// Mirror projectPendingWorkflowGateMessage()'s prompt fallback (schema
-	// enum/type-derived) so a gate without context.prompt/title projects the
-	// same label before and after the streaming change; dropping the fallback
-	// would change the payload hash across an upgrade and reject the stored
-	// outbox row.
-	const prompt = boundedNullableText(boundedGatePrompt(gate));
-	const options = gate.options ?? [];
-	// Build only the prefix needed to determine the bounded label: once the
-	// accumulated lines exceed the 80-char window, later options cannot affect
-	// the result, so stop instead of constructing and retaining a line for
-	// every option (a many-option gate would otherwise allocate memory
-	// proportional to the whole gate).
+function boundedGateMessage(event: GjcTurnEvent): string {
+	const payload = isRecord(event.payload) ? event.payload : undefined;
+	// Read only the small fields the projected label shows, straight from the
+	// raw payload: pendingWorkflowGateFromEvent() would normalize every option
+	// and the whole schema first, allocating memory proportional to an
+	// option/enum-dominated gate.
+	const gateId = boundedNullableText(
+		stringJsonField(payload, "gateId") ?? stringJsonField(payload, "gate_id") ?? event.id,
+	);
+	const schemaHash = boundedNullableText(
+		stringJsonField(payload, "schemaHash") ?? stringJsonField(payload, "schema_hash") ?? "unknown",
+	);
+	const prompt = boundedNullableText(boundedPayloadPrompt(payload));
+	const rawOptions = Array.isArray(payload?.options) ? (payload.options as unknown[]) : [];
+	// Apply the same filtering as optionsFromUnknown(): only entries with a
+	// string label and a valid JsonValue value are valid options. Raw invalid
+	// entries (e.g. {label:"bad"} without value) must not affect numbering or
+	// the payload hash. Scan incrementally so a many-option gate never retains
+	// a normalised array proportional to the document.
 	const limit = 80;
 	const lines: string[] = ["### GJC workflow gate pending", "", ...(prompt === null ? [] : [prompt])];
 	let accumulated = lines.join("\n");
+	// First pass not needed separately: single scan counts valid options for
+	// the answer hint and emits at most the prefix that fits the bounded
+	// window, renumbering with the filtered index.
+	let filteredTotal = 0;
+	for (const candidate of rawOptions) {
+		if (!isRecord(candidate)) continue;
+		const label = stringJsonField(candidate, "label");
+		const rawValue = (candidate as Record<string, unknown>).value;
+		if (label === undefined || jsonValueFromUnknown(rawValue) === undefined) continue;
+		filteredTotal += 1;
+	}
 	const answerHint =
-		options.length > 0
-			? `Reply with a number from 1 to ${options.length} to continue this GJC session.`
+		filteredTotal > 0
+			? `Reply with a number from 1 to ${filteredTotal} to continue this GJC session.`
 			: "Reply with the requested approval, rejection, or answer to continue this GJC session.";
-	if (options.length > 0 && accumulated.length <= limit) {
+	if (filteredTotal > 0 && accumulated.length <= limit) {
 		lines.push("");
 		accumulated += "\n";
-		for (let index = 0; index < options.length; index += 1) {
-			const option = options[index]!;
-			const description = option.description === undefined ? "" : ` - ${boundedText(option.description)}`;
-			const line = `${index + 1}. ${boundedText(stripLeadingChoiceNumber(option.label))}${description}`;
-			if (accumulated.length + line.length + 1 > limit) break;
+		let emittedFilteredIndex = 0;
+		let doneEmitting = false;
+		for (const candidate of rawOptions) {
+			if (!isRecord(candidate)) continue;
+			const label = stringJsonField(candidate, "label");
+			const rawValue = (candidate as Record<string, unknown>).value;
+			if (label === undefined || jsonValueFromUnknown(rawValue) === undefined) continue;
+			emittedFilteredIndex += 1;
+			if (doneEmitting) continue;
+			const description = stringJsonField(candidate, "description");
+			const descriptionSuffix = description === undefined ? "" : ` - ${boundedText(description)}`;
+			const line = `${emittedFilteredIndex}. ${boundedText(stripLeadingChoiceNumber(label))}${descriptionSuffix}`;
+			const remaining = limit - accumulated.length;
+			if (line.length + 1 > remaining) {
+				if (remaining > 1) lines.push(line.slice(0, remaining - 1));
+				doneEmitting = true;
+				continue;
+			}
 			lines.push(line);
 			accumulated += `\n${line}`;
 		}
 	}
-	const tail = [
-		"",
-		`Gate ID: ${boundedText(gate.gateId)}`,
-		`Schema hash: ${boundedText(gate.schemaHash)}`,
-		"",
-		answerHint,
-	];
+	const tail = ["", `Gate ID: ${gateId ?? "unknown-gate"}`, `Schema hash: ${schemaHash ?? "unknown"}`, "", answerHint];
 	return boundedText([...lines, ...tail].join("\n"));
 }
 
-/** Mirrors gatePrompt() from the workflow-gate projection module, but bounded. */
-function boundedGatePrompt(gate: PendingWorkflowGate): string | undefined {
-	const prompt = stringJsonField(gate.context, "prompt") ?? stringJsonField(gate.context, "title");
-	if (prompt !== undefined) return prompt;
-	const schema = gate.schema;
-	if (schema.enum !== undefined) {
-		// A huge enum must not materialize as one joined string before the
-		// label is truncated; build only the prefix boundedText() will show.
-		const enumPrefix = boundedEnumPrefix(schema.enum);
-		return `Choose one of: ${enumPrefix}`;
+/** Reads the prompt/title from the raw gate payload without schema parsing. */
+function boundedPayloadPrompt(payload: Record<string, unknown> | undefined): string | undefined {
+	const context = payload === undefined ? undefined : payload.context;
+	if (isRecord(context)) {
+		const prompt = stringJsonField(context, "prompt") ?? stringJsonField(context, "title");
+		if (prompt !== undefined) return prompt;
 	}
-	if (schema.type === "boolean") return "Answer true/false for this approval gate.";
-	if (schema.type === "string") return "Answer with the requested text for this workflow gate.";
+	const schema = payload === undefined ? undefined : payload.schema;
+	if (isRecord(schema)) {
+		const enumValue = schema.enum;
+		if (Array.isArray(enumValue)) {
+			// A huge enum must not materialize as one joined string before the
+			// label is truncated; build only the prefix boundedText() will show.
+			return `Choose one of: ${boundedEnumPrefix(enumValue as unknown[])}`;
+		}
+		if (schema.type === "boolean") return "Answer true/false for this approval gate.";
+		if (schema.type === "string") return "Answer with the requested text for this workflow gate.";
+	}
 	return "Answer this workflow gate using the requested structured values.";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** Joins at most enough enum values to exceed the bounded label window. */
@@ -569,7 +605,11 @@ function boundedEnumPrefix(values: readonly unknown[]): string {
 			continue;
 		}
 		const extra = part.length + 2;
-		if (length + extra > limit) break;
+		if (length + extra > limit) {
+			const remaining = limit - length - 2;
+			if (remaining > 0) parts.push(part.slice(0, remaining));
+			break;
+		}
 		parts.push(part);
 		length += extra;
 	}

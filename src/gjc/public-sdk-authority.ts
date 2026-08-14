@@ -1,4 +1,4 @@
-import { closeSync, fstatSync, lstatSync } from "node:fs";
+import { closeSync, fstatSync, lstatSync, realpathSync } from "node:fs";
 import {
 	assertAttachmentAuthority,
 	descriptorPayloadDigest,
@@ -66,12 +66,21 @@ function assertIdentity(
 		typeof metadata !== "object" ||
 		metadata === null ||
 		Reflect.get(metadata, "sessionId") !== authority.expectedSessionId ||
-		Reflect.get(metadata, "cwd") !== authority.expectedCwd ||
+		canonicalCwd(Reflect.get(metadata, "cwd")) !== canonicalCwd(authority.expectedCwd) ||
 		authority.expectedSessionId !== attachment.sessionId ||
 		authority.expectedCwd !== attachment.cwd ||
 		!context.isCurrent()
 	) {
 		throw new SdkV3OperationError("endpoint_stale", "Session endpoint identity changed after attachment");
+	}
+}
+
+function canonicalCwd(cwd: unknown): string | undefined {
+	if (typeof cwd !== "string" || cwd.length === 0) return undefined;
+	try {
+		return realpathSync(cwd);
+	} catch {
+		return cwd;
 	}
 }
 

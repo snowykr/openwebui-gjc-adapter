@@ -660,22 +660,22 @@ export class FileSessionAuthority extends SessionAuthority {
 			!isAuthorityDocumentRelationallyValid(mappings, provisionalOperations)
 		)
 			throw new Error("Refusing to persist an invalid v2 session authority.");
-		const normalizedMappings = mappings.map(normalizeRecordForPersistence);
-		const normalizedProvisional = provisionalOperations.map(normalizeProvisionalForPersistence);
 		mkdirSync(dirname(this.filePath), { recursive: true });
 		const temporary = `${this.filePath}.tmp-${process.pid}-${Date.now()}`;
 		const descriptor = openSync(temporary, "wx", 0o600);
 		let committed = false;
 		const nextGeneration = randomUUID();
 		const contentHash = createHash("sha256");
+		const normalizedMappings: SessionAuthorityRecord[] = [];
+		const normalizedProvisional: ProvisionalSessionOperation[] = [];
 		try {
 			// Serialize the document INCREMENTALLY so a 1 GiB-class authority does not
 			// materialize another whole-document JavaScript string on top of the
-			// parsed authority: each record is stringified on its own (peak bounded
-			// by the largest single record) and flushed through a bounded buffer, with
-			// the content digest accumulated incrementally. The record serializers
-			// are module-level so the same streaming bytes also serve the boot
-			// recovered-authority size measurement (measureLiveAuthorityBytes).
+			// parsed authority: each record is normalized and stringified on its own
+			// (peak bounded by the largest single record) and flushed through a
+			// bounded buffer, with the content digest accumulated incrementally. The
+			// normalized records are retained ONLY for the live journal replacement
+			// below, never duplicated into a second graph for the writer.
 			let buffer = "";
 			const flush = () => {
 				if (buffer.length === 0) return;
@@ -691,14 +691,18 @@ export class FileSessionAuthority extends SessionAuthority {
 			writeChunk(`${SESSION_AUTHORITY_VERSION},"generation":`);
 			writeChunk(JSON.stringify(nextGeneration));
 			writeChunk(',"normalized":true,"mappings":[');
-			for (let index = 0; index < normalizedMappings.length; index += 1) {
+			for (let index = 0; index < mappings.length; index += 1) {
 				if (index > 0) writeChunk(",");
-				streamRecord(normalizedMappings[index], writeChunk);
+				const normalized = normalizeRecordForPersistence(mappings[index]!);
+				normalizedMappings.push(normalized);
+				streamRecord(normalized, writeChunk);
 			}
 			writeChunk('],"provisionalOperations":[');
-			for (let index = 0; index < normalizedProvisional.length; index += 1) {
+			for (let index = 0; index < provisionalOperations.length; index += 1) {
 				if (index > 0) writeChunk(",");
-				streamProvisional(normalizedProvisional[index], writeChunk);
+				const normalized = normalizeProvisionalForPersistence(provisionalOperations[index]!);
+				normalizedProvisional.push(normalized);
+				streamProvisional(normalized, writeChunk);
 			}
 			writeChunk("]}\n");
 			flush();
