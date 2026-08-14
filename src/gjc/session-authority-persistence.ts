@@ -643,7 +643,7 @@ export class FileSessionAuthority extends SessionAuthority {
 		const raw = this.rawJournalEntries();
 		let bytes = 0;
 		const count: ChunkSink = chunk => {
-			bytes += chunk.length;
+			bytes += Buffer.byteLength(chunk, "utf8");
 		};
 		for (const record of raw.records.values()) streamRecord(record, count);
 		for (const operation of raw.provisional.values()) streamProvisional(operation, count);
@@ -695,7 +695,7 @@ export class FileSessionAuthority extends SessionAuthority {
 		writeChunk('],"provisionalOperations":[');
 		for (let index = 0; index < normalizedProvisional.length; index += 1) {
 			if (index > 0) writeChunk(",");
-			writeChunk(JSON.stringify(normalizedProvisional[index]));
+			streamProvisional(normalizedProvisional[index], writeChunk);
 		}
 		writeChunk("]}\n");
 		flush();
@@ -1532,12 +1532,37 @@ function streamReassignment(reassignment: SessionAuthorityReassignment, emit: Ch
 	}
 	emit("}");
 }
+/** Streams a journal operation: the small non-event fields as one chunk,
+ * then the retained result events element by element (normalization preserves
+ * ambiguous results containing multiple workflow-gate events under
+ * result.events, which can reach 1 GiB class for legacy records). */
+function streamJournalOperation(operation: SessionOperation, emit: ChunkSink): void {
+	const { result, ...rest } = operation;
+	emit(JSON.stringify(rest).slice(0, -1));
+	if (result !== undefined) {
+		emit(',"result":');
+		const { events, ...resultRest } = result;
+		emit(JSON.stringify(resultRest).slice(0, -1));
+		streamEvents(events, emit);
+		emit("}");
+	}
+	emit("}");
+}
 /** Streams a session authority record with the same per-record layout the
  * persisted document uses: small fields first, then the retained events (top
- * level and inside any reassignment tombstones) element by element. */
+ * level, inside any reassignment tombstones, and inside normalized journal
+ * results) element by element. */
 function streamRecord(record: SessionAuthorityRecord, emit: ChunkSink): void {
-	const { events: _events, reassignment: _reassignment, ...rest } = record;
+	const { events: _events, reassignment: _reassignment, journal, ...rest } = record;
 	emit(JSON.stringify(rest).slice(0, -1));
+	if (journal !== undefined && journal.length > 0) {
+		emit(',"journal":[');
+		for (let index = 0; index < journal.length; index += 1) {
+			if (index > 0) emit(",");
+			streamJournalOperation(journal[index], emit);
+		}
+		emit("]");
+	}
 	streamEvents(record.events, emit);
 	if (record.reassignment !== undefined) {
 		emit(',"reassignment":');

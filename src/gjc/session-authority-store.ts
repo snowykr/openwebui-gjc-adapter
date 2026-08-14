@@ -19,6 +19,13 @@ export class SessionAuthority {
 		const record = this.#journal.records.get(chatId);
 		return record === undefined ? undefined : copy(record);
 	}
+	/** Copy-free record lookup for boot synthesis: returns the ACTUAL record
+	 * object (shared by reference) so oversized retained payloads are never
+	 * deep-copied while a record is only being inspected (retirement, scope,
+	 * operation state). Consumers must not mutate the returned record. */
+	recordReference(chatId: string): SessionAuthorityRecord | undefined {
+		return this.#journal.records.get(chatId);
+	}
 	entries(): readonly SessionAuthorityRecord[] {
 		return [...this.#journal.records.values()].map(copy);
 	}

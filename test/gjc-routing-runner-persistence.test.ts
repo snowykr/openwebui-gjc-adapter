@@ -1115,12 +1115,163 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		};
 		expect(buildSessionMappingPayloadHash(mapping)).toBe(buildProjectionPayloadHash(legacyShape));
 
+		// A payload whose string ends in an UNMATCHED high surrogate must still
+		// hash byte-identically: JSON.stringify escapes a terminal lone
+		// surrogate (\\ud800) while an unescaped raw code unit would be encoded
+		// by Bun as the replacement character, diverging from stored hashes.
+		const terminalSurrogate = "ends-in-\uD800";
+		expect(JSON.stringify(terminalSurrogate)).toBe('"ends-in-\\ud800"');
+		let escapedTerminal = "";
+		streamEscapedJsonString(terminalSurrogate, chunk => (escapedTerminal += chunk));
+		expect(escapedTerminal).toBe(JSON.stringify(terminalSurrogate).slice(1, -1));
+
 		// streamPlainJson / streamEscapedJsonString must reproduce
 		// JSON.stringify and its string-value escape byte for byte.
 		const payload = { a: 'x"y', b: ["\n", "\u0001"], c: { d: "\u{1F600}" } };
 		let streamed = "";
 		streamPlainJson(payload, chunk => streamEscapedJsonString(chunk, fragment => (streamed += fragment)));
 		expect(streamed).toBe(JSON.stringify(JSON.stringify(payload)).slice(1, -1));
+	});
+	test("routes a CJK-heavy WAL recovery by UTF-8 bytes through the reference writer", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-cjk-"));
+		const filePath = join(directory, "mappings.json");
+		const walPath = `${filePath}.wal`;
+		try {
+			// Small base: nothing requires boot compaction on its own.
+			const writer = new FileSessionAuthority(filePath);
+			writer.set(mappingInput(mediumSelection));
+			writer.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+			expect(statSync(filePath).size).toBeLessThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			// ~26 MiB of CJK characters serialize to ~78 MiB UTF-8 (3 bytes per
+			// code unit) but only ~26 MiB of UTF-16 code units: the recovered
+			// authority must be measured in serialized BYTES so it routes
+			// through the reference-based compaction writer.
+			const lines = readFileSync(walPath, "utf8").trimEnd().split("\n");
+			const lastHead = (JSON.parse(lines[lines.length - 1]!) as { readonly head: string }).head;
+			const cjkChunk = "가".repeat(512 * 1024);
+			const events = Array.from({ length: 52 }, (_, index) => ({
+				type: "assistant" as const,
+				text: `event-${index}`,
+				payload: { transcript: `${cjkChunk}-${index}` },
+			}));
+			const document = validAuthorityDocument();
+			document.provisionalOperations = [];
+			const record = document.mappings[0];
+			record.chatId = "chat-9";
+			record.header = { chatId: "chat-9", projectId: record.projectId, sessionId: record.sessionId };
+			record.operationId = "user-9";
+			record.events = events;
+			record.journal[0].id = "user-9";
+			record.journal[0].result.mapping = {
+				chatId: "chat-9",
+				projectId: record.projectId,
+				sessionId: record.sessionId,
+				rawFrameCursor: record.rawFrameCursor,
+				eventCursor: record.eventCursor,
+				operationId: "user-9",
+			};
+			const body = {
+				kind: "openwebui-gjc-session-authority-wal",
+				version: 2,
+				records: [record],
+				provisional: [],
+				prevHash: lastHead,
+			};
+			const head = createHash("sha256").update(lastHead).update("\n").update(JSON.stringify(body)).digest("hex");
+			appendFileSync(walPath, `${JSON.stringify({ ...body, head })}\n`);
+			// The replayed authority is ~78 MiB of UTF-8 but its UTF-16 length is
+			// below the threshold: only a BYTE-based measurement routes it to the
+			// reference writer.
+			expect(statSync(walPath).size).toBeGreaterThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			expect(store.bootCompaction?.beforeBytes).toBeGreaterThan(0);
+			expect(store.get("chat-9")?.events).toHaveLength(52);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+	test("streams oversized provisional result events through boot compaction", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-provisional-"));
+		const filePath = join(directory, "mappings.json");
+		const walPath = `${filePath}.wal`;
+		try {
+			// A large WAL delta carrying a pending provisional operation whose
+			// normalized result retains a multi-gate event array: replaying it
+			// recovers an oversized authority (small original base) so the boot
+			// compaction writer must serialize the provisional with
+			// streamProvisional (per-event chunks) instead of an eager
+			// provisional-sized string.
+			const writer = new FileSessionAuthority(filePath);
+			writer.set(mappingInput(mediumSelection));
+			writer.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+			expect(statSync(filePath).size).toBeLessThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const lines = readFileSync(walPath, "utf8").trimEnd().split("\n");
+			const lastHead = (JSON.parse(lines[lines.length - 1]!) as { readonly head: string }).head;
+			const chunk = "x".repeat(512 * 1024);
+			// Ambiguous multi-gate events (two workflow-gate events, so no single
+			// gate binding can be synthesized): normalization preserves the
+			// retained array, and the compaction writer must stream it per
+			// element instead of serializing the whole provisional eagerly.
+			const events = Array.from({ length: 140 }, (_, index) => ({
+				type: "workflow_gate" as const,
+				text: `event-${index}`,
+				payload: {
+					gateId: `gate-${index % 2}`, // two distinct gates: ambiguous
+					schemaHash: `schema-${index % 2}`,
+					transcript: `${chunk}-${index}`,
+				},
+			}));
+			const document = validAuthorityDocument();
+			document.mappings[0].journal[0].result.events = [];
+			const provisional = {
+				id: "operation-2",
+				kind: "create",
+				state: "complete",
+				startedAt: (document.mappings[0] as Record<string, unknown>).createdAt as string,
+				completedAt: (document.mappings[0] as Record<string, unknown>).createdAt as string,
+				chatId: "chat-2",
+				projectId: (document.mappings[0] as Record<string, unknown>).projectId as string,
+				result: {
+					kind: "turn",
+					assistantText: "done",
+					events,
+					mapping: {
+						chatId: "chat-2",
+						projectId: (document.mappings[0] as Record<string, unknown>).projectId as string,
+						sessionId: "session-2",
+						rawFrameCursor: 0,
+						eventCursor: 0,
+						operationId: "operation-2",
+					},
+				},
+			};
+			const body = {
+				kind: "openwebui-gjc-session-authority-wal",
+				version: 2,
+				records: [document.mappings[0]],
+				provisional: [{ key: JSON.stringify(["chat-2", "operation-2"]), operation: provisional }],
+				prevHash: lastHead,
+			};
+			const head = createHash("sha256").update(lastHead).update("\n").update(JSON.stringify(body)).digest("hex");
+			appendFileSync(walPath, `${JSON.stringify({ ...body, head })}\n`);
+			expect(statSync(walPath).size).toBeGreaterThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			// The reference-based compaction ran (streaming the provisional) and
+			// reported the rewrite.
+			expect(store.bootCompaction?.beforeBytes).toBeGreaterThan(0);
+
+			const reloaded = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
+			const reloadedProvisional = reloaded.provisionalOperations as Array<Record<string, unknown>>;
+			const reloadedEvents = (reloadedProvisional[0]?.result as Record<string, unknown> | undefined)?.events;
+			expect(Array.isArray(reloadedEvents)).toBe(true);
+			expect((reloadedEvents as unknown[]).length).toBe(140);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
 	});
 	test("fails closed on a malformed WAL header", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-malformed-header-")), "mappings.json");

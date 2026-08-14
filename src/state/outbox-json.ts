@@ -102,13 +102,21 @@ export function streamEscapedJsonString(raw: string, emit: (chunk: string) => vo
 			default:
 				if (code < 0x20) {
 					buffer += `\\u${code.toString(16).padStart(4, "0")}`;
-				} else if (code >= 0xd800 && code <= 0xdbff && index + 1 < raw.length) {
-					const next = raw.charCodeAt(index + 1);
-					if (next >= 0xdc00 && next <= 0xdfff) {
-						buffer += raw[index]!;
-						buffer += raw[index + 1]!;
-						index += 1;
+				} else if (code >= 0xd800 && code <= 0xdbff) {
+					if (index + 1 < raw.length) {
+						const next = raw.charCodeAt(index + 1);
+						if (next >= 0xdc00 && next <= 0xdfff) {
+							buffer += raw[index]!;
+							buffer += raw[index + 1]!;
+							index += 1;
+						} else {
+							buffer += `\\u${code.toString(16).padStart(4, "0")}`;
+						}
 					} else {
+						// A terminal high surrogate is a lone surrogate: JSON.stringify
+						// escapes it (\\ud800) instead of emitting the raw code unit,
+						// which Bun would encode as the replacement character and
+						// diverge from hashes stored by the previous implementation.
 						buffer += `\\u${code.toString(16).padStart(4, "0")}`;
 					}
 				} else if (code >= 0xdc00 && code <= 0xdfff) {

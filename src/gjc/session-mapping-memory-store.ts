@@ -224,7 +224,7 @@ export class SessionMappingStore {
 		chatId: string,
 		operationId: string,
 	): { readonly state: SessionOperationState; readonly resultOperationId?: string } | undefined {
-		const record = this.authority.get(chatId);
+		const record = this.authority.recordReference(chatId);
 		return record === undefined || isRetiredRecord(record)
 			? undefined
 			: this.authority.operationStateReference(chatId, operationId);
@@ -234,7 +234,7 @@ export class SessionMappingStore {
 		operationId: string,
 	): { readonly state: SessionOperationState; readonly resultOperationId?: string } | undefined {
 		const canonicalScope = canonicalScopeFor(scope);
-		const record = this.authority.get(canonicalScope.key);
+		const record = this.authority.recordReference(canonicalScope.key);
 		return record === undefined || !isScopedRecordFor(record, canonicalScope) || isRetiredRecord(record)
 			? undefined
 			: this.authority.operationStateReference(canonicalScope.key, operationId);
