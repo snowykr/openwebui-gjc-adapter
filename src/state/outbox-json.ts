@@ -1,6 +1,6 @@
-import { mkdtempSync, openSync, readSync, closeSync, rmSync, writeSync } from "node:fs";
-import { join } from "node:path";
+import { closeSync, mkdtempSync, openSync, readSync, rmSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 type CanonicalJsonValue =
 	| null
