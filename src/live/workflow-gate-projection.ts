@@ -128,7 +128,22 @@ export function synthesizeProjectionRows(
 					})()
 				: mappings.operationStateReferenceScoped({ principalId, chatId: mapping.chatId }, mapping.operationId);
 		if (operation?.state !== "complete" || operation.resultOperationId !== mapping.operationId) continue;
-		ensureProjectionRows(outbox, mapping, principalId ?? ownerUserId, principalId);
+		// Avoid recomputing the projection payload hashes (which stringify every
+		// retained event payload) for rows whose immutable identity is already
+		// present: the completion-time enqueue already created them, so boot
+		// synthesis for an oversized record-level event array should not allocate
+		// event-sized strings just to discover the dedupe.
+		const owner = principalId ?? ownerUserId;
+		const mappingRowExists =
+			outbox.get({ principalId, chatId: mapping.chatId, operationId: mapping.operationId }) !== undefined;
+		const eventRowExists =
+			outbox.get({ principalId, chatId: mapping.chatId, operationId: `${mapping.operationId}:event` }) !== undefined;
+		if (!mappingRowExists || !eventRowExists) {
+			for (const row of expectedProjectionRows(mapping, owner, principalId)) {
+				if (outbox.get({ principalId, chatId: mapping.chatId, operationId: row.operationId! }) === undefined)
+					outbox.enqueue(row);
+			}
+		}
 	}
 }
 

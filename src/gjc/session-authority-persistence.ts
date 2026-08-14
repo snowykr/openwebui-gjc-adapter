@@ -640,16 +640,39 @@ export class FileSessionAuthority extends SessionAuthority {
 		const temporary = `${this.filePath}.tmp-${process.pid}-${Date.now()}`;
 		const descriptor = openSync(temporary, "wx", 0o600);
 		const nextGeneration = randomUUID();
-		const writtenDocument = `${JSON.stringify({
-			kind: "openwebui-gjc-session-authority",
-			version: SESSION_AUTHORITY_VERSION,
-			generation: nextGeneration,
-			normalized: true,
-			mappings: normalizedMappings,
-			provisionalOperations: normalizedProvisional,
-		})}\n`;
+		// Serialize the document INCREMENTALLY so a 1 GiB-class authority does not
+		// materialize another whole-document JavaScript string on top of the
+		// parsed authority: each record is stringified on its own (peak bounded
+		// by the largest single record) and flushed through a bounded buffer, with
+		// the content digest accumulated incrementally.
+		const contentHash = createHash("sha256");
+		let buffer = "";
+		const flush = () => {
+			if (buffer.length === 0) return;
+			writeFileSync(descriptor, buffer, "utf8");
+			contentHash.update(buffer);
+			buffer = "";
+		};
+		const writeChunk = (chunk: string) => {
+			buffer += chunk;
+			if (buffer.length > 1024 * 1024) flush();
+		};
+		writeChunk('{"kind":"openwebui-gjc-session-authority","version":');
+		writeChunk(`${SESSION_AUTHORITY_VERSION},"generation":`);
+		writeChunk(JSON.stringify(nextGeneration));
+		writeChunk(',"normalized":true,"mappings":[');
+		for (let index = 0; index < normalizedMappings.length; index += 1) {
+			if (index > 0) writeChunk(",");
+			writeChunk(JSON.stringify(normalizedMappings[index]));
+		}
+		writeChunk('],"provisionalOperations":[');
+		for (let index = 0; index < normalizedProvisional.length; index += 1) {
+			if (index > 0) writeChunk(",");
+			writeChunk(JSON.stringify(normalizedProvisional[index]));
+		}
+		writeChunk("]}\n");
+		flush();
 		try {
-			writeFileSync(descriptor, writtenDocument, "utf8");
 			fsyncSync(descriptor);
 		} finally {
 			closeSync(descriptor);
@@ -688,7 +711,7 @@ export class FileSessionAuthority extends SessionAuthority {
 		// compact.
 		this.replaceAllWithReferences(normalizedMappings, normalizedProvisional);
 		try {
-			this.refreshBaseIdentity(nextGeneration, createHash("sha256").update(writtenDocument).digest("hex"));
+			this.refreshBaseIdentity(nextGeneration, contentHash.digest("hex"));
 		} catch (error) {
 			try {
 				this.load();
