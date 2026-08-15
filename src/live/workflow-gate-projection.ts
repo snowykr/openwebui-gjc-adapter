@@ -4,7 +4,7 @@ import type { GjcTurnEvent } from "../gjc/turn-runner";
 import type { OpenWebUIMessageEvent } from "../openwebui/events";
 import { type ProjectableAgentFrame, projectAgentFrame } from "../projection/events";
 import { jsonValueFromUnknown } from "../projection/workflow-gate-schema-parse";
-import { type PendingWorkflowGate, pendingWorkflowGateFromEvent } from "../projection/workflow-gates";
+
 import {
 	type EnqueueProjectionOperationInput,
 	hashCanonicalStream,
@@ -392,7 +392,6 @@ function turnEventToProjectableFrame(event: GjcTurnEvent): ProjectableAgentFrame
 	if (sessionFrame !== undefined) return sessionFrame;
 	if (event.type === "message_update" || event.type === "assistant_text" || event.type === "assistant") return null;
 	if (classified.kind === "workflow_gate" || event.type === "workflow_gate") {
-		const pendingGate = pendingGateFromEvent(event);
 		return {
 			kind: "skill_progress",
 			// projectPendingWorkflowGateMessage() concatenates the prompt, every
@@ -410,7 +409,7 @@ function turnEventToProjectableFrame(event: GjcTurnEvent): ProjectableAgentFrame
 				gateId: boundedNullableText(
 					classified.kind === "workflow_gate" ? (classified.gateId ?? event.id ?? null) : (event.id ?? null),
 				),
-				workflow_gate: workflowGateStatusMetadata(pendingGate),
+				workflow_gate: boundedWorkflowGateStatusMetadata(event),
 			},
 		};
 	}
@@ -443,28 +442,35 @@ function progressFrame(
 	};
 }
 
-function pendingGateFromEvent(event: GjcTurnEvent): PendingWorkflowGate {
-	return (
-		pendingWorkflowGateFromEvent(event) ?? {
-			gateId: event.id ?? "unknown-gate",
-			schemaHash: "unknown",
-			idempotencyKey: event.id ?? "unknown-gate",
-			boundUserMessageId: null,
-			status: "pending",
-			schema: { type: "string" },
+function boundedWorkflowGateStatusMetadata(event: GjcTurnEvent): Record<string, unknown> {
+	const payload = isRecord(event.payload) ? event.payload : undefined;
+	const gateId =
+		stringJsonField(payload, "gateId") ?? stringJsonField(payload, "gate_id") ?? event.id ?? "unknown-gate";
+	const stage = stringJsonField(payload, "stage");
+	const kind = stringJsonField(payload, "kind");
+	const schemaHash = stringJsonField(payload, "schemaHash") ?? stringJsonField(payload, "schema_hash") ?? "unknown";
+	const createdAt = stringJsonField(payload, "createdAt") ?? stringJsonField(payload, "created_at");
+	const requiredRaw = payload?.required;
+	const required = typeof requiredRaw === "boolean" ? requiredRaw : undefined;
+	const rawOptions = Array.isArray(payload?.options) ? (payload.options as unknown[]) : undefined;
+	let optionCount = 0;
+	if (rawOptions !== undefined) {
+		for (const candidate of rawOptions) {
+			if (!isRecord(candidate)) continue;
+			const label = stringJsonField(candidate as Record<string, unknown>, "label");
+			if (label === undefined) continue;
+			if (jsonValueFromUnknown((candidate as Record<string, unknown>).value) === undefined) continue;
+			optionCount += 1;
 		}
-	);
-}
-
-function workflowGateStatusMetadata(gate: PendingWorkflowGate): Record<string, unknown> {
+	}
 	return {
-		gateId: gate.gateId,
-		...(gate.stage === undefined ? {} : { stage: gate.stage }),
-		...(gate.kind === undefined ? {} : { kind: gate.kind }),
-		schemaHash: gate.schemaHash,
-		...(gate.createdAt === undefined ? {} : { createdAt: gate.createdAt }),
-		...(gate.required === undefined ? {} : { required: gate.required }),
-		optionCount: gate.options?.length ?? 0,
+		gateId: boundedText(String(gateId)),
+		...(stage === undefined ? {} : { stage: boundedText(stage) }),
+		...(kind === undefined ? {} : { kind: boundedText(kind) }),
+		schemaHash: boundedText(String(schemaHash)),
+		...(createdAt === undefined ? {} : { createdAt: boundedText(createdAt) }),
+		...(required === undefined ? {} : { required }),
+		optionCount,
 	};
 }
 

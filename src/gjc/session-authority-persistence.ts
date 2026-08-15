@@ -16,7 +16,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { dirname } from "node:path";
-import { pendingWorkflowGateFromEvent } from "../projection/workflow-gates";
+
 import { streamEscapedJsonString, streamPlainJson, streamPlainObjectHead } from "../state/outbox-json";
 import { AuthorityMutationLock } from "./session-authority-file";
 import { SessionAuthority } from "./session-authority-store";
@@ -1714,17 +1714,12 @@ function normalizeResult(result: SessionOperationResult): SessionOperationResult
 	// so the legacy replay path can still verify against them.
 	if (result.gate === undefined && gateEvents.length > 0) {
 		if (gateEvents.length === 1) {
-			const gate = pendingWorkflowGateFromEvent(gateEvents[0]!);
+			const gate = compactGateIdentityFromEvent(gateEvents[0]!);
 			if (gate !== null) {
 				const { events: _events, ...withoutEvents } = result;
 				return {
 					...withoutEvents,
-					gate: {
-						gateId: gate.gateId,
-						...(gate.commandId === undefined || gate.turnId === undefined || gate.sessionId === undefined
-							? {}
-							: { commandId: gate.commandId, turnId: gate.turnId, sessionId: gate.sessionId }),
-					},
+					gate,
 				};
 			}
 		}
@@ -1732,6 +1727,28 @@ function normalizeResult(result: SessionOperationResult): SessionOperationResult
 	}
 	const { events: _events, ...withoutEvents } = result;
 	return withoutEvents;
+}
+
+function compactGateIdentityFromEvent(
+	event: NonNullable<SessionOperationResult["events"]>[number],
+): SessionOperationResult["gate"] | null {
+	const payload = isRecord(event.payload) ? event.payload : undefined;
+	const gateIdRaw =
+		(payload !== undefined ? ((payload.gateId as unknown) ?? (payload.gate_id as unknown)) : undefined) ??
+		(event as unknown as { readonly id?: unknown }).id;
+	if (typeof gateIdRaw !== "string" || gateIdRaw.length === 0) return null;
+	const gateId = gateIdRaw;
+	const commandIdRaw = payload?.commandId as unknown;
+	const turnIdRaw = payload?.turnId as unknown;
+	const sessionIdRaw = payload?.sessionId as unknown;
+	const hasCorrelation =
+		typeof commandIdRaw === "string" &&
+		typeof turnIdRaw === "string" &&
+		typeof sessionIdRaw === "string" &&
+		commandIdRaw.length > 0 &&
+		turnIdRaw.length > 0 &&
+		sessionIdRaw.length > 0;
+	return hasCorrelation ? { gateId, commandId: commandIdRaw, turnId: turnIdRaw, sessionId: sessionIdRaw } : { gateId };
 }
 
 export function isAuthorityDocument(value: unknown): value is {
