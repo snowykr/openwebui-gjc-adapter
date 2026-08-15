@@ -594,7 +594,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isJsonValue(value: unknown): boolean {
 	type ArrayFrame = { readonly arr: readonly unknown[]; idx: number };
-	type ObjectFrame = { readonly obj: Record<string, unknown>; readonly keys: string[]; idx: number };
+	type ObjectFrame = { readonly obj: Record<string, unknown>; iter: Iterator<string> };
 	const stack: Array<ArrayFrame | ObjectFrame> = [];
 	const pushValue = (v: unknown): boolean | null => {
 		if (v === null || typeof v === "string" || typeof v === "boolean") return true;
@@ -605,11 +605,10 @@ function isJsonValue(value: unknown): boolean {
 		}
 		if (isRecord(v as Record<string, unknown>)) {
 			const obj = v as Record<string, unknown>;
-			(stack as Array<ArrayFrame | ObjectFrame>).push({
-				obj,
-				keys: Object.keys(obj),
-				idx: 0,
-			} as ObjectFrame);
+			function* ownKeys(): Generator<string> {
+				for (const k in obj) if (Object.prototype.hasOwnProperty.call(obj, k)) yield k;
+			}
+			(stack as Array<ArrayFrame | ObjectFrame>).push({ obj, iter: ownKeys() } as ObjectFrame);
 			return null;
 		}
 		return false;
@@ -629,13 +628,13 @@ function isJsonValue(value: unknown): boolean {
 			const res = pushValue(cur);
 			if (res === false) return false;
 		} else {
-			const frame = top as ObjectFrame & { idx: number };
-			if (frame.idx >= frame.keys.length) {
+			const frame = top as ObjectFrame;
+			const nxt = frame.iter.next();
+			if (nxt.done) {
 				stack.pop();
 				continue;
 			}
-			const key = frame.keys[frame.idx++]!;
-			const cur = frame.obj[key];
+			const cur = frame.obj[nxt.value!];
 			const res = pushValue(cur);
 			if (res === false) return false;
 		}
@@ -648,9 +647,27 @@ function boundedStringPrefix(value: unknown, limit: number): string {
 		let result = "";
 		for (let index = 0; index < value.length; index += 1) {
 			const element = value[index];
-			// Array.prototype.toString renders null/undefined as empty string, not "null".
-			// Preserve that semantics while bounding, otherwise String([null,"x"]) = ",x"
-			// would become "null,x" and change the gate label hash.
+			// Nested arrays must be recursed before any String(element) call so a
+			// very large nested array never allocates a payload-sized string.
+			if (Array.isArray(element)) {
+				const remainingForElement = limit - result.length - (index === 0 ? 0 : 1);
+				if (remainingForElement <= 0) break;
+				const elementPrefix = boundedStringPrefix(element, remainingForElement);
+				// Array.prototype.toString for [] is "", for [null] is "", for
+				// [null,null] is "," — distinguish genuinely empty raw vs truncated.
+				const nestedRawEmpty = element.length === 0 || (element.length === 1 && element[0] == null);
+				if (elementPrefix.length === 0 && nestedRawEmpty) {
+					if (index !== 0) result += ",";
+					continue;
+				}
+				if (elementPrefix.length === 0 && !nestedRawEmpty) break;
+				if (index === 0) result += elementPrefix;
+				else result += `,${elementPrefix}`;
+				if (result.length >= limit) break;
+				if (elementPrefix.length === remainingForElement) break;
+				continue;
+			}
+			// Array.prototype.toString renders null/undefined as empty string.
 			const elementRawString = element == null ? "" : String(element);
 			const remainingForElement = limit - result.length - (index === 0 ? 0 : 1);
 			if (remainingForElement <= 0) break;
@@ -658,20 +675,10 @@ function boundedStringPrefix(value: unknown, limit: number): string {
 				if (index !== 0) result += ",";
 				continue;
 			}
-			let elementPrefix: string;
-			if (Array.isArray(element)) {
-				elementPrefix = boundedStringPrefix(element, remainingForElement);
-			} else if (element != null && typeof element === "object") {
-				elementPrefix =
+			const elementPrefix =
 					elementRawString.length <= remainingForElement
 						? elementRawString
 						: elementRawString.slice(0, remainingForElement);
-			} else {
-				elementPrefix =
-					elementRawString.length <= remainingForElement
-						? elementRawString
-						: elementRawString.slice(0, remainingForElement);
-			}
 			if (elementPrefix.length === 0 && elementRawString.length > 0) break;
 			if (index === 0) result += elementPrefix;
 			else result += `,${elementPrefix}`;
@@ -694,7 +701,23 @@ function boundedEnumPrefix(values: readonly unknown[]): string {
 		const remaining = limit - length - separator;
 		if (remaining <= 0) break;
 		const part = boundedStringPrefix(value, remaining);
-		if (part.length === 0) break;
+		if (part.length === 0) {
+			// Preserve empty-string/array entries: String("") and String([]) are "",
+			// and map(String).join(", ") keeps them as empty slots (e.g. ["", "x"]
+			// => ", x"). Break only when the original value would be non-empty but
+			// prefix was truncated to empty due to no budget.
+			const raw = value == null ? "" : String(value as unknown);
+			// For arrays, String([]) is "" but nested arrays like ["a"] => "a";
+			// use bounded check: if raw empty, this is a genuine empty entry.
+			const isGenuinelyEmpty = Array.isArray(value) ? (value as unknown[]).length === 0 || String(value as unknown).length === 0 : raw.length === 0;
+			if (isGenuinelyEmpty) {
+				parts.push("");
+				length += separator;
+				if (length >= limit) break;
+				continue;
+			}
+			break;
+		}
 		parts.push(part);
 		length += separator + part.length;
 		if (part.length === remaining) break;

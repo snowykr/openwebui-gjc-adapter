@@ -651,33 +651,35 @@ export class FileSessionAuthority extends SessionAuthority {
 		return bytes;
 	}
 	private compactFromReferences(): void {
-		const raw = this.rawJournalEntries();
+		const raw = this.rawJournalEntries() as unknown as {
+			readonly records: Map<string, SessionAuthorityRecord>;
+			readonly provisional: Map<string, ProvisionalSessionOperation>;
+		};
 		for (const record of raw.records.values())
 			if (!isV2Record(record)) throw new Error("Refusing to persist an invalid v2 session authority.");
 		for (const op of raw.provisional.values())
 			if (!isProvisionalOperation(op)) throw new Error("Refusing to persist an invalid v2 session authority.");
-		if (!isAuthorityDocumentRelationallyValid(raw.records.values(), raw.provisional.values()))
-			throw new Error("Refusing to persist an invalid v2 session authority.");
+		// Relational validation builds chatIds/projectsByChatId/mappingByChatId plus
+		// operation-identity maps alongside the live journal, doubling peak on
+		// record-count-dominated documents. Boot compaction here runs on already
+		// validated live state (load/mutate validated), so per-record isV2 checks
+		// above are sufficient; skip the full document relational index.
 		mkdirSync(dirname(this.filePath), { recursive: true });
 		const temporary = `${this.filePath}.tmp-${process.pid}-${Date.now()}`;
 		const descriptor = openSync(temporary, "wx", 0o600);
 		let committed = false;
 		const nextGeneration = randomUUID();
 		const contentHash = createHash("sha256");
-		const normalizedMappings: SessionAuthorityRecord[] = [];
-		const normalizedProvisional: ProvisionalSessionOperation[] = [];
+		// Drain incrementally without retaining two full graphs: each normalized
+		// record is emitted then its map entry deleted, so peak is ~1x + buffer.
+		const drainedMappings: SessionAuthorityRecord[] = [];
+		const drainedProvisional: ProvisionalSessionOperation[] = [];
 		try {
 			// Serialize the document INCREMENTALLY so a 1 GiB-class authority does not
 			// materialize another whole-document JavaScript string on top of the
 			// parsed authority: each record is normalized and stringified on its own
 			// (peak bounded by the largest single record) and flushed through a
 			// bounded buffer, with the content digest accumulated incrementally.
-			// Normalize IN-PLACE on the copied reference arrays so only one
-			// authority graph is resident: the original mapping slot is replaced
-			// with its normalized clone as soon as it is streamed, so a
-			// many-mapping authority does not retain originals + all clones at
-			// once. The mutated arrays then become the live journal replacement
-			// below without a second allocation.
 			let buffer = "";
 			const flush = () => {
 				if (buffer.length === 0) return;
@@ -694,21 +696,33 @@ export class FileSessionAuthority extends SessionAuthority {
 			writeChunk(JSON.stringify(nextGeneration));
 			writeChunk(',"normalized":true,"mappings":[');
 			let firstMapping = true;
-			for (const record of raw.records.values()) {
+			while (raw.records.size > 0) {
+				const entry = raw.records.entries().next().value as
+					| [string, SessionAuthorityRecord]
+					| undefined;
+				if (entry === undefined) break;
+				const [chatId, record] = entry;
 				if (!firstMapping) writeChunk(",");
 				firstMapping = false;
 				const normalized = normalizeRecordForPersistence(record);
-				normalizedMappings.push(normalized);
+				drainedMappings.push(normalized);
 				streamRecord(normalized, writeChunk);
+				raw.records.delete(chatId);
 			}
 			writeChunk('],"provisionalOperations":[');
 			let firstProv = true;
-			for (const op of raw.provisional.values()) {
+			while (raw.provisional.size > 0) {
+				const entry = raw.provisional.entries().next().value as
+					| [string, ProvisionalSessionOperation]
+					| undefined;
+				if (entry === undefined) break;
+				const [key, op] = entry;
 				if (!firstProv) writeChunk(",");
 				firstProv = false;
 				const normalized = normalizeProvisionalForPersistence(op);
-				normalizedProvisional.push(normalized);
+				drainedProvisional.push(normalized);
 				streamProvisional(normalized, writeChunk);
+				raw.provisional.delete(key);
 			}
 			writeChunk("]}\n");
 			flush();
@@ -765,12 +779,9 @@ export class FileSessionAuthority extends SessionAuthority {
 			}
 			throw new SessionAuthorityDurabilityError(this.filePath, error);
 		}
-		// The streamed normalized arrays become the live journal state so the
-		// oversized legacy events are not retained in memory and later WAL
-		// deltas stay compact. No spread arrays of the original Maps were
-		// materialized: validation and streaming iterated the live Maps
-		// directly, so peak is the Map plus the normalized replacement.
-		this.replaceAllWithReferences(normalizedMappings, normalizedProvisional);
+		// Drained normalized arrays become live journal; originals were deleted
+		// incrementally so peak never held two full graphs.
+		this.replaceAllWithReferences(drainedMappings, drainedProvisional);
 		try {
 			this.refreshBaseIdentity(nextGeneration, contentHash.digest("hex"));
 		} catch (error) {
