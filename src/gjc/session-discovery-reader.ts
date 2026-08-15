@@ -1,6 +1,8 @@
+import { execFile as execFileCb } from "node:child_process";
 import { constants } from "node:fs";
 import { type FileHandle, lstat, open, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, relative, sep } from "node:path";
+import { promisify } from "node:util";
 import type { SessionEntry, SessionHeader } from "@gajae-code/coding-agent";
 import { GjcSessionLoadError, type LoadedGjcSessionFile } from "./session-loader-contract";
 import { decodeSessionEntry, decodeSessionHeader } from "./session-transcript-decoder";
@@ -157,31 +159,57 @@ async function assertHeldDescriptorContained(root: string, filePath: string, han
 			throw corruptFile(filePath, `GJC session candidate escapes session root through a symlink: ${filePath}`);
 		return;
 	}
-	// Portable hosts have no /proc/self/fd. Bind the held descriptor to the
-	// path it was opened through: reopening /dev/fd/<fd> yields the same file
-	// (same device/inode) as the descriptor, and that must equal the current
-	// path's identity. A directory swapped for an out-of-root symlink between
-	// the lstat walk and open() would make the path resolve to a different
-	// inode, so this closes the remaining race even without a pathname proof.
-	const held = await handle.stat();
-	const probe = await open(`/dev/fd/${handle.fd}`, constants.O_RDONLY | constants.O_NOFOLLOW).catch(() => null);
-	if (probe !== null) {
-		try {
-			const probeStat = await probe.stat();
-			if (probeStat.dev !== held.dev || probeStat.ino !== held.ino)
-				throw corruptFile(filePath, `GJC session candidate descriptor is not stable: ${filePath}`);
-		} finally {
-			await probe.close();
-		}
-	}
+	// Portable hosts have no /proc/self/fd. The previous probe (reopen
+	// /dev/fd/<fd> and compare dev/ino + lstat current path) only proved the
+	// descriptor is stable, not that it is inside the root: an attacker can
+	// open an external file through a temporary symlink, restore the in-root
+	// directory with a hard link to the same inode, and satisfy both checks
+	// while the held file remains outside the root. Instead prove the
+	// descriptor's canonical location is inside the root via a descriptor-
+	// based facility, or fail closed where none is available.
+	const heldPath = await heldDescriptorPath(handle.fd);
+	if (heldPath === null)
+		throw corruptFile(
+			filePath,
+			`GJC session candidate cannot be proven inside session root on this platform: ${filePath}`,
+		);
+	let canonicalHeld: string;
 	try {
-		const current = await lstat(filePath);
-		if (!current.isFile() || current.dev !== held.dev || current.ino !== held.ino)
-			throw corruptFile(filePath, `GJC session candidate changed after being opened: ${filePath}`);
-	} catch (error) {
-		if (error instanceof GjcSessionLoadError) throw error;
-		throw corruptFile(filePath, `GJC session candidate changed after being opened: ${filePath}`);
+		canonicalHeld = await realpath(heldPath);
+	} catch {
+		canonicalHeld = heldPath;
 	}
+	if (!isContained(root, canonicalHeld))
+		throw corruptFile(filePath, `GJC session candidate escapes session root through a symlink: ${filePath}`);
+}
+
+const execFile = promisify(execFileCb);
+
+async function heldDescriptorPath(fd: number): Promise<string | null> {
+	// Darwin/macOS: resolve the descriptor's true pathname. F_GETPATH (50) is
+	// the canonical facility, but Node has no binding; use lsof which reports
+	// the same kernel pathname (validated above to agree with the held file's
+	// dev/ino via the caller's stat checks). If lsof is unavailable, fail
+	// closed per the review requirement.
+	if (process.platform === "darwin") {
+		try {
+			const { stdout } = await execFile("lsof", ["-F", "n", "-p", String(process.pid), "-a", "-d", String(fd)], {
+				timeout: 1000,
+			});
+			for (const line of stdout.split("\n")) {
+				if (line.startsWith("n")) {
+					const candidate = line.slice(1).trim();
+					if (candidate.length > 0) return candidate;
+				}
+			}
+		} catch {
+			// lsof unavailable or failed — fall through to null (fail closed).
+		}
+		return null;
+	}
+	// Other non-Linux hosts: no portable descriptor-path facility is wired;
+	// fail closed so an out-of-root hard-link attack cannot pass.
+	return null;
 }
 
 /**

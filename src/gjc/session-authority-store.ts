@@ -40,6 +40,13 @@ export class SessionAuthority {
 	records(): readonly SessionAuthorityRecord[] {
 		return [...this.#journal.records.values()];
 	}
+	/** @internal Streaming no-copy view of the journal's records. Iterates the
+	 * live Map directly without allocating an array of every value, so a
+	 * record-count-dominated authority does not exhaust the heap before the
+	 * caller can filter/project one entry at a time. */
+	*recordsIterable(): Iterable<SessionAuthorityRecord> {
+		for (const record of this.#journal.records.values()) yield record;
+	}
 	set(input: SessionAuthorityInput): SessionAuthorityRecord {
 		return this.#journal.store(input);
 	}

@@ -1169,18 +1169,18 @@ export class FileSessionAuthority extends SessionAuthority {
 		return this.#walIdentity !== undefined && this.#walIdentity.size > this.walCompactionThresholdBytes;
 	}
 	private hasPendingOperations(): boolean {
-		// Inspect through the internal reference view: entries() deep-copies every
-		// record and event payload, and this check runs BEFORE the oversized boot
-		// compaction — a 1 GiB-class document must not allocate a second
-		// document-sized object just to look for pending operations.
+		// Inspect through the internal reference view without spreading the maps:
+		// an authority dominated by record count (millions of small records)
+		// must not allocate arrays of every map value before `.some()` can
+		// return on the first pending entry; this check runs BEFORE boot
+		// compaction so it must iterate the live Maps directly.
 		const raw = this.rawJournalEntries();
-		return (
-			[...raw.records.values()].some(
-				record =>
-					record.reassignment?.state === "pending" ||
-					record.journal.some(operation => operation.state === "pending"),
-			) || [...raw.provisional.values()].some(operation => operation.state === "pending")
-		);
+		for (const record of raw.records.values()) {
+			if (record.reassignment?.state === "pending") return true;
+			for (const operation of record.journal) if (operation.state === "pending") return true;
+		}
+		for (const operation of raw.provisional.values()) if (operation.state === "pending") return true;
+		return false;
 	}
 	private get walPath(): string {
 		return `${this.filePath}.wal`;

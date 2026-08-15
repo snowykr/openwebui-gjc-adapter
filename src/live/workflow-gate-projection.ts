@@ -176,7 +176,7 @@ export function synthesizeProjectionRows(
 	adminPrincipalId?: string,
 ): void {
 	const configuredAdmin = normalizePrincipalId(adminPrincipalId);
-	for (const mapping of mappings.mappingRecords()) {
+	for (const mapping of mappings.mappingRecordsIterable()) {
 		const principalId = normalizePrincipalId(mapping.principalId);
 		if (principalId === undefined && configuredAdmin === undefined) continue;
 		// Reference-based operation state check: operation()/operationScoped()

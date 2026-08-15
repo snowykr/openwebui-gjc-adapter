@@ -150,10 +150,22 @@ export class SessionMappingStore {
 	 * not mutate the returned mappings or their event payloads.
 	 */
 	mappingRecords(): readonly SessionMapping[] {
-		return this.authority
-			.records()
-			.filter(record => !isRetiredRecord(record))
-			.map(mappingFromRecordShallow);
+		return [...this.mappingRecordsIterable()];
+	}
+	/**
+	 * Streaming no-copy view for boot synthesis: filters and projects one
+	 * record at a time without materializing array views of every record.
+	 * When the authority contains millions of small mappings, the previous
+	 * `records()` → `filter()` → `map()` chain created three arrays plus a
+	 * shallow object per record before synthesis began; this generator yields
+	 * one shallow mapping at a time so peak memory is bounded by a single
+	 * record.
+	 */
+	*mappingRecordsIterable(): Iterable<SessionMapping> {
+		for (const record of this.authority.recordsIterable()) {
+			if (isRetiredRecord(record)) continue;
+			yield mappingFromRecordShallow(record);
+		}
 	}
 	entriesForPrincipal(
 		principalId: string,
