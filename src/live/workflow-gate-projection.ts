@@ -3,7 +3,6 @@ import { normalizeModelSelection, type SessionMapping, type SessionMappingStore 
 import type { GjcTurnEvent } from "../gjc/turn-runner";
 import type { OpenWebUIMessageEvent } from "../openwebui/events";
 import { type ProjectableAgentFrame, projectAgentFrame } from "../projection/events";
-import { jsonValueFromUnknown } from "../projection/workflow-gate-schema-parse";
 
 import {
 	type EnqueueProjectionOperationInput,
@@ -405,10 +404,8 @@ function turnEventToProjectableFrame(event: GjcTurnEvent): ProjectableAgentFrame
 			phase: "start",
 			hidden: false,
 			metadata: {
-				eventType: boundedText(event.type),
-				gateId: boundedNullableText(
-					classified.kind === "workflow_gate" ? (classified.gateId ?? event.id ?? null) : (event.id ?? null),
-				),
+				eventType: event.type,
+				gateId: classified.kind === "workflow_gate" ? (classified.gateId ?? event.id ?? null) : (event.id ?? null),
 				workflow_gate: boundedWorkflowGateStatusMetadata(event),
 			},
 		};
@@ -459,16 +456,16 @@ function boundedWorkflowGateStatusMetadata(event: GjcTurnEvent): Record<string, 
 			if (!isRecord(candidate)) continue;
 			const label = stringJsonField(candidate as Record<string, unknown>, "label");
 			if (label === undefined) continue;
-			if (jsonValueFromUnknown((candidate as Record<string, unknown>).value) === undefined) continue;
+			if (!isJsonValue(candidate.value)) continue;
 			optionCount += 1;
 		}
 	}
 	return {
-		gateId: boundedText(String(gateId)),
-		...(stage === undefined ? {} : { stage: boundedText(stage) }),
-		...(kind === undefined ? {} : { kind: boundedText(kind) }),
-		schemaHash: boundedText(String(schemaHash)),
-		...(createdAt === undefined ? {} : { createdAt: boundedText(createdAt) }),
+		gateId,
+		...(stage === undefined ? {} : { stage }),
+		...(kind === undefined ? {} : { kind }),
+		schemaHash,
+		...(createdAt === undefined ? {} : { createdAt }),
 		...(required === undefined ? {} : { required }),
 		optionCount,
 	};
@@ -534,7 +531,7 @@ function boundedGateMessage(event: GjcTurnEvent): string {
 		if (!isRecord(candidate)) continue;
 		const label = stringJsonField(candidate, "label");
 		const rawValue = (candidate as Record<string, unknown>).value;
-		if (label === undefined || jsonValueFromUnknown(rawValue) === undefined) continue;
+		if (label === undefined || !isJsonValue(rawValue)) continue;
 		filteredTotal += 1;
 	}
 	const answerHint =
@@ -550,7 +547,7 @@ function boundedGateMessage(event: GjcTurnEvent): string {
 			if (!isRecord(candidate)) continue;
 			const label = stringJsonField(candidate, "label");
 			const rawValue = (candidate as Record<string, unknown>).value;
-			if (label === undefined || jsonValueFromUnknown(rawValue) === undefined) continue;
+			if (label === undefined || !isJsonValue(rawValue)) continue;
 			emittedFilteredIndex += 1;
 			if (doneEmitting) continue;
 			const description = stringJsonField(candidate, "description");
@@ -595,29 +592,66 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isJsonValue(value: unknown): boolean {
+	const stack: unknown[] = [value];
+	while (stack.length > 0) {
+		const cur = stack.pop();
+		if (cur === null || typeof cur === "string" || typeof cur === "boolean") continue;
+		if (typeof cur === "number") {
+			if (!Number.isFinite(cur)) return false;
+			continue;
+		}
+		if (Array.isArray(cur)) {
+			for (let index = cur.length - 1; index >= 0; index -= 1) stack.push(cur[index]);
+			continue;
+		}
+		if (isRecord(cur as Record<string, unknown>)) {
+			const record = cur as Record<string, unknown>;
+			for (const key in record) {
+				if (!Object.hasOwn(record, key)) continue;
+				stack.push(record[key]);
+			}
+			continue;
+		}
+		return false;
+	}
+	return true;
+}
+
+function boundedStringPrefix(value: unknown, limit: number): string {
+	if (Array.isArray(value)) {
+		let result = "";
+		for (let index = 0; index < value.length; index += 1) {
+			const remainingForElement = limit - result.length - (index === 0 ? 0 : 1);
+			if (remainingForElement <= 0) break;
+			const elementPrefix = boundedStringPrefix(value[index], remainingForElement);
+			if (elementPrefix.length === 0 && String(value[index]).length > 0) break;
+			if (index === 0) result += elementPrefix;
+			else result += `,${elementPrefix}`;
+			if (result.length >= limit) break;
+			if (elementPrefix.length < String(value[index]).length) break;
+		}
+		return result;
+	}
+	const stringified = String(value);
+	return stringified.length <= limit ? stringified : stringified.slice(0, limit);
+}
+
 /** Joins at most enough enum values to exceed the bounded label window. */
 function boundedEnumPrefix(values: readonly unknown[]): string {
 	const limit = 80;
 	let length = 0;
 	const parts: string[] = [];
 	for (const value of values) {
-		const part = String(value);
-		if (parts.length === 0) {
-			// The first value may alone exceed the window; retain the portion that
-			// fits (boundedText() of the assembled message would show the prefix)
-			// instead of dropping the oversized value and changing the hash.
-			parts.push(part.length <= limit ? part : part.slice(0, limit));
-			length += Math.min(part.length, limit);
-			continue;
-		}
-		const extra = part.length + 2;
-		if (length + extra > limit) {
-			const remaining = limit - length - 2;
-			if (remaining > 0) parts.push(part.slice(0, remaining));
-			break;
-		}
+		const separator = parts.length === 0 ? 0 : 2;
+		const remaining = limit - length - separator;
+		if (remaining <= 0) break;
+		const part = boundedStringPrefix(value, remaining);
+		if (part.length === 0) break;
 		parts.push(part);
-		length += extra;
+		length += separator + part.length;
+		if (part.length === remaining) break;
+		if (length >= limit) break;
 	}
 	return parts.join(", ");
 }

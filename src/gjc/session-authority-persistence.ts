@@ -666,16 +666,18 @@ export class FileSessionAuthority extends SessionAuthority {
 		let committed = false;
 		const nextGeneration = randomUUID();
 		const contentHash = createHash("sha256");
-		const normalizedMappings: SessionAuthorityRecord[] = [];
-		const normalizedProvisional: ProvisionalSessionOperation[] = [];
 		try {
 			// Serialize the document INCREMENTALLY so a 1 GiB-class authority does not
 			// materialize another whole-document JavaScript string on top of the
 			// parsed authority: each record is normalized and stringified on its own
 			// (peak bounded by the largest single record) and flushed through a
-			// bounded buffer, with the content digest accumulated incrementally. The
-			// normalized records are retained ONLY for the live journal replacement
-			// below, never duplicated into a second graph for the writer.
+			// bounded buffer, with the content digest accumulated incrementally.
+			// Normalize IN-PLACE on the copied reference arrays so only one
+			// authority graph is resident: the original mapping slot is replaced
+			// with its normalized clone as soon as it is streamed, so a
+			// many-mapping authority does not retain originals + all clones at
+			// once. The mutated arrays then become the live journal replacement
+			// below without a second allocation.
 			let buffer = "";
 			const flush = () => {
 				if (buffer.length === 0) return;
@@ -694,14 +696,14 @@ export class FileSessionAuthority extends SessionAuthority {
 			for (let index = 0; index < mappings.length; index += 1) {
 				if (index > 0) writeChunk(",");
 				const normalized = normalizeRecordForPersistence(mappings[index]!);
-				normalizedMappings.push(normalized);
+				mappings[index] = normalized;
 				streamRecord(normalized, writeChunk);
 			}
 			writeChunk('],"provisionalOperations":[');
 			for (let index = 0; index < provisionalOperations.length; index += 1) {
 				if (index > 0) writeChunk(",");
 				const normalized = normalizeProvisionalForPersistence(provisionalOperations[index]!);
-				normalizedProvisional.push(normalized);
+				provisionalOperations[index] = normalized;
 				streamProvisional(normalized, writeChunk);
 			}
 			writeChunk("]}\n");
@@ -759,10 +761,10 @@ export class FileSessionAuthority extends SessionAuthority {
 			}
 			throw new SessionAuthorityDurabilityError(this.filePath, error);
 		}
-		// The normalized records become the live journal state so the oversized
-		// legacy events are not retained in memory and later WAL deltas stay
-		// compact.
-		this.replaceAllWithReferences(normalizedMappings, normalizedProvisional);
+		// The in-place-normalized arrays become the live journal state so the
+		// oversized legacy events are not retained in memory and later WAL
+		// deltas stay compact.
+		this.replaceAllWithReferences(mappings, provisionalOperations);
 		try {
 			this.refreshBaseIdentity(nextGeneration, contentHash.digest("hex"));
 		} catch (error) {
