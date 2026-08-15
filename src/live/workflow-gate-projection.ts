@@ -606,7 +606,7 @@ function isJsonValue(value: unknown): boolean {
 		if (isRecord(v as Record<string, unknown>)) {
 			const obj = v as Record<string, unknown>;
 			function* ownKeys(): Generator<string> {
-				for (const k in obj) if (Object.prototype.hasOwnProperty.call(obj, k)) yield k;
+				for (const k in obj) if (Object.hasOwn(obj, k)) yield k;
 			}
 			(stack as Array<ArrayFrame | ObjectFrame>).push({ obj, iter: ownKeys() } as ObjectFrame);
 			return null;
@@ -676,9 +676,9 @@ function boundedStringPrefix(value: unknown, limit: number): string {
 				continue;
 			}
 			const elementPrefix =
-					elementRawString.length <= remainingForElement
-						? elementRawString
-						: elementRawString.slice(0, remainingForElement);
+				elementRawString.length <= remainingForElement
+					? elementRawString
+					: elementRawString.slice(0, remainingForElement);
 			if (elementPrefix.length === 0 && elementRawString.length > 0) break;
 			if (index === 0) result += elementPrefix;
 			else result += `,${elementPrefix}`;
@@ -709,7 +709,9 @@ function boundedEnumPrefix(values: readonly unknown[]): string {
 			const raw = value == null ? "" : String(value as unknown);
 			// For arrays, String([]) is "" but nested arrays like ["a"] => "a";
 			// use bounded check: if raw empty, this is a genuine empty entry.
-			const isGenuinelyEmpty = Array.isArray(value) ? (value as unknown[]).length === 0 || String(value as unknown).length === 0 : raw.length === 0;
+			const isGenuinelyEmpty = Array.isArray(value)
+				? (value as unknown[]).length === 0 || String(value as unknown).length === 0
+				: raw.length === 0;
 			if (isGenuinelyEmpty) {
 				parts.push("");
 				length += separator;

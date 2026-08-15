@@ -697,9 +697,7 @@ export class FileSessionAuthority extends SessionAuthority {
 			writeChunk(',"normalized":true,"mappings":[');
 			let firstMapping = true;
 			while (raw.records.size > 0) {
-				const entry = raw.records.entries().next().value as
-					| [string, SessionAuthorityRecord]
-					| undefined;
+				const entry = raw.records.entries().next().value as [string, SessionAuthorityRecord] | undefined;
 				if (entry === undefined) break;
 				const [chatId, record] = entry;
 				if (!firstMapping) writeChunk(",");
@@ -712,9 +710,7 @@ export class FileSessionAuthority extends SessionAuthority {
 			writeChunk('],"provisionalOperations":[');
 			let firstProv = true;
 			while (raw.provisional.size > 0) {
-				const entry = raw.provisional.entries().next().value as
-					| [string, ProvisionalSessionOperation]
-					| undefined;
+				const entry = raw.provisional.entries().next().value as [string, ProvisionalSessionOperation] | undefined;
 				if (entry === undefined) break;
 				const [key, op] = entry;
 				if (!firstProv) writeChunk(",");
