@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resolveExistingOrProspectivePath } from "../src/gjc/session-file-path";
 import { SessionMappingStore } from "../src/gjc/session-router";
 import type { GjcControlResult, GjcTurnRunner } from "../src/gjc/turn-runner";
 import type { LiveGatewayRunnerInput } from "../src/live/chat-completions";
@@ -141,7 +142,7 @@ describe("createGjcRoutingLiveGatewayRunner", () => {
 
 		// Then: the SDK path remains the continuation authority.
 		expect(turnRunner.switches[0]?.sessionFile).toBe(
-			"/private/var/lib/gjc/agent/sessions/--workspace-project--/session-sdk.jsonl",
+			resolveExistingOrProspectivePath("/var/lib/gjc/agent/sessions/--workspace-project--/session-sdk.jsonl"),
 		);
 		expect(turnRunner.continues[0]?.sessionRoot).toBe("/var/lib/gjc/agent/sessions/--workspace-project--");
 	});
