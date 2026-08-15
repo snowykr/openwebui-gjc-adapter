@@ -496,7 +496,7 @@ export class SessionAuthorityJournal {
 			copyResults,
 		);
 	}
-	replace(records: readonly SessionAuthorityRecord[], provisional: readonly ProvisionalSessionOperation[] = []): void {
+	replace(records: Iterable<SessionAuthorityRecord>, provisional: Iterable<ProvisionalSessionOperation> = []): void {
 		if (!isAuthorityDocumentRelationallyValid(records, provisional))
 			throw new Error("Refusing to replace session authority with invalid operation identities.");
 		this.records.clear();
@@ -517,8 +517,8 @@ export class SessionAuthorityJournal {
 	 * parses or this journal's own prior copy-on-write values), so storing them
 	 * directly avoids a second full-document deep copy. */
 	replaceReferences(
-		records: readonly SessionAuthorityRecord[],
-		provisional: readonly ProvisionalSessionOperation[] = [],
+		records: Iterable<SessionAuthorityRecord>,
+		provisional: Iterable<ProvisionalSessionOperation> = [],
 	): void {
 		if (!isAuthorityDocumentRelationallyValid(records, provisional))
 			throw new Error("Refusing to replace session authority with invalid operation identities.");

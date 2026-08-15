@@ -652,13 +652,11 @@ export class FileSessionAuthority extends SessionAuthority {
 	}
 	private compactFromReferences(): void {
 		const raw = this.rawJournalEntries();
-		const mappings = [...raw.records.values()];
-		const provisionalOperations = [...raw.provisional.values()];
-		if (
-			!mappings.every(isV2Record) ||
-			!provisionalOperations.every(isProvisionalOperation) ||
-			!isAuthorityDocumentRelationallyValid(mappings, provisionalOperations)
-		)
+		for (const record of raw.records.values())
+			if (!isV2Record(record)) throw new Error("Refusing to persist an invalid v2 session authority.");
+		for (const op of raw.provisional.values())
+			if (!isProvisionalOperation(op)) throw new Error("Refusing to persist an invalid v2 session authority.");
+		if (!isAuthorityDocumentRelationallyValid(raw.records.values(), raw.provisional.values()))
 			throw new Error("Refusing to persist an invalid v2 session authority.");
 		mkdirSync(dirname(this.filePath), { recursive: true });
 		const temporary = `${this.filePath}.tmp-${process.pid}-${Date.now()}`;
@@ -666,6 +664,8 @@ export class FileSessionAuthority extends SessionAuthority {
 		let committed = false;
 		const nextGeneration = randomUUID();
 		const contentHash = createHash("sha256");
+		const normalizedMappings: SessionAuthorityRecord[] = [];
+		const normalizedProvisional: ProvisionalSessionOperation[] = [];
 		try {
 			// Serialize the document INCREMENTALLY so a 1 GiB-class authority does not
 			// materialize another whole-document JavaScript string on top of the
@@ -693,17 +693,21 @@ export class FileSessionAuthority extends SessionAuthority {
 			writeChunk(`${SESSION_AUTHORITY_VERSION},"generation":`);
 			writeChunk(JSON.stringify(nextGeneration));
 			writeChunk(',"normalized":true,"mappings":[');
-			for (let index = 0; index < mappings.length; index += 1) {
-				if (index > 0) writeChunk(",");
-				const normalized = normalizeRecordForPersistence(mappings[index]!);
-				mappings[index] = normalized;
+			let firstMapping = true;
+			for (const record of raw.records.values()) {
+				if (!firstMapping) writeChunk(",");
+				firstMapping = false;
+				const normalized = normalizeRecordForPersistence(record);
+				normalizedMappings.push(normalized);
 				streamRecord(normalized, writeChunk);
 			}
 			writeChunk('],"provisionalOperations":[');
-			for (let index = 0; index < provisionalOperations.length; index += 1) {
-				if (index > 0) writeChunk(",");
-				const normalized = normalizeProvisionalForPersistence(provisionalOperations[index]!);
-				provisionalOperations[index] = normalized;
+			let firstProv = true;
+			for (const op of raw.provisional.values()) {
+				if (!firstProv) writeChunk(",");
+				firstProv = false;
+				const normalized = normalizeProvisionalForPersistence(op);
+				normalizedProvisional.push(normalized);
 				streamProvisional(normalized, writeChunk);
 			}
 			writeChunk("]}\n");
@@ -761,10 +765,12 @@ export class FileSessionAuthority extends SessionAuthority {
 			}
 			throw new SessionAuthorityDurabilityError(this.filePath, error);
 		}
-		// The in-place-normalized arrays become the live journal state so the
+		// The streamed normalized arrays become the live journal state so the
 		// oversized legacy events are not retained in memory and later WAL
-		// deltas stay compact.
-		this.replaceAllWithReferences(mappings, provisionalOperations);
+		// deltas stay compact. No spread arrays of the original Maps were
+		// materialized: validation and streaming iterated the live Maps
+		// directly, so peak is the Map plus the normalized replacement.
+		this.replaceAllWithReferences(normalizedMappings, normalizedProvisional);
 		try {
 			this.refreshBaseIdentity(nextGeneration, contentHash.digest("hex"));
 		} catch (error) {

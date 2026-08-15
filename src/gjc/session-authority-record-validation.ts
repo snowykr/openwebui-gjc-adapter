@@ -123,17 +123,19 @@ export function isProvisionalOperation(value: unknown): value is ProvisionalSess
 }
 
 export function isAuthorityDocumentRelationallyValid(
-	mappings: readonly SessionAuthorityRecord[],
-	provisionalOperations: readonly ProvisionalSessionOperation[],
+	mappings: Iterable<SessionAuthorityRecord>,
+	provisionalOperations: Iterable<ProvisionalSessionOperation>,
 ): boolean {
 	const chatIds = new Set<string>();
 	const identities = new Map<string, string>();
 	const provisionalIdentities = new Set<string>();
 	const projectsByChatId = new Map<string, string>();
+	const mappingByChatId = new Map<string, SessionAuthorityRecord>();
 	for (const mapping of mappings) {
 		if (chatIds.has(mapping.chatId)) return false;
 		chatIds.add(mapping.chatId);
 		projectsByChatId.set(mapping.chatId, mapping.projectId);
+		mappingByChatId.set(mapping.chatId, mapping);
 		if (!hasUniqueJournalIdentities(mapping) || !hasConsistentOperationResults(mapping)) return false;
 		for (const operation of mapping.journal)
 			for (const identifier of operationIdentifiers(operation))
@@ -151,7 +153,7 @@ export function isAuthorityDocumentRelationallyValid(
 		}
 	}
 	for (const operation of provisionalOperations) {
-		const mapping = mappings.find(candidate => candidate.chatId === operation.chatId);
+		const mapping = mappingByChatId.get(operation.chatId);
 		const activeProject = projectsByChatId.get(operation.chatId);
 		const reassignment = mapping?.reassignment;
 		if (activeProject !== undefined && activeProject !== operation.projectId) {

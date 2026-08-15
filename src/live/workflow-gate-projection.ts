@@ -593,27 +593,52 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isJsonValue(value: unknown): boolean {
-	const stack: unknown[] = [value];
-	while (stack.length > 0) {
-		const cur = stack.pop();
-		if (cur === null || typeof cur === "string" || typeof cur === "boolean") continue;
-		if (typeof cur === "number") {
-			if (!Number.isFinite(cur)) return false;
-			continue;
+	type ArrayFrame = { readonly arr: readonly unknown[]; idx: number };
+	type ObjectFrame = { readonly obj: Record<string, unknown>; readonly keys: string[]; idx: number };
+	const stack: Array<ArrayFrame | ObjectFrame> = [];
+	const pushValue = (v: unknown): boolean | null => {
+		if (v === null || typeof v === "string" || typeof v === "boolean") return true;
+		if (typeof v === "number") return Number.isFinite(v);
+		if (Array.isArray(v)) {
+			(stack as Array<ArrayFrame | ObjectFrame>).push({ arr: v, idx: 0 } as ArrayFrame);
+			return null;
 		}
-		if (Array.isArray(cur)) {
-			for (let index = cur.length - 1; index >= 0; index -= 1) stack.push(cur[index]);
-			continue;
-		}
-		if (isRecord(cur as Record<string, unknown>)) {
-			const record = cur as Record<string, unknown>;
-			for (const key in record) {
-				if (!Object.hasOwn(record, key)) continue;
-				stack.push(record[key]);
-			}
-			continue;
+		if (isRecord(v as Record<string, unknown>)) {
+			const obj = v as Record<string, unknown>;
+			(stack as Array<ArrayFrame | ObjectFrame>).push({
+				obj,
+				keys: Object.keys(obj),
+				idx: 0,
+			} as ObjectFrame);
+			return null;
 		}
 		return false;
+	};
+	const initial = pushValue(value);
+	if (initial === false) return false;
+	if (initial === true) return stack.length === 0;
+	while (stack.length > 0) {
+		const top = stack[stack.length - 1]!;
+		if ("arr" in top) {
+			const frame = top as ArrayFrame & { idx: number };
+			if (frame.idx >= frame.arr.length) {
+				stack.pop();
+				continue;
+			}
+			const cur = frame.arr[frame.idx++];
+			const res = pushValue(cur);
+			if (res === false) return false;
+		} else {
+			const frame = top as ObjectFrame & { idx: number };
+			if (frame.idx >= frame.keys.length) {
+				stack.pop();
+				continue;
+			}
+			const key = frame.keys[frame.idx++]!;
+			const cur = frame.obj[key];
+			const res = pushValue(cur);
+			if (res === false) return false;
+		}
 	}
 	return true;
 }
@@ -622,14 +647,36 @@ function boundedStringPrefix(value: unknown, limit: number): string {
 	if (Array.isArray(value)) {
 		let result = "";
 		for (let index = 0; index < value.length; index += 1) {
+			const element = value[index];
+			// Array.prototype.toString renders null/undefined as empty string, not "null".
+			// Preserve that semantics while bounding, otherwise String([null,"x"]) = ",x"
+			// would become "null,x" and change the gate label hash.
+			const elementRawString = element == null ? "" : String(element);
 			const remainingForElement = limit - result.length - (index === 0 ? 0 : 1);
 			if (remainingForElement <= 0) break;
-			const elementPrefix = boundedStringPrefix(value[index], remainingForElement);
-			if (elementPrefix.length === 0 && String(value[index]).length > 0) break;
+			if (elementRawString.length === 0) {
+				if (index !== 0) result += ",";
+				continue;
+			}
+			let elementPrefix: string;
+			if (Array.isArray(element)) {
+				elementPrefix = boundedStringPrefix(element, remainingForElement);
+			} else if (element != null && typeof element === "object") {
+				elementPrefix =
+					elementRawString.length <= remainingForElement
+						? elementRawString
+						: elementRawString.slice(0, remainingForElement);
+			} else {
+				elementPrefix =
+					elementRawString.length <= remainingForElement
+						? elementRawString
+						: elementRawString.slice(0, remainingForElement);
+			}
+			if (elementPrefix.length === 0 && elementRawString.length > 0) break;
 			if (index === 0) result += elementPrefix;
 			else result += `,${elementPrefix}`;
 			if (result.length >= limit) break;
-			if (elementPrefix.length < String(value[index]).length) break;
+			if (elementPrefix.length < elementRawString.length) break;
 		}
 		return result;
 	}
