@@ -237,20 +237,19 @@ function streamPlainJsonResolved(value: unknown, emit: (chunk: string) => void):
 }
 
 /** Hashes a canonical serialization produced by a caller-supplied streaming
- * emitter without ever materializing the whole serialization: the producer
- * runs once into a compact byte spool, whose length is hashed as the lineage
- * prefix and whose bytes are then hashed directly. Snapshotting the emitted
- * bytes means effectful JSON values (a stateful toJSON or getter) are
- * evaluated exactly once, so the measured length always describes exactly the
- * bytes that are hashed; the later WAL JSON.stringify round trip can then
- * never disagree with the stored hash. The producer's bytes are spooled to a
- * temp file so the heap stays bounded: a 1 GiB-class authority never
- * materializes a document-sized in-memory snapshot, and the file is removed
- * before returning. */
+ * emitter without ever materializing the whole serialization. Small payloads
+ * stay in memory, avoiding filesystem work for ordinary startup records;
+ * oversized payloads spill to a temporary file so a 1 GiB-class authority
+ * cannot materialize a document-sized snapshot. The producer runs once, so
+ * effectful JSON values are evaluated exactly once and the measured length
+ * always describes the bytes that are hashed. */
 export function hashCanonicalStream(produce: (emit: (chunk: string) => void) => void): string {
-	const directory = mkdtempSync(join(tmpdir(), "gjc-hash-spool-"));
-	const spoolPath = join(directory, "spool");
-	const descriptor = openSync(spoolPath, "wx", 0o600);
+	const memoryThreshold = 64 * 1024;
+	const memoryChunks: string[] = [];
+	let memoryBytes = 0;
+	let directory: string | undefined;
+	let spoolPath: string | undefined;
+	let descriptor: number | undefined;
 	let length = 0;
 	try {
 		try {
@@ -259,23 +258,40 @@ export function hashCanonicalStream(produce: (emit: (chunk: string) => void) => 
 				// matching the previous in-memory spool) so persisted hashes stay
 				// byte-identical; the file stores the UTF-8 bytes for re-reading.
 				length += chunk.length;
+				const bytes = Buffer.byteLength(chunk, "utf8");
+				if (descriptor === undefined && memoryBytes + bytes <= memoryThreshold) {
+					memoryChunks.push(chunk);
+					memoryBytes += bytes;
+					return;
+				}
+				if (descriptor === undefined) {
+					directory = mkdtempSync(join(tmpdir(), "gjc-hash-spool-"));
+					spoolPath = join(directory, "spool");
+					descriptor = openSync(spoolPath, "wx", 0o600);
+					for (const memoryChunk of memoryChunks) writeSyncAll(descriptor, Buffer.from(memoryChunk, "utf8"));
+					memoryChunks.length = 0;
+				}
 				writeSyncAll(descriptor, Buffer.from(chunk, "utf8"));
 			});
 		} finally {
-			closeSync(descriptor);
+			if (descriptor !== undefined) closeSync(descriptor);
 		}
 		const hasher = new Bun.CryptoHasher("sha256");
 		hasher.update(`${length}:`);
-		const reader = openSync(spoolPath, "r");
-		try {
-			const buffer = Buffer.allocUnsafe(64 * 1024);
-			for (;;) {
-				const read = readSync(reader, buffer, 0, buffer.length, null);
-				if (read <= 0) break;
-				hasher.update(buffer.subarray(0, read));
+		if (spoolPath === undefined) {
+			for (const chunk of memoryChunks) hasher.update(chunk);
+		} else {
+			const reader = openSync(spoolPath, "r");
+			try {
+				const buffer = Buffer.allocUnsafe(64 * 1024);
+				for (;;) {
+					const read = readSync(reader, buffer, 0, buffer.length, null);
+					if (read <= 0) break;
+					hasher.update(buffer.subarray(0, read));
+				}
+			} finally {
+				closeSync(reader);
 			}
-		} finally {
-			closeSync(reader);
 		}
 		hasher.update(";");
 		return hasher.digest("hex");
@@ -283,7 +299,7 @@ export function hashCanonicalStream(produce: (emit: (chunk: string) => void) => 
 		// Always remove the spool, including when the producer or a write
 		// fails (e.g. /tmp fills while hashing an oversized mapping): a partial
 		// file must not accumulate across repeated startup attempts.
-		rmSync(directory, { recursive: true, force: true });
+		if (directory !== undefined) rmSync(directory, { recursive: true, force: true });
 	}
 }
 

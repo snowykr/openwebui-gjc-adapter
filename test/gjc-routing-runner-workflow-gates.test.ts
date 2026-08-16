@@ -189,8 +189,34 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 			.find(value => value?.includes("workflow gate pending"));
 		expect(description).toBeDefined();
 		expect(description!.length).toBeLessThanOrEqual(80);
-		expect(description!).toContain("Choose one of: " + "x".repeat(20));
-		expect(description!).not.toContain("Choose one of: " + "x".repeat(80));
+		expect(description!).toContain(`Choose one of: ${"x".repeat(20)}`);
+		expect(description!).not.toContain(`Choose one of: ${"x".repeat(80)}`);
+	});
+	test("keeps enum values after an empty nested array prefix", () => {
+		// Array#toString([[[]], [true]]) is ",true". The empty first nested
+		// component must not be mistaken for a truncated prefix, or the second
+		// enum value is lost and boot synthesis changes the persisted hash.
+		const projected = projectTurnEvents(
+			[
+				{
+					type: "workflow_gate",
+					id: "gate-enum-nested-empty-1",
+					payload: {
+						gateId: "gate-enum-nested-empty-1",
+						schemaHash: "sha256:enum-nested-empty",
+						idempotencyKey: "idem-enum-nested-empty-1",
+						boundUserMessageId: null,
+						status: "pending",
+						schema: { enum: [[[[]], [true]]] },
+					},
+				},
+			],
+			"gjc/anthropic/claude-sonnet-4:medium",
+		);
+		const description = projected
+			.map(event => (event as { data?: { description?: string } }).data?.description)
+			.find(value => value?.includes("workflow gate pending"));
+		expect(description).toContain("Choose one of: ,true");
 	});
 	test("preserves the authenticated principal for workflow gate publication and replay after restart", async () => {
 		const root = mkdtempSync(join(tmpdir(), "gjc-workflow-gate-projection-"));

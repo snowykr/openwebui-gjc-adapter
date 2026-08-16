@@ -6,11 +6,13 @@ import * as path from "node:path";
 import { join } from "node:path";
 import { FileBackedSessionMappingStore, SessionMappingStore } from "../src/gjc/session-router";
 import {
+	buildEventPayloadHash,
 	createProjectionOperationApplier,
 	expectedProjectionRows,
 	synthesizeProjectionRows,
 } from "../src/live/workflow-gate-projection";
 import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
+import type { OpenWebUIMessageEvent } from "../src/openwebui/events";
 import { ProjectLinkService } from "../src/projects/link-service";
 import { SqliteProjectRegistrationStore } from "../src/projects/registration-store";
 import { registerProjectDirectory } from "../src/projects/registry";
@@ -178,6 +180,20 @@ describe("InMemoryOutboxStore", () => {
 		// streamed through streamPlainJson.
 		const direct = hashCanonicalStream(emit => emit(JSON.stringify({ stateful })));
 		expect(hash).toBe(direct);
+	});
+
+	test("hashes event iterables without requiring a projected event array", () => {
+		const events: OpenWebUIMessageEvent[] = [
+			{ type: "status", data: { description: "one", done: false } },
+			{ type: "status", data: { description: "two", done: true } },
+		];
+		function* eventIterator(): Iterable<(typeof events)[number]> {
+			for (const event of events) yield event;
+		}
+
+		expect(buildEventPayloadHash(eventIterator())).toBe(
+			buildProjectionPayloadHash({ eventsJson: JSON.stringify(events) }),
+		);
 	});
 });
 

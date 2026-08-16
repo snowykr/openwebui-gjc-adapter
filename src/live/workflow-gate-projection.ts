@@ -21,9 +21,16 @@ export function projectTurnEvents(
 	events: readonly GjcTurnEvent[],
 	canonicalModel?: string,
 ): readonly OpenWebUIMessageEvent[] {
-	if (canonicalModel === undefined) return [];
-	const projected: OpenWebUIMessageEvent[] = [];
-	for (const [index, event] of events.entries()) {
+	return [...projectTurnEventsIterable(events, canonicalModel)];
+}
+
+function* projectTurnEventsIterable(
+	events: readonly GjcTurnEvent[],
+	canonicalModel?: string,
+): Iterable<OpenWebUIMessageEvent> {
+	if (canonicalModel === undefined) return;
+	for (let index = 0; index < events.length; index += 1) {
+		const event = events[index]!;
 		const frame = turnEventToProjectableFrame(event);
 		if (frame === null) continue;
 		const frameEvents = projectAgentFrame(frame, {
@@ -31,9 +38,8 @@ export function projectTurnEvents(
 			created: 0,
 			model: canonicalModel,
 		}).events;
-		projected.push(...frameEvents);
+		for (const frameEvent of frameEvents) yield frameEvent;
 	}
-	return projected;
 }
 
 export function buildSessionMappingPayloadHash(mapping: SessionMapping): string {
@@ -120,15 +126,20 @@ export function buildSessionMappingPayloadHash(mapping: SessionMapping): string 
 	});
 }
 
-export function buildEventPayloadHash(events: readonly OpenWebUIMessageEvent[]): string {
+export function buildEventPayloadHash(events: Iterable<OpenWebUIMessageEvent>): string {
 	// The previous shape was { eventsJson: JSON.stringify(events) }: emit that
 	// string value without ever materializing the whole events JSON — the array
 	// serialization is streamed and escaped in flight, then wrapped in the
 	// eventsJson key so stored hashes stay byte-identical.
 	return hashCanonicalStream(emit => {
-		emit('{"eventsJson":"');
-		streamPlainJson(events, chunk => streamEscapedJsonString(chunk, emit));
-		emit('"}');
+		emit('{"eventsJson":"[');
+		let first = true;
+		for (const event of events) {
+			if (!first) emit(",");
+			first = false;
+			streamPlainJson(event, chunk => streamEscapedJsonString(chunk, emit));
+		}
+		emit(']"}');
 	});
 }
 
@@ -137,7 +148,6 @@ export function expectedProjectionRows(
 	ownerUserId: string,
 	principalId: string | null | undefined = mapping.principalId,
 ): readonly EnqueueProjectionOperationInput[] {
-	const events = projectedMappingEvents(mapping);
 	const scopedPrincipalId = normalizePrincipalId(principalId === null ? undefined : principalId);
 	return [
 		{
@@ -156,7 +166,7 @@ export function expectedProjectionRows(
 			projectId: mapping.projectId,
 			chatId: mapping.chatId,
 			kind: "event",
-			payloadHash: buildEventPayloadHash(events),
+			payloadHash: buildEventPayloadHash(projectedMappingEvents(mapping)),
 		},
 	];
 }
@@ -377,9 +387,9 @@ function normalizePrincipalId(value: string | undefined): string | undefined {
 	return normalized.length === 0 ? undefined : normalized;
 }
 
-function projectedMappingEvents(mapping: SessionMapping): readonly OpenWebUIMessageEvent[] {
+function projectedMappingEvents(mapping: SessionMapping): Iterable<OpenWebUIMessageEvent> {
 	const selection = normalizeModelSelection(mapping.modelSelection);
-	return projectTurnEvents(
+	return projectTurnEventsIterable(
 		mapping.events ?? [],
 		selection === undefined ? undefined : formatCanonicalModelId(selection),
 	);
@@ -642,53 +652,31 @@ function isJsonValue(value: unknown): boolean {
 	return true;
 }
 
-function boundedStringPrefix(value: unknown, limit: number): string {
+type BoundedStringPrefix = { readonly prefix: string; readonly complete: boolean };
+
+/** Returns a bounded Array#toString prefix and whether its whole value fit. */
+function boundedStringPrefixResult(value: unknown, limit: number): BoundedStringPrefix {
 	if (Array.isArray(value)) {
 		let result = "";
 		for (let index = 0; index < value.length; index += 1) {
 			const element = value[index];
 			// Nested arrays must be recursed before any String(element) call so a
 			// very large nested array never allocates a payload-sized string.
-			if (Array.isArray(element)) {
-				const remainingForElement = limit - result.length - (index === 0 ? 0 : 1);
-				if (remainingForElement <= 0) break;
-				const elementPrefix = boundedStringPrefix(element, remainingForElement);
-				// Array.prototype.toString for [] is "", for [null] is "", for
-				// [null,null] is "," — distinguish genuinely empty raw vs truncated.
-				const nestedRawEmpty = element.length === 0 || (element.length === 1 && element[0] == null);
-				if (elementPrefix.length === 0 && nestedRawEmpty) {
-					if (index !== 0) result += ",";
-					continue;
-				}
-				if (elementPrefix.length === 0 && !nestedRawEmpty) break;
-				if (index === 0) result += elementPrefix;
-				else result += `,${elementPrefix}`;
-				if (result.length >= limit) break;
-				if (elementPrefix.length === remainingForElement) break;
-				continue;
-			}
-			// Array.prototype.toString renders null/undefined as empty string.
-			const elementRawString = element == null ? "" : String(element);
 			const remainingForElement = limit - result.length - (index === 0 ? 0 : 1);
-			if (remainingForElement <= 0) break;
-			if (elementRawString.length === 0) {
-				if (index !== 0) result += ",";
-				continue;
-			}
-			const elementPrefix =
-				elementRawString.length <= remainingForElement
-					? elementRawString
-					: elementRawString.slice(0, remainingForElement);
-			if (elementPrefix.length === 0 && elementRawString.length > 0) break;
-			if (index === 0) result += elementPrefix;
-			else result += `,${elementPrefix}`;
-			if (result.length >= limit) break;
-			if (elementPrefix.length < elementRawString.length) break;
+			if (remainingForElement <= 0) return { prefix: result, complete: false };
+			const elementResult = Array.isArray(element)
+				? boundedStringPrefixResult(element, remainingForElement)
+				: boundedStringPrefixResult(element == null ? "" : element, remainingForElement);
+			if (index !== 0) result += ",";
+			result += elementResult.prefix;
+			if (!elementResult.complete) return { prefix: result, complete: false };
 		}
-		return result;
+		return { prefix: result, complete: true };
 	}
 	const stringified = String(value);
-	return stringified.length <= limit ? stringified : stringified.slice(0, limit);
+	return stringified.length <= limit
+		? { prefix: stringified, complete: true }
+		: { prefix: stringified.slice(0, limit), complete: false };
 }
 
 /** Joins at most enough enum values to exceed the bounded label window. */
@@ -700,29 +688,10 @@ function boundedEnumPrefix(values: readonly unknown[]): string {
 		const separator = parts.length === 0 ? 0 : 2;
 		const remaining = limit - length - separator;
 		if (remaining <= 0) break;
-		const part = boundedStringPrefix(value, remaining);
-		if (part.length === 0) {
-			// Preserve empty-string/array entries: String("") and String([]) are "",
-			// and map(String).join(", ") keeps them as empty slots (e.g. ["", "x"]
-			// => ", x"). Break only when the original value would be non-empty but
-			// prefix was truncated to empty due to no budget.
-			const raw = value == null ? "" : String(value as unknown);
-			// For arrays, String([]) is "" but nested arrays like ["a"] => "a";
-			// use bounded check: if raw empty, this is a genuine empty entry.
-			const isGenuinelyEmpty = Array.isArray(value)
-				? (value as unknown[]).length === 0 || String(value as unknown).length === 0
-				: raw.length === 0;
-			if (isGenuinelyEmpty) {
-				parts.push("");
-				length += separator;
-				if (length >= limit) break;
-				continue;
-			}
-			break;
-		}
-		parts.push(part);
-		length += separator + part.length;
-		if (part.length === remaining) break;
+		const part = boundedStringPrefixResult(value, remaining);
+		parts.push(part.prefix);
+		length += separator + part.prefix.length;
+		if (!part.complete) break;
 		if (length >= limit) break;
 	}
 	return parts.join(", ");
