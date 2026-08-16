@@ -3,6 +3,7 @@ import { normalizeModelSelection, type SessionMapping, type SessionMappingStore 
 import type { GjcTurnEvent } from "../gjc/turn-runner";
 import type { OpenWebUIMessageEvent } from "../openwebui/events";
 import { type ProjectableAgentFrame, projectAgentFrame } from "../projection/events";
+import { type PendingWorkflowGate, projectPendingWorkflowGateMessage } from "../projection/workflow-gates";
 
 import {
 	type EnqueueProjectionOperationInput,
@@ -401,6 +402,7 @@ function turnEventToProjectableFrame(event: GjcTurnEvent): ProjectableAgentFrame
 	if (sessionFrame !== undefined) return sessionFrame;
 	if (event.type === "message_update" || event.type === "assistant_text" || event.type === "assistant") return null;
 	if (classified.kind === "workflow_gate" || event.type === "workflow_gate") {
+		const fallback = missingWorkflowGateIdentity(event);
 		return {
 			kind: "skill_progress",
 			// projectPendingWorkflowGateMessage() concatenates the prompt, every
@@ -410,13 +412,17 @@ function turnEventToProjectableFrame(event: GjcTurnEvent): ProjectableAgentFrame
 			// field first (parsed straight from the raw payload, without the
 			// full options/schema normalization) so only a small projected
 			// message is ever assembled.
-			label: boundedGateMessage(event),
+			label: fallback
+				? boundedText(projectPendingWorkflowGateMessage(MISSING_GATE_ID_FALLBACK))
+				: boundedGateMessage(event),
 			phase: "start",
 			hidden: false,
 			metadata: {
 				eventType: event.type,
 				gateId: classified.kind === "workflow_gate" ? (classified.gateId ?? event.id ?? null) : (event.id ?? null),
-				workflow_gate: boundedWorkflowGateStatusMetadata(event),
+				workflow_gate: fallback
+					? workflowGateStatusMetadata(MISSING_GATE_ID_FALLBACK)
+					: boundedWorkflowGateStatusMetadata(event),
 			},
 		};
 	}
@@ -434,6 +440,37 @@ function turnEventToProjectableFrame(event: GjcTurnEvent): ProjectableAgentFrame
 	}
 	return {
 		kind: "unsupported",
+	};
+}
+
+const MISSING_GATE_ID_FALLBACK: PendingWorkflowGate = {
+	gateId: "unknown-gate",
+	schemaHash: "unknown",
+	idempotencyKey: "unknown-gate",
+	boundUserMessageId: null,
+	status: "pending",
+	schema: { type: "string" },
+};
+
+/** Matches pendingWorkflowGateFromEvent() returning null for an unidentifiable gate. */
+function missingWorkflowGateIdentity(event: GjcTurnEvent): boolean {
+	const payload = isRecord(event.payload) ? event.payload : undefined;
+	return (
+		stringJsonField(payload, "gateId") === undefined &&
+		stringJsonField(payload, "gate_id") === undefined &&
+		event.id === undefined
+	);
+}
+
+function workflowGateStatusMetadata(gate: PendingWorkflowGate): Record<string, unknown> {
+	return {
+		gateId: gate.gateId,
+		...(gate.stage === undefined ? {} : { stage: gate.stage }),
+		...(gate.kind === undefined ? {} : { kind: gate.kind }),
+		schemaHash: gate.schemaHash,
+		...(gate.createdAt === undefined ? {} : { createdAt: gate.createdAt }),
+		...(gate.required === undefined ? {} : { required: gate.required }),
+		optionCount: gate.options?.length ?? 0,
 	};
 }
 

@@ -169,6 +169,36 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 		for (const description of descriptions)
 			expect(description).toContain("Answer with the requested text for this workfl");
 	});
+	test("preserves the fallback projection for a workflow gate without an identity", () => {
+		const projected = projectTurnEvents(
+			[
+				{
+					type: "workflow_gate",
+					payload: {
+						schemaHash: "custom",
+						context: { prompt: "Approve?" },
+						schema: { type: "boolean" },
+						options: [{ label: "Approve", value: true }],
+					},
+				},
+			],
+			"gjc/anthropic/claude-sonnet-4:medium",
+		);
+		expect(projected).toMatchObject([
+			{
+				type: "status",
+				data: {
+					description: expect.stringContaining("Answer with the requested text for this workfl"),
+					gjc_adapter: {
+						metadata: { eventType: "workflow_gate", gateId: null },
+						workflow_gate: { gateId: "unknown-gate", schemaHash: "unknown", optionCount: 0 },
+					},
+				},
+			},
+		]);
+		expect(JSON.stringify(projected)).not.toContain("Approve?");
+		expect(JSON.stringify(projected)).not.toContain('"custom"');
+	});
 	test("bounds a huge schema enum in the gate prompt fallback", () => {
 		// A large enum must not be joined whole before the label truncates;
 		// only the bounded prefix is projected.
