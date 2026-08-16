@@ -696,10 +696,9 @@ export class FileSessionAuthority extends SessionAuthority {
 			writeChunk(JSON.stringify(nextGeneration));
 			writeChunk(',"normalized":true,"mappings":[');
 			let firstMapping = true;
-			while (raw.records.size > 0) {
-				const entry = raw.records.entries().next().value as [string, SessionAuthorityRecord] | undefined;
-				if (entry === undefined) break;
-				const [chatId, record] = entry;
+			const recordIterator = raw.records.entries();
+			for (let entry = recordIterator.next(); !entry.done; entry = recordIterator.next()) {
+				const [chatId, record] = entry.value;
 				if (!firstMapping) writeChunk(",");
 				firstMapping = false;
 				const normalized = normalizeRecordForPersistence(record);
@@ -709,10 +708,9 @@ export class FileSessionAuthority extends SessionAuthority {
 			}
 			writeChunk('],"provisionalOperations":[');
 			let firstProv = true;
-			while (raw.provisional.size > 0) {
-				const entry = raw.provisional.entries().next().value as [string, ProvisionalSessionOperation] | undefined;
-				if (entry === undefined) break;
-				const [key, op] = entry;
+			const provisionalIterator = raw.provisional.entries();
+			for (let entry = provisionalIterator.next(); !entry.done; entry = provisionalIterator.next()) {
+				const [key, op] = entry.value;
 				if (!firstProv) writeChunk(",");
 				firstProv = false;
 				const normalized = normalizeProvisionalForPersistence(op);
