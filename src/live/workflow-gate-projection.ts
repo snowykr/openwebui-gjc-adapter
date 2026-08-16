@@ -585,16 +585,18 @@ function boundedPayloadPrompt(payload: Record<string, unknown> | undefined): str
 		if (prompt !== undefined) return prompt;
 	}
 	const schema = payload === undefined ? undefined : payload.schema;
-	if (isRecord(schema)) {
-		const enumValue = schema.enum;
-		if (Array.isArray(enumValue)) {
-			// A huge enum must not materialize as one joined string before the
-			// label is truncated; build only the prefix boundedText() will show.
-			return `Choose one of: ${boundedEnumPrefix(enumValue as unknown[])}`;
-		}
-		if (schema.type === "boolean") return "Answer true/false for this approval gate.";
-		if (schema.type === "string") return "Answer with the requested text for this workflow gate.";
+	// pendingWorkflowGateFromEvent() historically normalizes an absent or
+	// malformed schema to { type: "string" }. Preserve that projected-label
+	// fallback so boot synthesis keeps the persisted event payload hash stable.
+	if (!isRecord(schema)) return "Answer with the requested text for this workflow gate.";
+	const enumValue = schema.enum;
+	if (Array.isArray(enumValue)) {
+		// A huge enum must not materialize as one joined string before the
+		// label is truncated; build only the prefix boundedText() will show.
+		return `Choose one of: ${boundedEnumPrefix(enumValue as unknown[])}`;
 	}
+	if (schema.type === "boolean") return "Answer true/false for this approval gate.";
+	if (schema.type === "string") return "Answer with the requested text for this workflow gate.";
 	return "Answer this workflow gate using the requested structured values.";
 }
 

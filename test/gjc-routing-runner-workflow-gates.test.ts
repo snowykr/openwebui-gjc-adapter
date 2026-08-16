@@ -133,6 +133,42 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 		expect(description).toBeDefined();
 		expect(description!).toContain("Answer with the requested text for this workfl");
 	});
+	test("preserves the default string-schema prompt for absent and invalid schemas", () => {
+		const projected = projectTurnEvents(
+			[
+				{
+					type: "workflow_gate",
+					id: "gate-missing-schema-1",
+					payload: {
+						gateId: "gate-missing-schema-1",
+						schemaHash: "sha256:missing-schema",
+						idempotencyKey: "idem-missing-schema-1",
+						boundUserMessageId: null,
+						status: "pending",
+					},
+				},
+				{
+					type: "workflow_gate",
+					id: "gate-invalid-schema-1",
+					payload: {
+						gateId: "gate-invalid-schema-1",
+						schemaHash: "sha256:invalid-schema",
+						idempotencyKey: "idem-invalid-schema-1",
+						boundUserMessageId: null,
+						status: "pending",
+						schema: null,
+					},
+				},
+			],
+			"gjc/anthropic/claude-sonnet-4:medium",
+		);
+		const descriptions = projected
+			.map(event => (event as { data?: { description?: string } }).data?.description)
+			.filter((value): value is string => value?.includes("workflow gate pending") ?? false);
+		expect(descriptions).toHaveLength(2);
+		for (const description of descriptions)
+			expect(description).toContain("Answer with the requested text for this workfl");
+	});
 	test("bounds a huge schema enum in the gate prompt fallback", () => {
 		// A large enum must not be joined whole before the label truncates;
 		// only the bounded prefix is projected.
