@@ -99,15 +99,19 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 			}
 			const modelReaderFactory =
 				principal.role === "user"
-					? () =>
-							sourceModelReaderFactory({
-								principal,
-								workspace,
-								lease: backgroundLease,
-								correlationId: `background:${headers.chatId}`,
-							})
+					? (_context?: unknown, signal?: AbortSignal) =>
+							sourceModelReaderFactory(
+								{
+									principal,
+									workspace,
+									lease: backgroundLease,
+									correlationId: `background:${headers.chatId}`,
+								},
+								signal,
+							)
 					: sourceModelReaderFactory;
-			const selection = await createModelSelectionPolicy(modelReaderFactory).resolve(requestedModelId);
+			const selection = await createModelSelectionPolicy(modelReaderFactory).resolve(requestedModelId, input.signal);
+			throwIfAborted(input.signal);
 			await assertWorkspaceLease(backgroundLease);
 			return await finishWorkspaceLease(backgroundLease, {
 				ok: true,
@@ -122,6 +126,10 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 			});
 		} catch (error) {
 			if (isWorkspaceAdmissionCancelledError(error)) throw error;
+			if (error instanceof GjcTurnCancelledError) {
+				await closeWorkspaceLease(backgroundLease);
+				throw error;
+			}
 			if (error instanceof WorkspaceLeaseUncertainError) {
 				return await finishWorkspaceLease(backgroundLease, workspaceLeaseErrorResult());
 			}
@@ -599,7 +607,12 @@ async function acquireWorkspaceLease(
 			leaseMs: durationMs,
 		});
 		if (lease === undefined) throw new WorkspaceLeaseUncertainError();
-		return new WorkspaceLeaseAdmission(lease, durationMs, heartbeatMs, releaseAdmission);
+		const admission = new WorkspaceLeaseAdmission(lease, durationMs, heartbeatMs, releaseAdmission);
+		if (input.signal?.aborted) {
+			if (!(await admission.finish())) throw new WorkspaceLeaseUncertainError();
+			throw new WorkspaceAdmissionCancelledError();
+		}
+		return admission;
 	} catch (error) {
 		releaseAdmission();
 		throw error;

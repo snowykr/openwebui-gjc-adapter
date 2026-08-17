@@ -90,7 +90,14 @@ export function createModelReaderFactory(input: CreateModelReaderFactoryInput): 
 			attachment = await awaitWithAbort(attachmentPromise, effectiveSignal);
 			await awaitWithAbort(assertScopedModelReaderContext(scopedContext, effectiveSignal), effectiveSignal);
 			assertAttachmentScope(scopedContext, attachment);
-			await awaitWithAbort(port.attach(attachment), effectiveSignal);
+			const attachPromise = Promise.resolve(port.attach(attachment));
+			void attachPromise.then(
+				() => {
+					if (effectiveSignal?.aborted) port.detach();
+				},
+				() => undefined,
+			);
+			await awaitWithAbort(attachPromise, effectiveSignal);
 			await awaitWithAbort(assertScopedModelReaderContext(scopedContext, effectiveSignal), effectiveSignal);
 			return new PublicSdkModelReader(port, temporaryModelAttachmentCleanups.get(attachment));
 		} catch (error) {

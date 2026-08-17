@@ -3,6 +3,7 @@ import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import { OpenWebUIHttpClient } from "../src/openwebui/http-client";
 import type { RegisteredProject } from "../src/projects/registry";
 import { createAdapterRequestHandler } from "../src/server";
+import { MODEL_DESCRIPTORS } from "./model-selection-fixtures";
 
 describe("createAdapterRequestHandler streaming", () => {
 	test("returns event-stream chat completions for streaming requests", async () => {
@@ -113,6 +114,46 @@ describe("OpenWebUI message event responses", () => {
 		controller.abort();
 
 		expect((await response).status).toBe(499);
+	});
+	test("maps cancellation during background model resolution to HTTP 499", async () => {
+		let markCatalogStarted: () => void = () => {};
+		const catalogStarted = new Promise<void>(resolve => {
+			markCatalogStarted = resolve;
+		});
+		let releaseCatalog!: () => void;
+		const catalog = new Promise<readonly unknown[]>(resolve => {
+			releaseCatalog = () => resolve(MODEL_DESCRIPTORS);
+		});
+		const controller = new AbortController();
+		let observedSignal: AbortSignal | undefined;
+		const handler = createAdapterRequestHandler({
+			routes: {
+				projects: [project],
+				owner,
+				runner: { run: () => ({ content: "unexpected", model: "gjc/anthropic/claude-sonnet-4:low" }) },
+				modelReaderFactory: async (_context, signal) => {
+					observedSignal = signal;
+					return {
+						getAvailableModels: () => {
+							markCatalogStarted();
+							return catalog;
+						},
+						getActiveProviders: async () => [],
+						getState: async () => ({}),
+						stop() {},
+					};
+				},
+			},
+		});
+		const request = chatRequest({ model: "gjc", messages: [] }, { signal: controller.signal });
+		request.headers.set("X-OpenWebUI-Task", "title_generation");
+		const response = handler(request);
+
+		await catalogStarted;
+		expect(observedSignal).toBe(controller.signal);
+		controller.abort();
+		expect((await response).status).toBe(499);
+		releaseCatalog();
 	});
 });
 

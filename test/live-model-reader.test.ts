@@ -63,7 +63,7 @@ describe("createModelReaderFactory", () => {
 		await expect(factory()).rejects.toThrow("attachment rejected");
 		expect(port.calls).toEqual(["attach", "detach"]);
 	});
-	test("aborts a pending reader attach and detaches the transport", async () => {
+	test("aborts a pending reader attach and detaches its late completion", async () => {
 		const controller = new AbortController();
 		let attachStarted!: () => void;
 		let releaseAttach!: () => void;
@@ -79,6 +79,7 @@ describe("createModelReaderFactory", () => {
 			port.attachments.push(value);
 			attachStarted();
 			await attach;
+			port.attached = true;
 		};
 		const factory = createModelReaderFactory({
 			cliPath: "/opt/gjc",
@@ -92,7 +93,12 @@ describe("createModelReaderFactory", () => {
 		controller.abort();
 		await expect(pending).rejects.toBeInstanceOf(GjcTurnCancelledError);
 		expect(port.calls).toEqual(["attach", "detach"]);
+		expect(port.attached).toBe(false);
 		releaseAttach();
+		await attach;
+		await Promise.resolve();
+		expect(port.calls).toEqual(["attach", "detach", "detach"]);
+		expect(port.attached).toBe(false);
 	});
 	test("uses the published descriptor as the default attachment authority", async () => {
 		const root = mkdtempSync(join(tmpdir(), "gjc-model-reader-"));
@@ -129,6 +135,7 @@ describe("createModelReaderFactory", () => {
 class FakePublicSessionPort implements PublicSdkSessionPort {
 	readonly calls: string[] = [];
 	readonly attachments: PublicSdkSessionAttachment[] = [];
+	attached = false;
 
 	constructor(private readonly rejectAttachment = false) {}
 
@@ -136,10 +143,12 @@ class FakePublicSessionPort implements PublicSdkSessionPort {
 		this.calls.push("attach");
 		this.attachments.push(value);
 		if (this.rejectAttachment) throw new Error("attachment rejected");
+		this.attached = true;
 	}
 
 	detach(): void {
 		this.calls.push("detach");
+		this.attached = false;
 	}
 
 	async getState() {
