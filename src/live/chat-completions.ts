@@ -443,41 +443,81 @@ class WorkspaceLeaseAdmission {
 		this.#failure = true;
 	}
 }
+type WorkspaceAdmissionWaiter = {
+	readonly resolve: (release: () => void) => void;
+	readonly reject: (error: Error) => void;
+	readonly signal?: AbortSignal;
+	onAbort?: () => void;
+	timer: ReturnType<typeof setTimeout>;
+	settled: boolean;
+};
+
 class WorkspaceAdmissionGate {
-	#tail = Promise.resolve();
+	#queue: WorkspaceAdmissionWaiter[] = [];
 	#queued = 0;
+	#active = false;
 
 	constructor(readonly onIdle: () => void) {}
 
-	async acquire(timeoutMs: number, queueLimit: number): Promise<() => void> {
-		if (this.#queued >= queueLimit) throw new WorkspaceLeaseUncertainError();
+	async acquire(timeoutMs: number, queueLimit: number, signal?: AbortSignal): Promise<() => void> {
+		if (this.#queued >= queueLimit || signal?.aborted) throw new WorkspaceLeaseUncertainError();
 		this.#queued += 1;
-		const previous = this.#tail;
-		let releaseTurn!: () => void;
-		const turn = new Promise<void>(resolve => {
-			releaseTurn = resolve;
+		const result = new Promise<() => void>((resolve, reject) => {
+			const waiter: WorkspaceAdmissionWaiter = {
+				resolve,
+				reject,
+				signal,
+				onAbort: undefined,
+				timer: undefined as unknown as ReturnType<typeof setTimeout>,
+				settled: false,
+			};
+			const onAbort = () => this.#cancel(waiter);
+			waiter.onAbort = onAbort;
+			waiter.timer = setTimeout(() => this.#cancel(waiter), timeoutMs);
+			(waiter.timer as unknown as { unref?: () => void }).unref?.();
+			signal?.addEventListener("abort", onAbort, { once: true });
+			this.#queue.push(waiter);
+			if (signal?.aborted) this.#cancel(waiter);
 		});
-		this.#tail = turn;
-		try {
-			await waitForWorkspaceAdmission(previous, timeoutMs);
-		} catch {
-			void previous.then(releaseTurn, releaseTurn).then(
-				() => this.#dequeue(),
-				() => this.#dequeue(),
-			);
-			throw new WorkspaceLeaseUncertainError();
-		}
-		let released = false;
-		return () => {
-			if (released) return;
-			released = true;
-			releaseTurn();
-			this.#dequeue();
-		};
+		this.#pump();
+		return result;
 	}
 
-	#dequeue(): void {
+	#pump(): void {
+		if (this.#active) return;
+		const waiter = this.#queue.shift();
+		if (waiter === undefined) {
+			if (this.#queued === 0) this.onIdle();
+			return;
+		}
+		if (waiter.settled) {
+			this.#pump();
+			return;
+		}
+		waiter.settled = true;
+		clearTimeout(waiter.timer);
+		waiter.signal?.removeEventListener("abort", waiter.onAbort!);
+		this.#active = true;
+		let released = false;
+		waiter.resolve(() => {
+			if (released) return;
+			released = true;
+			this.#active = false;
+			this.#queued -= 1;
+			this.#pump();
+		});
+	}
+
+	#cancel(waiter: WorkspaceAdmissionWaiter): void {
+		if (waiter.settled) return;
+		waiter.settled = true;
+		clearTimeout(waiter.timer);
+		waiter.signal?.removeEventListener("abort", waiter.onAbort!);
+		const index = this.#queue.indexOf(waiter);
+		if (index === -1) return;
+		this.#queue.splice(index, 1);
 		this.#queued -= 1;
+		waiter.reject(new WorkspaceLeaseUncertainError());
 		if (this.#queued === 0) this.onIdle();
 	}
 }
@@ -500,30 +540,15 @@ function workspaceAdmissionGateFor(manager: object, safeKey: string): WorkspaceA
 	return gate;
 }
 
-async function waitForWorkspaceAdmission(previous: Promise<void>, timeoutMs: number): Promise<void> {
-	await new Promise<void>((resolve, reject) => {
-		const timer = setTimeout(() => reject(new WorkspaceLeaseUncertainError()), timeoutMs);
-		(timer as unknown as { unref?: () => void }).unref?.();
-		void previous.then(
-			() => {
-				clearTimeout(timer);
-				resolve();
-			},
-			error => {
-				clearTimeout(timer);
-				reject(error);
-			},
-		);
-	});
-}
 /** Acquires the same-process workspace admission queue for a normal-user operation. */
 export async function acquireWorkspaceAdmission(
 	manager: object,
 	safeKey: string,
 	timeoutMs: number,
 	queueLimit: number,
+	signal?: AbortSignal,
 ): Promise<() => void> {
-	return workspaceAdmissionGateFor(manager, safeKey).acquire(timeoutMs, queueLimit);
+	return workspaceAdmissionGateFor(manager, safeKey).acquire(timeoutMs, queueLimit, signal);
 }
 
 async function acquireWorkspaceLease(
@@ -540,8 +565,10 @@ async function acquireWorkspaceLease(
 		safeKey,
 		timeoutMs,
 		queueLimit,
+		input.signal,
 	);
 	try {
+		if (input.signal?.aborted) throw new WorkspaceLeaseUncertainError();
 		const lease = await input.workspaceLeaseManager.acquire({
 			safeKey,
 			holderId: `gjc-turn-${process.pid}-${randomUUID()}`,

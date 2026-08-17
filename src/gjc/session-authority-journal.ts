@@ -477,6 +477,31 @@ export class SessionAuthorityJournal {
 		const journal = record.journal.filter((_, candidateIndex) => candidateIndex !== index);
 		this.setRecord(chatId, { ...record, journal });
 	}
+	discardPendingProvisionalOperation(
+		chatId: string,
+		operation: Pick<ProvisionalSessionOperation, "id" | "ingressId" | "detail">,
+	): void {
+		const current = [...this.provisional.values()].find(
+			candidate =>
+				candidate.chatId === chatId &&
+				candidate.id === operation.id &&
+				candidate.ingressId === operation.ingressId,
+		);
+		if (
+			current === undefined ||
+			operation.detail === undefined ||
+			current.detail !== operation.detail ||
+			current.state !== "pending" ||
+			current.acknowledgedSuccessor !== undefined
+		)
+			throw new Error(`Session operation ${operation.id} requires reconciliation.`);
+		const key = provisionalKey(current.chatId, current.ingressId ?? current.id);
+		this.provisional.delete(key);
+		this.#dirtyProvisional.add(key);
+		// WAL deltas are additive. Force a compacted rewrite so the deletion is
+		// durable instead of being resurrected when an older WAL is replayed.
+		this.#forceCompaction = true;
+	}
 	transition(
 		chatId: string,
 		operationId: string,

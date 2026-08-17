@@ -95,6 +95,13 @@ export function scopedSessionMappingStore(
 			requireChat(actual);
 			mappings.discardPendingOperationScoped(scope, operation);
 		},
+		discardPendingProvisionalOperation: (
+			actual: string,
+			operation: Parameters<SessionMappingStore["discardPendingProvisionalOperation"]>[1],
+		) => {
+			requireChat(actual);
+			mappings.discardPendingProvisionalOperationScoped(scope, operation);
+		},
 		transitionOperation: (
 			actual: string,
 			operationId: string,

@@ -245,6 +245,7 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 			started = resolve;
 		});
 		let releaseFirst!: () => void;
+		const secondAbort = new AbortController();
 		try {
 			const runner = {
 				run() {
@@ -275,13 +276,29 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 				owner,
 				workspaceRegistry,
 				workspaceLeaseManager,
+				signal: secondAbort.signal,
+				workspaceAdmissionQueueLimit: 2,
+				runner,
+			});
+			await Promise.resolve();
+			expect(runnerCalls).toBe(1);
+			secondAbort.abort();
+			const third = handleChatCompletions({
+				request: { model: "gjc", messages: [{ role: "user", content: "third" }] },
+				headers: { ...chatHeaders, "X-OpenWebUI-User-Id": "normal-1", "X-OpenWebUI-Message-Id": "assistant-3" },
+				projects: [project],
+				owner,
+				workspaceRegistry,
+				workspaceLeaseManager,
+				workspaceAdmissionQueueLimit: 2,
 				runner,
 			});
 			await Promise.resolve();
 			expect(runnerCalls).toBe(1);
 			releaseFirst();
 			expect((await first).ok).toBe(true);
-			expect((await second).ok).toBe(true);
+			expect((await second).ok).toBe(false);
+			expect((await third).ok).toBe(true);
 			expect(runnerCalls).toBe(2);
 		} finally {
 			await rm(root, { recursive: true, force: true });

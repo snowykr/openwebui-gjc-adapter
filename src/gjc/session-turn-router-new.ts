@@ -22,6 +22,7 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 		input.runner.resolveSessionRoot,
 	);
 	let authorityCompleted = false;
+	let promptMayHaveDispatched = false;
 	const markUncertain = () => {
 		if (!authorityCompleted)
 			input.mappings.transitionProvisionalOperation(
@@ -85,10 +86,27 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 				});
 			},
 			async () => {
+				promptMayHaveDispatched = true;
 				markUncertain();
 			},
 		);
 	} catch (error) {
+		if (error instanceof GjcTurnCancelledError && !promptMayHaveDispatched) {
+			try {
+				input.mappings.discardPendingProvisionalOperation(input.chatId, operation);
+			} catch (discardError) {
+				try {
+					markUncertain();
+				} catch (transitionError) {
+					throw new AggregateError(
+						[error, discardError, transitionError],
+						"pre-prompt cancellation provisional cleanup is uncertain",
+					);
+				}
+				throw new AggregateError([error, discardError], "pre-prompt cancellation provisional cleanup is uncertain");
+			}
+			throw error;
+		}
 		markUncertain();
 		throw error;
 	}

@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { SessionMappingStore } from "../src/gjc/session-router";
-import { GjcTurnCancelledError, type GjcControlResult, type GjcTurnRunner } from "../src/gjc/turn-runner";
+import {
+	GjcTurnCancelledError,
+	type GjcControlResult,
+	type GjcLifecyclePublicationAddress,
+	type GjcLifecycleTransaction,
+	type GjcTurnRunner,
+} from "../src/gjc/turn-runner";
 import type { LiveGatewayRunnerInput } from "../src/live/chat-completions";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
 import { InMemoryOutboxStore } from "../src/state/outbox";
@@ -84,6 +90,22 @@ class DispatchedErrorControlRunner extends ControlTurnRunner {
 	}
 }
 
+class CancelledReplayControlRunner extends ControlTurnRunner {
+	constructor(private readonly cancelBeforeEffect: () => void) {
+		super();
+	}
+
+	async withLifecyclePublication<T>(
+		address: GjcLifecyclePublicationAddress,
+		effect: (lifecycle: GjcLifecycleTransaction) => Promise<T>,
+	): Promise<T> {
+		return await super.withLifecyclePublication(address, async lifecycle => {
+			this.cancelBeforeEffect();
+			return await effect(lifecycle);
+		});
+	}
+}
+
 function seedMapping(mappings: SessionMappingStore): void {
 	mappings.set({
 		chatId: "chat-control",
@@ -142,6 +164,29 @@ describe("control operation replay", () => {
 		expect(turnRunner.calls).toHaveLength(1);
 		expect(turnRunner.continues).toHaveLength(1);
 		expect(rowIdentity(outbox)).toEqual(rowsAfterRegularTurn);
+	});
+	test("rejects a completed control replay cancelled after lifecycle reattachment", async () => {
+		const mappings = new SessionMappingStore();
+		seedMapping(mappings);
+		const outbox = new InMemoryOutboxStore();
+		const userMessageId = "control-replay-cancelled";
+		const first = createGjcRoutingLiveGatewayRunner({
+			turnRunner: new ControlTurnRunner(),
+			mappings,
+			outbox,
+		});
+		await first.run(controlTurn(userMessageId));
+		const rowsAtCompletion = rowIdentity(outbox);
+
+		const controller = new AbortController();
+		const replayRunner = new CancelledReplayControlRunner(() => controller.abort());
+		const replay = createGjcRoutingLiveGatewayRunner({ turnRunner: replayRunner, mappings, outbox });
+
+		await expect(replay.run({ ...controlTurn(userMessageId), signal: controller.signal })).rejects.toMatchObject({
+			name: "GjcTurnCancelledError",
+		});
+		expect(replayRunner.calls).toHaveLength(0);
+		expect(rowIdentity(outbox)).toEqual(rowsAtCompletion);
 	});
 	test("cleans up a pre-aborted control so the same operation ID can retry", async () => {
 		const mappings = new SessionMappingStore();

@@ -1,5 +1,6 @@
 import type { SessionMappingStore } from "../gjc/session-router";
 import { scopedSessionMappingStore } from "../gjc/session-turn-router";
+import { GjcTurnCancelledError } from "../gjc/turn-runner";
 import type { OutboxStore } from "../state/outbox";
 import type { LiveGatewayRunnerInput, LiveGatewayRunnerResult } from "./chat-completions";
 import type { GjcSessionTurnRunner } from "./gjc-routing-gateway";
@@ -57,7 +58,9 @@ export async function replayRoutingOperation(
 		// would conflict with them). A superseded operation's rows settle as
 		// obsolete during reconciliation.
 		const isCurrentReplay = recordMapping !== undefined && recordMapping.operationId === turn.userMessageId;
+		throwIfAborted(turn.signal);
 		return replayWithLifecyclePublication(input.turnRunner, turn, result.mapping, async () => {
+			throwIfAborted(turn.signal);
 			if (isCurrentReplay) ensureProjectionRows(input.outbox, recordMapping!, projectionOwnerUserId, principalId);
 			const events = projectTurnEvents(
 				isCurrentReplay ? (recordMapping!.events ?? []) : (result.events ?? []),
@@ -121,7 +124,9 @@ export async function replayRoutingOperation(
 		throw new Error(
 			`GJC workflow gate operation ${turn.userMessageId} completed without a valid immutable result binding.`,
 		);
+	throwIfAborted(turn.signal);
 	return replayWithLifecyclePublication(input.turnRunner, turn, result.mapping, async () => {
+		throwIfAborted(turn.signal);
 		const replayed = replayCompletedWorkflowGateReply(scopedInput, turn);
 		if (replayed === null)
 			throw new Error(
@@ -130,6 +135,11 @@ export async function replayRoutingOperation(
 		return withCanonicalModel(replayed, result.mapping.modelSelection);
 	});
 }
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) throw new GjcTurnCancelledError();
+}
+
 function principalIdForTurn(turn: LiveGatewayRunnerInput): string | undefined {
 	const ownerUserId = turn.ownerUserId;
 	return typeof ownerUserId === "string" && ownerUserId.trim().length > 0 ? ownerUserId : undefined;

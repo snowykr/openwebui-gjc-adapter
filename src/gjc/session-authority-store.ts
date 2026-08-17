@@ -164,6 +164,12 @@ export class SessionAuthority {
 	): void {
 		this.#journal.discardPendingOperation(chatId, operation);
 	}
+	discardPendingProvisionalOperation(
+		chatId: string,
+		operation: Pick<ProvisionalSessionOperation, "id" | "ingressId" | "detail">,
+	): void {
+		this.#journal.discardPendingProvisionalOperation(chatId, operation);
+	}
 	transitionOperation(
 		chatId: string,
 		operationId: string,
