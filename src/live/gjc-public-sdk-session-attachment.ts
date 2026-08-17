@@ -226,6 +226,8 @@ export async function prompt(
 	selection?: NormalizedModelSelection,
 	observer?: GjcTurnEventObserver,
 	beforePrompt?: () => void,
+	onDispatch?: () => void,
+	beforeDispatch?: () => void,
 ): Promise<{ readonly outcome: PublicSdkTurnOutcome; readonly modelSelection?: NormalizedModelSelection }> {
 	let modelSelection = selection;
 	if (selection !== undefined) {
@@ -246,6 +248,8 @@ export async function prompt(
 			text,
 			context.input.turnTimeoutMs,
 			observer === undefined ? undefined : event => observer(normalizeObservedSdkRecord(event)),
+			onDispatch,
+			beforeDispatch,
 		),
 		modelSelection,
 	};

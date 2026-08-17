@@ -13,7 +13,14 @@ export interface PublicSdkTurnContext {
 	readonly client: SdkV3Client;
 	readonly attachment: PublicSdkSessionAttachment;
 	readonly authority: <T>(timeoutMs: number, effect: (client: SdkV3Client) => Promise<T>) => Promise<T>;
-	readonly mutate: (operation: string, input: SdkRecord, key?: string, timeoutMs?: number) => Promise<unknown>;
+	readonly mutate: (
+		operation: string,
+		input: SdkRecord,
+		key?: string,
+		timeoutMs?: number,
+		onDispatch?: () => void,
+		beforeDispatch?: () => void,
+	) => Promise<unknown>;
 }
 
 export async function runTurn(
@@ -23,6 +30,8 @@ export async function runTurn(
 	key: string | undefined,
 	timeoutMs: number,
 	observer?: PublicSdkTurnEventObserver,
+	onDispatch?: () => void,
+	beforeDispatch?: () => void,
 ): Promise<PublicSdkTurnOutcome> {
 	const { attachment, client } = context;
 	const deadline = createPublicSdkDeadline(timeoutMs, `${operation} timed out after ${timeoutMs}ms`);
@@ -32,7 +41,7 @@ export async function runTurn(
 		window.beginMutation();
 		const accepted = parseRecord(
 			await context.authority(deadline.remaining(), () =>
-				context.mutate(operation, input, key, deadline.remaining()),
+				context.mutate(operation, input, key, deadline.remaining(), onDispatch, beforeDispatch),
 			),
 			`${operation} result`,
 		);
@@ -57,6 +66,8 @@ export async function runGateTurn(
 	key: string | undefined,
 	timeoutMs: number,
 	observer?: PublicSdkTurnEventObserver,
+	onDispatch?: () => void,
+	beforeDispatch?: () => void,
 ): Promise<PublicSdkTurnOutcome> {
 	const { attachment, client } = context;
 	if (gate.correlation.sessionId !== attachment.sessionId) {
@@ -73,6 +84,8 @@ export async function runGateTurn(
 				{ id: gate.gateId, response: answer, expectedSessionId: attachment.sessionId },
 				key,
 				deadline.remaining(),
+				onDispatch,
+				beforeDispatch,
 			),
 		);
 		window.accept(gate.correlation);
