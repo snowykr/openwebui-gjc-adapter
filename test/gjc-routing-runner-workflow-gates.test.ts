@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { NormalizedModelSelection } from "../src/contracts";
+import type { PublicSdkSessionPort } from "../src/gjc/public-sdk-contract";
 import { SessionAuthorityLoadError } from "../src/gjc/session-authority";
 import {
 	FileBackedSessionMappingStore,
@@ -17,9 +18,12 @@ import type {
 	GjcTurnResult,
 } from "../src/gjc/turn-runner";
 import { GjcTurnCancelledError } from "../src/gjc/turn-runner";
+import { respondWorkflowGate } from "../src/live/gjc-public-sdk-session-ops";
+import { createPublicSdkRunnerContext } from "../src/live/gjc-routing-lifecycle";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
 import { projectTurnEvents, synthesizeProjectionRows } from "../src/live/workflow-gate-projection";
 import { InMemoryOutboxStore } from "../src/state/outbox";
+import { lifecycleFixture } from "./gjc-lifecycle-fixtures";
 import {
 	decisionWorkflowGateEvent,
 	deepInterviewWorkflowGateEvent,
@@ -136,6 +140,107 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 
 		await expect(runner.run(replyInput("1"))).resolves.toEqual({ content: "workflow gate accepted" });
 		expect(mappings.operation("chat-1", "user-2")).toMatchObject({ state: "complete" });
+	});
+	test("does not send a terminal abort before gate dispatch and retries the same message", async () => {
+		const root = mkdtempSync(join(tmpdir(), "gjc-gate-dispatch-boundary-"));
+		const sessionRoot = join(root, ".gjc", "sessions");
+		const endpointRoot = join(root, ".gjc", "state", "sdk");
+		const sessionFile = join(sessionRoot, "session-1.jsonl");
+		mkdirSync(sessionRoot, { recursive: true });
+		mkdirSync(endpointRoot, { recursive: true });
+		writeFileSync(
+			sessionFile,
+			`${JSON.stringify({ type: "session", version: 3, id: "session-1", timestamp: "2026-01-01T00:00:00.000Z", cwd: root })}\n`,
+		);
+		writeFileSync(
+			join(endpointRoot, "session-1.json"),
+			JSON.stringify({ version: 1, url: "ws://127.0.0.1:1", token: "test" }),
+		);
+		let registeredAbort: (() => Promise<unknown>) | undefined;
+		let answerCalls = 0;
+		let abortCalls = 0;
+		const port = {
+			async attach() {},
+			detach() {},
+			async answerGate(
+				_gate: unknown,
+				_answer: unknown,
+				_key: string | undefined,
+				_timeoutMs: number | undefined,
+				_observer: unknown,
+				onDispatch?: () => void,
+				_beforeDispatch?: () => void,
+			) {
+				answerCalls += 1;
+				if (answerCalls === 1) {
+					void registeredAbort?.();
+					return await new Promise<never>(() => {});
+				}
+				onDispatch?.();
+				if (answerCalls === 3) {
+					void registeredAbort?.();
+					return await new Promise<never>(() => {});
+				}
+				return { events: [], finalizedAssistantText: "accepted" };
+			},
+			async abort(_key?: string, _timeoutMs?: number, onDispatch?: () => void) {
+				abortCalls += 1;
+				onDispatch?.();
+				return {};
+			},
+		} as unknown as PublicSdkSessionPort;
+		const context = createPublicSdkRunnerContext({
+			cliPath: "missing-gjc-cli",
+			runtimeLocations: { childEnvironment: {} } as never,
+			turnTimeoutMs: 1_000,
+			sessionPortFactory: () => port,
+		});
+		const address = {
+			cwd: root,
+			sessionRoot,
+			projectId: "project",
+			chatId: "chat-1",
+			sessionId: "session-1",
+			sessionFile,
+		};
+		const input = {
+			...address,
+			gateId: "gate-1",
+			answer: { selected: ["JWT"] },
+			promptText: "Choose authentication method",
+			idempotencyKey: "chat-1:user-2",
+			userMessageId: "user-2",
+			operationId: "user-2",
+			rawFrameCursor: 0,
+			eventCursor: 0,
+			gateCorrelation: { commandId: "command-1", turnId: "turn-1", sessionId: "session-1" },
+			lifecycle: lifecycleFixture(address),
+		};
+		const register = (
+			_address: unknown,
+			_principal: string | undefined,
+			_operation: string,
+			abort: () => Promise<unknown>,
+		) => {
+			registeredAbort = abort;
+			return { cancelled: false, unregister() {} };
+		};
+		await expect(respondWorkflowGate(context, input, register)).rejects.toMatchObject({
+			name: "GjcTurnCancelledError",
+		});
+		expect(abortCalls).toBe(0);
+		await expect(respondWorkflowGate(context, input, register)).resolves.toMatchObject({ text: "accepted" });
+		expect(answerCalls).toBe(2);
+		expect(abortCalls).toBe(0);
+		await expect(respondWorkflowGate(context, input, register)).rejects.toMatchObject({
+			name: "GjcTurnCancelledError",
+		});
+		expect(abortCalls).toBe(1);
+		try {
+			// The descriptor and session file are test-only lifecycle state.
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 	test("retains uncertain workflow gate authority when an SDK dispatch was acknowledged before an error", async () => {
 		const turnRunner = new DispatchedErrorWorkflowGateRunner();

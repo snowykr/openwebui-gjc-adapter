@@ -363,12 +363,17 @@ export async function respondWorkflowGate(
 	};
 	const outcome = await withMutationPort(context, attachment, input.lifecycle, async port => {
 		let cancelled = false;
+		let gateDispatched = false;
 		let rejectCancelled!: (error: Error) => void;
 		const cancellation = new Promise<never>((_resolve, reject) => {
 			rejectCancelled = reject;
 		});
 		const registration = registerOwnedAbort?.(input, input.principalId, input.operationId, async () => {
 			cancelled = true;
+			if (!gateDispatched) {
+				rejectCancelled(new GjcTurnCancelledError());
+				return;
+			}
 			try {
 				const abort = abortWithDispatch(
 					port,
@@ -389,7 +394,10 @@ export async function respondWorkflowGate(
 					input.idempotencyKey,
 					context.input.turnTimeoutMs,
 					input.observer === undefined ? undefined : event => input.observer?.(normalizeObservedSdkRecord(event)),
-					input.onDispatch,
+					() => {
+						gateDispatched = true;
+						input.onDispatch?.();
+					},
 					() => throwIfAborted(input.signal, cancelled),
 				),
 				cancellation,

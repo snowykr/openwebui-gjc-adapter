@@ -117,9 +117,12 @@ export async function runControl(
 	const terminalAbortKey = terminalAbortIdempotencyKey(input.chatId, input.userMessageId);
 	const principalId =
 		typeof input.ownerUserId === "string" && input.ownerUserId.trim().length > 0 ? input.ownerUserId : undefined;
-	const mutate = <T>(operation: (port: PublicSdkSessionPort, beforeDispatch: () => void) => Promise<T>) =>
+	const mutate = <T>(
+		operation: (port: PublicSdkSessionPort, beforeDispatch: () => void, onDispatch: () => void) => Promise<T>,
+	) =>
 		withMutationPort(context, attachment, lifecycle, async port => {
 			let cancelled = false;
+			let operationDispatched = false;
 			let rejectCancelled!: (error: Error) => void;
 			const cancellation = new Promise<never>((_resolve, reject) => {
 				rejectCancelled = reject;
@@ -130,6 +133,10 @@ export async function runControl(
 				input.userMessageId,
 				async () => {
 					cancelled = true;
+					if (!operationDispatched) {
+						rejectCancelled(new GjcTurnCancelledError());
+						return;
+					}
 					try {
 						const abort = abortWithDispatch(port, terminalAbortKey, context.input.turnTimeoutMs);
 						await awaitAbortDispatch(abort.promise, abort.dispatched);
@@ -141,40 +148,44 @@ export async function runControl(
 			const beforeDispatch = () => {
 				if (cancelled || input.signal?.aborted) throw new GjcTurnCancelledError();
 			};
+			const dispatch = () => {
+				operationDispatched = true;
+				onDispatch?.();
+			};
 			try {
 				if (registration?.cancelled || input.signal?.aborted) throw new GjcTurnCancelledError();
-				return await Promise.race([operation(port, beforeDispatch), cancellation]);
+				return await Promise.race([operation(port, beforeDispatch, dispatch), cancellation]);
 			} finally {
 				registration?.unregister();
 			}
 		});
 	if (control.operation === "abort") {
-		await mutate((port, beforeDispatch) =>
-			port.abort(terminalAbortKey, context.input.turnTimeoutMs, onDispatch, beforeDispatch),
+		await mutate((port, beforeDispatch, dispatch) =>
+			port.abort(terminalAbortKey, context.input.turnTimeoutMs, dispatch, beforeDispatch),
 		);
 		return { attachment: await freshAttachmentProof(input.project.cwd, attachment, lifecycle) };
 	}
 	if (control.operation === "steer") {
-		await mutate((port, beforeDispatch) =>
+		await mutate((port, beforeDispatch, dispatch) =>
 			port.steer(
 				control.text ?? input.prompt,
 				idempotencyKey,
 				context.input.turnTimeoutMs,
-				onDispatch,
+				dispatch,
 				beforeDispatch,
 			),
 		);
 		return { attachment: await freshAttachmentProof(input.project.cwd, attachment, lifecycle) };
 	}
 	if (control.operation === "follow_up" || control.operation === "abort_and_prompt") {
-		const outcome = await mutate((port, beforeDispatch) =>
+		const outcome = await mutate((port, beforeDispatch, dispatch) =>
 			control.operation === "follow_up"
 				? port.followUp(
 						control.text ?? input.prompt,
 						idempotencyKey,
 						context.input.turnTimeoutMs,
 						undefined,
-						onDispatch,
+						dispatch,
 						beforeDispatch,
 					)
 				: port.abortAndPrompt(
@@ -182,7 +193,7 @@ export async function runControl(
 						idempotencyKey,
 						context.input.turnTimeoutMs,
 						undefined,
-						onDispatch,
+						dispatch,
 						beforeDispatch,
 					),
 		);
@@ -196,13 +207,13 @@ export async function runControl(
 		};
 	}
 	if (control.operation === "action_reply") {
-		await mutate((port, beforeDispatch) =>
+		await mutate((port, beforeDispatch, dispatch) =>
 			port.replyToAction(
 				control.actionId,
 				control.answer,
 				idempotencyKey,
 				context.input.turnTimeoutMs,
-				onDispatch,
+				dispatch,
 				beforeDispatch,
 			),
 		);
@@ -210,8 +221,8 @@ export async function runControl(
 	}
 	if (control.operation !== "workflow.plan_approve")
 		throw new Error(`Unsupported OpenWebUI control surface: ${control.operation}.`);
-	await mutate((port, beforeDispatch) =>
-		port.planApprove(control.input, idempotencyKey, context.input.turnTimeoutMs, onDispatch, beforeDispatch),
+	await mutate((port, beforeDispatch, dispatch) =>
+		port.planApprove(control.input, idempotencyKey, context.input.turnTimeoutMs, dispatch, beforeDispatch),
 	);
 	return { attachment: await freshAttachmentProof(input.project.cwd, attachment, lifecycle) };
 }

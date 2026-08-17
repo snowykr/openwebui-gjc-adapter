@@ -1,4 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { PublicSdkSessionPort } from "../src/gjc/public-sdk-contract";
 import { SessionMappingStore } from "../src/gjc/session-router";
 import {
 	type GjcControlResult,
@@ -8,9 +12,11 @@ import {
 	type GjcTurnRunner,
 } from "../src/gjc/turn-runner";
 import type { LiveGatewayRunnerInput } from "../src/live/chat-completions";
+import { runControl } from "../src/live/gjc-public-sdk-control-ops";
+import { createPublicSdkRunnerContext } from "../src/live/gjc-routing-lifecycle";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
 import { InMemoryOutboxStore } from "../src/state/outbox";
-import { attachmentProof } from "./gjc-lifecycle-fixtures";
+import { attachmentProof, lifecycleFixture } from "./gjc-lifecycle-fixtures";
 import { FakeGjcTurnRunner, project } from "./gjc-routing-runner-fixtures";
 
 const controlTurn = (userMessageId: string): LiveGatewayRunnerInput => ({
@@ -240,6 +246,104 @@ describe("control operation replay", () => {
 
 		await expect(gateway.run(controlTurn(userMessageId))).resolves.toMatchObject({ content: "control done" });
 		expect(mappings.operation("chat-control", userMessageId)).toMatchObject({ state: "complete" });
+	});
+	test("does not send a terminal abort before control dispatch and retries the same message", async () => {
+		const root = mkdtempSync(join(tmpdir(), "gjc-control-dispatch-boundary-"));
+		const sessionRoot = join(root, ".gjc", "sessions");
+		const endpointRoot = join(root, ".gjc", "state", "sdk");
+		const sessionFile = join(sessionRoot, "session-1.jsonl");
+		mkdirSync(sessionRoot, { recursive: true });
+		mkdirSync(endpointRoot, { recursive: true });
+		writeFileSync(
+			sessionFile,
+			`${JSON.stringify({ type: "session", version: 3, id: "session-1", timestamp: "2026-01-01T00:00:00.000Z", cwd: root })}\n`,
+		);
+		writeFileSync(
+			join(endpointRoot, "session-1.json"),
+			JSON.stringify({ version: 1, url: "ws://127.0.0.1:1", token: "test" }),
+		);
+		let registeredAbort: (() => Promise<unknown>) | undefined;
+		let steerCalls = 0;
+		let abortCalls = 0;
+		let dispatches = 0;
+		const port = {
+			async attach() {},
+			detach() {},
+			async steer(_text: string, _key: string | undefined, _timeoutMs: number | undefined, onDispatch?: () => void) {
+				steerCalls += 1;
+				if (steerCalls === 1) {
+					void registeredAbort?.();
+					return await new Promise<never>(() => {});
+				}
+				onDispatch?.();
+				if (steerCalls === 3) {
+					void registeredAbort?.();
+					return await new Promise<never>(() => {});
+				}
+				return {};
+			},
+			async abort(_key?: string, _timeoutMs?: number, onDispatch?: () => void) {
+				abortCalls += 1;
+				onDispatch?.();
+				return {};
+			},
+		} as unknown as PublicSdkSessionPort;
+		const context = createPublicSdkRunnerContext({
+			cliPath: "missing-gjc-cli",
+			runtimeLocations: { childEnvironment: {} } as never,
+			turnTimeoutMs: 1_000,
+			sessionPortFactory: () => port,
+		});
+		const turn = {
+			...controlTurn("control-boundary"),
+			project: { ...project, cwd: root, sessionRoot },
+			control: { operation: "steer" as const, text: "continue" },
+		};
+		const mapping = {
+			chatId: turn.chatId,
+			projectId: project.id,
+			sessionId: "session-1",
+			sessionFile,
+			rawFrameCursor: 0,
+			eventCursor: 0,
+			operationId: "prior",
+		};
+		const lifecycle = lifecycleFixture({
+			cwd: root,
+			sessionRoot,
+			projectId: project.id,
+			chatId: turn.chatId,
+			sessionId: "session-1",
+			sessionFile,
+		});
+		const register = (
+			_address: unknown,
+			_principal: string | undefined,
+			_operation: string,
+			abort: () => Promise<unknown>,
+		) => {
+			registeredAbort = abort;
+			return { cancelled: false, unregister() {} };
+		};
+		await expect(
+			runControl(context, turn, mapping, lifecycle, undefined, register, () => (dispatches += 1)),
+		).rejects.toMatchObject({
+			name: "GjcTurnCancelledError",
+		});
+		expect(abortCalls).toBe(0);
+		await expect(
+			runControl(context, turn, mapping, lifecycle, undefined, register, () => (dispatches += 1)),
+		).resolves.toBeDefined();
+		expect(steerCalls).toBe(2);
+		expect(abortCalls).toBe(0);
+		await expect(
+			runControl(context, turn, mapping, lifecycle, undefined, register, () => (dispatches += 1)),
+		).rejects.toMatchObject({
+			name: "GjcTurnCancelledError",
+		});
+		expect(dispatches).toBe(2);
+		expect(abortCalls).toBe(1);
+		rmSync(root, { recursive: true, force: true });
 	});
 	test("retains uncertain control authority when an SDK dispatch was acknowledged before an error", async () => {
 		const mappings = new SessionMappingStore();
