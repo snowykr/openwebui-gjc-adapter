@@ -47,7 +47,10 @@ export async function runControl(
 	if (control.operation === "branch") {
 		const principalId =
 			typeof input.ownerUserId === "string" && input.ownerUserId.trim().length > 0 ? input.ownerUserId : undefined;
+		const idempotencyKey = `${input.chatId}:${input.userMessageId}`;
 		let cancelled = false;
+		let activePort: PublicSdkSessionPort | undefined;
+		let abortSent = false;
 		let rejectCancelled!: (error: Error) => void;
 		const cancellation = new Promise<never>((_resolve, reject) => {
 			rejectCancelled = reject;
@@ -59,22 +62,41 @@ export async function runControl(
 			async () => {
 				cancelled = true;
 				rejectCancelled(new GjcTurnCancelledError());
+				if (activePort === undefined || abortSent) return;
+				abortSent = true;
+				return await activePort.abort(idempotencyKey, context.input.turnTimeoutMs);
 			},
 		);
+		let branchOperation: Promise<GjcControlResult> | undefined;
 		try {
 			if (registration?.cancelled || input.signal?.aborted) throw new GjcTurnCancelledError();
-			const branched = await Promise.race([
-				runBranchControl(context, input, mapping, lifecycle, async successor => {
+			branchOperation = runBranchControl(
+				context,
+				input,
+				mapping,
+				lifecycle,
+				async successor => {
 					if (cancelled || input.signal?.aborted) throw new GjcTurnCancelledError();
 					await onAcknowledgedSuccessor?.(successor);
 					if (cancelled || input.signal?.aborted) throw new GjcTurnCancelledError();
-				}),
-				cancellation,
-			]);
+				},
+				async port => {
+					activePort = port;
+					if (cancelled && !abortSent) {
+						abortSent = true;
+						await port.abort(idempotencyKey, context.input.turnTimeoutMs);
+					}
+				},
+				() => {
+					if (cancelled || input.signal?.aborted) throw new GjcTurnCancelledError();
+				},
+			);
+			const branched = await Promise.race([branchOperation, cancellation]);
 			if (cancelled || input.signal?.aborted) throw new GjcTurnCancelledError();
 			return branched;
 		} finally {
 			registration?.unregister();
+			await branchOperation?.catch(() => undefined);
 		}
 	}
 	const attachment = await ensureAttachment(context, mappedAddress(input, mapping), lifecycle);

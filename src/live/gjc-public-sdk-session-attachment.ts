@@ -225,6 +225,7 @@ export async function prompt(
 	text: string,
 	selection?: NormalizedModelSelection,
 	observer?: GjcTurnEventObserver,
+	beforePrompt?: () => void,
 ): Promise<{ readonly outcome: PublicSdkTurnOutcome; readonly modelSelection?: NormalizedModelSelection }> {
 	let modelSelection = selection;
 	if (selection !== undefined) {
@@ -239,6 +240,7 @@ export async function prompt(
 			throw error;
 		}
 	}
+	beforePrompt?.();
 	return {
 		outcome: await port.prompt(
 			text,

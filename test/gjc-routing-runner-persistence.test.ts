@@ -3600,6 +3600,63 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			fixture.dispose();
 		}
 	});
+	test("aborts an in-flight branch through its active port before branch successor work starts", async () => {
+		let branchCandidatesStarted!: () => void;
+		const branchCandidatesReady = new Promise<void>(resolve => {
+			branchCandidatesStarted = resolve;
+		});
+		let releaseBranchCandidates!: () => void;
+		const branchCandidatesRelease = new Promise<void>(resolve => {
+			releaseBranchCandidates = resolve;
+		});
+		let abortCalls = 0;
+		let aborted = false;
+		const sessionPortFactory = () => {
+			const client = new PublicSdkSessionClient();
+			return new Proxy(client, {
+				get(target, property) {
+					const value = Reflect.get(target, property, target);
+					if (property === "branchCandidates") {
+						return async (...args: Parameters<PublicSdkSessionPort["branchCandidates"]>) => {
+							branchCandidatesStarted();
+							await branchCandidatesRelease;
+							if (aborted) throw new Error("branch candidates cancelled");
+							return await (value as PublicSdkSessionPort["branchCandidates"]).apply(target, args);
+						};
+					}
+					if (property === "abort") {
+						return async (...args: Parameters<PublicSdkSessionPort["abort"]>) => {
+							abortCalls += 1;
+							aborted = true;
+							releaseBranchCandidates();
+							return await (value as PublicSdkSessionPort["abort"]).apply(target, args);
+						};
+					}
+					return typeof value === "function" ? value.bind(target) : value;
+				},
+			}) as unknown as PublicSdkSessionPort;
+		};
+		const fixture = await setupPublicSdkBranchFixture("branch_regenerate", undefined, sessionPortFactory);
+		try {
+			const controller = new AbortController();
+			const pending = fixture.runner.run({ ...fixture.turn, signal: controller.signal });
+			await branchCandidatesReady;
+			controller.abort();
+			releaseBranchCandidates();
+			await expect(pending).rejects.toMatchObject({ name: "GjcTurnCancelledError" });
+			expect(abortCalls).toBe(1);
+			expect(
+				fixture.server.frames.some(
+					frame => frame.type === "query_request" && frame.query === "session.branch_candidates",
+				),
+			).toBe(false);
+			expect(
+				fixture.server.frames.some(frame => frame.type === "control_request" && frame.operation === "session.branch"),
+			).toBe(false);
+		} finally {
+			fixture.dispose();
+		}
+	});
 	test("keeps an acknowledged branch checkpoint uncertain after restart without remote replay", async () => {
 		let barrierHits = 0;
 		const fixture = await setupPublicSdkBranchFixture("branch_regenerate", async (phase, evidence) => {
@@ -4317,6 +4374,111 @@ test("applies released model selection responses across fresh and continuation t
 		rmSync(root, { recursive: true, force: true });
 	}
 });
+test("cleans up a cancelled new session when model setup finishes before the prompt boundary", async () => {
+	const root = mkdtempSync(join(tmpdir(), "gjc-cancel-model-setup-"));
+	const sessionRoot = join(root, ".gjc", "sessions");
+	const mappingFile = join(root, "mappings.json");
+	const server = startSdkFixtureServer("model_catalog", root);
+	let releaseSetup!: () => void;
+	const setupRelease = new Promise<void>(resolve => {
+		releaseSetup = resolve;
+	});
+	let setupStarted!: () => void;
+	const setupReady = new Promise<void>(resolve => {
+		setupStarted = resolve;
+	});
+	let holdFirstSetup = true;
+	try {
+		writeFileSync(
+			join(root, "gjc-sdk-fixture.json"),
+			JSON.stringify({
+				GJC_SDK_FIXTURE_CLI_TRANSCRIPT: join(root, "sdk-cli.jsonl"),
+				GJC_SDK_FIXTURE_ENDPOINT_URL: server.url,
+				GJC_SDK_FIXTURE_ENDPOINT_TOKEN: server.token,
+				GJC_SDK_FIXTURE_DYNAMIC_AUTHORITY: "1",
+			}),
+		);
+		const sessionPortFactory = () => {
+			const client = new PublicSdkSessionClient();
+			const syntheticSetup = holdFirstSetup;
+			return new Proxy(client, {
+				get(target, property) {
+					const value = Reflect.get(target, property, target);
+					if (property === "setThinking" && syntheticSetup) {
+						return async (...args: Parameters<PublicSdkSessionPort["setThinking"]>) => ({
+							provider: "anthropic",
+							modelId: "claude-sonnet-4",
+							thinkingLevel: args[0],
+						});
+					}
+					if (property !== "setModel" || !syntheticSetup || !holdFirstSetup) {
+						return typeof value === "function" ? value.bind(target) : value;
+					}
+					holdFirstSetup = false;
+					return async (...args: Parameters<PublicSdkSessionPort["setModel"]>) => {
+						setupStarted();
+						await setupRelease;
+						return args[0];
+					};
+				},
+			}) as unknown as PublicSdkSessionPort;
+		};
+		const turnRunner = createPublicSdkGjcTurnRunner({
+			cliPath: join(import.meta.dir, "fixtures", "gjc-sdk-interactive-cli-session-fixture.ts"),
+			runtimeLocations: {
+				childEnvironment: {
+					HOME: root,
+					GJC_CONFIG_DIR: join(root, ".gjc"),
+					GJC_CODING_AGENT_DIR: join(root, ".gjc"),
+				},
+			} as GjcRuntimeLocations,
+			turnTimeoutMs: 1_000,
+			sessionPortFactory,
+		});
+		const runner = createGjcRoutingLiveGatewayRunner({
+			turnRunner,
+			mappings: new FileBackedSessionMappingStore(mappingFile),
+			requestedModelId: () => "gjc/anthropic/claude-sonnet-4:medium",
+			modelReaderFactory: staticModelReaderFactory(),
+		});
+		const firstTurn = {
+			project: { ...project, cwd: root, sessionRoot },
+			prompt: "cancel during setup",
+			chatId: "cancel-model-setup",
+			messageId: "assistant-cancel-model-setup",
+			userMessageId: "cancel-model-setup-1",
+			userMessageParentId: null,
+			continued: false,
+		};
+		const controller = new AbortController();
+		const pending = runner.run({ ...firstTurn, signal: controller.signal });
+		await setupReady;
+		controller.abort();
+		releaseSetup();
+		await expect(pending).rejects.toMatchObject({ name: "GjcTurnCancelledError" });
+		expect(
+			server.frames.some(frame => frame.type === "control_request" && frame.operation === "turn.prompt"),
+		).toBe(false);
+		expect(tmuxPanesInCwd(root)).toEqual([]);
+
+		await expect(
+			runner.run({
+				...firstTurn,
+				prompt: "retry after setup cancellation",
+				messageId: "assistant-cancel-model-setup-retry",
+				userMessageId: "cancel-model-setup-retry",
+			}),
+		).resolves.toMatchObject({ content: expect.any(String) });
+		expect(
+			server.frames.filter(frame => frame.type === "control_request" && frame.operation === "turn.prompt"),
+		).toHaveLength(1);
+	} finally {
+		for (const pane of tmuxPanesInCwd(root))
+			Bun.spawnSync(["tmux", "kill-pane", "-t", pane], { stdout: "ignore", stderr: "ignore" });
+		server.stop();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
 test("cleans up exactly the owned CLI pane when the post-CLI binding barrier fails", async () => {
 	const root = mkdtempSync(join(tmpdir(), "gjc-post-cli-pre-bind-"));
 	const sessionRoot = join(root, ".gjc", "sessions");
@@ -4924,7 +5086,11 @@ function turn(chatId: string, userMessageId: string, continued = false) {
 		continued,
 	};
 }
-function setupPublicSdkBranchFixture(scenario: SdkFixtureScenario, routingBarrierHook?: GjcLifecycleTestBarrierHook) {
+function setupPublicSdkBranchFixture(
+	scenario: SdkFixtureScenario,
+	routingBarrierHook?: GjcLifecycleTestBarrierHook,
+	sessionPortFactory?: () => PublicSdkSessionPort,
+) {
 	const root = mkdtempSync(join(tmpdir(), "gjc-public-sdk-branch-"));
 	const sessionRoot = join(root, ".gjc", "sessions");
 	const endpointRoot = join(root, ".gjc", "state", "sdk");
@@ -4967,6 +5133,7 @@ function setupPublicSdkBranchFixture(scenario: SdkFixtureScenario, routingBarrie
 			childEnvironment: { HOME: root, GJC_CONFIG_DIR: join(root, ".gjc"), GJC_CODING_AGENT_DIR: join(root, ".gjc") },
 		} as GjcRuntimeLocations,
 		turnTimeoutMs: 1_000,
+		...(sessionPortFactory === undefined ? {} : { sessionPortFactory }),
 	};
 	const runner = createGjcRoutingLiveGatewayRunner({
 		turnRunner: createPublicSdkGjcTurnRunner(runnerInput),

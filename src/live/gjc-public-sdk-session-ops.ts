@@ -99,8 +99,9 @@ export async function startNewSession<T>(
 					await beforePrompt(address, provisionalProof, lifecycle);
 					provisionalAuthorityPersisted = true;
 					const result = await withMutationPort(context, attachment, lifecycle, async port => {
+						let cancelledBeforePrompt = false;
 						let rejectCancelled!: (error: Error) => void;
-						const cancelled = new Promise<never>((_resolve, reject) => {
+						const cancellation = new Promise<never>((_resolve, reject) => {
 							rejectCancelled = reject;
 						});
 						const registration = registerOwnedAbort?.(
@@ -108,16 +109,19 @@ export async function startNewSession<T>(
 							input.principalId,
 							input.userMessageId,
 							async () => {
+								cancelledBeforePrompt = true;
 								rejectCancelled(new GjcTurnCancelledError());
 								return await port.abort(undefined, context.input.turnTimeoutMs);
 							},
 						);
 						try {
 							throwIfAborted(input.signal, registration?.cancelled);
-							promptStarted = true;
 							return await Promise.race([
-								prompt(context, port, input.text, input.modelSelection, input.observer),
-								cancelled,
+								prompt(context, port, input.text, input.modelSelection, input.observer, () => {
+									throwIfAborted(input.signal, cancelledBeforePrompt);
+									promptStarted = true;
+								}),
+								cancellation,
 							]);
 						} finally {
 							registration?.unregister();
@@ -198,19 +202,23 @@ export async function continueSession(
 	const attachment = await ensureAttachment(context, input, input.lifecycle);
 	throwIfAborted(input.signal);
 	const result = await withMutationPort(context, attachment, input.lifecycle, async port => {
+		let cancelledBeforePrompt = false;
 		let rejectCancelled!: (error: Error) => void;
-		const cancelled = new Promise<never>((_resolve, reject) => {
+		const cancellation = new Promise<never>((_resolve, reject) => {
 			rejectCancelled = reject;
 		});
 		const registration = registerOwnedAbort?.(input, input.principalId, input.operationId, async () => {
+			cancelledBeforePrompt = true;
 			rejectCancelled(new GjcTurnCancelledError());
 			return await port.abort(undefined, context.input.turnTimeoutMs);
 		});
 		try {
 			throwIfAborted(input.signal, registration?.cancelled);
 			return await Promise.race([
-				prompt(context, port, input.text, input.modelSelection, input.observer),
-				cancelled,
+				prompt(context, port, input.text, input.modelSelection, input.observer, () => {
+					throwIfAborted(input.signal, cancelledBeforePrompt);
+				}),
+				cancellation,
 			]);
 		} finally {
 			registration?.unregister();
