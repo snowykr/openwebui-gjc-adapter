@@ -31,7 +31,7 @@
 		"@gajae-code/ai": "0.12.8",
 		"@gajae-code/bridge-client": "0.12.8",
 		"@gajae-code/coding-agent": "0.12.8",
-		"@gajae-code/natives": "0.12.8"
+		"@gajae-code/natives": "0.13.2"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.5.5",
