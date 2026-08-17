@@ -281,6 +281,7 @@ export async function routeGjcTurn(input: ScopedRouteGjcTurnInput): Promise<Rout
 			async lifecycle => {
 				throwIfAborted(input.signal);
 				const operation = beginDurableOperation(scopedInput, mappings);
+				let promptDispatched = false;
 				try {
 					await input.runner.switchSession({
 						...address,
@@ -288,6 +289,7 @@ export async function routeGjcTurn(input: ScopedRouteGjcTurnInput): Promise<Rout
 						sessionFile: existingSessionFile,
 						recoveryAttachment: existing.attachment,
 					});
+					throwIfAborted(input.signal);
 					const state = await input.runner.getState({
 						...address,
 						lifecycle,
@@ -311,6 +313,9 @@ export async function routeGjcTurn(input: ScopedRouteGjcTurnInput): Promise<Rout
 						...(input.onObservedTurn === undefined ? {} : { observer: input.onObservedTurn }),
 						...(input.signal === undefined ? {} : { signal: input.signal }),
 						...(input.principalId === undefined ? {} : { principalId: input.principalId }),
+						onDispatch: () => {
+							promptDispatched = true;
+						},
 					});
 					throwIfAborted(input.signal);
 					const completedSelection =
@@ -356,6 +361,29 @@ export async function routeGjcTurn(input: ScopedRouteGjcTurnInput): Promise<Rout
 					});
 					return { assistantText, events: result.events, mapping };
 				} catch (error) {
+					if (error instanceof GjcTurnCancelledError && !promptDispatched) {
+						try {
+							mappings.discardPendingOperation(input.chatId, {
+								id: operation.key,
+								ingressId: operation.key,
+								detail: operation.hash,
+							});
+						} catch (discardError) {
+							try {
+								mappings.transitionOperation(input.chatId, operation.key, "uncertain", operation.hash);
+							} catch (transitionError) {
+								throw new AggregateError(
+									[error, discardError, transitionError],
+									"pre-prompt cancellation operation cleanup is uncertain",
+								);
+							}
+							throw new AggregateError(
+								[error, discardError],
+								"pre-prompt cancellation operation cleanup is uncertain",
+							);
+						}
+						throw error;
+					}
 					mappings.transitionOperation(input.chatId, operation.key, "uncertain", operation.hash);
 					throw error;
 				}

@@ -279,6 +279,7 @@ export async function continueSession(
 			return await Promise.race([
 				prompt(context, port, input.text, input.modelSelection, input.observer, () => {
 					throwIfAborted(input.signal, cancelledBeforePrompt);
+					input.onDispatch?.();
 				}),
 				cancellation,
 			]);

@@ -53,6 +53,7 @@ export interface GjcContinueSessionInput extends GjcSessionAddress, GjcLifecycle
 	readonly observer?: GjcTurnEventObserver;
 	readonly signal?: AbortSignal;
 	readonly principalId?: string;
+	readonly onDispatch?: () => void;
 }
 
 export interface GjcSwitchSessionInput extends GjcSessionAddress, GjcLifecycleScoped {
