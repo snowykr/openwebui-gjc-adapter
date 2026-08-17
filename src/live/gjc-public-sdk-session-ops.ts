@@ -34,6 +34,7 @@ import type { PublicSdkRunnerContext } from "./gjc-routing-lifecycle";
 import { normalizeObservedSdkRecord, turnResult } from "./gjc-routing-proof";
 import { runLifecycleTestBarrier } from "./gjc-routing-test-barrier";
 import { projectSessionArtifactEvents } from "./gjc-session-artifact-events";
+import { terminalAbortIdempotencyKey } from "./gjc-terminal-abort-key";
 
 export type OwnedAbortRegistration = (
 	address: GjcSessionAddress,
@@ -160,7 +161,11 @@ export async function startNewSession<T>(
 							async () => {
 								cancelledBeforePrompt = true;
 								try {
-									const abort = abortWithDispatch(port, undefined, context.input.turnTimeoutMs);
+									const abort = abortWithDispatch(
+										port,
+										terminalAbortIdempotencyKey(input.chatId, input.userMessageId),
+										context.input.turnTimeoutMs,
+									);
 									await awaitAbortDispatch(abort.promise, abort.dispatched);
 								} finally {
 									rejectCancelled(new GjcTurnCancelledError());
@@ -170,10 +175,18 @@ export async function startNewSession<T>(
 						try {
 							throwIfAborted(input.signal, registration?.cancelled);
 							return await Promise.race([
-								prompt(context, port, input.text, input.modelSelection, input.observer, () => {
-									throwIfAborted(input.signal, cancelledBeforePrompt);
-									promptStarted = true;
-								}),
+								prompt(
+									context,
+									port,
+									input.text,
+									input.modelSelection,
+									input.observer,
+									() => throwIfAborted(input.signal, cancelledBeforePrompt),
+									() => {
+										promptStarted = true;
+									},
+									() => throwIfAborted(input.signal, cancelledBeforePrompt),
+								),
 								cancellation,
 							]);
 						} finally {
@@ -268,7 +281,11 @@ export async function continueSession(
 		const registration = registerOwnedAbort?.(input, input.principalId, input.operationId, async () => {
 			cancelledBeforePrompt = true;
 			try {
-				const abort = abortWithDispatch(port, undefined, context.input.turnTimeoutMs);
+				const abort = abortWithDispatch(
+					port,
+					terminalAbortIdempotencyKey(input.chatId, input.userMessageId),
+					context.input.turnTimeoutMs,
+				);
 				await awaitAbortDispatch(abort.promise, abort.dispatched);
 			} finally {
 				rejectCancelled(new GjcTurnCancelledError());
@@ -277,10 +294,16 @@ export async function continueSession(
 		try {
 			throwIfAborted(input.signal, registration?.cancelled);
 			return await Promise.race([
-				prompt(context, port, input.text, input.modelSelection, input.observer, () => {
-					throwIfAborted(input.signal, cancelledBeforePrompt);
-					input.onDispatch?.();
-				}),
+				prompt(
+					context,
+					port,
+					input.text,
+					input.modelSelection,
+					input.observer,
+					() => throwIfAborted(input.signal, cancelledBeforePrompt),
+					input.onDispatch,
+					() => throwIfAborted(input.signal, cancelledBeforePrompt),
+				),
 				cancellation,
 			]);
 		} finally {
@@ -321,13 +344,19 @@ export async function respondWorkflowGate(
 		payload: {},
 	};
 	const outcome = await withMutationPort(context, attachment, input.lifecycle, async port => {
+		let cancelled = false;
 		let rejectCancelled!: (error: Error) => void;
-		const cancelled = new Promise<never>((_resolve, reject) => {
+		const cancellation = new Promise<never>((_resolve, reject) => {
 			rejectCancelled = reject;
 		});
 		const registration = registerOwnedAbort?.(input, input.principalId, input.operationId, async () => {
+			cancelled = true;
 			try {
-				const abort = abortWithDispatch(port, input.idempotencyKey, context.input.turnTimeoutMs);
+				const abort = abortWithDispatch(
+					port,
+					terminalAbortIdempotencyKey(input.chatId, input.userMessageId),
+					context.input.turnTimeoutMs,
+				);
 				await awaitAbortDispatch(abort.promise, abort.dispatched);
 			} finally {
 				rejectCancelled(new GjcTurnCancelledError());
@@ -335,7 +364,6 @@ export async function respondWorkflowGate(
 		});
 		try {
 			throwIfAborted(input.signal, registration?.cancelled);
-			input.onDispatch?.();
 			return await Promise.race([
 				port.answerGate(
 					gate,
@@ -343,8 +371,10 @@ export async function respondWorkflowGate(
 					input.idempotencyKey,
 					context.input.turnTimeoutMs,
 					input.observer === undefined ? undefined : event => input.observer?.(normalizeObservedSdkRecord(event)),
+					input.onDispatch,
+					() => throwIfAborted(input.signal, cancelled),
 				),
-				cancelled,
+				cancellation,
 			]);
 		} finally {
 			registration?.unregister();

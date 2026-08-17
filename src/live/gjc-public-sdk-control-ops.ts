@@ -27,6 +27,7 @@ import { attachmentKey, validatePersistedSessionIdentity } from "./gjc-routing-e
 import type { PublicSdkRunnerContext } from "./gjc-routing-lifecycle";
 import { attachmentProof, type SessionAttachment, turnResult } from "./gjc-routing-proof";
 import { runLifecycleTestBarrier } from "./gjc-routing-test-barrier";
+import { terminalAbortIdempotencyKey } from "./gjc-terminal-abort-key";
 
 export async function runControl(
 	context: PublicSdkRunnerContext,
@@ -51,6 +52,7 @@ export async function runControl(
 		const principalId =
 			typeof input.ownerUserId === "string" && input.ownerUserId.trim().length > 0 ? input.ownerUserId : undefined;
 		const idempotencyKey = `${input.chatId}:${input.userMessageId}`;
+		const terminalAbortKey = terminalAbortIdempotencyKey(input.chatId, input.userMessageId);
 		let cancelled = false;
 		let activePort: PublicSdkSessionPort | undefined;
 		let rejectCancelled!: (error: Error) => void;
@@ -61,7 +63,7 @@ export async function runControl(
 		let branchOperation: Promise<GjcControlResult> | undefined;
 		const dispatchAbort = (port: PublicSdkSessionPort): Promise<unknown> => {
 			if (abortDispatch !== undefined) return abortDispatch.promise;
-			abortDispatch = abortWithDispatch(port, idempotencyKey, context.input.turnTimeoutMs);
+			abortDispatch = abortWithDispatch(port, terminalAbortKey, context.input.turnTimeoutMs);
 			return abortDispatch.promise;
 		};
 		const registration = registerOwnedAbort?.(
@@ -113,10 +115,12 @@ export async function runControl(
 	}
 	const attachment = await ensureAttachment(context, mappedAddress(input, mapping), lifecycle);
 	const idempotencyKey = `${input.chatId}:${input.userMessageId}`;
+	const terminalAbortKey = terminalAbortIdempotencyKey(input.chatId, input.userMessageId);
 	const principalId =
 		typeof input.ownerUserId === "string" && input.ownerUserId.trim().length > 0 ? input.ownerUserId : undefined;
-	const mutate = <T>(operation: (port: PublicSdkSessionPort) => Promise<T>) =>
+	const mutate = <T>(operation: (port: PublicSdkSessionPort, beforeDispatch: () => void) => Promise<T>) =>
 		withMutationPort(context, attachment, lifecycle, async port => {
+			let cancelled = false;
 			let rejectCancelled!: (error: Error) => void;
 			const cancellation = new Promise<never>((_resolve, reject) => {
 				rejectCancelled = reject;
@@ -126,35 +130,62 @@ export async function runControl(
 				principalId,
 				input.userMessageId,
 				async () => {
+					cancelled = true;
 					try {
-						const abort = abortWithDispatch(port, idempotencyKey, context.input.turnTimeoutMs);
+						const abort = abortWithDispatch(port, terminalAbortKey, context.input.turnTimeoutMs);
 						await awaitAbortDispatch(abort.promise, abort.dispatched);
 					} finally {
 						rejectCancelled(new GjcTurnCancelledError());
 					}
 				},
 			);
+			const beforeDispatch = () => {
+				if (cancelled || input.signal?.aborted) throw new GjcTurnCancelledError();
+			};
 			try {
 				if (registration?.cancelled || input.signal?.aborted) throw new GjcTurnCancelledError();
-				onDispatch?.();
-				return await Promise.race([operation(port), cancellation]);
+				return await Promise.race([operation(port, beforeDispatch), cancellation]);
 			} finally {
 				registration?.unregister();
 			}
 		});
 	if (control.operation === "abort") {
-		await mutate(port => port.abort(idempotencyKey, context.input.turnTimeoutMs));
+		await mutate((port, beforeDispatch) =>
+			port.abort(idempotencyKey, context.input.turnTimeoutMs, onDispatch, beforeDispatch),
+		);
 		return { attachment: await freshAttachmentProof(input.project.cwd, attachment, lifecycle) };
 	}
 	if (control.operation === "steer") {
-		await mutate(port => port.steer(control.text ?? input.prompt, idempotencyKey, context.input.turnTimeoutMs));
+		await mutate((port, beforeDispatch) =>
+			port.steer(
+				control.text ?? input.prompt,
+				idempotencyKey,
+				context.input.turnTimeoutMs,
+				onDispatch,
+				beforeDispatch,
+			),
+		);
 		return { attachment: await freshAttachmentProof(input.project.cwd, attachment, lifecycle) };
 	}
 	if (control.operation === "follow_up" || control.operation === "abort_and_prompt") {
-		const outcome = await mutate(port =>
+		const outcome = await mutate((port, beforeDispatch) =>
 			control.operation === "follow_up"
-				? port.followUp(control.text ?? input.prompt, idempotencyKey, context.input.turnTimeoutMs)
-				: port.abortAndPrompt(control.text ?? input.prompt, idempotencyKey, context.input.turnTimeoutMs),
+				? port.followUp(
+						control.text ?? input.prompt,
+						idempotencyKey,
+						context.input.turnTimeoutMs,
+						undefined,
+						onDispatch,
+						beforeDispatch,
+					)
+				: port.abortAndPrompt(
+						control.text ?? input.prompt,
+						idempotencyKey,
+						context.input.turnTimeoutMs,
+						undefined,
+						onDispatch,
+						beforeDispatch,
+					),
 		);
 		return {
 			result: turnResult(
@@ -166,14 +197,23 @@ export async function runControl(
 		};
 	}
 	if (control.operation === "action_reply") {
-		await mutate(port =>
-			port.replyToAction(control.actionId, control.answer, idempotencyKey, context.input.turnTimeoutMs),
+		await mutate((port, beforeDispatch) =>
+			port.replyToAction(
+				control.actionId,
+				control.answer,
+				idempotencyKey,
+				context.input.turnTimeoutMs,
+				onDispatch,
+				beforeDispatch,
+			),
 		);
 		return { attachment: await freshAttachmentProof(input.project.cwd, attachment, lifecycle) };
 	}
 	if (control.operation !== "workflow.plan_approve")
 		throw new Error(`Unsupported OpenWebUI control surface: ${control.operation}.`);
-	await mutate(port => port.planApprove(control.input, idempotencyKey, context.input.turnTimeoutMs));
+	await mutate((port, beforeDispatch) =>
+		port.planApprove(control.input, idempotencyKey, context.input.turnTimeoutMs, onDispatch, beforeDispatch),
+	);
 	return { attachment: await freshAttachmentProof(input.project.cwd, attachment, lifecycle) };
 }
 
@@ -218,6 +258,7 @@ async function runSessionControl(
 	}
 	const target = sessionTarget;
 	const key = `${input.chatId}:${input.userMessageId}`;
+	const terminalAbortKey = terminalAbortIdempotencyKey(input.chatId, input.userMessageId);
 	const principalId =
 		typeof input.ownerUserId === "string" && input.ownerUserId.trim().length > 0 ? input.ownerUserId : undefined;
 	let cancelled = false;
@@ -243,7 +284,7 @@ async function runSessionControl(
 				async () => {
 					cancelled = true;
 					try {
-						const abort = abortWithDispatch(port, key, context.input.turnTimeoutMs);
+						const abort = abortWithDispatch(port, terminalAbortKey, context.input.turnTimeoutMs);
 						await awaitAbortDispatch(abort.promise, abort.dispatched);
 					} finally {
 						rejectCancelled(new GjcTurnCancelledError());

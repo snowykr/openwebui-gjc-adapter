@@ -63,10 +63,18 @@ export class SdkV3Client {
 		timeoutMs?: number,
 		idempotencyKey?: string,
 		onDispatch?: () => void,
+		beforeDispatch?: () => void,
 	): Promise<unknown> {
 		try {
-			if (onDispatch !== undefined)
-				return await this.controlWithDispatch(operation, input, timeoutMs, idempotencyKey, onDispatch);
+			if (onDispatch !== undefined || beforeDispatch !== undefined)
+				return await this.controlWithDispatch(
+					operation,
+					input,
+					timeoutMs,
+					idempotencyKey,
+					onDispatch,
+					beforeDispatch,
+				);
 			const frame = await this.requireClient().control(operation, input, { timeoutMs, idempotencyKey });
 			return parseOperationResult(asRecord(frame, `${operation} response`), `${operation} response`);
 		} catch (error) {
@@ -79,7 +87,8 @@ export class SdkV3Client {
 		input: SdkRecord,
 		timeoutMs: number | undefined,
 		idempotencyKey: string | undefined,
-		onDispatch: () => void,
+		onDispatch: (() => void) | undefined,
+		beforeDispatch: (() => void) | undefined,
 	): Promise<unknown> {
 		const client = this.requireClient();
 		const id = randomUUID();
@@ -117,10 +126,11 @@ export class SdkV3Client {
 			}, timeoutMs ?? DEFAULT_TIMEOUT_MS);
 			(timer as unknown as { unref?: () => void }).unref?.();
 			try {
+				beforeDispatch?.();
 				client.send(frame);
 				// Let the transport event loop hand the frame to the socket before the
 				// owner can detach; this is a dispatch boundary, not a time grace.
-				setImmediate(onDispatch);
+				if (onDispatch !== undefined) setImmediate(onDispatch);
 			} catch (error) {
 				cleanup();
 				reject(error);

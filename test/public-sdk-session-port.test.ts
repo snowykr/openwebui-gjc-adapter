@@ -1,6 +1,7 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import {
+	linkSync,
 	mkdirSync,
 	mkdtempSync,
 	rmSync,
@@ -249,6 +250,38 @@ describe("published SDK endpoint attachment", () => {
 				}),
 			).toThrow();
 		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(outside, { recursive: true, force: true });
+		}
+	});
+	test("fails closed on unsupported held-descriptor proof platforms", () => {
+		const root = mkdtempSync(join(tmpdir(), "gjc-sdk-endpoint-platform-"));
+		const outside = mkdtempSync(join(tmpdir(), "gjc-sdk-endpoint-platform-outside-"));
+		const directory = join(root, ".gjc", "state", "sdk");
+		const descriptorPath = join(directory, "session-1.json");
+		const outsideDescriptor = join(outside, "session-1.json");
+		const platform = Object.getOwnPropertyDescriptor(process, "platform");
+		try {
+			mkdirSync(directory, { recursive: true });
+			writeFileSync(
+				outsideDescriptor,
+				JSON.stringify({ sessionId: "session-1", version: 1, url: "ws://127.0.0.1:4123", token: "token" }),
+			);
+			// A pathname realpath would report this hard link as inside root even
+			// though the held descriptor was supplied by an external file.
+			linkSync(outsideDescriptor, descriptorPath);
+			Object.defineProperty(process, "platform", { configurable: true, value: "darwin" });
+			expect(() =>
+				attachmentFromPublishedSdkEndpoint(root, "session-1", {
+					sessionId: "session-1",
+					path: descriptorPath,
+					url: "ws://127.0.0.1:4123",
+					token: "token",
+				}),
+			).toThrow("cannot be proven inside the canonical workspace on this platform");
+		} finally {
+			if (platform === undefined) Reflect.deleteProperty(process, "platform");
+			else Object.defineProperty(process, "platform", platform);
 			rmSync(root, { recursive: true, force: true });
 			rmSync(outside, { recursive: true, force: true });
 		}

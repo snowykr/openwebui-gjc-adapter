@@ -73,13 +73,21 @@ export function assertPublishedSdkDescriptorPath(cwd: string, descriptorPath: st
 /** Proves the descriptor held by an open descriptor is still inside the workspace. */
 export function assertHeldPublishedSdkDescriptorWithinWorkspace(
 	workspace: string,
-	descriptorPath: string,
+	_descriptorPath: string,
 	descriptor: number,
 ): void {
+	// Only Linux exposes a descriptor-backed canonical pathname through
+	// /proc/self/fd.  Falling back to realpath(descriptorPath) on other hosts
+	// would inspect the mutable name rather than the held file and lets a
+	// symlink swap or hard-link substitution escape containment proof.
+	if (process.platform !== "linux")
+		throw new SdkV3OperationError(
+			"endpoint_stale",
+			"Published session endpoint descriptor cannot be proven inside the canonical workspace on this platform",
+		);
 	let heldPath: string;
 	try {
-		heldPath =
-			process.platform === "linux" ? realpathSync(`/proc/self/fd/${descriptor}`) : realpathSync(descriptorPath);
+		heldPath = realpathSync(`/proc/self/fd/${descriptor}`);
 	} catch {
 		throw new SdkV3OperationError(
 			"endpoint_stale",

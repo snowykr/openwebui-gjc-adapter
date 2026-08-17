@@ -42,6 +42,7 @@ import type {
 import { GjcTurnCancelledError } from "../src/gjc/turn-runner";
 import type { LiveGatewayRunnerInput } from "../src/live/chat-completions";
 import { createGjcRoutingLiveGatewayRunner, createPublicSdkGjcTurnRunner } from "../src/live/gjc-routing-runner";
+import { terminalAbortIdempotencyKey } from "../src/live/gjc-terminal-abort-key";
 import { synthesizeProjectionRows } from "../src/live/workflow-gate-projection";
 import { buildSessionMappingPayloadHash } from "../src/live/workflow-gate-turns";
 import { InMemoryOutboxStore } from "../src/state/outbox";
@@ -3646,85 +3647,97 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			fixture.dispose();
 		}
 	});
-	test("aborts an in-flight branch without waiting for an unresponsive abort response", async () => {
-		let branchCandidatesStarted!: () => void;
-		const branchCandidatesReady = new Promise<void>(resolve => {
-			branchCandidatesStarted = resolve;
-		});
-		let releaseBranchCandidates!: () => void;
-		const branchCandidatesRelease = new Promise<void>(resolve => {
-			releaseBranchCandidates = resolve;
-		});
-		const portLifecycle: string[] = [];
-		let resolveDetached!: () => void;
-		const detached = new Promise<void>(resolve => {
-			resolveDetached = resolve;
-		});
-		let abortCalls = 0;
-		let aborted = false;
-		let fixture!: ReturnType<typeof setupPublicSdkBranchFixture>;
-		class BranchCancellationPort extends PublicSdkSessionClient {
-			#branchStarted = false;
-			override async branchCandidates(timeoutMs?: number) {
-				this.#branchStarted = true;
-				branchCandidatesStarted();
-				await branchCandidatesRelease;
-				if (aborted) throw new Error("branch candidates cancelled");
-				return super.branchCandidates(timeoutMs);
-			}
-			override async abort(idempotencyKey?: string, timeoutMs?: number, onDispatch?: () => void) {
-				abortCalls += 1;
-				aborted = true;
-				portLifecycle.push("abort-start");
-				const pendingAbort = super.abort(idempotencyKey, timeoutMs, () => {
-					portLifecycle.push("abort-dispatched");
-					onDispatch?.();
-				});
-				void pendingAbort.catch(() => undefined);
-				return await new Promise<never>(() => {});
-			}
-			override detach(): void {
-				if (this.#branchStarted) {
-					portLifecycle.push("detach");
-					resolveDetached();
+	test.each([
+		["normal IDs", "branch-q16"],
+		["oversized user message ID", "u".repeat(256)],
+	] as const)(
+		"aborts an in-flight branch with %s without waiting for an unresponsive abort response",
+		async (_label, userMessageId) => {
+			let branchCandidatesStarted!: () => void;
+			const branchCandidatesReady = new Promise<void>(resolve => {
+				branchCandidatesStarted = resolve;
+			});
+			let releaseBranchCandidates!: () => void;
+			const branchCandidatesRelease = new Promise<void>(resolve => {
+				releaseBranchCandidates = resolve;
+			});
+			const portLifecycle: string[] = [];
+			let resolveDetached!: () => void;
+			const detached = new Promise<void>(resolve => {
+				resolveDetached = resolve;
+			});
+			let abortCalls = 0;
+			let aborted = false;
+			let fixture!: ReturnType<typeof setupPublicSdkBranchFixture>;
+			class BranchCancellationPort extends PublicSdkSessionClient {
+				#branchStarted = false;
+				override async branchCandidates(timeoutMs?: number) {
+					this.#branchStarted = true;
+					branchCandidatesStarted();
+					await branchCandidatesRelease;
+					if (aborted) throw new Error("branch candidates cancelled");
+					return super.branchCandidates(timeoutMs);
 				}
-				super.detach();
+				override async abort(idempotencyKey?: string, timeoutMs?: number, onDispatch?: () => void) {
+					abortCalls += 1;
+					aborted = true;
+					portLifecycle.push("abort-start");
+					const pendingAbort = super.abort(idempotencyKey, timeoutMs, () => {
+						portLifecycle.push("abort-dispatched");
+						onDispatch?.();
+					});
+					void pendingAbort.catch(() => undefined);
+					return await new Promise<never>(() => {});
+				}
+				override detach(): void {
+					if (this.#branchStarted) {
+						portLifecycle.push("detach");
+						resolveDetached();
+					}
+					super.detach();
+				}
 			}
-		}
-		const sessionPortFactory = () => new BranchCancellationPort();
-		fixture = await setupPublicSdkBranchFixture("branch_regenerate", undefined, sessionPortFactory);
-		try {
-			const controller = new AbortController();
-			const pending = fixture.runner.run({ ...fixture.turn, signal: controller.signal });
-			await branchCandidatesReady;
-			controller.abort();
-			await expect(
-				Promise.race([
-					pending,
-					Bun.sleep(100).then(() => {
-						throw new Error("branch cancellation waited for the background branch operation");
-					}),
-				]),
-			).rejects.toMatchObject({ name: "GjcTurnCancelledError" });
-			releaseBranchCandidates();
-			await detached;
-			expect(abortCalls).toBe(1);
-			expect(portLifecycle.indexOf("abort-dispatched")).toBeLessThan(portLifecycle.indexOf("detach"));
-			expectSdkRequest(fixture.server.frames, "control_request", "turn.abort");
-			expect(
-				fixture.server.frames.some(
-					frame => frame.type === "query_request" && frame.query === "session.branch_candidates",
-				),
-			).toBe(false);
-			expect(
-				fixture.server.frames.some(
-					frame => frame.type === "control_request" && frame.operation === "session.branch",
-				),
-			).toBe(false);
-		} finally {
-			fixture.dispose();
-		}
-	});
+			const sessionPortFactory = () => new BranchCancellationPort();
+			fixture = await setupPublicSdkBranchFixture("branch_regenerate", undefined, sessionPortFactory);
+			try {
+				const controller = new AbortController();
+				const pending = fixture.runner.run({
+					...fixture.turn,
+					userMessageId,
+					signal: controller.signal,
+				});
+				await branchCandidatesReady;
+				controller.abort();
+				await expect(
+					Promise.race([
+						pending,
+						Bun.sleep(100).then(() => {
+							throw new Error("branch cancellation waited for the background branch operation");
+						}),
+					]),
+				).rejects.toMatchObject({ name: "GjcTurnCancelledError" });
+				releaseBranchCandidates();
+				await detached;
+				expect(abortCalls).toBe(1);
+				expect(portLifecycle.indexOf("abort-dispatched")).toBeLessThan(portLifecycle.indexOf("detach"));
+				const abort = expectSdkRequest(fixture.server.frames, "control_request", "turn.abort");
+				expect(abort.idempotencyKey).toBe(terminalAbortIdempotencyKey(fixture.turn.chatId, userMessageId));
+				expect(Buffer.byteLength(String(abort.idempotencyKey), "utf8")).toBeLessThanOrEqual(128);
+				expect(
+					fixture.server.frames.some(
+						frame => frame.type === "query_request" && frame.query === "session.branch_candidates",
+					),
+				).toBe(false);
+				expect(
+					fixture.server.frames.some(
+						frame => frame.type === "control_request" && frame.operation === "session.branch",
+					),
+				).toBe(false);
+			} finally {
+				fixture.dispose();
+			}
+		},
+	);
 	test("keeps an acknowledged branch checkpoint uncertain after restart without remote replay", async () => {
 		let barrierHits = 0;
 		const fixture = await setupPublicSdkBranchFixture("branch_regenerate", async (phase, evidence) => {
