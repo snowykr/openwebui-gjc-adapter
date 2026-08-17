@@ -39,6 +39,7 @@ import type {
 	GjcLifecycleTransaction,
 	GjcTurnRunner,
 } from "../src/gjc/turn-runner";
+import { GjcTurnCancelledError } from "../src/gjc/turn-runner";
 import type { LiveGatewayRunnerInput } from "../src/live/chat-completions";
 import { createGjcRoutingLiveGatewayRunner, createPublicSdkGjcTurnRunner } from "../src/live/gjc-routing-runner";
 import { synthesizeProjectionRows } from "../src/live/workflow-gate-projection";
@@ -3516,19 +3517,22 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			});
 			expect(barrierHits).toBe(1);
 			expect(
-				new FileBackedSessionMappingStore(fixture.mappingFile).operationScoped({
-					principalId: "owner-q16",
-					chatId: "chat-q16",
-				}, "branch-q16"),
+				new FileBackedSessionMappingStore(fixture.mappingFile).operationScoped(
+					{
+						principalId: "owner-q16",
+						chatId: "chat-q16",
+					},
+					"branch-q16",
+				),
 			).toMatchObject({
 				state: "uncertain",
 				acknowledgedSuccessor: {
 					sessionId: "sdk-session-successor",
 				},
 			});
-			await expect(
-				fixture.runner.run({ ...fixture.turn, signal: new AbortController().signal }),
-			).rejects.toThrow("requires reconciliation");
+			await expect(fixture.runner.run({ ...fixture.turn, signal: new AbortController().signal })).rejects.toThrow(
+				"requires reconciliation",
+			);
 		} finally {
 			fixture.dispose();
 		}
@@ -3642,7 +3646,7 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			fixture.dispose();
 		}
 	});
-	test("aborts an in-flight branch through its active port before branch successor work starts", async () => {
+	test("aborts an in-flight branch without waiting for an unresponsive abort response", async () => {
 		let branchCandidatesStarted!: () => void;
 		const branchCandidatesReady = new Promise<void>(resolve => {
 			branchCandidatesStarted = resolve;
@@ -3686,9 +3690,9 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 					await Bun.sleep(0);
 				}
 				if (!dispatched) throw new Error("C04 abort was not dispatched");
-				portLifecycle.push("abort-finished");
+				portLifecycle.push("abort-dispatched");
 				void pendingAbort.catch(() => undefined);
-				return { status: "accepted" };
+				return await new Promise<never>(() => {});
 			}
 			override detach(): void {
 				if (this.#branchStarted) {
@@ -3716,7 +3720,7 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			releaseBranchCandidates();
 			await detached;
 			expect(abortCalls).toBe(1);
-			expect(portLifecycle.indexOf("abort-finished")).toBeLessThan(portLifecycle.indexOf("detach"));
+			expect(portLifecycle.indexOf("abort-dispatched")).toBeLessThan(portLifecycle.indexOf("detach"));
 			expectSdkRequest(fixture.server.frames, "control_request", "turn.abort");
 			expect(
 				fixture.server.frames.some(
@@ -3724,7 +3728,9 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				),
 			).toBe(false);
 			expect(
-				fixture.server.frames.some(frame => frame.type === "control_request" && frame.operation === "session.branch"),
+				fixture.server.frames.some(
+					frame => frame.type === "control_request" && frame.operation === "session.branch",
+				),
 			).toBe(false);
 		} finally {
 			fixture.dispose();
@@ -4529,9 +4535,7 @@ test("cleans up a cancelled new session when model setup finishes before the pro
 		controller.abort();
 		releaseSetup();
 		await expect(pending).rejects.toMatchObject({ name: "GjcTurnCancelledError" });
-		expect(
-			server.frames.some(frame => frame.type === "control_request" && frame.operation === "turn.prompt"),
-		);
+		expect(server.frames.some(frame => frame.type === "control_request" && frame.operation === "turn.prompt"));
 		expect(tmuxPanesInCwd(root)).toEqual([]);
 	} finally {
 		for (const pane of tmuxPanesInCwd(root))
@@ -4695,6 +4699,55 @@ test("promotes a delayed acknowledged session.new successor after restart", asyn
 		expect(
 			fixture.server.frames.filter(frame => frame.type === "control_request" && frame.operation === "turn.prompt"),
 		).toHaveLength(0);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("does not publish an acknowledged session.new successor after cancellation", async () => {
+	const fixture = setupAcknowledgedSessionNewFixture("absent");
+	try {
+		await expect(fixture.runner.run(fixture.turn)).rejects.toThrow();
+		writeFileSync(
+			fixture.successorPath,
+			`${JSON.stringify({
+				type: "session",
+				version: 3,
+				id: "sdk-session-new",
+				timestamp: "2026-01-01T00:00:00.000Z",
+				cwd: fixture.root,
+			})}\n`,
+		);
+		const controller = new AbortController();
+		class CancelledRecoveryRunner extends FakeGjcTurnRunner {
+			override async withLifecyclePublication<T>(
+				address: GjcLifecyclePublicationAddress,
+				effect: (lifecycle: GjcLifecycleTransaction) => Promise<T>,
+			): Promise<T> {
+				controller.abort();
+				return await super.withLifecyclePublication(address, effect);
+			}
+		}
+		const mappings = new FileBackedSessionMappingStore(fixture.mappingFile);
+		const outbox = new InMemoryOutboxStore();
+		const replay = createGjcRoutingLiveGatewayRunner({
+			turnRunner: new CancelledRecoveryRunner(),
+			mappings,
+			outbox,
+		});
+
+		await expect(replay.run({ ...fixture.turn, signal: controller.signal })).rejects.toBeInstanceOf(
+			GjcTurnCancelledError,
+		);
+		expect(mappings.get("chat-session-new")).toMatchObject({
+			sessionId: "sdk-session-created",
+			operationId: "predecessor",
+		});
+		expect(mappings.operation("chat-session-new", "session-new")).toMatchObject({
+			state: "uncertain",
+			acknowledgedSuccessor: { sessionId: "sdk-session-new" },
+		});
+		expect(outbox.listPending()).toEqual([]);
 	} finally {
 		fixture.dispose();
 	}

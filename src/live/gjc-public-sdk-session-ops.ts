@@ -41,6 +41,32 @@ export type OwnedAbortRegistration = (
 	abort: () => Promise<unknown>,
 ) => { readonly unregister: () => void; readonly cancelled: boolean };
 
+/**
+ * Start an owner-scoped abort while its port is still attached, but do not
+ * make local cancellation wait for an unresponsive abort response. The
+ * request promise is observed for its eventual rejection; the grace turn only
+ * covers transport dispatch before the local operation is allowed to unwind
+ * and detach.
+ */
+export async function awaitAbortDispatch(abortPromise: Promise<unknown>): Promise<void> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const dispatchGrace = new Promise<void>(resolve => {
+		timer = setTimeout(resolve, 0);
+		(timer as unknown as { unref?: () => void }).unref?.();
+	});
+	try {
+		await Promise.race([
+			abortPromise.then(
+				() => undefined,
+				() => undefined,
+			),
+			dispatchGrace,
+		]);
+	} finally {
+		if (timer !== undefined) clearTimeout(timer);
+	}
+}
+
 export {
 	currentAttachmentProof,
 	ensureAttachment,
@@ -110,8 +136,11 @@ export async function startNewSession<T>(
 							input.userMessageId,
 							async () => {
 								cancelledBeforePrompt = true;
+								let abortPromise: Promise<unknown>;
 								try {
-									return await port.abort(undefined, context.input.turnTimeoutMs);
+									abortPromise = port.abort(undefined, context.input.turnTimeoutMs);
+									void abortPromise.catch(() => undefined);
+									await awaitAbortDispatch(abortPromise);
 								} finally {
 									rejectCancelled(new GjcTurnCancelledError());
 								}
@@ -211,9 +240,12 @@ export async function continueSession(
 			rejectCancelled = reject;
 		});
 		const registration = registerOwnedAbort?.(input, input.principalId, input.operationId, async () => {
+			let abortPromise: Promise<unknown>;
 			cancelledBeforePrompt = true;
 			try {
-				return await port.abort(undefined, context.input.turnTimeoutMs);
+				abortPromise = port.abort(undefined, context.input.turnTimeoutMs);
+				void abortPromise.catch(() => undefined);
+				await awaitAbortDispatch(abortPromise);
 			} finally {
 				rejectCancelled(new GjcTurnCancelledError());
 			}
@@ -269,8 +301,11 @@ export async function respondWorkflowGate(
 			rejectCancelled = reject;
 		});
 		const registration = registerOwnedAbort?.(input, input.principalId, input.operationId, async () => {
+			let abortPromise: Promise<unknown>;
 			try {
-				return await port.abort(input.idempotencyKey, context.input.turnTimeoutMs);
+				abortPromise = port.abort(input.idempotencyKey, context.input.turnTimeoutMs);
+				void abortPromise.catch(() => undefined);
+				await awaitAbortDispatch(abortPromise);
 			} finally {
 				rejectCancelled(new GjcTurnCancelledError());
 			}

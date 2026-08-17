@@ -8,6 +8,7 @@ import { type GjcControlResult, type GjcLifecycleTransaction, GjcTurnCancelledEr
 import type { LiveGatewayRunnerInput } from "./chat-completions";
 import { OpenWebUIControlError } from "./chat-completions-types";
 import {
+	awaitAbortDispatch,
 	ensureAttachment,
 	freshAttachmentProof,
 	type OwnedAbortRegistration,
@@ -60,6 +61,7 @@ export async function runControl(
 		const dispatchAbort = (port: PublicSdkSessionPort): Promise<unknown> => {
 			if (abortPromise !== undefined) return abortPromise;
 			abortPromise = port.abort(idempotencyKey, context.input.turnTimeoutMs);
+			void abortPromise.catch(() => undefined);
 			return abortPromise;
 		};
 		const registration = registerOwnedAbort?.(
@@ -68,12 +70,14 @@ export async function runControl(
 			input.userMessageId,
 			async () => {
 				cancelled = true;
+				let abortRequest: Promise<unknown> | undefined;
 				try {
 					// The branch operation may still be between lifecycle phases. Without an
 					// attached owner port there is no C04 dispatch to await; reject the local
 					// race and let onPortAvailable dispatch once the owner is attached.
 					if (activePort === undefined) return;
-					return await dispatchAbort(activePort!);
+					abortRequest = dispatchAbort(activePort);
+					await awaitAbortDispatch(abortRequest);
 				} finally {
 					rejectCancelled(new GjcTurnCancelledError());
 				}
@@ -93,7 +97,7 @@ export async function runControl(
 				},
 				async port => {
 					activePort = port;
-					if (cancelled) await dispatchAbort(port);
+					if (cancelled) await awaitAbortDispatch(dispatchAbort(port));
 				},
 				() => {
 					if (cancelled || input.signal?.aborted) throw new GjcTurnCancelledError();
@@ -122,8 +126,11 @@ export async function runControl(
 				principalId,
 				input.userMessageId,
 				async () => {
+					let abortPromise: Promise<unknown>;
 					try {
-						return await port.abort(idempotencyKey, context.input.turnTimeoutMs);
+						abortPromise = port.abort(idempotencyKey, context.input.turnTimeoutMs);
+						void abortPromise.catch(() => undefined);
+						await awaitAbortDispatch(abortPromise);
 					} finally {
 						rejectCancelled(new GjcTurnCancelledError());
 					}
@@ -237,8 +244,11 @@ async function runSessionControl(
 				input.userMessageId,
 				async () => {
 					cancelled = true;
+					let abortPromise: Promise<unknown>;
 					try {
-						return await port.abort(key, context.input.turnTimeoutMs);
+						abortPromise = port.abort(key, context.input.turnTimeoutMs);
+						void abortPromise.catch(() => undefined);
+						await awaitAbortDispatch(abortPromise);
 					} finally {
 						rejectCancelled(new GjcTurnCancelledError());
 					}

@@ -81,12 +81,14 @@ export async function replayRoutingOperation(
 		if (predecessor === undefined) throw new Error(`GJC operation ${turn.userMessageId} requires reconciliation.`);
 		if (input.turnRunner.withLifecyclePublication === undefined)
 			throw new Error("GJC runner must provide lifecycle publication for acknowledged successor recovery.");
+		throwIfAborted(turn.signal);
 		const recovered = await findRecoveredAcknowledgedSuccessor(
 			turn,
 			predecessor,
 			priorOperation,
 			controlOperationHash(turn),
 		);
+		throwIfAborted(turn.signal);
 		return input.turnRunner.withLifecyclePublication(
 			{
 				cwd: turn.project.cwd,
@@ -98,6 +100,7 @@ export async function replayRoutingOperation(
 				recoveryAttachment: recovered.attachment,
 			},
 			async lifecycle => {
+				throwIfAborted(turn.signal);
 				const published = await publishRecoveredAcknowledgedSuccessor(
 					mappings,
 					turn,
