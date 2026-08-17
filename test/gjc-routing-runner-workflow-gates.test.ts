@@ -9,8 +9,10 @@ import {
 	SessionFileBoundaryError,
 	SessionMappingStore,
 } from "../src/gjc/session-router";
+import { GjcTurnCancelledError } from "../src/gjc/turn-runner";
 import type {
 	GjcLifecycleTransaction,
+	GjcRespondWorkflowGateInput,
 	GjcSessionAddress,
 	GjcStartNewSessionInput,
 	GjcTurnResult,
@@ -24,6 +26,32 @@ import {
 	FakeGjcTurnRunner,
 	project,
 } from "./gjc-routing-runner-fixtures";
+
+class PreDispatchCancellationWorkflowGateRunner extends FakeGjcTurnRunner {
+	#first = true;
+
+	constructor(private readonly cancelBeforeDispatch: () => void) {
+		super();
+	}
+
+	async respondWorkflowGate(input: GjcRespondWorkflowGateInput): Promise<GjcTurnResult> {
+		if (this.#first) {
+			this.#first = false;
+			this.gateResponses.push(input);
+			this.cancelBeforeDispatch();
+			throw new GjcTurnCancelledError();
+		}
+		return await super.respondWorkflowGate(input);
+	}
+}
+
+class DispatchedErrorWorkflowGateRunner extends FakeGjcTurnRunner {
+	async respondWorkflowGate(input: GjcRespondWorkflowGateInput): Promise<GjcTurnResult> {
+		this.gateResponses.push(input);
+		input.onDispatch?.();
+		throw new Error("workflow gate failed after dispatch");
+	}
+}
 
 describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 	test("surfaces workflow gate options as the assistant message", async () => {
@@ -94,6 +122,31 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 
 		await expect(runner.run(replyInput("1"))).resolves.toEqual({ content: "workflow gate accepted" });
 		expect(turnRunner.gateResponses).toHaveLength(1);
+	});
+	test("discards a workflow gate cancelled after begin but before SDK dispatch so the same ID can retry", async () => {
+		const controller = new AbortController();
+		const turnRunner = new PreDispatchCancellationWorkflowGateRunner(() => controller.abort());
+		const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent);
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings });
+
+		await expect(runner.run({ ...replyInput("1"), signal: controller.signal })).rejects.toMatchObject({
+			name: "GjcTurnCancelledError",
+		});
+		expect(mappings.operation("chat-1", "user-2")).toBeUndefined();
+
+		await expect(runner.run(replyInput("1"))).resolves.toEqual({ content: "workflow gate accepted" });
+		expect(mappings.operation("chat-1", "user-2")).toMatchObject({ state: "complete" });
+	});
+	test("retains uncertain workflow gate authority when an SDK dispatch was acknowledged before an error", async () => {
+		const turnRunner = new DispatchedErrorWorkflowGateRunner();
+		const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent);
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings });
+
+		await expect(runner.run(replyInput("1"))).rejects.toThrow("workflow gate failed after dispatch");
+		expect(mappings.operation("chat-1", "user-2")).toMatchObject({
+			state: "uncertain",
+			id: "user-2",
+		});
 	});
 	test("bounds oversized gate fields before projecting the gate label", () => {
 		// projectPendingWorkflowGateMessage() concatenates the prompt and every

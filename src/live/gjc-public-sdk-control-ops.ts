@@ -33,6 +33,7 @@ export async function runControl(
 	lifecycle: GjcLifecycleTransaction,
 	onAcknowledgedSuccessor?: (successor: AcknowledgedSuccessor) => Promise<void> | void,
 	registerOwnedAbort?: OwnedAbortRegistration,
+	onDispatch?: () => void,
 ): Promise<GjcControlResult> {
 	const control = input.control;
 	if (control === undefined) throw new Error("OpenWebUI control request was not supplied.");
@@ -120,6 +121,7 @@ export async function runControl(
 			);
 			try {
 				if (registration?.cancelled || input.signal?.aborted) throw new GjcTurnCancelledError();
+				onDispatch?.();
 				return await Promise.race([operation(port), cancellation]);
 			} finally {
 				registration?.unregister();

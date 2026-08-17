@@ -53,6 +53,15 @@ export async function runRoutingControl(
 	};
 	turn.signal?.addEventListener("abort", onAbort, { once: true });
 	if (turn.signal?.aborted) onAbort();
+	// The public SDK control runner reports the exact point at which a command
+	// is handed to the SDK. Lifecycle controls and branch commands do not expose
+	// that callback, so their dispatch state remains unknown and must retain the
+	// existing uncertain handling.
+	const dispatchIsTracked =
+		control.operation !== "branch" &&
+		control.operation !== "session.new" &&
+		control.operation !== "session.resume" &&
+		control.operation !== "session.switch";
 	let predecessor: { readonly applied: GjcControlResult; readonly mapping?: SessionMapping };
 	try {
 		throwIfAborted(turn.signal);
@@ -68,6 +77,7 @@ export async function runRoutingControl(
 			},
 			async lifecycle => {
 				throwIfAborted(turn.signal);
+				let dispatchFired: boolean | undefined = dispatchIsTracked ? false : undefined;
 				mappings.beginOperation(turn.chatId, {
 					id: turn.userMessageId,
 					kind: control.operation === "session.new" ? "create" : controlOperationKind(control.operation),
@@ -85,6 +95,9 @@ export async function runRoutingControl(
 									mappings.recordAcknowledgedSuccessor(turn.chatId, turn.userMessageId, hash, successor);
 								}
 							: undefined,
+						() => {
+							dispatchFired = true;
+						},
 					);
 					throwIfAborted(turn.signal);
 					if (control.operation === "branch") return { applied };
@@ -95,7 +108,15 @@ export async function runRoutingControl(
 						),
 					};
 				} catch (error) {
-					mappings.transitionOperation(turn.chatId, turn.userMessageId, "uncertain", hash);
+					if (dispatchFired === false) {
+						mappings.discardPendingOperation(turn.chatId, {
+							id: turn.userMessageId,
+							ingressId: turn.userMessageId,
+							detail: hash,
+						});
+					} else {
+						mappings.transitionOperation(turn.chatId, turn.userMessageId, "uncertain", hash);
+					}
 					throw error;
 				}
 			},

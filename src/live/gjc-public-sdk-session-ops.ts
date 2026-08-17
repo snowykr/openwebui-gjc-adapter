@@ -268,6 +268,7 @@ export async function respondWorkflowGate(
 		});
 		try {
 			throwIfAborted(input.signal, registration?.cancelled);
+			input.onDispatch?.();
 			return await Promise.race([
 				port.answerGate(
 					gate,

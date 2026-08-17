@@ -158,6 +158,12 @@ export class SessionAuthority {
 	): SessionOperation {
 		return this.#journal.acknowledge(chatId, operationId, operationHash, successor);
 	}
+	discardPendingOperation(
+		chatId: string,
+		operation: Pick<SessionOperation, "id" | "ingressId" | "detail">,
+	): void {
+		this.#journal.discardPendingOperation(chatId, operation);
+	}
 	transitionOperation(
 		chatId: string,
 		operationId: string,

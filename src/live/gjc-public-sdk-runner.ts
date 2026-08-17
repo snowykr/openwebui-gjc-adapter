@@ -135,8 +135,17 @@ class PublicSdkGjcTurnRunner implements GjcTurnRunner {
 		mapping: SessionMapping,
 		lifecycle: GjcLifecycleTransaction,
 		onAcknowledgedSuccessor?: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[3],
+		onDispatch?: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[4],
 	): Promise<GjcControlResult> {
-		return runControl(this.#context, input, mapping, lifecycle, onAcknowledgedSuccessor, this.registerOwnedAbort);
+		return runControl(
+			this.#context,
+			input,
+			mapping,
+			lifecycle,
+			onAcknowledgedSuccessor,
+			this.registerOwnedAbort,
+			onDispatch,
+		);
 	}
 
 	readonly registerOwnedAbort: OwnedAbortRegistration = (address, principalId, operationId, abort) => {

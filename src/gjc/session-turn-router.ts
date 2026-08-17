@@ -88,6 +88,13 @@ export function scopedSessionMappingStore(
 			requireChat(actual);
 			return mappings.recordAcknowledgedSuccessorScoped(scope, operationId, operationHash, successor);
 		},
+		discardPendingOperation: (
+			actual: string,
+			operation: Parameters<SessionMappingStore["discardPendingOperation"]>[1],
+		) => {
+			requireChat(actual);
+			mappings.discardPendingOperationScoped(scope, operation);
+		},
 		transitionOperation: (
 			actual: string,
 			operationId: string,

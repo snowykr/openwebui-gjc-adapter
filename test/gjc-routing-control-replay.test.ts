@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { SessionMappingStore } from "../src/gjc/session-router";
-import type { GjcControlResult, GjcTurnRunner } from "../src/gjc/turn-runner";
+import { GjcTurnCancelledError, type GjcControlResult, type GjcTurnRunner } from "../src/gjc/turn-runner";
 import type { LiveGatewayRunnerInput } from "../src/live/chat-completions";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
 import { InMemoryOutboxStore } from "../src/state/outbox";
@@ -27,8 +27,11 @@ class ControlTurnRunner extends FakeGjcTurnRunner {
 		input: LiveGatewayRunnerInput,
 		_mapping: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[1],
 		_lifecycle: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[2],
+		_onAcknowledgedSuccessor?: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[3],
+		onDispatch?: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[4],
 	): Promise<GjcControlResult> {
 		this.calls.push(input);
+		onDispatch?.();
 		return {
 			result: {
 				text: "control done",
@@ -40,6 +43,44 @@ class ControlTurnRunner extends FakeGjcTurnRunner {
 				attachment: attachmentProof({ cwd: project.cwd, sessionId: "session-1" }),
 			},
 		};
+	}
+}
+
+class PreDispatchCancellationControlRunner extends ControlTurnRunner {
+	#first = true;
+
+	constructor(private readonly cancelBeforeDispatch: () => void) {
+		super();
+	}
+
+	async runControl(
+		input: LiveGatewayRunnerInput,
+		_mapping: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[1],
+		_lifecycle: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[2],
+		_onAcknowledgedSuccessor?: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[3],
+		onDispatch?: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[4],
+	): Promise<GjcControlResult> {
+		if (this.#first) {
+			this.#first = false;
+			this.calls.push(input);
+			this.cancelBeforeDispatch();
+			throw new GjcTurnCancelledError();
+		}
+		return await super.runControl(input, _mapping, _lifecycle, _onAcknowledgedSuccessor, onDispatch);
+	}
+}
+
+class DispatchedErrorControlRunner extends ControlTurnRunner {
+	async runControl(
+		input: LiveGatewayRunnerInput,
+		_mapping: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[1],
+		_lifecycle: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[2],
+		_onAcknowledgedSuccessor?: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[3],
+		onDispatch?: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[4],
+	): Promise<GjcControlResult> {
+		this.calls.push(input);
+		onDispatch?.();
+		throw new Error("control failed after dispatch");
 	}
 }
 
@@ -138,5 +179,34 @@ describe("control operation replay", () => {
 		expect(turnRunner.calls).toHaveLength(1);
 		expect(mappings.operation("chat-control", userMessageId)).toMatchObject({ state: "complete" });
 		expect(cleared).toHaveLength(2);
+	});
+	test("discards a control cancelled after begin but before SDK dispatch so the same ID can retry", async () => {
+		const mappings = new SessionMappingStore();
+		seedMapping(mappings);
+		const controller = new AbortController();
+		const turnRunner = new PreDispatchCancellationControlRunner(() => controller.abort());
+		const gateway = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings });
+		const userMessageId = "control-dispatch-cancelled";
+
+		await expect(gateway.run({ ...controlTurn(userMessageId), signal: controller.signal })).rejects.toMatchObject({
+			name: "GjcTurnCancelledError",
+		});
+		expect(mappings.operation("chat-control", userMessageId)).toBeUndefined();
+
+		await expect(gateway.run(controlTurn(userMessageId))).resolves.toMatchObject({ content: "control done" });
+		expect(mappings.operation("chat-control", userMessageId)).toMatchObject({ state: "complete" });
+	});
+	test("retains uncertain control authority when an SDK dispatch was acknowledged before an error", async () => {
+		const mappings = new SessionMappingStore();
+		seedMapping(mappings);
+		const turnRunner = new DispatchedErrorControlRunner();
+		const gateway = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings });
+		const userMessageId = "control-dispatched-error";
+
+		await expect(gateway.run(controlTurn(userMessageId))).rejects.toThrow("control failed after dispatch");
+		expect(mappings.operation("chat-control", userMessageId)).toMatchObject({
+			state: "uncertain",
+			id: userMessageId,
+		});
 	});
 });

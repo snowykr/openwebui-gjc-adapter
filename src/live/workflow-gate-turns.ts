@@ -180,6 +180,7 @@ export async function handleWorkflowGateReply(
 	turn.signal?.addEventListener("abort", onAbort, { once: true });
 	if (turn.signal?.aborted) onAbort();
 	let operationBegun = false;
+	let dispatchFired = false;
 	try {
 		throwIfAborted(turn.signal);
 		mappings.beginOperation(turn.chatId, {
@@ -219,6 +220,9 @@ export async function handleWorkflowGateReply(
 			...(observer === undefined ? {} : { observer }),
 			...(turn.signal === undefined ? {} : { signal: turn.signal }),
 			...(principalId === undefined ? {} : { principalId }),
+			onDispatch: () => {
+				dispatchFired = true;
+			},
 			...(pendingGate.commandId === undefined ||
 			pendingGate.turnId === undefined ||
 			pendingGate.sessionId === undefined
@@ -298,7 +302,17 @@ export async function handleWorkflowGateReply(
 			? { content: responseText }
 			: { content: responseText, events: projectedEvents };
 	} catch (error) {
-		if (operationBegun) mappings.transitionOperation(turn.chatId, turn.userMessageId, "uncertain", operationDetail);
+		if (operationBegun) {
+			if (!dispatchFired) {
+				mappings.discardPendingOperation(turn.chatId, {
+					id: turn.userMessageId,
+					ingressId: turn.userMessageId,
+					detail: operationDetail,
+				});
+			} else {
+				mappings.transitionOperation(turn.chatId, turn.userMessageId, "uncertain", operationDetail);
+			}
+		}
 		throw error;
 	} finally {
 		turn.signal?.removeEventListener("abort", onAbort);

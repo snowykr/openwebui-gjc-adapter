@@ -82,6 +82,7 @@ export interface GjcRespondWorkflowGateInput extends GjcSessionAddress, GjcLifec
 	readonly observer?: GjcTurnEventObserver;
 	readonly signal?: AbortSignal;
 	readonly principalId?: string;
+	readonly onDispatch?: () => void;
 }
 
 export interface GjcWorkflowGateCorrelation {
@@ -176,6 +177,7 @@ export interface GjcTurnRunner {
 		mapping: SessionMapping,
 		lifecycle: GjcLifecycleTransaction,
 		onAcknowledgedSuccessor?: (successor: AcknowledgedSuccessor) => Promise<void> | void,
+		onDispatch?: () => void,
 	): Promise<GjcControlResult>;
 }
 

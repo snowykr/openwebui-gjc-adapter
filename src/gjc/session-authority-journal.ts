@@ -453,6 +453,30 @@ export class SessionAuthorityJournal {
 		this.setRecord(chatId, { ...record, journal });
 		return copyOperation(journal[index]!);
 	}
+	discardPendingOperation(
+		chatId: string,
+		operation: Pick<SessionOperation, "id" | "ingressId" | "detail">,
+	): void {
+		const record = this.require(chatId);
+		const index = record.journal.findIndex(
+			candidate =>
+				candidate.id === operation.id ||
+				(operation.ingressId !== undefined && candidate.ingressId === operation.ingressId),
+		);
+		const current = record.journal[index];
+		if (
+			current === undefined ||
+			operation.detail === undefined ||
+			current.id !== operation.id ||
+			current.ingressId !== operation.ingressId ||
+			current.detail !== operation.detail ||
+			current.state !== "pending" ||
+			current.acknowledgedSuccessor !== undefined
+		)
+			throw new Error(`Session operation ${operation.id} requires reconciliation.`);
+		const journal = record.journal.filter((_, candidateIndex) => candidateIndex !== index);
+		this.setRecord(chatId, { ...record, journal });
+	}
 	transition(
 		chatId: string,
 		operationId: string,
