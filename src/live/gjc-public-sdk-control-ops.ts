@@ -51,24 +51,38 @@ export async function runControl(
 		const idempotencyKey = `${input.chatId}:${input.userMessageId}`;
 		let cancelled = false;
 		let activePort: PublicSdkSessionPort | undefined;
-		let abortSent = false;
 		let rejectCancelled!: (error: Error) => void;
 		const cancellation = new Promise<never>((_resolve, reject) => {
 			rejectCancelled = reject;
 		});
+		let abortPromise: Promise<unknown> | undefined;
+		let branchOperationStarted!: () => void;
+		const branchStarted = new Promise<void>(resolve => {
+			branchOperationStarted = resolve;
+		});
+		let branchOperation: Promise<GjcControlResult> | undefined;
+		const dispatchAbort = (port: PublicSdkSessionPort): Promise<unknown> => {
+			if (abortPromise !== undefined) return abortPromise;
+			abortPromise = port.abort(idempotencyKey, context.input.turnTimeoutMs);
+			return abortPromise;
+		};
 		const registration = registerOwnedAbort?.(
 			mappedAddress(input, mapping),
 			principalId,
 			input.userMessageId,
 			async () => {
 				cancelled = true;
-				rejectCancelled(new GjcTurnCancelledError());
-				if (activePort === undefined || abortSent) return;
-				abortSent = true;
-				return await activePort.abort(idempotencyKey, context.input.turnTimeoutMs);
+				try {
+					if (activePort === undefined) {
+						await branchStarted;
+						if (activePort === undefined) return await branchOperation?.catch(() => undefined);
+					}
+					return await dispatchAbort(activePort!);
+				} finally {
+					rejectCancelled(new GjcTurnCancelledError());
+				}
 			},
 		);
-		let branchOperation: Promise<GjcControlResult> | undefined;
 		try {
 			if (registration?.cancelled || input.signal?.aborted) throw new GjcTurnCancelledError();
 			branchOperation = runBranchControl(
@@ -83,15 +97,13 @@ export async function runControl(
 				},
 				async port => {
 					activePort = port;
-					if (cancelled && !abortSent) {
-						abortSent = true;
-						await port.abort(idempotencyKey, context.input.turnTimeoutMs);
-					}
+					if (cancelled) await dispatchAbort(port);
 				},
 				() => {
 					if (cancelled || input.signal?.aborted) throw new GjcTurnCancelledError();
 				},
 			);
+			branchOperationStarted();
 			const branched = await Promise.race([branchOperation, cancellation]);
 			if (cancelled || input.signal?.aborted) throw new GjcTurnCancelledError();
 			return branched;
@@ -115,8 +127,11 @@ export async function runControl(
 				principalId,
 				input.userMessageId,
 				async () => {
-					rejectCancelled(new GjcTurnCancelledError());
-					return await port.abort(idempotencyKey, context.input.turnTimeoutMs);
+					try {
+						return await port.abort(idempotencyKey, context.input.turnTimeoutMs);
+					} finally {
+						rejectCancelled(new GjcTurnCancelledError());
+					}
 				},
 			);
 			try {
@@ -227,8 +242,11 @@ async function runSessionControl(
 				input.userMessageId,
 				async () => {
 					cancelled = true;
-					rejectCancelled(new GjcTurnCancelledError());
-					return await port.abort(key, context.input.turnTimeoutMs);
+					try {
+						return await port.abort(key, context.input.turnTimeoutMs);
+					} finally {
+						rejectCancelled(new GjcTurnCancelledError());
+					}
 				},
 			);
 			unregisterOwnedAbort = registration?.unregister;

@@ -110,8 +110,11 @@ export async function startNewSession<T>(
 							input.userMessageId,
 							async () => {
 								cancelledBeforePrompt = true;
-								rejectCancelled(new GjcTurnCancelledError());
-								return await port.abort(undefined, context.input.turnTimeoutMs);
+								try {
+									return await port.abort(undefined, context.input.turnTimeoutMs);
+								} finally {
+									rejectCancelled(new GjcTurnCancelledError());
+								}
 							},
 						);
 						try {
@@ -209,8 +212,11 @@ export async function continueSession(
 		});
 		const registration = registerOwnedAbort?.(input, input.principalId, input.operationId, async () => {
 			cancelledBeforePrompt = true;
-			rejectCancelled(new GjcTurnCancelledError());
-			return await port.abort(undefined, context.input.turnTimeoutMs);
+			try {
+				return await port.abort(undefined, context.input.turnTimeoutMs);
+			} finally {
+				rejectCancelled(new GjcTurnCancelledError());
+			}
 		});
 		try {
 			throwIfAborted(input.signal, registration?.cancelled);
@@ -263,8 +269,11 @@ export async function respondWorkflowGate(
 			rejectCancelled = reject;
 		});
 		const registration = registerOwnedAbort?.(input, input.principalId, input.operationId, async () => {
-			rejectCancelled(new GjcTurnCancelledError());
-			return await port.abort(input.idempotencyKey, context.input.turnTimeoutMs);
+			try {
+				return await port.abort(input.idempotencyKey, context.input.turnTimeoutMs);
+			} finally {
+				rejectCancelled(new GjcTurnCancelledError());
+			}
 		});
 		try {
 			throwIfAborted(input.signal, registration?.cancelled);

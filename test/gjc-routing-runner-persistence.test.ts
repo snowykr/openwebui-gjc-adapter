@@ -3491,6 +3491,38 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			rmSync(root, { recursive: true, force: true });
 		}
 	});
+	test("marks a branch uncertain and clears cancellation after post-RPC abort", async () => {
+		let fixture!: ReturnType<typeof setupPublicSdkBranchFixture>;
+		const controller = new AbortController();
+		let barrierHits = 0;
+		fixture = await setupPublicSdkBranchFixture("branch_regenerate", phase => {
+			expect(phase).toBe("between_branch_phases");
+			barrierHits += 1;
+			controller.abort();
+		});
+		try {
+			await expect(fixture.runner.run({ ...fixture.turn, signal: controller.signal })).rejects.toMatchObject({
+				name: "GjcTurnCancelledError",
+			});
+			expect(barrierHits).toBe(1);
+			expect(
+				new FileBackedSessionMappingStore(fixture.mappingFile).operationScoped({
+					principalId: "owner-q16",
+					chatId: "chat-q16",
+				}, "branch-q16"),
+			).toMatchObject({
+				state: "uncertain",
+				acknowledgedSuccessor: {
+					sessionId: "sdk-session-successor",
+				},
+			});
+			await expect(
+				fixture.runner.run({ ...fixture.turn, signal: new AbortController().signal }),
+			).rejects.toThrow("requires reconciliation");
+		} finally {
+			fixture.dispose();
+		}
+	});
 	test.each([
 		["start", false],
 		["continuation", true],
@@ -3609,6 +3641,7 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		const branchCandidatesRelease = new Promise<void>(resolve => {
 			releaseBranchCandidates = resolve;
 		});
+		const portLifecycle: string[] = [];
 		let abortCalls = 0;
 		let aborted = false;
 		const sessionPortFactory = () => {
@@ -3628,7 +3661,18 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 						return async (...args: Parameters<PublicSdkSessionPort["abort"]>) => {
 							abortCalls += 1;
 							aborted = true;
-							return await (value as PublicSdkSessionPort["abort"]).apply(target, args);
+							portLifecycle.push("abort-start");
+							try {
+								return await (value as PublicSdkSessionPort["abort"]).apply(target, args);
+							} finally {
+								portLifecycle.push("abort-finished");
+							}
+						};
+					}
+					if (property === "detach") {
+						return () => {
+							portLifecycle.push("detach");
+							return (value as PublicSdkSessionPort["detach"]).call(target);
 						};
 					}
 					return typeof value === "function" ? value.bind(target) : value;
@@ -3652,6 +3696,8 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			releaseBranchCandidates();
 			await expect(pending).rejects.toMatchObject({ name: "GjcTurnCancelledError" });
 			expect(abortCalls).toBe(1);
+			expect(portLifecycle.indexOf("abort-finished")).toBeLessThan(portLifecycle.indexOf("detach"));
+			expectSdkRequest(fixture.server.frames, "control_request", "turn.abort");
 			expect(
 				fixture.server.frames.some(
 					frame => frame.type === "query_request" && frame.query === "session.branch_candidates",

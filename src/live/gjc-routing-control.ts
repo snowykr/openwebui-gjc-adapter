@@ -177,8 +177,8 @@ async function continueBranch(
 	};
 	turn.signal?.addEventListener("abort", onAbort, { once: true });
 	if (turn.signal?.aborted) onAbort();
-	throwIfAborted(turn.signal);
 	try {
+		throwIfAborted(turn.signal);
 		if (sessionId === undefined || sessionFile === undefined || attachment === undefined)
 			throw new Error("GJC branch did not return an exact successor descriptor.");
 		assertCurrentBranchPredecessor(input.mappings, turn.chatId, existing, turn.userMessageId);
@@ -207,6 +207,8 @@ async function continueBranch(
 			);
 	} catch (error) {
 		input.mappings.transitionOperation(turn.chatId, turn.userMessageId, "uncertain", hash);
+		turn.signal?.removeEventListener("abort", onAbort);
+		controlled.clearTurnCancellation?.(cancellation);
 		throw error;
 	}
 	try {
