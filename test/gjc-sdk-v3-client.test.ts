@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { SdkV3Client } from "../src/gjc/sdk-v3-client";
 import { SdkV3ProtocolError } from "../src/gjc/sdk-v3-protocol";
 
@@ -146,7 +146,7 @@ describe("SDK v3 client boundaries", () => {
 		}
 	});
 
-	test("Given multiple slow pages When the original deadline expires Then later pages do not receive a fresh timeout", async () => {
+	test("Given multiple slow pages When the original deadline expires after the next frame is sent Then the outcome is uncertain", async () => {
 		// Given
 		let requests = 0;
 		const server = Bun.serve({
@@ -185,9 +185,59 @@ describe("SDK v3 client boundaries", () => {
 			const result = client.queryAll("models.list/current", {}, 60);
 
 			// Then
-			await expect(result).rejects.toMatchObject({ code: "timeout" });
+			await expect(result).rejects.toMatchObject({ code: "uncertain_after_send" });
 			expect(requests).toBe(2);
 		} finally {
+			client.detach();
+			server.stop(true);
+		}
+	});
+
+	test("Given pagination exhausts its deadline before the next page frame When collecting all pages Then it reports timeout without sending another frame", async () => {
+		// Given
+		let requests = 0;
+		let deadline = 0;
+		let now = Date.now();
+		const nowSpy = spyOn(Date, "now").mockImplementation(() => now);
+		const server = Bun.serve({
+			port: 0,
+			fetch(request, bunServer) {
+				return bunServer.upgrade(request) ? undefined : new Response("upgrade required", { status: 426 });
+			},
+			websocket: {
+				open(socket) {
+					socket.send(JSON.stringify({ type: "server_hello", protocolVersion: 3, connectionId: "test" }));
+				},
+				message(socket, message) {
+					requests += 1;
+					const frame = parseFrame(message);
+					// Expire the shared query deadline while the first page is in flight.
+					// The continuation check must fail before query() can send page two.
+					if (requests === 1) now = deadline + 1;
+					socket.send(
+						JSON.stringify({
+							type: "query_response",
+							id: frame.id,
+							ok: true,
+							page: { items: [1], complete: false, continuationCursor: "next" },
+						}),
+					);
+				},
+			},
+		});
+		const client = new SdkV3Client({ url: `ws://127.0.0.1:${server.port}`, token: "test" });
+
+		try {
+			await client.connect(500);
+			// When
+			deadline = now + 100;
+			const result = client.queryAll("models.list/current", {}, 100);
+
+			// Then
+			await expect(result).rejects.toMatchObject({ code: "timeout" });
+			expect(requests).toBe(1);
+		} finally {
+			nowSpy.mockRestore();
 			client.detach();
 			server.stop(true);
 		}
