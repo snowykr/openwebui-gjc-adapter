@@ -12,7 +12,10 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { listPublishedSdkEndpointDescriptors } from "../src/gjc/public-sdk-attachment";
+import {
+	listPublishedSdkEndpointDescriptors,
+	readPublishedSdkEndpointDescriptor,
+} from "../src/gjc/public-sdk-attachment";
 import { createPublicSdkDeadline } from "../src/gjc/public-sdk-deadline";
 import {
 	attachmentFromPublishedSdkEndpoint,
@@ -24,11 +27,12 @@ import { startSdkFixtureServer } from "./gjc-sdk-v3-server-fixture";
 describe("published SDK endpoint attachment", () => {
 	test("authorizes only the descriptor bytes held after discovery", () => {
 		const root = mkdtempSync(join(tmpdir(), "gjc-sdk-endpoint-"));
-		const path = join(root, "session-1.json");
+		const path = join(root, ".gjc", "state", "sdk", "session-1.json");
 		try {
+			mkdirSync(join(root, ".gjc", "state", "sdk"), { recursive: true });
 			writeFileSync(path, JSON.stringify({ version: 1, url: "ws://127.0.0.1:3111", token: "discovery-token" }));
 			writeFileSync(path, JSON.stringify({ version: 1, url: "ws://127.0.0.1:4123", token: "held-token" }));
-			const attachment = attachmentFromPublishedSdkEndpoint("/workspace", "session-1", {
+			const attachment = attachmentFromPublishedSdkEndpoint(root, "session-1", {
 				sessionId: "session-1",
 				path,
 				url: "ws://attacker.invalid:4123",
@@ -42,12 +46,13 @@ describe("published SDK endpoint attachment", () => {
 	});
 	test("reads held descriptor payloads positionally across repeated authority checks", async () => {
 		const root = mkdtempSync(join(tmpdir(), "gjc-sdk-endpoint-"));
-		const path = join(root, "sdk-session-created.json");
-		const server = startSdkFixtureServer("turn_complete");
+		const path = join(root, ".gjc", "state", "sdk", "sdk-session-created.json");
+		const server = startSdkFixtureServer("turn_complete", root);
 		const client = new PublicSdkSessionClient();
 		try {
+			mkdirSync(join(root, ".gjc", "state", "sdk"), { recursive: true });
 			writeFileSync(path, JSON.stringify({ version: 1, url: server.url, token: server.token }));
-			const attachment = attachmentFromPublishedSdkEndpoint("/workspace", "sdk-session-created", {
+			const attachment = attachmentFromPublishedSdkEndpoint(root, "sdk-session-created", {
 				sessionId: "sdk-session-created",
 				path,
 				url: server.url,
@@ -98,8 +103,9 @@ describe("published SDK endpoint attachment", () => {
 
 	test("rejects malformed and non-local endpoint descriptors", () => {
 		const root = mkdtempSync(join(tmpdir(), "gjc-sdk-endpoint-"));
-		const path = join(root, "session-1.json");
+		const path = join(root, ".gjc", "state", "sdk", "session-1.json");
 		try {
+			mkdirSync(join(root, ".gjc", "state", "sdk"), { recursive: true });
 			for (const descriptor of [
 				"{",
 				JSON.stringify({ version: 1, url: "wss://127.0.0.1:4123", token: "token" }),
@@ -123,7 +129,7 @@ describe("published SDK endpoint attachment", () => {
 			]) {
 				writeFileSync(path, descriptor);
 				expect(() =>
-					attachmentFromPublishedSdkEndpoint("/workspace", "session-1", {
+					attachmentFromPublishedSdkEndpoint(root, "session-1", {
 						sessionId: "session-1",
 						path,
 						url: "ws://127.0.0.1:1",
@@ -137,12 +143,13 @@ describe("published SDK endpoint attachment", () => {
 	});
 	test("rejects FIFO and oversized sparse descriptors before parsing or allocation", () => {
 		const root = mkdtempSync(join(tmpdir(), "gjc-sdk-endpoint-"));
-		const fifoPath = join(root, "session-1.json");
-		const sparsePath = join(root, "session-2.json");
+		const fifoPath = join(root, ".gjc", "state", "sdk", "session-1.json");
+		const sparsePath = join(root, ".gjc", "state", "sdk", "session-2.json");
 		try {
+			mkdirSync(join(root, ".gjc", "state", "sdk"), { recursive: true });
 			execFileSync("mkfifo", [fifoPath]);
 			expect(() =>
-				attachmentFromPublishedSdkEndpoint("/workspace", "session-1", {
+				attachmentFromPublishedSdkEndpoint(root, "session-1", {
 					sessionId: "session-1",
 					path: fifoPath,
 					url: "ws://127.0.0.1:1",
@@ -152,7 +159,7 @@ describe("published SDK endpoint attachment", () => {
 			writeFileSync(sparsePath, "");
 			truncateSync(sparsePath, 16 * 1024 + 1);
 			expect(() =>
-				attachmentFromPublishedSdkEndpoint("/workspace", "session-2", {
+				attachmentFromPublishedSdkEndpoint(root, "session-2", {
 					sessionId: "session-2",
 					path: sparsePath,
 					url: "ws://127.0.0.1:1",
@@ -197,6 +204,53 @@ describe("published SDK endpoint attachment", () => {
 			await expect(listPublishedSdkEndpointDescriptors(root)).rejects.toMatchObject({ code: "endpoint_stale" });
 		} finally {
 			rmSync(root, { recursive: true, force: true });
+		}
+	});
+	test("rejects symlinked adapter endpoint ancestors before reading an external descriptor", async () => {
+		const root = mkdtempSync(join(tmpdir(), "gjc-sdk-endpoint-workspace-"));
+		const outside = mkdtempSync(join(tmpdir(), "gjc-sdk-endpoint-outside-"));
+		const outsideDirectory = join(outside, ".gjc", "state", "sdk");
+		const outsideDescriptor = join(outsideDirectory, "session-1.json");
+		const workspaceDirectory = join(root, ".gjc", "state", "sdk");
+		try {
+			mkdirSync(outsideDirectory, { recursive: true });
+			writeFileSync(
+				outsideDescriptor,
+				JSON.stringify({ sessionId: "session-1", version: 1, url: "ws://127.0.0.1:4123", token: "outside-token" }),
+			);
+			for (const ancestor of ["gjc", "state", "sdk"]) {
+				rmSync(join(root, ".gjc"), { recursive: true, force: true });
+				if (ancestor === "gjc") {
+					symlinkSync(join(outside, ".gjc"), join(root, ".gjc"), "dir");
+				} else if (ancestor === "state") {
+					mkdirSync(join(root, ".gjc"), { recursive: true });
+					symlinkSync(join(outside, ".gjc", "state"), join(root, ".gjc", "state"), "dir");
+				} else {
+					mkdirSync(join(root, ".gjc", "state"), { recursive: true });
+					symlinkSync(join(outsideDirectory), join(root, ".gjc", "state", "sdk"), "dir");
+				}
+				await expect(readPublishedSdkEndpointDescriptor(root, "session-1")).rejects.toMatchObject({
+					code: "endpoint_stale",
+				});
+				await expect(listPublishedSdkEndpointDescriptors(root)).rejects.toMatchObject({ code: "endpoint_stale" });
+			}
+			rmSync(join(root, ".gjc"), { recursive: true, force: true });
+			mkdirSync(workspaceDirectory, { recursive: true });
+			writeFileSync(
+				join(workspaceDirectory, "session-1.json"),
+				JSON.stringify({ sessionId: "session-1", version: 1, url: "ws://127.0.0.1:4123", token: "inside-token" }),
+			);
+			await expect(() =>
+				attachmentFromPublishedSdkEndpoint(root, "session-1", {
+					sessionId: "session-1",
+					path: outsideDescriptor,
+					url: "ws://127.0.0.1:4123",
+					token: "outside-token",
+				}),
+			).toThrow();
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(outside, { recursive: true, force: true });
 		}
 	});
 });

@@ -1,6 +1,8 @@
 import { closeSync, fstatSync, lstatSync, realpathSync } from "node:fs";
 import {
 	assertAttachmentAuthority,
+	assertHeldPublishedSdkDescriptorWithinWorkspace,
+	assertPublishedSdkDescriptorPath,
 	descriptorPayloadDigest,
 	openPublishedDescriptor,
 	readHeldDescriptor,
@@ -24,8 +26,10 @@ export async function withPublicSdkAuthority<T>(
 	const { attachment, client } = context;
 	assertAttachmentAuthority(attachment);
 	const authority = attachment.authority;
+	const workspace = assertPublishedSdkDescriptorPath(attachment.cwd, authority.descriptorPath);
 	const descriptor = openPublishedDescriptor(authority.descriptorPath);
 	try {
+		assertHeldPublishedSdkDescriptorWithinWorkspace(workspace, authority.descriptorPath, descriptor);
 		assertDescriptorStat(fstatSync(descriptor), authority);
 		assertDescriptorPayload(descriptor, authority);
 		const metadata = await queryOne(client, "session.metadata", timeoutMs);

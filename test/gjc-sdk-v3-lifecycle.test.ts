@@ -127,7 +127,8 @@ describe("public SDK lifecycle contract", () => {
 	});
 	test("refuses close when its descriptor was replaced while identity query Q14 was pending", async () => {
 		const root = mkdtempSync(join(tmpdir(), "gjc-sdk-descriptor-"));
-		const descriptorPath = join(root, "session-1.json");
+		const descriptorPath = join(root, ".gjc", "state", "sdk", "session-1.json");
+		mkdirSync(join(root, ".gjc", "state", "sdk"), { recursive: true });
 		writeFileSync(descriptorPath, "{}");
 		const descriptorStat = await Bun.file(descriptorPath).stat();
 		let closeControls = 0;
@@ -165,7 +166,7 @@ describe("public SDK lifecycle contract", () => {
 								type: "query_response",
 								id: frame.id,
 								ok: true,
-								page: { items: [{ sessionId: "session-1", cwd: "/workspace" }], complete: true },
+								page: { items: [{ sessionId: "session-1", cwd: root }], complete: true },
 							}),
 						);
 					}
@@ -177,7 +178,7 @@ describe("public SDK lifecycle contract", () => {
 		try {
 			await client.attach({
 				sessionId: "session-1",
-				cwd: "/workspace",
+				cwd: root,
 				endpoint: { url: `ws://127.0.0.1:${server.port}`, token: "token" },
 				authority: {
 					descriptorPath,
@@ -190,7 +191,7 @@ describe("public SDK lifecycle contract", () => {
 					payloadDigest: digest("{}"),
 					generation: descriptorStat.mtimeMs,
 					expectedSessionId: "session-1",
-					expectedCwd: "/workspace",
+					expectedCwd: root,
 				},
 			});
 			const close = client.closeSession(undefined, 1_000);
@@ -313,7 +314,8 @@ async function expectDescriptorReplacementBlocksControl(
 	invoke: (client: PublicSdkSessionClient) => Promise<unknown>,
 ): Promise<void> {
 	const root = mkdtempSync(join(tmpdir(), "gjc-sdk-descriptor-"));
-	const descriptorPath = join(root, "session-1.json");
+	const descriptorPath = join(root, ".gjc", "state", "sdk", "session-1.json");
+	mkdirSync(join(root, ".gjc", "state", "sdk"), { recursive: true });
 	writeFileSync(descriptorPath, "{}");
 	const descriptorStat = await Bun.file(descriptorPath).stat();
 	let controls = 0;
@@ -356,7 +358,7 @@ async function expectDescriptorReplacementBlocksControl(
 							type: "query_response",
 							id: frame.id,
 							ok: true,
-							page: { items: [{ sessionId: "session-1", cwd: "/workspace" }], complete: true },
+							page: { items: [{ sessionId: "session-1", cwd: root }], complete: true },
 						}),
 					);
 				}
@@ -368,7 +370,7 @@ async function expectDescriptorReplacementBlocksControl(
 	try {
 		await client.attach({
 			sessionId: "session-1",
-			cwd: "/workspace",
+			cwd: root,
 			endpoint: { url: `ws://127.0.0.1:${server.port}`, token: "token" },
 			authority: {
 				descriptorPath,
@@ -381,7 +383,7 @@ async function expectDescriptorReplacementBlocksControl(
 				payloadDigest: digest("{}"),
 				generation: descriptorStat.mtimeMs,
 				expectedSessionId: "session-1",
-				expectedCwd: "/workspace",
+				expectedCwd: root,
 			},
 		});
 		const mutation = invoke(client);
@@ -403,7 +405,8 @@ async function expectDescriptorReplacementAfterControl(
 	operation: string,
 ): Promise<void> {
 	const root = mkdtempSync(join(tmpdir(), "gjc-sdk-post-control-descriptor-"));
-	const descriptorPath = join(root, "session-1.json");
+	const descriptorPath = join(root, ".gjc", "state", "sdk", "session-1.json");
+	mkdirSync(join(root, ".gjc", "state", "sdk"), { recursive: true });
 	writeFileSync(descriptorPath, "{}");
 	const descriptorStat = await Bun.file(descriptorPath).stat();
 	const controls: string[] = [];
@@ -431,7 +434,7 @@ async function expectDescriptorReplacementAfterControl(
 							type: "query_response",
 							id: frame.id,
 							ok: true,
-							page: { items: [{ sessionId: "session-1", cwd: "/workspace" }], complete: true },
+							page: { items: [{ sessionId: "session-1", cwd: root }], complete: true },
 						}),
 					);
 					return;
@@ -452,7 +455,7 @@ async function expectDescriptorReplacementAfterControl(
 	try {
 		await client.attach({
 			sessionId: "session-1",
-			cwd: "/workspace",
+			cwd: root,
 			endpoint: { url: `ws://127.0.0.1:${server.port}`, token: "token" },
 			authority: {
 				descriptorPath,
@@ -465,7 +468,7 @@ async function expectDescriptorReplacementAfterControl(
 				payloadDigest: digest("{}"),
 				generation: descriptorStat.mtimeMs,
 				expectedSessionId: "session-1",
-				expectedCwd: "/workspace",
+				expectedCwd: root,
 			},
 		});
 		await expect(invoke(client)).rejects.toThrow("descriptor changed");
