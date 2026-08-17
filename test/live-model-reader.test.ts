@@ -149,6 +149,60 @@ describe("createModelReaderFactory", () => {
 		expect(port.calls).toEqual(["attach", "closeSession", "detach"]);
 		expect(port.attached).toBe(false);
 	});
+	test("closes a temporary attachment after a cancelled attach rejects", async () => {
+		const controller = new AbortController();
+		let attachStarted!: () => void;
+		let rejectAttach!: (reason?: unknown) => void;
+		const started = new Promise<void>(resolve => {
+			attachStarted = resolve;
+		});
+		const attach = new Promise<void>((_resolve, reject) => {
+			rejectAttach = reject;
+		});
+		let detachObserved!: () => void;
+		const detached = new Promise<void>(resolve => {
+			detachObserved = resolve;
+		});
+		let cleanupCalls = 0;
+		let cleanupReceivedPort: PublicSdkSessionPort | undefined;
+		let cleanupRanBeforeDetach = false;
+		const port = new FakePublicSessionPort();
+		const temporaryAttachment = registerTemporaryModelAttachment({ ...attachment }, async activePort => {
+			cleanupCalls += 1;
+			cleanupReceivedPort = activePort;
+			cleanupRanBeforeDetach = !port.calls.includes("detach");
+		});
+		port.attach = async value => {
+			port.calls.push("attach");
+			port.attachments.push(value);
+			attachStarted();
+			await attach;
+		};
+		port.detach = () => {
+			port.calls.push("detach");
+			port.attached = false;
+			detachObserved();
+		};
+		const pending = createModelReaderFactory({
+			cliPath: "/opt/gjc",
+			runtimeLocations,
+			resolveAttachment: async () => temporaryAttachment,
+			sessionPortFactory: () => port,
+		})(undefined, controller.signal);
+
+		await started;
+		controller.abort();
+		await expect(pending).rejects.toBeInstanceOf(GjcTurnCancelledError);
+		expect(port.calls).toEqual(["attach"]);
+
+		rejectAttach(new Error("attachment rejected"));
+		await detached;
+
+		expect(cleanupCalls).toBe(1);
+		expect(cleanupReceivedPort).toBeUndefined();
+		expect(cleanupRanBeforeDetach).toBe(true);
+		expect(port.calls).toEqual(["attach", "detach"]);
+	});
 	test("cleans up a late temporary attachment without an unattached port", async () => {
 		const controller = new AbortController();
 		let resolveAttachment!: (value: PublicSdkSessionAttachment) => void;

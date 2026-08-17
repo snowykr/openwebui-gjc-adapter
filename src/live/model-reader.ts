@@ -117,12 +117,19 @@ export function createModelReaderFactory(input: CreateModelReaderFactoryInput): 
 						}
 						port.detach();
 					},
-					() => {
+					async () => {
 						attachSettled = true;
-						if (lateTemporaryCleanupPending) {
-							lateTemporaryCleanupPending = false;
-							port.detach();
+						if (!lateTemporaryCleanupPending) return;
+						lateTemporaryCleanupPending = false;
+						if (!temporaryCleanupStarted && temporaryCleanup !== undefined) {
+							temporaryCleanupStarted = true;
+							try {
+								await temporaryCleanup();
+							} catch {
+								// Cancellation cleanup failures remain suppressed after late attachment.
+							}
 						}
+						port.detach();
 					},
 				)
 				.catch(() => undefined);
