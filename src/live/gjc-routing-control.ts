@@ -54,14 +54,10 @@ export async function runRoutingControl(
 	turn.signal?.addEventListener("abort", onAbort, { once: true });
 	if (turn.signal?.aborted) onAbort();
 	// The public SDK control runner reports the exact point at which a command
-	// is handed to the SDK. Lifecycle controls and branch commands do not expose
-	// that callback, so their dispatch state remains unknown and must retain the
-	// existing uncertain handling.
-	const dispatchIsTracked =
-		control.operation !== "branch" &&
-		control.operation !== "session.new" &&
-		control.operation !== "session.resume" &&
-		control.operation !== "session.switch";
+	// is handed to the SDK. Branch controls have a separate multi-phase flow and
+	// remain conservatively uncertain; all other controls, including lifecycle
+	// controls, expose this dispatch boundary.
+	const dispatchIsTracked = control.operation !== "branch";
 	let predecessor: { readonly applied: GjcControlResult; readonly mapping?: SessionMapping };
 	try {
 		throwIfAborted(turn.signal);

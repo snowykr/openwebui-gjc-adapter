@@ -46,7 +46,15 @@ export async function runControl(
 		control.operation === "session.resume" ||
 		control.operation === "session.switch"
 	) {
-		return runSessionControl(context, input, mapping, lifecycle, onAcknowledgedSuccessor, registerOwnedAbort);
+		return runSessionControl(
+			context,
+			input,
+			mapping,
+			lifecycle,
+			onAcknowledgedSuccessor,
+			registerOwnedAbort,
+			onDispatch,
+		);
 	}
 	if (control.operation === "branch") {
 		const principalId =
@@ -234,6 +242,7 @@ async function runSessionControl(
 	lifecycle: GjcLifecycleTransaction,
 	onAcknowledgedSuccessor?: (successor: AcknowledgedSuccessor) => Promise<void> | void,
 	registerOwnedAbort?: OwnedAbortRegistration,
+	onDispatch?: () => void,
 ): Promise<GjcControlResult> {
 	const control = input.control;
 	if (
@@ -276,6 +285,7 @@ async function runSessionControl(
 	const cancellation = new Promise<never>((_resolve, reject) => {
 		rejectCancelled = reject;
 	});
+	let operationDispatched = false;
 	let unregisterOwnedAbort: (() => void) | undefined;
 	const acknowledgeDiscoveredSuccessor = async (successor: PublicSdkSessionAttachment) => {
 		if (cancelled || input.signal?.aborted) throw new GjcTurnCancelledError();
@@ -293,6 +303,10 @@ async function runSessionControl(
 				input.userMessageId,
 				async () => {
 					cancelled = true;
+					if (!operationDispatched) {
+						rejectCancelled(new GjcTurnCancelledError());
+						return;
+					}
 					try {
 						const abort = abortWithDispatch(port, terminalAbortKey, context.input.turnTimeoutMs);
 						await awaitAbortDispatch(abort.promise, abort.dispatched);
@@ -302,9 +316,11 @@ async function runSessionControl(
 				},
 			);
 			unregisterOwnedAbort = registration?.unregister;
-			if (registration?.cancelled || input.signal?.aborted) throw new GjcTurnCancelledError();
+			if (registration?.cancelled || cancelled || input.signal?.aborted) throw new GjcTurnCancelledError();
 			let operation: Promise<PublicSdkSessionAttachment>;
 			if (control.operation === "session.new") {
+				operationDispatched = true;
+				onDispatch?.();
 				operation = port.newSession({}, key, context.input.turnTimeoutMs, acknowledgeDiscoveredSuccessor);
 			} else if (target === undefined) {
 				throw new SdkV3OperationError(
@@ -312,12 +328,16 @@ async function runSessionControl(
 					"A persisted GJC session file is required for lifecycle target authority",
 				);
 			} else if (control.operation === "session.resume") {
+				operationDispatched = true;
+				onDispatch?.();
 				operation = port.resumeSession(
 					{ sessionId: target.sessionId, sessionPath: target.sessionFile },
 					key,
 					context.input.turnTimeoutMs,
 				);
 			} else {
+				operationDispatched = true;
+				onDispatch?.();
 				operation = port.switchSession(
 					{ sessionId: target.sessionId, sessionPath: target.sessionFile },
 					key,
