@@ -166,6 +166,13 @@ export async function buildResolvedAdapterServerOptions(
 			});
 		}
 		const mappings = dependencies.mappings ?? new FileBackedSessionMappingStore(mappingStorePath);
+		if (mappings instanceof FileBackedSessionMappingStore && mappings.bootCompaction !== undefined) {
+			isolationDiagnostics.push({
+				name: "session-authority-compaction",
+				status: "ok",
+				detail: `Session authority compacted from ${mappings.bootCompaction.beforeBytes} to ${mappings.bootCompaction.afterBytes} bytes.`,
+			});
+		}
 		if (mappings instanceof SessionMappingStore) mappings.setLegacyAdminPrincipalId(owner.ownerUserId);
 		const runtimeAdminClientFactory = buildOpenWebUIRuntimeAdminClientFactory(config);
 		const principalClientFactory = buildOpenWebUIPrincipalClientFactory(config, workspaceRegistry);

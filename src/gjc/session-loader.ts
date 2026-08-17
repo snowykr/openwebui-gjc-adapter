@@ -1,5 +1,6 @@
+import { realpathSync } from "node:fs";
 import { readdir, realpath } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { loadHeldGjcSessionFile } from "./session-discovery-reader";
 import { GjcSessionLoadError, type LoadedGjcSessionFile } from "./session-loader-contract";
 
@@ -47,7 +48,11 @@ export async function discoverFreshGjcSessionFile(
 		if (baselinePaths.has(candidate)) continue;
 		try {
 			const loaded = await loadHeldGjcSessionFile(root, validateGjcSessionPathWithinRoot(root, candidate));
-			if (loaded.header.id === expectedSessionId && loaded.header.cwd === expectedCwd) matches.push(loaded);
+			if (
+				loaded.header.id === expectedSessionId &&
+				canonicalMetadataCwd(loaded.header.cwd) === canonicalMetadataCwd(expectedCwd)
+			)
+				matches.push(loaded);
 		} catch {
 			// An unrelated partial/corrupt transcript cannot prove this attachment.
 		}
@@ -101,13 +106,14 @@ export async function snapshotGjcSessionFiles(sessionRoot: string): Promise<Read
 }
 
 export function validateGjcSessionPathWithinRoot(sessionRoot: string, filePath: string): string {
-	const root = validateAbsoluteGjcSessionRoot(sessionRoot);
-	const canonicalPath = validateAbsoluteGjcSessionPath(filePath);
+	const root = canonicalGjcSessionRootSync(sessionRoot);
+	const absolutePath = validateAbsoluteGjcSessionPath(filePath);
+	const canonicalPath = canonicalGjcSessionFileSync(absolutePath);
 	const pathFromRoot = relative(root, canonicalPath);
 	if (
 		pathFromRoot.length === 0 ||
 		pathFromRoot === ".." ||
-		pathFromRoot.startsWith(`..${"/"}`) ||
+		pathFromRoot.split(sep).includes("..") ||
 		isAbsolute(pathFromRoot)
 	) {
 		throw new GjcSessionLoadError(filePath, [
@@ -128,6 +134,39 @@ function validateAbsoluteGjcSessionRoot(sessionRoot: string): string {
 		]);
 	}
 	return resolve(sessionRoot);
+}
+
+function canonicalGjcSessionRootSync(sessionRoot: string): string {
+	const root = validateAbsoluteGjcSessionRoot(sessionRoot);
+	try {
+		return realpathSync(root);
+	} catch (error) {
+		throw new GjcSessionLoadError(
+			root,
+			[{ code: "corrupt_session_file", message: `Cannot resolve GJC session root ${root}`, filePath: root }],
+			error,
+		);
+	}
+}
+
+function canonicalGjcSessionFileSync(filePath: string): string {
+	try {
+		return realpathSync(filePath);
+	} catch (error) {
+		throw new GjcSessionLoadError(
+			filePath,
+			[{ code: "corrupt_session_file", message: `Cannot resolve GJC session file ${filePath}`, filePath: filePath }],
+			error,
+		);
+	}
+}
+
+function canonicalMetadataCwd(cwd: string): string {
+	try {
+		return realpathSync(cwd);
+	} catch {
+		return cwd;
+	}
 }
 
 async function canonicalGjcSessionRoot(sessionRoot: string): Promise<string> {

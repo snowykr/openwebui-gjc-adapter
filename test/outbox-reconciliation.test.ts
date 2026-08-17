@@ -4,13 +4,15 @@ import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { join } from "node:path";
-import { SessionMappingStore } from "../src/gjc/session-router";
+import { FileBackedSessionMappingStore, SessionMappingStore } from "../src/gjc/session-router";
 import {
+	buildEventPayloadHash,
 	createProjectionOperationApplier,
 	expectedProjectionRows,
 	synthesizeProjectionRows,
 } from "../src/live/workflow-gate-projection";
 import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
+import type { OpenWebUIMessageEvent } from "../src/openwebui/events";
 import { ProjectLinkService } from "../src/projects/link-service";
 import { SqliteProjectRegistrationStore } from "../src/projects/registration-store";
 import { registerProjectDirectory } from "../src/projects/registry";
@@ -18,10 +20,12 @@ import { resolveAllowedRoots } from "../src/security/paths";
 import {
 	buildProjectionPayloadHash,
 	FileBackedOutboxStore,
+	hashCanonicalStream,
 	InMemoryOutboxStore,
 	nodeOutboxFileSystem,
 	type OutboxFileSystem,
 	type OutboxStore,
+	streamPlainJson,
 } from "../src/state/outbox";
 import { reconcilePendingOperations } from "../src/state/reconciler";
 import { messageEntry, writeSessionFile } from "./session-sync-fixtures";
@@ -104,6 +108,92 @@ describe("InMemoryOutboxStore", () => {
 		expect(left).toBe(right);
 		expect(left).toHaveLength(64);
 		expect(left).not.toBe(buildProjectionPayloadHash({ chatId: "chat-2" }));
+	});
+
+	test("streams plain JSON byte-identically to JSON.stringify including toJSON and non-finite numbers", () => {
+		// streamPlainJson is used for event payload hashing: a value whose
+		// serialization differs from JSON.stringify (a Date/boxed primitive via
+		// toJSON, or NaN/Infinity) would hash differently before persistence
+		// than after the WAL's JSON.stringify/parse round trip, making startup
+		// synthesis reject a valid stored row.
+		const samples: unknown[] = [
+			{ when: new Date("2026-01-01T00:00:00.000Z") },
+			[new Date("2026-01-01T00:00:00.000Z"), 1],
+			{ a: NaN, b: Infinity, c: -Infinity },
+			[NaN, Infinity],
+			{ n: new Number(5), s: new String("x"), b: new Boolean(false) },
+			{ custom: { toJSON: () => "serialized", other: 1 } },
+			{ keyed: { toJSON: (key: string) => `k=${key}` } },
+			{ chain: { toJSON: () => ({ toJSON: () => "double", v: 1 }) } },
+			{ deep: { inner: new Date(0) } },
+			{ holes: Array(3) },
+		];
+		for (const sample of samples) {
+			let streamed = "";
+			streamPlainJson(sample, chunk => (streamed += chunk));
+			expect(streamed).toBe(JSON.stringify(sample));
+		}
+	});
+
+	test("streams object properties in JSON.stringify evaluation order", () => {
+		// Object.entries() eagerly reads every enumerable getter before any
+		// value is serialized, which diverges from JSON.stringify()'s
+		// per-property read-then-serialize order when an earlier getter mutates
+		// a later property. The streamed serialization must match JSON.stringify
+		// byte-for-byte so stored hashes agree with the WAL round trip.
+		const order: string[] = [];
+		const stateful = {
+			first: "a",
+			get second(): string {
+				order.push("read-second");
+				stateful.third = "mutated";
+				return "b";
+			},
+			third: "original",
+		};
+		let streamed = "";
+		streamPlainJson(stateful, chunk => (streamed += chunk));
+		expect(streamed).toBe(JSON.stringify(stateful));
+		expect(JSON.parse(streamed)).toMatchObject({ first: "a", second: "b", third: "mutated" });
+	});
+
+	test("hashes canonical stream bytes with a single evaluation of effectful JSON values", () => {
+		// hashCanonicalStream must snapshot the producer's emitted bytes instead
+		// of running the producer twice: a stateful toJSON or getter evaluated
+		// once for measuring and again for hashing could describe different
+		// bytes than the WAL JSON.stringify round trip later reproduces, and the
+		// stored hash would then fail startup synthesis.
+		let evaluations = 0;
+		const stateful = {
+			toJSON() {
+				evaluations += 1;
+				return "deterministic-serialization";
+			},
+		};
+		const hash = hashCanonicalStream(emit => streamPlainJson({ stateful }, emit));
+		// The old two-pass implementation invoked the producer twice (once to
+		// measure, once to hash), so a stateful toJSON could be evaluated more
+		// than once; the snapshot must evaluate it exactly once.
+		expect(evaluations).toBe(1);
+		// JSON.stringify also invokes toJSON, but because the serialization is
+		// deterministic the byte stream it hashes is identical to the one
+		// streamed through streamPlainJson.
+		const direct = hashCanonicalStream(emit => emit(JSON.stringify({ stateful })));
+		expect(hash).toBe(direct);
+	});
+
+	test("hashes event iterables without requiring a projected event array", () => {
+		const events: OpenWebUIMessageEvent[] = [
+			{ type: "status", data: { description: "one", done: false } },
+			{ type: "status", data: { description: "two", done: true } },
+		];
+		function* eventIterator(): Iterable<(typeof events)[number]> {
+			for (const event of events) yield event;
+		}
+
+		expect(buildEventPayloadHash(eventIterator())).toBe(
+			buildProjectionPayloadHash({ eventsJson: JSON.stringify(events) }),
+		);
 	});
 });
 
@@ -706,6 +796,91 @@ describe("durable projection reconciliation", () => {
 		}
 	});
 
+	test("synthesizes byte-identical projection rows from in-memory and file-backed stores", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-outbox-lean-synthesis-"));
+		try {
+			const filePath = join(directory, "mappings.json");
+			const mapping = {
+				chatId: "chat-1",
+				projectId: "project-1",
+				sessionId: "session-1",
+				rawFrameCursor: 1,
+				eventCursor: 1,
+				operationId: "op-1",
+				assistantText: "done",
+				events: [{ type: "tool_start", id: "tool-1", payload: { nested: { value: [1, 2, 3] } } }],
+			};
+			const memory = new SessionMappingStore();
+			memory.set({ ...mapping, operationId: "bootstrap" });
+			memory.beginOperation("chat-1", { id: "op-1", kind: "prompt", detail: "request" });
+			memory.completeOperationWithMapping("chat-1", "op-1", "request", mapping, "turn");
+
+			const fileBacked = new FileBackedSessionMappingStore(filePath);
+			fileBacked.set({ ...mapping, operationId: "bootstrap" });
+			fileBacked.beginOperation("chat-1", { id: "op-1", kind: "prompt", detail: "request" });
+			fileBacked.completeOperationWithMapping("chat-1", "op-1", "request", mapping, "turn");
+			const booted = new FileBackedSessionMappingStore(filePath);
+
+			const memoryOutbox = new InMemoryOutboxStore();
+			const fileOutbox = new InMemoryOutboxStore();
+			synthesizeProjectionRows(memoryOutbox, memory, "user-1", "user-1");
+			synthesizeProjectionRows(fileOutbox, booted, "user-1", "user-1");
+
+			const rows = (store: OutboxStore) =>
+				store
+					.listPending()
+					.map(row => ({ operationId: row.operationId, kind: row.kind, payloadHash: row.payloadHash }));
+			expect(rows(fileOutbox)).toEqual(rows(memoryOutbox));
+			expect(rows(fileOutbox)).toHaveLength(2);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+	test("mappingRecords() matches entries() for a mix of scoped, legacy, and retired records", () => {
+		const mappings = new SessionMappingStore();
+		const scopedA = {
+			principalId: "principal-a",
+			chatId: "chat-a",
+			projectId: "project-a",
+			sessionId: "session-a",
+			rawFrameCursor: 3,
+			eventCursor: 2,
+			operationId: "op-a",
+			assistantText: "from a",
+			events: [{ type: "assistant", text: "from a", payload: { shared: true } }],
+		};
+		const scopedB = {
+			principalId: "principal-b",
+			chatId: "chat-b",
+			projectId: "project-b",
+			sessionId: "session-b",
+			rawFrameCursor: 5,
+			eventCursor: 4,
+			operationId: "op-b",
+		};
+		const scopeA = { principalId: scopedA.principalId, chatId: scopedA.chatId };
+		const scopeB = { principalId: scopedB.principalId, chatId: scopedB.chatId };
+		mappings.setScoped(scopeA, scopedA);
+		mappings.setScoped(scopeB, scopedB);
+		mappings.set({
+			chatId: "chat-legacy",
+			projectId: "project-legacy",
+			sessionId: "session-legacy",
+			rawFrameCursor: 1,
+			eventCursor: 1,
+			operationId: "op-legacy",
+		});
+		mappings.retireScoped(scopeB);
+
+		expect(mappings.mappingRecords()).toEqual(mappings.entries());
+		expect(
+			mappings
+				.mappingRecords()
+				.map(mapping => mapping.chatId)
+				.sort(),
+		).toEqual(["chat-a", "chat-legacy"]);
+		expect(mappings.mappingRecords()[0]?.events?.[0]?.payload).toEqual({ shared: true });
+	});
 	test("fails closed when a row cannot be reconstructed exactly", async () => {
 		const mappings = new SessionMappingStore();
 		const mapping = {

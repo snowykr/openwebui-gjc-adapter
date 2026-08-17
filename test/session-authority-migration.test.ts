@@ -12,7 +12,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { AuthorityMutationLock } from "../src/gjc/session-authority-file";
 import {
 	preflightSessionAuthorityMigration,
@@ -1843,6 +1843,27 @@ describe("session authority pre-store migration", () => {
 			const result = preflightSessionAuthorityMigration({
 				sourcePath,
 				stateRoot: root,
+				adminPrincipalId: "admin-1",
+				now: NOW,
+			});
+
+			expect(result.status).toBe("not_needed");
+		});
+	});
+	test("destination-exists not_needed path performs no destination parse", () => {
+		withRoot((root, _sourcePath) => {
+			const stateRoot = join(root, "state");
+			const destinationPath = join(stateRoot, "sessions", "openwebui-session-mappings.json");
+			// Valid bytes that are not parseable JSON: the not_needed path must
+			// never read the existing destination, so this cannot fail.
+			const opaqueDestination = Buffer.from("not-json:{broken");
+			mkdirSync(dirname(destinationPath), { recursive: true });
+			writeFileSync(destinationPath, opaqueDestination);
+
+			const result = preflightSessionAuthorityMigration({
+				sourcePath: join(root, "missing", "openwebui-session-mappings.json"),
+				destinationPath,
+				stateRoot,
 				adminPrincipalId: "admin-1",
 				now: NOW,
 			});

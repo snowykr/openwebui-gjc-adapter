@@ -16,7 +16,7 @@ import type {
 	GjcTurnResult,
 } from "../src/gjc/turn-runner";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
-import { synthesizeProjectionRows } from "../src/live/workflow-gate-projection";
+import { projectTurnEvents, synthesizeProjectionRows } from "../src/live/workflow-gate-projection";
 import { InMemoryOutboxStore } from "../src/state/outbox";
 import {
 	decisionWorkflowGateEvent,
@@ -69,6 +69,220 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 			expectedSessionId: "session-1",
 			expectedCwd: project.cwd,
 		});
+	});
+	test("bounds oversized gate fields before projecting the gate label", () => {
+		// projectPendingWorkflowGateMessage() concatenates the prompt and every
+		// option before boundedText() truncates; a retained gate with a
+		// payload-sized prompt would allocate that whole string during boot
+		// projection. The projected label must equal boundedText() applied to the
+		// full message while never materializing the full message itself.
+		const hugePrompt = "x".repeat(10_000);
+		const hugeLabel = "y".repeat(10_000);
+		const projected = projectTurnEvents(
+			[
+				{
+					type: "workflow_gate",
+					id: "gate-huge-1",
+					payload: {
+						gateId: "gate-huge-1",
+						schemaHash: "sha256:huge",
+						idempotencyKey: "idem-huge-1",
+						boundUserMessageId: null,
+						status: "pending",
+						context: { prompt: hugePrompt },
+						options: [{ label: hugeLabel, value: hugeLabel }],
+					},
+				},
+			],
+			"gjc/anthropic/claude-sonnet-4:medium",
+		);
+		const description = projected
+			.map(event => (event as { data?: { description?: string } }).data?.description)
+			.find(value => value?.includes("workflow gate pending"));
+		expect(description).toBeDefined();
+		// The projected label is boundedText() of the assembled message; the
+		// huge fields must not leak past the 80-char truncation.
+		expect(description!.length).toBeLessThanOrEqual(80);
+		expect(description!).not.toContain("x".repeat(80));
+		expect(description!).not.toContain("y".repeat(80));
+	});
+	test("preserves the schema-derived gate prompt fallback in the projected label", () => {
+		// A gate without context.prompt/title must keep projectPendingWorkflowGateMessage()'s
+		// schema fallback; dropping it would change the payload hash across an upgrade
+		// and make startup synthesis reject the stored outbox row.
+		const projected = projectTurnEvents(
+			[
+				{
+					type: "workflow_gate",
+					id: "gate-string-1",
+					payload: {
+						gateId: "gate-string-1",
+						schemaHash: "sha256:string",
+						idempotencyKey: "idem-string-1",
+						boundUserMessageId: null,
+						status: "pending",
+						schema: { type: "string" },
+					},
+				},
+			],
+			"gjc/anthropic/claude-sonnet-4:medium",
+		);
+		const description = projected
+			.map(event => (event as { data?: { description?: string } }).data?.description)
+			.find(value => value?.includes("workflow gate pending"));
+		expect(description).toBeDefined();
+		expect(description!).toContain("Answer with the requested text for this workfl");
+	});
+	test("preserves the default string-schema prompt for absent and invalid schemas", () => {
+		const projected = projectTurnEvents(
+			[
+				{
+					type: "workflow_gate",
+					id: "gate-missing-schema-1",
+					payload: {
+						gateId: "gate-missing-schema-1",
+						schemaHash: "sha256:missing-schema",
+						idempotencyKey: "idem-missing-schema-1",
+						boundUserMessageId: null,
+						status: "pending",
+					},
+				},
+				{
+					type: "workflow_gate",
+					id: "gate-invalid-schema-1",
+					payload: {
+						gateId: "gate-invalid-schema-1",
+						schemaHash: "sha256:invalid-schema",
+						idempotencyKey: "idem-invalid-schema-1",
+						boundUserMessageId: null,
+						status: "pending",
+						schema: null,
+					},
+				},
+			],
+			"gjc/anthropic/claude-sonnet-4:medium",
+		);
+		const descriptions = projected
+			.map(event => (event as { data?: { description?: string } }).data?.description)
+			.filter((value): value is string => value?.includes("workflow gate pending") ?? false);
+		expect(descriptions).toHaveLength(2);
+		for (const description of descriptions)
+			expect(description).toContain("Answer with the requested text for this workfl");
+	});
+	test("preserves the fallback projection for a workflow gate without an identity", () => {
+		const projected = projectTurnEvents(
+			[
+				{
+					type: "workflow_gate",
+					payload: {
+						schemaHash: "custom",
+						context: { prompt: "Approve?" },
+						schema: { type: "boolean" },
+						options: [{ label: "Approve", value: true }],
+					},
+				},
+			],
+			"gjc/anthropic/claude-sonnet-4:medium",
+		);
+		expect(projected).toMatchObject([
+			{
+				type: "status",
+				data: {
+					description: expect.stringContaining("Answer with the requested text for this workfl"),
+					gjc_adapter: {
+						metadata: { eventType: "workflow_gate", gateId: null },
+						workflow_gate: { gateId: "unknown-gate", schemaHash: "unknown", optionCount: 0 },
+					},
+				},
+			},
+		]);
+		expect(JSON.stringify(projected)).not.toContain("Approve?");
+		expect(JSON.stringify(projected)).not.toContain('"custom"');
+	});
+	test("bounds a huge schema enum in the gate prompt fallback", () => {
+		// A large enum must not be joined whole before the label truncates;
+		// only the bounded prefix is projected.
+		const hugeEnum = Array.from({ length: 10_000 }, (_, index) => `option-${index}`);
+		const projected = projectTurnEvents(
+			[
+				{
+					type: "workflow_gate",
+					id: "gate-enum-1",
+					payload: {
+						gateId: "gate-enum-1",
+						schemaHash: "sha256:enum",
+						idempotencyKey: "idem-enum-1",
+						boundUserMessageId: null,
+						status: "pending",
+						schema: { enum: hugeEnum },
+					},
+				},
+			],
+			"gjc/anthropic/claude-sonnet-4:medium",
+		);
+		const description = projected
+			.map(event => (event as { data?: { description?: string } }).data?.description)
+			.find(value => value?.includes("workflow gate pending"));
+		expect(description).toBeDefined();
+		expect(description!.length).toBeLessThanOrEqual(80);
+		expect(description!).toContain("option-0");
+		expect(description!).not.toContain("option-9999");
+	});
+	test("keeps the oversized first enum value's prefix in the gate prompt", () => {
+		// A first enum value that alone exceeds the window must retain its
+		// prefix (boundedText of the assembled message would show it); dropping
+		// it would change the payload hash across the streaming change.
+		const oversized = "x".repeat(100);
+		const projected = projectTurnEvents(
+			[
+				{
+					type: "workflow_gate",
+					id: "gate-enum-first-1",
+					payload: {
+						gateId: "gate-enum-first-1",
+						schemaHash: "sha256:enum-first",
+						idempotencyKey: "idem-enum-first-1",
+						boundUserMessageId: null,
+						status: "pending",
+						schema: { enum: [oversized] },
+					},
+				},
+			],
+			"gjc/anthropic/claude-sonnet-4:medium",
+		);
+		const description = projected
+			.map(event => (event as { data?: { description?: string } }).data?.description)
+			.find(value => value?.includes("workflow gate pending"));
+		expect(description).toBeDefined();
+		expect(description!.length).toBeLessThanOrEqual(80);
+		expect(description!).toContain(`Choose one of: ${"x".repeat(20)}`);
+		expect(description!).not.toContain(`Choose one of: ${"x".repeat(80)}`);
+	});
+	test("keeps enum values after an empty nested array prefix", () => {
+		// Array#toString([[[]], [true]]) is ",true". The empty first nested
+		// component must not be mistaken for a truncated prefix, or the second
+		// enum value is lost and boot synthesis changes the persisted hash.
+		const projected = projectTurnEvents(
+			[
+				{
+					type: "workflow_gate",
+					id: "gate-enum-nested-empty-1",
+					payload: {
+						gateId: "gate-enum-nested-empty-1",
+						schemaHash: "sha256:enum-nested-empty",
+						idempotencyKey: "idem-enum-nested-empty-1",
+						boundUserMessageId: null,
+						status: "pending",
+						schema: { enum: [[[[]], [true]]] },
+					},
+				},
+			],
+			"gjc/anthropic/claude-sonnet-4:medium",
+		);
+		const description = projected
+			.map(event => (event as { data?: { description?: string } }).data?.description)
+			.find(value => value?.includes("workflow gate pending"));
+		expect(description).toContain("Choose one of: ,true");
 	});
 	test("preserves the authenticated principal for workflow gate publication and replay after restart", async () => {
 		const root = mkdtempSync(join(tmpdir(), "gjc-workflow-gate-projection-"));

@@ -19,8 +19,33 @@ export class SessionAuthority {
 		const record = this.#journal.records.get(chatId);
 		return record === undefined ? undefined : copy(record);
 	}
+	/** Copy-free record lookup for boot synthesis: returns the ACTUAL record
+	 * object (shared by reference) so oversized retained payloads are never
+	 * deep-copied while a record is only being inspected (retirement, scope,
+	 * operation state). Consumers must not mutate the returned record. */
+	recordReference(chatId: string): SessionAuthorityRecord | undefined {
+		return this.#journal.records.get(chatId);
+	}
 	entries(): readonly SessionAuthorityRecord[] {
 		return [...this.#journal.records.values()].map(copy);
+	}
+	/**
+	 * Read-only view of the live records; callers must not mutate the returned
+	 * records or their nested event payloads.
+	 */
+	/** @internal Boot-synthesis-only no-copy view of the journal's records.
+	 * Returns the ACTUAL record objects (shared by reference): consumers must
+	 * never mutate them or their nested payloads, or they would modify durable
+	 * state without dirty tracking. Public copy-returning access is entries(). */
+	records(): readonly SessionAuthorityRecord[] {
+		return [...this.#journal.records.values()];
+	}
+	/** @internal Streaming no-copy view of the journal's records. Iterates the
+	 * live Map directly without allocating an array of every value, so a
+	 * record-count-dominated authority does not exhaust the heap before the
+	 * caller can filter/project one entry at a time. */
+	*recordsIterable(): Iterable<SessionAuthorityRecord> {
+		for (const record of this.#journal.records.values()) yield record;
 	}
 	set(input: SessionAuthorityInput): SessionAuthorityRecord {
 		return this.#journal.store(input);
@@ -55,6 +80,15 @@ export class SessionAuthority {
 	}
 	lookupOperation(chatId: string, operationId: string): SessionOperation | undefined {
 		return this.#journal.lookupOperation(chatId, operationId);
+	}
+	/** Copy-free operation state check for boot synthesis (see the journal
+	 * counterpart): avoids the document-sized copies that lookupOperation()
+	 * would incur for oversized legacy records. */
+	operationStateReference(
+		chatId: string,
+		operationId: string,
+	): { readonly state: SessionOperationState; readonly resultOperationId?: string } | undefined {
+		return this.#journal.operationStateReference(chatId, operationId);
 	}
 	lookupOperationAuthority(
 		chatId: string,
@@ -143,8 +177,8 @@ export class SessionAuthority {
 		this.transitionOperation(chatId, operationId, "complete", detail, result);
 		return this.upsert(mapping);
 	}
-	reconcileRestart(): readonly SessionAuthorityRecord[] {
-		return this.#journal.reconcile();
+	reconcileRestart(copyResults = true): readonly SessionAuthorityRecord[] {
+		return this.#journal.reconcile(copyResults);
 	}
 	protected takeDirtyRecords(): readonly SessionAuthorityRecord[] {
 		return this.#journal.takeDirtyRecords();

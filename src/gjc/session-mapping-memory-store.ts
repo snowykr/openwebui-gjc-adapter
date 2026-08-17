@@ -143,6 +143,30 @@ export class SessionMappingStore {
 			.filter(record => !isRetiredRecord(record))
 			.map(mappingFromRecord);
 	}
+	/**
+	 * Read-only, no-copy view for boot synthesis: the same filters and scope
+	 * derivation as {@link entries}, but the mapping shapes and their event
+	 * arrays are shared by reference with the authority records. Callers must
+	 * not mutate the returned mappings or their event payloads.
+	 */
+	mappingRecords(): readonly SessionMapping[] {
+		return [...this.mappingRecordsIterable()];
+	}
+	/**
+	 * Streaming no-copy view for boot synthesis: filters and projects one
+	 * record at a time without materializing array views of every record.
+	 * When the authority contains millions of small mappings, the previous
+	 * `records()` → `filter()` → `map()` chain created three arrays plus a
+	 * shallow object per record before synthesis began; this generator yields
+	 * one shallow mapping at a time so peak memory is bounded by a single
+	 * record.
+	 */
+	*mappingRecordsIterable(): Iterable<SessionMapping> {
+		for (const record of this.authority.recordsIterable()) {
+			if (isRetiredRecord(record)) continue;
+			yield mappingFromRecordShallow(record);
+		}
+	}
 	entriesForPrincipal(
 		principalId: string,
 		options: { readonly includeLegacyAdmin?: boolean } = {},
@@ -203,6 +227,29 @@ export class SessionMappingStore {
 		return record === undefined || isRetiredRecord(record)
 			? undefined
 			: this.authority.lookupOperation(chatId, operationId);
+	}
+	/** Copy-free operation state check (state + result mapping operationId)
+	 * without deep-copying the record, its event payloads, or the operation
+	 * result; used by boot projection synthesis to avoid document-sized
+	 * allocations for oversized legacy records. */
+	operationStateReference(
+		chatId: string,
+		operationId: string,
+	): { readonly state: SessionOperationState; readonly resultOperationId?: string } | undefined {
+		const record = this.authority.recordReference(chatId);
+		return record === undefined || isRetiredRecord(record)
+			? undefined
+			: this.authority.operationStateReference(chatId, operationId);
+	}
+	operationStateReferenceScoped(
+		scope: SessionMappingScope,
+		operationId: string,
+	): { readonly state: SessionOperationState; readonly resultOperationId?: string } | undefined {
+		const canonicalScope = canonicalScopeFor(scope);
+		const record = this.authority.recordReference(canonicalScope.key);
+		return record === undefined || !isScopedRecordFor(record, canonicalScope) || isRetiredRecord(record)
+			? undefined
+			: this.authority.operationStateReference(canonicalScope.key, operationId);
 	}
 	operationScoped(scope: SessionMappingScope, operationId: string): SessionOperation | undefined {
 		const canonicalScope = canonicalScopeFor(scope);
@@ -705,6 +752,29 @@ function mappingFromRecord(record: SessionAuthorityRecord): SessionMapping {
 		chatId: storedScope?.chatId ?? mapping.chatId,
 		...(storedScope === undefined ? {} : { principalId: storedScope.principalId }),
 	});
+}
+function mappingFromRecordShallow(record: SessionAuthorityRecord): SessionMapping {
+	const storedScope = storedScopeFromRecord(record);
+	const {
+		version: _version,
+		createdAt: _createdAt,
+		header: _header,
+		observations: _observations,
+		journal: _journal,
+		reassignment: _reassignment,
+		...mapping
+	} = record;
+	return {
+		...mapping,
+		// The returned mapping shares the record's readonly event array by
+		// reference (copy-free boot synthesis): the array and its objects are
+		// both readonly-typed, so a consumer cannot push/splice onto the
+		// durable record's event list. Cloning the array would allocate a
+		// second array proportional to an oversized authority.
+		...(mapping.events === undefined ? {} : { events: mapping.events }),
+		chatId: storedScope?.chatId ?? mapping.chatId,
+		...(storedScope === undefined ? {} : { principalId: storedScope.principalId }),
+	};
 }
 
 function storedScopeFromRecord(record: SessionAuthorityRecord): SessionMappingScope | undefined {

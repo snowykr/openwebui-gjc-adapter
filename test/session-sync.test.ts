@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { realpathSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -158,12 +159,12 @@ describe("syncProjectSessionsToOpenWebUI", () => {
 		expect(result.skipped).toEqual([
 			expect.objectContaining({
 				projectId: "project-a",
-				filePath: path.join(sessionRootA, "broken.jsonl"),
+				filePath: path.join(realpathSync(sessionRootA), "broken.jsonl"),
 				code: "corrupt_session_file",
 			}),
 			{
 				projectId: "project-a",
-				filePath: path.join(sessionRootA, "loop.jsonl"),
+				filePath: path.join(realpathSync(sessionRootA), "loop.jsonl"),
 				code: "session_cwd_invalid",
 				message: "GJC session cwd could not be resolved",
 			},
@@ -207,7 +208,7 @@ describe("syncProjectSessionsToOpenWebUI", () => {
 		expect(result.skipped).toEqual([
 			expect.objectContaining({
 				projectId: "project-duplicate",
-				filePath: path.join(sessionRoot, "b-second.jsonl"),
+				filePath: path.join(realpathSync(sessionRoot), "b-second.jsonl"),
 				code: "duplicate_session_id",
 			}),
 		]);

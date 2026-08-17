@@ -692,24 +692,62 @@ async function assertResolvedPathInside(targetPath: string, rootPath: string, ph
 }
 
 async function assertNoUnsafeExistingPath(targetPath: string, rootPath: string, label: string): Promise<void> {
-	const relativePath = path.relative(rootPath, path.resolve(targetPath));
+	// Canonicalize only the root prefix so a platform-equivalent spelling
+	// (macOS /var -> /private/var) cannot make a legitimate registry path look
+	// like it escaped the workspaces root, while preserving every
+	// workspace-relative component for the lstat walk below. Canonicalizing the
+	// whole target would silently follow a user-controlled symlink (for example
+	// one user's .gjc pointing at another user's .gjc) and let the walk miss it.
+	const resolvedRoot = await fs.realpath(rootPath);
+	const target = path.resolve(targetPath);
+	let relativePath = path.relative(rootPath, target);
+	if (relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
+		// The target is spelled through a symlink-equivalent root prefix. Find
+		// the deepest existing ancestor whose real path is the resolved root and
+		// treat everything below it as the workspace-relative tail to walk.
+		relativePath = await canonicalRootRelative(resolvedRoot, target, targetPath);
+	}
 	if (relativePath === "" || relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
 		throw new Error(`User workspace ${label} path is outside workspaces root: ${targetPath}`);
 	}
-	let current = rootPath;
-	for (const segment of relativePath.split(path.sep).filter(Boolean)) {
+	let current = resolvedRoot;
+	const segments = relativePath.split(path.sep).filter(Boolean);
+	const final = segments.length === 0 ? resolvedRoot : path.join(resolvedRoot, ...segments);
+	for (const segment of segments) {
 		current = path.join(current, segment);
 		try {
 			const stats = await fs.lstat(current);
 			if (stats.isSymbolicLink())
 				throw new Error(`User workspace ${label} path must not contain a symlink: ${current}`);
-			if (!stats.isDirectory() && current !== targetPath) {
+			if (!stats.isDirectory() && current !== final) {
 				throw new Error(`User workspace ${label} path contains a non-directory entry: ${current}`);
 			}
 		} catch (error) {
 			if (isNodeFsError(error, "ENOENT")) return;
 			throw error;
 		}
+	}
+}
+
+async function canonicalRootRelative(
+	resolvedRoot: string,
+	targetPath: string,
+	originalTarget: string,
+): Promise<string> {
+	let ancestor = targetPath;
+	const tail: string[] = [];
+	while (true) {
+		try {
+			if ((await fs.realpath(ancestor)) === resolvedRoot) {
+				return tail.join(path.sep) || ".";
+			}
+		} catch (error) {
+			if (!isNodeFsError(error, "ENOENT")) throw error;
+		}
+		const parent = path.dirname(ancestor);
+		if (parent === ancestor) throw new Error(`User workspace path is outside workspaces root: ${originalTarget}`);
+		tail.unshift(path.basename(ancestor));
+		ancestor = parent;
 	}
 }
 

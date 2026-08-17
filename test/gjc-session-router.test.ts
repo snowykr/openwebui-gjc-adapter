@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { NormalizedModelSelection } from "../src/contracts";
@@ -454,7 +454,7 @@ describe("routeGjcTurn", () => {
 			expect(result.assistantText).toBe("recovered");
 			expect(result.mapping).toMatchObject({
 				sessionId: "session-1",
-				sessionFile: join(sessionRoot, "session-1.jsonl"),
+				sessionFile: join(realpathSync(sessionRoot), "session-1.jsonl"),
 				activeLeaf: "assistant-1",
 				operationId: "message-1",
 			});

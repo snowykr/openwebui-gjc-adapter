@@ -7,6 +7,7 @@ export function reconcileSessionAuthority(
 	provisional: Map<string, ProvisionalSessionOperation>,
 	dirtyRecords?: Set<string>,
 	dirtyProvisional?: Set<string>,
+	copyResults = true,
 ): readonly SessionAuthorityRecord[] {
 	const reconciled: SessionAuthorityRecord[] = [];
 	for (const record of records.values()) {
@@ -34,7 +35,11 @@ export function reconcileSessionAuthority(
 		};
 		records.set(record.chatId, next);
 		dirtyRecords?.add(record.chatId);
-		reconciled.push(copy(next));
+		// When the caller discards the result (e.g. the boot path that will
+		// immediately persist or compact), skip the deep copy: copy(next)
+		// recursively clones the record's event payloads, which for a 1 GiB-class
+		// legacy authority can exhaust memory before the boot compaction runs.
+		if (copyResults) reconciled.push(copy(next));
 	}
 	for (const operation of provisional.values()) {
 		if (operation.state !== "pending") continue;

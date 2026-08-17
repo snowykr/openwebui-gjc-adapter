@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resolveExistingOrProspectivePath } from "../src/gjc/session-file-path";
 import { SessionMappingStore } from "../src/gjc/session-router";
 import type { GjcControlResult, GjcTurnRunner } from "../src/gjc/turn-runner";
 import type { LiveGatewayRunnerInput } from "../src/live/chat-completions";
@@ -141,7 +142,7 @@ describe("createGjcRoutingLiveGatewayRunner", () => {
 
 		// Then: the SDK path remains the continuation authority.
 		expect(turnRunner.switches[0]?.sessionFile).toBe(
-			"/var/lib/gjc/agent/sessions/--workspace-project--/session-sdk.jsonl",
+			resolveExistingOrProspectivePath("/var/lib/gjc/agent/sessions/--workspace-project--/session-sdk.jsonl"),
 		);
 		expect(turnRunner.continues[0]?.sessionRoot).toBe("/var/lib/gjc/agent/sessions/--workspace-project--");
 	});
@@ -181,8 +182,8 @@ describe("createGjcRoutingLiveGatewayRunner", () => {
 			});
 
 			expect(readFileSync(sdkFile, "utf8")).toBe(legacyTranscript);
-			expect(turnRunner.switches[0]?.sessionFile).toBe(sdkFile);
-			expect(mappings.get("chat-legacy")?.sessionFile).toBe(sdkFile);
+			expect(turnRunner.switches[0]?.sessionFile).toBe(realpathSync(sdkFile));
+			expect(mappings.get("chat-legacy")?.sessionFile).toBe(realpathSync(sdkFile));
 			expect(readFileSync(legacyFile, "utf8")).toBe(legacyTranscript);
 		} finally {
 			rmSync(root, { recursive: true, force: true });

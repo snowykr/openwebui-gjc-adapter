@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { readSdkSessionEndpoint } from "@gajae-code/coding-agent/sdk";
 import type { PublicSdkSessionAttachment } from "../gjc/public-sdk-contract";
@@ -96,11 +97,24 @@ export async function validatePersistedSessionIdentity(
 ): Promise<void> {
 	const sessionFile = validateGjcSessionPathWithinRoot(input.sessionRoot, input.sessionFile);
 	const loaded = await loadAbsoluteGjcSessionFile(sessionFile);
-	if (loaded.filePath !== sessionFile || loaded.header.id !== input.sessionId || loaded.header.cwd !== input.cwd)
+	if (
+		loaded.filePath !== sessionFile ||
+		loaded.header.id !== input.sessionId ||
+		canonicalCwd(loaded.header.cwd) !== canonicalCwd(input.cwd)
+	)
 		throw new SdkV3OperationError(
 			"endpoint_stale",
 			"Persisted GJC JSONL session identity does not match the requested attachment",
 		);
+}
+
+function canonicalCwd(cwd: unknown): string | undefined {
+	if (typeof cwd !== "string" || cwd.length === 0) return undefined;
+	try {
+		return realpathSync(cwd);
+	} catch {
+		return cwd;
+	}
 }
 
 export function attachmentKey<T extends { readonly cwd: string; readonly sessionId: string }>(input: T): string {

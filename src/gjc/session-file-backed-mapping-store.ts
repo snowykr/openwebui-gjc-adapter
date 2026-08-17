@@ -1,3 +1,4 @@
+import { statSync } from "node:fs";
 import { FileSessionAuthority } from "./session-authority";
 import {
 	preflightSessionAuthorityMigration,
@@ -29,10 +30,15 @@ class RetirableFileSessionAuthority extends FileSessionAuthority {
 			this.replaceAll(next.records, next.provisional);
 		});
 	}
+	get capturedBootCompaction(): { readonly beforeBytes: number } | undefined {
+		const beforeBytes = this.bootCompactionBeforeBytes;
+		return beforeBytes === undefined ? undefined : { beforeBytes };
+	}
 }
 
 export class FileBackedSessionMappingStore extends SessionMappingStore {
 	readonly migrationResult?: SessionAuthorityMigrationResult;
+	readonly bootCompaction?: { readonly beforeBytes: number; readonly afterBytes: number };
 
 	protected override mutateAuthorityState(mutation: AuthorityStateMutation): void {
 		const authority = this.authority;
@@ -53,7 +59,13 @@ export class FileBackedSessionMappingStore extends SessionMappingStore {
 				`Session authority migration degraded for ${filePath}; refusing to open the authority store.`,
 				migration,
 			);
-		super(new RetirableFileSessionAuthority(filePath));
+		const authority = new RetirableFileSessionAuthority(filePath);
+		super(authority);
 		this.migrationResult = migration;
+		const captured = authority.capturedBootCompaction;
+		if (captured !== undefined) {
+			const stat = statSync(filePath);
+			this.bootCompaction = { beforeBytes: captured.beforeBytes, afterBytes: stat.size };
+		}
 	}
 }

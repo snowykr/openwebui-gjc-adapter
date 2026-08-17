@@ -16,7 +16,8 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { dirname } from "node:path";
-import { pendingWorkflowGateFromEvent } from "../projection/workflow-gates";
+
+import { streamEscapedJsonString, streamPlainJson, streamPlainObjectHead } from "../state/outbox-json";
 import { AuthorityMutationLock } from "./session-authority-file";
 import { SessionAuthority } from "./session-authority-store";
 import type {
@@ -88,6 +89,7 @@ type WalIdentity = {
 	 * but must be upgraded before the next append. */
 	readonly digestBound?: boolean;
 };
+export const AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES = 64 * 1024 * 1024;
 
 export class SessionAuthorityDurabilityError extends Error {
 	constructor(filePath: string, cause: unknown) {
@@ -99,7 +101,17 @@ export class SessionAuthorityDurabilityError extends Error {
 export class FileSessionAuthority extends SessionAuthority {
 	#baseIdentity: BaseIdentity | undefined = undefined;
 	#walIdentity: WalIdentity | undefined = undefined;
+	/** Set when the loaded base document is already in the normalized form this
+	 * instance writes (a `normalized: true` marker persisted at compaction): an
+	 * oversized base that cannot shrink below the threshold must not be
+	 * rewritten again on every boot. */
+	#normalized = false;
 	protected walCompactionThresholdBytes = WAL_COMPACTION_THRESHOLD_BYTES;
+	/**
+	 * Base-class-owned so a subclass capture written during the constructor
+	 * survives field initialization (subclass fields run after `super()`).
+	 */
+	protected bootCompactionBeforeBytes: number | undefined = undefined;
 
 	/** When the caller already holds the authority mutation lock (which is not
 	 * reentrant), pass it in so the boot-time replay/compaction stays inside the
@@ -118,13 +130,55 @@ export class FileSessionAuthority extends SessionAuthority {
 				return;
 			}
 			this.load();
+			// Capture the ORIGINAL base size before any recovery compaction below:
+			// a pending operation, trailing WAL garbage, or an oversized WAL can
+			// shrink the file, and the oversized decision and its health diagnostic
+			// must still reflect the pre-compaction document.
+			const originalBaseBytes = statIdentity(this.filePath)?.size ?? 0;
 			let trailingGarbage = false;
 			if (existsSync(this.walPath)) trailingGarbage = this.replayWal().trailingGarbage;
 			const pendingOperations = this.hasPendingOperations();
-			if (trailingGarbage || this.walOversized() || pendingOperations) {
-				if (pendingOperations) super.reconcileRestart();
-				this.persist();
+			const needsRecovery = trailingGarbage || this.walOversized() || pendingOperations;
+			const oversizedNotNormalized =
+				originalBaseBytes > AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES && !this.#normalized;
+			let bootRewrote = false;
+			if (needsRecovery) {
+				if (pendingOperations) super.reconcileRestart(false);
+				// Oversized recovery (normalized or legacy): write through the
+				// reference-based writer, never persist()'s entries() deep copy
+				// of every retained event payload. The decision considers the
+				// ORIGINAL base size AND the size of the replayed live authority:
+				// a WAL below the compaction threshold can still recover to a
+				// document-sized authority (e.g. a large delta fsynced just
+				// before the normal threshold compaction), and that fall-through
+				// to persist() would recreate a document-sized allocation from
+				// the replayed state on every restart. For a legacy base the
+				// normalization drops result events; for an already-normalized
+				// oversized base it is a no-op normalization that still writes
+				// from the reference view (no document-sized allocation) and
+				// keeps the marker.
+				const recoveredAuthorityBytes = this.measureLiveAuthorityBytes();
+				if (
+					originalBaseBytes > AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES ||
+					recoveredAuthorityBytes > AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES
+				) {
+					this.compactFromReferences();
+					bootRewrote = true;
+				} else {
+					this.persist();
+				}
+			} else if (oversizedNotNormalized) {
+				// No recovery needed but the legacy base is oversized: reference-based
+				// compaction (normalization drops legacy result event arrays by
+				// reference, no deep copy, and the live journal is replaced with the
+				// normalized records). The persisted `normalized` marker prevents
+				// re-running this on every boot.
+				this.compactFromReferences();
+				bootRewrote = true;
 			}
+			// Report the compaction ONLY when startup actually rewrote an oversized
+			// document (an already-normalized oversized base is left untouched).
+			if (bootRewrote) this.recordBootCompaction(originalBaseBytes);
 		} finally {
 			if (lock === undefined) held.release();
 		}
@@ -448,6 +502,7 @@ export class FileSessionAuthority extends SessionAuthority {
 		)
 			throw new SessionAuthorityLoadError(this.filePath, "authority document is not a valid v2 authority");
 		this.replaceAllWithReferences(document.mappings, document.provisionalOperations ?? []);
+		this.#normalized = (document as Record<string, unknown>).normalized === true;
 		const stat = statIdentity(this.filePath);
 		this.#baseIdentity =
 			stat === undefined
@@ -460,6 +515,14 @@ export class FileSessionAuthority extends SessionAuthority {
 							: {}),
 					};
 		this.clearDirtyJournal();
+	}
+	/**
+	 * Captures a one-time normalizing boot compaction of an oversized base
+	 * document. Subclasses may override to observe the before-bytes; the base
+	 * implementation records it for `bootCompactionBeforeBytes`.
+	 */
+	protected recordBootCompaction(beforeBytes: number): void {
+		this.bootCompactionBeforeBytes = beforeBytes;
 	}
 	protected persist(): void {
 		const mappings = this.entries();
@@ -488,6 +551,7 @@ export class FileSessionAuthority extends SessionAuthority {
 			kind: "openwebui-gjc-session-authority",
 			version: SESSION_AUTHORITY_VERSION,
 			generation: nextGeneration,
+			normalized: true,
 			mappings: normalizedMappings,
 			provisionalOperations: normalizedProvisional,
 		})}\n`;
@@ -558,6 +622,174 @@ export class FileSessionAuthority extends SessionAuthority {
 			}
 			throw new SessionAuthorityDurabilityError(this.filePath, error);
 		}
+		// The persisted document is always the normalized form, so the in-memory
+		// marker must be set here too: when the recovery branch persisted first
+		// (pending/garbage/oversized-WAL) and the base is still oversized, the
+		// subsequent boot-compaction condition must not rewrite it a second time.
+		this.#normalized = true;
+		this.clearDirtyJournal();
+	}
+	/** Boot-only compaction from the internal reference view: no deep copy of
+	 * every record/event payload happens (the legacy result events are dropped
+	 * by reference during normalization), the compact base is written with the
+	 * `normalized` marker, and the live journal is replaced with the normalized
+	 * records so the oversized legacy state does not stay resident. */
+	/** Streaming byte length of the live authority's serialized form (records +
+	 * provisional) without materializing any document-sized string: the same
+	 * per-record streaming serializer the boot compaction writer uses, fed into
+	 * a counting sink. Used to route an oversized WAL-recovered authority
+	 * through the reference-based compaction writer instead of persist()'s
+	 * entries() deep copy. */
+	private measureLiveAuthorityBytes(): number {
+		const raw = this.rawJournalEntries();
+		let bytes = 0;
+		const count: ChunkSink = chunk => {
+			bytes += Buffer.byteLength(chunk, "utf8");
+		};
+		for (const record of raw.records.values()) streamRecord(record, count);
+		for (const operation of raw.provisional.values()) streamProvisional(operation, count);
+		return bytes;
+	}
+	private compactFromReferences(): void {
+		const raw = this.rawJournalEntries() as unknown as {
+			readonly records: Map<string, SessionAuthorityRecord>;
+			readonly provisional: Map<string, ProvisionalSessionOperation>;
+		};
+		for (const record of raw.records.values())
+			if (!isV2Record(record)) throw new Error("Refusing to persist an invalid v2 session authority.");
+		for (const op of raw.provisional.values())
+			if (!isProvisionalOperation(op)) throw new Error("Refusing to persist an invalid v2 session authority.");
+		// Relational validation builds chatIds/projectsByChatId/mappingByChatId plus
+		// operation-identity maps alongside the live journal, doubling peak on
+		// record-count-dominated documents. Boot compaction here runs on already
+		// validated live state (load/mutate validated), so per-record isV2 checks
+		// above are sufficient; skip the full document relational index.
+		mkdirSync(dirname(this.filePath), { recursive: true });
+		const temporary = `${this.filePath}.tmp-${process.pid}-${Date.now()}`;
+		const descriptor = openSync(temporary, "wx", 0o600);
+		let committed = false;
+		const nextGeneration = randomUUID();
+		const contentHash = createHash("sha256");
+		// Drain incrementally without retaining two full graphs: each normalized
+		// record is emitted then its map entry deleted, so peak is ~1x + buffer.
+		const drainedMappings: SessionAuthorityRecord[] = [];
+		const drainedProvisional: ProvisionalSessionOperation[] = [];
+		try {
+			// Serialize the document INCREMENTALLY so a 1 GiB-class authority does not
+			// materialize another whole-document JavaScript string on top of the
+			// parsed authority: each record is normalized and stringified on its own
+			// (peak bounded by the largest single record) and flushed through a
+			// bounded buffer, with the content digest accumulated incrementally.
+			let buffer = "";
+			const flush = () => {
+				if (buffer.length === 0) return;
+				writeFileSync(descriptor, buffer, "utf8");
+				contentHash.update(buffer);
+				buffer = "";
+			};
+			const writeChunk: ChunkSink = chunk => {
+				buffer += chunk;
+				if (buffer.length > 1024 * 1024) flush();
+			};
+			writeChunk('{"kind":"openwebui-gjc-session-authority","version":');
+			writeChunk(`${SESSION_AUTHORITY_VERSION},"generation":`);
+			writeChunk(JSON.stringify(nextGeneration));
+			writeChunk(',"normalized":true,"mappings":[');
+			let firstMapping = true;
+			const recordIterator = raw.records.entries();
+			for (let entry = recordIterator.next(); !entry.done; entry = recordIterator.next()) {
+				const [chatId, record] = entry.value;
+				if (!firstMapping) writeChunk(",");
+				firstMapping = false;
+				const normalized = normalizeRecordForPersistence(record);
+				drainedMappings.push(normalized);
+				streamRecord(normalized, writeChunk);
+				raw.records.delete(chatId);
+			}
+			writeChunk('],"provisionalOperations":[');
+			let firstProv = true;
+			const provisionalIterator = raw.provisional.entries();
+			for (let entry = provisionalIterator.next(); !entry.done; entry = provisionalIterator.next()) {
+				const [key, op] = entry.value;
+				if (!firstProv) writeChunk(",");
+				firstProv = false;
+				const normalized = normalizeProvisionalForPersistence(op);
+				drainedProvisional.push(normalized);
+				streamProvisional(normalized, writeChunk);
+				raw.provisional.delete(key);
+			}
+			writeChunk("]}\n");
+			flush();
+			try {
+				fsyncSync(descriptor);
+			} finally {
+				closeSync(descriptor);
+			}
+			renameSync(temporary, this.filePath);
+			committed = true;
+		} finally {
+			// A write failure (e.g. ENOSPC) must not leak the descriptor or a
+			// partially written authority file: close the descriptor and remove
+			// the uncommitted temporary so retried startups do not accumulate
+			// abandoned files.
+			try {
+				if (descriptor >= 0) closeSync(descriptor);
+			} catch {
+				// Already closed or never opened; the commit path closes it.
+			}
+			if (!committed) {
+				try {
+					unlinkSync(temporary);
+				} catch {
+					// The temporary was never created or already removed.
+				}
+			}
+		}
+		try {
+			this.syncDirectory();
+		} catch (error) {
+			this.#walIdentity = undefined;
+			try {
+				this.load();
+			} catch (loadError) {
+				throw new SessionAuthorityDurabilityError(
+					this.filePath,
+					new AggregateError([error, loadError], "authority reload failed after the base replacement"),
+				);
+			}
+			throw new SessionAuthorityDurabilityError(this.filePath, error);
+		}
+		try {
+			this.resetWalFile();
+		} catch (error) {
+			this.#walIdentity = undefined;
+			try {
+				this.load();
+			} catch (loadError) {
+				throw new SessionAuthorityDurabilityError(
+					this.filePath,
+					new AggregateError([error, loadError], "authority reload failed after the WAL reset"),
+				);
+			}
+			throw new SessionAuthorityDurabilityError(this.filePath, error);
+		}
+		// Drained normalized arrays become live journal; originals were deleted
+		// incrementally so peak never held two full graphs.
+		this.replaceAllWithReferences(drainedMappings, drainedProvisional);
+		try {
+			this.refreshBaseIdentity(nextGeneration, contentHash.digest("hex"));
+		} catch (error) {
+			try {
+				this.load();
+			} catch (loadError) {
+				throw new SessionAuthorityDurabilityError(
+					this.filePath,
+					new AggregateError([error, loadError], "authority reload failed after the base replacement"),
+				);
+			}
+			throw new SessionAuthorityDurabilityError(this.filePath, error);
+		}
+		this.#normalized = true;
 		this.clearDirtyJournal();
 	}
 	/** Refreshes the cached base identity (stat + generation) after a rewrite;
@@ -948,13 +1180,18 @@ export class FileSessionAuthority extends SessionAuthority {
 		return this.#walIdentity !== undefined && this.#walIdentity.size > this.walCompactionThresholdBytes;
 	}
 	private hasPendingOperations(): boolean {
-		return (
-			this.entries().some(
-				record =>
-					record.reassignment?.state === "pending" ||
-					record.journal.some(operation => operation.state === "pending"),
-			) || this.provisionalEntries().some(operation => operation.state === "pending")
-		);
+		// Inspect through the internal reference view without spreading the maps:
+		// an authority dominated by record count (millions of small records)
+		// must not allocate arrays of every map value before `.some()` can
+		// return on the first pending entry; this check runs BEFORE boot
+		// compaction so it must iterate the live Maps directly.
+		const raw = this.rawJournalEntries();
+		for (const record of raw.records.values()) {
+			if (record.reassignment?.state === "pending") return true;
+			for (const operation of record.journal) if (operation.state === "pending") return true;
+		}
+		for (const operation of raw.provisional.values()) if (operation.state === "pending") return true;
+		return false;
 	}
 	private get walPath(): string {
 		return `${this.filePath}.wal`;
@@ -1289,6 +1526,144 @@ function walDeltaBodyJson(delta: Record<string, unknown>): string {
 	const { head: _head, ...body } = delta;
 	return JSON.stringify(body);
 }
+
+/** Receives serialization chunks; used both by the boot compaction writer
+ * (writing through a bounded buffer) and by the recovered-authority size
+ * measurement (counting bytes). */
+type ChunkSink = (chunk: string) => void;
+
+/** Streams a record's retained event array element by element (peak bounded by
+ * the largest single event) so a 1 GiB sequential-gate record never
+ * materializes a record-sized string on top of the parsed authority. Each
+ * event is serialized through the incremental plain-JSON writer too, so a
+ * single very large retained event (a 1 GiB-class tool or workflow payload) is
+ * itself streamed instead of being materialized whole by an eager
+ * JSON.stringify call. The emitted bytes are byte-identical to
+ * JSON.stringify of the same event array. */
+function streamEvents(events: readonly unknown[] | undefined, emit: ChunkSink): void {
+	if (events === undefined || events.length === 0) return;
+	emit(',"events":[');
+	for (let index = 0; index < events.length; index += 1) {
+		if (index > 0) emit(",");
+		streamPlainJson(events[index], emit);
+	}
+	emit("]");
+}
+/** Streams a tombstone: the small non-event fields as one chunk, the journal
+ * operations (streaming any retained result events per element), the retained
+ * events, and a recursively retained prior tombstone's events per element. */
+function streamTombstone(tombstone: SessionAuthorityTombstone, emit: ChunkSink): void {
+	const { events: _tombstoneEvents, journal, prior: priorTombstone, assistantText, observations, ...rest } = tombstone;
+	streamPlainObjectHead(rest, emit);
+	if (assistantText !== undefined) {
+		emit(',"assistantText":"');
+		streamEscapedJsonString(assistantText, emit);
+		emit('"');
+	}
+	if (observations !== undefined) {
+		emit(',"observations":');
+		streamPlainJson(observations, emit);
+	}
+	emit(',"journal":[');
+	for (let index = 0; index < journal.length; index += 1) {
+		if (index > 0) emit(",");
+		streamJournalOperation(journal[index], emit);
+	}
+	emit("]");
+	streamEvents(tombstone.events, emit);
+	if (priorTombstone !== undefined) {
+		emit(',"prior":');
+		streamTombstone(priorTombstone, emit);
+	}
+	emit("}");
+}
+/** Streams a reassignment: the small non-event fields as one chunk, then each
+ * retained tombstone (sourceTombstone and priorTombstone) recursively. */
+function streamReassignment(reassignment: SessionAuthorityReassignment, emit: ChunkSink): void {
+	const { sourceTombstone, priorTombstone, ...rest } = reassignment;
+	streamPlainObjectHead(rest, emit);
+	if (sourceTombstone !== undefined) {
+		emit(',"sourceTombstone":');
+		streamTombstone(sourceTombstone, emit);
+	}
+	if (priorTombstone !== undefined) {
+		emit(',"priorTombstone":');
+		streamTombstone(priorTombstone, emit);
+	}
+	emit("}");
+}
+/** Streams a journal operation: the small non-event fields as one chunk,
+ * then the retained result events element by element (normalization preserves
+ * ambiguous results containing multiple workflow-gate events under
+ * result.events, which can reach 1 GiB class for legacy records). */
+function streamJournalOperation(operation: SessionOperation, emit: ChunkSink): void {
+	const { result, ...rest } = operation;
+	streamPlainObjectHead(rest, emit);
+	if (result !== undefined) {
+		emit(',"result":');
+		const { events, assistantText, ...resultRest } = result;
+		streamPlainObjectHead(resultRest, emit);
+		if (assistantText !== undefined) {
+			emit(',"assistantText":"');
+			streamEscapedJsonString(assistantText, emit);
+			emit('"');
+		}
+		streamEvents(events, emit);
+		emit("}");
+	}
+	emit("}");
+}
+/** Streams a session authority record with the same per-record layout the
+ * persisted document uses: small fields first, then the retained events (top
+ * level, inside any reassignment tombstones, and inside normalized journal
+ * results) element by element. */
+function streamRecord(record: SessionAuthorityRecord, emit: ChunkSink): void {
+	const { events: _events, reassignment: _reassignment, journal, assistantText, observations, ...rest } = record;
+	streamPlainObjectHead(rest, emit);
+	if (assistantText !== undefined) {
+		emit(',"assistantText":"');
+		streamEscapedJsonString(assistantText, emit);
+		emit('"');
+	}
+	if (observations !== undefined) {
+		emit(',"observations":');
+		streamPlainJson(observations, emit);
+	}
+	// journal is a required v2 record field: always serialize it, including the
+	// empty array (isV2Record requires journal to be an array, so omitting it
+	// would make the next boot reject the rewritten base).
+	emit(',"journal":[');
+	for (let index = 0; index < journal.length; index += 1) {
+		if (index > 0) emit(",");
+		streamJournalOperation(journal[index], emit);
+	}
+	emit("]");
+	streamEvents(record.events, emit);
+	if (record.reassignment !== undefined) {
+		emit(',"reassignment":');
+		streamReassignment(record.reassignment, emit);
+	}
+	emit("}");
+}
+/** Streams a provisional operation, streaming a large retained result event
+ * array element by element the same way streamRecord does. */
+function streamProvisional(operation: ProvisionalSessionOperation, emit: ChunkSink): void {
+	const { result, ...rest } = operation;
+	streamPlainObjectHead(rest, emit);
+	if (result !== undefined) {
+		emit(',"result":');
+		const { events, assistantText, ...resultRest } = result;
+		streamPlainObjectHead(resultRest, emit);
+		if (assistantText !== undefined) {
+			emit(',"assistantText":"');
+			streamEscapedJsonString(assistantText, emit);
+			emit('"');
+		}
+		streamEvents(events, emit);
+		emit("}");
+	}
+	emit("}");
+}
 function isNonEmptyString(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0;
 }
@@ -1332,7 +1707,16 @@ function normalizeOperationResult(operation: SessionOperation): SessionOperation
 }
 function normalizeResult(result: SessionOperationResult): SessionOperationResult {
 	if (result.events === undefined) return result;
-	const gateEvents = result.events.filter(event => event.type === "workflow_gate");
+	// Only zero/one/many gates matter below; scanning every workflow-gate
+	// event into a filtered array would allocate a second reference array for
+	// a gate-heavy legacy authority. Collect at most the first two.
+	const gateEvents: Array<NonNullable<SessionOperationResult["events"]>[number]> = [];
+	for (const event of result.events) {
+		if (event.type === "workflow_gate") {
+			gateEvents.push(event);
+			if (gateEvents.length >= 2) break;
+		}
+	}
 	// Legacy workflow-gate results (written before the compact gate binding
 	// existed) may rely on their retained events as the only evidence
 	// authenticating the answered gate once the record mapping has advanced.
@@ -1343,17 +1727,12 @@ function normalizeResult(result: SessionOperationResult): SessionOperationResult
 	// so the legacy replay path can still verify against them.
 	if (result.gate === undefined && gateEvents.length > 0) {
 		if (gateEvents.length === 1) {
-			const gate = pendingWorkflowGateFromEvent(gateEvents[0]!);
+			const gate = compactGateIdentityFromEvent(gateEvents[0]!);
 			if (gate !== null) {
 				const { events: _events, ...withoutEvents } = result;
 				return {
 					...withoutEvents,
-					gate: {
-						gateId: gate.gateId,
-						...(gate.commandId === undefined || gate.turnId === undefined || gate.sessionId === undefined
-							? {}
-							: { commandId: gate.commandId, turnId: gate.turnId, sessionId: gate.sessionId }),
-					},
+					gate,
 				};
 			}
 		}
@@ -1361,6 +1740,28 @@ function normalizeResult(result: SessionOperationResult): SessionOperationResult
 	}
 	const { events: _events, ...withoutEvents } = result;
 	return withoutEvents;
+}
+
+function compactGateIdentityFromEvent(
+	event: NonNullable<SessionOperationResult["events"]>[number],
+): SessionOperationResult["gate"] | null {
+	const payload = isRecord(event.payload) ? event.payload : undefined;
+	const gateIdRaw =
+		(payload !== undefined ? ((payload.gateId as unknown) ?? (payload.gate_id as unknown)) : undefined) ??
+		(event as unknown as { readonly id?: unknown }).id;
+	if (typeof gateIdRaw !== "string" || gateIdRaw.length === 0) return null;
+	const gateId = gateIdRaw;
+	const commandIdRaw = payload?.commandId as unknown;
+	const turnIdRaw = payload?.turnId as unknown;
+	const sessionIdRaw = payload?.sessionId as unknown;
+	const hasCorrelation =
+		typeof commandIdRaw === "string" &&
+		typeof turnIdRaw === "string" &&
+		typeof sessionIdRaw === "string" &&
+		commandIdRaw.length > 0 &&
+		turnIdRaw.length > 0 &&
+		sessionIdRaw.length > 0;
+	return hasCorrelation ? { gateId, commandId: commandIdRaw, turnId: turnIdRaw, sessionId: sessionIdRaw } : { gateId };
 }
 
 export function isAuthorityDocument(value: unknown): value is {
@@ -1374,7 +1775,7 @@ export function isAuthorityDocument(value: unknown): value is {
 	const document = value as Record<string, unknown>;
 	return (
 		Object.keys(document).every(key =>
-			["kind", "version", "generation", "mappings", "provisionalOperations"].includes(key),
+			["kind", "version", "generation", "normalized", "mappings", "provisionalOperations"].includes(key),
 		) &&
 		document.kind === "openwebui-gjc-session-authority" &&
 		document.version === SESSION_AUTHORITY_VERSION &&

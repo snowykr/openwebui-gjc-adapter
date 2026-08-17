@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import {
 	assertPublishedSdkAttachmentCurrent,
@@ -176,11 +177,19 @@ function assertSuccessorMetadata(
 ): void {
 	const sessionId = requiredString(metadata, "sessionId", "session.metadata result");
 	const cwd = requiredString(metadata, "cwd", "session.metadata result");
-	if (sessionId !== successor.sessionId || cwd !== canonicalCwd) {
+	if (sessionId !== successor.sessionId || canonicalMetadataCwd(cwd) !== canonicalMetadataCwd(canonicalCwd)) {
 		throw new SdkV3OperationError(
 			"endpoint_stale",
 			"Session successor metadata does not match its published identity",
 		);
+	}
+}
+
+function canonicalMetadataCwd(cwd: string): string {
+	try {
+		return realpathSync(cwd);
+	} catch {
+		return cwd;
 	}
 }
 function lifecycleTargetSessionId(operation: string, input: SdkRecord): string | undefined {

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import type { Stats } from "node:fs";
+import { realpathSync, type Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -159,7 +159,7 @@ describe("fresh GJC session discovery", () => {
 		await writeSessionHeader(path.join(sessionRoot, "successor.jsonl"), "successor", projectCwd);
 
 		await expect(discoverFreshGjcSessionFile(sessionRoot, baseline, "successor", projectCwd)).resolves.toMatchObject({
-			filePath: path.join(sessionRoot, "successor.jsonl"),
+			filePath: path.join(realpathSync(sessionRoot), "successor.jsonl"),
 			header: { id: "successor", cwd: projectCwd },
 		});
 	});
@@ -175,7 +175,7 @@ describe("fresh GJC session discovery", () => {
 		}, 30);
 
 		await expect(pending).resolves.toMatchObject({
-			filePath: path.join(sessionRoot, "successor.jsonl"),
+			filePath: path.join(realpathSync(sessionRoot), "successor.jsonl"),
 			header: { id: "successor", cwd: projectCwd },
 		});
 	});
@@ -193,7 +193,9 @@ describe("fresh GJC session discovery", () => {
 		await expect(discoverFreshGjcSessionFile(sessionRoot, baseline, "successor", projectCwd)).rejects.toBeInstanceOf(
 			GjcSessionLoadError,
 		);
-		expect(await snapshotGjcSessionFiles(sessionRoot)).toEqual(new Set([path.join(sessionRoot, "escape.jsonl")]));
+		expect(await snapshotGjcSessionFiles(sessionRoot)).toEqual(
+			new Set([path.join(realpathSync(sessionRoot), "escape.jsonl")]),
+		);
 	});
 	test("excludes baseline names even when they were invalid or symlinks", async () => {
 		const sessionRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-session-discovery-"));
@@ -212,7 +214,7 @@ describe("fresh GJC session discovery", () => {
 		await writeSessionHeader(path.join(sessionRoot, "fresh.jsonl"), "successor", projectCwd);
 
 		await expect(discoverFreshGjcSessionFile(sessionRoot, baseline, "successor", projectCwd)).resolves.toMatchObject({
-			filePath: path.join(sessionRoot, "fresh.jsonl"),
+			filePath: path.join(realpathSync(sessionRoot), "fresh.jsonl"),
 		});
 	});
 

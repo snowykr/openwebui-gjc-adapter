@@ -5,7 +5,9 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
 	statSync,
 	unlinkSync,
@@ -13,17 +15,23 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { GjcRuntimeLocations, NormalizedModelSelection } from "../src/contracts";
 import type { PublicSdkSessionPort } from "../src/gjc/public-sdk-contract";
 import { PublicSdkSessionClient } from "../src/gjc/public-sdk-session-port";
 import {
+	AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES,
 	FileSessionAuthority,
 	findGenerationOffset,
 	SessionAuthorityDurabilityError,
 } from "../src/gjc/session-authority-persistence";
 import type { ProvisionalSessionOperation, SessionAuthorityRecord } from "../src/gjc/session-authority-types";
-import { FileBackedSessionMappingStore, SessionMappingStore } from "../src/gjc/session-router";
+import {
+	FileBackedSessionMappingStore,
+	normalizeModelSelection,
+	type SessionMapping,
+	SessionMappingStore,
+} from "../src/gjc/session-router";
 import type {
 	GjcControlResult,
 	GjcLifecyclePublicationAddress,
@@ -36,6 +44,7 @@ import { createGjcRoutingLiveGatewayRunner, createPublicSdkGjcTurnRunner } from 
 import { synthesizeProjectionRows } from "../src/live/workflow-gate-projection";
 import { buildSessionMappingPayloadHash } from "../src/live/workflow-gate-turns";
 import { InMemoryOutboxStore } from "../src/state/outbox";
+import { buildProjectionPayloadHash, streamEscapedJsonString, streamPlainJson } from "../src/state/outbox-json";
 import { attachmentProof } from "./gjc-lifecycle-fixtures";
 import { FakeGjcTurnRunner, project } from "./gjc-routing-runner-fixtures";
 import type { SdkFixtureScenario, SdkFixtureServer } from "./gjc-sdk-v3-fixture-types";
@@ -852,6 +861,794 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				.sort(),
 		).toEqual(["chat-1", "chat-2", "chat-3"]);
 	});
+	test("does not recompact an already-normalized oversized authority on later boots", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-boot-compaction-once-"));
+		const filePath = join(directory, "mappings.json");
+		try {
+			// A normalized oversized document (written by our own persist, so it
+			// carries the marker): many mappings keep it above the threshold but
+			// no legacy normalization is needed, so later boots must not rewrite
+			// it again.
+			const oversized = oversizedAuthorityJson(70 * 1024 * 1024);
+			const document = JSON.parse(oversized.json) as Record<string, unknown>;
+			document.normalized = true;
+			writeFileSync(filePath, JSON.stringify(document));
+			const firstBytes = statSync(filePath).size;
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			expect(store.bootCompaction).toBeUndefined();
+			expect(statSync(filePath).size).toBe(firstBytes);
+
+			// A second boot also leaves the file untouched.
+			new FileBackedSessionMappingStore(filePath);
+			expect(statSync(filePath).size).toBe(firstBytes);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+	test("reports boot compaction from the original size even when recovery compacts first", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-boot-compaction-recovery-"));
+		const filePath = join(directory, "mappings.json");
+		try {
+			// An oversized legacy document that ALSO has a pending operation: the
+			// recovery branch persists first (shrinking the file), but the boot
+			// compaction diagnostic must still report the ORIGINAL oversized size.
+			const oversized = oversizedAuthorityJson(70 * 1024 * 1024);
+			const document = JSON.parse(oversized.json) as Record<string, unknown>;
+			const mappings = document.mappings as Array<Record<string, unknown>>;
+			const record = mappings[0]!;
+			const journal = record.journal as Array<Record<string, unknown>>;
+			journal.push({
+				id: "pending-op",
+				kind: "prompt",
+				state: "pending",
+				startedAt: "2026-01-01T00:00:00.000Z",
+			});
+			writeFileSync(filePath, JSON.stringify(document));
+			const originalBytes = statSync(filePath).size;
+			expect(originalBytes).toBeGreaterThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			expect(store.bootCompaction?.beforeBytes).toBe(originalBytes);
+			expect(store.bootCompaction?.afterBytes ?? 0).toBeLessThan(originalBytes);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+	test("does not rewrite a second time when recovery persists first", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-recovery-then-compaction-"));
+		const filePath = join(directory, "mappings.json");
+		try {
+			// An oversized legacy document with a pending operation: the recovery
+			// branch persists (writing a normalized base) before the oversized
+			// condition; the in-memory normalized marker must prevent a second
+			// full rewrite, so the file is written exactly once during boot.
+			const oversized = oversizedAuthorityJson(70 * 1024 * 1024);
+			const document = JSON.parse(oversized.json) as Record<string, unknown>;
+			const mappings = document.mappings as Array<Record<string, unknown>>;
+			const record = mappings[0]!;
+			const journal = record.journal as Array<Record<string, unknown>>;
+			journal.push({
+				id: "pending-op",
+				kind: "prompt",
+				state: "pending",
+				startedAt: "2026-01-01T00:00:00.000Z",
+			});
+			writeFileSync(filePath, JSON.stringify(document));
+			const originalBytes = statSync(filePath).size;
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			// The recovery persist already normalized the base (the marker is set in
+			// memory), so the oversized condition does NOT rewrite it a second time,
+			// but the compaction is still reported from the original size.
+			expect(store.bootCompaction?.beforeBytes).toBe(originalBytes);
+			expect(statSync(filePath).size).toBeLessThan(originalBytes);
+			expect(statSync(filePath).size).toBeLessThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			// A second boot is also stable.
+			const stableBytes = statSync(filePath).size;
+			new FileBackedSessionMappingStore(filePath);
+			expect(statSync(filePath).size).toBe(stableBytes);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+	test("routes oversized normalized recovery through the reference writer", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-normalized-recovery-"));
+		const filePath = join(directory, "mappings.json");
+		try {
+			// A legitimately oversized NORMALIZED authority (marker set) with a
+			// pending operation: recovery must still write through the
+			// reference-based writer (no entries() deep copy of retained events),
+			// persist the reconciled state, and stay stable on later boots.
+			const oversized = oversizedAuthorityJson(70 * 1024 * 1024);
+			const document = JSON.parse(oversized.json) as Record<string, unknown>;
+			document.normalized = true;
+			const mappings = document.mappings as Array<Record<string, unknown>>;
+			const record = mappings[0]!;
+			const journal = record.journal as Array<Record<string, unknown>>;
+			journal.push({
+				id: "pending-op",
+				kind: "prompt",
+				state: "pending",
+				startedAt: "2026-01-01T00:00:00.000Z",
+			});
+			writeFileSync(filePath, JSON.stringify(document));
+			const originalBytes = statSync(filePath).size;
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			// Recovery persisted the reconciled state (reported from the original
+			// size) without a second rewrite, and a later boot is stable.
+			expect(store.bootCompaction?.beforeBytes).toBe(originalBytes);
+			const stableBytes = statSync(filePath).size;
+			new FileBackedSessionMappingStore(filePath);
+			expect(statSync(filePath).size).toBe(stableBytes);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+	test("streams retained record events through boot compaction byte-consistently", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-streamed-events-"));
+		const filePath = join(directory, "mappings.json");
+		try {
+			// A legacy record with MANY retained events: the boot compaction must
+			// stream them element by element and the reloaded document must carry
+			// every event intact (byte-consistent round trip).
+			const oversized = oversizedAuthorityJson(70 * 1024 * 1024);
+			const document = JSON.parse(oversized.json) as Record<string, unknown>;
+			writeFileSync(filePath, JSON.stringify(document));
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			expect(store.bootCompaction?.beforeBytes).toBeGreaterThan(0);
+
+			const reloaded = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
+			const reloadedMapping = (reloaded.mappings as Array<Record<string, unknown>>)[0]!;
+			const reloadedJournal = reloadedMapping.journal as Array<Record<string, unknown>>;
+			// The retained result events survive the streamed write.
+			expect(reloadedJournal[0]?.result).toBeDefined();
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+	test("routes a WAL-only oversized recovery through the reference writer", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-oversized-"));
+		const filePath = join(directory, "mappings.json");
+		const walPath = `${filePath}.wal`;
+		try {
+			// Small base: nothing requires boot compaction on its own.
+			const writer = new FileSessionAuthority(filePath);
+			writer.set(mappingInput(mediumSelection));
+			// A second mutation appends to a v2 WAL (the first write persists the
+			// base directly because the file does not exist yet).
+			writer.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+			expect(statSync(filePath).size).toBeLessThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			// A large delta fsynced just before the normal WAL threshold
+			// compaction: the WAL is oversized and must be replayed, but the
+			// ORIGINAL base is small, so the recovered authority (not the base)
+			// is what exceeds the boot compaction threshold. The recovery must
+			// route through the reference-based compaction writer instead of
+			// persist()'s deep copy of the replayed state.
+			const lines = readFileSync(walPath, "utf8").trimEnd().split("\n");
+			const lastHead = (JSON.parse(lines[lines.length - 1]!) as { readonly head: string }).head;
+			const chunk = "x".repeat(512 * 1024);
+			const events = Array.from({ length: 130 }, (_, index) => ({
+				type: "assistant" as const,
+				text: `event-${index}`,
+				payload: { transcript: `${chunk}-${index}` },
+			}));
+			const document = validAuthorityDocument();
+			document.provisionalOperations = [];
+			const record = document.mappings[0];
+			record.chatId = "chat-9";
+			record.header = { chatId: "chat-9", projectId: record.projectId, sessionId: record.sessionId };
+			record.operationId = "user-9";
+			record.events = events;
+			record.journal[0].id = "user-9";
+			record.journal[0].result.mapping = {
+				chatId: "chat-9",
+				projectId: record.projectId,
+				sessionId: record.sessionId,
+				rawFrameCursor: record.rawFrameCursor,
+				eventCursor: record.eventCursor,
+				operationId: "user-9",
+			};
+			const body = {
+				kind: "openwebui-gjc-session-authority-wal",
+				version: 2,
+				records: [record],
+				provisional: [],
+				prevHash: lastHead,
+			};
+			const head = createHash("sha256").update(lastHead).update("\n").update(JSON.stringify(body)).digest("hex");
+			appendFileSync(walPath, `${JSON.stringify({ ...body, head })}\n`);
+			expect(statSync(walPath).size).toBeGreaterThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			// The reference-based compaction ran (not persist()'s deep copy) and
+			// reported the rewrite.
+			expect(store.bootCompaction?.beforeBytes).toBeGreaterThan(0);
+			// The replayed large authority survived intact.
+			expect(store.get("chat-9")?.events).toHaveLength(130);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+	test("streams projection payload hashes byte-identically to whole-string canonicalization", () => {
+		// The boot synthesis hashes must stay byte-identical to the previous
+		// eager shape (JSON.stringify(event.payload) collected into a mapped
+		// array, then whole-string canonicalization) so stored outbox rows and
+		// persisted projection hashes keep matching across the streaming change.
+		const mapping: SessionMapping = {
+			...mappingInput(mediumSelection),
+			chatId: "chat-1",
+			events: [
+				{
+					type: "assistant",
+					text: "hi",
+					id: "e1",
+					payload: { transcript: [{ role: "assistant", content: "hi" }] },
+				},
+				{
+					type: "user",
+					text: "hello\nworld",
+					id: "e0",
+					payload: { transcript: [{ role: "user", content: "hello\nworld" }] },
+				},
+			],
+		};
+		const legacyShape = {
+			chatId: mapping.chatId,
+			projectId: mapping.projectId,
+			sessionId: mapping.sessionId,
+			sessionFile: mapping.sessionFile ?? null,
+			activeLeaf: mapping.activeLeaf ?? null,
+			rawFrameCursor: mapping.rawFrameCursor,
+			eventCursor: mapping.eventCursor,
+			operationId: mapping.operationId,
+			assistantText: mapping.assistantText ?? null,
+			modelSelection: normalizeModelSelection(mapping.modelSelection) ?? null,
+			events: (mapping.events ?? []).map(event => ({
+				type: event.type,
+				text: event.text ?? null,
+				id: event.id ?? null,
+				payloadJson: event.payload === undefined ? null : JSON.stringify(event.payload),
+			})),
+		};
+		expect(buildSessionMappingPayloadHash(mapping)).toBe(buildProjectionPayloadHash(legacyShape));
+
+		// A payload whose string ends in an UNMATCHED high surrogate must still
+		// hash byte-identically: JSON.stringify escapes a terminal lone
+		// surrogate (\\ud800) while an unescaped raw code unit would be encoded
+		// by Bun as the replacement character, diverging from stored hashes.
+		const terminalSurrogate = "ends-in-\uD800";
+		expect(JSON.stringify(terminalSurrogate)).toBe('"ends-in-\\ud800"');
+		let escapedTerminal = "";
+		streamEscapedJsonString(terminalSurrogate, chunk => (escapedTerminal += chunk));
+		expect(escapedTerminal).toBe(JSON.stringify(terminalSurrogate).slice(1, -1));
+
+		// streamPlainJson / streamEscapedJsonString must reproduce
+		// JSON.stringify and its string-value escape byte for byte.
+		const payload = { a: 'x"y', b: ["\n", "\u0001"], c: { d: "\u{1F600}" } };
+		let streamed = "";
+		streamPlainJson(payload, chunk => streamEscapedJsonString(chunk, fragment => (streamed += fragment)));
+		expect(streamed).toBe(JSON.stringify(JSON.stringify(payload)).slice(1, -1));
+	});
+	test("hashes a large assistantText byte-identically to whole-string canonicalization", () => {
+		// A large persisted response must not materialize an assistant-sized
+		// string on each projection hashing pass; the streamed escape must stay
+		// byte-identical to JSON.stringify so stored outbox rows keep matching.
+		const bigText = `${"x".repeat(1024 * 1024)}\n"quoted"\\slash\u0001\uD800 tail`;
+		const mapping: SessionMapping = {
+			...mappingInput(mediumSelection),
+			chatId: "chat-1",
+			assistantText: bigText,
+			events: [],
+		};
+		const legacyShape = {
+			chatId: mapping.chatId,
+			projectId: mapping.projectId,
+			sessionId: mapping.sessionId,
+			sessionFile: mapping.sessionFile ?? null,
+			activeLeaf: mapping.activeLeaf ?? null,
+			rawFrameCursor: mapping.rawFrameCursor,
+			eventCursor: mapping.eventCursor,
+			operationId: mapping.operationId,
+			assistantText: mapping.assistantText ?? null,
+			modelSelection: normalizeModelSelection(mapping.modelSelection) ?? null,
+			events: (mapping.events ?? []).map(event => ({
+				type: event.type,
+				text: event.text ?? null,
+				id: event.id ?? null,
+				payloadJson: event.payload === undefined ? null : JSON.stringify(event.payload),
+			})),
+		};
+		expect(buildSessionMappingPayloadHash(mapping)).toBe(buildProjectionPayloadHash(legacyShape));
+	});
+	test("routes a CJK-heavy WAL recovery by UTF-8 bytes through the reference writer", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-wal-cjk-"));
+		const filePath = join(directory, "mappings.json");
+		const walPath = `${filePath}.wal`;
+		try {
+			// Small base: nothing requires boot compaction on its own.
+			const writer = new FileSessionAuthority(filePath);
+			writer.set(mappingInput(mediumSelection));
+			writer.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+			expect(statSync(filePath).size).toBeLessThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			// ~26 MiB of CJK characters serialize to ~78 MiB UTF-8 (3 bytes per
+			// code unit) but only ~26 MiB of UTF-16 code units: the recovered
+			// authority must be measured in serialized BYTES so it routes
+			// through the reference-based compaction writer.
+			const lines = readFileSync(walPath, "utf8").trimEnd().split("\n");
+			const lastHead = (JSON.parse(lines[lines.length - 1]!) as { readonly head: string }).head;
+			const cjkChunk = "가".repeat(512 * 1024);
+			const events = Array.from({ length: 52 }, (_, index) => ({
+				type: "assistant" as const,
+				text: `event-${index}`,
+				payload: { transcript: `${cjkChunk}-${index}` },
+			}));
+			const document = validAuthorityDocument();
+			document.provisionalOperations = [];
+			const record = document.mappings[0];
+			record.chatId = "chat-9";
+			record.header = { chatId: "chat-9", projectId: record.projectId, sessionId: record.sessionId };
+			record.operationId = "user-9";
+			record.events = events;
+			record.journal[0].id = "user-9";
+			record.journal[0].result.mapping = {
+				chatId: "chat-9",
+				projectId: record.projectId,
+				sessionId: record.sessionId,
+				rawFrameCursor: record.rawFrameCursor,
+				eventCursor: record.eventCursor,
+				operationId: "user-9",
+			};
+			const body = {
+				kind: "openwebui-gjc-session-authority-wal",
+				version: 2,
+				records: [record],
+				provisional: [],
+				prevHash: lastHead,
+			};
+			const head = createHash("sha256").update(lastHead).update("\n").update(JSON.stringify(body)).digest("hex");
+			appendFileSync(walPath, `${JSON.stringify({ ...body, head })}\n`);
+			// The replayed authority is ~78 MiB of UTF-8 but its UTF-16 length is
+			// below the threshold: only a BYTE-based measurement routes it to the
+			// reference writer.
+			expect(statSync(walPath).size).toBeGreaterThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			expect(store.bootCompaction?.beforeBytes).toBeGreaterThan(0);
+			expect(store.get("chat-9")?.events).toHaveLength(52);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+	test("streams oversized provisional result events through boot compaction", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-provisional-"));
+		const filePath = join(directory, "mappings.json");
+		const walPath = `${filePath}.wal`;
+		try {
+			// A large WAL delta carrying a pending provisional operation whose
+			// normalized result retains a multi-gate event array: replaying it
+			// recovers an oversized authority (small original base) so the boot
+			// compaction writer must serialize the provisional with
+			// streamProvisional (per-event chunks) instead of an eager
+			// provisional-sized string.
+			const writer = new FileSessionAuthority(filePath);
+			writer.set(mappingInput(mediumSelection));
+			writer.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+			expect(statSync(filePath).size).toBeLessThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const lines = readFileSync(walPath, "utf8").trimEnd().split("\n");
+			const lastHead = (JSON.parse(lines[lines.length - 1]!) as { readonly head: string }).head;
+			const chunk = "x".repeat(512 * 1024);
+			// Ambiguous multi-gate events (two workflow-gate events, so no single
+			// gate binding can be synthesized): normalization preserves the
+			// retained array, and the compaction writer must stream it per
+			// element instead of serializing the whole provisional eagerly.
+			const events = Array.from({ length: 140 }, (_, index) => ({
+				type: "workflow_gate" as const,
+				text: `event-${index}`,
+				payload: {
+					gateId: `gate-${index % 2}`, // two distinct gates: ambiguous
+					schemaHash: `schema-${index % 2}`,
+					transcript: `${chunk}-${index}`,
+				},
+			}));
+			const document = validAuthorityDocument();
+			document.mappings[0].journal[0].result.events = [];
+			const provisional = {
+				id: "operation-2",
+				kind: "create",
+				state: "complete",
+				startedAt: (document.mappings[0] as Record<string, unknown>).createdAt as string,
+				completedAt: (document.mappings[0] as Record<string, unknown>).createdAt as string,
+				chatId: "chat-2",
+				projectId: (document.mappings[0] as Record<string, unknown>).projectId as string,
+				result: {
+					kind: "turn",
+					assistantText: "done",
+					events,
+					mapping: {
+						chatId: "chat-2",
+						projectId: (document.mappings[0] as Record<string, unknown>).projectId as string,
+						sessionId: "session-2",
+						rawFrameCursor: 0,
+						eventCursor: 0,
+						operationId: "operation-2",
+					},
+				},
+			};
+			const body = {
+				kind: "openwebui-gjc-session-authority-wal",
+				version: 2,
+				records: [document.mappings[0]],
+				provisional: [{ key: JSON.stringify(["chat-2", "operation-2"]), operation: provisional }],
+				prevHash: lastHead,
+			};
+			const head = createHash("sha256").update(lastHead).update("\n").update(JSON.stringify(body)).digest("hex");
+			appendFileSync(walPath, `${JSON.stringify({ ...body, head })}\n`);
+			expect(statSync(walPath).size).toBeGreaterThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			// The reference-based compaction ran (streaming the provisional) and
+			// reported the rewrite.
+			expect(store.bootCompaction?.beforeBytes).toBeGreaterThan(0);
+
+			const reloaded = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
+			const reloadedProvisional = reloaded.provisionalOperations as Array<Record<string, unknown>>;
+			const reloadedEvents = (reloadedProvisional[0]?.result as Record<string, unknown> | undefined)?.events;
+			expect(Array.isArray(reloadedEvents)).toBe(true);
+			expect((reloadedEvents as unknown[]).length).toBe(140);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+	test("preserves an empty journal through boot compaction so the rewritten base still validates", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-empty-journal-"));
+		const filePath = join(directory, "mappings.json");
+		const walPath = `${filePath}.wal`;
+		try {
+			const writer = new FileSessionAuthority(filePath);
+			writer.set(mappingInput(mediumSelection));
+			writer.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+			expect(statSync(filePath).size).toBeLessThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const lines = readFileSync(walPath, "utf8").trimEnd().split("\n");
+			const lastHead = (JSON.parse(lines[lines.length - 1]!) as { readonly head: string }).head;
+			const chunk = "x".repeat(512 * 1024);
+			// An empty journal is a REQUIRED v2 record field: isV2Record checks
+			// Array.isArray(journal) and hasOnlyKeys includes "journal", so a
+			// compaction writer that omits the field produces a base the next
+			// boot rejects. The oversized delta forces compaction to run.
+			const document = validAuthorityDocument();
+			document.provisionalOperations = [];
+			const record = document.mappings[0];
+			record.journal = [];
+			record.events = Array.from({ length: 140 }, (_, index) => ({
+				type: "assistant" as const,
+				text: `event-${index}`,
+				payload: { transcript: `${chunk}-${index}` },
+			}));
+			const body = {
+				kind: "openwebui-gjc-session-authority-wal",
+				version: 2,
+				records: [record],
+				provisional: [],
+				prevHash: lastHead,
+			};
+			const head = createHash("sha256").update(lastHead).update("\n").update(JSON.stringify(body)).digest("hex");
+			appendFileSync(walPath, `${JSON.stringify({ ...body, head })}\n`);
+			expect(statSync(walPath).size).toBeGreaterThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			expect(store.bootCompaction?.beforeBytes).toBeGreaterThan(0);
+			// The rewritten base must still parse and validate on the NEXT boot
+			// (the WAL was reset by compaction), so the empty journal field must
+			// be present.
+			const booted = new FileSessionAuthority(filePath);
+			expect(
+				booted
+					.entries()
+					.map(record => record.chatId)
+					.sort(),
+			).toEqual(["chat-1", "chat-2"]);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+	test("streams ambiguous multi-gate events retained inside a tombstone journal through boot compaction", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-tombstone-journal-"));
+		const filePath = join(directory, "mappings.json");
+		const walPath = `${filePath}.wal`;
+		try {
+			const writer = new FileSessionAuthority(filePath);
+			writer.set(mappingInput(mediumSelection));
+			writer.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+			expect(statSync(filePath).size).toBeLessThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const lines = readFileSync(walPath, "utf8").trimEnd().split("\n");
+			const lastHead = (JSON.parse(lines[lines.length - 1]!) as { readonly head: string }).head;
+			const chunk = "x".repeat(256 * 1024);
+			// Normalization preserves ambiguous results (multiple workflow-gate
+			// events) under journal[].result.events: the tombstone serializer
+			// must stream those per element instead of eager-serializing the
+			// whole tombstone journal.
+			const gateEvents = Array.from({ length: 140 }, (_, index) => ({
+				type: "workflow_gate" as const,
+				text: `event-${index}`,
+				payload: {
+					gateId: `gate-${index % 2}`,
+					schemaHash: `schema-${index % 2}`,
+					transcript: `${chunk}-${index}`,
+				},
+			}));
+			const document = validAuthorityDocument();
+			document.provisionalOperations = [];
+			const record = document.mappings[0];
+			// A committed reassignment moves the mapping INTO the target project: the
+			// record's projectId IS the target project, and the tombstone (frozen
+			// under the source project) keeps sourceProjectId === tombstone.projectId.
+			record.projectId = "project-target";
+			record.header = { ...record.header, projectId: "project-target" };
+			record.journal = [
+				{
+					id: "operation-2",
+					kind: "prompt",
+					state: "complete",
+					startedAt: record.createdAt,
+					completedAt: record.createdAt,
+					result: {
+						kind: "turn",
+						assistantText: "done",
+						events: gateEvents,
+						mapping: {
+							chatId: "chat-1",
+							projectId: "project-target",
+							sessionId: record.sessionId,
+							rawFrameCursor: record.rawFrameCursor,
+							eventCursor: record.eventCursor,
+							operationId: "operation-2",
+						},
+					},
+				},
+			];
+			record.operationId = "operation-2";
+			record.events = [];
+			record.reassignment = {
+				state: "committed",
+				sourceProjectId: project.id,
+				targetProjectId: "project-target",
+				startedAt: record.createdAt,
+				completedAt: record.createdAt,
+				sourceTombstone: {
+					version: 2,
+					chatId: "chat-1",
+					projectId: project.id, // frozen under the SOURCE project
+					sessionId: record.sessionId,
+					createdAt: record.createdAt,
+					header: { chatId: "chat-1", projectId: project.id, sessionId: record.sessionId },
+					rawFrameCursor: record.rawFrameCursor,
+					eventCursor: record.eventCursor,
+					operationId: "operation-1",
+					journal: [
+						{
+							id: "operation-1",
+							kind: "prompt",
+							state: "complete",
+							startedAt: record.createdAt,
+							completedAt: record.createdAt,
+							result: {
+								kind: "turn",
+								assistantText: "done",
+								events: gateEvents,
+								mapping: {
+									chatId: "chat-1",
+									projectId: project.id,
+									sessionId: record.sessionId,
+									rawFrameCursor: record.rawFrameCursor,
+									eventCursor: record.eventCursor,
+									operationId: "operation-1",
+								},
+							},
+						},
+					],
+					retiredAt: record.createdAt,
+				},
+			};
+			const body = {
+				kind: "openwebui-gjc-session-authority-wal",
+				version: 2,
+				records: [record],
+				provisional: [],
+				prevHash: lastHead,
+			};
+			const head = createHash("sha256").update(lastHead).update("\n").update(JSON.stringify(body)).digest("hex");
+			appendFileSync(walPath, `${JSON.stringify({ ...body, head })}\n`);
+			expect(statSync(walPath).size).toBeGreaterThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			expect(store.bootCompaction?.beforeBytes).toBeGreaterThan(0);
+			const reloaded = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
+			const mapping = (reloaded.mappings as Array<Record<string, unknown>>)[0]!;
+			const tombstone = (mapping.reassignment as Record<string, unknown>).sourceTombstone as Record<string, unknown>;
+			const tombstoneEvents = (
+				(tombstone.journal as Array<Record<string, unknown>>)[0]?.result as Record<string, unknown> | undefined
+			)?.events;
+			expect(Array.isArray(tombstoneEvents)).toBe(true);
+			expect((tombstoneEvents as unknown[]).length).toBe(140);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+	test("streams a single large retained event through boot compaction byte-identically", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-single-event-"));
+		const filePath = join(directory, "mappings.json");
+		const walPath = `${filePath}.wal`;
+		try {
+			const writer = new FileSessionAuthority(filePath);
+			writer.set(mappingInput(mediumSelection));
+			writer.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+			expect(statSync(filePath).size).toBeLessThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const lines = readFileSync(walPath, "utf8").trimEnd().split("\n");
+			const lastHead = (JSON.parse(lines[lines.length - 1]!) as { readonly head: string }).head;
+			const chunk = "x".repeat(512 * 1024);
+			// One retained event whose payload alone dominates the authority: an
+			// eager JSON.stringify(event) would materialize another
+			// payload-sized string, so the event must stream through the
+			// incremental plain-JSON writer instead.
+			const singleEvent = {
+				type: "tool" as const,
+				text: "tool-0",
+				id: "event-0",
+				payload: { toolCallId: "tool-0", transcript: `${chunk.repeat(140)}\n"quoted"\\slash\u0001 tail` },
+			};
+			const document = validAuthorityDocument();
+			document.provisionalOperations = [];
+			const record = document.mappings[0];
+			record.events = [singleEvent];
+			record.journal = [];
+			record.operationId = "operation-1";
+			const body = {
+				kind: "openwebui-gjc-session-authority-wal",
+				version: 2,
+				records: [record],
+				provisional: [],
+				prevHash: lastHead,
+			};
+			const head = createHash("sha256").update(lastHead).update("\n").update(JSON.stringify(body)).digest("hex");
+			appendFileSync(walPath, `${JSON.stringify({ ...body, head })}\n`);
+			expect(statSync(walPath).size).toBeGreaterThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			expect(store.bootCompaction?.beforeBytes).toBeGreaterThan(0);
+			const reloaded = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
+			const mapping = (reloaded.mappings as Array<Record<string, unknown>>)[0]!;
+			const events = mapping.events as Array<Record<string, unknown>>;
+			expect(events).toHaveLength(1);
+			expect((events[0]!.payload as Record<string, unknown>).transcript).toBe(singleEvent.payload.transcript);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+	test("streams large record assistantText and observations through boot compaction byte-identically", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-large-fields-"));
+		const filePath = join(directory, "mappings.json");
+		const walPath = `${filePath}.wal`;
+		try {
+			const writer = new FileSessionAuthority(filePath);
+			writer.set(mappingInput(mediumSelection));
+			writer.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+			expect(statSync(filePath).size).toBeLessThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const lines = readFileSync(walPath, "utf8").trimEnd().split("\n");
+			const lastHead = (JSON.parse(lines[lines.length - 1]!) as { readonly head: string }).head;
+			const chunk = "x".repeat(512 * 1024);
+			// assistantText and observations are unbounded record fields: the
+			// compaction writer must serialize them incrementally (no
+			// payload-sized eager string) while remaining byte-identical, so the
+			// rewritten base round-trips exactly. Two 33 MiB copies (record
+			// assistantText + nested observations value) push the delta over the
+			// 64 MiB compaction threshold.
+			const bigText = `${chunk.repeat(66)}\n"quoted"\\backslash\u0001\uD800 tail`;
+			const observations = {
+				__gjcSessionMappingScope: { chatId: "chat-1", projectId: project.id },
+				nested: { deep: [1, null, { value: bigText }] },
+			};
+			const document = validAuthorityDocument();
+			document.provisionalOperations = [];
+			const record = document.mappings[0];
+			record.assistantText = bigText;
+			record.observations = observations;
+			record.journal = [
+				{
+					...record.journal[0]!,
+					result: {
+						...record.journal[0]!.result!,
+						assistantText: bigText,
+					},
+				},
+			];
+			const body = {
+				kind: "openwebui-gjc-session-authority-wal",
+				version: 2,
+				records: [record],
+				provisional: [],
+				prevHash: lastHead,
+			};
+			const head = createHash("sha256").update(lastHead).update("\n").update(JSON.stringify(body)).digest("hex");
+			appendFileSync(walPath, `${JSON.stringify({ ...body, head })}\n`);
+			expect(statSync(walPath).size).toBeGreaterThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			expect(store.bootCompaction?.beforeBytes).toBeGreaterThan(0);
+			const reloaded = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
+			const mapping = (reloaded.mappings as Array<Record<string, unknown>>)[0]!;
+			expect(mapping.assistantText).toBe(bigText);
+			expect(mapping.observations).toEqual(observations);
+			const result = (mapping.journal as Array<Record<string, unknown>>)[0]!.result as Record<string, unknown>;
+			expect(result.assistantText).toBe(bigText);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+	test("streams unbounded operation detail and result correlation through boot compaction byte-identically", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-detail-correlation-"));
+		const filePath = join(directory, "mappings.json");
+		const walPath = `${filePath}.wal`;
+		try {
+			const writer = new FileSessionAuthority(filePath);
+			writer.set(mappingInput(mediumSelection));
+			writer.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+			expect(statSync(filePath).size).toBeLessThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const lines = readFileSync(walPath, "utf8").trimEnd().split("\n");
+			const lastHead = (JSON.parse(lines[lines.length - 1]!) as { readonly head: string }).head;
+			const chunk = "x".repeat(512 * 1024);
+			// SessionOperation.detail and a string-valued result.correlation are
+			// unbounded by validation but were still eagerly materialized inside
+			// JSON.stringify(rest)/JSON.stringify(resultRest): the remaining
+			// object metadata must stream too, byte-identically, so an oversized
+			// valid authority does not allocate a payload-sized string again.
+			const bigDetail = `${chunk.repeat(66)}\n"quoted"\\backslash\u0001 tail`;
+			const bigCorrelationValue = `${chunk.repeat(66)}\ncorrelation-value`;
+			const document = validAuthorityDocument();
+			document.provisionalOperations = [];
+			const record = document.mappings[0];
+			record.journal[0]!.detail = bigDetail;
+			record.journal[0]!.result!.correlation = {
+				closeStatus: "closed",
+				mappingOperationId: bigCorrelationValue,
+			};
+			const body = {
+				kind: "openwebui-gjc-session-authority-wal",
+				version: 2,
+				records: [record],
+				provisional: [],
+				prevHash: lastHead,
+			};
+			const head = createHash("sha256").update(lastHead).update("\n").update(JSON.stringify(body)).digest("hex");
+			appendFileSync(walPath, `${JSON.stringify({ ...body, head })}\n`);
+			expect(statSync(walPath).size).toBeGreaterThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			expect(store.bootCompaction?.beforeBytes).toBeGreaterThan(0);
+			const reloaded = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
+			const mapping = (reloaded.mappings as Array<Record<string, unknown>>)[0]!;
+			const operation = (mapping.journal as Array<Record<string, unknown>>)[0]!;
+			expect(operation.detail).toBe(bigDetail);
+			const result = operation.result as Record<string, unknown>;
+			expect(result.correlation).toEqual({
+				closeStatus: "closed",
+				mappingOperationId: bigCorrelationValue,
+			});
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
 	test("fails closed on a malformed WAL header", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-malformed-header-")), "mappings.json");
 		const walPath = `${filePath}.wal`;
@@ -1298,6 +2095,30 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				.sort(),
 		).toEqual(["chat-1"]);
 	});
+	test("removes the temporary compaction file after a failed persist", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-compaction-cleanup-")), "mappings.json");
+		const directory = dirname(filePath);
+		const authority = new SmallThresholdFailingFileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		// A failed persist must not leave an uncommitted temporary file behind:
+		// retried startups would otherwise accumulate abandoned authority files.
+		authority.failure = new Error("injected persist failure");
+		expect(() =>
+			authority.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" }),
+		).toThrow();
+		expect(readdirSync(directory).filter(name => name.includes(".tmp-"))).toEqual([]);
+	});
+	test("leaves no temporary compaction file after a committed rewrite", () => {
+		const filePath = join(
+			mkdtempSync(join(tmpdir(), "gjc-session-authority-compaction-cleanup-ok-")),
+			"mappings.json",
+		);
+		const directory = dirname(filePath);
+		const authority = new SmallThresholdFailingFileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.set({ ...mappingInput(mediumSelection), chatId: "chat-2", operationId: "user-2" });
+		expect(readdirSync(directory).filter(name => name.includes(".tmp-"))).toEqual([]);
+	});
 	test("compacts the valid WAL prefix on a live reload before appending past garbage", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-live-wal-garbage-")), "mappings.json");
 		const walPath = `${filePath}.wal`;
@@ -1630,6 +2451,66 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				.map(record => record.chatId)
 				.sort(),
 		).toEqual(["chat-1", "chat-3", "operator-chat"]);
+	});
+	test("boot-compacts an oversized legacy authority document in one bounded step", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-boot-compaction-"));
+		const filePath = join(directory, "mappings.json");
+		try {
+			const oversized = oversizedAuthorityJson(70 * 1024 * 1024);
+			writeFileSync(filePath, oversized.json);
+			const beforeBytes = statSync(filePath).size;
+			expect(beforeBytes).toBeGreaterThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			const afterBytes = statSync(filePath).size;
+			expect(afterBytes).toBeLessThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+			const compacted = JSON.parse(readFileSync(filePath, "utf8")) as {
+				readonly mappings: readonly {
+					readonly journal: readonly { readonly result?: Record<string, unknown> }[];
+				}[];
+			};
+			for (const mapping of compacted.mappings)
+				for (const operation of mapping.journal)
+					if (operation.result !== undefined) expect(operation.result).not.toHaveProperty("events");
+			expect(store.bootCompaction).toEqual({ beforeBytes, afterBytes });
+			expect(store.bootCompaction?.beforeBytes).toBeGreaterThan(store.bootCompaction?.afterBytes ?? 0);
+			expect(store.get("chat-1")).toMatchObject({
+				chatId: "chat-1",
+				projectId: project.id,
+				sessionId: "session-1",
+				operationId: "operation-1",
+			});
+			// Compaction rewrites the in-memory journal to the normalized records
+			// (consistent with the persisted file), so the legacy result events are
+			// stripped there too; the record and its assistant text survive.
+			expect(store.operation("chat-1", "operation-1")?.result?.events).toBeUndefined();
+			expect(store.operation("chat-1", "operation-1")?.result?.assistantText).toBe("done");
+
+			const secondBootBytes = statSync(filePath).size;
+			const booted = new FileSessionAuthority(filePath);
+			expect(statSync(filePath).size).toBe(secondBootBytes);
+			expect(booted.lookupOperation("chat-1", "operation-1")?.result?.assistantText).toBe("done");
+			expect(new FileBackedSessionMappingStore(filePath).bootCompaction).toBeUndefined();
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+	test("does not rewrite a boot authority document below the compaction threshold", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-session-authority-boot-compaction-threshold-"));
+		const filePath = join(directory, "mappings.json");
+		try {
+			const near = oversizedAuthorityJson(55 * 1024 * 1024);
+			writeFileSync(filePath, near.json);
+			const beforeBytes = statSync(filePath).size;
+			expect(beforeBytes).toBeLessThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
+
+			const store = new FileBackedSessionMappingStore(filePath);
+			expect(statSync(filePath).size).toBe(beforeBytes);
+			expect(store.bootCompaction).toBeUndefined();
+			expect(store.operation("chat-1", "operation-1")?.result?.events).toHaveLength(near.eventCount);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
 	});
 	test("a no-op mutation does not grow the WAL", () => {
 		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-noop-")), "mappings.json");
@@ -2316,7 +3197,7 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		const filePath = join(root, "mappings.json");
 		const endpointRoot = join(root, ".gjc", "state", "sdk");
 		const predecessorPath = join(sessionRoot, "predecessor.jsonl");
-		const successorPath = join(sessionRoot, "successor.jsonl");
+		const successorPath = join(realpathSync(root), ".gjc", "sessions", "successor.jsonl");
 		writeFileSync(
 			predecessorPath,
 			`${JSON.stringify({ type: "session", version: 3, id: "predecessor", timestamp: "2026-01-01T00:00:00.000Z", cwd: root })}\n`,
@@ -3408,7 +4289,7 @@ test("applies released model selection responses across fresh and continuation t
 		await runner.run(firstTurn);
 		expect(checkedProvisionalPersistence).toBe(true);
 		const persisted = new FileBackedSessionMappingStore(mappingFile).get("same-session");
-		expect(persisted?.sessionFile).toMatch(new RegExp(`^${sessionRoot}/[^/]+\\.jsonl$`));
+		expect(persisted?.sessionFile).toMatch(new RegExp(`^${realpathSync(sessionRoot)}/[^/]+\\.jsonl$`));
 		expect(persisted?.sessionFile).toBeDefined();
 		await runner.run({
 			...firstTurn,
@@ -3695,7 +4576,7 @@ function setupAcknowledgedSessionNewFixture(transcript: "absent" | "valid" | "du
 	const endpointRoot = join(root, ".gjc", "state", "sdk");
 	const mappingFile = join(root, "mappings.json");
 	const predecessorPath = join(sessionRoot, "sdk-session-created.jsonl");
-	const successorPath = join(sessionRoot, "sdk-session-new.jsonl");
+	const successorPath = join(realpathSync(root), ".gjc", "sessions", "sdk-session-new.jsonl");
 	const server = startSdkFixtureServer("controls", root);
 	let barrierHits = 0;
 	mkdirSync(endpointRoot, { recursive: true });
@@ -3918,6 +4799,22 @@ function acknowledgedSuccessor(): any {
 		},
 	};
 }
+function oversizedAuthorityJson(targetBytes: number): { readonly json: string; readonly eventCount: number } {
+	const chunk = "x".repeat(512 * 1024);
+	const eventCount = Math.max(2, Math.ceil(targetBytes / (512 * 1024)));
+	const events = Array.from({ length: eventCount }, (_, index) => ({
+		type: "assistant" as const,
+		text: `event-${index}`,
+		payload: { transcript: `${chunk}-${index}` },
+	}));
+	const document = validAuthorityDocument();
+	// A pending provisional operation would make boot reconcile-and-persist via
+	// the pre-existing branch; the oversized boot-compaction branch is only
+	// exercised when nothing else requires a rewrite.
+	document.provisionalOperations = [];
+	document.mappings[0].journal[0].result.events = events;
+	return { json: JSON.stringify(document), eventCount };
+}
 function validAuthorityDocument(): any {
 	const timestamp = "2026-01-01T00:00:00.000Z";
 	const mapping = {
@@ -4083,7 +4980,7 @@ function setupPublicSdkBranchFixture(scenario: SdkFixtureScenario, routingBarrie
 		runnerInput,
 		mappingFile,
 		project: branchProject,
-		successorPath: join(sessionRoot, "sdk-session-successor.jsonl"),
+		successorPath: join(realpathSync(root), ".gjc", "sessions", "sdk-session-successor.jsonl"),
 		turn: {
 			project: branchProject,
 			prompt: "branch successor",
