@@ -53,9 +53,9 @@ export async function runRoutingControl(
 	};
 	turn.signal?.addEventListener("abort", onAbort, { once: true });
 	if (turn.signal?.aborted) onAbort();
-	throwIfAborted(turn.signal);
 	let predecessor: { readonly applied: GjcControlResult; readonly mapping?: SessionMapping };
 	try {
+		throwIfAborted(turn.signal);
 		predecessor = await controlled.withLifecyclePublication(
 			{
 				cwd: turn.project.cwd,

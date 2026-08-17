@@ -102,4 +102,41 @@ describe("control operation replay", () => {
 		expect(turnRunner.continues).toHaveLength(1);
 		expect(rowIdentity(outbox)).toEqual(rowsAfterRegularTurn);
 	});
+	test("cleans up a pre-aborted control so the same operation ID can retry", async () => {
+		const mappings = new SessionMappingStore();
+		seedMapping(mappings);
+		const turnRunner = new ControlTurnRunner();
+		const cancellations: unknown[] = [];
+		const cleared: unknown[] = [];
+		turnRunner.cancelTurn = cancellation => cancellations.push(cancellation);
+		Object.assign(turnRunner, {
+			clearTurnCancellation: (cancellation: unknown) => cleared.push(cancellation),
+		});
+		const gateway = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings });
+		const userMessageId = "control-pre-aborted";
+		const aborted = new AbortController();
+		aborted.abort();
+
+		await expect(gateway.run({ ...controlTurn(userMessageId), signal: aborted.signal })).rejects.toMatchObject({
+			name: "GjcTurnCancelledError",
+		});
+		const cancellation = {
+			projectId: project.id,
+			chatId: "chat-control",
+			sessionId: "session-1",
+			operationId: userMessageId,
+		};
+		expect(cancellations).toEqual([cancellation]);
+		expect(cleared).toEqual([cancellation]);
+		expect(turnRunner.calls).toHaveLength(0);
+		expect(mappings.operation("chat-control", userMessageId)).toBeUndefined();
+
+		const retry = new AbortController();
+		await expect(gateway.run({ ...controlTurn(userMessageId), signal: retry.signal })).resolves.toMatchObject({
+			content: "control done",
+		});
+		expect(turnRunner.calls).toHaveLength(1);
+		expect(mappings.operation("chat-control", userMessageId)).toMatchObject({ state: "complete" });
+		expect(cleared).toHaveLength(2);
+	});
 });
