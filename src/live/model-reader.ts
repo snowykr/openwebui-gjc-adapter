@@ -1,7 +1,6 @@
 import { resolve } from "node:path";
-import { listSdkSessionEndpoints } from "@gajae-code/coding-agent/sdk";
 import type { GjcRuntimeLocations } from "../contracts";
-import { attachmentFromPublishedSdkEndpoint } from "../gjc/public-sdk-attachment";
+import { snapshotPublishedSdkEndpointGenerations } from "../gjc/public-sdk-attachment";
 import type { PublicSdkSessionAttachment, PublicSdkSessionPort } from "../gjc/public-sdk-contract";
 import { PublicSdkSessionClient } from "../gjc/public-sdk-session-port";
 import { GjcTurnCancelledError } from "../gjc/turn-runner";
@@ -126,10 +125,10 @@ async function resolvePublicSdkAttachment(
 	const workspace = context?.principal.role === "user" ? context.workspace?.root : runtimeLocations.readerWorkspace;
 	if (workspace === undefined)
 		throw new ModelReaderUnavailableError("A normal-user model reader requires a workspace.");
-	const { endpoints } = await awaitWithAbort(listSdkSessionEndpoints(workspace), signal);
-	const endpoint = [...endpoints].sort((left, right) => left.sessionId.localeCompare(right.sessionId))[0];
-	if (endpoint === undefined) throw new ModelReaderUnavailableError();
-	return attachmentFromPublishedSdkEndpoint(workspace, endpoint.sessionId, endpoint);
+	const attachments = await awaitWithAbort(snapshotPublishedSdkEndpointGenerations(workspace), signal);
+	const attachment = [...attachments.values()].sort((left, right) => left.sessionId.localeCompare(right.sessionId))[0];
+	if (attachment === undefined) throw new ModelReaderUnavailableError();
+	return attachment;
 }
 
 async function assertScopedModelReaderContext(

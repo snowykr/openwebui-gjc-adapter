@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { NormalizedModelSelection } from "../contracts";
 import { assertAttachmentAuthority } from "./public-sdk-attachment";
 import type {
@@ -14,6 +15,7 @@ import type {
 export {
 	assertPublishedSdkAttachmentCurrent,
 	attachmentFromPublishedSdkEndpoint,
+	readPublishedSdkEndpointDescriptor,
 	samePublishedSdkEndpoint,
 } from "./public-sdk-attachment";
 
@@ -116,11 +118,11 @@ export class PublicSdkSessionClient implements PublicSdkSessionPort {
 		);
 	}
 	abort(key?: string, timeoutMs?: number, onDispatch?: () => void): Promise<unknown> {
-		// C04 turn.abort is owner-scoped upstream. It must bypass the prompt's
-		// serialized mutation lane so the owning connection can abort its active
-		// prompt instead of waiting for that prompt to settle. Dispatch is reported
-		// from the transport send boundary so callers never guess with a timer.
-		return this.authority(timeoutMs, client => client.control("turn.abort", {}, timeoutMs, key, onDispatch));
+		// GJC 0.14 terminal C04 abort owns the active root turn and has an explicit
+		// idempotency requirement. It bypasses the prompt mutation lane.
+		return this.authority(timeoutMs, client =>
+			client.control("turn.abort", { mode: "terminal", scope: "turn" }, timeoutMs, key ?? randomUUID(), onDispatch),
+		);
 	}
 	abortAndPrompt(
 		text: string,

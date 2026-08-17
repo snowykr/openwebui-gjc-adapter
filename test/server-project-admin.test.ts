@@ -3,11 +3,13 @@ import { statSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { readSdkSessionEndpoint } from "@gajae-code/coding-agent/sdk";
 import { buildAdapterServerOptionsFromEnv } from "../src/adapter-server-options";
 import { resolveGjcRuntimeLocations } from "../src/configure/runtime-locations";
 import type { PublicSdkSessionPort } from "../src/gjc/public-sdk-contract";
-import { attachmentFromPublishedSdkEndpoint } from "../src/gjc/public-sdk-session-port";
+import {
+	attachmentFromPublishedSdkEndpoint,
+	readPublishedSdkEndpointDescriptor,
+} from "../src/gjc/public-sdk-session-port";
 import { type SessionMapping, SessionMappingStore } from "../src/gjc/session-router";
 import { GjcCloseReceipt, type GjcLifecyclePublicationAddress } from "../src/gjc/turn-runner";
 import type { LiveGatewayRunner } from "../src/live/chat-completions";
@@ -343,7 +345,7 @@ describe("project admin routes", () => {
 		});
 		expect(calls).toEqual([]);
 		expect(await fs.readFile(trace, "utf8")).toBe("exit\n");
-		expect(await readSdkSessionEndpoint(projectDirectory, sessionId)).toBeNull();
+		expect(await readPublishedSdkEndpointDescriptor(projectDirectory, sessionId)).toBeNull();
 		const pane = await runTmux(socket, ["display-message", "-p", "-t", tmuxPane, "#{pane_id}"]);
 		expect(pane.exitCode).not.toBe(0);
 		expect(mappings.getScoped({ principalId: "owner-test", chatId: "dynamic-chat" })).toBeDefined();
@@ -843,7 +845,7 @@ async function currentLifecycleMapping(
 }
 
 async function currentSdkAttachment(cwd: string, sessionId: string) {
-	const endpoint = await readSdkSessionEndpoint(cwd, sessionId);
+	const endpoint = await readPublishedSdkEndpointDescriptor(cwd, sessionId);
 	if (endpoint === null) throw new Error(`expected published SDK endpoint for ${sessionId}`);
 	return attachmentFromPublishedSdkEndpoint(cwd, sessionId, endpoint);
 }

@@ -1,14 +1,23 @@
 import { createHash } from "node:crypto";
-import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from "node:fs";
-import { basename, resolve } from "node:path";
-import { listSdkSessionEndpoints, type readSdkSessionEndpoint } from "@gajae-code/coding-agent/sdk";
+import { closeSync, constants, type Dirent, fstatSync, lstatSync, openSync, readdirSync, readSync } from "node:fs";
+import { basename, join, resolve } from "node:path";
 import type { PublicSdkSessionAttachment } from "./public-sdk-contract";
-import { parsePublishedSdkEndpointDescriptor, SdkV3OperationError } from "./sdk-v3-protocol";
+import { parseJsonRecord, parsePublishedSdkEndpointDescriptor, SdkV3OperationError } from "./sdk-v3-protocol";
 
 const MAX_PUBLISHED_SDK_ENDPOINT_DESCRIPTOR_BYTES = 16 * 1024;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
+const PUBLISHED_SDK_ENDPOINT_DIRECTORY = [".gjc", "state", "sdk"] as const;
 type DescriptorStat = Readonly<{ dev: number; ino: number; size: number; mtimeMs: number }>;
 export type PublishedSdkEndpointGenerations = ReadonlyMap<string, PublicSdkSessionAttachment>;
+
+/** Filesystem-local representation of one published SDK endpoint descriptor. */
+export interface PublishedSdkEndpoint {
+	readonly sessionId: string;
+	readonly url: string;
+	readonly token: string;
+	readonly pid?: number;
+	readonly path: string;
+}
 
 export function openPublishedDescriptor(path: string): number {
 	try {
@@ -96,7 +105,7 @@ export function assertPublishedSdkAttachmentCurrent(attachment: PublicSdkSession
 export function attachmentFromPublishedSdkEndpoint(
 	cwd: string,
 	sessionId: string,
-	endpoint: NonNullable<Awaited<ReturnType<typeof readSdkSessionEndpoint>>>,
+	endpoint: PublishedSdkEndpoint,
 ): PublicSdkSessionAttachment {
 	const canonicalCwd = resolve(cwd);
 	if (endpoint.sessionId !== sessionId)
@@ -140,12 +149,65 @@ export function attachmentFromPublishedSdkEndpoint(
 		closeSync(descriptor);
 	}
 }
+
+/** Reads one descriptor from the adapter-owned published endpoint directory. */
+export async function readPublishedSdkEndpointDescriptor(
+	cwd: string,
+	sessionId: string,
+): Promise<PublishedSdkEndpoint | null> {
+	if (!isUsableSessionId(sessionId)) return null;
+	const descriptorPath = publishedSdkEndpointPath(cwd, sessionId);
+	const named = lstatSync(descriptorPath, { throwIfNoEntry: false });
+	if (named === undefined) return null;
+	return readPublishedSdkEndpointRecord(descriptorPath, sessionId);
+}
+
+/** Lists and validates every descriptor in the adapter-owned published endpoint directory. */
+export async function listPublishedSdkEndpointDescriptors(cwd: string): Promise<readonly PublishedSdkEndpoint[]> {
+	const directory = publishedSdkEndpointDirectory(cwd);
+	const directoryStat = lstatSync(directory, { throwIfNoEntry: false });
+	if (directoryStat === undefined) return [];
+	if (!directoryStat.isDirectory())
+		throw new SdkV3OperationError("endpoint_stale", "Published SDK endpoint directory is not a regular directory");
+	let entries: Dirent[];
+	try {
+		entries = readdirSync(directory, { withFileTypes: true });
+	} catch {
+		throw new SdkV3OperationError("endpoint_stale", "Published SDK endpoint directory cannot be read");
+	}
+	const endpoints: PublishedSdkEndpoint[] = [];
+	const sessionIds = new Set<string>();
+	for (const entry of entries) {
+		if (!entry.name.endsWith(".json")) {
+			if (entry.isSymbolicLink())
+				throw new SdkV3OperationError(
+					"endpoint_stale",
+					"Published SDK endpoint directory contains a symbolic link",
+				);
+			continue;
+		}
+		const sessionId = entry.name.slice(0, -".json".length);
+		if (!isUsableSessionId(sessionId))
+			throw new SdkV3OperationError(
+				"endpoint_stale",
+				"Published SDK endpoint filename does not contain a usable session id",
+			);
+		const endpoint = readPublishedSdkEndpointRecord(join(directory, entry.name), sessionId);
+		if (sessionIds.has(endpoint.sessionId))
+			throw new SdkV3OperationError(
+				"endpoint_stale",
+				"Published SDK endpoint discovery contains duplicate session identities",
+			);
+		sessionIds.add(endpoint.sessionId);
+		endpoints.push(endpoint);
+	}
+	return endpoints;
+}
+
 export async function snapshotPublishedSdkEndpointGenerations(cwd: string): Promise<PublishedSdkEndpointGenerations> {
-	const published = await listSdkSessionEndpoints(cwd);
-	if (published.warnings.length !== 0)
-		throw new SdkV3OperationError("endpoint_stale", "Published session endpoint discovery returned warnings");
+	const published = await listPublishedSdkEndpointDescriptors(cwd);
 	const generations = new Map<string, PublicSdkSessionAttachment>();
-	for (const endpoint of published.endpoints) {
+	for (const endpoint of published) {
 		if (generations.has(endpoint.sessionId))
 			throw new SdkV3OperationError(
 				"endpoint_stale",
@@ -154,6 +216,73 @@ export async function snapshotPublishedSdkEndpointGenerations(cwd: string): Prom
 		generations.set(endpoint.sessionId, attachmentFromPublishedSdkEndpoint(cwd, endpoint.sessionId, endpoint));
 	}
 	return generations;
+}
+
+function publishedSdkEndpointDirectory(cwd: string): string {
+	return join(resolve(cwd), ...PUBLISHED_SDK_ENDPOINT_DIRECTORY);
+}
+
+function publishedSdkEndpointPath(cwd: string, sessionId: string): string {
+	return join(publishedSdkEndpointDirectory(cwd), `${sessionId}.json`);
+}
+
+function isUsableSessionId(sessionId: string): boolean {
+	return (
+		sessionId.length > 0 &&
+		sessionId !== "." &&
+		sessionId !== ".." &&
+		!sessionId.includes("/") &&
+		!sessionId.includes("\\") &&
+		!sessionId.includes("\0")
+	);
+}
+
+function readPublishedSdkEndpointRecord(descriptorPath: string, sessionId: string): PublishedSdkEndpoint {
+	const descriptor = openPublishedDescriptor(descriptorPath);
+	try {
+		try {
+			const opened = fstatSync(descriptor);
+			if (!opened.isFile())
+				throw new SdkV3OperationError(
+					"endpoint_stale",
+					"Published session endpoint descriptor is not a regular file",
+				);
+			const bytes = readHeldDescriptor(descriptor, opened.size);
+			const descriptorStat = fstatSync(descriptor);
+			if (!sameDescriptorStat(opened, descriptorStat))
+				throw new SdkV3OperationError(
+					"endpoint_stale",
+					"Published session endpoint descriptor changed while it was read",
+				);
+			const named = lstatSync(descriptorPath);
+			if (!named.isFile() || !sameDescriptorStat(named, descriptorStat))
+				throw new SdkV3OperationError(
+					"endpoint_stale",
+					"Published session endpoint descriptor changed during discovery",
+				);
+			const parsed = parseJsonRecord(bytes.toString("utf8"), "published session endpoint descriptor");
+			if (parsed.sessionId !== undefined && parsed.sessionId !== sessionId)
+				throw new SdkV3OperationError(
+					"endpoint_stale",
+					"Published endpoint identity does not match its descriptor filename",
+				);
+			const endpoint = parsePublishedSdkEndpointDescriptor(
+				bytes.toString("utf8"),
+				"published session endpoint descriptor",
+			);
+			return {
+				sessionId,
+				path: descriptorPath,
+				url: endpoint.url,
+				token: endpoint.token,
+				...(endpoint.pid === undefined ? {} : { pid: endpoint.pid }),
+			};
+		} catch (error) {
+			throwPublishedDescriptorValidationError(error);
+		}
+	} finally {
+		closeSync(descriptor);
+	}
 }
 export function samePublishedSdkEndpoint(left: PublicSdkSessionAttachment, right: PublicSdkSessionAttachment): boolean {
 	const a = left.authority;
@@ -179,6 +308,12 @@ function createPublishedSdkAttachment(
 	descriptorStat: DescriptorStat,
 	bytes: Buffer,
 ): PublicSdkSessionAttachment {
+	const parsed = parseJsonRecord(bytes.toString("utf8"), "published session endpoint descriptor");
+	if (parsed.sessionId !== undefined && parsed.sessionId !== sessionId)
+		throw new SdkV3OperationError(
+			"endpoint_stale",
+			"Published endpoint identity does not match its descriptor filename",
+		);
 	const endpoint = parsePublishedSdkEndpointDescriptor(
 		bytes.toString("utf8"),
 		"published session endpoint descriptor",

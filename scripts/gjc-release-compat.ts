@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { mkdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import type { SdkClient } from "@gajae-code/coding-agent/sdk";
+import type { SdkClient } from "@gajae-code/bridge-client";
 import { apiKey, providerResponse, writeLocalProviderConfig } from "./gjc-release-compat-fixtures";
 import {
 	awaitLifecycleTermination,
@@ -14,6 +14,7 @@ import {
 import {
 	branchEntryId,
 	openSessionDashboard,
+	promptAndAbortTerminal,
 	promptAndAwaitTerminal,
 	rediscoverSessionId,
 	sessionFromFilesystem,
@@ -63,6 +64,14 @@ try {
 	await observe("model.set", () => client!.control("model.set", { id: "compat-local/hermetic-model" }));
 	observed.thinking = { supported: thinkingSupported, requested: "off" };
 	if (thinkingSupported) await observe("thinking.set", () => client!.control("thinking.set", { level: "off" }));
+	const terminalAbort = await promptAndAbortTerminal(
+		client,
+		sessionId,
+		"terminal-abort.turn.prompt",
+		"Reply only after the terminal abort arrives.",
+		observe,
+	);
+	observed.terminalAbort = terminalAbort;
 	const initialTranscriptTurn = await promptAndAwaitTerminal(
 		client,
 		sessionId,

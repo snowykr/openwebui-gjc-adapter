@@ -1,10 +1,10 @@
-import { readSdkSessionEndpoint } from "@gajae-code/coding-agent/sdk";
 import {
 	type CliLifecycleAttachment,
 	type CliLifecycleResult,
 	MAX_LIFECYCLE_CLOSE_PROOF_WINDOW_MS,
 	unavailable,
 } from "./cli-lifecycle-types";
+import { readPublishedSdkEndpointDescriptor } from "./public-sdk-attachment";
 import { type OwnedTmuxPane, proveTmuxPaneOwnership, type TmuxCommandRunner } from "./tmux-ownership";
 
 export async function requestExit(
@@ -52,7 +52,7 @@ export async function proveClosedAfterAcknowledgement(
 	for (;;) {
 		try {
 			endpointMessage =
-				(await readSdkSessionEndpoint(cwd, attachment.sessionId)) === null
+				(await readPublishedSdkEndpointDescriptor(cwd, attachment.sessionId)) === null
 					? ""
 					: "session endpoint is still available";
 		} catch (error) {

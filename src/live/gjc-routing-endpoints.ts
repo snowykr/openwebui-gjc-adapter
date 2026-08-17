@@ -1,6 +1,6 @@
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
-import { readSdkSessionEndpoint } from "@gajae-code/coding-agent/sdk";
+import { readPublishedSdkEndpointDescriptor } from "../gjc/public-sdk-attachment";
 import type { PublicSdkSessionAttachment } from "../gjc/public-sdk-contract";
 import {
 	attachmentFromPublishedSdkEndpoint,
@@ -60,7 +60,7 @@ export async function readPublishedSdkEndpoint(
 	cwd: string,
 	sessionId: string,
 ): Promise<PublicSdkSessionAttachment | undefined> {
-	const endpoint = await readSdkSessionEndpoint(cwd, sessionId);
+	const endpoint = await readPublishedSdkEndpointDescriptor(cwd, sessionId);
 	return endpoint === null ? undefined : attachmentFromPublishedSdkEndpoint(cwd, sessionId, endpoint);
 }
 export async function requireCurrentPublishedSdkEndpoint(

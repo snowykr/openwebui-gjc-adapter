@@ -1,6 +1,6 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import type { SdkClient } from "@gajae-code/coding-agent/sdk";
+import type { SdkClient } from "@gajae-code/bridge-client";
 import { connectFor, lifecycleDeadlineMs, snapshotPublicEndpoints } from "./gjc-release-compat-sdk";
 
 type Observe = (name: string, action: () => Promise<unknown>) => Promise<unknown>;
@@ -26,7 +26,32 @@ export async function promptAndAwaitTerminal(
 	await observe(`${name}.terminal`, async () => frame);
 	return { accepted, terminal: frame };
 }
-function awaitTerminal(client: SdkClient): (correlation: TurnCorrelation) => Promise<Record<string, unknown>> {
+export async function promptAndAbortTerminal(
+	client: SdkClient,
+	sessionId: string,
+	name: string,
+	text: string,
+	observe: Observe,
+): Promise<{ accepted: unknown; abort: unknown; abortReplay: unknown; terminal: Record<string, unknown> }> {
+	const terminal = awaitTerminal(client, true);
+	const accepted = await observe(name, () => client.control("turn.prompt", { text }));
+	const correlation = turnCorrelation(accepted, sessionId);
+	const idempotencyKey = `terminal-abort-${crypto.randomUUID()}`;
+	const abortInput = { mode: "terminal", scope: "turn" };
+	const abort = await observe(`${name}.abort`, () => client.control("turn.abort", abortInput, { idempotencyKey }));
+	assertTerminalAbortAcknowledgement(abort, name);
+	const abortReplay = await observe(`${name}.abort.replay`, () =>
+		client.control("turn.abort", abortInput, { idempotencyKey }),
+	);
+	assertTerminalAbortAcknowledgement(abortReplay, `${name}.abort.replay`);
+	const frame = await terminal(correlation);
+	await observe(`${name}.terminal`, async () => frame);
+	return { accepted, abort, abortReplay, terminal: frame };
+}
+function awaitTerminal(
+	client: SdkClient,
+	allowFailure = false,
+): (correlation: TurnCorrelation) => Promise<Record<string, unknown>> {
 	let pendingCorrelation: TurnCorrelation | undefined;
 	let resolveTerminal: ((frame: Record<string, unknown>) => void) | undefined;
 	const terminal = new Promise<Record<string, unknown>>(resolve => {
@@ -61,12 +86,24 @@ function awaitTerminal(client: SdkClient): (correlation: TurnCorrelation) => Pro
 					);
 				}),
 			]);
-			if (frame.type === "agent_failed") throw new Error(`turn failed: ${JSON.stringify(frame.error ?? frame)}`);
+			if (frame.type === "agent_failed" && !allowFailure)
+				throw new Error(`turn failed: ${JSON.stringify(frame.error ?? frame)}`);
 			return frame;
 		} finally {
 			unsubscribe();
 		}
 	};
+}
+function assertTerminalAbortAcknowledgement(value: unknown, operation: string): void {
+	if (
+		!isRecord(value) ||
+		value.ok !== true ||
+		!isRecord(value.result) ||
+		value.result.ok !== true ||
+		value.result.selection !== "turn" ||
+		typeof value.result.turn !== "string"
+	)
+		throw new Error(`${operation} returned an invalid terminal abort acknowledgement`);
 }
 function turnCorrelation(value: unknown, sessionId: string): TurnCorrelation {
 	if (!isRecord(value)) throw new Error("turn.prompt did not return an accepted correlation");

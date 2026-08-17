@@ -1,8 +1,18 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, statSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
+import {
+	mkdirSync,
+	mkdtempSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	truncateSync,
+	utimesSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { listPublishedSdkEndpointDescriptors } from "../src/gjc/public-sdk-attachment";
 import { createPublicSdkDeadline } from "../src/gjc/public-sdk-deadline";
 import {
 	attachmentFromPublishedSdkEndpoint,
@@ -149,6 +159,42 @@ describe("published SDK endpoint attachment", () => {
 					token: "token",
 				}),
 			).toThrow();
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+	test("reads adapter-owned descriptor records and rejects malformed, non-file, symlink, and duplicate entries", async () => {
+		const root = mkdtempSync(join(tmpdir(), "gjc-sdk-endpoint-"));
+		const directory = join(root, ".gjc", "state", "sdk");
+		const first = join(directory, "first.json");
+		const second = join(directory, "second.json");
+		try {
+			mkdirSync(directory, { recursive: true });
+			writeFileSync(
+				first,
+				JSON.stringify({ sessionId: "first", version: 1, url: "ws://127.0.0.1:4123", token: "token" }),
+			);
+			expect(await listPublishedSdkEndpointDescriptors(root)).toEqual([
+				expect.objectContaining({ sessionId: "first", path: first }),
+			]);
+
+			writeFileSync(second, "{");
+			await expect(listPublishedSdkEndpointDescriptors(root)).rejects.toMatchObject({ code: "endpoint_stale" });
+			rmSync(second, { force: true });
+
+			execFileSync("mkfifo", [second]);
+			await expect(listPublishedSdkEndpointDescriptors(root)).rejects.toMatchObject({ code: "endpoint_stale" });
+			rmSync(second, { force: true });
+
+			symlinkSync(first, second);
+			await expect(listPublishedSdkEndpointDescriptors(root)).rejects.toMatchObject({ code: "endpoint_stale" });
+			rmSync(second, { force: true });
+
+			writeFileSync(
+				second,
+				JSON.stringify({ sessionId: "first", version: 1, url: "ws://127.0.0.1:4124", token: "token" }),
+			);
+			await expect(listPublishedSdkEndpointDescriptors(root)).rejects.toMatchObject({ code: "endpoint_stale" });
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
