@@ -56,8 +56,12 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 		);
 	}
 	const principal = principalResolution.principal;
-	const workspace = principal.role === "user" ? await input.workspaceRegistry?.open(principal.userId) : undefined;
+	const workspace =
+		principal.role === "user"
+			? await raceWithAbort(() => input.workspaceRegistry?.open(principal.userId), input.signal)
+			: undefined;
 	if (principal.role === "user" && workspace === undefined) {
+		throwIfAborted(input.signal);
 		return errorResult(
 			503,
 			"server_error",
@@ -87,12 +91,15 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 			}
 			const sourceModelReaderFactory = input.modelReaderFactory;
 			if (principal.role === "user") {
-				if (workspace === undefined || input.workspaceLeaseManager === undefined)
+				if (workspace === undefined || input.workspaceLeaseManager === undefined) {
+					throwIfAborted(input.signal);
 					return workspaceLeaseErrorResult();
+				}
 				try {
 					backgroundLease = await acquireWorkspaceLease(input, workspace.safeKey);
 				} catch (error) {
 					if (isWorkspaceAdmissionCancelledError(error)) throw error;
+					throwIfAborted(input.signal);
 					// A busy workspace is retryable, not a missing/bad model.
 					return workspaceLeaseErrorResult();
 				}
@@ -113,17 +120,21 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 			const selection = await createModelSelectionPolicy(modelReaderFactory).resolve(requestedModelId, input.signal);
 			throwIfAborted(input.signal);
 			await assertWorkspaceLease(backgroundLease);
-			return await finishWorkspaceLease(backgroundLease, {
-				ok: true,
-				status: 200,
-				body: buildCompletion({
-					id,
-					created,
-					model: formatCanonicalModelId(selection),
-					content: "",
-					metadata: { task: headers.task, noop: true },
-				}),
-			});
+			return await finishWorkspaceLeaseWithCancellation(
+				backgroundLease,
+				{
+					ok: true,
+					status: 200,
+					body: buildCompletion({
+						id,
+						created,
+						model: formatCanonicalModelId(selection),
+						content: "",
+						metadata: { task: headers.task, noop: true },
+					}),
+				},
+				input.signal,
+			);
 		} catch (error) {
 			if (isWorkspaceAdmissionCancelledError(error)) throw error;
 			if (error instanceof GjcTurnCancelledError) {
@@ -131,7 +142,11 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 				throw error;
 			}
 			if (error instanceof WorkspaceLeaseUncertainError) {
-				return await finishWorkspaceLease(backgroundLease, workspaceLeaseErrorResult());
+				return await finishWorkspaceLeaseWithCancellation(
+					backgroundLease,
+					workspaceLeaseErrorResult(),
+					input.signal,
+				);
 			}
 			const result =
 				error instanceof ModelSelectionError
@@ -143,7 +158,7 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 									: "model_selection_default_read_failed",
 							),
 						);
-			return await finishWorkspaceLease(backgroundLease, result);
+			return await finishWorkspaceLeaseWithCancellation(backgroundLease, result, input.signal);
 		}
 	}
 
@@ -168,11 +183,15 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 
 	let leaseAdmission: WorkspaceLeaseAdmission | undefined;
 	if (principal.role === "user") {
-		if (workspace === undefined || input.workspaceLeaseManager === undefined) return workspaceLeaseErrorResult();
+		if (workspace === undefined || input.workspaceLeaseManager === undefined) {
+			throwIfAborted(input.signal);
+			return workspaceLeaseErrorResult();
+		}
 		try {
 			leaseAdmission = await acquireWorkspaceLease(input, workspace.safeKey);
 		} catch (error) {
 			if (isWorkspaceAdmissionCancelledError(error)) throw error;
+			throwIfAborted(input.signal);
 			return workspaceLeaseErrorResult();
 		}
 	}
@@ -181,38 +200,51 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 	try {
 		const projects =
 			principal.role === "admin" && input.projectProvider !== undefined
-				? await input.projectProvider()
+				? await raceWithAbort(() => input.projectProvider!(), input.signal)
 				: input.projects;
-		const projectContext = await resolveLiveProjectContext({
-			projects,
-			modelId: requestedModelId,
-			ownerUserId: principal.userId,
-			chatId: headers.chatId,
-			repository: input.projectContextRepository,
-			neutralWorkspace: workspace?.root ?? input.neutralWorkspace,
-			allowFolderProject: principal.role === "admin",
-			now: input.now,
-		});
-		if (!projectContext.ok)
-			return finishWorkspaceLease(
+		const projectContext = await raceWithAbort(
+			() =>
+				resolveLiveProjectContext({
+					projects,
+					modelId: requestedModelId,
+					ownerUserId: principal.userId,
+					chatId: headers.chatId,
+					repository: input.projectContextRepository,
+					neutralWorkspace: workspace?.root ?? input.neutralWorkspace,
+					allowFolderProject: principal.role === "admin",
+					now: input.now,
+				}),
+			input.signal,
+		);
+		if (!projectContext.ok) {
+			throwIfAborted(input.signal);
+			const finished = await finishWorkspaceLeaseWithCancellation(
 				leaseAdmission,
 				errorResult(503, "server_error", projectContext.code, projectContext.message),
+				input.signal,
 			);
+			return finished;
+		}
 		const project = projectContext.project;
 		let prompt: string;
 		try {
-			prompt = await appendResolvedFileContexts({
-				prompt: latestPrompt,
-				messages: input.request.messages,
-				files: input.request.files,
-				project,
-				chatId: headers.chatId,
-				userMessageId: headers.userMessageId,
-				resolver: input.fileContextResolver,
-				ownerUserId: principal.userId,
-			});
+			prompt = await raceWithAbort(
+				() =>
+					appendResolvedFileContexts({
+						prompt: latestPrompt,
+						messages: input.request.messages,
+						files: input.request.files,
+						project,
+						chatId: headers.chatId,
+						userMessageId: headers.userMessageId,
+						resolver: input.fileContextResolver,
+						ownerUserId: principal.userId,
+					}),
+				input.signal,
+			);
 		} catch {
-			return finishWorkspaceLease(
+			throwIfAborted(input.signal);
+			const finished = await finishWorkspaceLeaseWithCancellation(
 				leaseAdmission,
 				errorResult(
 					503,
@@ -220,10 +252,13 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 					"attachment_resolution_failed",
 					"OpenWebUI attachment files could not be resolved.",
 				),
+				input.signal,
 			);
+			return finished;
 		}
 
 		await assertWorkspaceLease(leaseAdmission);
+		throwIfAborted(input.signal);
 		let liveEventsDelivered = false;
 		const guardedEventSink =
 			input.eventSink === undefined
@@ -656,6 +691,17 @@ async function finishWorkspaceLease(
 	return result;
 }
 
+async function finishWorkspaceLeaseWithCancellation(
+	admission: WorkspaceLeaseAdmission | undefined,
+	result: LiveChatCompletionsResult,
+	signal?: AbortSignal,
+): Promise<LiveChatCompletionsResult> {
+	throwIfAborted(signal);
+	const finished = await finishWorkspaceLease(admission, result);
+	throwIfAborted(signal);
+	return finished;
+}
+
 async function closeWorkspaceLease(admission: WorkspaceLeaseAdmission | undefined): Promise<boolean> {
 	if (admission === undefined) return true;
 	return admission.finish();
@@ -663,6 +709,45 @@ async function closeWorkspaceLease(admission: WorkspaceLeaseAdmission | undefine
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
 	if (signal?.aborted) throw new GjcTurnCancelledError();
+}
+
+function raceWithAbort<T>(operation: () => Promise<T> | T, signal?: AbortSignal): Promise<T> {
+	if (signal?.aborted) return Promise.reject(new GjcTurnCancelledError());
+	let promise: Promise<T>;
+	try {
+		promise = Promise.resolve(operation());
+	} catch (error) {
+		promise = Promise.reject(error);
+	}
+	if (signal === undefined) return promise;
+	return new Promise<T>((resolve, reject) => {
+		let settled = false;
+		const cleanup = () => {
+			if (settled) return;
+			settled = true;
+			signal.removeEventListener("abort", onAbort);
+		};
+		const onAbort = () => {
+			cleanup();
+			reject(new GjcTurnCancelledError());
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		promise.then(
+			value => {
+				cleanup();
+				if (signal.aborted) {
+					reject(new GjcTurnCancelledError());
+					return;
+				}
+				resolve(value);
+			},
+			error => {
+				cleanup();
+				reject(signal.aborted ? new GjcTurnCancelledError() : error);
+			},
+		);
+		if (signal.aborted) onAbort();
+	});
 }
 
 function workspaceLeaseErrorResult(): LiveChatCompletionsResult {

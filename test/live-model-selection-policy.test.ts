@@ -83,9 +83,10 @@ describe("createModelSelectionPolicy", () => {
 		expect((await policy.listModels()).data.map(model => model.id)).toEqual([...CANONICAL_MODEL_IDS]);
 		expect(transcript).toEqual(["catalog", "stop"]);
 	});
-	test("cancellation interrupts catalog resolution and still stops the reader", async () => {
+	test("cancellation interrupts catalog resolution without waiting for reader cleanup", async () => {
 		const controller = new AbortController();
 		let releaseCatalog!: () => void;
+		let releaseStop!: () => void;
 		let catalogStarted!: () => void;
 		let stopCalls = 0;
 		const started = new Promise<void>(resolve => {
@@ -93,6 +94,9 @@ describe("createModelSelectionPolicy", () => {
 		});
 		const catalog = new Promise<readonly unknown[]>(resolve => {
 			releaseCatalog = () => resolve(MODEL_DESCRIPTORS);
+		});
+		const stop = new Promise<void>(resolve => {
+			releaseStop = resolve;
 		});
 		const policy = createModelSelectionPolicy(async (_context, signal) => {
 			expect(signal).toBe(controller.signal);
@@ -105,6 +109,7 @@ describe("createModelSelectionPolicy", () => {
 				getState: async () => ({}),
 				stop: async () => {
 					stopCalls += 1;
+					await stop;
 				},
 			};
 		});
@@ -115,6 +120,7 @@ describe("createModelSelectionPolicy", () => {
 		await expect(pending).rejects.toBeInstanceOf(GjcTurnCancelledError);
 		expect(stopCalls).toBe(1);
 		releaseCatalog();
+		releaseStop();
 	});
 	test("advertises and accepts only models whose GJC provider is active", async () => {
 		const catalog = [

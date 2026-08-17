@@ -4533,6 +4533,64 @@ test("cleans up a cancelled new session when model setup finishes before the pro
 		rmSync(root, { recursive: true, force: true });
 	}
 });
+test("cancels new-session CLI setup without waiting for endpoint publication", async () => {
+	const root = mkdtempSync(join(tmpdir(), "gjc-cancel-cli-setup-"));
+	const sessionRoot = join(root, ".gjc", "sessions");
+	const mappingFile = join(root, "mappings.json");
+	const server = startSdkFixtureServer("turn_complete", root);
+	try {
+		writeFileSync(
+			join(root, "gjc-sdk-fixture.json"),
+			JSON.stringify({
+				GJC_SDK_FIXTURE_CLI_TRANSCRIPT: join(root, "sdk-cli.jsonl"),
+				GJC_SDK_FIXTURE_ENDPOINT_URL: server.url,
+				GJC_SDK_FIXTURE_ENDPOINT_TOKEN: server.token,
+				GJC_SDK_FIXTURE_DYNAMIC_AUTHORITY: "1",
+				GJC_SDK_FIXTURE_DELAY_MS: "500",
+			}),
+		);
+		const runner = createGjcRoutingLiveGatewayRunner({
+			turnRunner: createPublicSdkGjcTurnRunner({
+				cliPath: join(import.meta.dir, "fixtures", "gjc-sdk-interactive-cli-session-fixture.ts"),
+				runtimeLocations: {
+					childEnvironment: {
+						HOME: root,
+						GJC_CONFIG_DIR: join(root, ".gjc"),
+						GJC_CODING_AGENT_DIR: join(root, ".gjc"),
+					},
+				} as GjcRuntimeLocations,
+				turnTimeoutMs: 1_000,
+			}),
+			mappings: new FileBackedSessionMappingStore(mappingFile),
+		});
+		const controller = new AbortController();
+		const pending = runner.run({
+			...turn("cancel-cli-setup", "cancel-cli-setup"),
+			project: { ...project, cwd: root, sessionRoot },
+			signal: controller.signal,
+		});
+		await Bun.sleep(50);
+		controller.abort();
+		await expect(
+			Promise.race([
+				pending,
+				Bun.sleep(250).then(() => {
+					throw new Error("new-session cancellation waited for CLI setup");
+				}),
+			]),
+		).rejects.toMatchObject({ name: "GjcTurnCancelledError" });
+		await Bun.sleep(600);
+		expect(tmuxPanesInCwd(root)).toEqual([]);
+		expect(server.frames.some(frame => frame.type === "control_request" && frame.operation === "turn.prompt")).toBe(
+			false,
+		);
+	} finally {
+		for (const pane of tmuxPanesInCwd(root))
+			Bun.spawnSync(["tmux", "kill-pane", "-t", pane], { stdout: "ignore", stderr: "ignore" });
+		server.stop();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
 test("cleans up exactly the owned CLI pane when the post-CLI binding barrier fails", async () => {
 	const root = mkdtempSync(join(tmpdir(), "gjc-post-cli-pre-bind-"));
 	const sessionRoot = join(root, ".gjc", "sessions");

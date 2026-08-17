@@ -227,6 +227,55 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 			await rm(root, { recursive: true, force: true });
 		}
 	});
+	it("maps cancellation during file preparation to HTTP 499 instead of attachment failure", async () => {
+		const controller = new AbortController();
+		let resolverStarted!: () => void;
+		const started = new Promise<void>(resolve => {
+			resolverStarted = resolve;
+		});
+		let releaseResolver!: () => void;
+		const resolverGate = new Promise<void>(resolve => {
+			releaseResolver = resolve;
+		});
+		const handler = createAdapterRequestHandler({
+			routes: {
+				projects: [projectWithFolder],
+				owner,
+				projectContextRepository: await demoRepository(),
+				runner: {
+					run() {
+						throw new Error("The runner must not start after cancellation.");
+					},
+				},
+				fileContextResolver: async () => {
+					resolverStarted();
+					await resolverGate;
+					throw new Error("attachment preparation failed after cancellation");
+				},
+			},
+		});
+		const response = handler(
+			new Request("http://adapter.test/v1/chat/completions", {
+				method: "POST",
+				headers: completionHeaders("assistant-http-file-cancel", "owner-1"),
+				signal: controller.signal,
+				body: JSON.stringify({
+					model: "gjc",
+					messages: [
+						{
+							role: "user",
+							content:
+								'<attached_files>\n<file type="file" url="file-1" name="notes.txt"/>\n</attached_files>\nRead it.',
+						},
+					],
+				}),
+			}),
+		);
+		await started;
+		controller.abort();
+		releaseResolver();
+		expect((await response).status).toBe(499);
+	});
 	it("rejects a concurrent normal turn before invoking the runner and releases the first turn", async () => {
 		const root = await mkdtemp(join(tmpdir(), "gjc-workspace-lease-concurrency-"));
 		const workspace = join(root, "workspace");

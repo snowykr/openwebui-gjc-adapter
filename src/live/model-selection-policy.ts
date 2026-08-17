@@ -161,7 +161,7 @@ async function withReader<T>(
 		void readerPromise.then(
 			lateReader => {
 				if (!signal?.aborted || reader === lateReader) return;
-				void Promise.resolve(lateReader.stop()).catch(() => undefined);
+				consumeReaderStop(lateReader);
 			},
 			() => undefined,
 		);
@@ -171,7 +171,7 @@ async function withReader<T>(
 		return throwAfterCleanup(reader, cancellationFor(error, signal) ?? mapError(error), signal);
 	}
 	try {
-		await reader.stop();
+		await awaitWithAbort(stopReader(reader), signal);
 	} catch (error) {
 		if (signal?.aborted) throw new GjcTurnCancelledError();
 		throw error;
@@ -185,14 +185,31 @@ async function throwAfterCleanup(
 	primary: unknown,
 	signal?: AbortSignal,
 ): Promise<never> {
+	if (primary instanceof GjcTurnCancelledError || signal?.aborted) {
+		consumeReaderStop(reader);
+		throw new GjcTurnCancelledError();
+	}
 	try {
-		await reader?.stop();
+		await awaitWithAbort(stopReader(reader), signal);
 	} catch (cleanup) {
 		if (signal?.aborted) throw new GjcTurnCancelledError();
 		throw new ModelSelectionCleanupError(primary as ModelSelectionError, cleanup);
 	}
 	if (signal?.aborted) throw new GjcTurnCancelledError();
 	throw primary;
+}
+
+function stopReader(reader: ModelReader | undefined): Promise<void> {
+	if (reader === undefined) return Promise.resolve();
+	try {
+		return Promise.resolve(reader.stop());
+	} catch (error) {
+		return Promise.reject(error);
+	}
+}
+
+function consumeReaderStop(reader: ModelReader | undefined): void {
+	void stopReader(reader).catch(() => undefined);
 }
 
 class ModelSelectionCleanupError extends ModelSelectionError {

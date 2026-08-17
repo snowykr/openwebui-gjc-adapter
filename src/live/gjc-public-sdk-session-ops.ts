@@ -110,18 +110,28 @@ export async function startNewSession<T>(
 		childEnvironment: context.input.runtimeLocations.childEnvironment,
 	});
 	let lifecycleAttachment: ReturnType<typeof requireLifecycleAttachment> | undefined;
+	let cleanupPromise: ReturnType<CliLifecycleBackend["fallbackBeforeCloseAcknowledgement"]> | undefined;
 	let provisionalAuthorityPersisted = false;
 	let promptStarted = false;
 	try {
-		const createdAttachment = requireLifecycleAttachment(
-			await backend.createEphemeral({ sessionRoot: input.sessionRoot }),
+		const lifecyclePromise = backend.createEphemeral({ sessionRoot: input.sessionRoot });
+		void lifecyclePromise.then(
+			result => {
+				if (!input.signal?.aborted || result.status !== "closed") return;
+				void cleanupOwnedPane(result.value).catch(() => undefined);
+			},
+			() => undefined,
 		);
+		const createdAttachment = requireLifecycleAttachment(await awaitWithAbort(lifecyclePromise, input.signal));
 		lifecycleAttachment = createdAttachment;
 		throwIfAborted(input.signal);
 		const address = {
 			...addressFor(input, createdAttachment.sessionId),
 		};
-		const initialPublished = await waitForSdkEndpoint(input.cwd, createdAttachment.sessionId);
+		const initialPublished = await awaitWithAbort(
+			waitForSdkEndpoint(input.cwd, createdAttachment.sessionId),
+			input.signal,
+		);
 		throwIfAborted(input.signal);
 		await runLifecycleTestBarrier(context.input.testBarrierHook, "post_cli_pre_bind", initialPublished);
 		const published = await requireCurrentPublishedSdkEndpoint(input.cwd, initialPublished);
@@ -212,12 +222,17 @@ export async function startNewSession<T>(
 		if (provisionalAuthorityPersisted && promptStarted) throw error;
 		context.attachments.delete(attachmentKey(addressFor(input, lifecycleAttachment.sessionId)));
 		try {
-			const fallback = await backend.fallbackBeforeCloseAcknowledgement(lifecycleAttachment);
+			const fallback = await cleanupOwnedPane(lifecycleAttachment);
 			if (fallback.status !== "closed") throw new Error(fallback.message);
 		} catch (cleanupError) {
 			throw new AggregateError([error, cleanupError], "new GJC session pre-prompt cleanup is uncertain");
 		}
 		throw error;
+	}
+
+	function cleanupOwnedPane(attachment: ReturnType<typeof requireLifecycleAttachment>) {
+		if (cleanupPromise === undefined) cleanupPromise = backend.fallbackBeforeCloseAcknowledgement(attachment);
+		return cleanupPromise;
 	}
 }
 
@@ -344,6 +359,38 @@ export async function respondWorkflowGate(
 
 function throwIfAborted(signal: AbortSignal | undefined, cancelled = false): void {
 	if (cancelled || signal?.aborted) throw new GjcTurnCancelledError();
+}
+
+function awaitWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (signal === undefined) return promise;
+	if (signal.aborted) {
+		void promise.catch(() => undefined);
+		return Promise.reject(new GjcTurnCancelledError());
+	}
+	return new Promise<T>((resolve, reject) => {
+		let settled = false;
+		const cleanup = () => {
+			if (settled) return;
+			settled = true;
+			signal.removeEventListener("abort", onAbort);
+		};
+		const onAbort = () => {
+			cleanup();
+			reject(new GjcTurnCancelledError());
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		promise.then(
+			value => {
+				cleanup();
+				resolve(value);
+			},
+			error => {
+				cleanup();
+				reject(error);
+			},
+		);
+		if (signal.aborted) onAbort();
+	});
 }
 async function withSessionArtifactEvents(
 	outcome: import("../gjc/public-sdk-contract").PublicSdkTurnOutcome,
