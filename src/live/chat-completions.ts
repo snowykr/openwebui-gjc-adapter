@@ -309,7 +309,11 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 					}),
 			...(input.signal === undefined ? {} : { signal: input.signal }),
 		});
-		await assertWorkspaceLease(leaseAdmission);
+		// A stream owns lease finalization after the runner hands its result to the
+		// response. If the heartbeat fails while that result is being prepared,
+		// preserve the stream handoff so the stream wrapper can retain admission
+		// until the caller abandons it and then fail closed before yielding data.
+		await assertWorkspaceLeaseForStreamHandoff(leaseAdmission, input.request.stream === true);
 		throwIfAborted(input.signal);
 
 		const resultModel = runnerResult.model;
@@ -342,7 +346,7 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 			ownerUserId: principal.userId,
 			projectId: project.id,
 		});
-		await assertWorkspaceLease(leaseAdmission);
+		await assertWorkspaceLeaseForStreamHandoff(leaseAdmission, input.request.stream === true);
 		throwIfAborted(input.signal);
 
 		const completion = await deliverChatCompletion({
@@ -680,6 +684,22 @@ function resolveWorkspaceLeaseHeartbeat(value: number | undefined, durationMs: n
 
 async function assertWorkspaceLease(admission: WorkspaceLeaseAdmission | undefined): Promise<void> {
 	await admission?.assertFence();
+}
+
+async function assertWorkspaceLeaseForStreamHandoff(
+	admission: WorkspaceLeaseAdmission | undefined,
+	streaming: boolean,
+): Promise<void> {
+	if (!streaming) {
+		await assertWorkspaceLease(admission);
+		return;
+	}
+	if (admission?.failed) return;
+	try {
+		await assertWorkspaceLease(admission);
+	} catch (error) {
+		if (!isWorkspaceLeaseUncertainError(error)) throw error;
+	}
 }
 
 async function finishWorkspaceLease(
