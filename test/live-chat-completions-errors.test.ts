@@ -5,6 +5,7 @@ import { asyncIterableBody } from "../src/live/openai-routes";
 import type { OpenAIChatCompletionRequest } from "../src/live/openai-types";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import type { RegisteredProject } from "../src/projects/registry";
+import type { WorkspaceLease } from "../src/security/workspace-lease";
 
 const project: RegisteredProject = {
 	id: "demo",
@@ -292,5 +293,58 @@ describe("live OpenAI-compatible chat completion errors", () => {
 				},
 			},
 		});
+	});
+	it("releases a lease acquired after cancellation before propagating the cancellation", async () => {
+		const controller = new AbortController();
+		let acquireStarted!: () => void;
+		const acquireStartedPromise = new Promise<void>(resolve => {
+			acquireStarted = resolve;
+		});
+		let finishAcquire!: () => void;
+		const acquireGate = new Promise<void>(resolve => {
+			finishAcquire = resolve;
+		});
+		let releases = 0;
+		let lease!: WorkspaceLease;
+		lease = {
+			renew: async () => lease,
+			assertFence: async () => {},
+			release: async () => {
+				releases += 1;
+			},
+		} as unknown as WorkspaceLease;
+		const pending = handleChatCompletions({
+			request,
+			headers: { ...chatHeaders, "X-OpenWebUI-User-Id": "normal-1" },
+			projects: [project],
+			owner,
+			neutralWorkspace: "/tmp",
+			workspaceRegistry: {
+				open: async userId => ({
+					userId,
+					safeKey: "a".repeat(64),
+					root: "/tmp",
+					sessionRoot: "/tmp/.gjc/sessions",
+				}),
+			},
+			workspaceLeaseManager: {
+				async acquire() {
+					acquireStarted();
+					await acquireGate;
+					return lease;
+				},
+			},
+			runner: {
+				run() {
+					throw new Error("The runner must not start after cancellation.");
+				},
+			},
+			signal: controller.signal,
+		});
+		await acquireStartedPromise;
+		controller.abort();
+		finishAcquire();
+		await expect(pending).rejects.toMatchObject({ name: "WorkspaceAdmissionCancelledError" });
+		expect(releases).toBe(1);
 	});
 });
