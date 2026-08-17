@@ -249,6 +249,12 @@ export class FileSessionAuthority extends SessionAuthority {
 	): SessionAuthorityRecord {
 		return this.mutate(() => super.beginOperation(chatId, operation));
 	}
+	override discardPendingOperation(
+		chatId: string,
+		operation: Pick<SessionOperation, "id" | "ingressId" | "detail">,
+	): void {
+		return this.mutate(() => super.discardPendingOperation(chatId, operation));
+	}
 	override reserveProvisionalOperation(
 		operation: Omit<ProvisionalSessionOperation, "state" | "startedAt" | "completedAt">,
 	): ProvisionalSessionOperation {
