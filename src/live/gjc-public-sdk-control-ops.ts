@@ -56,10 +56,6 @@ export async function runControl(
 			rejectCancelled = reject;
 		});
 		let abortPromise: Promise<unknown> | undefined;
-		let branchOperationStarted!: () => void;
-		const branchStarted = new Promise<void>(resolve => {
-			branchOperationStarted = resolve;
-		});
 		let branchOperation: Promise<GjcControlResult> | undefined;
 		const dispatchAbort = (port: PublicSdkSessionPort): Promise<unknown> => {
 			if (abortPromise !== undefined) return abortPromise;
@@ -73,10 +69,10 @@ export async function runControl(
 			async () => {
 				cancelled = true;
 				try {
-					if (activePort === undefined) {
-						await branchStarted;
-						if (activePort === undefined) return await branchOperation?.catch(() => undefined);
-					}
+					// The branch operation may still be between lifecycle phases. Without an
+					// attached owner port there is no C04 dispatch to await; reject the local
+					// race and let onPortAvailable dispatch once the owner is attached.
+					if (activePort === undefined) return;
 					return await dispatchAbort(activePort!);
 				} finally {
 					rejectCancelled(new GjcTurnCancelledError());
@@ -103,7 +99,6 @@ export async function runControl(
 					if (cancelled || input.signal?.aborted) throw new GjcTurnCancelledError();
 				},
 			);
-			branchOperationStarted();
 			const branched = await Promise.race([branchOperation, cancellation]);
 			if (cancelled || input.signal?.aborted) throw new GjcTurnCancelledError();
 			return branched;

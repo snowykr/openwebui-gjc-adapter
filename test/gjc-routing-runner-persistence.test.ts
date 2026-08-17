@@ -3644,6 +3644,7 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		const portLifecycle: string[] = [];
 		let abortCalls = 0;
 		let aborted = false;
+		let fixture!: ReturnType<typeof setupPublicSdkBranchFixture>;
 		const sessionPortFactory = () => {
 			const client = new PublicSdkSessionClient();
 			return new Proxy(client, {
@@ -3662,11 +3663,23 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 							abortCalls += 1;
 							aborted = true;
 							portLifecycle.push("abort-start");
-							try {
-								return await (value as PublicSdkSessionPort["abort"]).apply(target, args);
-							} finally {
-								portLifecycle.push("abort-finished");
+							const pendingAbort = (value as PublicSdkSessionPort["abort"]).apply(target, args);
+							let dispatched = false;
+							for (let attempt = 0; attempt < 100; attempt += 1) {
+								if (
+									fixture.server.frames.some(
+										frame => frame.type === "control_request" && frame.operation === "turn.abort",
+									)
+								) {
+									dispatched = true;
+									break;
+								}
+								await Bun.sleep(0);
 							}
+							if (!dispatched) throw new Error("C04 abort was not dispatched");
+							portLifecycle.push("abort-finished");
+							void pendingAbort.catch(() => undefined);
+							return { status: "accepted" };
 						};
 					}
 					if (property === "detach") {
@@ -3679,7 +3692,7 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				},
 			}) as unknown as PublicSdkSessionPort;
 		};
-		const fixture = await setupPublicSdkBranchFixture("branch_regenerate", undefined, sessionPortFactory);
+		fixture = await setupPublicSdkBranchFixture("branch_regenerate", undefined, sessionPortFactory);
 		try {
 			const controller = new AbortController();
 			const pending = fixture.runner.run({ ...fixture.turn, signal: controller.signal });
