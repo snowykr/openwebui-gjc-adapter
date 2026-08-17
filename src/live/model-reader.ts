@@ -36,7 +36,7 @@ export type PublicSdkAttachmentResolver = (
 	signal?: AbortSignal,
 ) => Promise<PublicSdkSessionAttachment>;
 export type PublicSdkSessionPortFactory = () => PublicSdkSessionPort;
-export type TemporaryModelAttachmentCleanup = (port: PublicSdkSessionPort) => Promise<void>;
+export type TemporaryModelAttachmentCleanup = (port?: PublicSdkSessionPort) => Promise<void>;
 
 const temporaryModelAttachmentCleanups = new WeakMap<PublicSdkSessionAttachment, TemporaryModelAttachmentCleanup>();
 
@@ -82,7 +82,7 @@ export function createModelReaderFactory(input: CreateModelReaderFactoryInput): 
 				lateAttachment => {
 					if (!effectiveSignal?.aborted) return;
 					const cleanup = temporaryModelAttachmentCleanups.get(lateAttachment);
-					if (cleanup !== undefined) void cleanup(port).catch(() => undefined);
+					if (cleanup !== undefined) void cleanup().catch(() => undefined);
 				},
 				() => undefined,
 			);

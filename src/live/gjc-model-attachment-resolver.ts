@@ -41,6 +41,13 @@ export function createPublicSdkModelAttachmentResolver(input: {
 				effectiveSignal,
 			);
 			return registerTemporaryModelAttachment(attachment, async port => {
+				if (port === undefined) {
+					const fallback = await backend.fallbackBeforeCloseAcknowledgement(lifecycle);
+					if (fallback.status !== "closed")
+						throw new Error(`temporary model session close is ${fallback.status}: ${fallback.message}`);
+					input.onProvenClosed?.(resolve(cwd), lifecycle.sessionId);
+					return;
+				}
 				let closePossiblyApplied = false;
 				try {
 					closePossiblyApplied = true;

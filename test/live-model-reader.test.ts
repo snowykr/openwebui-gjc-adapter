@@ -37,6 +37,7 @@ describe("createModelReaderFactory", () => {
 	test("closes a one-shot catalog session before detaching its port", async () => {
 		const port = new FakePublicSessionPort();
 		const temporaryAttachment = registerTemporaryModelAttachment({ ...attachment }, async activePort => {
+			if (activePort === undefined) throw new Error("attached reader cleanup requires a port");
 			await activePort.closeSession();
 		});
 		const reader = await createModelReaderFactory({
@@ -99,6 +100,46 @@ describe("createModelReaderFactory", () => {
 		await Promise.resolve();
 		expect(port.calls).toEqual(["attach", "detach", "detach"]);
 		expect(port.attached).toBe(false);
+	});
+	test("cleans up a late temporary attachment without an unattached port", async () => {
+		const controller = new AbortController();
+		let resolveAttachment!: (value: PublicSdkSessionAttachment) => void;
+		const attachmentPromise = new Promise<PublicSdkSessionAttachment>(resolve => {
+			resolveAttachment = resolve;
+		});
+		let resolveAttachmentStarted!: () => void;
+		const attachmentStarted = new Promise<void>(resolve => {
+			resolveAttachmentStarted = resolve;
+		});
+		let resolveCleanup!: () => void;
+		const cleanupFinished = new Promise<void>(resolve => {
+			resolveCleanup = resolve;
+		});
+		let cleanupReceivedPort = false;
+		const temporaryAttachment = registerTemporaryModelAttachment({ ...attachment }, async activePort => {
+			cleanupReceivedPort = activePort !== undefined;
+			if (activePort !== undefined) await activePort.closeSession();
+			resolveCleanup();
+		});
+		const port = new FakePublicSessionPort();
+		const pending = createModelReaderFactory({
+			cliPath: "/opt/gjc",
+			runtimeLocations,
+			resolveAttachment: async () => {
+				resolveAttachmentStarted();
+				return attachmentPromise;
+			},
+			sessionPortFactory: () => port,
+		})(undefined, controller.signal);
+
+		await attachmentStarted;
+		controller.abort();
+		await expect(pending).rejects.toBeInstanceOf(GjcTurnCancelledError);
+		resolveAttachment(temporaryAttachment);
+		await cleanupFinished;
+
+		expect(cleanupReceivedPort).toBe(false);
+		expect(port.calls).toEqual(["detach"]);
 	});
 	test("uses the published descriptor as the default attachment authority", async () => {
 		const root = mkdtempSync(join(tmpdir(), "gjc-model-reader-"));
