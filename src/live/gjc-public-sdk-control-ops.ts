@@ -150,7 +150,7 @@ export async function runControl(
 		});
 	if (control.operation === "abort") {
 		await mutate((port, beforeDispatch) =>
-			port.abort(idempotencyKey, context.input.turnTimeoutMs, onDispatch, beforeDispatch),
+			port.abort(terminalAbortKey, context.input.turnTimeoutMs, onDispatch, beforeDispatch),
 		);
 		return { attachment: await freshAttachmentProof(input.project.cwd, attachment, lifecycle) };
 	}

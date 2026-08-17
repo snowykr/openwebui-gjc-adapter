@@ -128,9 +128,9 @@ export class SdkV3Client {
 			try {
 				beforeDispatch?.();
 				client.send(frame);
-				// Let the transport event loop hand the frame to the socket before the
-				// owner can detach; this is a dispatch boundary, not a time grace.
-				if (onDispatch !== undefined) setImmediate(onDispatch);
+				// A successful send is the irreversible dispatch boundary. Mark it in
+				// this call stack before a transport response or cancellation can settle.
+				onDispatch?.();
 			} catch (error) {
 				cleanup();
 				reject(error);

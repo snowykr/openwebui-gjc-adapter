@@ -67,18 +67,28 @@ export function abortWithDispatch(
 	return { promise, dispatched };
 }
 
-/** Wait until the SDK control frame was sent, or the request failed before dispatch. */
+/**
+ * Wait until the abort control is acknowledged, or its frame has crossed the
+ * transport boundary and had one I/O turn to reach the peer. The dispatch
+ * marker itself remains synchronous; this grace only keeps an owner port alive
+ * long enough for an unacknowledged abort frame to be delivered before detach.
+ */
 export async function awaitAbortDispatch(
 	abortPromise: Promise<unknown>,
 	dispatchPromise?: Promise<void>,
 ): Promise<void> {
+	const flushed = dispatchPromise?.then(() => waitForTransportFlush());
 	await Promise.race([
 		abortPromise.then(
 			() => undefined,
 			() => undefined,
 		),
-		dispatchPromise ?? new Promise<void>(() => undefined),
+		flushed ?? new Promise<void>(() => undefined),
 	]);
+}
+
+function waitForTransportFlush(): Promise<void> {
+	return new Promise(resolve => setImmediate(resolve));
 }
 
 export {

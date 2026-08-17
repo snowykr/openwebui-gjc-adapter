@@ -3738,6 +3738,23 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			}
 		},
 	);
+	test("uses a bounded terminal idempotency key for direct abort controls with an oversized ID", async () => {
+		const fixture = await setupPublicSdkBranchFixture("controls");
+		const userMessageId = "u".repeat(256);
+		try {
+			await fixture.runner.run({
+				...fixture.turn,
+				messageId: `assistant-${userMessageId}`,
+				userMessageId,
+				control: { operation: "abort" },
+			});
+			const abort = expectSdkRequest(fixture.server.frames, "control_request", "turn.abort");
+			expect(abort.idempotencyKey).toBe(terminalAbortIdempotencyKey(fixture.turn.chatId, userMessageId));
+			expect(Buffer.byteLength(String(abort.idempotencyKey), "utf8")).toBeLessThanOrEqual(128);
+		} finally {
+			fixture.dispose();
+		}
+	});
 	test("keeps an acknowledged branch checkpoint uncertain after restart without remote replay", async () => {
 		let barrierHits = 0;
 		const fixture = await setupPublicSdkBranchFixture("branch_regenerate", async (phase, evidence) => {
