@@ -3,7 +3,7 @@ import { ensureSdkSessionFile } from "../gjc/session-file";
 import type { SessionMapping, SessionMappingStore } from "../gjc/session-router";
 import { validateSessionFile } from "../gjc/session-router";
 import { scopedSessionMappingStore } from "../gjc/session-turn-router";
-import type { GjcLifecycleTransaction, GjcTurnEventObserver } from "../gjc/turn-runner";
+import { type GjcLifecycleTransaction, GjcTurnCancelledError, type GjcTurnEventObserver } from "../gjc/turn-runner";
 import {
 	answerFromWorkflowGateReply,
 	type PendingWorkflowGate,
@@ -164,14 +164,33 @@ export async function handleWorkflowGateReply(
 	) {
 		throw new Error(`GJC workflow gate operation ${turn.userMessageId} requires reconciliation.`);
 	}
-	mappings.beginOperation(turn.chatId, {
-		id: turn.userMessageId,
-		kind: "gate",
-		ingressId: turn.userMessageId,
-		detail: operationDetail,
-	});
-
+	const cancellation = {
+		projectId: mapping.projectId,
+		chatId: mapping.chatId,
+		sessionId: mapping.sessionId,
+		operationId: turn.userMessageId,
+		...(principalId === undefined ? {} : { principalId }),
+	};
+	let cancellationRequested = false;
+	const onAbort = () => {
+		if (cancellationRequested) return;
+		cancellationRequested = true;
+		void Promise.resolve(input.turnRunner.cancelTurn?.(cancellation)).catch(() => undefined);
+	};
+	turn.signal?.addEventListener("abort", onAbort, { once: true });
+	if (turn.signal?.aborted) onAbort();
+	let operationBegun = false;
+	let dispatchFired = false;
 	try {
+		throwIfAborted(turn.signal);
+		mappings.beginOperation(turn.chatId, {
+			id: turn.userMessageId,
+			kind: "gate",
+			ingressId: turn.userMessageId,
+			detail: operationDetail,
+		});
+		operationBegun = true;
+		throwIfAborted(turn.signal);
 		const sessionRoot = turn.project.sessionRoot ?? `${turn.project.cwd}/.gjc/sessions`;
 		const existingSessionFile = await ensureSdkSessionFile(
 			turn.project,
@@ -199,6 +218,11 @@ export async function handleWorkflowGateReply(
 			operationId: turn.userMessageId,
 			lifecycle,
 			...(observer === undefined ? {} : { observer }),
+			...(turn.signal === undefined ? {} : { signal: turn.signal }),
+			...(principalId === undefined ? {} : { principalId }),
+			onDispatch: () => {
+				dispatchFired = true;
+			},
 			...(pendingGate.commandId === undefined ||
 			pendingGate.turnId === undefined ||
 			pendingGate.sessionId === undefined
@@ -211,6 +235,7 @@ export async function handleWorkflowGateReply(
 						},
 					}),
 		});
+		throwIfAborted(turn.signal);
 		if (result.attachment === undefined) {
 			throw new Error("Workflow gate response did not return a validated current GJC attachment.");
 		}
@@ -257,6 +282,7 @@ export async function handleWorkflowGateReply(
 					}),
 		};
 		await lifecycle.publish(result.attachment, () => {
+			throwIfAborted(turn.signal);
 			const published = mappings.completeOperationWithMapping(
 				turn.chatId,
 				turn.userMessageId,
@@ -276,9 +302,26 @@ export async function handleWorkflowGateReply(
 			? { content: responseText }
 			: { content: responseText, events: projectedEvents };
 	} catch (error) {
-		mappings.transitionOperation(turn.chatId, turn.userMessageId, "uncertain", operationDetail);
+		if (operationBegun) {
+			if (!dispatchFired) {
+				mappings.discardPendingOperation(turn.chatId, {
+					id: turn.userMessageId,
+					ingressId: turn.userMessageId,
+					detail: operationDetail,
+				});
+			} else {
+				mappings.transitionOperation(turn.chatId, turn.userMessageId, "uncertain", operationDetail);
+			}
+		}
 		throw error;
+	} finally {
+		turn.signal?.removeEventListener("abort", onAbort);
+		input.turnRunner.clearTurnCancellation?.(cancellation);
 	}
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) throw new GjcTurnCancelledError();
 }
 
 function principalIdForTurn(turn: LiveGatewayRunnerInput): string | undefined {

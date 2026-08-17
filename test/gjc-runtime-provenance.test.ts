@@ -3,7 +3,8 @@ import { join } from "node:path";
 import { closeTmux, exitAndObservePostCloseFailure } from "../scripts/gjc-release-compat-lifecycle";
 
 const ROOT = join(import.meta.dir, "..");
-const GJC_VERSION = "0.12.8";
+const GJC_VERSION = "0.14.0";
+const BRIDGE_CLIENT_VERSION = "0.13.3";
 const BUN_IMAGE_DIGEST = "sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4";
 const PYTHON_IMAGE_DIGEST = "sha256:8a7e7cc04fd3e2bd787f7f24e22d5d119aa590d429b50c95dfe12b3abe52f48b";
 
@@ -27,13 +28,9 @@ describe("GJC SDK runtime provenance", () => {
 		const manifest = await Bun.file(join(ROOT, "package.json")).json();
 		const dependencies = Reflect.get(manifest, "dependencies");
 
-		for (const packageName of [
-			"@gajae-code/ai",
-			"@gajae-code/bridge-client",
-			"@gajae-code/coding-agent",
-			"@gajae-code/natives",
-		])
+		for (const packageName of ["@gajae-code/ai", "@gajae-code/coding-agent", "@gajae-code/natives"])
 			expect(Reflect.get(dependencies, packageName)).toBe(GJC_VERSION);
+		expect(Reflect.get(dependencies, "@gajae-code/bridge-client")).toBe(BRIDGE_CLIENT_VERSION);
 		expect(Reflect.get(manifest, "patchedDependencies")).toBeUndefined();
 		expect(Reflect.get(manifest, "files")).not.toContain("patches");
 	});
@@ -167,7 +164,8 @@ describe("GJC SDK runtime provenance", () => {
 		expect(runner).not.toContain("promptInteractive");
 		expect(runner).not.toContain("--op");
 
-		expect(sdk).toContain("SdkClient.connect(endpoint.url, endpoint.token");
+		expect(sdk).toContain('from "@gajae-code/bridge-client"');
+		expect(sdk).not.toContain('from "@gajae-code/coding-agent/sdk"');
 		expect(sdk).toContain("client.control(operation, input");
 		expect(sdk).toContain("snapshotPublicEndpoints(workspace)");
 		expect(sdk).toContain("endpointFingerprint(previous) !== endpointFingerprint(endpoint)");
@@ -175,6 +173,9 @@ describe("GJC SDK runtime provenance", () => {
 		expect(sdk).toContain("targetSessionId: requestedSessionId");
 
 		expect(runtime).toContain('client.control("turn.prompt", { text })');
+		expect(runtime).toContain('client.control("turn.abort", abortInput, { idempotencyKey })');
+		expect(runtime).toContain('mode: "terminal", scope: "turn"');
+		expect(runtime).toContain("abortReplay");
 		expect(runtime).toContain('probe.query("session.branch_candidates")');
 		expect(runtime).toContain("rediscoverSessionId");
 		expect(runtime).toContain("client.onFrame(frame =>");

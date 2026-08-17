@@ -1,5 +1,5 @@
 import { stat } from "node:fs/promises";
-import type { SdkClient } from "@gajae-code/coding-agent/sdk";
+import type { SdkClient } from "@gajae-code/bridge-client";
 import {
 	endpointFingerprint,
 	endpointFor,

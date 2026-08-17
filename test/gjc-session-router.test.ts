@@ -27,7 +27,7 @@ import type {
 	GjcTurnResult,
 	GjcTurnRunner,
 } from "../src/gjc/turn-runner";
-import { GjcCloseReceipt } from "../src/gjc/turn-runner";
+import { GjcCloseReceipt, GjcTurnCancelledError } from "../src/gjc/turn-runner";
 import type { RegisteredProject } from "../src/projects/registry";
 import { attachmentProof, lifecycleFixture } from "./gjc-lifecycle-fixtures";
 import { messageEntry, writeSessionFile } from "./session-sync-fixtures";
@@ -59,6 +59,8 @@ class FakeGjcTurnRunner implements GjcTurnRunner {
 	};
 	returnedSelection: NormalizedModelSelection | undefined;
 	failPrompt = false;
+	cancelBeforePrompt = false;
+	mappedCancellation: "switch" | "state" | "continue-before-dispatch" | "continue-after-dispatch" | undefined;
 
 	async startNewSession<T>(
 		input: GjcStartNewSessionInput,
@@ -79,6 +81,10 @@ class FakeGjcTurnRunner implements GjcTurnRunner {
 			sessionId: "session-1",
 		};
 		const lifecycle = lifecycleFixture(address);
+		if (this.cancelBeforePrompt) {
+			await beforePrompt(address, ownedAttachmentProof(address), lifecycle);
+			throw new GjcTurnCancelledError();
+		}
 		if (this.failPrompt) {
 			await beforePrompt(address, ownedAttachmentProof(address), lifecycle);
 			const error = new Error("prompt failed");
@@ -103,6 +109,9 @@ class FakeGjcTurnRunner implements GjcTurnRunner {
 
 	async continueSession(input: GjcContinueSessionInput): Promise<GjcTurnResult> {
 		this.continues.push(input);
+		if (this.mappedCancellation === "continue-before-dispatch") throw new GjcTurnCancelledError();
+		input.onDispatch?.();
+		if (this.mappedCancellation === "continue-after-dispatch") throw new GjcTurnCancelledError();
 		if (this.failPrompt) throw new Error("prompt failed");
 		return {
 			text: `continued:${input.text}`,
@@ -118,6 +127,7 @@ class FakeGjcTurnRunner implements GjcTurnRunner {
 
 	async switchSession(input: GjcSwitchSessionInput): Promise<void> {
 		this.switches.push(input);
+		if (this.mappedCancellation === "switch") throw new GjcTurnCancelledError();
 	}
 	async withLifecyclePublication<T>(
 		address: GjcLifecyclePublicationAddress,
@@ -128,6 +138,7 @@ class FakeGjcTurnRunner implements GjcTurnRunner {
 
 	async getState(input: GjcSessionStateInput): Promise<GjcSessionState> {
 		this.states.push(input);
+		if (this.mappedCancellation === "state") throw new GjcTurnCancelledError();
 		return { ...this.state, attachment: attachmentProof(input.lifecycle.address) };
 	}
 }
@@ -223,6 +234,87 @@ describe("routeGjcTurn", () => {
 		});
 	});
 
+	test("discards a mapped pending operation when cancellation precedes prompt dispatch", async () => {
+		for (const phase of ["switch", "state", "continue-before-dispatch"] as const) {
+			const runner = new FakeGjcTurnRunner();
+			const mappings = new SessionMappingStore();
+			mappings.set({
+				chatId: "chat-1",
+				projectId: "project",
+				sessionId: "session-1",
+				sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
+				activeLeaf: "leaf-0",
+				rawFrameCursor: 2,
+				eventCursor: 1,
+				operationId: "message-1",
+			});
+			runner.mappedCancellation = phase;
+
+			await expect(
+				routeGjcTurn(
+					routeInput(runner, mappings, {
+						userMessageId: "message-2",
+						parentId: "message-1",
+						text: "again",
+					}),
+				),
+			).rejects.toBeInstanceOf(GjcTurnCancelledError);
+			expect(mappings.operation("chat-1", "message-2")).toBeUndefined();
+
+			runner.mappedCancellation = undefined;
+			const retry = await routeGjcTurn(
+				routeInput(runner, mappings, {
+					userMessageId: "message-2",
+					parentId: "message-1",
+					text: "again",
+				}),
+			);
+			expect(retry.assistantText).toBe("continued:again");
+		}
+	});
+
+	test("keeps a mapped operation uncertain when cancellation follows prompt dispatch", async () => {
+		const runner = new FakeGjcTurnRunner();
+		const mappings = new SessionMappingStore();
+		mappings.set({
+			chatId: "chat-1",
+			projectId: "project",
+			sessionId: "session-1",
+			sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
+			activeLeaf: "leaf-0",
+			rawFrameCursor: 2,
+			eventCursor: 1,
+			operationId: "message-1",
+		});
+		runner.mappedCancellation = "continue-after-dispatch";
+
+		await expect(
+			routeGjcTurn(
+				routeInput(runner, mappings, {
+					userMessageId: "message-2",
+					parentId: "message-1",
+					text: "again",
+				}),
+			),
+		).rejects.toBeInstanceOf(GjcTurnCancelledError);
+		expect(mappings.operation("chat-1", "message-2")).toMatchObject({
+			id: "message-2",
+			ingressId: "message-2",
+			state: "uncertain",
+		});
+
+		runner.mappedCancellation = undefined;
+		await expect(
+			routeGjcTurn(
+				routeInput(runner, mappings, {
+					userMessageId: "message-2",
+					parentId: "message-1",
+					text: "again",
+				}),
+			),
+		).rejects.toThrow("requires reconciliation");
+	});
+
 	test("rejects persisted session files outside the project session root", async () => {
 		const runner = new FakeGjcTurnRunner();
 		const mappings = new SessionMappingStore();
@@ -312,6 +404,19 @@ describe("routeGjcTurn", () => {
 		release?.();
 		await first;
 		expect(runner.starts).toHaveLength(1);
+	});
+	test("discards a pre-prompt cancellation so the same ID can retry", async () => {
+		const runner = new FakeGjcTurnRunner();
+		const mappings = new SessionMappingStore();
+		runner.cancelBeforePrompt = true;
+
+		await expect(routeGjcTurn(routeInput(runner, mappings))).rejects.toBeInstanceOf(GjcTurnCancelledError);
+		expect(mappings.provisionalOperation("chat-1", "message-1")).toBeUndefined();
+
+		runner.cancelBeforePrompt = false;
+		const retry = await routeGjcTurn(routeInput(runner, mappings));
+		expect(runner.starts).toHaveLength(2);
+		expect(retry.assistantText).toBe("new:hello");
 	});
 
 	test("keeps the durable provisional create proof after a prompt failure and rejects replay or conflicting ingress", async () => {

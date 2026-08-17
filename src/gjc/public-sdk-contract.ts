@@ -93,35 +93,72 @@ export interface PublicSdkSessionPort {
 		idempotencyKey?: string,
 		timeoutMs?: number,
 	): Promise<NormalizedModelSelection>;
-	prompt(text: string, timeoutMs?: number, observer?: PublicSdkTurnEventObserver): Promise<PublicSdkTurnOutcome>;
+	prompt(
+		text: string,
+		timeoutMs?: number,
+		observer?: PublicSdkTurnEventObserver,
+		onDispatch?: () => void,
+		beforeDispatch?: () => void,
+	): Promise<PublicSdkTurnOutcome>;
 	reply(
 		operation: string,
 		input: Readonly<Record<string, unknown>>,
 		idempotencyKey?: string,
 		timeoutMs?: number,
 	): Promise<unknown>;
-	steer(text: string, idempotencyKey?: string, timeoutMs?: number): Promise<unknown>;
+	steer(
+		text: string,
+		idempotencyKey?: string,
+		timeoutMs?: number,
+		onDispatch?: () => void,
+		beforeDispatch?: () => void,
+	): Promise<unknown>;
 	followUp(
 		text: string,
 		idempotencyKey?: string,
 		timeoutMs?: number,
 		observer?: PublicSdkTurnEventObserver,
+		onDispatch?: () => void,
+		beforeDispatch?: () => void,
 	): Promise<PublicSdkTurnOutcome>;
-	abort(idempotencyKey?: string, timeoutMs?: number): Promise<unknown>;
+	/** Sends the owner-scoped abort; onDispatch fires immediately after its control frame is sent. */
+	abort(
+		idempotencyKey?: string,
+		timeoutMs?: number,
+		onDispatch?: () => void,
+		beforeDispatch?: () => void,
+	): Promise<unknown>;
 	abortAndPrompt(
 		text: string,
 		idempotencyKey?: string,
 		timeoutMs?: number,
 		observer?: PublicSdkTurnEventObserver,
+		onDispatch?: () => void,
+		beforeDispatch?: () => void,
 	): Promise<PublicSdkTurnOutcome>;
-	replyToAction(actionId: string, answer: unknown, idempotencyKey?: string, timeoutMs?: number): Promise<unknown>;
-	planApprove(input: Readonly<Record<string, unknown>>, idempotencyKey?: string, timeoutMs?: number): Promise<unknown>;
+	replyToAction(
+		actionId: string,
+		answer: unknown,
+		idempotencyKey?: string,
+		timeoutMs?: number,
+		onDispatch?: () => void,
+		beforeDispatch?: () => void,
+	): Promise<unknown>;
+	planApprove(
+		input: Readonly<Record<string, unknown>>,
+		idempotencyKey?: string,
+		timeoutMs?: number,
+		onDispatch?: () => void,
+		beforeDispatch?: () => void,
+	): Promise<unknown>;
 	answerGate(
 		gate: PublicSdkGate,
 		answer: unknown,
 		idempotencyKey?: string,
 		timeoutMs?: number,
 		observer?: PublicSdkTurnEventObserver,
+		onDispatch?: () => void,
+		beforeDispatch?: () => void,
 	): Promise<PublicSdkTurnOutcome>;
 	branchCandidates(timeoutMs?: number): Promise<readonly PublicSdkBranchCandidate[]>;
 	branch(

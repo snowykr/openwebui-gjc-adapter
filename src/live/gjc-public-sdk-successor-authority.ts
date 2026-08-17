@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
 import { authorizeBranchRegenerateCandidate, resolveBranchRegenerateAction } from "../branches/regenerate";
 import { CliLifecycleBackend } from "../gjc/cli-lifecycle-backend";
-import type { PublicSdkSessionAttachment } from "../gjc/public-sdk-contract";
+import type { PublicSdkSessionAttachment, PublicSdkSessionPort } from "../gjc/public-sdk-contract";
 import type {
 	AcknowledgedSuccessor,
 	EndpointSessionAttachmentProof,
@@ -103,7 +103,10 @@ export async function runBranchControl(
 	mapping: SessionMapping,
 	lifecycle: GjcLifecycleTransaction,
 	onAcknowledgedSuccessor?: (successor: AcknowledgedSuccessor) => Promise<void> | void,
+	onPortAvailable?: (port: PublicSdkSessionPort) => Promise<void> | void,
+	assertActive?: () => void,
 ): Promise<GjcControlResult> {
+	assertActive?.();
 	const decision = resolveBranchRegenerateAction({
 		ownerUserId: input.ownerUserId,
 		project: input.project,
@@ -115,6 +118,7 @@ export async function runBranchControl(
 	if (decision.action === "uncertain") throw new OpenWebUIControlError(`branch_lineage_${decision.reason}`);
 	const sessionRoot = resolve(input.project.sessionRoot ?? `${input.project.cwd}/.gjc/sessions`);
 	const baseline = await snapshotGjcSessionFiles(sessionRoot);
+	assertActive?.();
 	const attachment = await ensureAttachment(
 		context,
 		{
@@ -128,11 +132,15 @@ export async function runBranchControl(
 		},
 		lifecycle,
 	);
+	assertActive?.();
 	const branched = await withPort(context, attachment, lifecycle, async port => {
+		await onPortAvailable?.(port);
+		assertActive?.();
 		const authorized = authorizeBranchRegenerateCandidate(
 			decision,
 			await port.branchCandidates(context.input.turnTimeoutMs),
 		);
+		assertActive?.();
 		if (authorized.action === "uncertain") throw new OpenWebUIControlError(`branch_lineage_${authorized.reason}`);
 		return port.branch(
 			{ entryId: authorized.gjcEntryId },
@@ -148,8 +156,11 @@ export async function runBranchControl(
 	});
 	if (branched.sessionId === attachment.sessionId) throw new OpenWebUIControlError("branch_successor_identity");
 	const published = await waitForSdkEndpoint(input.project.cwd, branched.sessionId);
+	assertActive?.();
 	const acknowledgedAttachment = await successorAttachmentProof(context, attachment, published);
+	assertActive?.();
 	const sessionFile = await discoverSuccessorSessionFile(sessionRoot, baseline, branched.sessionId, input.project.cwd);
+	assertActive?.();
 	const retainedPane = retainedSuccessorPane(attachment, acknowledgedAttachment);
 	const successorAttachment: SessionAttachment = {
 		cwd: resolve(input.project.cwd),

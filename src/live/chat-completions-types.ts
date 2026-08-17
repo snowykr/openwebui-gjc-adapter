@@ -42,6 +42,7 @@ export interface LiveGatewayRunnerInput {
 	readonly messageMetadata?: Readonly<Record<string, unknown>>;
 	readonly control?: OpenWebUIControl;
 	readonly onLiveEvents?: (events: readonly OpenWebUIMessageEvent[]) => Promise<void> | void;
+	readonly signal?: AbortSignal;
 }
 
 export type LiveGatewayRunnerResult =
@@ -122,4 +123,5 @@ export interface HandleChatCompletionsInput {
 	/** Maximum same-process normal-user admission queue depth. */
 	readonly workspaceAdmissionQueueLimit?: number;
 	readonly workspaceLeaseHeartbeatMs?: number;
+	readonly signal?: AbortSignal;
 }

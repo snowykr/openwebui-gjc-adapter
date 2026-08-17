@@ -41,7 +41,7 @@ Add the required custom headers on the OpenAI connection:
 
 Normal users cannot resolve linked host projects, project-admin routes, or another principal's chat, file, message, session, replay, close, or reaper state. Administrator project operations remain available through the configured owner identity. Workspace cleanup is administrator-only: `POST /admin/workspaces/{userId}/cleanup/preview` returns a short-lived confirmation token, and `POST /admin/workspaces/{userId}/cleanup` consumes `{ "confirmationToken": "…" }`. Cleanup is lease-fenced and leaves the workspace blocked when completion is uncertain.
 
-Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. The adapter and managed image use the published `@gajae-code/ai`, `@gajae-code/bridge-client`, `@gajae-code/coding-agent`, and `@gajae-code/natives` `0.12.8` release. The image runs the published `gjc` executable as the non-root `adapter` user, including `tmux`; it does not build a private broker or apply an upstream source patch. Background task calls such as title generation are no-ops and must not create GJC sessions.
+Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. The adapter and managed image use published GJC 0.14.0 runtime packages (`@gajae-code/ai`, `@gajae-code/coding-agent`, and `@gajae-code/natives`); `@gajae-code/bridge-client` remains at its latest published compatible 0.13.3 release. The adapter uses the v0.14 terminal SDK abort contract and validates published endpoint descriptors itself because v0.14 no longer exposes raw endpoint discovery/client exports. The image runs the published `gjc` executable as the non-root `adapter` user, including `tmux`; it does not build a private broker or apply an upstream source patch. Background task calls such as title generation are no-ops and must not create GJC sessions.
 
 ## CLI first-install configuration
 
@@ -119,7 +119,7 @@ An unavailable or empty catalog, noncanonical model id, or provider-auth failure
 
 The OpenWebUI picker maps to GJC `DEFAULT`: selection is persisted as the shared agent-domain default and promoted in the currently attached session. It is not profile/preset selection, profile activation, or an all-role assignment. The adapter UI does not support selecting or activating GJC model profiles, forwarding profile options, configuration patching, or runtime reload. The bare `gjc` alias is input-only; `/v1/models` emits canonical routing ids and display-only names.
 
-GJC 0.12.8 may still activate an already-persisted `modelProfile.default` when a new GJC process starts. That startup behavior is GJC-owned and does not mean the adapter can select a profile.
+GJC 0.14.0 may still activate an already-persisted `modelProfile.default` when a new GJC process starts. That startup behavior is GJC-owned and does not mean the adapter can select a profile.
 
 To change role models, tell GJC what to persist in a normal OpenWebUI message. For example:
 

@@ -35,6 +35,8 @@ export interface GjcStartNewSessionInput {
 	readonly text: string;
 	readonly modelSelection?: NormalizedModelSelection;
 	readonly observer?: GjcTurnEventObserver;
+	readonly signal?: AbortSignal;
+	readonly principalId?: string;
 }
 
 export interface GjcContinueSessionInput extends GjcSessionAddress, GjcLifecycleScoped {
@@ -49,6 +51,9 @@ export interface GjcContinueSessionInput extends GjcSessionAddress, GjcLifecycle
 	readonly operationId: string;
 	readonly modelSelection?: NormalizedModelSelection;
 	readonly observer?: GjcTurnEventObserver;
+	readonly signal?: AbortSignal;
+	readonly principalId?: string;
+	readonly onDispatch?: () => void;
 }
 
 export interface GjcSwitchSessionInput extends GjcSessionAddress, GjcLifecycleScoped {
@@ -76,6 +81,9 @@ export interface GjcRespondWorkflowGateInput extends GjcSessionAddress, GjcLifec
 	readonly operationId: string;
 	readonly gateCorrelation?: GjcWorkflowGateCorrelation;
 	readonly observer?: GjcTurnEventObserver;
+	readonly signal?: AbortSignal;
+	readonly principalId?: string;
+	readonly onDispatch?: () => void;
 }
 
 export interface GjcWorkflowGateCorrelation {
@@ -99,6 +107,23 @@ export interface GjcTurnEvent {
 	readonly payload?: Readonly<Record<string, unknown>>;
 }
 
+export interface GjcCancelTurnInput {
+	readonly projectId: string;
+	readonly chatId: string;
+	readonly sessionId?: string;
+	readonly operationId?: string;
+	readonly principalId?: string;
+}
+
+export class GjcTurnCancelledError extends Error {
+	readonly code = "gjc_turn_cancelled";
+
+	constructor() {
+		super("GJC turn was cancelled.");
+		this.name = "GjcTurnCancelledError";
+	}
+}
+
 export interface GjcTurnResult {
 	readonly text: string;
 	readonly events: readonly GjcTurnEvent[];
@@ -118,6 +143,8 @@ export interface GjcControlResult {
 
 export interface GjcTurnRunner {
 	stop?(): void;
+	cancelTurn?(input: GjcCancelTurnInput): void | Promise<void>;
+	clearTurnCancellation?(input: GjcCancelTurnInput): void;
 	resolveSessionRoot?(cwd: string): string;
 	discardSessionAttachment?(cwd: string, sessionId: string): void;
 	withLifecyclePublication?<T>(
@@ -151,6 +178,7 @@ export interface GjcTurnRunner {
 		mapping: SessionMapping,
 		lifecycle: GjcLifecycleTransaction,
 		onAcknowledgedSuccessor?: (successor: AcknowledgedSuccessor) => Promise<void> | void,
+		onDispatch?: () => void,
 	): Promise<GjcControlResult>;
 }
 

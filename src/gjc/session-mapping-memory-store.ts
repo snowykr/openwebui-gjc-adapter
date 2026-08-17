@@ -321,6 +321,17 @@ export class SessionMappingStore {
 		assertLegacyKeyAvailable(this.authority, chatId);
 		return this.authority.recordAcknowledgedSuccessor(chatId, operationId, operationHash, successor);
 	}
+	discardPendingOperation(chatId: string, operation: Pick<SessionOperation, "id" | "ingressId" | "detail">): void {
+		assertLegacyKeyAvailable(this.authority, chatId);
+		this.authority.discardPendingOperation(chatId, operation);
+	}
+	discardPendingProvisionalOperation(
+		chatId: string,
+		operation: Pick<ProvisionalSessionOperation, "id" | "ingressId" | "detail">,
+	): void {
+		assertLegacyKeyAvailable(this.authority, chatId);
+		this.authority.discardPendingProvisionalOperation(chatId, operation);
+	}
 	recordAcknowledgedSuccessorScoped(
 		scope: SessionMappingScope,
 		operationId: string,
@@ -333,6 +344,22 @@ export class SessionMappingStore {
 			this.authority.recordAcknowledgedSuccessor(canonicalScope.key, operationId, operationHash, successor),
 			canonicalScope,
 		);
+	}
+	discardPendingOperationScoped(
+		scope: SessionMappingScope,
+		operation: Pick<SessionOperation, "id" | "ingressId" | "detail">,
+	): void {
+		const canonicalScope = canonicalScopeFor(scope);
+		assertScopedKeyAvailable(this.authority, canonicalScope);
+		this.authority.discardPendingOperation(canonicalScope.key, operation);
+	}
+	discardPendingProvisionalOperationScoped(
+		scope: SessionMappingScope,
+		operation: Pick<ProvisionalSessionOperation, "id" | "ingressId" | "detail">,
+	): void {
+		const canonicalScope = canonicalScopeFor(scope);
+		assertScopedKeyAvailable(this.authority, canonicalScope);
+		this.authority.discardPendingProvisionalOperation(canonicalScope.key, operation);
 	}
 	transitionOperation(
 		chatId: string,

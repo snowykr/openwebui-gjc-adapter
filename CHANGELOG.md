@@ -13,7 +13,7 @@
 
 ### Changed
 
-- Updated the runtime to the published GJC `0.12.8` packages and SDK v3 hybrid lifecycle backend. `/v1/models` now intersects the GJC model catalog with the SDK's active-provider catalog, so OpenWebUI is shown only models from currently connected providers. Session attachment, turns, selection, gates, and events use the public SDK; the published CLI is limited to lifecycle creation, cold resume, readiness, and proof-bound close.
+- Updated the runtime to published GJC 0.14.0 packages and SDK v3 hybrid lifecycle backend (`@gajae-code/bridge-client` remains at compatible published 0.13.3 because it has no 0.14.0 release). Terminal cancellation uses the v0.14 terminal abort contract, and endpoint descriptor discovery is adapter-owned because v0.14 retires public raw discovery/client exports. `/v1/models` now intersects the GJC model catalog with the SDK's active-provider catalog, so OpenWebUI is shown only models from currently connected providers. Session attachment, turns, selection, gates, and events use the public SDK; the published CLI is limited to lifecycle creation, cold resume, readiness, and proof-bound close.
 - Streamed assistant reasoning/text and lifecycle events while a turn is running instead of waiting for transcript completion. Workflow-gate continuations use the same streaming path.
 - Made GJC session JSONL, artifacts, and correlated SDK finals authoritative while preserving OpenWebUI rows as projections and user-owned fields during reprojection.
 - Separated project identity from model identity and made the bare `gjc` model an input-only alias; emitted model ids are canonical normalized tuples.

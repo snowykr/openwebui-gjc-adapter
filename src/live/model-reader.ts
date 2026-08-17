@@ -1,9 +1,9 @@
 import { resolve } from "node:path";
-import { listSdkSessionEndpoints } from "@gajae-code/coding-agent/sdk";
 import type { GjcRuntimeLocations } from "../contracts";
-import { attachmentFromPublishedSdkEndpoint } from "../gjc/public-sdk-attachment";
+import { snapshotPublishedSdkEndpointGenerations } from "../gjc/public-sdk-attachment";
 import type { PublicSdkSessionAttachment, PublicSdkSessionPort } from "../gjc/public-sdk-contract";
 import { PublicSdkSessionClient } from "../gjc/public-sdk-session-port";
+import { GjcTurnCancelledError } from "../gjc/turn-runner";
 import type { OpenWebUIPrincipal } from "../openwebui/auth";
 import type { UserWorkspace } from "../security/user-workspace";
 
@@ -23,15 +23,20 @@ export interface ModelReaderContext {
 	/** Lease fence proving exclusive access to the workspace. Required for normal-user readers. */
 	readonly lease?: { readonly assertFence: () => Promise<unknown> };
 	readonly correlationId?: string;
+	/** Request cancellation propagated through model preparation. */
+	readonly signal?: AbortSignal;
 }
 
 /** Alias used by callers that refer to the reader's scope rather than its context. */
 export type ModelReaderScope = ModelReaderContext;
 
-export type ModelReaderFactory = (context?: ModelReaderContext) => Promise<ModelReader>;
-export type PublicSdkAttachmentResolver = (context?: ModelReaderContext) => Promise<PublicSdkSessionAttachment>;
+export type ModelReaderFactory = (context?: ModelReaderContext, signal?: AbortSignal) => Promise<ModelReader>;
+export type PublicSdkAttachmentResolver = (
+	context?: ModelReaderContext,
+	signal?: AbortSignal,
+) => Promise<PublicSdkSessionAttachment>;
 export type PublicSdkSessionPortFactory = () => PublicSdkSessionPort;
-export type TemporaryModelAttachmentCleanup = (port: PublicSdkSessionPort) => Promise<void>;
+export type TemporaryModelAttachmentCleanup = (port?: PublicSdkSessionPort) => Promise<void>;
 
 const temporaryModelAttachmentCleanups = new WeakMap<PublicSdkSessionAttachment, TemporaryModelAttachmentCleanup>();
 
@@ -61,24 +66,91 @@ export class ModelReaderUnavailableError extends Error {
 
 export function createModelReaderFactory(input: CreateModelReaderFactoryInput): ModelReaderFactory {
 	const resolveAttachment =
-		input.resolveAttachment ?? (context => resolvePublicSdkAttachment(input.runtimeLocations, context));
-	return async (context?: ModelReaderContext): Promise<ModelReader> => {
-		await assertScopedModelReaderContext(context);
+		input.resolveAttachment ??
+		((context, signal) => resolvePublicSdkAttachment(input.runtimeLocations, context, signal));
+	return async (context?: ModelReaderContext, signal?: AbortSignal): Promise<ModelReader> => {
+		const effectiveSignal = signal ?? context?.signal;
+		const scopedContext =
+			context === undefined || effectiveSignal === undefined ? context : { ...context, signal: effectiveSignal };
+		throwIfAborted(effectiveSignal);
+		await awaitWithAbort(assertScopedModelReaderContext(scopedContext, effectiveSignal), effectiveSignal);
 		const port = (input.sessionPortFactory ?? (() => new PublicSdkSessionClient()))();
 		let attachment: PublicSdkSessionAttachment | undefined;
+		let temporaryCleanup: TemporaryModelAttachmentCleanup | undefined;
+		let attachPromise: Promise<void> | undefined;
+		let attachSettled = false;
+		let lateTemporaryCleanupPending = false;
+		let temporaryCleanupStarted = false;
+		let lateTemporaryCleanupOwnsDetach = false;
 		try {
-			attachment = await resolveAttachment(context);
-			await assertScopedModelReaderContext(context);
-			assertAttachmentScope(context, attachment);
-			await port.attach(attachment);
-			await assertScopedModelReaderContext(context);
-			return new PublicSdkModelReader(port, temporaryModelAttachmentCleanups.get(attachment));
+			const attachmentPromise = Promise.resolve(resolveAttachment(scopedContext, effectiveSignal));
+			void attachmentPromise.then(
+				lateAttachment => {
+					if (!effectiveSignal?.aborted) return;
+					const cleanup = temporaryModelAttachmentCleanups.get(lateAttachment);
+					if (cleanup !== undefined) void cleanup().catch(() => undefined);
+				},
+				() => undefined,
+			);
+			attachment = await awaitWithAbort(attachmentPromise, effectiveSignal);
+			await awaitWithAbort(assertScopedModelReaderContext(scopedContext, effectiveSignal), effectiveSignal);
+			assertAttachmentScope(scopedContext, attachment);
+			temporaryCleanup = temporaryModelAttachmentCleanups.get(attachment);
+			attachPromise = Promise.resolve(port.attach(attachment));
+			void attachPromise
+				.then(
+					async () => {
+						attachSettled = true;
+						if (!effectiveSignal?.aborted) return;
+						if (temporaryCleanup === undefined) {
+							port.detach();
+							return;
+						}
+						if (temporaryCleanupStarted) return;
+						temporaryCleanupStarted = true;
+						lateTemporaryCleanupPending = false;
+						lateTemporaryCleanupOwnsDetach = true;
+						try {
+							await temporaryCleanup(port);
+						} catch {
+							// Cancellation cleanup failures remain suppressed after late attachment.
+						}
+						port.detach();
+					},
+					async () => {
+						attachSettled = true;
+						if (!lateTemporaryCleanupPending) return;
+						lateTemporaryCleanupPending = false;
+						if (!temporaryCleanupStarted && temporaryCleanup !== undefined) {
+							temporaryCleanupStarted = true;
+							try {
+								await temporaryCleanup();
+							} catch {
+								// Cancellation cleanup failures remain suppressed after late attachment.
+							}
+						}
+						port.detach();
+					},
+				)
+				.catch(() => undefined);
+			await awaitWithAbort(attachPromise, effectiveSignal);
+			await awaitWithAbort(assertScopedModelReaderContext(scopedContext, effectiveSignal), effectiveSignal);
+			return new PublicSdkModelReader(port, temporaryCleanup);
 		} catch (error) {
+			const deferTemporaryCleanup =
+				temporaryCleanup !== undefined && attachPromise !== undefined && !attachSettled && effectiveSignal?.aborted;
+			if (deferTemporaryCleanup) lateTemporaryCleanupPending = true;
 			try {
-				if (attachment !== undefined) await temporaryModelAttachmentCleanups.get(attachment)?.(port);
+				if (!deferTemporaryCleanup && !temporaryCleanupStarted && temporaryCleanup !== undefined) {
+					temporaryCleanupStarted = true;
+					await temporaryCleanup(port);
+				}
+			} catch (cleanupError) {
+				if (!(error instanceof GjcTurnCancelledError)) throw cleanupError;
 			} finally {
-				port.detach();
+				if (!deferTemporaryCleanup && !lateTemporaryCleanupOwnsDetach) port.detach();
 			}
+			if (effectiveSignal?.aborted && !(error instanceof GjcTurnCancelledError)) throw new GjcTurnCancelledError();
 			throw error;
 		}
 	};
@@ -91,17 +163,22 @@ export function resolveGjcCliPath(gjcCommand: string): string {
 async function resolvePublicSdkAttachment(
 	runtimeLocations: GjcRuntimeLocations,
 	context?: ModelReaderContext,
+	signal?: AbortSignal,
 ): Promise<PublicSdkSessionAttachment> {
 	const workspace = context?.principal.role === "user" ? context.workspace?.root : runtimeLocations.readerWorkspace;
 	if (workspace === undefined)
 		throw new ModelReaderUnavailableError("A normal-user model reader requires a workspace.");
-	const { endpoints } = await listSdkSessionEndpoints(workspace);
-	const endpoint = [...endpoints].sort((left, right) => left.sessionId.localeCompare(right.sessionId))[0];
-	if (endpoint === undefined) throw new ModelReaderUnavailableError();
-	return attachmentFromPublishedSdkEndpoint(workspace, endpoint.sessionId, endpoint);
+	const attachments = await awaitWithAbort(snapshotPublishedSdkEndpointGenerations(workspace), signal);
+	const attachment = [...attachments.values()].sort((left, right) => left.sessionId.localeCompare(right.sessionId))[0];
+	if (attachment === undefined) throw new ModelReaderUnavailableError();
+	return attachment;
 }
 
-async function assertScopedModelReaderContext(context: ModelReaderContext | undefined): Promise<void> {
+async function assertScopedModelReaderContext(
+	context: ModelReaderContext | undefined,
+	signal?: AbortSignal,
+): Promise<void> {
+	throwIfAborted(signal);
 	if (context === undefined) return;
 	const principal = context.principal;
 	if (
@@ -121,10 +198,47 @@ async function assertScopedModelReaderContext(context: ModelReaderContext | unde
 	if (context.workspace.userId !== principal.userId)
 		throw new ModelReaderUnavailableError("The normal-user model reader workspace is bound to another principal.");
 	try {
-		await context.lease.assertFence();
+		await awaitWithAbort(context.lease.assertFence(), signal);
 	} catch (error) {
+		if (error instanceof GjcTurnCancelledError) throw error;
 		throw new ModelReaderUnavailableError("The normal-user workspace lease is no longer valid.", { cause: error });
 	}
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) throw new GjcTurnCancelledError();
+}
+
+function awaitWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (signal === undefined) return promise;
+	if (signal.aborted) {
+		void promise.catch(() => undefined);
+		return Promise.reject(new GjcTurnCancelledError());
+	}
+	return new Promise<T>((resolve, reject) => {
+		let settled = false;
+		const cleanup = () => {
+			if (settled) return;
+			settled = true;
+			signal.removeEventListener("abort", onAbort);
+		};
+		const onAbort = () => {
+			cleanup();
+			reject(new GjcTurnCancelledError());
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		promise.then(
+			value => {
+				cleanup();
+				resolve(value);
+			},
+			error => {
+				cleanup();
+				reject(error);
+			},
+		);
+		if (signal.aborted) onAbort();
+	});
 }
 
 function assertAttachmentScope(context: ModelReaderContext | undefined, attachment: PublicSdkSessionAttachment): void {

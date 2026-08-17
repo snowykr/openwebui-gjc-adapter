@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import type { NormalizedModelSelection } from "../src/contracts";
 import type {
+	GjcCancelTurnInput,
 	GjcContinueSessionInput,
 	GjcRespondWorkflowGateInput,
 	GjcSessionAddress,
@@ -20,6 +21,7 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 	readonly switches: GjcSwitchSessionInput[] = [];
 	readonly states: GjcSessionStateInput[] = [];
 	readonly gateResponses: GjcRespondWorkflowGateInput[] = [];
+	cancelTurn?: (input: GjcCancelTurnInput) => void;
 
 	state: GjcSessionState = {
 		sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",

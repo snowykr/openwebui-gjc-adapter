@@ -11,10 +11,12 @@ export interface RouteGjcTurnInput {
 	readonly text: string;
 	readonly runner: GjcTurnRunner;
 	readonly mappings: SessionMappingStore;
+	readonly principalId?: string;
 	readonly modelSelection?: NormalizedModelSelection;
 	readonly projectAssistantText?: (result: GjcTurnResult) => string;
 	readonly afterPublish?: (result: RouteGjcTurnResult) => void;
 	readonly onObservedTurn?: GjcTurnEventObserver;
+	readonly signal?: AbortSignal;
 }
 
 export interface RouteGjcTurnResult {

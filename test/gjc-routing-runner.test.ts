@@ -4,7 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveExistingOrProspectivePath } from "../src/gjc/session-file-path";
 import { SessionMappingStore } from "../src/gjc/session-router";
-import type { GjcControlResult, GjcTurnRunner } from "../src/gjc/turn-runner";
+import {
+	type GjcCancelTurnInput,
+	type GjcContinueSessionInput,
+	type GjcControlResult,
+	GjcTurnCancelledError,
+	type GjcTurnResult,
+	type GjcTurnRunner,
+} from "../src/gjc/turn-runner";
 import type { LiveGatewayRunnerInput } from "../src/live/chat-completions";
 import { controlOperationHash } from "../src/live/gjc-routing-publication";
 import { createGjcRoutingLiveGatewayRunner, createPublicSdkGjcTurnRunner } from "../src/live/gjc-routing-runner";
@@ -114,6 +121,66 @@ describe("createGjcRoutingLiveGatewayRunner", () => {
 		});
 	});
 
+	test("cancels a mapped turn and rejects its late result without replacing the mapping", async () => {
+		const turnRunner = new FakeGjcTurnRunner();
+		const mappings = new SessionMappingStore();
+		mappings.set({
+			chatId: "chat-cancelled",
+			projectId: project.id,
+			sessionId: "session-cancelled",
+			sessionFile: "/workspace/project/.gjc/sessions/session-cancelled.jsonl",
+			activeLeaf: "old-leaf",
+			rawFrameCursor: 2,
+			eventCursor: 1,
+			operationId: "user-1",
+			assistantText: "old response",
+		});
+		const cancellations: GjcCancelTurnInput[] = [];
+		turnRunner.cancelTurn = input => cancellations.push(input);
+		let resolveTurn: (result: GjcTurnResult) => void = () => {};
+		const started = new Promise<void>(resolve => {
+			turnRunner.continueSession = async (input: GjcContinueSessionInput): Promise<GjcTurnResult> => {
+				turnRunner.continues.push(input);
+				resolve();
+				return new Promise<GjcTurnResult>(complete => {
+					resolveTurn = complete;
+				});
+			};
+		});
+		const controller = new AbortController();
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings });
+		const pending = runner.run({
+			project,
+			prompt: "replacement",
+			chatId: "chat-cancelled",
+			messageId: "assistant-2",
+			userMessageId: "user-2",
+			userMessageParentId: "user-1",
+			continued: true,
+			signal: controller.signal,
+		});
+		await started;
+		controller.abort();
+		expect(cancellations).toEqual([
+			{
+				projectId: project.id,
+				chatId: "chat-cancelled",
+				sessionId: "session-cancelled",
+				operationId: "user-2",
+			},
+		]);
+		resolveTurn({
+			text: "late response",
+			events: [{ type: "assistant", text: "late response" }],
+			sessionFile: "/workspace/project/.gjc/sessions/session-cancelled.jsonl",
+			activeLeaf: "late-leaf",
+			rawFrameCursor: 9,
+			eventCursor: 5,
+		});
+		await expect(pending).rejects.toBeInstanceOf(GjcTurnCancelledError);
+		expect(mappings.get("chat-cancelled")).toMatchObject({ operationId: "user-1", assistantText: "old response" });
+	});
+
 	test("validates continuation transcripts against the SDK-owned session root", async () => {
 		// Given: a stored SDK transcript outside the adapter's configured project session root.
 		const turnRunner = new SdkSessionRootTurnRunner();
@@ -209,10 +276,12 @@ describe("createGjcRoutingLiveGatewayRunner", () => {
 				_mapping: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[1],
 				_lifecycle: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[2],
 				onAcknowledgedSuccessor?: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[3],
+				onDispatch?: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[4],
 			): Promise<GjcControlResult> {
 				this.calls++;
 				const operation = mappings.operation(input.chatId, input.userMessageId);
 				acknowledgements.push({ kind: operation?.kind ?? "", detail: operation?.detail });
+				onDispatch?.();
 				await onAcknowledgedSuccessor?.({
 					sessionId: "successor",
 					attachment: attachmentProof({ cwd: project.cwd, sessionId: "successor" }),

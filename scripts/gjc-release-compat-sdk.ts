@@ -1,6 +1,6 @@
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { SdkClient } from "@gajae-code/coding-agent/sdk";
+import { SdkClient } from "@gajae-code/bridge-client";
 
 export const lifecycleDeadlineMs = 15_000;
 export type PublishedEndpoint = {

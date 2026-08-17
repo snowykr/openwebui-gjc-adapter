@@ -17,6 +17,8 @@ export interface PublicSdkActionHost {
 		input: SdkRecord,
 		key: string | undefined,
 		timeoutMs: number,
+		onDispatch?: () => void,
+		beforeDispatch?: () => void,
 	): Promise<unknown>;
 	selectedModel(): NormalizedModelSelection | undefined;
 	setSelectedModel(selection: NormalizedModelSelection | undefined): void;
@@ -98,6 +100,8 @@ export async function reply(
 	input: SdkRecord,
 	key: string | undefined,
 	timeoutMs: number,
+	onDispatch?: () => void,
+	beforeDispatch?: () => void,
 ): Promise<unknown> {
 	const deadline = createPublicSdkDeadline(timeoutMs, `${operation} timed out after ${timeoutMs}ms`);
 	const { attachment, client } = host.connected();
@@ -106,7 +110,7 @@ export async function reply(
 		actionId === undefined ? undefined : waitForReply(client, attachment.sessionId, actionId, deadline.remaining());
 	try {
 		const value = await host.authority(deadline.remaining(), authorized =>
-			host.mutate(authorized, operation, input, key, deadline.remaining()),
+			host.mutate(authorized, operation, input, key, deadline.remaining(), onDispatch, beforeDispatch),
 		);
 		await resolution?.promise;
 		await host.authority(deadline.remaining(), async () => undefined);

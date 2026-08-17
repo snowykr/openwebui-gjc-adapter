@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { NormalizedModelSelection } from "../contracts";
 import { assertAttachmentAuthority } from "./public-sdk-attachment";
 import type {
@@ -14,6 +15,7 @@ import type {
 export {
 	assertPublishedSdkAttachmentCurrent,
 	attachmentFromPublishedSdkEndpoint,
+	readPublishedSdkEndpointDescriptor,
 	samePublishedSdkEndpoint,
 } from "./public-sdk-attachment";
 
@@ -97,41 +99,108 @@ export class PublicSdkSessionClient implements PublicSdkSessionPort {
 	): Promise<NormalizedModelSelection> {
 		return this.coordinated(() => setThinking(this.actionHost(), thinkingLevel, key, timeoutMs));
 	}
-	prompt(text: string, timeoutMs = 60_000, observer?: PublicSdkTurnEventObserver): Promise<PublicSdkTurnOutcome> {
+	prompt(
+		text: string,
+		timeoutMs = 60_000,
+		observer?: PublicSdkTurnEventObserver,
+		onDispatch?: () => void,
+		beforeDispatch?: () => void,
+	): Promise<PublicSdkTurnOutcome> {
 		return this.coordinated(() =>
-			runTurn(this.turnContext(), "turn.prompt", { text }, undefined, timeoutMs, observer),
+			runTurn(
+				this.turnContext(),
+				"turn.prompt",
+				{ text },
+				undefined,
+				timeoutMs,
+				observer,
+				onDispatch,
+				beforeDispatch,
+			),
 		);
 	}
-	steer(text: string, key?: string, timeoutMs?: number): Promise<unknown> {
-		return this.reply("turn.steer", { text }, key, timeoutMs);
+	steer(
+		text: string,
+		key?: string,
+		timeoutMs?: number,
+		onDispatch?: () => void,
+		beforeDispatch?: () => void,
+	): Promise<unknown> {
+		return this.reply("turn.steer", { text }, key, timeoutMs, onDispatch, beforeDispatch);
 	}
 	followUp(
 		text: string,
 		key?: string,
 		timeoutMs?: number,
 		observer?: PublicSdkTurnEventObserver,
+		onDispatch?: () => void,
+		beforeDispatch?: () => void,
 	): Promise<PublicSdkTurnOutcome> {
 		return this.coordinated(() =>
-			runTurn(this.turnContext(), "turn.follow_up", { text }, key, timeoutMs ?? 60_000, observer),
+			runTurn(
+				this.turnContext(),
+				"turn.follow_up",
+				{ text },
+				key,
+				timeoutMs ?? 60_000,
+				observer,
+				onDispatch,
+				beforeDispatch,
+			),
 		);
 	}
-	abort(key?: string, timeoutMs?: number): Promise<unknown> {
-		return this.reply("turn.abort", {}, key, timeoutMs);
+	abort(key?: string, timeoutMs?: number, onDispatch?: () => void, beforeDispatch?: () => void): Promise<unknown> {
+		// GJC 0.14 terminal C04 abort owns the active root turn and has an explicit
+		// idempotency requirement. It bypasses the prompt mutation lane.
+		return this.authority(timeoutMs, client =>
+			client.control(
+				"turn.abort",
+				{ mode: "terminal", scope: "turn" },
+				timeoutMs,
+				key ?? randomUUID(),
+				onDispatch,
+				beforeDispatch,
+			),
+		);
 	}
 	abortAndPrompt(
 		text: string,
 		key?: string,
 		timeoutMs?: number,
 		observer?: PublicSdkTurnEventObserver,
+		onDispatch?: () => void,
+		beforeDispatch?: () => void,
 	): Promise<PublicSdkTurnOutcome> {
 		return this.coordinated(() =>
-			runTurn(this.turnContext(), "turn.abort_and_prompt", { text }, key, timeoutMs ?? 60_000, observer),
+			runTurn(
+				this.turnContext(),
+				"turn.abort_and_prompt",
+				{ text },
+				key,
+				timeoutMs ?? 60_000,
+				observer,
+				onDispatch,
+				beforeDispatch,
+			),
 		);
 	}
-	replyToAction(id: string, answer: unknown, key?: string, timeoutMs?: number): Promise<unknown> {
-		return this.reply("ask.answer", { id, answer }, key, timeoutMs);
+	replyToAction(
+		id: string,
+		answer: unknown,
+		key?: string,
+		timeoutMs?: number,
+		onDispatch?: () => void,
+		beforeDispatch?: () => void,
+	): Promise<unknown> {
+		return this.reply("ask.answer", { id, answer }, key, timeoutMs, onDispatch, beforeDispatch);
 	}
-	planApprove(input: SdkRecord, key?: string, timeoutMs = 60_000): Promise<unknown> {
+	planApprove(
+		input: SdkRecord,
+		key?: string,
+		timeoutMs = 60_000,
+		onDispatch?: () => void,
+		beforeDispatch?: () => void,
+	): Promise<unknown> {
 		return this.coordinated(() =>
 			runTurn(
 				this.turnContext(),
@@ -139,6 +208,9 @@ export class PublicSdkSessionClient implements PublicSdkSessionPort {
 				{ ...input, expectedSessionId: this.connected().attachment.sessionId },
 				key,
 				timeoutMs,
+				undefined,
+				onDispatch,
+				beforeDispatch,
 			),
 		);
 	}
@@ -148,8 +220,12 @@ export class PublicSdkSessionClient implements PublicSdkSessionPort {
 		key?: string,
 		timeoutMs = 60_000,
 		observer?: PublicSdkTurnEventObserver,
+		onDispatch?: () => void,
+		beforeDispatch?: () => void,
 	): Promise<PublicSdkTurnOutcome> {
-		return this.coordinated(() => runGateTurn(this.turnContext(), gate, answer, key, timeoutMs, observer));
+		return this.coordinated(() =>
+			runGateTurn(this.turnContext(), gate, answer, key, timeoutMs, observer, onDispatch, beforeDispatch),
+		);
 	}
 
 	branch(
@@ -182,8 +258,17 @@ export class PublicSdkSessionClient implements PublicSdkSessionPort {
 		await this.coordinated(() => closeSession(this.actionHost(), key, timeoutMs));
 	}
 
-	async reply(operation: string, input: SdkRecord, key?: string, timeoutMs = 60_000): Promise<unknown> {
-		return this.coordinated(() => reply(this.actionHost(), operation, input, key, timeoutMs));
+	async reply(
+		operation: string,
+		input: SdkRecord,
+		key?: string,
+		timeoutMs = 60_000,
+		onDispatch?: () => void,
+		beforeDispatch?: () => void,
+	): Promise<unknown> {
+		return this.coordinated(() =>
+			reply(this.actionHost(), operation, input, key, timeoutMs, onDispatch, beforeDispatch),
+		);
 	}
 
 	private turnContext() {
@@ -193,15 +278,22 @@ export class PublicSdkSessionClient implements PublicSdkSessionPort {
 			client,
 			authority: <T>(timeoutMs: number, effect: (authorized: SdkV3Client) => Promise<T>) =>
 				this.authority(timeoutMs, effect),
-			mutate: (operation: string, input: SdkRecord, key?: string, timeoutMs?: number) =>
-				this.mutate(client, operation, input, key, timeoutMs),
+			mutate: (
+				operation: string,
+				input: SdkRecord,
+				key?: string,
+				timeoutMs?: number,
+				onDispatch?: () => void,
+				beforeDispatch?: () => void,
+			) => this.mutate(client, operation, input, key, timeoutMs, onDispatch, beforeDispatch),
 		};
 	}
 
 	private actionHost(): PublicSdkActionHost {
 		return {
 			authority: (timeoutMs, effect, post) => this.authority(timeoutMs, effect, post),
-			mutate: (client, operation, input, key, timeoutMs) => this.mutate(client, operation, input, key, timeoutMs),
+			mutate: (client, operation, input, key, timeoutMs, onDispatch, beforeDispatch) =>
+				this.mutate(client, operation, input, key, timeoutMs, onDispatch, beforeDispatch),
 			selectedModel: () => this.#selectedModel,
 			setSelectedModel: selection => {
 				this.#selectedModel = selection;
@@ -216,13 +308,15 @@ export class PublicSdkSessionClient implements PublicSdkSessionPort {
 		input: SdkRecord,
 		key?: string,
 		timeoutMs?: number,
+		onDispatch?: () => void,
+		beforeDispatch?: () => void,
 	): Promise<unknown> {
 		return this.coordinated(async () => {
 			if (this.#mutationInFlight)
 				throw new SdkV3OperationError("mutation_in_flight", "Only one mutation may run per session attachment");
 			this.#mutationInFlight = true;
 			try {
-				return await client.control(operation, input, timeoutMs, key);
+				return await client.control(operation, input, timeoutMs, key, onDispatch, beforeDispatch);
 			} finally {
 				this.#mutationInFlight = false;
 			}

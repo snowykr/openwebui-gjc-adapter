@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { withPublicSdkSessionMutationCoordinator } from "../src/gjc/public-sdk-session-port";
-import { waitForReply } from "../src/gjc/public-sdk-turns";
+import { runTurn, waitForReply } from "../src/gjc/public-sdk-turns";
 import type { SdkV3Client } from "../src/gjc/sdk-v3-client";
 import type { SdkRecord } from "../src/gjc/sdk-v3-protocol";
 import { SdkTerminalWindow } from "../src/gjc/sdk-v3-terminal";
@@ -157,7 +157,6 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 			await fixture.dispose();
 		}
 	});
-
 	test("Given a gate answer opens another gate When continuing Then the next gate remains observable and answerable", async () => {
 		const fixture = createSdkTransportFixture("workflow_gate_sequence");
 		try {
@@ -213,6 +212,100 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 		} finally {
 			await fixture.dispose();
 		}
+	});
+	test("Given cancellation during the gate baseline When retrying Then prompt dispatch is marked only on the retry", async () => {
+		const listeners = new Set<(frame: SdkRecord) => void>();
+		let baselineStarted!: () => void;
+		const baselineReady = new Promise<void>(resolve => {
+			baselineStarted = resolve;
+		});
+		let releaseBaseline!: () => void;
+		let baselineQueries = 0;
+		let dispatches = 0;
+		let cancelled = false;
+		const emit = (frame: SdkRecord) => {
+			for (const listener of listeners) listener(frame);
+		};
+		const client = {
+			onFrame(listener: (frame: SdkRecord) => void) {
+				listeners.add(listener);
+				return () => listeners.delete(listener);
+			},
+			queryAll: async () => {
+				baselineQueries += 1;
+				if (baselineQueries === 1) {
+					baselineStarted();
+					await new Promise<void>(resolve => {
+						releaseBaseline = resolve;
+					});
+				}
+				return [];
+			},
+		} as unknown as SdkV3Client;
+		const context = {
+			client,
+			attachment: { sessionId: "session-baseline-retry" },
+			authority: async <T>(_timeoutMs: number, effect: (authorized: SdkV3Client) => Promise<T>) => effect(client),
+			mutate: async (
+				_operation: string,
+				_input: SdkRecord,
+				_key: string | undefined,
+				_timeoutMs: number | undefined,
+				onDispatch?: () => void,
+				beforeDispatch?: () => void,
+			) => {
+				beforeDispatch?.();
+				onDispatch?.();
+				setTimeout(
+					() =>
+						emit({
+							type: "agent_end",
+							sessionId: "session-baseline-retry",
+							commandId: "command-retry",
+							turnId: "turn-retry",
+						}),
+					0,
+				);
+				return { commandId: "command-retry", turnId: "turn-retry" };
+			},
+		} as Parameters<typeof runTurn>[0];
+		const onDispatch = () => {
+			dispatches += 1;
+		};
+		const beforeDispatch = () => {
+			if (cancelled) throw new Error("cancelled before prompt dispatch");
+		};
+
+		const first = runTurn(
+			context,
+			"turn.prompt",
+			{ text: "first" },
+			undefined,
+			500,
+			undefined,
+			onDispatch,
+			beforeDispatch,
+		);
+		await baselineReady;
+		cancelled = true;
+		releaseBaseline();
+		await expect(first).rejects.toThrow("cancelled before prompt dispatch");
+		expect(dispatches).toBe(0);
+
+		cancelled = false;
+		const retry = runTurn(
+			context,
+			"turn.prompt",
+			{ text: "retry" },
+			undefined,
+			500,
+			undefined,
+			onDispatch,
+			beforeDispatch,
+		);
+		await expect(retry).resolves.toMatchObject({ events: expect.any(Array) });
+		expect(dispatches).toBe(1);
+		expect(baselineQueries).toBe(2);
 	});
 
 	test("Given finalized output and idle without a lifecycle terminal When prompting Then it cannot end the turn", async () => {
@@ -305,6 +398,26 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 			for (const operation of ["turn.steer", "turn.abort", "ask.answer", "workflow.plan_approve"]) {
 				expectSdkRequest(fixture.server.frames, "control_request", operation);
 			}
+		} finally {
+			await fixture.dispose();
+		}
+	});
+	test("Given an active prompt When its owning port aborts Then C04 bypasses the prompt mutation lane", async () => {
+		const fixture = createSdkTransportFixture("controls");
+		try {
+			await fixture.attach();
+			const pendingPrompt = fixture.port.prompt("long-running", 500);
+			await Bun.sleep(10);
+			await expect(
+				Promise.race([
+					fixture.port.abort("owned-abort", 500),
+					Bun.sleep(100).then(() => {
+						throw new Error("C04 abort was queued behind the active prompt");
+					}),
+				]),
+			).resolves.toMatchObject({ status: "accepted" });
+			expectSdkRequest(fixture.server.frames, "control_request", "turn.abort");
+			await expect(pendingPrompt).rejects.toMatchObject({ code: "timeout" });
 		} finally {
 			await fixture.dispose();
 		}

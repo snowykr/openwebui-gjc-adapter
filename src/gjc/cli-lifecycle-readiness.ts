@@ -1,5 +1,5 @@
-import { readSdkSessionEndpoint } from "@gajae-code/coding-agent/sdk";
 import type { CliLifecycleResult } from "./cli-lifecycle-types";
+import { readPublishedSdkEndpointDescriptor } from "./public-sdk-attachment";
 import { type OwnedTmuxPane, proveTmuxPaneOwnership, type TmuxCommandRunner } from "./tmux-ownership";
 
 export async function readCliSession(
@@ -40,7 +40,8 @@ export async function readCliSession(
 		}
 		if (sessionId !== undefined) {
 			try {
-				if ((await readSdkSessionEndpoint(cwd, sessionId)) !== null) return { status: "closed", value: sessionId };
+				if ((await readPublishedSdkEndpointDescriptor(cwd, sessionId)) !== null)
+					return { status: "closed", value: sessionId };
 			} catch (error) {
 				return {
 					status: "uncertain",

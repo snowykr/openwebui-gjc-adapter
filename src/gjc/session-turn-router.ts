@@ -6,7 +6,7 @@ import { copyAttachment, hashTurnIngress, normalizeModelSelection } from "./sess
 import { resolveEffectiveGjcSessionRoot } from "./session-root";
 import type { RouteGjcTurnInput, RouteGjcTurnResult } from "./session-turn-router-contract";
 import { startNewMappedSession } from "./session-turn-router-new";
-import { type GjcTurnRunner, getProjectSessionRoot } from "./turn-runner";
+import { GjcTurnCancelledError, type GjcTurnRunner, getProjectSessionRoot } from "./turn-runner";
 
 export interface ScopedRouteGjcTurnInput extends RouteGjcTurnInput {
 	readonly principalId?: string;
@@ -88,6 +88,20 @@ export function scopedSessionMappingStore(
 			requireChat(actual);
 			return mappings.recordAcknowledgedSuccessorScoped(scope, operationId, operationHash, successor);
 		},
+		discardPendingOperation: (
+			actual: string,
+			operation: Parameters<SessionMappingStore["discardPendingOperation"]>[1],
+		) => {
+			requireChat(actual);
+			mappings.discardPendingOperationScoped(scope, operation);
+		},
+		discardPendingProvisionalOperation: (
+			actual: string,
+			operation: Parameters<SessionMappingStore["discardPendingProvisionalOperation"]>[1],
+		) => {
+			requireChat(actual);
+			mappings.discardPendingProvisionalOperationScoped(scope, operation);
+		},
 		transitionOperation: (
 			actual: string,
 			operationId: string,
@@ -160,163 +174,229 @@ export async function routeGjcTurn(input: ScopedRouteGjcTurnInput): Promise<Rout
 			? scopedSessionMappingStore(input.mappings, input.principalId, input.chatId)
 			: input.mappings;
 	const scopedInput = mappings === input.mappings ? input : { ...input, mappings };
-	const existing = mappings.get(input.chatId);
-	const operationHash = hashTurnIngress({
-		chatId: input.chatId,
+	const initialMapping = mappings.get(input.chatId);
+	const cancellation = {
 		projectId: input.project.id,
-		parentId: input.parentId,
-		text: input.text,
-		...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
-	});
-	const priorOperation = existing === undefined ? undefined : mappings.operation(input.chatId, input.userMessageId);
-	if (priorOperation?.state === "complete") {
-		if (priorOperation.detail !== operationHash)
-			throw new Error(`GJC operation ${input.userMessageId} conflicts with a different ingress payload.`);
-		const replayed = replayOperation(input.userMessageId, priorOperation.result);
-		// Journal results no longer carry the event stream; the record mapping
-		// retains it. Replay the CURRENT record mapping so projection rows hash
-		// identically to completion, and skip re-enqueueing a superseded
-		// operation whose rows already exist (they settle as obsolete).
-		const currentMapping = mappings.get(input.chatId);
-		const isCurrentReplay = currentMapping !== undefined && currentMapping.operationId === input.userMessageId;
-		const replayMapping = isCurrentReplay ? currentMapping! : replayed.mapping;
+		chatId: input.chatId,
+		operationId: input.userMessageId,
+		...(input.principalId === undefined ? {} : { principalId: input.principalId }),
+		...(initialMapping?.projectId === input.project.id ? { sessionId: initialMapping.sessionId } : {}),
+	};
+	let cancellationRequested = false;
+	const onAbort = () => {
+		if (cancellationRequested) return;
+		cancellationRequested = true;
+		void Promise.resolve(input.runner.cancelTurn?.(cancellation)).catch(() => undefined);
+	};
+	input.signal?.addEventListener("abort", onAbort, { once: true });
+	if (input.signal?.aborted) onAbort();
+	try {
+		throwIfAborted(input.signal);
+		const existing = mappings.get(input.chatId);
+		const operationHash = hashTurnIngress({
+			chatId: input.chatId,
+			projectId: input.project.id,
+			parentId: input.parentId,
+			text: input.text,
+			...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
+		});
+		const priorOperation = existing === undefined ? undefined : mappings.operation(input.chatId, input.userMessageId);
+		if (priorOperation?.state === "complete") {
+			if (priorOperation.detail !== operationHash)
+				throw new Error(`GJC operation ${input.userMessageId} conflicts with a different ingress payload.`);
+			const replayed = replayOperation(input.userMessageId, priorOperation.result);
+			// Journal results no longer carry the event stream; the record mapping
+			// retains it. Replay the CURRENT record mapping so projection rows hash
+			// identically to completion, and skip re-enqueueing a superseded
+			// operation whose rows already exist (they settle as obsolete).
+			const currentMapping = mappings.get(input.chatId);
+			const isCurrentReplay = currentMapping !== undefined && currentMapping.operationId === input.userMessageId;
+			const replayMapping = isCurrentReplay ? currentMapping! : replayed.mapping;
+			const sessionRoot = resolveEffectiveGjcSessionRoot(
+				input.project.cwd,
+				getProjectSessionRoot(input.project),
+				input.runner.resolveSessionRoot,
+			);
+			return await withLifecyclePublication(
+				input.runner,
+				{
+					cwd: input.project.cwd,
+					sessionRoot,
+					projectId: replayed.mapping.projectId,
+					chatId: replayed.mapping.chatId,
+					sessionId: replayed.mapping.sessionId,
+					sessionFile: replayed.mapping.sessionFile,
+					recoveryAttachment: replayed.mapping.attachment,
+				},
+				async () => {
+					throwIfAborted(input.signal);
+					if (isCurrentReplay) input.afterPublish?.({ ...replayed, mapping: replayMapping });
+					throwIfAborted(input.signal);
+					return { ...replayed, mapping: replayMapping };
+				},
+			);
+		}
+		if (priorOperation?.state === "pending") {
+			throw new Error(`GJC operation ${input.userMessageId} is pending and cannot be replayed.`);
+		}
+		if (priorOperation?.state === "uncertain" || priorOperation?.state === "conflict") {
+			throw new Error(`GJC operation ${input.userMessageId} requires reconciliation.`);
+		}
+
+		if (existing === undefined && mappings.provisionalOperation(input.chatId, input.userMessageId) !== undefined)
+			return await recoverInitialMappedSession(scopedInput, operationHash);
+		if (existing === undefined || existing.projectId !== input.project.id) {
+			return await startNewMappedSession(scopedInput);
+		}
+
 		const sessionRoot = resolveEffectiveGjcSessionRoot(
 			input.project.cwd,
 			getProjectSessionRoot(input.project),
 			input.runner.resolveSessionRoot,
 		);
-		return withLifecyclePublication(
-			input.runner,
-			{
-				cwd: input.project.cwd,
+		let existingSessionFile: string | undefined;
+		try {
+			existingSessionFile = await ensureSdkSessionFile(
+				input.project,
+				existing.sessionFile,
 				sessionRoot,
-				projectId: replayed.mapping.projectId,
-				chatId: replayed.mapping.chatId,
-				sessionId: replayed.mapping.sessionId,
-				sessionFile: replayed.mapping.sessionFile,
-				recoveryAttachment: replayed.mapping.attachment,
-			},
-			async () => {
-				if (isCurrentReplay) input.afterPublish?.({ ...replayed, mapping: replayMapping });
-				return { ...replayed, mapping: replayMapping };
-			},
-		);
-	}
-	if (priorOperation?.state === "pending") {
-		throw new Error(`GJC operation ${input.userMessageId} is pending and cannot be replayed.`);
-	}
-	if (priorOperation?.state === "uncertain" || priorOperation?.state === "conflict") {
-		throw new Error(`GJC operation ${input.userMessageId} requires reconciliation.`);
-	}
-
-	if (existing === undefined && mappings.provisionalOperation(input.chatId, input.userMessageId) !== undefined)
-		return recoverInitialMappedSession(scopedInput, operationHash);
-	if (existing === undefined || existing.projectId !== input.project.id) {
-		return startNewMappedSession(scopedInput);
-	}
-
-	const sessionRoot = resolveEffectiveGjcSessionRoot(
-		input.project.cwd,
-		getProjectSessionRoot(input.project),
-		input.runner.resolveSessionRoot,
-	);
-	const operation = beginDurableOperation(scopedInput, mappings);
-	let existingSessionFile: string | undefined;
-	try {
-		existingSessionFile = await ensureSdkSessionFile(
-			input.project,
-			existing.sessionFile,
+				existing.sessionId,
+			);
+		} catch (error) {
+			if (input.signal?.aborted) throw error;
+			const operation = beginDurableOperation(scopedInput, mappings);
+			mappings.transitionOperation(input.chatId, operation.key, "uncertain", operation.hash);
+			throw error;
+		}
+		const address = {
+			cwd: input.project.cwd,
 			sessionRoot,
-			existing.sessionId,
-		);
-	} catch (error) {
-		mappings.transitionOperation(input.chatId, operation.key, "uncertain", operation.hash);
-		throw error;
-	}
-	const address = {
-		cwd: input.project.cwd,
-		sessionRoot,
-		projectId: input.project.id,
-		sessionId: existing.sessionId,
-		chatId: input.chatId,
-	};
-	return withLifecyclePublication(
-		input.runner,
-		{ ...address, sessionFile: existingSessionFile, recoveryAttachment: existing.attachment },
-		async lifecycle => {
-			try {
-				await input.runner.switchSession({
-					...address,
-					lifecycle,
-					sessionFile: existingSessionFile,
-					recoveryAttachment: existing.attachment,
-				});
-				const state = await input.runner.getState({
-					...address,
-					lifecycle,
-					sessionFile: existingSessionFile,
-					recoveryAttachment: existing.attachment,
-				});
-				const result = await input.runner.continueSession({
-					...address,
-					sessionFile: existingSessionFile,
-					userMessageId: input.userMessageId,
-					parentId: input.parentId,
-					text: input.text,
-					activeLeaf: state.activeLeaf,
-					rawFrameCursor: state.rawFrameCursor,
-					eventCursor: state.eventCursor,
-					operationId: input.userMessageId,
-					recoveryAttachment: existing.attachment,
-					lifecycle,
-					...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
-					...(input.onObservedTurn === undefined ? {} : { observer: input.onObservedTurn }),
-				});
-				const completedSelection =
-					input.modelSelection === undefined ? undefined : normalizeModelSelection(result.modelSelection);
-				if (input.modelSelection !== undefined && completedSelection === undefined)
-					throw new TypeError("Missing selected GJC outcome");
-				const sessionFile = [result.sessionFile, state.sessionFile, existingSessionFile].find(
-					candidate => candidate !== undefined,
-				);
-				const assistantText = input.projectAssistantText?.(result) ?? result.text;
-				const nextMapping = {
-					chatId: input.chatId,
-					projectId: input.project.id,
-					sessionId: existing.sessionId,
-					sessionFile:
-						sessionFile === undefined ? undefined : validateSessionFile(input.project, sessionFile, sessionRoot),
-					activeLeaf: result.activeLeaf ?? state.activeLeaf,
-					rawFrameCursor: result.rawFrameCursor,
-					eventCursor: result.eventCursor,
-					operationId: input.userMessageId,
-					assistantText,
-					events: result.events,
-					...((result.attachment ?? state.attachment ?? existing.attachment) === undefined
-						? {}
-						: { attachment: result.attachment ?? state.attachment ?? existing.attachment }),
-					...(completedSelection === undefined ? {} : { modelSelection: completedSelection }),
-				};
-				const proof = result.attachment ?? state.attachment ?? existing.attachment;
-				if (proof === undefined) throw new Error("GJC turn did not return a validated current attachment.");
-				const mapping = await lifecycle.publish(proof, () => {
-					const published = mappings.completeOperationWithMapping(
-						input.chatId,
-						operation.key,
-						operation.hash,
-						nextMapping,
-						"turn",
+			projectId: input.project.id,
+			sessionId: existing.sessionId,
+			chatId: input.chatId,
+		};
+		return await withLifecyclePublication(
+			input.runner,
+			{ ...address, sessionFile: existingSessionFile, recoveryAttachment: existing.attachment },
+			async lifecycle => {
+				throwIfAborted(input.signal);
+				const operation = beginDurableOperation(scopedInput, mappings);
+				let promptDispatched = false;
+				try {
+					await input.runner.switchSession({
+						...address,
+						lifecycle,
+						sessionFile: existingSessionFile,
+						recoveryAttachment: existing.attachment,
+					});
+					throwIfAborted(input.signal);
+					const state = await input.runner.getState({
+						...address,
+						lifecycle,
+						sessionFile: existingSessionFile,
+						recoveryAttachment: existing.attachment,
+					});
+					throwIfAborted(input.signal);
+					const result = await input.runner.continueSession({
+						...address,
+						sessionFile: existingSessionFile,
+						userMessageId: input.userMessageId,
+						parentId: input.parentId,
+						text: input.text,
+						activeLeaf: state.activeLeaf,
+						rawFrameCursor: state.rawFrameCursor,
+						eventCursor: state.eventCursor,
+						operationId: input.userMessageId,
+						recoveryAttachment: existing.attachment,
+						lifecycle,
+						...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
+						...(input.onObservedTurn === undefined ? {} : { observer: input.onObservedTurn }),
+						...(input.signal === undefined ? {} : { signal: input.signal }),
+						...(input.principalId === undefined ? {} : { principalId: input.principalId }),
+						onDispatch: () => {
+							promptDispatched = true;
+						},
+					});
+					throwIfAborted(input.signal);
+					const completedSelection =
+						input.modelSelection === undefined ? undefined : normalizeModelSelection(result.modelSelection);
+					if (input.modelSelection !== undefined && completedSelection === undefined)
+						throw new TypeError("Missing selected GJC outcome");
+					const sessionFile = [result.sessionFile, state.sessionFile, existingSessionFile].find(
+						candidate => candidate !== undefined,
 					);
-					input.afterPublish?.({ assistantText, events: result.events, mapping: published });
-					return published;
-				});
-				return { assistantText, events: result.events, mapping };
-			} catch (error) {
-				mappings.transitionOperation(input.chatId, operation.key, "uncertain", operation.hash);
-				throw error;
-			}
-		},
-	);
+					const assistantText = input.projectAssistantText?.(result) ?? result.text;
+					const nextMapping = {
+						chatId: input.chatId,
+						projectId: input.project.id,
+						sessionId: existing.sessionId,
+						sessionFile:
+							sessionFile === undefined
+								? undefined
+								: validateSessionFile(input.project, sessionFile, sessionRoot),
+						activeLeaf: result.activeLeaf ?? state.activeLeaf,
+						rawFrameCursor: result.rawFrameCursor,
+						eventCursor: result.eventCursor,
+						operationId: input.userMessageId,
+						assistantText,
+						events: result.events,
+						...((result.attachment ?? state.attachment ?? existing.attachment) === undefined
+							? {}
+							: { attachment: result.attachment ?? state.attachment ?? existing.attachment }),
+						...(completedSelection === undefined ? {} : { modelSelection: completedSelection }),
+					};
+					const proof = result.attachment ?? state.attachment ?? existing.attachment;
+					if (proof === undefined) throw new Error("GJC turn did not return a validated current attachment.");
+					const mapping = await lifecycle.publish(proof, () => {
+						throwIfAborted(input.signal);
+						const published = mappings.completeOperationWithMapping(
+							input.chatId,
+							operation.key,
+							operation.hash,
+							nextMapping,
+							"turn",
+						);
+						input.afterPublish?.({ assistantText, events: result.events, mapping: published });
+						return published;
+					});
+					return { assistantText, events: result.events, mapping };
+				} catch (error) {
+					if (error instanceof GjcTurnCancelledError && !promptDispatched) {
+						try {
+							mappings.discardPendingOperation(input.chatId, {
+								id: operation.key,
+								ingressId: operation.key,
+								detail: operation.hash,
+							});
+						} catch (discardError) {
+							try {
+								mappings.transitionOperation(input.chatId, operation.key, "uncertain", operation.hash);
+							} catch (transitionError) {
+								throw new AggregateError(
+									[error, discardError, transitionError],
+									"pre-prompt cancellation operation cleanup is uncertain",
+								);
+							}
+							throw new AggregateError(
+								[error, discardError],
+								"pre-prompt cancellation operation cleanup is uncertain",
+							);
+						}
+						throw error;
+					}
+					mappings.transitionOperation(input.chatId, operation.key, "uncertain", operation.hash);
+					throw error;
+				}
+			},
+		);
+	} finally {
+		input.signal?.removeEventListener("abort", onAbort);
+		input.runner.clearTurnCancellation?.(cancellation);
+	}
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) throw new GjcTurnCancelledError();
 }
 
 function beginDurableOperation(
