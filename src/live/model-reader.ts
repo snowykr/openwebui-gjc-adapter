@@ -76,6 +76,12 @@ export function createModelReaderFactory(input: CreateModelReaderFactoryInput): 
 		await awaitWithAbort(assertScopedModelReaderContext(scopedContext, effectiveSignal), effectiveSignal);
 		const port = (input.sessionPortFactory ?? (() => new PublicSdkSessionClient()))();
 		let attachment: PublicSdkSessionAttachment | undefined;
+		let temporaryCleanup: TemporaryModelAttachmentCleanup | undefined;
+		let attachPromise: Promise<void> | undefined;
+		let attachSettled = false;
+		let lateTemporaryCleanupPending = false;
+		let temporaryCleanupStarted = false;
+		let lateTemporaryCleanupOwnsDetach = false;
 		try {
 			const attachmentPromise = Promise.resolve(resolveAttachment(scopedContext, effectiveSignal));
 			void attachmentPromise.then(
@@ -89,23 +95,53 @@ export function createModelReaderFactory(input: CreateModelReaderFactoryInput): 
 			attachment = await awaitWithAbort(attachmentPromise, effectiveSignal);
 			await awaitWithAbort(assertScopedModelReaderContext(scopedContext, effectiveSignal), effectiveSignal);
 			assertAttachmentScope(scopedContext, attachment);
-			const attachPromise = Promise.resolve(port.attach(attachment));
-			void attachPromise.then(
-				() => {
-					if (effectiveSignal?.aborted) port.detach();
-				},
-				() => undefined,
-			);
+			temporaryCleanup = temporaryModelAttachmentCleanups.get(attachment);
+			attachPromise = Promise.resolve(port.attach(attachment));
+			void attachPromise
+				.then(
+					async () => {
+						attachSettled = true;
+						if (!effectiveSignal?.aborted) return;
+						if (temporaryCleanup === undefined) {
+							port.detach();
+							return;
+						}
+						if (temporaryCleanupStarted) return;
+						temporaryCleanupStarted = true;
+						lateTemporaryCleanupPending = false;
+						lateTemporaryCleanupOwnsDetach = true;
+						try {
+							await temporaryCleanup(port);
+						} catch {
+							// Cancellation cleanup failures remain suppressed after late attachment.
+						}
+						port.detach();
+					},
+					() => {
+						attachSettled = true;
+						if (lateTemporaryCleanupPending) {
+							lateTemporaryCleanupPending = false;
+							port.detach();
+						}
+					},
+				)
+				.catch(() => undefined);
 			await awaitWithAbort(attachPromise, effectiveSignal);
 			await awaitWithAbort(assertScopedModelReaderContext(scopedContext, effectiveSignal), effectiveSignal);
-			return new PublicSdkModelReader(port, temporaryModelAttachmentCleanups.get(attachment));
+			return new PublicSdkModelReader(port, temporaryCleanup);
 		} catch (error) {
+			const deferTemporaryCleanup =
+				temporaryCleanup !== undefined && attachPromise !== undefined && !attachSettled && effectiveSignal?.aborted;
+			if (deferTemporaryCleanup) lateTemporaryCleanupPending = true;
 			try {
-				if (attachment !== undefined) await temporaryModelAttachmentCleanups.get(attachment)?.(port);
+				if (!deferTemporaryCleanup && !temporaryCleanupStarted && temporaryCleanup !== undefined) {
+					temporaryCleanupStarted = true;
+					await temporaryCleanup(port);
+				}
 			} catch (cleanupError) {
 				if (!(error instanceof GjcTurnCancelledError)) throw cleanupError;
 			} finally {
-				port.detach();
+				if (!deferTemporaryCleanup && !lateTemporaryCleanupOwnsDetach) port.detach();
 			}
 			if (effectiveSignal?.aborted && !(error instanceof GjcTurnCancelledError)) throw new GjcTurnCancelledError();
 			throw error;

@@ -101,6 +101,54 @@ describe("createModelReaderFactory", () => {
 		expect(port.calls).toEqual(["attach", "detach", "detach"]);
 		expect(port.attached).toBe(false);
 	});
+	test("closes a temporary attachment after a cancelled attach completes", async () => {
+		const controller = new AbortController();
+		let attachStarted!: () => void;
+		let releaseAttach!: () => void;
+		const started = new Promise<void>(resolve => {
+			attachStarted = resolve;
+		});
+		const attach = new Promise<void>(resolve => {
+			releaseAttach = resolve;
+		});
+		let resolveCleanup!: () => void;
+		const cleanupFinished = new Promise<void>(resolve => {
+			resolveCleanup = resolve;
+		});
+		let cleanupReceivedAttachedPort = false;
+		const port = new FakePublicSessionPort();
+		const temporaryAttachment = registerTemporaryModelAttachment({ ...attachment }, async activePort => {
+			cleanupReceivedAttachedPort = activePort === port && port.attached;
+			if (activePort !== undefined) await activePort.closeSession();
+			resolveCleanup();
+		});
+		port.attach = async value => {
+			port.calls.push("attach");
+			port.attachments.push(value);
+			attachStarted();
+			await attach;
+			port.attached = true;
+		};
+		const pending = createModelReaderFactory({
+			cliPath: "/opt/gjc",
+			runtimeLocations,
+			resolveAttachment: async () => temporaryAttachment,
+			sessionPortFactory: () => port,
+		})(undefined, controller.signal);
+
+		await started;
+		controller.abort();
+		await expect(pending).rejects.toBeInstanceOf(GjcTurnCancelledError);
+		expect(port.calls).toEqual(["attach"]);
+
+		releaseAttach();
+		await cleanupFinished;
+		await Promise.resolve();
+
+		expect(cleanupReceivedAttachedPort).toBe(true);
+		expect(port.calls).toEqual(["attach", "closeSession", "detach"]);
+		expect(port.attached).toBe(false);
+	});
 	test("cleans up a late temporary attachment without an unattached port", async () => {
 		const controller = new AbortController();
 		let resolveAttachment!: (value: PublicSdkSessionAttachment) => void;
