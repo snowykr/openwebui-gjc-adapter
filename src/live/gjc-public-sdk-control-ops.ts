@@ -51,7 +51,6 @@ export async function runControl(
 	if (control.operation === "branch") {
 		const principalId =
 			typeof input.ownerUserId === "string" && input.ownerUserId.trim().length > 0 ? input.ownerUserId : undefined;
-		const idempotencyKey = `${input.chatId}:${input.userMessageId}`;
 		const terminalAbortKey = terminalAbortIdempotencyKey(input.chatId, input.userMessageId);
 		let cancelled = false;
 		let activePort: PublicSdkSessionPort | undefined;

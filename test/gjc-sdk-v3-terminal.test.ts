@@ -245,8 +245,7 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 		const context = {
 			client,
 			attachment: { sessionId: "session-baseline-retry" },
-			authority: async <T>(_timeoutMs: number, effect: (authorized: SdkV3Client) => Promise<T>) =>
-				effect(client),
+			authority: async <T>(_timeoutMs: number, effect: (authorized: SdkV3Client) => Promise<T>) => effect(client),
 			mutate: async (
 				_operation: string,
 				_input: SdkRecord,
@@ -257,7 +256,16 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 			) => {
 				beforeDispatch?.();
 				onDispatch?.();
-				setTimeout(() => emit({ type: "agent_end", sessionId: "session-baseline-retry", commandId: "command-retry", turnId: "turn-retry" }), 0);
+				setTimeout(
+					() =>
+						emit({
+							type: "agent_end",
+							sessionId: "session-baseline-retry",
+							commandId: "command-retry",
+							turnId: "turn-retry",
+						}),
+					0,
+				);
 				return { commandId: "command-retry", turnId: "turn-retry" };
 			},
 		} as Parameters<typeof runTurn>[0];
@@ -268,7 +276,16 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 			if (cancelled) throw new Error("cancelled before prompt dispatch");
 		};
 
-		const first = runTurn(context, "turn.prompt", { text: "first" }, undefined, 500, undefined, onDispatch, beforeDispatch);
+		const first = runTurn(
+			context,
+			"turn.prompt",
+			{ text: "first" },
+			undefined,
+			500,
+			undefined,
+			onDispatch,
+			beforeDispatch,
+		);
 		await baselineReady;
 		cancelled = true;
 		releaseBaseline();
@@ -276,7 +293,16 @@ describe("latest dev SDK v3 terminal and gate contract", () => {
 		expect(dispatches).toBe(0);
 
 		cancelled = false;
-		const retry = runTurn(context, "turn.prompt", { text: "retry" }, undefined, 500, undefined, onDispatch, beforeDispatch);
+		const retry = runTurn(
+			context,
+			"turn.prompt",
+			{ text: "retry" },
+			undefined,
+			500,
+			undefined,
+			onDispatch,
+			beforeDispatch,
+		);
 		await expect(retry).resolves.toMatchObject({ events: expect.any(Array) });
 		expect(dispatches).toBe(1);
 		expect(baselineQueries).toBe(2);
