@@ -4472,6 +4472,172 @@ test("applies released model selection responses across fresh and continuation t
 		rmSync(root, { recursive: true, force: true });
 	}
 });
+test("does not terminal-abort model setup cancellation before a same-message retry dispatch", async () => {
+	const root = mkdtempSync(join(tmpdir(), "gjc-cancel-continuation-model-setup-"));
+	const sessionRoot = join(root, ".gjc", "sessions");
+	const endpointRoot = join(root, ".gjc", "state", "sdk");
+	const sessionId = "sdk-session-created";
+	const sessionFile = join(sessionRoot, `${sessionId}.jsonl`);
+	const mappingFile = join(root, "mappings.json");
+	const server = startSdkFixtureServer("model_catalog", root);
+	let releaseSetup!: () => void;
+	const setupRelease = new Promise<void>(resolve => {
+		releaseSetup = resolve;
+	});
+	let setupStarted!: () => void;
+	const setupReady = new Promise<void>(resolve => {
+		setupStarted = resolve;
+	});
+	let releaseRetryPrompt!: () => void;
+	const retryPromptRelease = new Promise<void>(resolve => {
+		releaseRetryPrompt = resolve;
+	});
+	let retryController: AbortController | undefined;
+	let holdFirstModelSetup = true;
+	let cancelRetryAfterPromptDispatch = false;
+	class CancellationBoundaryPort extends PublicSdkSessionClient {
+		#holdSetup = false;
+		#selection: NormalizedModelSelection | undefined;
+
+		override async setModel(
+			selection: NormalizedModelSelection,
+			key?: string,
+			timeoutMs?: number,
+		): Promise<NormalizedModelSelection> {
+			this.#selection = selection;
+			if (holdFirstModelSetup) {
+				holdFirstModelSetup = false;
+				this.#holdSetup = true;
+				setupStarted();
+				await setupRelease;
+				return selection;
+			}
+			return super.setModel(selection, key, timeoutMs);
+		}
+
+		override async setThinking(
+			thinkingLevel: NormalizedModelSelection["thinkingLevel"],
+			key?: string,
+			timeoutMs?: number,
+		): Promise<NormalizedModelSelection> {
+			if (this.#holdSetup) {
+				if (this.#selection === undefined) throw new Error("model setup did not select a model");
+				return { ...this.#selection, thinkingLevel };
+			}
+			return super.setThinking(thinkingLevel, key, timeoutMs);
+		}
+
+		override prompt(
+			text: string,
+			timeoutMs = 60_000,
+			observer?: Parameters<PublicSdkSessionPort["prompt"]>[2],
+			onDispatch?: () => void,
+			beforeDispatch?: () => void,
+		) {
+			if (!cancelRetryAfterPromptDispatch)
+				return super.prompt(text, timeoutMs, observer, onDispatch, beforeDispatch);
+			const controller = retryController;
+			if (controller === undefined) throw new Error("retry cancellation controller is not initialized");
+			const pending = super.prompt(
+				text,
+				timeoutMs,
+				observer,
+				() => {
+					onDispatch?.();
+					controller.abort();
+				},
+				beforeDispatch,
+			);
+			return (async () => {
+				await retryPromptRelease;
+				return await pending;
+			})();
+		}
+	}
+	const sessionPortFactory = () => new CancellationBoundaryPort();
+	const branchProject = { ...project, cwd: root, sessionRoot };
+	const turn = {
+		project: branchProject,
+		prompt: "cancel during continuation model setup",
+		chatId: "cancel-continuation-model-setup",
+		messageId: "assistant-cancel-continuation-model-setup",
+		userMessageId: "cancel-continuation-model-setup-1",
+		userMessageParentId: null,
+		continued: true,
+	};
+	mkdirSync(sessionRoot, { recursive: true });
+	mkdirSync(endpointRoot, { recursive: true });
+	writeFileSync(
+		sessionFile,
+		`${JSON.stringify({ type: "session", version: 3, id: sessionId, timestamp: "2026-01-01T00:00:00.000Z", cwd: root })}\n`,
+	);
+	writeFileSync(
+		join(endpointRoot, `${sessionId}.json`),
+		JSON.stringify({ version: 1, url: server.url, token: server.token }),
+	);
+	const mappings = new FileBackedSessionMappingStore(mappingFile);
+	mappings.set({
+		chatId: turn.chatId,
+		projectId: branchProject.id,
+		sessionId,
+		sessionFile,
+		rawFrameCursor: 0,
+		eventCursor: 0,
+		operationId: "predecessor",
+	});
+	const runner = createGjcRoutingLiveGatewayRunner({
+		turnRunner: createPublicSdkGjcTurnRunner({
+			cliPath: join(root, "missing-gjc-cli"),
+			runtimeLocations: {
+				childEnvironment: {
+					HOME: root,
+					GJC_CONFIG_DIR: join(root, ".gjc"),
+					GJC_CODING_AGENT_DIR: join(root, ".gjc"),
+				},
+			} as GjcRuntimeLocations,
+			turnTimeoutMs: 1_000,
+			sessionPortFactory,
+		}),
+		mappings,
+		requestedModelId: () => "gjc/anthropic/claude-sonnet-4:medium",
+		modelReaderFactory: staticModelReaderFactory(),
+	});
+	try {
+		const firstController = new AbortController();
+		const firstAttempt = runner.run({ ...turn, signal: firstController.signal });
+		await setupReady;
+		firstController.abort();
+		releaseSetup();
+		await expect(firstAttempt).rejects.toMatchObject({ name: "GjcTurnCancelledError" });
+		await Bun.sleep(0);
+		expect(
+			server.frames.filter(frame => frame.type === "control_request" && frame.operation === "turn.abort"),
+		).toHaveLength(0);
+		expect(
+			server.frames.filter(frame => frame.type === "control_request" && frame.operation === "turn.prompt"),
+		).toHaveLength(0);
+
+		retryController = new AbortController();
+		cancelRetryAfterPromptDispatch = true;
+		const retry = runner.run({ ...turn, signal: retryController.signal });
+		await expect(retry).rejects.toMatchObject({ name: "GjcTurnCancelledError" });
+		releaseRetryPrompt();
+		await Bun.sleep(0);
+		expect(
+			server.frames.filter(frame => frame.type === "control_request" && frame.operation === "turn.prompt"),
+		).toHaveLength(1);
+		const aborts = server.frames.filter(
+			frame => frame.type === "control_request" && frame.operation === "turn.abort",
+		);
+		expect(aborts).toHaveLength(1);
+		expect(aborts[0]?.idempotencyKey).toBe(terminalAbortIdempotencyKey(turn.chatId, turn.userMessageId));
+	} finally {
+		releaseSetup();
+		releaseRetryPrompt();
+		server.stop();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
 test("cleans up a cancelled new session when model setup finishes before the prompt boundary", async () => {
 	const root = mkdtempSync(join(tmpdir(), "gjc-cancel-model-setup-"));
 	const sessionRoot = join(root, ".gjc", "sessions");

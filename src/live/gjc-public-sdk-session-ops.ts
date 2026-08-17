@@ -284,12 +284,17 @@ export async function continueSession(
 	throwIfAborted(input.signal);
 	const result = await withMutationPort(context, attachment, input.lifecycle, async port => {
 		let cancelledBeforePrompt = false;
+		let promptDispatched = false;
 		let rejectCancelled!: (error: Error) => void;
 		const cancellation = new Promise<never>((_resolve, reject) => {
 			rejectCancelled = reject;
 		});
 		const registration = registerOwnedAbort?.(input, input.principalId, input.operationId, async () => {
 			cancelledBeforePrompt = true;
+			if (!promptDispatched) {
+				rejectCancelled(new GjcTurnCancelledError());
+				return;
+			}
 			try {
 				const abort = abortWithDispatch(
 					port,
@@ -311,7 +316,10 @@ export async function continueSession(
 					input.modelSelection,
 					input.observer,
 					() => throwIfAborted(input.signal, cancelledBeforePrompt),
-					input.onDispatch,
+					() => {
+						promptDispatched = true;
+						input.onDispatch?.();
+					},
 					() => throwIfAborted(input.signal, cancelledBeforePrompt),
 				),
 				cancellation,
