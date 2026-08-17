@@ -41,6 +41,10 @@ export type OwnedAbortRegistration = (
 	abort: () => Promise<unknown>,
 ) => { readonly unregister: () => void; readonly cancelled: boolean };
 
+// Allow the WebSocket send and its server event to run, without tying local
+// cancellation to the abort RPC's response deadline.
+const ABORT_DISPATCH_GRACE_MS = 25;
+
 /**
  * Start an owner-scoped abort while its port is still attached, but do not
  * make local cancellation wait for an unresponsive abort response. The
@@ -51,7 +55,7 @@ export type OwnedAbortRegistration = (
 export async function awaitAbortDispatch(abortPromise: Promise<unknown>): Promise<void> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	const dispatchGrace = new Promise<void>(resolve => {
-		timer = setTimeout(resolve, 0);
+		timer = setTimeout(resolve, ABORT_DISPATCH_GRACE_MS);
 		(timer as unknown as { unref?: () => void }).unref?.();
 	});
 	try {
