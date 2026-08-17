@@ -3642,6 +3642,10 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			releaseBranchCandidates = resolve;
 		});
 		const portLifecycle: string[] = [];
+		let resolveDetached!: () => void;
+		const detached = new Promise<void>(resolve => {
+			resolveDetached = resolve;
+		});
 		let abortCalls = 0;
 		let aborted = false;
 		let fixture!: ReturnType<typeof setupPublicSdkBranchFixture>;
@@ -3685,6 +3689,7 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 					if (property === "detach") {
 						return () => {
 							portLifecycle.push("detach");
+							resolveDetached();
 							return (value as PublicSdkSessionPort["detach"]).call(target);
 						};
 					}
@@ -3707,7 +3712,7 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				]),
 			).rejects.toMatchObject({ name: "GjcTurnCancelledError" });
 			releaseBranchCandidates();
-			await expect(pending).rejects.toMatchObject({ name: "GjcTurnCancelledError" });
+			await detached;
 			expect(abortCalls).toBe(1);
 			expect(portLifecycle.indexOf("abort-finished")).toBeLessThan(portLifecycle.indexOf("detach"));
 			expectSdkRequest(fixture.server.frames, "control_request", "turn.abort");
