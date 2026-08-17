@@ -2535,6 +2535,16 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		expect(existsSync(`${filePath}.wal`)).toBe(false);
 		expect(readFileSync(filePath, "utf8")).toContain('"state":"uncertain"');
 	});
+	test("persists discarding a pending operation across restart", () => {
+		const filePath = join(mkdtempSync(join(tmpdir(), "gjc-session-authority-discard-restart-")), "mappings.json");
+		const authority = new FileSessionAuthority(filePath);
+		authority.set(mappingInput(mediumSelection));
+		authority.beginOperation("chat-1", { id: "pending-op", kind: "prompt", detail: "hash" });
+
+		authority.discardPendingOperation("chat-1", { id: "pending-op", detail: "hash" });
+		expect(authority.lookupOperation("chat-1", "pending-op")).toBeUndefined();
+		expect(new FileSessionAuthority(filePath).lookupOperation("chat-1", "pending-op")).toBeUndefined();
+	});
 	test("durably records acknowledged create successors without replacing their predecessor", () => {
 		withFileStore((store, filePath) => {
 			const predecessor = store.set({
@@ -3650,7 +3660,9 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		let aborted = false;
 		let fixture!: ReturnType<typeof setupPublicSdkBranchFixture>;
 		class BranchCancellationPort extends PublicSdkSessionClient {
+			#branchStarted = false;
 			override async branchCandidates(timeoutMs?: number) {
+				this.#branchStarted = true;
 				branchCandidatesStarted();
 				await branchCandidatesRelease;
 				if (aborted) throw new Error("branch candidates cancelled");
@@ -3679,8 +3691,10 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				return { status: "accepted" };
 			}
 			override detach(): void {
-				portLifecycle.push("detach");
-				resolveDetached();
+				if (this.#branchStarted) {
+					portLifecycle.push("detach");
+					resolveDetached();
+				}
 				super.detach();
 			}
 		}
