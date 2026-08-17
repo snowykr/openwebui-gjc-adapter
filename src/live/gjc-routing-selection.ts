@@ -37,18 +37,24 @@ export async function resolveNormalSelection(
 	turn: LiveGatewayRunnerInput,
 	requestedModelId: string,
 ): Promise<NormalizedModelSelection> {
-	const createReader =
-		input.modelReaderFactory === undefined
-			? input.createNeutralModelReader === undefined
-				? undefined
-				: () => input.createNeutralModelReader?.(turn)
-			: () => input.modelReaderFactory?.(turn.modelReaderContext);
+	let createReader: ((signal?: AbortSignal) => Promise<ModelReader | undefined>) | undefined;
+	if (input.modelReaderFactory !== undefined) {
+		createReader = async (signal?: AbortSignal) =>
+			await input.modelReaderFactory?.(
+				turn.modelReaderContext === undefined || signal === undefined
+					? turn.modelReaderContext
+					: { ...turn.modelReaderContext, signal },
+				signal,
+			);
+	} else if (input.createNeutralModelReader !== undefined) {
+		createReader = async () => input.createNeutralModelReader?.(turn);
+	}
 	if (createReader === undefined) throw new TypeError("GJC model selection reader is unavailable");
-	return createModelSelectionPolicy(async () => {
-		const reader = await createReader();
+	return createModelSelectionPolicy(async (_context, signal) => {
+		const reader = await createReader(signal);
 		if (reader === undefined) throw new TypeError("GJC model selection reader is unavailable");
 		return reader;
-	}).resolve(requestedModelId);
+	}).resolve(requestedModelId, turn.signal);
 }
 
 export async function replayWithLifecyclePublication<T>(

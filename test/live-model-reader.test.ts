@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GjcRuntimeLocations } from "../src/contracts";
 import type { PublicSdkSessionAttachment, PublicSdkSessionPort } from "../src/gjc/public-sdk-contract";
+import { GjcTurnCancelledError } from "../src/gjc/turn-runner";
 import {
 	createModelReaderFactory,
 	ModelReaderUnavailableError,
@@ -61,6 +62,37 @@ describe("createModelReaderFactory", () => {
 
 		await expect(factory()).rejects.toThrow("attachment rejected");
 		expect(port.calls).toEqual(["attach", "detach"]);
+	});
+	test("aborts a pending reader attach and detaches the transport", async () => {
+		const controller = new AbortController();
+		let attachStarted!: () => void;
+		let releaseAttach!: () => void;
+		const started = new Promise<void>(resolve => {
+			attachStarted = resolve;
+		});
+		const attach = new Promise<void>(resolve => {
+			releaseAttach = resolve;
+		});
+		const port = new FakePublicSessionPort();
+		port.attach = async value => {
+			port.calls.push("attach");
+			port.attachments.push(value);
+			attachStarted();
+			await attach;
+		};
+		const factory = createModelReaderFactory({
+			cliPath: "/opt/gjc",
+			runtimeLocations,
+			resolveAttachment: async () => attachment,
+			sessionPortFactory: () => port,
+		});
+
+		const pending = factory(undefined, controller.signal);
+		await started;
+		controller.abort();
+		await expect(pending).rejects.toBeInstanceOf(GjcTurnCancelledError);
+		expect(port.calls).toEqual(["attach", "detach"]);
+		releaseAttach();
 	});
 	test("uses the published descriptor as the default attachment authority", async () => {
 		const root = mkdtempSync(join(tmpdir(), "gjc-model-reader-"));

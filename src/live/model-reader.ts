@@ -4,6 +4,7 @@ import type { GjcRuntimeLocations } from "../contracts";
 import { attachmentFromPublishedSdkEndpoint } from "../gjc/public-sdk-attachment";
 import type { PublicSdkSessionAttachment, PublicSdkSessionPort } from "../gjc/public-sdk-contract";
 import { PublicSdkSessionClient } from "../gjc/public-sdk-session-port";
+import { GjcTurnCancelledError } from "../gjc/turn-runner";
 import type { OpenWebUIPrincipal } from "../openwebui/auth";
 import type { UserWorkspace } from "../security/user-workspace";
 
@@ -23,13 +24,18 @@ export interface ModelReaderContext {
 	/** Lease fence proving exclusive access to the workspace. Required for normal-user readers. */
 	readonly lease?: { readonly assertFence: () => Promise<unknown> };
 	readonly correlationId?: string;
+	/** Request cancellation propagated through model preparation. */
+	readonly signal?: AbortSignal;
 }
 
 /** Alias used by callers that refer to the reader's scope rather than its context. */
 export type ModelReaderScope = ModelReaderContext;
 
-export type ModelReaderFactory = (context?: ModelReaderContext) => Promise<ModelReader>;
-export type PublicSdkAttachmentResolver = (context?: ModelReaderContext) => Promise<PublicSdkSessionAttachment>;
+export type ModelReaderFactory = (context?: ModelReaderContext, signal?: AbortSignal) => Promise<ModelReader>;
+export type PublicSdkAttachmentResolver = (
+	context?: ModelReaderContext,
+	signal?: AbortSignal,
+) => Promise<PublicSdkSessionAttachment>;
 export type PublicSdkSessionPortFactory = () => PublicSdkSessionPort;
 export type TemporaryModelAttachmentCleanup = (port: PublicSdkSessionPort) => Promise<void>;
 
@@ -61,24 +67,41 @@ export class ModelReaderUnavailableError extends Error {
 
 export function createModelReaderFactory(input: CreateModelReaderFactoryInput): ModelReaderFactory {
 	const resolveAttachment =
-		input.resolveAttachment ?? (context => resolvePublicSdkAttachment(input.runtimeLocations, context));
-	return async (context?: ModelReaderContext): Promise<ModelReader> => {
-		await assertScopedModelReaderContext(context);
+		input.resolveAttachment ??
+		((context, signal) => resolvePublicSdkAttachment(input.runtimeLocations, context, signal));
+	return async (context?: ModelReaderContext, signal?: AbortSignal): Promise<ModelReader> => {
+		const effectiveSignal = signal ?? context?.signal;
+		const scopedContext =
+			context === undefined || effectiveSignal === undefined ? context : { ...context, signal: effectiveSignal };
+		throwIfAborted(effectiveSignal);
+		await awaitWithAbort(assertScopedModelReaderContext(scopedContext, effectiveSignal), effectiveSignal);
 		const port = (input.sessionPortFactory ?? (() => new PublicSdkSessionClient()))();
 		let attachment: PublicSdkSessionAttachment | undefined;
 		try {
-			attachment = await resolveAttachment(context);
-			await assertScopedModelReaderContext(context);
-			assertAttachmentScope(context, attachment);
-			await port.attach(attachment);
-			await assertScopedModelReaderContext(context);
+			const attachmentPromise = Promise.resolve(resolveAttachment(scopedContext, effectiveSignal));
+			void attachmentPromise.then(
+				lateAttachment => {
+					if (!effectiveSignal?.aborted) return;
+					const cleanup = temporaryModelAttachmentCleanups.get(lateAttachment);
+					if (cleanup !== undefined) void cleanup(port).catch(() => undefined);
+				},
+				() => undefined,
+			);
+			attachment = await awaitWithAbort(attachmentPromise, effectiveSignal);
+			await awaitWithAbort(assertScopedModelReaderContext(scopedContext, effectiveSignal), effectiveSignal);
+			assertAttachmentScope(scopedContext, attachment);
+			await awaitWithAbort(port.attach(attachment), effectiveSignal);
+			await awaitWithAbort(assertScopedModelReaderContext(scopedContext, effectiveSignal), effectiveSignal);
 			return new PublicSdkModelReader(port, temporaryModelAttachmentCleanups.get(attachment));
 		} catch (error) {
 			try {
 				if (attachment !== undefined) await temporaryModelAttachmentCleanups.get(attachment)?.(port);
+			} catch (cleanupError) {
+				if (!(error instanceof GjcTurnCancelledError)) throw cleanupError;
 			} finally {
 				port.detach();
 			}
+			if (effectiveSignal?.aborted && !(error instanceof GjcTurnCancelledError)) throw new GjcTurnCancelledError();
 			throw error;
 		}
 	};
@@ -91,17 +114,22 @@ export function resolveGjcCliPath(gjcCommand: string): string {
 async function resolvePublicSdkAttachment(
 	runtimeLocations: GjcRuntimeLocations,
 	context?: ModelReaderContext,
+	signal?: AbortSignal,
 ): Promise<PublicSdkSessionAttachment> {
 	const workspace = context?.principal.role === "user" ? context.workspace?.root : runtimeLocations.readerWorkspace;
 	if (workspace === undefined)
 		throw new ModelReaderUnavailableError("A normal-user model reader requires a workspace.");
-	const { endpoints } = await listSdkSessionEndpoints(workspace);
+	const { endpoints } = await awaitWithAbort(listSdkSessionEndpoints(workspace), signal);
 	const endpoint = [...endpoints].sort((left, right) => left.sessionId.localeCompare(right.sessionId))[0];
 	if (endpoint === undefined) throw new ModelReaderUnavailableError();
 	return attachmentFromPublishedSdkEndpoint(workspace, endpoint.sessionId, endpoint);
 }
 
-async function assertScopedModelReaderContext(context: ModelReaderContext | undefined): Promise<void> {
+async function assertScopedModelReaderContext(
+	context: ModelReaderContext | undefined,
+	signal?: AbortSignal,
+): Promise<void> {
+	throwIfAborted(signal);
 	if (context === undefined) return;
 	const principal = context.principal;
 	if (
@@ -121,10 +149,47 @@ async function assertScopedModelReaderContext(context: ModelReaderContext | unde
 	if (context.workspace.userId !== principal.userId)
 		throw new ModelReaderUnavailableError("The normal-user model reader workspace is bound to another principal.");
 	try {
-		await context.lease.assertFence();
+		await awaitWithAbort(context.lease.assertFence(), signal);
 	} catch (error) {
+		if (error instanceof GjcTurnCancelledError) throw error;
 		throw new ModelReaderUnavailableError("The normal-user workspace lease is no longer valid.", { cause: error });
 	}
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) throw new GjcTurnCancelledError();
+}
+
+function awaitWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (signal === undefined) return promise;
+	if (signal.aborted) {
+		void promise.catch(() => undefined);
+		return Promise.reject(new GjcTurnCancelledError());
+	}
+	return new Promise<T>((resolve, reject) => {
+		let settled = false;
+		const cleanup = () => {
+			if (settled) return;
+			settled = true;
+			signal.removeEventListener("abort", onAbort);
+		};
+		const onAbort = () => {
+			cleanup();
+			reject(new GjcTurnCancelledError());
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		promise.then(
+			value => {
+				cleanup();
+				resolve(value);
+			},
+			error => {
+				cleanup();
+				reject(error);
+			},
+		);
+		if (signal.aborted) onAbort();
+	});
 }
 
 function assertAttachmentScope(context: ModelReaderContext | undefined, attachment: PublicSdkSessionAttachment): void {

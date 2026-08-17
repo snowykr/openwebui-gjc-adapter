@@ -372,6 +372,44 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 		}
 	});
 
+	it("maps an abort after final assistant delivery to HTTP 499 instead of 200", async () => {
+		let releaseDelivery!: () => void;
+		let deliveryStarted!: () => void;
+		const started = new Promise<void>(resolve => {
+			deliveryStarted = resolve;
+		});
+		const delivery = new Promise<void>(resolve => {
+			releaseDelivery = resolve;
+		});
+		const controller = new AbortController();
+		const handler = createAdapterRequestHandler({
+			routes: {
+				projects: [projectWithFolder],
+				owner,
+				runner: {
+					run: () => ({ content: "done", model: "gjc/anthropic/claude-sonnet-4:low" }),
+				},
+				projectContextRepository: await demoRepository(),
+				messageSink: async () => {
+					deliveryStarted();
+					await delivery;
+				},
+			},
+		});
+		const response = handler(
+			new Request("http://adapter.test/v1/chat/completions", {
+				method: "POST",
+				headers: completionHeaders("assistant-http-effect-cancel", "owner-1"),
+				signal: controller.signal,
+				body: JSON.stringify({ model: "gjc", messages: [{ role: "user", content: "complete" }] }),
+			}),
+		);
+		await started;
+		controller.abort();
+		releaseDelivery();
+		expect((await response).status).toBe(499);
+	});
+
 	it("keeps the durable workspace lease outside the workspace and releases it on stream abandon and completion", async () => {
 		const root = await mkdtemp(join(tmpdir(), "gjc-workspace-lease-stream-"));
 		const workspace = join(root, "workspace");

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { SdkV3OperationError } from "../src/gjc/sdk-v3-protocol";
+import { GjcTurnCancelledError } from "../src/gjc/turn-runner";
 import type { ModelReaderFactory } from "../src/live/model-reader";
 import {
 	MODEL_SELECTION_ERROR_CODES,
@@ -81,6 +82,39 @@ describe("createModelSelectionPolicy", () => {
 		const policy = createModelSelectionPolicy(staticModelReaderFactory(transcript));
 		expect((await policy.listModels()).data.map(model => model.id)).toEqual([...CANONICAL_MODEL_IDS]);
 		expect(transcript).toEqual(["catalog", "stop"]);
+	});
+	test("cancellation interrupts catalog resolution and still stops the reader", async () => {
+		const controller = new AbortController();
+		let releaseCatalog!: () => void;
+		let catalogStarted!: () => void;
+		let stopCalls = 0;
+		const started = new Promise<void>(resolve => {
+			catalogStarted = resolve;
+		});
+		const catalog = new Promise<readonly unknown[]>(resolve => {
+			releaseCatalog = () => resolve(MODEL_DESCRIPTORS);
+		});
+		const policy = createModelSelectionPolicy(async (_context, signal) => {
+			expect(signal).toBe(controller.signal);
+			return {
+				getAvailableModels: () => {
+					catalogStarted();
+					return catalog;
+				},
+				getActiveProviders: async () => [{ provider: "anthropic", connectionKind: "credential" }],
+				getState: async () => ({}),
+				stop: async () => {
+					stopCalls += 1;
+				},
+			};
+		});
+
+		const pending = policy.resolve(LOW_MODEL_ID, controller.signal);
+		await started;
+		controller.abort();
+		await expect(pending).rejects.toBeInstanceOf(GjcTurnCancelledError);
+		expect(stopCalls).toBe(1);
+		releaseCatalog();
 	});
 	test("advertises and accepts only models whose GJC provider is active", async () => {
 		const catalog = [

@@ -1,46 +1,49 @@
 import type { NormalizedModelSelection } from "../contracts";
 import { SdkV3OperationError } from "../gjc/sdk-v3-protocol";
 import { normalizeModelSelection } from "../gjc/session-router";
+import { GjcTurnCancelledError } from "../gjc/turn-runner";
 import type { ModelReader, ModelReaderFactory } from "./model-reader";
 import { ModelSelectionError, modelSelectionError } from "./model-selection-errors";
 import { buildModelList, classifyGjcModelId, decodeStrictModelCatalog, type GjcModelIdClassification } from "./models";
 import type { OpenAIModelListResponse } from "./openai-types";
 
 export interface ModelSelectionPolicy {
-	listModels(): Promise<OpenAIModelListResponse>;
-	resolve(modelId: string): Promise<NormalizedModelSelection>;
+	listModels(signal?: AbortSignal): Promise<OpenAIModelListResponse>;
+	resolve(modelId: string, signal?: AbortSignal): Promise<NormalizedModelSelection>;
 }
 
 export function createModelSelectionPolicy(createReader: ModelReaderFactory): ModelSelectionPolicy {
 	return {
-		async listModels(): Promise<OpenAIModelListResponse> {
+		async listModels(signal?: AbortSignal): Promise<OpenAIModelListResponse> {
 			return withReader(
 				createReader,
 				async reader => {
-					const rawCatalog = await reader.getAvailableModels();
+					const rawCatalog = await awaitWithAbort(reader.getAvailableModels(), signal);
 					const catalog = decodeStrictModelCatalog(rawCatalog);
-					const activeProviders = await availableProviderIds(reader, catalog);
+					const activeProviders = await availableProviderIds(reader, catalog, signal);
 					if (catalog !== null)
 						return buildModelList(
 							activeProviders === undefined
 								? catalog
 								: catalog.filter(selection => activeProviders.has(selection.provider)),
 						);
-					const current = currentSelection(rawCatalog, await reader.getState());
+					const current = currentSelection(rawCatalog, await awaitWithAbort(reader.getState(), signal));
 					if (current === undefined || (activeProviders !== undefined && !activeProviders.has(current.provider)))
 						throw modelSelectionError("model_catalog_unavailable");
 					return buildModelList([current]);
 				},
 				error => (isCatalogError(error) ? error : modelSelectionError("model_catalog_unavailable")),
+				signal,
 			);
 		},
 
-		async resolve(modelId: string): Promise<NormalizedModelSelection> {
+		async resolve(modelId: string, signal?: AbortSignal): Promise<NormalizedModelSelection> {
+			throwIfAborted(signal);
 			const classified = classifyGjcModelId(modelId);
 			assertSelectableSyntax(classified, modelId);
 			return classified.kind === "alias"
-				? resolveAlias(createReader)
-				: resolveCanonical(createReader, classified.selection);
+				? resolveAlias(createReader, signal)
+				: resolveCanonical(createReader, classified.selection, signal);
 		},
 	};
 }
@@ -55,14 +58,14 @@ function assertSelectableSyntax(
 	if (classified.kind === "foreign") throw modelSelectionError("model_not_found", modelId);
 }
 
-async function resolveAlias(createReader: ModelReaderFactory): Promise<NormalizedModelSelection> {
+async function resolveAlias(createReader: ModelReaderFactory, signal?: AbortSignal): Promise<NormalizedModelSelection> {
 	return withReader(
 		createReader,
 		async reader => {
-			const rawCatalog = await reader.getAvailableModels();
+			const rawCatalog = await awaitWithAbort(reader.getAvailableModels(), signal);
 			const catalog = decodeStrictModelCatalog(rawCatalog);
-			const activeProviders = await availableProviderIds(reader, catalog);
-			const selection = selectionFromState(await reader.getState());
+			const activeProviders = await availableProviderIds(reader, catalog, signal);
+			const selection = selectionFromState(await awaitWithAbort(reader.getState(), signal));
 			const usable =
 				selection !== undefined &&
 				(activeProviders === undefined || activeProviders.has(selection.provider)) &&
@@ -75,21 +78,23 @@ async function resolveAlias(createReader: ModelReaderFactory): Promise<Normalize
 			return selection;
 		},
 		error => (isDefaultUnusableError(error) ? error : modelSelectionError("model_selection_default_read_failed")),
+		signal,
 	);
 }
 
 async function resolveCanonical(
 	createReader: ModelReaderFactory,
 	selection: NormalizedModelSelection,
+	signal?: AbortSignal,
 ): Promise<NormalizedModelSelection> {
 	return withReader(
 		createReader,
 		async reader => {
-			const rawCatalog = await reader.getAvailableModels();
+			const rawCatalog = await awaitWithAbort(reader.getAvailableModels(), signal);
 			const catalog = decodeStrictModelCatalog(rawCatalog);
-			const activeProviders = await availableProviderIds(reader, catalog);
+			const activeProviders = await availableProviderIds(reader, catalog, signal);
 			if (catalog === null) {
-				const current = currentSelection(rawCatalog, await reader.getState());
+				const current = currentSelection(rawCatalog, await awaitWithAbort(reader.getState(), signal));
 				if (
 					current !== undefined &&
 					(activeProviders === undefined || activeProviders.has(current.provider)) &&
@@ -107,15 +112,17 @@ async function resolveCanonical(
 			return selection;
 		},
 		error => (isCanonicalResolutionError(error) ? error : modelSelectionError("model_selection_not_available")),
+		signal,
 	);
 }
 
 async function availableProviderIds(
 	reader: ModelReader,
 	catalog: readonly NormalizedModelSelection[] | null,
+	signal?: AbortSignal,
 ): Promise<ReadonlySet<string> | undefined> {
 	try {
-		return activeProviderIds(await reader.getActiveProviders());
+		return activeProviderIds(await awaitWithAbort(reader.getActiveProviders(), signal));
 	} catch (error) {
 		if (catalog !== null && error instanceof SdkV3OperationError && error.code === "operation_not_session_owned")
 			return undefined;
@@ -144,25 +151,47 @@ async function withReader<T>(
 	createReader: ModelReaderFactory,
 	operation: (reader: ModelReader) => Promise<T>,
 	mapError: (error: unknown) => ModelSelectionError,
+	signal?: AbortSignal,
 ): Promise<T> {
 	let reader: ModelReader | undefined;
 	let result: T;
 	try {
-		reader = await createReader();
+		throwIfAborted(signal);
+		const readerPromise = Promise.resolve(createReader(undefined, signal));
+		void readerPromise.then(
+			lateReader => {
+				if (!signal?.aborted || reader === lateReader) return;
+				void Promise.resolve(lateReader.stop()).catch(() => undefined);
+			},
+			() => undefined,
+		);
+		reader = await awaitWithAbort(readerPromise, signal);
 		result = await operation(reader);
 	} catch (error) {
-		return throwAfterCleanup(reader, mapError(error));
+		return throwAfterCleanup(reader, cancellationFor(error, signal) ?? mapError(error), signal);
 	}
-	await reader.stop();
+	try {
+		await reader.stop();
+	} catch (error) {
+		if (signal?.aborted) throw new GjcTurnCancelledError();
+		throw error;
+	}
+	throwIfAborted(signal);
 	return result;
 }
 
-async function throwAfterCleanup(reader: ModelReader | undefined, primary: ModelSelectionError): Promise<never> {
+async function throwAfterCleanup(
+	reader: ModelReader | undefined,
+	primary: unknown,
+	signal?: AbortSignal,
+): Promise<never> {
 	try {
 		await reader?.stop();
 	} catch (cleanup) {
-		throw new ModelSelectionCleanupError(primary, cleanup);
+		if (signal?.aborted) throw new GjcTurnCancelledError();
+		throw new ModelSelectionCleanupError(primary as ModelSelectionError, cleanup);
 	}
+	if (signal?.aborted) throw new GjcTurnCancelledError();
 	throw primary;
 }
 
@@ -232,3 +261,44 @@ const isDefaultUnusableError = (error: unknown): error is ModelSelectionError =>
 const isCanonicalResolutionError = (error: unknown): error is ModelSelectionError =>
 	error instanceof ModelSelectionError &&
 	(error.code === "model_selection_not_available" || error.code === "model_catalog_unavailable");
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) throw new GjcTurnCancelledError();
+}
+
+function cancellationFor(error: unknown, signal?: AbortSignal): GjcTurnCancelledError | undefined {
+	if (error instanceof GjcTurnCancelledError) return error;
+	return signal?.aborted ? new GjcTurnCancelledError() : undefined;
+}
+
+function awaitWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (signal === undefined) return promise;
+	if (signal.aborted) {
+		void promise.catch(() => undefined);
+		return Promise.reject(new GjcTurnCancelledError());
+	}
+	return new Promise<T>((resolve, reject) => {
+		let settled = false;
+		const cleanup = () => {
+			if (settled) return;
+			settled = true;
+			signal.removeEventListener("abort", onAbort);
+		};
+		const onAbort = () => {
+			cleanup();
+			reject(new GjcTurnCancelledError());
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		promise.then(
+			value => {
+				cleanup();
+				resolve(value);
+			},
+			error => {
+				cleanup();
+				reject(error);
+			},
+		);
+		if (signal.aborted) onAbort();
+	});
+}

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { GjcTurnCancelledError } from "../gjc/turn-runner";
 import { resolveForwardedPrincipal } from "../openwebui/auth";
 import { parseOpenWebUIHeaders } from "../openwebui/headers";
 import type { WorkspaceLease } from "../security/workspace-lease";
@@ -266,6 +267,7 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 			...(input.signal === undefined ? {} : { signal: input.signal }),
 		});
 		await assertWorkspaceLease(leaseAdmission);
+		throwIfAborted(input.signal);
 
 		const resultModel = runnerResult.model;
 		if (resultModel === undefined || classifyGjcModelId(resultModel).kind !== "canonical") {
@@ -298,6 +300,7 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 			projectId: project.id,
 		});
 		await assertWorkspaceLease(leaseAdmission);
+		throwIfAborted(input.signal);
 
 		const completion = await deliverChatCompletion({
 			stream: input.request.stream === true,
@@ -311,6 +314,7 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 			ownerUserId: principal.userId,
 			projectId: project.id,
 		});
+		throwIfAborted(input.signal);
 		if ("stream" in completion) {
 			const stream =
 				leaseAdmission === undefined
@@ -320,7 +324,9 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 			return { ...completion, stream };
 		}
 		runnerResult = undefined;
-		return finishWorkspaceLease(leaseAdmission, completion);
+		const finished = await finishWorkspaceLease(leaseAdmission, completion);
+		throwIfAborted(input.signal);
+		return finished;
 	} catch (error) {
 		if (runnerResult !== undefined) {
 			await abandonRunnerResult(runnerResult);
@@ -640,6 +646,10 @@ async function finishWorkspaceLease(
 async function closeWorkspaceLease(admission: WorkspaceLeaseAdmission | undefined): Promise<boolean> {
 	if (admission === undefined) return true;
 	return admission.finish();
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) throw new GjcTurnCancelledError();
 }
 
 function workspaceLeaseErrorResult(): LiveChatCompletionsResult {
