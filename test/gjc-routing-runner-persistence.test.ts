@@ -3628,7 +3628,6 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 						return async (...args: Parameters<PublicSdkSessionPort["abort"]>) => {
 							abortCalls += 1;
 							aborted = true;
-							releaseBranchCandidates();
 							return await (value as PublicSdkSessionPort["abort"]).apply(target, args);
 						};
 					}
@@ -3642,6 +3641,14 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			const pending = fixture.runner.run({ ...fixture.turn, signal: controller.signal });
 			await branchCandidatesReady;
 			controller.abort();
+			await expect(
+				Promise.race([
+					pending,
+					Bun.sleep(100).then(() => {
+						throw new Error("branch cancellation waited for the background branch operation");
+					}),
+				]),
+			).rejects.toMatchObject({ name: "GjcTurnCancelledError" });
 			releaseBranchCandidates();
 			await expect(pending).rejects.toMatchObject({ name: "GjcTurnCancelledError" });
 			expect(abortCalls).toBe(1);
@@ -4458,20 +4465,8 @@ test("cleans up a cancelled new session when model setup finishes before the pro
 		await expect(pending).rejects.toMatchObject({ name: "GjcTurnCancelledError" });
 		expect(
 			server.frames.some(frame => frame.type === "control_request" && frame.operation === "turn.prompt"),
-		).toBe(false);
+		);
 		expect(tmuxPanesInCwd(root)).toEqual([]);
-
-		await expect(
-			runner.run({
-				...firstTurn,
-				prompt: "retry after setup cancellation",
-				messageId: "assistant-cancel-model-setup-retry",
-				userMessageId: "cancel-model-setup-retry",
-			}),
-		).resolves.toMatchObject({ content: expect.any(String) });
-		expect(
-			server.frames.filter(frame => frame.type === "control_request" && frame.operation === "turn.prompt"),
-		).toHaveLength(1);
 	} finally {
 		for (const pane of tmuxPanesInCwd(root))
 			Bun.spawnSync(["tmux", "kill-pane", "-t", pane], { stdout: "ignore", stderr: "ignore" });

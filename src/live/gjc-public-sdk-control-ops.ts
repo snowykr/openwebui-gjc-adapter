@@ -96,7 +96,7 @@ export async function runControl(
 			return branched;
 		} finally {
 			registration?.unregister();
-			await branchOperation?.catch(() => undefined);
+			void branchOperation?.catch(() => undefined);
 		}
 	}
 	const attachment = await ensureAttachment(context, mappedAddress(input, mapping), lifecycle);

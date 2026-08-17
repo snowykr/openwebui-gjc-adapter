@@ -158,7 +158,7 @@ export async function startNewSession<T>(
 						lifecycle,
 					);
 				} catch (error) {
-					await onFailure?.(lifecycle, error);
+					if (promptStarted) await onFailure?.(lifecycle, error);
 					throw error;
 				}
 			},
