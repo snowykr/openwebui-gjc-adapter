@@ -15,6 +15,7 @@ import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
 import { buildOpenWebUIStatusEvent } from "../src/openwebui/events";
 import type { RegisteredProject } from "../src/projects/registry";
 import { WorkspaceLeaseManager } from "../src/security/workspace-lease";
+import { createAdapterRequestHandler } from "../src/server";
 import { attachmentProof, lifecycleFixture } from "./gjc-lifecycle-fixtures";
 import { staticModelReaderFactory } from "./model-selection-fixtures";
 
@@ -283,6 +284,9 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 			await Promise.resolve();
 			expect(runnerCalls).toBe(1);
 			secondAbort.abort();
+			const secondCancelled = expect(second).rejects.toMatchObject({
+				name: "WorkspaceAdmissionCancelledError",
+			});
 			const third = handleChatCompletions({
 				request: { model: "gjc", messages: [{ role: "user", content: "third" }] },
 				headers: { ...chatHeaders, "X-OpenWebUI-User-Id": "normal-1", "X-OpenWebUI-Message-Id": "assistant-3" },
@@ -297,9 +301,72 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 			expect(runnerCalls).toBe(1);
 			releaseFirst();
 			expect((await first).ok).toBe(true);
-			expect((await second).ok).toBe(false);
+			await secondCancelled;
 			expect((await third).ok).toBe(true);
 			expect(runnerCalls).toBe(2);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("maps an aborted queued admission to the existing HTTP 499 response", async () => {
+		const root = await mkdtemp(join(tmpdir(), "gjc-workspace-admission-http-cancel-"));
+		const workspace = join(root, "workspace");
+		const safeKey = "c".repeat(64);
+		const workspaceRegistry = {
+			open: async (userId: string) => ({
+				userId,
+				safeKey,
+				root: workspace,
+				sessionRoot: join(workspace, ".gjc", "sessions"),
+			}),
+		};
+		const workspaceLeaseManager = new WorkspaceLeaseManager({ stateRoot: root });
+		let runnerCalls = 0;
+		let started!: () => void;
+		const startedPromise = new Promise<void>(resolve => {
+			started = resolve;
+		});
+		let releaseFirst!: () => void;
+		try {
+			const runner = {
+				run() {
+					runnerCalls += 1;
+					if (runnerCalls === 1)
+						return new Promise<LiveGatewayRunnerResult>(resolve => {
+							releaseFirst = () => resolve({ content: "first", model: "gjc/anthropic/claude-sonnet-4:low" });
+							started();
+						});
+					return { content: "unexpected", model: "gjc/anthropic/claude-sonnet-4:low" };
+				},
+			};
+			const handler = createAdapterRequestHandler({
+				routes: { projects: [project], owner, runner, workspaceRegistry, workspaceLeaseManager },
+			});
+			const first = handler(
+				new Request("http://adapter.test/v1/chat/completions", {
+					method: "POST",
+					headers: completionHeaders("assistant-http-1", "normal-1"),
+					body: JSON.stringify({ model: "gjc", messages: [{ role: "user", content: "first" }] }),
+				}),
+			);
+			await startedPromise;
+			const controller = new AbortController();
+			const second = handler(
+				new Request("http://adapter.test/v1/chat/completions", {
+					method: "POST",
+					headers: completionHeaders("assistant-http-2", "normal-1"),
+					signal: controller.signal,
+					body: JSON.stringify({ model: "gjc", messages: [{ role: "user", content: "second" }] }),
+				}),
+			);
+			await Promise.resolve();
+			expect(runnerCalls).toBe(1);
+			controller.abort();
+			expect((await second).status).toBe(499);
+			releaseFirst();
+			expect((await first).status).toBe(200);
+			expect(runnerCalls).toBe(1);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
@@ -725,6 +792,17 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 		}
 	});
 });
+
+function completionHeaders(messageId: string, userId: string): Record<string, string> {
+	return {
+		"content-type": "application/json",
+		"X-OpenWebUI-Chat-Id": "chat-1",
+		"X-OpenWebUI-Message-Id": messageId,
+		"X-OpenWebUI-User-Message-Id": `user-${messageId}`,
+		"X-OpenWebUI-User-Message-Parent-Id": "",
+		"X-OpenWebUI-User-Id": userId,
+	};
+}
 
 async function demoRepository(): Promise<InMemoryOpenWebUIProjectionRepository> {
 	const repository = new InMemoryOpenWebUIProjectionRepository();

@@ -90,7 +90,8 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 					return workspaceLeaseErrorResult();
 				try {
 					backgroundLease = await acquireWorkspaceLease(input, workspace.safeKey);
-				} catch {
+				} catch (error) {
+					if (isWorkspaceAdmissionCancelledError(error)) throw error;
 					// A busy workspace is retryable, not a missing/bad model.
 					return workspaceLeaseErrorResult();
 				}
@@ -119,6 +120,7 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 				}),
 			});
 		} catch (error) {
+			if (isWorkspaceAdmissionCancelledError(error)) throw error;
 			if (error instanceof WorkspaceLeaseUncertainError) {
 				return await finishWorkspaceLease(backgroundLease, workspaceLeaseErrorResult());
 			}
@@ -160,7 +162,8 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 		if (workspace === undefined || input.workspaceLeaseManager === undefined) return workspaceLeaseErrorResult();
 		try {
 			leaseAdmission = await acquireWorkspaceLease(input, workspace.safeKey);
-		} catch {
+		} catch (error) {
+			if (isWorkspaceAdmissionCancelledError(error)) throw error;
 			return workspaceLeaseErrorResult();
 		}
 	}
@@ -325,6 +328,7 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 		}
 		const leaseClosed = await closeWorkspaceLease(leaseAdmission);
 		if (leaseAdmission !== undefined && (!leaseClosed || leaseAdmission.failed)) return workspaceLeaseErrorResult();
+		if (isWorkspaceAdmissionCancelledError(error)) throw error;
 		if (error instanceof WorkspaceLeaseUncertainError) return workspaceLeaseErrorResult();
 		if (error instanceof LiveGatewayUnavailableError)
 			return errorResult(503, "server_error", error.code, error.message);
@@ -346,10 +350,22 @@ export function isWorkspaceLeaseUncertainError(error: unknown): boolean {
 		(error instanceof Error && error.name === "WorkspaceLeaseUncertainError")
 	);
 }
+function isWorkspaceAdmissionCancelledError(error: unknown): boolean {
+	return (
+		error instanceof WorkspaceAdmissionCancelledError ||
+		(error instanceof Error && error.name === "WorkspaceAdmissionCancelledError")
+	);
+}
 class WorkspaceLeaseUncertainError extends Error {
 	constructor() {
 		super("Workspace lease admission is uncertain.");
 		this.name = "WorkspaceLeaseUncertainError";
+	}
+}
+class WorkspaceAdmissionCancelledError extends Error {
+	constructor() {
+		super("Workspace lease admission was cancelled.");
+		this.name = "WorkspaceAdmissionCancelledError";
 	}
 }
 
@@ -460,7 +476,8 @@ class WorkspaceAdmissionGate {
 	constructor(readonly onIdle: () => void) {}
 
 	async acquire(timeoutMs: number, queueLimit: number, signal?: AbortSignal): Promise<() => void> {
-		if (this.#queued >= queueLimit || signal?.aborted) throw new WorkspaceLeaseUncertainError();
+		if (signal?.aborted) throw new WorkspaceAdmissionCancelledError();
+		if (this.#queued >= queueLimit) throw new WorkspaceLeaseUncertainError();
 		this.#queued += 1;
 		const result = new Promise<() => void>((resolve, reject) => {
 			const waiter: WorkspaceAdmissionWaiter = {
@@ -471,13 +488,13 @@ class WorkspaceAdmissionGate {
 				timer: undefined as unknown as ReturnType<typeof setTimeout>,
 				settled: false,
 			};
-			const onAbort = () => this.#cancel(waiter);
+			const onAbort = () => this.#cancel(waiter, true);
 			waiter.onAbort = onAbort;
 			waiter.timer = setTimeout(() => this.#cancel(waiter), timeoutMs);
 			(waiter.timer as unknown as { unref?: () => void }).unref?.();
 			signal?.addEventListener("abort", onAbort, { once: true });
 			this.#queue.push(waiter);
-			if (signal?.aborted) this.#cancel(waiter);
+			if (signal?.aborted) this.#cancel(waiter, true);
 		});
 		this.#pump();
 		return result;
@@ -508,7 +525,7 @@ class WorkspaceAdmissionGate {
 		});
 	}
 
-	#cancel(waiter: WorkspaceAdmissionWaiter): void {
+	#cancel(waiter: WorkspaceAdmissionWaiter, cancelled = false): void {
 		if (waiter.settled) return;
 		waiter.settled = true;
 		clearTimeout(waiter.timer);
@@ -517,7 +534,7 @@ class WorkspaceAdmissionGate {
 		if (index === -1) return;
 		this.#queue.splice(index, 1);
 		this.#queued -= 1;
-		waiter.reject(new WorkspaceLeaseUncertainError());
+		waiter.reject(cancelled ? new WorkspaceAdmissionCancelledError() : new WorkspaceLeaseUncertainError());
 		if (this.#queued === 0) this.onIdle();
 	}
 }
@@ -568,7 +585,7 @@ async function acquireWorkspaceLease(
 		input.signal,
 	);
 	try {
-		if (input.signal?.aborted) throw new WorkspaceLeaseUncertainError();
+		if (input.signal?.aborted) throw new WorkspaceAdmissionCancelledError();
 		const lease = await input.workspaceLeaseManager.acquire({
 			safeKey,
 			holderId: `gjc-turn-${process.pid}-${randomUUID()}`,
