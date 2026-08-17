@@ -9,7 +9,6 @@ import {
 	SessionFileBoundaryError,
 	SessionMappingStore,
 } from "../src/gjc/session-router";
-import { GjcTurnCancelledError } from "../src/gjc/turn-runner";
 import type {
 	GjcLifecycleTransaction,
 	GjcRespondWorkflowGateInput,
@@ -17,6 +16,7 @@ import type {
 	GjcStartNewSessionInput,
 	GjcTurnResult,
 } from "../src/gjc/turn-runner";
+import { GjcTurnCancelledError } from "../src/gjc/turn-runner";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
 import { projectTurnEvents, synthesizeProjectionRows } from "../src/live/workflow-gate-projection";
 import { InMemoryOutboxStore } from "../src/state/outbox";

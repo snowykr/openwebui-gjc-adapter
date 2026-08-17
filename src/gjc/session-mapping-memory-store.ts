@@ -321,10 +321,7 @@ export class SessionMappingStore {
 		assertLegacyKeyAvailable(this.authority, chatId);
 		return this.authority.recordAcknowledgedSuccessor(chatId, operationId, operationHash, successor);
 	}
-	discardPendingOperation(
-		chatId: string,
-		operation: Pick<SessionOperation, "id" | "ingressId" | "detail">,
-	): void {
+	discardPendingOperation(chatId: string, operation: Pick<SessionOperation, "id" | "ingressId" | "detail">): void {
 		assertLegacyKeyAvailable(this.authority, chatId);
 		this.authority.discardPendingOperation(chatId, operation);
 	}

@@ -453,10 +453,7 @@ export class SessionAuthorityJournal {
 		this.setRecord(chatId, { ...record, journal });
 		return copyOperation(journal[index]!);
 	}
-	discardPendingOperation(
-		chatId: string,
-		operation: Pick<SessionOperation, "id" | "ingressId" | "detail">,
-	): void {
+	discardPendingOperation(chatId: string, operation: Pick<SessionOperation, "id" | "ingressId" | "detail">): void {
 		const record = this.require(chatId);
 		const index = record.journal.findIndex(
 			candidate =>
@@ -483,9 +480,7 @@ export class SessionAuthorityJournal {
 	): void {
 		const current = [...this.provisional.values()].find(
 			candidate =>
-				candidate.chatId === chatId &&
-				candidate.id === operation.id &&
-				candidate.ingressId === operation.ingressId,
+				candidate.chatId === chatId && candidate.id === operation.id && candidate.ingressId === operation.ingressId,
 		);
 		if (
 			current === undefined ||
