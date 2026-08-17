@@ -276,10 +276,12 @@ describe("createGjcRoutingLiveGatewayRunner", () => {
 				_mapping: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[1],
 				_lifecycle: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[2],
 				onAcknowledgedSuccessor?: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[3],
+				onDispatch?: Parameters<NonNullable<GjcTurnRunner["runControl"]>>[4],
 			): Promise<GjcControlResult> {
 				this.calls++;
 				const operation = mappings.operation(input.chatId, input.userMessageId);
 				acknowledgements.push({ kind: operation?.kind ?? "", detail: operation?.detail });
+				onDispatch?.();
 				await onAcknowledgedSuccessor?.({
 					sessionId: "successor",
 					attachment: attachmentProof({ cwd: project.cwd, sessionId: "successor" }),
