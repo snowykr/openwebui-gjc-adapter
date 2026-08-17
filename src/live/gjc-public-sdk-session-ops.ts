@@ -1,6 +1,7 @@
 import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import { CliLifecycleBackend } from "../gjc/cli-lifecycle-backend";
+import type { PublicSdkSessionPort } from "../gjc/public-sdk-contract";
 import { snapshotGjcSessionFiles, waitForFreshGjcSessionFile } from "../gjc/session-loader";
 import type {
 	GjcContinueSessionInput,
@@ -41,34 +42,42 @@ export type OwnedAbortRegistration = (
 	abort: () => Promise<unknown>,
 ) => { readonly unregister: () => void; readonly cancelled: boolean };
 
-// Allow the WebSocket send and its server event to run, without tying local
-// cancellation to the abort RPC's response deadline.
-const ABORT_DISPATCH_GRACE_MS = 25;
+export interface AbortDispatchObservation {
+	readonly promise: Promise<unknown>;
+	readonly dispatched: Promise<void>;
+}
 
-/**
- * Start an owner-scoped abort while its port is still attached, but do not
- * make local cancellation wait for an unresponsive abort response. The
- * request promise is observed for its eventual rejection; the grace turn only
- * covers transport dispatch before the local operation is allowed to unwind
- * and detach.
- */
-export async function awaitAbortDispatch(abortPromise: Promise<unknown>): Promise<void> {
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	const dispatchGrace = new Promise<void>(resolve => {
-		timer = setTimeout(resolve, ABORT_DISPATCH_GRACE_MS);
-		(timer as unknown as { unref?: () => void }).unref?.();
+export function abortWithDispatch(
+	port: PublicSdkSessionPort,
+	key: string | undefined,
+	timeoutMs: number | undefined,
+): AbortDispatchObservation {
+	let resolveDispatch!: () => void;
+	const dispatched = new Promise<void>(resolve => {
+		resolveDispatch = resolve;
 	});
+	let promise: Promise<unknown>;
 	try {
-		await Promise.race([
-			abortPromise.then(
-				() => undefined,
-				() => undefined,
-			),
-			dispatchGrace,
-		]);
-	} finally {
-		if (timer !== undefined) clearTimeout(timer);
+		promise = port.abort(key, timeoutMs, resolveDispatch);
+	} catch (error) {
+		promise = Promise.reject(error);
 	}
+	void promise.catch(() => undefined);
+	return { promise, dispatched };
+}
+
+/** Wait until the SDK control frame was sent, or the request failed before dispatch. */
+export async function awaitAbortDispatch(
+	abortPromise: Promise<unknown>,
+	dispatchPromise?: Promise<void>,
+): Promise<void> {
+	await Promise.race([
+		abortPromise.then(
+			() => undefined,
+			() => undefined,
+		),
+		dispatchPromise ?? new Promise<void>(() => undefined),
+	]);
 }
 
 export {
@@ -140,11 +149,9 @@ export async function startNewSession<T>(
 							input.userMessageId,
 							async () => {
 								cancelledBeforePrompt = true;
-								let abortPromise: Promise<unknown>;
 								try {
-									abortPromise = port.abort(undefined, context.input.turnTimeoutMs);
-									void abortPromise.catch(() => undefined);
-									await awaitAbortDispatch(abortPromise);
+									const abort = abortWithDispatch(port, undefined, context.input.turnTimeoutMs);
+									await awaitAbortDispatch(abort.promise, abort.dispatched);
 								} finally {
 									rejectCancelled(new GjcTurnCancelledError());
 								}
@@ -244,12 +251,10 @@ export async function continueSession(
 			rejectCancelled = reject;
 		});
 		const registration = registerOwnedAbort?.(input, input.principalId, input.operationId, async () => {
-			let abortPromise: Promise<unknown>;
 			cancelledBeforePrompt = true;
 			try {
-				abortPromise = port.abort(undefined, context.input.turnTimeoutMs);
-				void abortPromise.catch(() => undefined);
-				await awaitAbortDispatch(abortPromise);
+				const abort = abortWithDispatch(port, undefined, context.input.turnTimeoutMs);
+				await awaitAbortDispatch(abort.promise, abort.dispatched);
 			} finally {
 				rejectCancelled(new GjcTurnCancelledError());
 			}
@@ -305,11 +310,9 @@ export async function respondWorkflowGate(
 			rejectCancelled = reject;
 		});
 		const registration = registerOwnedAbort?.(input, input.principalId, input.operationId, async () => {
-			let abortPromise: Promise<unknown>;
 			try {
-				abortPromise = port.abort(input.idempotencyKey, context.input.turnTimeoutMs);
-				void abortPromise.catch(() => undefined);
-				await awaitAbortDispatch(abortPromise);
+				const abort = abortWithDispatch(port, input.idempotencyKey, context.input.turnTimeoutMs);
+				await awaitAbortDispatch(abort.promise, abort.dispatched);
 			} finally {
 				rejectCancelled(new GjcTurnCancelledError());
 			}

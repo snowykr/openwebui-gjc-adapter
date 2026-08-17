@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { SdkClient, SdkClientError } from "@gajae-code/bridge-client";
 import {
 	parseOperationResult,
@@ -56,10 +57,77 @@ export class SdkV3Client {
 		return client.onFrame(frame => listener(asRecord(frame, "SDK frame")));
 	}
 
-	async control(operation: string, input: SdkRecord, timeoutMs?: number, idempotencyKey?: string): Promise<unknown> {
+	async control(
+		operation: string,
+		input: SdkRecord,
+		timeoutMs?: number,
+		idempotencyKey?: string,
+		onDispatch?: () => void,
+	): Promise<unknown> {
 		try {
+			if (onDispatch !== undefined)
+				return await this.controlWithDispatch(operation, input, timeoutMs, idempotencyKey, onDispatch);
 			const frame = await this.requireClient().control(operation, input, { timeoutMs, idempotencyKey });
 			return parseOperationResult(asRecord(frame, `${operation} response`), `${operation} response`);
+		} catch (error) {
+			throw sdkError(error);
+		}
+	}
+
+	private async controlWithDispatch(
+		operation: string,
+		input: SdkRecord,
+		timeoutMs: number | undefined,
+		idempotencyKey: string | undefined,
+		onDispatch: () => void,
+	): Promise<unknown> {
+		const client = this.requireClient();
+		const id = randomUUID();
+		const frame = {
+			type: "control_request",
+			operation,
+			input,
+			id,
+			...(idempotencyKey === undefined ? {} : { idempotencyKey }),
+		};
+		const response = new Promise<unknown>((resolve, reject) => {
+			let settled = false;
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			let unsubscribe: () => void = () => undefined;
+			const cleanup = () => {
+				if (settled) return;
+				settled = true;
+				if (timer !== undefined) clearTimeout(timer);
+				unsubscribe();
+			};
+			unsubscribe = client.onFrame(received => {
+				if (received.id !== id) return;
+				cleanup();
+				try {
+					resolve(parseOperationResult(asRecord(received, `${operation} response`), `${operation} response`));
+				} catch (error) {
+					reject(error);
+				}
+			});
+			timer = setTimeout(() => {
+				cleanup();
+				reject(
+					new SdkV3OperationError("timeout", `SDK request timed out after ${timeoutMs ?? DEFAULT_TIMEOUT_MS}ms`),
+				);
+			}, timeoutMs ?? DEFAULT_TIMEOUT_MS);
+			(timer as unknown as { unref?: () => void }).unref?.();
+			try {
+				client.send(frame);
+				// Let the transport event loop hand the frame to the socket before the
+				// owner can detach; this is a dispatch boundary, not a time grace.
+				setImmediate(onDispatch);
+			} catch (error) {
+				cleanup();
+				reject(error);
+			}
+		});
+		try {
+			return await response;
 		} catch (error) {
 			throw sdkError(error);
 		}

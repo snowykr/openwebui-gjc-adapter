@@ -115,11 +115,12 @@ export class PublicSdkSessionClient implements PublicSdkSessionPort {
 			runTurn(this.turnContext(), "turn.follow_up", { text }, key, timeoutMs ?? 60_000, observer),
 		);
 	}
-	abort(key?: string, timeoutMs?: number): Promise<unknown> {
+	abort(key?: string, timeoutMs?: number, onDispatch?: () => void): Promise<unknown> {
 		// C04 turn.abort is owner-scoped upstream. It must bypass the prompt's
 		// serialized mutation lane so the owning connection can abort its active
-		// prompt instead of waiting for that prompt to settle.
-		return this.authority(timeoutMs, client => client.control("turn.abort", {}, timeoutMs, key));
+		// prompt instead of waiting for that prompt to settle. Dispatch is reported
+		// from the transport send boundary so callers never guess with a timer.
+		return this.authority(timeoutMs, client => client.control("turn.abort", {}, timeoutMs, key, onDispatch));
 	}
 	abortAndPrompt(
 		text: string,

@@ -3672,25 +3672,14 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				if (aborted) throw new Error("branch candidates cancelled");
 				return super.branchCandidates(timeoutMs);
 			}
-			override async abort(idempotencyKey?: string, timeoutMs?: number) {
+			override async abort(idempotencyKey?: string, timeoutMs?: number, onDispatch?: () => void) {
 				abortCalls += 1;
 				aborted = true;
 				portLifecycle.push("abort-start");
-				const pendingAbort = super.abort(idempotencyKey, timeoutMs);
-				let dispatched = false;
-				for (let attempt = 0; attempt < 100; attempt += 1) {
-					if (
-						fixture.server.frames.some(
-							frame => frame.type === "control_request" && frame.operation === "turn.abort",
-						)
-					) {
-						dispatched = true;
-						break;
-					}
-					await Bun.sleep(0);
-				}
-				if (!dispatched) throw new Error("C04 abort was not dispatched");
-				portLifecycle.push("abort-dispatched");
+				const pendingAbort = super.abort(idempotencyKey, timeoutMs, () => {
+					portLifecycle.push("abort-dispatched");
+					onDispatch?.();
+				});
 				void pendingAbort.catch(() => undefined);
 				return await new Promise<never>(() => {});
 			}

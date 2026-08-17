@@ -107,7 +107,8 @@ export interface PublicSdkSessionPort {
 		timeoutMs?: number,
 		observer?: PublicSdkTurnEventObserver,
 	): Promise<PublicSdkTurnOutcome>;
-	abort(idempotencyKey?: string, timeoutMs?: number): Promise<unknown>;
+	/** Sends the owner-scoped abort; onDispatch fires immediately after its control frame is sent. */
+	abort(idempotencyKey?: string, timeoutMs?: number, onDispatch?: () => void): Promise<unknown>;
 	abortAndPrompt(
 		text: string,
 		idempotencyKey?: string,
