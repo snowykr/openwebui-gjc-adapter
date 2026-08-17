@@ -70,6 +70,31 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 			expectedCwd: project.cwd,
 		});
 	});
+	test("cleans up a pre-aborted workflow gate reply so the same message can retry", async () => {
+		const turnRunner = new FakeGjcTurnRunner();
+		const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent);
+		const cancellations: unknown[] = [];
+		const cleared: unknown[] = [];
+		turnRunner.cancelTurn = cancellation => cancellations.push(cancellation);
+		Object.assign(turnRunner, {
+			clearTurnCancellation: (cancellation: unknown) => cleared.push(cancellation),
+		});
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings });
+		const controller = new AbortController();
+		controller.abort();
+
+		await expect(runner.run({ ...replyInput("1"), signal: controller.signal })).rejects.toMatchObject({
+			name: "GjcTurnCancelledError",
+		});
+		expect(cancellations).toHaveLength(1);
+		expect(cleared).toHaveLength(1);
+		expect(cleared[0]).toBe(cancellations[0]);
+		expect(mappings.operation("chat-1", "user-2")).toBeUndefined();
+		expect(turnRunner.gateResponses).toHaveLength(0);
+
+		await expect(runner.run(replyInput("1"))).resolves.toEqual({ content: "workflow gate accepted" });
+		expect(turnRunner.gateResponses).toHaveLength(1);
+	});
 	test("bounds oversized gate fields before projecting the gate label", () => {
 		// projectPendingWorkflowGateMessage() concatenates the prompt and every
 		// option before boundedText() truncates; a retained gate with a

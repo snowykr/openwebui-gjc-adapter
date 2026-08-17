@@ -179,15 +179,16 @@ export async function handleWorkflowGateReply(
 	};
 	turn.signal?.addEventListener("abort", onAbort, { once: true });
 	if (turn.signal?.aborted) onAbort();
-	throwIfAborted(turn.signal);
-	mappings.beginOperation(turn.chatId, {
-		id: turn.userMessageId,
-		kind: "gate",
-		ingressId: turn.userMessageId,
-		detail: operationDetail,
-	});
-
+	let operationBegun = false;
 	try {
+		throwIfAborted(turn.signal);
+		mappings.beginOperation(turn.chatId, {
+			id: turn.userMessageId,
+			kind: "gate",
+			ingressId: turn.userMessageId,
+			detail: operationDetail,
+		});
+		operationBegun = true;
 		throwIfAborted(turn.signal);
 		const sessionRoot = turn.project.sessionRoot ?? `${turn.project.cwd}/.gjc/sessions`;
 		const existingSessionFile = await ensureSdkSessionFile(
@@ -297,7 +298,7 @@ export async function handleWorkflowGateReply(
 			? { content: responseText }
 			: { content: responseText, events: projectedEvents };
 	} catch (error) {
-		mappings.transitionOperation(turn.chatId, turn.userMessageId, "uncertain", operationDetail);
+		if (operationBegun) mappings.transitionOperation(turn.chatId, turn.userMessageId, "uncertain", operationDetail);
 		throw error;
 	} finally {
 		turn.signal?.removeEventListener("abort", onAbort);
