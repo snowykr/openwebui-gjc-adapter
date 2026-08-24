@@ -1,6 +1,7 @@
 import { mkdir } from "node:fs/promises";
 import * as path from "node:path";
 import { createAdapterSessionCloser } from "./adapter-close-options";
+import { type ActiveManagedV3Runtime, startActiveManagedRuntime } from "./adapter-managed-v3-runtime";
 import {
 	buildOpenWebUIPrincipalClientFactory,
 	buildOpenWebUIPrincipalEventSinkFactory,
@@ -15,9 +16,13 @@ import { buildRuntimeHealthChecks, type RuntimeIsolationDiagnostic } from "./ada
 import { type AdapterConfig, loadAdapterConfig, type ResolvedAdapterConfig } from "./config";
 import { resolveLegacySessionAuthoritySourcePaths, SESSION_AUTHORITY_MAPPING_FILE } from "./config-env";
 import type { ManagedBootstrapRunnerDependencies, ManagedBootstrapService } from "./gjc/managed-bootstrap";
+import { ManagedSdkRuntime, type TenantSessionKey } from "./gjc/managed-sdk-runtime";
+import { probeSessionAuthorityEpoch } from "./gjc/session-authority-epoch";
 import { preflightSessionAuthorityMigrationCandidates } from "./gjc/session-authority-migration";
+import { readSessionAuthorityV3ActiveMarker } from "./gjc/session-authority-v3-activation";
 import { loadGjcSessionFile } from "./gjc/session-loader";
 import { FileBackedSessionMappingStore, type SessionMapping, SessionMappingStore } from "./gjc/session-router";
+import { V3FileBackedSessionMappingStore } from "./gjc/session-v3-file-backed-mapping-store";
 import type { GjcCloseReceipt } from "./gjc/turn-runner";
 import type { LiveGatewayEventSink, LiveGatewayMessageSink } from "./live/chat-completions";
 import type { LiveGatewayFileContextResolver } from "./live/file-contexts";
@@ -53,7 +58,7 @@ import { RuntimeSingletonLock } from "./runtime-singleton-lock";
 import { resolveAllowedRoots } from "./security/paths";
 import { createUserWorkspaceRegistry } from "./security/user-workspace";
 import { createWorkspaceCleanupService, type WorkspaceCleanupAuthorityCoordinator } from "./security/workspace-cleanup";
-import { createWorkspaceLeaseManager } from "./security/workspace-lease";
+import { createWorkspaceLeaseManager, parseWorkspaceLeaseId } from "./security/workspace-lease";
 import {
 	type AdapterServerHandle,
 	type AdapterServerOptions,
@@ -142,6 +147,7 @@ export async function buildResolvedAdapterServerOptions(
 	let routingRunner: ReturnType<typeof createGjcRoutingLiveGatewayRunner> | undefined;
 	let managedBootstrap: ManagedBootstrapService | undefined;
 	let managedBootstrapDependencies: ManagedBootstrapRunnerDependencies | undefined;
+	let activeManagedV3Runtime: ActiveManagedV3Runtime | undefined;
 	const skipManagedSdkRuntimeStart = dependencies.skipManagedSdkRuntimeStart ?? true;
 	let managedSdkRuntime: ManagedSdkRuntimeDependency | undefined;
 	let managedSdkTenantFence: ManagedSdkTenantFence | undefined;
@@ -184,7 +190,12 @@ export async function buildResolvedAdapterServerOptions(
 		const workspaceLeaseDurationMs = workspaceLeaseDuration(config.turnTimeoutMs);
 		const workspaceLeaseHeartbeatMs = workspaceLeaseHeartbeat(workspaceLeaseDurationMs);
 		const mappingStorePath = path.join(config.sessionRoot, SESSION_MAPPING_STORE_FILE);
-		if (dependencies.mappings === undefined && owner.ownerUserId.length > 0) {
+		const activeV3Marker = readSessionAuthorityV3ActiveMarker(mappingStorePath);
+		const authorityEpoch = probeSessionAuthorityEpoch(mappingStorePath, {
+			...(activeV3Marker === undefined ? {} : { managedDigest: activeV3Marker.canonicalDigest }),
+		});
+		if (authorityEpoch.status === "blocked") throw new Error("Canonical session authority activation is blocked.");
+		if (authorityEpoch.status !== "v3" && dependencies.mappings === undefined && owner.ownerUserId.length > 0) {
 			const sourcePaths =
 				behavior.sessionAuthorityMigrationSourcePaths ??
 				(config.mode === "managed" ? [path.join("/run/gjc-session", SESSION_MAPPING_STORE_FILE)] : []);
@@ -204,7 +215,10 @@ export async function buildResolvedAdapterServerOptions(
 				detail: `Session authority migration ${migration.status}.`,
 			});
 		}
-		const mappings = dependencies.mappings ?? new FileBackedSessionMappingStore(mappingStorePath);
+		const mappings =
+			authorityEpoch.status === "v3"
+				? new V3FileBackedSessionMappingStore(mappingStorePath)
+				: (dependencies.mappings ?? new FileBackedSessionMappingStore(mappingStorePath));
 		if (mappings instanceof FileBackedSessionMappingStore && mappings.bootCompaction !== undefined) {
 			isolationDiagnostics.push({
 				name: "session-authority-compaction",
@@ -213,7 +227,23 @@ export async function buildResolvedAdapterServerOptions(
 			});
 		}
 		if (mappings instanceof SessionMappingStore) mappings.setLegacyAdminPrincipalId(owner.ownerUserId);
-		managedBootstrap = dependencies.managedBootstrap ?? dependencies.createManagedBootstrap?.();
+		if (authorityEpoch.status === "v3") {
+			const runtime =
+				dependencies.managedSdkRuntime ??
+				dependencies.createManagedSdkRuntime?.(config.runtimeLocations.agentDir) ??
+				new ManagedSdkRuntime({ agentDir: config.runtimeLocations.agentDir });
+			activeManagedV3Runtime = await startActiveManagedRuntime({
+				mappings: mappings as V3FileBackedSessionMappingStore,
+				runtime: runtime as ManagedSdkRuntime,
+				liveTenantFence: key =>
+					assertActiveManagedV3TenantFence(key, mappings, workspaceRegistry, projectStore, workspaceLeaseManager),
+			});
+			managedSdkRuntime = activeManagedV3Runtime.runtime;
+			managedSdkTenantFence = activeManagedV3Runtime.tenantFence;
+			managedSdkRuntimeHealth.phase = "ready";
+		} else {
+			managedBootstrap = dependencies.managedBootstrap ?? dependencies.createManagedBootstrap?.();
+		}
 		if (managedBootstrap !== undefined) {
 			const started = await managedBootstrap.start();
 			const dependencies = started.dependencies;
@@ -232,7 +262,7 @@ export async function buildResolvedAdapterServerOptions(
 			managedBootstrapDependencies = dependencies;
 			managedSdkRuntime = dependencies.runtime;
 			managedSdkTenantFence = dependencies.tenantFence;
-		} else {
+		} else if (authorityEpoch.status !== "v3") {
 			managedSdkRuntime =
 				dependencies.managedSdkRuntime ??
 				(dependencies.createManagedSdkRuntime === undefined
@@ -261,6 +291,7 @@ export async function buildResolvedAdapterServerOptions(
 				: new FileBackedOutboxStore(path.join(config.statePath, PROJECTION_OUTBOX_STORE_FILE)));
 		const cliPath = resolveGjcCliPath(config.gjcCommand);
 		const turnRunner =
+			activeManagedV3Runtime?.runner ??
 			managedBootstrapDependencies?.runner ??
 			dependencies.turnRunner ??
 			createPublicSdkGjcTurnRunner({
@@ -557,6 +588,47 @@ export async function buildResolvedAdapterServerOptions(
 		throw startupError;
 	}
 }
+
+async function assertActiveManagedV3TenantFence(
+	key: TenantSessionKey,
+	mappings: SessionMappingStore,
+	workspaceRegistry: ReturnType<typeof createUserWorkspaceRegistry>,
+	projectStore: SqliteProjectRegistrationStore | undefined,
+	workspaceLeaseManager: ReturnType<typeof createWorkspaceLeaseManager>,
+): Promise<boolean> {
+	try {
+		const lease = parseWorkspaceLeaseId(key.leaseId);
+		const workspace = await workspaceRegistry.resolveBySafeKey(lease.safeKey);
+		const project = projectStore?.getProject(key.projectId);
+		const mapping = mappings.getScoped({ principalId: key.principalId, chatId: key.chatId });
+		const authority = mapping?.managedAuthority;
+		if (
+			workspace === undefined ||
+			workspace.userId !== key.principalId ||
+			path.resolve(workspace.root) !== key.canonicalWorkspace ||
+			project?.id !== key.projectId ||
+			project.status !== "linked" ||
+			mapping?.principalId !== key.principalId ||
+			mapping.projectId !== key.projectId ||
+			mapping.sessionId !== key.sessionId ||
+			authority === undefined ||
+			authority.principalId !== key.principalId ||
+			authority.projectId !== key.projectId ||
+			authority.canonicalWorkspace !== key.canonicalWorkspace ||
+			authority.chatId !== key.chatId ||
+			authority.sessionId !== key.sessionId ||
+			authority.generation !== key.generation ||
+			authority.leaseId !== key.leaseId ||
+			authority.epoch !== key.epoch
+		)
+			return false;
+		await workspaceLeaseManager.assertFence(lease);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 async function replayPrincipalProjection(
 	input: PrincipalProjectionSynchronizerInput,
 	principalClient: OpenWebUIPrincipalClient,

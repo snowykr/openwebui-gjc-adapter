@@ -1,4 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -74,7 +75,107 @@ function resolvedBuilderConfig(root: string) {
 	};
 }
 
+function writeV3Activation(canonicalPath: string, digestOverride?: string): void {
+	const authority = Buffer.from(
+		`${JSON.stringify({
+			kind: "openwebui-gjc-session-authority",
+			version: 3,
+			authorityEpoch: "managed/1",
+			mappings: [],
+			provisionalOperations: [],
+		})}\n`,
+	);
+	writeFileSync(canonicalPath, authority);
+	const canonicalDigest = digestOverride ?? createHash("sha256").update(authority).digest("hex");
+	writeFileSync(
+		`${canonicalPath}.v3-active.json`,
+		`${JSON.stringify({
+			kind: "openwebui-gjc-session-authority-active",
+			version: 1,
+			authorityEpoch: "managed/1",
+			canonicalDigest,
+			source: {
+				baseDigest: "0".repeat(64),
+				walDigest: "0".repeat(64),
+				walPresent: false,
+			},
+		})}\n`,
+	);
+}
+
 describe("runtime location composition", () => {
+	test("selects direct V3 mappings and the active managed runtime before legacy construction", async () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-v3-runtime-selection-")));
+		const calls: string[] = [];
+		const runtime = {
+			state: "new",
+			start: async () => void calls.push("runtime-start"),
+			dispose: async () => void calls.push("runtime-dispose"),
+			reconcile: async () => undefined,
+			registerTenant: () => undefined,
+			acquireAttachment: async () => undefined,
+			generationStatus: async () => ({ status: "current" }),
+		};
+		const legacyMappings = new SessionMappingStore();
+		try {
+			const config = resolvedBuilderConfig(root);
+			mkdirSync(config.sessionRoot);
+			writeV3Activation(join(config.sessionRoot, "openwebui-session-mappings.json"));
+			const options = await buildResolvedAdapterServerOptions(config, {
+				mappings: legacyMappings,
+				managedSdkRuntime: runtime as never,
+				turnRunner: { stop: async () => void calls.push("legacy-runner-stop") } as never,
+			});
+
+			const selectedMappings = options.routes?.mappings;
+			expect(selectedMappings).not.toBeUndefined();
+			expect(selectedMappings).not.toBe(legacyMappings);
+			expect(selectedMappings!.constructor.name).toBe("V3FileBackedSessionMappingStore");
+			expect(options.routes?.runner).not.toBeUndefined();
+			expect(options.managedSdkRuntime?.runtime).toBe(runtime as never);
+			expect(calls).toEqual(["runtime-start"]);
+			await options.shutdownCleanup?.();
+			expect(calls).toEqual(["runtime-start", "runtime-dispose"]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("blocks invalid active V3 markers and digests before any legacy mapping store is selected", async () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-v3-runtime-blocked-")));
+		try {
+			const config = resolvedBuilderConfig(root);
+			mkdirSync(config.sessionRoot);
+			const canonicalPath = join(config.sessionRoot, "openwebui-session-mappings.json");
+			for (const marker of ["{\n", undefined] as const) {
+				writeV3Activation(canonicalPath, marker === undefined ? "f".repeat(64) : undefined);
+				if (marker !== undefined) writeFileSync(`${canonicalPath}.v3-active.json`, marker);
+				await expect(
+					buildResolvedAdapterServerOptions(config, { mappings: new SessionMappingStore() }),
+				).rejects.toThrow("Canonical session authority activation is blocked.");
+			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("retains the explicit V2 legacy composition path", async () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-v2-runtime-regression-")));
+		const mappings = new SessionMappingStore();
+		try {
+			const config = resolvedBuilderConfig(root);
+			mkdirSync(config.sessionRoot);
+			writeFileSync(
+				join(config.sessionRoot, "openwebui-gjc-session-authority.json"),
+				'{"kind":"openwebui-gjc-session-authority","version":2}\n',
+			);
+			const options = await buildResolvedAdapterServerOptions(config, { mappings });
+			expect(options.routes?.mappings).toBe(mappings);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	test("required builder and renderer seams reject omitted resolved locations", async () => {
 		const message = "resolved runtime locations are required";
 

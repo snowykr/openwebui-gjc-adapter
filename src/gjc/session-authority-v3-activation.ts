@@ -61,6 +61,10 @@ export interface SessionAuthorityV3ActivationResult {
 	readonly reasons?: readonly string[];
 }
 
+export function readSessionAuthorityV3ActiveMarker(canonicalPath: string): SessionAuthorityV3ActiveMarker | undefined {
+	return readMarker(`${resolve(canonicalPath)}.v3-active.json`);
+}
+
 /**
  * Converts the canonical V2 authority while its runtime and authority-mutation
  * locks are already held. The only files it opens are the authority, its WAL,
