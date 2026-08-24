@@ -8,6 +8,8 @@ import {
 	type ManagedAuthorityActivationStorage,
 	type ManagedAuthorityAdmission,
 	type ManagedAuthorityLifecycleRecovery,
+	type ManagedAuthorityPreparedRebindIntent,
+	managedAuthorityManifestDigest,
 } from "./managed-authority-activation";
 import { ManagedAuthorityFileOwner, ManagedAuthorityFileStorage } from "./managed-authority-file-storage";
 import { ManagedSdkRuntime, type ManagedSdkRuntimeDeps, type TenantSessionKey } from "./managed-sdk-runtime";
@@ -45,6 +47,11 @@ export interface ManagedBootstrapStartResult {
 	readonly result: ManagedAuthorityActivationResult;
 	readonly health: ManagedBootstrapHealth;
 	readonly dependencies?: ManagedBootstrapRunnerDependencies;
+	/** Present only after the canonical v3 authority is durably active. */
+	readonly canonical?: Readonly<{
+		owner: ManagedAuthorityActivationOwner;
+		storage: ManagedAuthorityActivationStorage;
+	}>;
 }
 
 export interface ManagedBootstrapOptions {
@@ -63,8 +70,11 @@ export interface ManagedBootstrapOptions {
 	readonly lifecycle: ManagedAuthorityLifecycleRecovery;
 	/** Re-proves external lease/epoch authority for every Router boundary. */
 	readonly tenantFence: (key: TenantSessionKey) => boolean | Promise<boolean>;
+	readonly preparedIntentFence: (intent: ManagedAuthorityPreparedRebindIntent) => boolean | Promise<boolean>;
 	readonly runtimeDeps?: Omit<ManagedSdkRuntimeDeps, "tenantFence">;
 	readonly acquireRuntimeLock?: (stateRoot: string) => Promise<ManagedBootstrapRuntimeLock>;
+	/** A lock transferred by the managed service supervisor is already held and is never re-acquired. */
+	readonly runtimeLock?: ManagedBootstrapRuntimeLock;
 	readonly createRuntime?: (input: {
 		readonly agentDir: string;
 		readonly tenantFence: ManagedSdkRuntimeDeps["tenantFence"];
@@ -100,7 +110,6 @@ export class ManagedBootstrapService {
 	#lock: ManagedBootstrapRuntimeLock | undefined;
 	#startPromise: Promise<ManagedBootstrapStartResult> | undefined;
 	#disposePromise: Promise<void> | undefined;
-	#admissionOpen = false;
 
 	constructor(options: ManagedBootstrapOptions) {
 		assertResolvedPath(options.agentDir, "agentDir");
@@ -142,43 +151,52 @@ export class ManagedBootstrapService {
 
 	async #start(): Promise<ManagedBootstrapStartResult> {
 		try {
-			this.#lock = await (this.#options.acquireRuntimeLock ?? RuntimeSingletonLock.acquire)(this.#options.stateRoot);
+			this.#lock =
+				this.#options.runtimeLock ??
+				(await (this.#options.acquireRuntimeLock ?? RuntimeSingletonLock.acquire)(this.#options.stateRoot));
 			const checkpoint = parseManagedSessionAuthorityMigrationCheckpoint(
 				(this.#options.plan ?? planManagedSessionAuthorityMigration)(await this.#options.legacyEvidence()),
 			);
 			const bindings = await this.#options.bindings(checkpoint);
 			const admission: ManagedAuthorityAdmission = {
-				open: async () => {
-					this.#admissionOpen = true;
-				},
+				open: async () => undefined,
+				close: async () => undefined,
 			};
-			const tenantFence = async (key: TenantSessionKey): Promise<boolean> =>
-				this.#admissionOpen && (await this.#options.tenantFence(key));
+			const tenantFence = async (key: TenantSessionKey): Promise<boolean> => await this.#options.tenantFence(key);
+			const publicTenantFence = async (key: TenantSessionKey): Promise<boolean> =>
+				this.#phase === "active" && this.#dependencies !== undefined && (await tenantFence(key));
 			this.#runtime =
 				this.#options.createRuntime?.({ agentDir: this.#options.agentDir, tenantFence }) ??
 				new ManagedSdkRuntime({
 					agentDir: this.#options.agentDir,
 					deps: { ...this.#options.runtimeDeps, tenantFence },
 				});
+			const storage = (this.#options.createStorage ?? (locations => new ManagedAuthorityFileStorage(locations)))({
+				stateRoot: this.#options.stateRoot,
+				sourcePath: this.#options.sourcePath,
+			});
+			const owner = (this.#options.createOwner ?? (locations => new ManagedAuthorityFileOwner(locations)))({
+				stateRoot: this.#options.stateRoot,
+				sourcePath: this.#options.sourcePath,
+			});
+			const manifestInput = {
+				authorityEpoch: MANAGED_SESSION_AUTHORITY_EPOCH,
+				checkpoint,
+				records: checkpoint.records,
+			} as const;
 			const activation = await new ManagedAuthorityActivationCoordinator({
 				manifest: {
-					authorityEpoch: MANAGED_SESSION_AUTHORITY_EPOCH,
-					digest: checkpoint.digests.targetManifestDigest,
-					checkpoint,
-					records: checkpoint.records,
+					...manifestInput,
+					digest: managedAuthorityManifestDigest(manifestInput),
 				},
 				bindings,
-				storage: (this.#options.createStorage ?? (locations => new ManagedAuthorityFileStorage(locations)))({
-					stateRoot: this.#options.stateRoot,
-					sourcePath: this.#options.sourcePath,
-				}),
-				owner: (this.#options.createOwner ?? (locations => new ManagedAuthorityFileOwner(locations)))({
-					stateRoot: this.#options.stateRoot,
-					sourcePath: this.#options.sourcePath,
-				}),
+				storage,
+				owner,
 				runtime: this.#runtime,
 				lifecycle: this.#options.lifecycle,
 				admission,
+				tenantFence: this.#options.tenantFence,
+				preparedIntentFence: this.#options.preparedIntentFence,
 			}).activate();
 			this.#result = activation;
 			if (
@@ -196,12 +214,11 @@ export class ManagedBootstrapService {
 				});
 				return { result: activation, health: this.health };
 			}
-			await this.#recoverActiveRuntime(bindings);
 			this.#phase = "active";
 			this.#dependencies = Object.freeze({
 				runtime: this.#runtime,
 				runner: (this.#options.createRunner ?? createManagedGjcTurnRunner)(this.#runtime),
-				tenantFence,
+				tenantFence: publicTenantFence,
 			});
 			this.#setHealth({
 				phase: "active",
@@ -209,7 +226,12 @@ export class ManagedBootstrapService {
 				routerAvailable: true,
 				epoch: MANAGED_SESSION_AUTHORITY_EPOCH,
 			});
-			return { result: activation, health: this.health, dependencies: this.#dependencies };
+			return {
+				result: activation,
+				health: this.health,
+				dependencies: this.#dependencies,
+				canonical: { owner, storage },
+			};
 		} catch (error) {
 			const reason = message(error);
 			this.#result = { phase: "failed", ready: false, routerAvailable: false, reason };
@@ -224,23 +246,7 @@ export class ManagedBootstrapService {
 		}
 	}
 
-	async #recoverActiveRuntime(bindings: readonly ManagedAuthorityActivationBinding[]): Promise<void> {
-		if (this.#runtime?.state === "running") return;
-		const runtime = this.#runtime;
-		if (runtime === undefined) throw new Error("Managed runtime is unavailable after activation.");
-		await runtime.start();
-		for (const binding of bindings) {
-			await this.#options.lifecycle.resume(binding.record, binding.tenant);
-			runtime.registerTenant(binding.tenant);
-			await runtime.reconcile();
-			const attachment = await runtime.acquireAttachment(binding.tenant);
-			if (attachment.generation !== binding.tenant.generation || !attachment.attachment.isCurrent())
-				throw new Error("Exact current Router attachment proof is required.");
-		}
-	}
-
 	async #dispose(): Promise<void> {
-		this.#admissionOpen = false;
 		this.#dependencies = undefined;
 		try {
 			await this.#cleanup();
@@ -254,7 +260,6 @@ export class ManagedBootstrapService {
 	}
 
 	async #cleanup(): Promise<void> {
-		this.#admissionOpen = false;
 		const runtime = this.#runtime;
 		const lock = this.#lock;
 		this.#runtime = undefined;

@@ -212,6 +212,38 @@ export function transitionManagedSessionAuthorityRecord(
 	return { ...valid, lifecycle: { state: next, recordedAt } };
 }
 
+/** Lifecycle evidence APIs intentionally encode the proof needed for each edge. */
+export function acknowledgeManagedSessionAuthorityRecord(
+	record: ManagedSessionAuthorityRecord,
+	recordedAt: string,
+): ManagedSessionAuthorityRecord {
+	return transitionManagedSessionAuthorityRecord(record, "acknowledged_unproven", recordedAt);
+}
+
+export function proveManagedSessionAuthorityGeneration(
+	record: ManagedSessionAuthorityRecord,
+	endpointGeneration: number,
+	recordedAt: string,
+): ManagedSessionAuthorityRecord {
+	const valid = parseManagedSessionAuthorityRecord(record);
+	if (!isPositiveGeneration(endpointGeneration) || endpointGeneration !== valid.generation)
+		throw new ManagedSessionAuthorityError(
+			"The returned positive endpoint generation must exactly prove the record.",
+		);
+	return transitionManagedSessionAuthorityRecord(valid, "active_generation_proven", recordedAt);
+}
+
+export function retireManagedSessionAuthorityRecord(
+	record: ManagedSessionAuthorityRecord,
+	generationStatus: Readonly<{ generation: number; retired: true }>,
+	recordedAt: string,
+): ManagedSessionAuthorityRecord {
+	const valid = parseManagedSessionAuthorityRecord(record);
+	if (!isPositiveGeneration(generationStatus.generation) || generationStatus.generation !== valid.generation)
+		throw new ManagedSessionAuthorityError("Positive exact generation status is required to retire authority.");
+	return transitionManagedSessionAuthorityRecord(valid, "retired", recordedAt);
+}
+
 export function isManagedSessionAuthorityMigrationCheckpoint(
 	value: unknown,
 ): value is ManagedSessionAuthorityMigrationCheckpoint {
@@ -287,7 +319,15 @@ export function planManagedSessionAuthorityMigration(
 				status: "migration_blocked",
 				reason: "missing or ambiguous tenant identity",
 			};
-		return { identity, status: record.status ?? "intent_prepared" };
+		// Legacy evidence has no public lifecycle result. In particular its old
+		// "active" label cannot manufacture an endpoint generation proof.
+		if (record.status === "retired")
+			return {
+				identity,
+				status: "migration_blocked",
+				reason: "legacy retired label lacks positive exact-generation evidence",
+			};
+		return { identity, status: record.status === "quarantined" ? "quarantined" : "intent_prepared" };
 	});
 	const planned: ManagedSessionAuthorityMigrationCheckpoint = {
 		authorityEpoch: MANAGED_SESSION_AUTHORITY_EPOCH,

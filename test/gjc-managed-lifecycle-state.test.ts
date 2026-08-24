@@ -10,11 +10,32 @@ import {
 	parseManagedLifecycleState,
 } from "../src/gjc/managed-lifecycle-state";
 
+const EXPECTED_TRANSITIONS = {
+	intent_prepared: ["invoking", "terminal_failure"],
+	invoking: ["acknowledged_unproven", "terminal_failure", "uncertain", "cleanup_pending"],
+	acknowledged_unproven: ["active_generation_proven", "cleanup_pending", "uncertain", "retired"],
+	active_generation_proven: ["closing"],
+	closing: ["active_generation_proven", "retired", "uncertain"],
+	retired: [],
+	terminal_failure: [],
+	uncertain: [
+		"acknowledged_unproven",
+		"active_generation_proven",
+		"retired",
+		"terminal_failure",
+		"cleanup_pending",
+		"cleanup_uncertain",
+	],
+	cleanup_pending: ["invoking", "cleanup_uncertain"],
+	cleanup_uncertain: ["cleanup_pending", "retired", "uncertain"],
+} as const;
+
 describe("managed lifecycle state", () => {
 	test("accepts every and only normative lifecycle edge", () => {
+		expect(MANAGED_LIFECYCLE_TRANSITIONS).toEqual(EXPECTED_TRANSITIONS);
 		for (const from of MANAGED_LIFECYCLE_STATES) {
 			for (const to of MANAGED_LIFECYCLE_STATES) {
-				const legal = MANAGED_LIFECYCLE_TRANSITIONS[from].includes(to);
+				const legal = (EXPECTED_TRANSITIONS[from] as readonly string[]).includes(to);
 				expect(canTransitionManagedLifecycleState(from, to)).toBe(legal);
 				if (legal) expect(() => assertManagedLifecycleTransition(from, to)).not.toThrow();
 				else expect(() => assertManagedLifecycleTransition(from, to)).toThrow(ManagedLifecycleStateError);

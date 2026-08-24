@@ -15,13 +15,15 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import type {
-	ManagedAuthorityActivationJournal,
-	ManagedAuthorityActivationLock,
-	ManagedAuthorityActivationManifest,
-	ManagedAuthorityActivationOwner,
-	ManagedAuthorityActivationStorage,
+import {
+	type ManagedAuthorityActivationJournal,
+	type ManagedAuthorityActivationLock,
+	type ManagedAuthorityActivationManifest,
+	type ManagedAuthorityActivationOwner,
+	type ManagedAuthorityActivationStorage,
+	managedAuthorityManifestDigest,
 } from "./managed-authority-activation";
+
 import {
 	decodeManagedSessionAuthorityRecord,
 	encodeManagedSessionAuthorityRecord,
@@ -192,20 +194,34 @@ export class ManagedAuthorityFileStorage implements ManagedAuthorityActivationSt
 		});
 		if (new Set(journal.staged).size !== records.length)
 			throw new Error("Activation journal contains duplicate staged records.");
-		writeAtomicJson(this.#canonicalPath, {
+		const canonical = {
+			kind: "openwebui-gjc-session-authority",
+			version: 3,
 			authorityEpoch: manifest.authorityEpoch,
 			digest: manifest.digest,
 			records,
-		});
+		};
+		// This is the authoritative replacement, not a sidecar: writeAtomic fsyncs
+		// the complete document, renames it over sourcePath, then fsyncs its parent.
+		writeAtomicJson(this.#sourcePath, canonical);
+		writeAtomicJson(this.#canonicalPath, canonical);
 	}
 
 	async canonicalReplacementState(): Promise<"replaced" | "not_replaced" | "uncertain"> {
 		const journal = await this.load();
 		if (journal === undefined) return "not_replaced";
 		try {
-			const canonical = readJsonIfPresent(this.#canonicalPath, "canonical v3 authority");
+			const canonical = readJsonIfPresent(this.#sourcePath, "canonical v3 authority");
 			if (canonical === undefined) return "not_replaced";
-			if (!isRecord(canonical) || canonical.digest !== journal.manifest.digest || !Array.isArray(canonical.records))
+			if (isRecord(canonical) && canonical.kind === "openwebui-gjc-session-authority" && canonical.version === 2)
+				return "not_replaced";
+			if (
+				!isRecord(canonical) ||
+				canonical.kind !== "openwebui-gjc-session-authority" ||
+				canonical.version !== 3 ||
+				canonical.digest !== journal.manifest.digest ||
+				!Array.isArray(canonical.records)
+			)
 				return "uncertain";
 			const records = canonical.records.map(record => decodeManagedSessionAuthorityRecord(record));
 			const identities = records.map(managedSessionAuthorityHash);
@@ -460,6 +476,15 @@ function assertManifest(value: unknown): asserts value is ManagedAuthorityActiva
 		!isRecord(value.checkpoint.digests)
 	)
 		throw new Error("Activation manifest is invalid.");
+	if (
+		value.digest !==
+		managedAuthorityManifestDigest({
+			authorityEpoch: value.authorityEpoch as ManagedAuthorityActivationManifest["authorityEpoch"],
+			checkpoint: value.checkpoint as unknown as ManagedAuthorityActivationManifest["checkpoint"],
+			records: value.records as ManagedAuthorityActivationManifest["records"],
+		})
+	)
+		throw new Error("Activation manifest digest is invalid.");
 }
 function assertJournal(value: unknown): asserts value is ManagedAuthorityActivationJournal {
 	if (
@@ -468,6 +493,8 @@ function assertJournal(value: unknown): asserts value is ManagedAuthorityActivat
 		typeof value.phase !== "string" ||
 		!Array.isArray(value.staged) ||
 		!value.staged.every(value => typeof value === "string" && SHA256.test(value)) ||
+		!Array.isArray(value.items) ||
+		!value.items.every(item => isRecord(item) && isRecord(item.intent) && typeof item.state === "string") ||
 		typeof value.canonicalReplaced !== "boolean" ||
 		typeof value.activeMarker !== "boolean"
 	)

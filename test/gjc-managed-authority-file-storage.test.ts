@@ -6,7 +6,9 @@ import path from "node:path";
 import type {
 	ManagedAuthorityActivationJournal,
 	ManagedAuthorityActivationManifest,
+	ManagedAuthorityPreparedRebindIntent,
 } from "../src/gjc/managed-authority-activation";
+import { managedAuthorityManifestDigest } from "../src/gjc/managed-authority-activation";
 import { ManagedAuthorityFileOwner, ManagedAuthorityFileStorage } from "../src/gjc/managed-authority-file-storage";
 import {
 	MANAGED_SESSION_AUTHORITY_EPOCH,
@@ -15,6 +17,28 @@ import {
 } from "../src/gjc/managed-session-authority";
 
 const sha256 = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
+
+function preparedIntent(): ManagedAuthorityPreparedRebindIntent {
+	return {
+		principalId: "principal",
+		projectId: "project",
+		canonicalWorkspace: "/workspace/project",
+		chatId: "chat",
+		sessionId: "session",
+		actorDigest: sha256("actor"),
+		actorRef: "actor",
+		stableKey: "stable-key",
+		operationHash: sha256("record"),
+		requestHash: sha256("record"),
+		payloadHash: sha256("record"),
+		leaseId: "lease",
+		epoch: "epoch",
+		preparedAt: "2026-01-01T00:00:00.000Z",
+		observedAt: "2026-01-01T00:00:00.000Z",
+		rawFrameCursor: 0,
+		eventCursor: 0,
+	};
+}
 
 async function fixture() {
 	const stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-authority-storage-"));
@@ -27,9 +51,8 @@ async function fixture() {
 	const storage = new ManagedAuthorityFileStorage({ stateRoot, sourcePath });
 	const owner = new ManagedAuthorityFileOwner({ stateRoot, sourcePath });
 	const record = authorityRecord();
-	const manifest: ManagedAuthorityActivationManifest = {
+	const manifestInput = {
 		authorityEpoch: MANAGED_SESSION_AUTHORITY_EPOCH,
-		digest: sha256("manifest"),
 		checkpoint: {
 			authorityEpoch: MANAGED_SESSION_AUTHORITY_EPOCH,
 			digests: {
@@ -42,7 +65,11 @@ async function fixture() {
 			canonicalReplaced: false,
 			activeMarkerReady: false,
 		},
-		records: [{ identity: "record", status: "active_generation_proven" }],
+		records: [{ identity: "record", status: "intent_prepared" }],
+	} as const;
+	const manifest: ManagedAuthorityActivationManifest = {
+		...manifestInput,
+		digest: managedAuthorityManifestDigest(manifestInput),
 	};
 	const journal = (
 		phase: ManagedAuthorityActivationJournal["phase"],
@@ -51,6 +78,7 @@ async function fixture() {
 		manifest,
 		phase,
 		staged: [managedSessionAuthorityHash(record)],
+		items: [{ intent: preparedIntent(), state: "active_generation_proven", record }],
 		canonicalReplaced,
 		activeMarker: false,
 	});
@@ -104,6 +132,13 @@ describe("managed authority file storage", () => {
 			await f.storage.fsyncCheckpoint();
 			await f.storage.replaceCanonical();
 			expect(await f.storage.canonicalReplacementState()).toBe("replaced");
+			expect(JSON.parse(await fs.readFile(f.sourcePath, "utf8"))).toEqual({
+				kind: "openwebui-gjc-session-authority",
+				version: 3,
+				authorityEpoch: MANAGED_SESSION_AUTHORITY_EPOCH,
+				digest: f.manifest.digest,
+				records: [f.record],
+			});
 			await f.storage.save(f.journal("committing", true));
 			await f.storage.writeActiveMarker(MANAGED_SESSION_AUTHORITY_EPOCH, f.manifest.digest);
 			await f.storage.fsyncActiveMarker();

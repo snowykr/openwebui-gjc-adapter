@@ -23,24 +23,22 @@ const STATE_SET = new Set<string>(MANAGED_LIFECYCLE_STATES);
 export const MANAGED_LIFECYCLE_TRANSITIONS: Readonly<Record<ManagedLifecycleState, readonly ManagedLifecycleState[]>> =
 	Object.freeze({
 		intent_prepared: ["invoking", "terminal_failure"],
-		invoking: ["acknowledged_unproven", "active_generation_proven", "terminal_failure", "uncertain"],
-		acknowledged_unproven: ["active_generation_proven", "closing", "terminal_failure", "uncertain"],
-		active_generation_proven: ["closing", "terminal_failure", "uncertain"],
-		closing: ["retired", "terminal_failure", "uncertain", "cleanup_pending", "cleanup_uncertain"],
+		invoking: ["acknowledged_unproven", "terminal_failure", "uncertain", "cleanup_pending"],
+		acknowledged_unproven: ["active_generation_proven", "cleanup_pending", "uncertain", "retired"],
+		active_generation_proven: ["closing"],
+		closing: ["active_generation_proven", "retired", "uncertain"],
 		retired: [],
 		terminal_failure: [],
 		uncertain: [
-			"invoking",
 			"acknowledged_unproven",
 			"active_generation_proven",
-			"closing",
 			"retired",
 			"terminal_failure",
 			"cleanup_pending",
 			"cleanup_uncertain",
 		],
-		cleanup_pending: ["closing", "retired", "terminal_failure", "uncertain", "cleanup_uncertain"],
-		cleanup_uncertain: ["cleanup_pending", "retired", "terminal_failure", "uncertain"],
+		cleanup_pending: ["invoking", "cleanup_uncertain"],
+		cleanup_uncertain: ["cleanup_pending", "retired", "uncertain"],
 	});
 
 export class ManagedLifecycleStateError extends Error {

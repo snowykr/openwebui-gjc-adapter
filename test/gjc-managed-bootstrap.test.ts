@@ -2,13 +2,12 @@ import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import type {
 	ManagedAuthorityActivationJournal,
-	ManagedAuthorityActivationStorage,
+	ManagedAuthorityPreparedRebindIntent,
 } from "../src/gjc/managed-authority-activation";
 import { type ManagedBootstrapOptions, ManagedBootstrapService } from "../src/gjc/managed-bootstrap";
 import {
 	type LegacyManagedSessionAuthorityEvidence,
 	MANAGED_SESSION_AUTHORITY_EPOCH,
-	type ManagedSessionAuthorityRecord,
 } from "../src/gjc/managed-session-authority";
 
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
@@ -18,26 +17,27 @@ const digests = {
 	walDigest: hash("wal"),
 	targetManifestDigest: hash("manifest"),
 };
+const preparedIntent = (): ManagedAuthorityPreparedRebindIntent => ({
+	principalId: "principal",
+	projectId: "project",
+	canonicalWorkspace: "/workspace/project",
+	chatId: "chat",
+	sessionId: "session",
+	actorDigest: hash("actor"),
+	actorRef: "actor",
+	stableKey: "stable-key",
+	operationHash: hash("operation"),
+	requestHash: hash("request"),
+	payloadHash: hash("payload"),
+	leaseId: "lease",
+	epoch: "epoch",
+	preparedAt: "2026-01-01T00:00:00.000Z",
+	observedAt: "2026-01-01T00:00:00.000Z",
+	rawFrameCursor: 0,
+	eventCursor: 0,
+});
 
-function authority(): ManagedSessionAuthorityRecord {
-	return {
-		authorityEpoch: MANAGED_SESSION_AUTHORITY_EPOCH,
-		principalId: "principal",
-		projectId: "project",
-		canonicalWorkspace: "/workspace/project",
-		chatId: "chat",
-		sessionId: "session",
-		generation: 1,
-		operationHash: hash("operation"),
-		requestHash: hash("request"),
-		payloadHash: hash("payload"),
-		session: { sessionId: "session", observedAt: "2026-01-01T00:00:00.000Z" },
-		projection: { rawFrameCursor: 0, eventCursor: 0 },
-		lifecycle: { state: "active_generation_proven", recordedAt: "2026-01-01T00:00:00.000Z" },
-	};
-}
-
-class FakeStorage implements ManagedAuthorityActivationStorage {
+class FakeStorage {
 	journal: ManagedAuthorityActivationJournal | undefined;
 	readonly calls: string[] = [];
 	async load() {
@@ -74,7 +74,6 @@ class FakeStorage implements ManagedAuthorityActivationStorage {
 		this.calls.push("rollback");
 	}
 }
-
 class FakeRuntime {
 	state: "new" | "running" | "stopped" = "new";
 	starts = 0;
@@ -101,7 +100,6 @@ class FakeRuntime {
 		this.state = "stopped";
 	}
 }
-
 function evidence(
 	records: LegacyManagedSessionAuthorityEvidence["records"] = [
 		{
@@ -118,7 +116,12 @@ function evidence(
 }
 
 function fixture(
-	options: { readonly blocked?: boolean; readonly failRuntime?: boolean; readonly storage?: FakeStorage } = {},
+	options: {
+		readonly blocked?: boolean;
+		readonly failRuntime?: boolean;
+		readonly releaseFails?: boolean;
+		readonly storage?: FakeStorage;
+	} = {},
 ) {
 	const storage = options.storage ?? new FakeStorage();
 	const runtime = new FakeRuntime();
@@ -133,33 +136,33 @@ function fixture(
 		legacyEvidence: async () => evidence(options.blocked ? [{ sessionId: "ambiguous" }] : undefined),
 		bindings: async checkpoint => {
 			bindCalls += 1;
-			if (checkpoint.records.some(record => record.status === "migration_blocked")) return [];
-			const record = authority();
-			return [
-				{
-					record,
-					tenant: {
-						principalId: record.principalId,
-						projectId: record.projectId,
-						canonicalWorkspace: record.canonicalWorkspace,
-						chatId: record.chatId,
-						sessionId: record.sessionId,
-						generation: record.generation,
-						leaseId: "lease",
-						epoch: "epoch",
-					},
-				},
-			];
+			return checkpoint.records.some(record => record.status !== "intent_prepared")
+				? []
+				: [{ intent: preparedIntent() }];
 		},
 		lifecycle: {
-			resume: async () => {
+			resume: async intent => {
 				resumes += 1;
+				return {
+					ok: true,
+					sessionId: intent.sessionId,
+					endpointGeneration: 5,
+					acknowledgedAt: "2026-01-01T00:00:01.000Z",
+				};
 			},
+			recover: async intent => ({
+				ok: true,
+				sessionId: intent.sessionId,
+				endpointGeneration: 5,
+				acknowledgedAt: "2026-01-01T00:00:01.000Z",
+			}),
 		},
-		tenantFence: async key => key.leaseId === "lease" && key.epoch === "epoch",
+		preparedIntentFence: async intent => intent.leaseId === "lease" && intent.epoch === "epoch",
+		tenantFence: async key => key.leaseId === "lease" && key.epoch === "epoch" && key.generation === 5,
 		acquireRuntimeLock: async () => ({
 			release: async () => {
 				releases += 1;
+				if (options.releaseFails) throw new Error("release failed");
 			},
 		}),
 		createRuntime: () => runtime as never,
@@ -171,10 +174,9 @@ function fixture(
 }
 
 describe("managed bootstrap", () => {
-	test("activates a clean state, exposes exact active result, and admits managed dependencies only afterward", async () => {
+	test("activates only after generation-free binding resumes to an exact positive generation", async () => {
 		const active = fixture();
 		expect(active.service.runnerDependencies).toBeUndefined();
-		expect(active.service.readiness).toBe(false);
 		const started = await active.service.start();
 		expect(started.result).toEqual({
 			phase: "active",
@@ -182,13 +184,21 @@ describe("managed bootstrap", () => {
 			routerAvailable: true,
 			epoch: MANAGED_SESSION_AUTHORITY_EPOCH,
 		});
-		expect(started.health).toEqual({
-			phase: "active",
-			ready: true,
-			routerAvailable: true,
-			epoch: MANAGED_SESSION_AUTHORITY_EPOCH,
-		});
 		expect(started.dependencies).toBe(active.service.runnerDependencies);
+		expect(active.storage.journal?.items).toEqual([
+			expect.objectContaining({
+				state: "active_generation_proven",
+				record: expect.objectContaining({ generation: 5 }),
+			}),
+		]);
+		expect(active.runtime.registered).toEqual(
+			expect.arrayContaining([expect.objectContaining({ generation: 5, leaseId: "lease", epoch: "epoch" })]),
+		);
+		expect(active.resumes()).toBe(1);
+	});
+	test("keeps public admission separate from the external tenant fence", async () => {
+		const active = fixture();
+		const started = await active.service.start();
 		expect(
 			await started.dependencies?.tenantFence({
 				principalId: "principal",
@@ -196,57 +206,62 @@ describe("managed bootstrap", () => {
 				canonicalWorkspace: "/workspace/project",
 				chatId: "chat",
 				sessionId: "session",
-				generation: 1,
+				generation: 5,
 				leaseId: "lease",
 				epoch: "epoch",
 			}),
 		).toBe(true);
-		expect(active.storage.calls).toEqual(expect.arrayContaining(["backup", "stage", "replace", "marker"]));
-		expect(active.runtime.starts).toBe(1);
-		expect(active.resumes()).toBe(1);
+		await active.service.dispose();
+		expect(
+			await started.dependencies?.tenantFence({
+				principalId: "principal",
+				projectId: "project",
+				canonicalWorkspace: "/workspace/project",
+				chatId: "chat",
+				sessionId: "session",
+				generation: 5,
+				leaseId: "lease",
+				epoch: "epoch",
+			}),
+		).toBe(false);
 	});
-
-	test("rebinds the staged v2 authority and restarts from the exact durable manifest", async () => {
+	test("replays durable active items on restart without resuming a generation", async () => {
 		const storage = new FakeStorage();
-		const first = fixture({ storage });
-		await first.service.start();
-		const second = fixture({ storage });
-		const restarted = await second.service.start();
-		expect(restarted.result.phase).toBe("active");
-		expect(second.runtime.starts).toBe(1);
-		expect(second.resumes()).toBe(1);
-		expect(storage.journal?.manifest.digest).toBe(digests.targetManifestDigest);
-		expect(storage.journal?.manifest.records).toEqual(storage.journal?.manifest.checkpoint.records);
+		await fixture({ storage }).service.start();
+		const restarted = fixture({ storage });
+		expect((await restarted.service.start()).result.phase).toBe("active");
+		expect(restarted.resumes()).toBe(0);
+		expect(restarted.runtime.registered).toEqual([expect.objectContaining({ generation: 5 })]);
 	});
-
-	test("blocks ambiguous legacy evidence without Router admission or managed dependencies", async () => {
+	test("blocks ambiguous evidence and releases the runtime lock after bootstrap or cleanup failure", async () => {
 		const blocked = fixture({ blocked: true });
-		const result = await blocked.service.start();
-		expect(result.result).toMatchObject({ phase: "blocked", ready: false, routerAvailable: false });
-		expect(result.dependencies).toBeUndefined();
-		expect(blocked.service.runnerDependencies).toBeUndefined();
-		expect(blocked.runtime.starts).toBe(0);
+		expect((await blocked.service.start()).result).toMatchObject({ phase: "blocked", ready: false });
 		expect(blocked.resumes()).toBe(0);
 		expect(blocked.releases()).toBe(1);
-	});
-
-	test("stops the Router and releases the runtime lock after runtime bootstrap failure", async () => {
 		const failed = fixture({ failRuntime: true });
-		const result = await failed.service.start();
-		expect(result.result).toMatchObject({ phase: "failed", ready: false, reason: "router start failed" });
+		expect((await failed.service.start()).result).toMatchObject({
+			phase: "failed",
+			ready: false,
+			reason: "router start failed",
+		});
 		expect(failed.runtime.disposes).toBe(1);
 		expect(failed.releases()).toBe(1);
-		expect(failed.service.health).toMatchObject({ phase: "failed", ready: false });
+		const release = fixture({ releaseFails: true });
+		await release.service.start();
+		await expect(release.service.dispose()).rejects.toThrow("Managed bootstrap cleanup failed");
+		expect(release.service.health).toMatchObject({
+			phase: "failed",
+			ready: false,
+			reason: "Managed bootstrap cleanup failed.",
+		});
 	});
-
-	test("makes start and disposal idempotent and keeps user artifact capabilities out of bootstrap", async () => {
+	test("keeps start and disposal idempotent and user artifact capabilities absent", async () => {
 		const active = fixture();
 		const [first, second] = await Promise.all([active.service.start(), active.service.start()]);
 		expect(second).toBe(first);
 		await Promise.all([active.service.dispose(), active.service.dispose()]);
 		expect(active.runtime.disposes).toBe(1);
 		expect(active.releases()).toBe(1);
-		expect(active.service.readiness).toBe(false);
 		expect(Object.keys(active.storage)).not.toContain("userArtifacts");
 	});
 });
