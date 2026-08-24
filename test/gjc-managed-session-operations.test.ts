@@ -191,6 +191,15 @@ class FakeRuntime {
 		unsubscribe.drain = async () => undefined;
 		return unsubscribe;
 	}
+	prepareFrameSubscription(_attachment: unknown, _operation: string, listener: (frame: unknown) => Promise<void>) {
+		this.subscriptions.push(listener);
+		const unsubscribe = (() => {
+			this.subscriptions.splice(this.subscriptions.indexOf(listener), 1);
+		}) as (() => void) & { bind(correlation: unknown): void; drain(): Promise<void> };
+		unsubscribe.bind = () => undefined;
+		unsubscribe.drain = async () => undefined;
+		return unsubscribe;
+	}
 	async generationStatus() {
 		return { status: this.status };
 	}

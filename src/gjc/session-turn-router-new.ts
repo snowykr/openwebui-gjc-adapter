@@ -54,10 +54,22 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 					input.modelSelection === undefined ? undefined : normalizeModelSelection(result.modelSelection);
 				if (input.modelSelection !== undefined && completedSelection === undefined)
 					throw new TypeError("Missing selected GJC outcome");
-				if (result.attachment === undefined)
-					throw new Error("New GJC session did not return a validated current attachment.");
+				if (result.attachment === undefined && result.managedProof === undefined)
+					throw new Error("New GJC session did not return validated generation authority.");
 				const assistantText = input.projectAssistantText?.(result) ?? result.text;
-				const mapping = await lifecycle.publish(result.attachment, () => {
+				const publish =
+					result.managedProof === undefined
+						? result.attachment === undefined
+							? undefined
+							: (write: () => import("./session-router").SessionMapping) =>
+									lifecycle.publish(result.attachment!, write)
+						: lifecycle.publishManaged === undefined
+							? undefined
+							: (write: () => import("./session-router").SessionMapping) =>
+									lifecycle.publishManaged!(result.managedProof!, write);
+				if (publish === undefined)
+					throw new Error("Lifecycle transaction cannot publish managed generation authority.");
+				const mapping = await publish(() => {
 					throwIfAborted(input.signal);
 					const published = input.mappings.publishProvisionalOperation(operation, {
 						chatId: input.chatId,
@@ -70,7 +82,7 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 						operationId: input.userMessageId,
 						assistantText,
 						events: result.events,
-						attachment: result.attachment,
+						...(result.attachment === undefined ? {} : { attachment: result.attachment }),
 						...(completedSelection === undefined ? {} : { modelSelection: completedSelection }),
 					});
 					authorityCompleted = true;

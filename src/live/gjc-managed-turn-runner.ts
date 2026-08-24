@@ -81,21 +81,26 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 				authority: input.authority as ManagedTurnAuthority,
 				target: input.lifecycleTarget,
 			});
-			const authority = {
+			const authority: ManagedTurnAuthority = {
 				...input.authority,
 				sessionId: lifecycle.tenant.sessionId,
 				generation: lifecycle.tenant.generation,
 			};
 			try {
-				return await operations.prompt(turnInput({ ...input, authority }, "turn.prompt"));
+				return withManagedProof(
+					await operations.prompt(turnInput({ ...input, authority }, "turn.prompt")),
+					authority,
+				);
 			} catch (error) {
 				await closeAfterPrePromptFailure(operations, authority, input.lifecycleTarget, error);
 				throw error;
 			}
 		},
 		resume: input => operations.resume(input),
-		continue: input => operations.followUp(turnInput(input, "turn.follow_up")),
-		continueSession: input => operations.followUp(turnInput(input, "turn.follow_up")),
+		continue: async input =>
+			withManagedProof(await operations.followUp(turnInput(input, "turn.follow_up")), input.authority),
+		continueSession: async input =>
+			withManagedProof(await operations.followUp(turnInput(input, "turn.follow_up")), input.authority),
 		async control(input) {
 			if ("gateId" in input) return { result: await operations.answerGate(gateInput(input)) };
 			return {
@@ -109,8 +114,9 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 					})),
 			};
 		},
-		gate: input => operations.answerGate(gateInput(input)),
-		respondWorkflowGate: input => operations.answerGate(gateInput(input)),
+		gate: async input => withManagedProof(await operations.answerGate(gateInput(input)), input.authority),
+		respondWorkflowGate: async input =>
+			withManagedProof(await operations.answerGate(gateInput(input)), input.authority),
 		async cancel(input) {
 			await operations.abort({
 				authority: input.authority,
@@ -132,6 +138,7 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 				...(input.sessionFile === undefined ? {} : { sessionFile: input.sessionFile }),
 				rawFrameCursor: 0,
 				eventCursor: 0,
+				managedProof: managedProof(input.authority),
 			};
 		},
 		getAvailableModels: input => operations.getModels(input.authority),
@@ -140,7 +147,7 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 				authority: input.authority as ManagedTurnAuthority,
 				target: input.lifecycleTarget,
 			});
-			const authority = {
+			const authority: ManagedTurnAuthority = {
 				...input.authority,
 				sessionId: lifecycle.tenant.sessionId,
 				generation: lifecycle.tenant.generation,
@@ -153,7 +160,10 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 				sessionId: authority.sessionId,
 			};
 			await beforePrompt(address);
-			const result = await operations.prompt(turnInput({ ...input, authority }, "turn.prompt"));
+			const result = withManagedProof(
+				await operations.prompt(turnInput({ ...input, authority }, "turn.prompt")),
+				authority,
+			);
 			return await publish({ ...address, ...result });
 		},
 	};
@@ -178,11 +188,6 @@ function gateInput(input: ManagedRunnerGateInput): ManagedGateInput {
 		operation: "workflow.gate_answer",
 		gateId: input.gateId,
 		answer: input.answer,
-		correlation: input.gateCorrelation ?? {
-			commandId: input.operationId,
-			turnId: input.operationId,
-			sessionId: input.sessionId,
-		},
 		signal: input.signal,
 		observer: input.observer,
 		onDispatch: input.onDispatch,
@@ -206,6 +211,20 @@ async function closeAfterPrePromptFailure(
 }
 function throwIfAborted(signal: AbortSignal | undefined): void {
 	if (signal?.aborted) throw new GjcTurnCancelledError();
+}
+
+function managedProof(authority: ManagedTurnAuthority) {
+	return {
+		kind: "managed-generation" as const,
+		sessionId: authority.sessionId,
+		generation: authority.generation,
+		leaseId: authority.leaseId,
+		epoch: authority.epoch,
+	};
+}
+
+function withManagedProof(result: GjcTurnResult, authority: ManagedTurnAuthority): GjcTurnResult {
+	return { ...result, managedProof: managedProof(authority) };
 }
 
 // Keeps the import contract visible to the eventual routing cutover without wiring it today.

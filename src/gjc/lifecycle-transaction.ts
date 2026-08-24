@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import type { PublicSdkSessionAttachment } from "./public-sdk-contract";
 import type { SessionAttachmentProof } from "./session-authority";
+import type { ManagedGenerationProof } from "./turn-runner";
 
 export type GjcLifecycleOwner = object;
 
@@ -150,6 +151,8 @@ export interface GjcLifecycleTransaction {
 	/** Returns the exact cached attachment only when persisted descriptor and full pane ownership proof match. */
 	assertClosePreflight(proof: SessionAttachmentProof): GjcCloseReceipt;
 	publish<T>(proof: SessionAttachmentProof, write: () => T): Promise<T>;
+	/** Publishes an exact credential-free managed generation after Router proof. */
+	publishManaged?<T>(proof: ManagedGenerationProof, write: () => T): Promise<T>;
 	/** Commits a proven close and evicts its exact active attachment before releasing the lifecycle owner. */
 	publishClosed<T>(receipt: GjcCloseReceipt, write: () => T): Promise<T>;
 	handoff(address: GjcLifecyclePublicationAddress, proof: SessionAttachmentProof): Promise<void>;

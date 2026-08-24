@@ -59,7 +59,6 @@ export interface ManagedTurnInput extends ManagedRequestInput {
 export interface ManagedGateInput extends ManagedRequestInput {
 	readonly gateId: string;
 	readonly answer: unknown;
-	readonly correlation: Readonly<{ commandId: string; turnId: string; sessionId: string }>;
 	readonly observer?: (event: GjcTurnEvent) => void | Promise<void>;
 }
 
@@ -204,6 +203,7 @@ export function createManagedSessionOperations(runtime: ManagedSdkRuntime): Mana
 						target: { sessionId: lifecycleTenant.sessionId, endpointGeneration: lifecycleTenant.generation },
 						timeoutMs: input.timeoutMs,
 					});
+					runtime.unregisterTenant(lifecycleTenant);
 				} catch (cleanup) {
 					throw new AggregateError([error, cleanup], "Managed lifecycle success has uncertain cleanup.");
 				}
@@ -266,10 +266,6 @@ export function createManagedSessionOperations(runtime: ManagedSdkRuntime): Mana
 	): Promise<GjcTurnResult> => {
 		throwIfAborted(input.signal);
 		const authority = input.authority;
-		const correlation =
-			"correlation" in input
-				? input.correlation
-				: deterministicCorrelation(authority, operation, input.idempotencyKey ?? authority.requestKey);
 		const attachment = await acquire(authority);
 		const events: GjcTurnEvent[] = [];
 		const eventIds = new Set<string>();
@@ -281,7 +277,7 @@ export function createManagedSessionOperations(runtime: ManagedSdkRuntime): Mana
 			await (input as ManagedTurnInput | ManagedGateInput).observer?.(event);
 		};
 		let closed = false;
-		const unsubscribe = runtime.subscribeFrames(attachment, operation, correlation, async observed => {
+		const subscription = runtime.prepareFrameSubscription(attachment, operation, async observed => {
 			if (closed) return;
 			const event = normalizeFrame({
 				...observed.frame.body,
@@ -313,13 +309,9 @@ export function createManagedSessionOperations(runtime: ManagedSdkRuntime): Mana
 								id: (input as ManagedGateInput).gateId,
 								response: (input as ManagedGateInput).answer,
 								expectedSessionId: authority.sessionId,
-								commandId: correlation.commandId,
-								turnId: correlation.turnId,
 							}
 						: {
 								text: (input as ManagedTurnInput).text,
-								commandId: correlation.commandId,
-								turnId: correlation.turnId,
 							},
 				onDispatch: () => {
 					dispatched = true;
@@ -327,12 +319,13 @@ export function createManagedSessionOperations(runtime: ManagedSdkRuntime): Mana
 					if (input.signal?.aborted) cancelAfterDispatch();
 				},
 			});
+			subscription.bind(decodeAcknowledgedCorrelation(response, authority));
 			if (input.signal?.aborted) {
 				await abortPromise;
 				throw new GjcTurnCancelledError();
 			}
 			for (const event of responseEventsFrom(response)) await observe(event);
-			await unsubscribe.drain();
+			await subscription.drain();
 			const projected =
 				"artifactProject" in input && input.artifactProject !== undefined
 					? await input.artifactProject(events)
@@ -346,7 +339,7 @@ export function createManagedSessionOperations(runtime: ManagedSdkRuntime): Mana
 		} finally {
 			input.signal?.removeEventListener("abort", cancelAfterDispatch);
 			closed = true;
-			unsubscribe();
+			subscription();
 		}
 	};
 	return {
@@ -519,18 +512,24 @@ function hasExactGeneration(authority: ManagedLifecycleInput["authority"]): auth
 		authority.generation > 0
 	);
 }
-function deterministicCorrelation(
+function decodeAcknowledgedCorrelation(
+	result: Readonly<Record<string, unknown>>,
 	authority: ManagedTurnAuthority,
-	operation: string,
-	idempotencyKey: string,
-): { readonly commandId: string; readonly turnId: string; readonly sessionId: string } {
-	const identity = payloadHash({
-		operation,
-		requestKey: idempotencyKey,
-		sessionId: authority.sessionId,
-		generation: authority.generation,
-	});
-	return { commandId: `managed-${identity}`, turnId: `managed-${identity}`, sessionId: authority.sessionId };
+): Readonly<{ commandId?: string; turnId?: string; publicationId?: string }> {
+	const value = isRecord(result.result) ? result.result : result;
+	const correlation = isRecord(value.correlation) ? value.correlation : value;
+	const commandId = correlation.commandId;
+	const turnId = correlation.turnId;
+	const publicationId = correlation.publicationId;
+	if (typeof commandId !== "string" && typeof turnId !== "string" && typeof publicationId !== "string")
+		throw new Error("Managed Router acknowledgement lacks correlation identity.");
+	if (typeof value.sessionId === "string" && value.sessionId !== authority.sessionId)
+		throw new Error("Managed Router acknowledgement references a foreign session.");
+	return {
+		...(typeof commandId === "string" ? { commandId } : {}),
+		...(typeof turnId === "string" ? { turnId } : {}),
+		...(typeof publicationId === "string" ? { publicationId } : {}),
+	};
 }
 function responseEventsFrom(result: Readonly<Record<string, unknown>>): readonly GjcTurnEvent[] {
 	const value = isRecord(result.result) ? result.result : result;
@@ -541,7 +540,13 @@ function responseEventsFrom(result: Readonly<Record<string, unknown>>): readonly
 function normalizeFrame(frame: Record<string, unknown>): GjcTurnEvent | undefined {
 	const value = frame.type === "event" && isRecord(frame.payload) ? frame.payload : frame;
 	if (typeof value.type !== "string") return undefined;
-	return { type: value.type, ...(typeof value.id === "string" ? { id: value.id } : {}), payload: value };
+	const text = typeof value.text === "string" ? value.text : typeof value.delta === "string" ? value.delta : undefined;
+	return {
+		type: value.type,
+		...(text === undefined ? {} : { text }),
+		...(typeof value.id === "string" ? { id: value.id } : {}),
+		payload: value,
+	};
 }
 function finalizedText(result: Readonly<Record<string, unknown>>, events: readonly GjcTurnEvent[]): string {
 	const value = isRecord(result.result) ? result.result : result;

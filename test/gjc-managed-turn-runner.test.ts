@@ -80,9 +80,8 @@ describe("unwired managed turn runner", () => {
 			"turn.abort",
 		]);
 		expect(fake.subscriptionHistory[1]?.correlation).toEqual({
-			commandId: "gate-command",
-			turnId: "gate-turn",
-			sessionId: authority.sessionId,
+			commandId: "command-1",
+			turnId: "turn-1",
 		});
 		expect(fake.subscriptionCountAtRequest).toEqual([1, 1, 0]);
 		expect("switch" in runner).toBeFalse();
@@ -206,6 +205,24 @@ class RunnerRuntime {
 			);
 		}) as (() => void) & { drain(): Promise<void> };
 		unsubscribe.drain = async () => undefined;
+		return unsubscribe;
+	}
+	prepareFrameSubscription(_attachment: unknown, operation: string, listener: (frame: unknown) => Promise<void>) {
+		const subscription = { correlation: {}, listener };
+		this.subscriptions.push(subscription);
+		this.subscriptionHistory.push(subscription);
+		const unsubscribe = (() => {
+			this.unsubscribed += 1;
+			this.subscriptions.splice(
+				this.subscriptions.findIndex(item => item.listener === listener),
+				1,
+			);
+		}) as (() => void) & { bind(correlation: Record<string, unknown>): void; drain(): Promise<void> };
+		unsubscribe.bind = correlation => {
+			subscription.correlation = correlation;
+		};
+		unsubscribe.drain = async () => undefined;
+		void operation;
 		return unsubscribe;
 	}
 	async generationStatus() {

@@ -25,6 +25,7 @@ const temporary = {
 	leaseId: tenant.leaseId,
 	epoch: tenant.epoch,
 	requestKey: "catalog-1",
+	assertFence: async () => undefined,
 };
 
 const userContext = {
@@ -101,11 +102,12 @@ describe("managed model reader", () => {
 			undefined,
 			lateController.signal,
 		);
-		await Promise.resolve();
+		for (let attempt = 0; attempt < 20 && fake.createCalls < 2; attempt++) await Bun.sleep(1);
+		expect(fake.createCalls).toBe(2);
 		lateController.abort();
 		release();
 		await expect(late).rejects.toBeInstanceOf(GjcTurnCancelledError);
-		await Promise.resolve();
+		await fake.closeObserved;
 		expect(fake.closed).toBeDefined();
 		void pending.catch(() => undefined);
 	});
@@ -159,6 +161,10 @@ describe("managed model reader", () => {
 });
 
 class FakeRuntime {
+	private closeResolve: () => void = () => undefined;
+	readonly closeObserved = new Promise<void>(resolve => {
+		this.closeResolve = resolve;
+	});
 	readonly attachment = { isCurrent: () => true };
 	readonly requests: Record<string, unknown>[] = [];
 	readonly acquired: TenantSessionKey[] = [];
@@ -166,6 +172,7 @@ class FakeRuntime {
 	readonly unregistered: TenantSessionKey[] = [];
 	readonly statusKeys: TenantSessionKey[] = [];
 	created: Record<string, unknown> | undefined;
+	createCalls = 0;
 	closed: Record<string, unknown> | undefined;
 	reconciles = 0;
 	status: "retired" | "replaced" | "unknown" = "retired";
@@ -206,6 +213,7 @@ class FakeRuntime {
 		};
 	}
 	async createExternalLifecycleSession(request: Record<string, unknown>) {
+		this.createCalls += 1;
 		this.created = request;
 		await this.createGate;
 		return { ok: true, result: { sessionId: "catalog-session", endpointGeneration: 11 } };
@@ -217,6 +225,7 @@ class FakeRuntime {
 	}
 	async closeLifecycleSession(request: Record<string, unknown>) {
 		this.closed = request;
+		this.closeResolve();
 		return { ok: true };
 	}
 	async generationStatus(key: TenantSessionKey) {

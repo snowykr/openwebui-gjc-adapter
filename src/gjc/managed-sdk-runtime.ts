@@ -73,9 +73,10 @@ interface FrameSubscription {
 	readonly id: number;
 	readonly tenant: TenantSessionKey;
 	readonly operation: string;
-	readonly correlation: ManagedSdkFrameCorrelation;
+	correlation: ManagedSdkFrameCorrelation | undefined;
 	readonly listener: (frame: ManagedSdkObservedFrame) => void | Promise<void>;
 	queued: number;
+	buffered: router.SessionRouterFrame[];
 	tail: Promise<void>;
 	active: boolean;
 }
@@ -84,6 +85,11 @@ export interface ManagedSdkFrameSubscription {
 	(): void;
 	/** Stops delivery and waits for already accepted frames to settle in order. */
 	drain(): Promise<void>;
+}
+
+/** A session/generation-scoped subscription that is bound only from a Router acknowledgement. */
+export interface ManagedSdkPendingFrameSubscription extends ManagedSdkFrameSubscription {
+	bind(correlation: ManagedSdkFrameCorrelation): void;
 }
 
 const DEFAULT_MAX_SUBSCRIPTIONS = 128;
@@ -210,15 +216,10 @@ export class ManagedSdkRuntime {
 	async registerLifecycleTenant(key: TenantSessionKey): Promise<ManagedSdkAttachment> {
 		assertTenantKey(key);
 		this.registerTenant(key);
-		try {
-			await this.reconcile();
-			const attachment = await this.acquireAttachment(key);
-			if (!attachment.attachment.isCurrent()) throw new Error("Lifecycle tenant attachment is no longer current.");
-			return attachment;
-		} catch (error) {
-			this.unregisterTenant(key);
-			throw error;
-		}
+		await this.reconcile();
+		const attachment = await this.acquireAttachment(key);
+		if (!attachment.attachment.isCurrent()) throw new Error("Lifecycle tenant attachment is no longer current.");
+		return attachment;
 	}
 
 	unregisterTenant(key: TenantSessionKey): void {
@@ -339,12 +340,60 @@ export class ManagedSdkRuntime {
 			correlation: { ...correlation },
 			listener,
 			queued: 0,
+			buffered: [],
 			tail: Promise.resolve(),
 			active: true,
 		};
 		this.#subscriptions.set(subscription.id, subscription);
 		const unsubscribe = (() => this.#cleanupSubscription(subscription)) as ManagedSdkFrameSubscription;
 		unsubscribe.drain = async () => await subscription.tail;
+		return unsubscribe;
+	}
+
+	/**
+	 * Installs the frame listener before dispatch. Frames are retained by exact tenant
+	 * generation until the Router acknowledgement supplies its authoritative correlation.
+	 */
+	prepareFrameSubscription(
+		managed: ManagedSdkAttachment,
+		operation: string,
+		listener: (frame: ManagedSdkObservedFrame) => void | Promise<void>,
+	): ManagedSdkPendingFrameSubscription {
+		if (this.#state !== "running") throw new Error("Managed SDK runtime is not running.");
+		if (!nonEmpty(operation)) throw new TypeError("Operation is required.");
+		if (!this.#isRegistered(managed.tenant) || !managed.attachment.isCurrent())
+			throw new Error("Registered current tenant attachment is required.");
+		const current = this.#router.attachment(managed.tenant.sessionId, managed.generation);
+		if (current !== managed.attachment) throw new Error("Current Router attachment is required.");
+		if (this.#subscriptions.size >= this.#maxSubscriptions) {
+			this.#classify("overflow");
+			throw new Error("Managed SDK frame subscription capacity exceeded.");
+		}
+		const subscription: FrameSubscription = {
+			id: this.#nextSubscriptionId++,
+			tenant: copyTenantKey(managed.tenant),
+			operation,
+			correlation: undefined,
+			listener,
+			queued: 0,
+			buffered: [],
+			tail: Promise.resolve(),
+			active: true,
+		};
+		this.#subscriptions.set(subscription.id, subscription);
+		const unsubscribe = (() => this.#cleanupSubscription(subscription)) as ManagedSdkPendingFrameSubscription;
+		unsubscribe.drain = async () => await subscription.tail;
+		unsubscribe.bind = correlation => {
+			if (!subscription.active) throw new Error("Managed SDK frame subscription is closed.");
+			if (!hasCorrelation(correlation)) throw new TypeError("Acknowledged frame correlation is required.");
+			if (subscription.correlation !== undefined)
+				throw new Error("Managed SDK frame subscription is already bound.");
+			subscription.correlation = { ...correlation };
+			for (const frame of subscription.buffered) {
+				if (matchesCorrelation(subscription.correlation, frame)) this.#deliver(subscription, frame);
+			}
+			subscription.buffered = [];
+		};
 		return unsubscribe;
 	}
 
@@ -369,7 +418,7 @@ export class ManagedSdkRuntime {
 				subscription.active &&
 				subscription.tenant.sessionId === frame.sessionId &&
 				subscription.tenant.generation === frame.generation &&
-				matchesCorrelation(subscription.correlation, frame),
+				(subscription.correlation === undefined || matchesCorrelation(subscription.correlation, frame)),
 		);
 		if (matching.length === 0) {
 			this.#classify(this.#expiredCorrelations.has(frameCorrelationIdentity(frame)) ? "late" : "unmatched");
@@ -391,34 +440,44 @@ export class ManagedSdkRuntime {
 		if (this.#seenFrameIds.size > this.#maxFrameHistory)
 			this.#seenFrameIds.delete(this.#seenFrameIds.values().next().value as string);
 		for (const subscription of authorized) {
-			if (subscription.queued >= this.#maxFramesPerSubscription) {
-				this.#classify("overflow");
+			if (subscription.correlation === undefined) {
+				if (subscription.buffered.length >= this.#maxFramesPerSubscription) this.#classify("overflow");
+				else subscription.buffered.push(frame);
 				continue;
 			}
-			subscription.queued += 1;
-			subscription.tail = subscription.tail
-				.then(async () => {
-					try {
-						if (subscription.active)
-							await subscription.listener({
-								tenant: subscription.tenant,
-								operation: subscription.operation,
-								correlation: subscription.correlation,
-								frame,
-							});
-					} finally {
-						subscription.queued -= 1;
-					}
-				})
-				.catch(() => undefined);
+			this.#deliver(subscription, frame);
 		}
+	}
+
+	#deliver(subscription: FrameSubscription, frame: router.SessionRouterFrame): void {
+		if (subscription.queued >= this.#maxFramesPerSubscription) {
+			this.#classify("overflow");
+			return;
+		}
+		subscription.queued += 1;
+		subscription.tail = subscription.tail
+			.then(async () => {
+				try {
+					if (subscription.active && subscription.correlation !== undefined)
+						await subscription.listener({
+							tenant: subscription.tenant,
+							operation: subscription.operation,
+							correlation: subscription.correlation,
+							frame,
+						});
+				} finally {
+					subscription.queued -= 1;
+				}
+			})
+			.catch(() => undefined);
 	}
 
 	#cleanupSubscription(subscription: FrameSubscription): void {
 		if (!subscription.active) return;
 		subscription.active = false;
 		this.#subscriptions.delete(subscription.id);
-		this.#expiredCorrelations.add(correlationIdentity(subscription.tenant, subscription.correlation));
+		if (subscription.correlation !== undefined)
+			this.#expiredCorrelations.add(correlationIdentity(subscription.tenant, subscription.correlation));
 		if (this.#expiredCorrelations.size > this.#maxFrameHistory)
 			this.#expiredCorrelations.delete(this.#expiredCorrelations.values().next().value as string);
 	}

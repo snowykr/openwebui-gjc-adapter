@@ -19,6 +19,7 @@ export interface ManagedTemporaryModelReaderInput {
 	readonly leaseId: string;
 	readonly epoch: string;
 	readonly requestKey: string;
+	readonly assertFence: () => Promise<unknown>;
 	readonly timeoutMs?: number;
 }
 
@@ -50,20 +51,30 @@ export function createManagedModelReaderFactory(input: CreateManagedModelReaderF
 		throwIfAborted(effectiveSignal);
 		if (input.resolveAttachment !== undefined) {
 			const resolved = await awaitWithAbort(input.resolveAttachment(effectiveSignal), effectiveSignal);
+			assertPrincipal(context, resolved.tenant.principalId);
 			await assertReaderContext(context, effectiveSignal, resolved.tenant.canonicalWorkspace);
 			const attachment = await acquire(input.runtime, resolved.tenant, effectiveSignal);
-			return new ManagedModelReader(input.runtime, attachment, undefined, effectiveSignal);
+			return new ManagedModelReader(
+				input.runtime,
+				attachment,
+				undefined,
+				effectiveSignal,
+				async () => await assertReaderContext(context, effectiveSignal, resolved.tenant.canonicalWorkspace),
+			);
 		}
-		return await createTemporaryReader(input.runtime, input.temporary!, effectiveSignal);
+		return await createTemporaryReader(input.runtime, input.temporary!, context, effectiveSignal);
 	};
 }
 
 async function createTemporaryReader(
 	runtime: ManagedSdkRuntime,
 	input: ManagedTemporaryModelReaderInput,
+	context?: ModelReaderContext,
 	signal?: AbortSignal,
 ): Promise<ModelReader> {
 	assertTemporaryInput(input);
+	assertPrincipal(context, input.principalId);
+	await assertTemporaryFence(input, context, signal);
 	const actor = { namespace: "openwebui-gjc-adapter", id: input.principalId };
 	const creation = runtime.createExternalLifecycleSession({
 		actor,
@@ -81,6 +92,7 @@ async function createTemporaryReader(
 		() => undefined,
 	);
 	const result = await awaitWithAbort(creation, signal);
+	await assertTemporaryFence(input, context, signal);
 	const tenant = tenantFromCreate(input, result);
 	if (tenant === undefined)
 		throw new ManagedModelReaderUnavailableError("Managed catalog session creation was not acknowledged.");
@@ -90,7 +102,14 @@ async function createTemporaryReader(
 	}
 	try {
 		const attachment = await runtime.registerLifecycleTenant(tenant);
-		return new ManagedModelReader(runtime, attachment, { tenant, timeoutMs: input.timeoutMs }, signal);
+		await assertTemporaryFence(input, context, signal);
+		return new ManagedModelReader(
+			runtime,
+			attachment,
+			{ tenant, timeoutMs: input.timeoutMs },
+			signal,
+			async () => await assertTemporaryFence(input, context, signal),
+		);
 	} catch (error) {
 		try {
 			await closeAndProveRetired(runtime, tenant, input.timeoutMs);
@@ -120,6 +139,7 @@ class ManagedModelReader implements ModelReader {
 		private readonly attachment: ManagedSdkAttachment,
 		private readonly temporary: { readonly tenant: TenantSessionKey; readonly timeoutMs?: number } | undefined,
 		private readonly signal: AbortSignal | undefined,
+		private readonly fence: () => Promise<void>,
 	) {}
 
 	getAvailableModels(): Promise<readonly unknown[]> {
@@ -138,6 +158,7 @@ class ManagedModelReader implements ModelReader {
 	async stop(): Promise<void> {
 		if (this.#stopped) return;
 		this.#stopped = true;
+		await this.fence();
 		if (this.temporary !== undefined)
 			await closeAndProveRetired(this.runtime, this.temporary.tenant, this.temporary.timeoutMs);
 	}
@@ -146,6 +167,7 @@ class ManagedModelReader implements ModelReader {
 		name: "models.list/current" | "providers.list/active" | "session.state",
 	): Promise<readonly unknown[]> {
 		throwIfAborted(this.signal);
+		await this.fence();
 		try {
 			const frame = await this.runtime.request(
 				this.attachment,
@@ -153,6 +175,7 @@ class ManagedModelReader implements ModelReader {
 				{ beforeDispatch: () => throwIfAborted(this.signal) },
 			);
 			throwIfAborted(this.signal);
+			await this.fence();
 			return decodeRouterPage(frame, name).items;
 		} catch (error) {
 			if (this.temporary !== undefined) {
@@ -247,6 +270,21 @@ function assertTemporaryInput(input: ManagedTemporaryModelReaderInput): void {
 	])
 		if (typeof value !== "string" || value.length === 0)
 			throw new TypeError("Complete temporary model-reader authority is required.");
+	if (typeof input.assertFence !== "function") throw new TypeError("Temporary model-reader fence is required.");
+}
+
+function assertPrincipal(context: ModelReaderContext | undefined, principalId: string): void {
+	if (context !== undefined && context.principal.userId !== principalId)
+		throw new ManagedModelReaderUnavailableError("Managed model reader principal does not match tenant authority.");
+}
+
+async function assertTemporaryFence(
+	input: ManagedTemporaryModelReaderInput,
+	context: ModelReaderContext | undefined,
+	signal?: AbortSignal,
+): Promise<void> {
+	await awaitWithAbort(input.assertFence(), signal);
+	if (context?.lease !== undefined) await awaitWithAbort(context.lease.assertFence(), signal);
 }
 async function assertReaderContext(
 	context: ModelReaderContext | undefined,

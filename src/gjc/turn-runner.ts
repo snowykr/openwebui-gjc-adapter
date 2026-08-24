@@ -25,6 +25,15 @@ export interface ManagedTurnAuthority {
 	readonly requestKey: string;
 }
 
+/** Durable managed authority proof; unlike legacy proof it contains no descriptor or terminal identity. */
+export interface ManagedGenerationProof {
+	readonly kind: "managed-generation";
+	readonly sessionId: string;
+	readonly generation: number;
+	readonly leaseId: string;
+	readonly epoch: string;
+}
+
 /** Explicit managed variants prevent legacy inputs from being mistaken for tenant-authorized traffic. */
 export type ManagedContinueSessionInput = GjcContinueSessionInput & { readonly authority: ManagedTurnAuthority };
 export type ManagedStartNewSessionInput = GjcStartNewSessionInput & { readonly authority: ManagedTurnAuthority };
@@ -128,6 +137,7 @@ export interface GjcSessionState {
 	readonly rawFrameCursor: number;
 	readonly eventCursor: number;
 	readonly attachment?: SessionAttachmentProof;
+	readonly managedProof?: ManagedGenerationProof;
 }
 
 export interface GjcTurnEvent {
@@ -163,6 +173,7 @@ export interface GjcTurnResult {
 	readonly eventCursor: number;
 	readonly modelSelection?: NormalizedModelSelection;
 	readonly attachment?: SessionAttachmentProof;
+	readonly managedProof?: ManagedGenerationProof;
 }
 export interface GjcControlResult {
 	readonly result?: GjcTurnResult;
