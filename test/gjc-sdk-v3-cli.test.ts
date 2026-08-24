@@ -480,12 +480,16 @@ describe("endpoint-less CLI lifecycle boundary", () => {
 });
 describe("installed released CLI parser", () => {
 	test("advertises a supported resume and session directory argv without a provider prompt", async () => {
-		const cli = Bun.which("gjc");
-		if (cli === null) return;
+		const cli = join(import.meta.dir, "..", "node_modules", ".bin", process.platform === "win32" ? "gjc.exe" : "gjc");
+		if (!(await Bun.file(cli).exists())) return;
 		const child = Bun.spawn([cli, "--help"], { stdout: "pipe", stderr: "pipe" });
-		const [stdout, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
 
-		expect(exitCode).toBe(0);
+		expect(exitCode, stderr).toBe(0);
 		expect(stdout).toMatch(/--resume(?:=<value>|\[=<value>\])/);
 		expect(stdout).toContain("--session-dir=<value>");
 	});
