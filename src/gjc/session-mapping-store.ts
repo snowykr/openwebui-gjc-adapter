@@ -3,6 +3,7 @@ export interface SessionMapping {
 	readonly chatId: string;
 	readonly projectId: string;
 	readonly sessionId: string;
+	readonly managedAuthority?: import("./turn-runner").ManagedTurnAuthority;
 	readonly sessionFile?: string;
 	readonly activeLeaf?: string;
 	readonly rawFrameCursor: number;

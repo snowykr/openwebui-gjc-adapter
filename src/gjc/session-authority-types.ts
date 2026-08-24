@@ -1,5 +1,5 @@
 import type { NormalizedModelSelection } from "../contracts";
-import type { GjcTurnEvent } from "./turn-runner";
+import type { GjcTurnEvent, ManagedTurnAuthority } from "./turn-runner";
 
 export const SESSION_AUTHORITY_VERSION = 2 as const;
 
@@ -69,6 +69,7 @@ export interface SessionOperationGateBinding {
 export interface SessionOperationResult {
 	readonly kind: "turn" | "control" | "close";
 	readonly assistantText: string;
+	readonly managedAuthority?: ManagedTurnAuthority;
 	readonly events?: readonly GjcTurnEvent[];
 	readonly mapping: Readonly<{
 		chatId: string;
@@ -127,6 +128,7 @@ export interface SessionAuthorityTombstone {
 	readonly modelSelection?: NormalizedModelSelection;
 	readonly observations?: Readonly<Record<string, unknown>>;
 	readonly attachment?: SessionAttachmentProof;
+	readonly managedAuthority?: ManagedTurnAuthority;
 	readonly journal: readonly SessionOperation[];
 	readonly retiredAt: string;
 	readonly prior?: SessionAuthorityTombstone;
@@ -152,6 +154,7 @@ export interface ProvisionalSessionOperation extends SessionOperation {
 	readonly sessionId?: string;
 	readonly sessionFile?: string;
 	readonly attachment?: SessionAttachmentProof;
+	readonly managedAuthority?: ManagedTurnAuthority;
 }
 
 /** The mapping identity header is deliberately separate from replaceable observations. */
@@ -172,6 +175,7 @@ export interface SessionAuthorityRecord {
 	readonly modelSelection?: NormalizedModelSelection;
 	readonly observations?: Readonly<Record<string, unknown>>;
 	readonly attachment?: SessionAttachmentProof;
+	readonly managedAuthority?: ManagedTurnAuthority;
 	readonly journal: readonly SessionOperation[];
 	readonly reassignment?: SessionAuthorityReassignment;
 }

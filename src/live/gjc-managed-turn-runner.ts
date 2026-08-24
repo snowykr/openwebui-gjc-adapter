@@ -224,7 +224,7 @@ function managedProof(authority: ManagedTurnAuthority) {
 }
 
 function withManagedProof(result: GjcTurnResult, authority: ManagedTurnAuthority): GjcTurnResult {
-	return { ...result, managedProof: managedProof(authority) };
+	return { ...result, managedProof: managedProof(authority), managedAuthority: authority };
 }
 
 // Keeps the import contract visible to the eventual routing cutover without wiring it today.

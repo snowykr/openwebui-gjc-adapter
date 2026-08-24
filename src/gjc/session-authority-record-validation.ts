@@ -21,6 +21,7 @@ import {
 	isTimestamp,
 } from "./session-authority-validation-primitives";
 import { operationIdentifiers } from "./session-operation-codec";
+import type { ManagedTurnAuthority } from "./turn-runner";
 
 export function isV2Record(value: unknown): value is SessionAuthorityRecord {
 	if (
@@ -41,6 +42,7 @@ export function isV2Record(value: unknown): value is SessionAuthorityRecord {
 			"modelSelection",
 			"observations",
 			"attachment",
+			"managedAuthority",
 			"journal",
 			"reassignment",
 		]) ||
@@ -76,6 +78,12 @@ export function isV2Record(value: unknown): value is SessionAuthorityRecord {
 		(value.modelSelection === undefined || isNormalizedModelSelection(value.modelSelection)) &&
 		(value.attachment === undefined ||
 			(isAttachmentProof(value.attachment) && value.attachment.expectedSessionId === value.sessionId)) &&
+		(value.managedAuthority === undefined ||
+			isManagedTurnAuthority(value.managedAuthority, {
+				chatId: value.chatId as string,
+				projectId: value.projectId as string,
+				sessionId: value.sessionId as string,
+			})) &&
 		value.journal.every(isOperation) &&
 		(value.reassignment === undefined ||
 			isReassignment(value.reassignment, { chatId: value.chatId as string, projectId: value.projectId as string }))
@@ -98,6 +106,7 @@ export function isProvisionalOperation(value: unknown): value is ProvisionalSess
 			"sessionId",
 			"sessionFile",
 			"attachment",
+			"managedAuthority",
 		]) ||
 		!isNonEmptyString(value.chatId) ||
 		!isNonEmptyString(value.projectId)
@@ -111,12 +120,23 @@ export function isProvisionalOperation(value: unknown): value is ProvisionalSess
 		(!isAttachmentProof(value.attachment) || value.attachment.expectedSessionId !== value.sessionId)
 	)
 		return false;
+	if (
+		value.managedAuthority !== undefined &&
+		(!isManagedTurnAuthority(value.managedAuthority, {
+			chatId: value.chatId,
+			projectId: value.projectId,
+			sessionId: value.sessionId,
+		}) ||
+			value.sessionId === undefined)
+	)
+		return false;
 	const {
 		chatId: _chatId,
 		projectId: _projectId,
 		sessionId: _sessionId,
 		sessionFile: _sessionFile,
 		attachment: _attachment,
+		managedAuthority: _managedAuthority,
 		...operation
 	} = value;
 	return isOperation(operation);
@@ -206,6 +226,7 @@ function hasConsistentOperationResults(mapping: SessionAuthorityRecord): boolean
 		if (
 			resultMapping.chatId !== mapping.chatId ||
 			resultMapping.projectId !== mapping.projectId ||
+			resultMapping.sessionId !== mapping.sessionId ||
 			resultMapping.operationId !== operation.id
 		)
 			return false;
@@ -289,6 +310,7 @@ function isTombstone(value: unknown): value is SessionAuthorityTombstone {
 			"modelSelection",
 			"observations",
 			"attachment",
+			"managedAuthority",
 			"journal",
 			"retiredAt",
 			"prior",
@@ -314,11 +336,48 @@ function isTombstone(value: unknown): value is SessionAuthorityTombstone {
 		(value.modelSelection !== undefined && !isNormalizedModelSelection(value.modelSelection)) ||
 		(value.attachment !== undefined &&
 			(!isAttachmentProof(value.attachment) || value.attachment.expectedSessionId !== value.sessionId)) ||
+		(value.managedAuthority !== undefined &&
+			!isManagedTurnAuthority(value.managedAuthority, {
+				chatId: value.chatId as string,
+				projectId: value.projectId as string,
+				sessionId: value.sessionId as string,
+			})) ||
 		!value.journal.every(isOperation) ||
 		(value.prior !== undefined && !isTombstone(value.prior))
 	)
 		return false;
 	return true;
+}
+
+function isManagedTurnAuthority(
+	value: unknown,
+	identity: Readonly<{ chatId: string; projectId: string; sessionId: string | undefined }>,
+): value is ManagedTurnAuthority {
+	return (
+		isRecord(value) &&
+		hasOnlyKeys(value, [
+			"principalId",
+			"projectId",
+			"canonicalWorkspace",
+			"chatId",
+			"sessionId",
+			"generation",
+			"leaseId",
+			"epoch",
+			"requestKey",
+		]) &&
+		isNonEmptyString(value.principalId) &&
+		value.projectId === identity.projectId &&
+		isNonEmptyString(value.canonicalWorkspace) &&
+		isAbsolute(value.canonicalWorkspace) &&
+		value.chatId === identity.chatId &&
+		value.sessionId === identity.sessionId &&
+		isNonnegativeSafeInteger(value.generation) &&
+		value.generation > 0 &&
+		isNonEmptyString(value.leaseId) &&
+		isNonEmptyString(value.epoch) &&
+		isNonEmptyString(value.requestKey)
+	);
 }
 
 function addIdentity(identities: Map<string, string>, chatId: string, identifier: string, identity: string): boolean {
@@ -358,6 +417,7 @@ function hasConsistentTombstoneResults(tombstone: SessionAuthorityTombstone): bo
 		return (
 			resultMapping.chatId === tombstone.chatId &&
 			resultMapping.projectId === tombstone.projectId &&
+			resultMapping.sessionId === tombstone.sessionId &&
 			resultMapping.operationId === operation.id
 		);
 	});

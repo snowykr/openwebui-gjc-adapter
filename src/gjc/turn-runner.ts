@@ -138,6 +138,7 @@ export interface GjcSessionState {
 	readonly eventCursor: number;
 	readonly attachment?: SessionAttachmentProof;
 	readonly managedProof?: ManagedGenerationProof;
+	readonly managedAuthority?: ManagedTurnAuthority;
 }
 
 export interface GjcTurnEvent {
@@ -174,6 +175,7 @@ export interface GjcTurnResult {
 	readonly modelSelection?: NormalizedModelSelection;
 	readonly attachment?: SessionAttachmentProof;
 	readonly managedProof?: ManagedGenerationProof;
+	readonly managedAuthority?: ManagedTurnAuthority;
 }
 export interface GjcControlResult {
 	readonly result?: GjcTurnResult;

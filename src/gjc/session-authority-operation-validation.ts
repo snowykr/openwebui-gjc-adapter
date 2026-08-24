@@ -173,7 +173,7 @@ function isSha256HexDigest(value: unknown): value is string {
 }
 function isOperationResult(value: unknown): value is SessionOperationResult {
 	if (
-		!hasOnlyKeys(value, ["kind", "assistantText", "events", "mapping", "correlation", "gate"]) ||
+		!hasOnlyKeys(value, ["kind", "assistantText", "managedAuthority", "events", "mapping", "correlation", "gate"]) ||
 		(value.kind !== "turn" && value.kind !== "control" && value.kind !== "close") ||
 		typeof value.assistantText !== "string" ||
 		(value.events !== undefined && (!Array.isArray(value.events) || !value.events.every(isEvent))) ||
@@ -220,6 +220,14 @@ function isOperationResult(value: unknown): value is SessionOperationResult {
 		(!isAttachmentProof(mapping.attachment) || mapping.attachment.expectedSessionId !== mapping.sessionId)
 	)
 		return false;
+	if (
+		value.managedAuthority !== undefined &&
+		!isManagedAuthority(
+			value.managedAuthority,
+			mapping as Readonly<{ chatId: string; projectId: string; sessionId: string }>,
+		)
+	)
+		return false;
 	return value.kind === "close"
 		? isRecord(value.correlation) &&
 				value.correlation.closeStatus === "closed" &&
@@ -228,4 +236,34 @@ function isOperationResult(value: unknown): value is SessionOperationResult {
 				Object.keys(value.correlation).every(key => key === "closeStatus" || key === "mappingOperationId")
 		: value.correlation === undefined ||
 				(isRecord(value.correlation) && Object.values(value.correlation).every(isNonEmptyString));
+}
+function isManagedAuthority(
+	value: unknown,
+	mapping: Readonly<{ chatId: string; projectId: string; sessionId: string }>,
+): boolean {
+	return (
+		isRecord(value) &&
+		hasOnlyKeys(value, [
+			"principalId",
+			"projectId",
+			"canonicalWorkspace",
+			"chatId",
+			"sessionId",
+			"generation",
+			"leaseId",
+			"epoch",
+			"requestKey",
+		]) &&
+		isNonEmptyString(value.principalId) &&
+		value.projectId === mapping.projectId &&
+		isNonEmptyString(value.canonicalWorkspace) &&
+		isAbsolute(value.canonicalWorkspace) &&
+		value.chatId === mapping.chatId &&
+		value.sessionId === mapping.sessionId &&
+		isNonnegativeSafeInteger(value.generation) &&
+		value.generation > 0 &&
+		isNonEmptyString(value.leaseId) &&
+		isNonEmptyString(value.epoch) &&
+		isNonEmptyString(value.requestKey)
+	);
 }

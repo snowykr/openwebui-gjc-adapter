@@ -6,11 +6,28 @@ import type {
 	SessionOperation,
 	SessionOperationResult,
 } from "./session-authority-types";
-import type { GjcTurnEvent } from "./turn-runner";
+import type { GjcTurnEvent, ManagedTurnAuthority } from "./turn-runner";
+
+export function copyManagedAuthority(authority: ManagedTurnAuthority): ManagedTurnAuthority {
+	return {
+		principalId: authority.principalId,
+		projectId: authority.projectId,
+		canonicalWorkspace: authority.canonicalWorkspace,
+		chatId: authority.chatId,
+		sessionId: authority.sessionId,
+		generation: authority.generation,
+		leaseId: authority.leaseId,
+		epoch: authority.epoch,
+		requestKey: authority.requestKey,
+	};
+}
 
 export function copyOperationResult(result: SessionOperationResult): SessionOperationResult {
 	return {
 		...result,
+		...(result.managedAuthority === undefined
+			? {}
+			: { managedAuthority: copyManagedAuthority(result.managedAuthority) }),
 		...(result.events === undefined ? {} : { events: copyEvents(result.events) }),
 		mapping: {
 			...result.mapping,
@@ -47,6 +64,9 @@ export function copy(record: SessionAuthorityRecord): SessionAuthorityRecord {
 		...(record.attachment === undefined
 			? {}
 			: { attachment: { ...record.attachment, descriptorStat: { ...record.attachment.descriptorStat } } }),
+		...(record.managedAuthority === undefined
+			? {}
+			: { managedAuthority: copyManagedAuthority(record.managedAuthority) }),
 		journal: record.journal.map(copyOperation),
 		...(record.reassignment === undefined
 			? {}
@@ -85,6 +105,9 @@ export function copyProvisionalOperation(operation: ProvisionalSessionOperation)
 						descriptorStat: { ...operation.attachment.descriptorStat },
 					},
 				}),
+		...(operation.managedAuthority === undefined
+			? {}
+			: { managedAuthority: copyManagedAuthority(operation.managedAuthority) }),
 	};
 }
 
@@ -105,6 +128,9 @@ export function copyTombstone(tombstone: SessionAuthorityTombstone): SessionAuth
 		...(tombstone.attachment === undefined
 			? {}
 			: { attachment: { ...tombstone.attachment, descriptorStat: { ...tombstone.attachment.descriptorStat } } }),
+		...(tombstone.managedAuthority === undefined
+			? {}
+			: { managedAuthority: copyManagedAuthority(tombstone.managedAuthority) }),
 		journal: tombstone.journal.map(copyOperation),
 		...(tombstone.prior === undefined ? {} : { prior: copyTombstone(tombstone.prior) }),
 	};

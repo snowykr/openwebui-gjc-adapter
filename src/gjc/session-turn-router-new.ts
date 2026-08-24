@@ -83,6 +83,7 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 						assistantText,
 						events: result.events,
 						...(result.attachment === undefined ? {} : { attachment: result.attachment }),
+						...(result.managedAuthority === undefined ? {} : { managedAuthority: result.managedAuthority }),
 						...(completedSelection === undefined ? {} : { modelSelection: completedSelection }),
 					});
 					authorityCompleted = true;
