@@ -66,6 +66,7 @@ export function createGjcRoutingLiveGatewayRunner(
 	input: CreateGjcRoutingLiveGatewayRunnerInput,
 ): GjcRoutingLiveGatewayRunner {
 	return {
+		supportsManagedSessions: input.turnRunner.startManagedSession !== undefined,
 		async stop(): Promise<void> {
 			await input.turnRunner.stop?.();
 		},

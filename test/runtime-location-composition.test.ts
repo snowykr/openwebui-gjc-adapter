@@ -14,6 +14,7 @@ import {
 	renderResolvedExistingSystemdUnit,
 	renderResolvedSystemdComposeUnit,
 } from "../src/configure/systemd";
+import { SessionMappingStore } from "../src/gjc/session-router";
 import { buildResolvedInstalledAdapterServerOptions } from "../src/installed-adapter-server-options";
 
 const { lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync } = fs;
@@ -55,6 +56,24 @@ function recorded<T>(calls: string[], name: string, result: T): T {
 	return result;
 }
 
+function resolvedBuilderConfig(root: string) {
+	const runtimeLocations = resolveGjcRuntimeLocations({ mode: "existing", serviceHome: root });
+	return {
+		bindHost: "127.0.0.1",
+		bindPort: 0,
+		openWebUIBaseUrl: "http://localhost:8080",
+		statePath: join(root, "state"),
+		gjcCommand: "gjc",
+		gjcConfigDirName: runtimeLocations.childEnvironment.GJC_CONFIG_DIR,
+		gjcCodingAgentDir: runtimeLocations.agentDir,
+		runtimeLocations,
+		turnTimeoutMs: 60_000,
+		sessionRoot: join(root, "sessions"),
+		allowedProjectRoots: [root],
+		projects: [],
+	};
+}
+
 describe("runtime location composition", () => {
 	test("required builder and renderer seams reject omitted resolved locations", async () => {
 		const message = "resolved runtime locations are required";
@@ -72,6 +91,88 @@ describe("runtime location composition", () => {
 		expect(() => Reflect.apply(renderResolvedExistingSystemdUnit, undefined, [{ workingDirectory: "/srv" }])).toThrow(
 			new TypeError(message),
 		);
+	});
+
+	test("selects an active managed bootstrap runner and preserves its service identity", async () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-managed-bootstrap-selection-")));
+		const calls: string[] = [];
+		const runtime = {};
+		const tenantFence = async () => true;
+		const runner = { stop: async () => void calls.push("managed-runner-stop") } as never;
+		const bootstrap = {
+			readiness: true,
+			health: { phase: "active", ready: true, routerAvailable: true },
+			start: async () => {
+				calls.push("bootstrap-start");
+				return {
+					result: { phase: "active", ready: true, routerAvailable: true },
+					health: { phase: "active", ready: true, routerAvailable: true },
+					dependencies: { runtime, runner, tenantFence },
+				};
+			},
+			dispose: async () => void calls.push("bootstrap-dispose"),
+		};
+		try {
+			const options = await buildResolvedAdapterServerOptions(resolvedBuilderConfig(root), {
+				managedBootstrap: bootstrap as never,
+				mappings: new SessionMappingStore(),
+				turnRunner: { stop: async () => void calls.push("legacy-runner-stop") } as never,
+			});
+
+			expect(options.managedBootstrap).toBe(bootstrap as never);
+			expect(options.managedSdkRuntime).toBeUndefined();
+			await options.routes?.runner.stop?.();
+			expect(calls).toEqual(["bootstrap-start", "managed-runner-stop"]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("fails closed and disposes a blocked managed bootstrap without constructing legacy routing", async () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-managed-bootstrap-blocked-")));
+		const calls: string[] = [];
+		const bootstrap = {
+			readiness: false,
+			health: { phase: "blocked", ready: false, routerAvailable: false, reason: "blocked" },
+			start: async () => {
+				calls.push("bootstrap-start");
+				return {
+					result: { phase: "blocked", ready: false, routerAvailable: false, reason: "blocked" },
+					health: { phase: "blocked", ready: false, routerAvailable: false, reason: "blocked" },
+				};
+			},
+			dispose: async () => void calls.push("bootstrap-dispose"),
+		};
+		try {
+			await expect(
+				buildResolvedAdapterServerOptions(resolvedBuilderConfig(root), {
+					managedBootstrap: bootstrap as never,
+					mappings: new SessionMappingStore(),
+					turnRunner: { stop: async () => void calls.push("legacy-runner-stop") } as never,
+				}),
+			).rejects.toThrow("Managed bootstrap is not ready: blocked");
+			expect(calls).toEqual(["bootstrap-start", "bootstrap-dispose"]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("retains legacy turn-runner composition when no managed bootstrap is supplied", async () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-legacy-bootstrap-regression-")));
+		const calls: string[] = [];
+		const legacyRunner = { stop: async () => void calls.push("legacy-runner-stop") } as never;
+		try {
+			const options = await buildResolvedAdapterServerOptions(resolvedBuilderConfig(root), {
+				mappings: new SessionMappingStore(),
+				turnRunner: legacyRunner,
+			});
+
+			expect(options.managedBootstrap).toBeUndefined();
+			await options.routes?.runner.stop?.();
+			expect(calls).toEqual(["legacy-runner-stop"]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	test("retains installed fields and resolves one frozen object", () => {

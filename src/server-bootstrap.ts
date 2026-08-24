@@ -1,3 +1,4 @@
+import type { ManagedBootstrapService } from "./gjc/managed-bootstrap";
 import type { AdapterHealthCheck, AdapterReadinessOptions } from "./health";
 import type { ManagedSdkRuntimeDependency } from "./live/gjc-routing-lifecycle";
 import type { AdapterRouteDependencies } from "./live/openai-routes";
@@ -15,6 +16,8 @@ export interface AdapterServerOptions {
 	port: number;
 	runtimeRoot: string;
 	runtimeLock: RuntimeSingletonLock;
+	/** Already-started managed authority composition; it owns its runtime lifecycle. */
+	managedBootstrap?: ManagedBootstrapService;
 	managedSdkRuntime?: ManagedSdkRuntimeOwnership;
 	shutdownCleanup?: () => void | Promise<void>;
 	checks?: readonly AdapterHealthCheck[];
@@ -73,6 +76,11 @@ export async function startAdapterServer(options: AdapterServerOptions): Promise
 			for (const result of await Promise.allSettled(concurrentStops))
 				if (result.status === "rejected") failures.push(result.reason);
 			try {
+				await options.managedBootstrap?.dispose();
+			} catch (error) {
+				failures.push(error);
+			}
+			try {
 				await options.managedSdkRuntime?.dispose();
 			} catch (error) {
 				failures.push(error);
@@ -102,6 +110,11 @@ export async function startAdapterServer(options: AdapterServerOptions): Promise
 			await options.routes?.runner.stop?.();
 		} catch (stopError) {
 			failures.push(stopError);
+		}
+		try {
+			await options.managedBootstrap?.dispose();
+		} catch (disposeError) {
+			failures.push(disposeError);
 		}
 		try {
 			await options.managedSdkRuntime?.dispose();

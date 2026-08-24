@@ -14,6 +14,7 @@ import { assertResolvedAdapterConfig, loadConfiguredProjects, resolveAdapterConf
 import { buildRuntimeHealthChecks, type RuntimeIsolationDiagnostic } from "./adapter-runtime-health";
 import { type AdapterConfig, loadAdapterConfig, type ResolvedAdapterConfig } from "./config";
 import { resolveLegacySessionAuthoritySourcePaths, SESSION_AUTHORITY_MAPPING_FILE } from "./config-env";
+import type { ManagedBootstrapRunnerDependencies, ManagedBootstrapService } from "./gjc/managed-bootstrap";
 import { preflightSessionAuthorityMigrationCandidates } from "./gjc/session-authority-migration";
 import { loadGjcSessionFile } from "./gjc/session-loader";
 import { FileBackedSessionMappingStore, type SessionMapping, SessionMappingStore } from "./gjc/session-router";
@@ -69,6 +70,10 @@ const SESSION_MAPPING_STORE_FILE = SESSION_AUTHORITY_MAPPING_FILE;
 const PROJECTION_OUTBOX_STORE_FILE = "openwebui-projection-outbox.json";
 
 export interface BuildAdapterServerOptionsDependencies {
+	/** Explicit managed authority composition seam. It is fail-closed and never falls back to legacy routing. */
+	readonly managedBootstrap?: ManagedBootstrapService;
+	/** Factory equivalent of managedBootstrap for tests that need deferred service construction. */
+	readonly createManagedBootstrap?: () => ManagedBootstrapService;
 	/** Test seam for the one process-owned public-SDK runtime. */
 	readonly managedSdkRuntime?: ManagedSdkRuntimeDependency;
 	/** Test seam; receives only the explicitly resolved managed agent directory. */
@@ -135,16 +140,11 @@ export async function buildResolvedAdapterServerOptions(
 	let projectStore: SqliteProjectRegistrationStore | undefined;
 	let idleSessionReaper: ReturnType<typeof createGjcIdleSessionReaper> | undefined;
 	let routingRunner: ReturnType<typeof createGjcRoutingLiveGatewayRunner> | undefined;
+	let managedBootstrap: ManagedBootstrapService | undefined;
+	let managedBootstrapDependencies: ManagedBootstrapRunnerDependencies | undefined;
 	const skipManagedSdkRuntimeStart = dependencies.skipManagedSdkRuntimeStart ?? true;
-	const managedSdkRuntime =
-		dependencies.managedSdkRuntime ??
-		(dependencies.createManagedSdkRuntime === undefined
-			? skipManagedSdkRuntimeStart
-				? undefined
-				: new (await import("./gjc/managed-sdk-runtime")).ManagedSdkRuntime({
-						agentDir: config.runtimeLocations.agentDir,
-					})
-			: dependencies.createManagedSdkRuntime(config.runtimeLocations.agentDir));
+	let managedSdkRuntime: ManagedSdkRuntimeDependency | undefined;
+	let managedSdkTenantFence: ManagedSdkTenantFence | undefined;
 	const managedSdkRuntimeHealth: ManagedSdkRuntimeHealth = {
 		phase: skipManagedSdkRuntimeStart ? "not_started" : "starting",
 	};
@@ -153,6 +153,12 @@ export async function buildResolvedAdapterServerOptions(
 		if (managedSdkRuntimeDisposePromise === undefined)
 			managedSdkRuntimeDisposePromise = managedSdkRuntime?.dispose() ?? Promise.resolve();
 		return managedSdkRuntimeDisposePromise;
+	};
+	let managedBootstrapDisposePromise: Promise<void> | undefined;
+	const disposeManagedBootstrap = (): Promise<void> => {
+		if (managedBootstrapDisposePromise === undefined)
+			managedBootstrapDisposePromise = managedBootstrap?.dispose() ?? Promise.resolve();
+		return managedBootstrapDisposePromise;
 	};
 	try {
 		const isolationDiagnostics: RuntimeIsolationDiagnostic[] = [];
@@ -207,6 +213,37 @@ export async function buildResolvedAdapterServerOptions(
 			});
 		}
 		if (mappings instanceof SessionMappingStore) mappings.setLegacyAdminPrincipalId(owner.ownerUserId);
+		managedBootstrap = dependencies.managedBootstrap ?? dependencies.createManagedBootstrap?.();
+		if (managedBootstrap !== undefined) {
+			const started = await managedBootstrap.start();
+			const dependencies = started.dependencies;
+			if (
+				started.result.phase !== "active" ||
+				!started.result.ready ||
+				!started.result.routerAvailable ||
+				started.health.phase !== "active" ||
+				!started.health.ready ||
+				!started.health.routerAvailable ||
+				dependencies === undefined
+			)
+				throw new Error(
+					`Managed bootstrap is not ready: ${started.health.reason ?? started.result.reason ?? "activation blocked"}`,
+				);
+			managedBootstrapDependencies = dependencies;
+			managedSdkRuntime = dependencies.runtime;
+			managedSdkTenantFence = dependencies.tenantFence;
+		} else {
+			managedSdkRuntime =
+				dependencies.managedSdkRuntime ??
+				(dependencies.createManagedSdkRuntime === undefined
+					? skipManagedSdkRuntimeStart
+						? undefined
+						: new (await import("./gjc/managed-sdk-runtime")).ManagedSdkRuntime({
+								agentDir: config.runtimeLocations.agentDir,
+							})
+					: dependencies.createManagedSdkRuntime(config.runtimeLocations.agentDir));
+			managedSdkTenantFence = dependencies.managedSdkTenantFence;
+		}
 		const runtimeAdminClientFactory = buildOpenWebUIRuntimeAdminClientFactory(config);
 		const principalClientFactory = buildOpenWebUIPrincipalClientFactory(config, workspaceRegistry);
 		const runtimeAdminClient =
@@ -224,15 +261,14 @@ export async function buildResolvedAdapterServerOptions(
 				: new FileBackedOutboxStore(path.join(config.statePath, PROJECTION_OUTBOX_STORE_FILE)));
 		const cliPath = resolveGjcCliPath(config.gjcCommand);
 		const turnRunner =
+			managedBootstrapDependencies?.runner ??
 			dependencies.turnRunner ??
 			createPublicSdkGjcTurnRunner({
 				cliPath,
 				runtimeLocations: config.runtimeLocations,
 				turnTimeoutMs: config.turnTimeoutMs,
 				...(managedSdkRuntime === undefined ? {} : { managedSdkRuntime }),
-				...(dependencies.managedSdkTenantFence === undefined
-					? {}
-					: { managedSdkTenantFence: dependencies.managedSdkTenantFence }),
+				...(managedSdkTenantFence === undefined ? {} : { managedSdkTenantFence }),
 				sessionPortFactory: dependencies.sessionPortFactory,
 			});
 		const modelReaderFactory =
@@ -252,7 +288,12 @@ export async function buildResolvedAdapterServerOptions(
 		const closeSession = createAdapterSessionCloser(
 			config,
 			cliPath,
-			{ ...dependencies, ...(managedSdkRuntime === undefined ? {} : { managedSdkRuntime }), turnRunner },
+			{
+				...dependencies,
+				...(managedSdkRuntime === undefined ? {} : { managedSdkRuntime }),
+				...(managedSdkTenantFence === undefined ? {} : { managedSdkTenantFence }),
+				turnRunner,
+			},
 			mappings,
 		);
 		const baseRoutingRunner = createGjcRoutingLiveGatewayRunner({
@@ -383,7 +424,7 @@ export async function buildResolvedAdapterServerOptions(
 		const shutdownCleanup = async (): Promise<void> => {
 			const failures: unknown[] = [];
 			try {
-				await disposeManagedSdkRuntime();
+				if (managedBootstrap === undefined) await disposeManagedSdkRuntime();
 			} catch (error) {
 				failures.push(error);
 			}
@@ -404,7 +445,20 @@ export async function buildResolvedAdapterServerOptions(
 			turnTimeoutMs: config.turnTimeoutMs,
 			checks: [
 				...buildRuntimeHealthChecks(config, isolationDiagnostics),
-				...(managedSdkRuntime === undefined
+				...(managedBootstrap === undefined
+					? []
+					: [
+							{
+								name: "managed-bootstrap",
+								get status() {
+									return managedBootstrap?.readiness ? "ok" : "degraded";
+								},
+								get detail() {
+									return managedBootstrap?.health.reason ?? "Managed bootstrap is active.";
+								},
+							},
+						]),
+				...(managedBootstrap !== undefined || managedSdkRuntime === undefined
 					? []
 					: [
 							{
@@ -421,7 +475,7 @@ export async function buildResolvedAdapterServerOptions(
 							},
 						]),
 			],
-			...(managedSdkRuntime === undefined
+			...(managedBootstrap !== undefined || managedSdkRuntime === undefined
 				? {}
 				: {
 						managedSdkRuntime: {
@@ -431,6 +485,7 @@ export async function buildResolvedAdapterServerOptions(
 							dispose: disposeManagedSdkRuntime,
 						},
 					}),
+			...(managedBootstrap === undefined ? {} : { managedBootstrap }),
 			routes: {
 				projects: [...projectLinkService.listLinkedProjects()],
 				projectProvider: async () => {
@@ -478,7 +533,12 @@ export async function buildResolvedAdapterServerOptions(
 			startupError = new AggregateError([startupError, stopError], "Adapter initialization cleanup failed");
 		}
 		try {
-			await disposeManagedSdkRuntime();
+			await disposeManagedBootstrap();
+		} catch (disposeError) {
+			startupError = appendStartupCleanupError(startupError, disposeError);
+		}
+		try {
+			if (managedBootstrap === undefined) await disposeManagedSdkRuntime();
 		} catch (disposeError) {
 			startupError = appendStartupCleanupError(startupError, disposeError);
 		}

@@ -264,6 +264,7 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 		throwIfAborted(input.signal);
 		const leaseReference = leaseAdmission?.reference;
 		const preparedManagedAuthority =
+			input.runner.supportsManagedSessions !== true ||
 			principal.role !== "user" ||
 			workspace === undefined ||
 			leaseReference === undefined ||

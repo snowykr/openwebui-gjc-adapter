@@ -65,6 +65,7 @@ export type LiveGatewayRunnerResult =
 	  };
 
 export interface LiveGatewayRunner {
+	readonly supportsManagedSessions?: boolean;
 	stop?(): void | Promise<void>;
 	run(input: LiveGatewayRunnerInput): Promise<LiveGatewayRunnerResult> | LiveGatewayRunnerResult;
 }
