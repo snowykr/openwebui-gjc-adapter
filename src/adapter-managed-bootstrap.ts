@@ -38,6 +38,8 @@ export interface AdapterManagedBootstrapInput {
 	readonly sourcePath: string;
 	readonly runtimeLock: RuntimeSingletonLock;
 	readonly authority: ManagedBootstrapAuthorityResolver;
+	/** Validates request-scoped lease identities after the migration bootstrap lease is no longer current. */
+	readonly liveTenantFence?: (key: TenantSessionKey) => boolean | Promise<boolean>;
 	readonly runtime: ManagedSdkRuntime;
 	readonly lifecycle: Pick<ManagedSdkRuntime, "resumeLifecycleSession">;
 }
@@ -248,7 +250,8 @@ async function tenantFence(
 		JSON.stringify([key.principalId, key.projectId, key.canonicalWorkspace, key.chatId, key.sessionId, operationId]),
 	);
 	const authority = authorities.get(stableKey);
-	if (authority === undefined || authority.leaseId !== key.leaseId || authority.epoch !== key.epoch) return false;
+	if (authority === undefined || authority.leaseId !== key.leaseId || authority.epoch !== key.epoch)
+		return (await input.liveTenantFence?.(key)) ?? false;
 	try {
 		const current = await input.authority.resolve(key.principalId, key.projectId);
 		if (

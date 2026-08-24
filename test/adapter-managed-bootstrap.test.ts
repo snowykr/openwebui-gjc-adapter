@@ -84,4 +84,48 @@ describe("adapter managed bootstrap composition", () => {
 			},
 		]);
 	});
+
+	test("delegates request-scoped lease identities to the live tenant fence", async () => {
+		const root = await mkdtemp(join(tmpdir(), "adapter-managed-live-fence-"));
+		const sourcePath = join(root, "authority.v2.json");
+		await writeFile(sourcePath, "authority");
+		const seen: string[] = [];
+		const bootstrap = createAdapterManagedBootstrap({
+			locations: { agentDir: root, stateRoot: root },
+			configuredOwnerUserId: "owner",
+			mappings: {
+				mappingRecordsIterable: function* () {
+					yield {
+						principalId: "owner",
+						projectId: "project",
+						chatId: "chat",
+						sessionId: "session",
+						operationId: "operation",
+					} as SessionMapping;
+				},
+			},
+			sourcePath,
+			runtimeLock: { release: async () => {} } as never,
+			authority: { resolve: async () => undefined },
+			liveTenantFence: async key => {
+				seen.push(key.leaseId);
+				return key.leaseId === "live-lease";
+			},
+			runtime: {} as never,
+			lifecycle: {} as never,
+		});
+		await expect(
+			bootstrap.options.tenantFence({
+				principalId: "owner",
+				projectId: "project",
+				canonicalWorkspace: root,
+				chatId: "chat",
+				sessionId: "session",
+				generation: 1,
+				leaseId: "live-lease",
+				epoch: "epoch",
+			}),
+		).resolves.toBe(true);
+		expect(seen).toEqual(["live-lease"]);
+	});
 });
