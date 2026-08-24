@@ -1,4 +1,5 @@
 import type { AdapterHealthCheck, AdapterReadinessOptions } from "./health";
+import type { ManagedSdkRuntimeDependency } from "./live/gjc-routing-lifecycle";
 import type { AdapterRouteDependencies } from "./live/openai-routes";
 import type { RuntimeSingletonLock } from "./runtime-singleton-lock";
 import { createAdapterRequestHandler } from "./server-request-handler";
@@ -14,12 +15,25 @@ export interface AdapterServerOptions {
 	port: number;
 	runtimeRoot: string;
 	runtimeLock: RuntimeSingletonLock;
+	managedSdkRuntime?: ManagedSdkRuntimeOwnership;
 	shutdownCleanup?: () => void | Promise<void>;
 	checks?: readonly AdapterHealthCheck[];
 	readiness?: AdapterReadinessOptions;
 	runtime?: AdapterRuntimeConfig;
 	routes?: AdapterRouteDependencies;
 	turnTimeoutMs: number;
+}
+
+export interface ManagedSdkRuntimeOwnership {
+	readonly runtime: ManagedSdkRuntimeDependency;
+	readonly start: boolean;
+	readonly health: ManagedSdkRuntimeHealth;
+	dispose(): Promise<void>;
+}
+
+export interface ManagedSdkRuntimeHealth {
+	phase: "not_started" | "starting" | "ready" | "degraded";
+	reason?: string;
 }
 export interface AdapterServerHandle {
 	url: string;
@@ -29,6 +43,7 @@ export interface AdapterServerHandle {
 export async function startAdapterServer(options: AdapterServerOptions): Promise<AdapterServerHandle> {
 	const lock = options.runtimeLock;
 	try {
+		await startManagedSdkRuntime(options.managedSdkRuntime);
 		const idleTimeout = idleTimeoutSeconds(options.turnTimeoutMs);
 		const server = Bun.serve({
 			hostname: options.host,
@@ -43,13 +58,25 @@ export async function startAdapterServer(options: AdapterServerOptions): Promise
 		});
 		let shutdownPromise: Promise<void> | undefined;
 		const shutdown = async (): Promise<void> => {
-			const shutdowns = await Promise.allSettled([
-				Promise.resolve().then(() => server.stop()),
-				Promise.resolve().then(() => options.routes?.runner.stop?.()),
-			]);
-			const failures = shutdowns
-				.filter((result): result is PromiseRejectedResult => result.status === "rejected")
-				.map(result => result.reason);
+			const failures: unknown[] = [];
+			const concurrentStops: Promise<unknown>[] = [];
+			try {
+				concurrentStops.push(Promise.resolve(server.stop()));
+			} catch (error) {
+				failures.push(error);
+			}
+			try {
+				concurrentStops.push(Promise.resolve(options.routes?.runner.stop?.()));
+			} catch (error) {
+				failures.push(error);
+			}
+			for (const result of await Promise.allSettled(concurrentStops))
+				if (result.status === "rejected") failures.push(result.reason);
+			try {
+				await options.managedSdkRuntime?.dispose();
+			} catch (error) {
+				failures.push(error);
+			}
 			try {
 				await options.shutdownCleanup?.();
 			} catch (error) {
@@ -77,6 +104,11 @@ export async function startAdapterServer(options: AdapterServerOptions): Promise
 			failures.push(stopError);
 		}
 		try {
+			await options.managedSdkRuntime?.dispose();
+		} catch (disposeError) {
+			failures.push(disposeError);
+		}
+		try {
 			await options.shutdownCleanup?.();
 		} catch (cleanupError) {
 			failures.push(cleanupError);
@@ -88,6 +120,20 @@ export async function startAdapterServer(options: AdapterServerOptions): Promise
 		}
 		if (failures.length > 1) throw new AggregateError(failures, "Server initialization cleanup failed");
 		throw error;
+	}
+}
+
+async function startManagedSdkRuntime(ownership: ManagedSdkRuntimeOwnership | undefined): Promise<void> {
+	if (ownership === undefined || !ownership.start) return;
+	ownership.health.phase = "starting";
+	delete ownership.health.reason;
+	try {
+		await ownership.runtime.start();
+		await ownership.runtime.reconcile();
+		ownership.health.phase = "ready";
+	} catch {
+		ownership.health.phase = "degraded";
+		ownership.health.reason = "Managed SDK runtime bootstrap or reconciliation failed.";
 	}
 }
 function idleTimeoutSeconds(turnTimeoutMs: number): number {

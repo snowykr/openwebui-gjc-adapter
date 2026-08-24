@@ -4,7 +4,7 @@ import {
 	withPublicSdkSessionMutationCoordinator,
 } from "../gjc/public-sdk-session-port";
 import { SdkV3OperationError } from "../gjc/sdk-v3-protocol";
-import type { GjcLifecycleTransaction } from "../gjc/turn-runner";
+import type { GjcLifecycleTransaction, ManagedTurnAuthority } from "../gjc/turn-runner";
 import { GjcCloseReceipt } from "../gjc/turn-runner";
 import { ensureAttachment } from "./gjc-public-sdk-session-ops";
 import { attachmentKey, readPublishedSdkEndpoint, validatePersistedSessionIdentity } from "./gjc-routing-endpoints";
@@ -19,6 +19,44 @@ import {
 	samePublishedAttachmentSnapshot,
 } from "./gjc-routing-proof";
 import { runLifecycleTestBarrier } from "./gjc-routing-test-barrier";
+
+export type ManagedCloseResult =
+	| { readonly status: "retired" }
+	| { readonly status: "current"; readonly notApplied: true }
+	| { readonly status: "uncertain"; readonly message: string };
+
+/**
+ * Managed close proof is Router generation evidence, never endpoint absence or a stopped transport.
+ * Callers may commit retirement only after this returns `retired`.
+ */
+export async function closeManagedLifecycle(
+	context: PublicSdkRunnerContext,
+	authority: ManagedTurnAuthority,
+): Promise<ManagedCloseResult> {
+	const managed = context.managed(authority);
+	try {
+		await managed.assertFence();
+		const outcome = await managed.runtime.closeLifecycleSession({
+			actor: { id: authority.principalId, namespace: authority.projectId },
+			capability: "session.close",
+			requestKey: authority.requestKey,
+			timeoutMs: context.input.turnTimeoutMs,
+			target: { sessionId: authority.sessionId, endpointGeneration: authority.generation },
+		});
+		await managed.assertFence();
+		await managed.runtime.reconcile();
+		const status = await managed.runtime.generationStatus(managed.tenant);
+		if (status.status === "retired") return { status: "retired" };
+		if (status.status === "current" && !outcome.ok && outcome.certainty === "retryable")
+			return { status: "current", notApplied: true };
+		return { status: "uncertain", message: `Exact generation close is ${status.status}.` };
+	} catch (error) {
+		return {
+			status: "uncertain",
+			message: error instanceof Error ? error.message : "Managed lifecycle close failed without retirement proof.",
+		};
+	}
+}
 
 export async function withLifecycle<T>(
 	context: PublicSdkRunnerContext,

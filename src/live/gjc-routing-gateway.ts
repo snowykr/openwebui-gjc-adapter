@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import type { NormalizedModelSelection } from "../contracts";
 import {
 	type RouteGjcTurnResult,
@@ -6,7 +7,7 @@ import {
 	type SessionMappingStore,
 } from "../gjc/session-router";
 import { scopedSessionMappingStore } from "../gjc/session-turn-router";
-import type { GjcLifecycleTestBarrierHook } from "../gjc/turn-runner";
+import type { GjcLifecycleTestBarrierHook, ManagedTurnAuthority } from "../gjc/turn-runner";
 import { projectPendingWorkflowGateMessage } from "../projection/workflow-gates";
 import type { OutboxStore } from "../state/outbox";
 import type { LiveGatewayRunner, LiveGatewayRunnerInput, LiveGatewayRunnerResult } from "./chat-completions";
@@ -72,6 +73,9 @@ export function createGjcRoutingLiveGatewayRunner(
 					? input.mappings
 					: scopedSessionMappingStore(input.mappings, principalId, turn.chatId);
 			let existing = scopedMappings.get(turn.chatId);
+			// A persisted managed authority is all-or-nothing. Legacy mappings are deliberately
+			// separate; once a mapping declares managed routing, missing tenant facts fail closed.
+			if (existing !== undefined) managedAuthorityForGateway(turn, existing);
 			const priorProvisional = scopedMappings.provisionalOperation(turn.chatId, turn.userMessageId);
 			if (
 				priorProvisional !== undefined &&
@@ -390,6 +394,34 @@ export function createGjcRoutingLiveGatewayRunner(
 			return withCanonicalModel({ chunks: queue, abandon: () => backgroundRoute }, modelSelection);
 		},
 	};
+}
+
+/** Parses only durable mapping authority; it never manufactures a principal, generation, lease, or epoch. */
+export function managedAuthorityForGateway(
+	turn: LiveGatewayRunnerInput,
+	mapping: SessionMapping,
+): ManagedTurnAuthority | undefined {
+	const raw = Reflect.get(mapping as object, "managedAuthority");
+	if (raw === undefined) return undefined;
+	if (typeof raw !== "object" || raw === null) throw new Error("Managed session mapping authority is malformed.");
+	const authority = raw as Partial<ManagedTurnAuthority>;
+	if (
+		authority.principalId !== principalIdForTurn(turn) ||
+		authority.projectId !== turn.project.id ||
+		authority.canonicalWorkspace !== resolve(turn.project.cwd) ||
+		authority.chatId !== turn.chatId ||
+		authority.sessionId !== mapping.sessionId ||
+		authority.requestKey !== turn.userMessageId ||
+		typeof authority.generation !== "number" ||
+		!Number.isSafeInteger(authority.generation) ||
+		authority.generation <= 0 ||
+		typeof authority.leaseId !== "string" ||
+		authority.leaseId.length === 0 ||
+		typeof authority.epoch !== "string" ||
+		authority.epoch.length === 0
+	)
+		throw new Error("Managed session mapping lacks exact principal, generation, lease, epoch, or request authority.");
+	return authority as ManagedTurnAuthority;
 }
 
 function isSameProject(mapping: SessionMapping | undefined, turn: LiveGatewayRunnerInput): mapping is SessionMapping {

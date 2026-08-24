@@ -460,7 +460,9 @@ describe("latest dev SDK v3 transport contract", () => {
 			types: "./src/gjc/public-sdk-contract.ts",
 			import: "./src/gjc/public-sdk-contract.ts",
 		});
-		expect(Reflect.get(Reflect.get(manifest, "dependencies"), "@gajae-code/coding-agent")).toBe("0.14.0");
+		expect(Reflect.get(Reflect.get(manifest, "dependencies"), "@gajae-code/coding-agent")).toBe(
+			"file:vendor/gajae-code-coding-agent-e3b3a76a590081ded16214a1188857524d40e701-8ba25005.tgz",
+		);
 		expect(Reflect.get(manifest, "patchedDependencies")).toBeUndefined();
 		expect(await Bun.file(join(root, "patches", "@gajae-code%2Fcoding-agent@0.10.0.patch")).exists()).toBe(false);
 		expect(await Bun.file(join(root, "patches", "@gajae-code%2Fcoding-agent@0.11.6.patch")).exists()).toBe(false);

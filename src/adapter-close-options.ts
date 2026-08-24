@@ -7,10 +7,13 @@ import {
 	type SessionMappingStore,
 } from "./gjc/session-router";
 import type { GjcCloseReceipt } from "./gjc/turn-runner";
+import type { ManagedSdkRuntimeDependency } from "./live/gjc-routing-lifecycle";
 import type { GjcSessionTurnRunner } from "./live/gjc-routing-runner";
 import type { SessionCloseResult } from "./projects/link-service";
 
 export interface AdapterCloseOptionsDependencies {
+	/** Process-owned managed runtime, deliberately unused while close receipts remain legacy-owned. */
+	readonly managedSdkRuntime?: ManagedSdkRuntimeDependency;
 	readonly turnRunner: GjcSessionTurnRunner;
 }
 

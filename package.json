@@ -28,10 +28,10 @@
 		"fmt": "biome format --write ."
 	},
 	"dependencies": {
-		"@gajae-code/ai": "0.14.0",
+		"@gajae-code/ai": "0.15.0",
 		"@gajae-code/bridge-client": "0.13.3",
-		"@gajae-code/coding-agent": "0.14.0",
-		"@gajae-code/natives": "0.14.0"
+		"@gajae-code/coding-agent": "file:vendor/gajae-code-coding-agent-e3b3a76a590081ded16214a1188857524d40e701-8ba25005.tgz",
+		"@gajae-code/natives": "0.15.0"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.5.5",

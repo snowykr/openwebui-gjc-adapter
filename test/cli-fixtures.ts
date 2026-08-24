@@ -27,19 +27,17 @@ export async function waitForStartedServer(proc: Bun.Subprocess, url: string): P
 	const abort = new AbortController();
 	const stdout = observeSubprocessOutput(proc.stdout);
 	const response = waitForHttpResponse(url, abort.signal);
-	const ready = stdout.ready.then(() => fetch(url, { signal: abort.signal }));
 	const exited = proc.exited.then(async code => {
 		const [capturedStdout, stderr] = await Promise.all([stdout.complete, readSubprocessOutput(proc.stderr)]);
 		throw new Error(`start command exited with ${code}\nstdout:\n${capturedStdout}\nstderr:\n${stderr}`);
 	});
 	exited.catch(() => undefined);
 	try {
-		return await Promise.race([ready, response, exited]);
+		return await Promise.race([response, exited]);
 	} catch (error) {
+		abort.abort();
 		if (proc.exitCode === null) await stopProcess(proc);
 		throw error;
-	} finally {
-		abort.abort();
 	}
 }
 

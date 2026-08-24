@@ -1,10 +1,16 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { closeTmux, exitAndObservePostCloseFailure } from "../scripts/gjc-release-compat-lifecycle";
 
 const ROOT = join(import.meta.dir, "..");
-const GJC_VERSION = "0.14.0";
+const GJC_VERSION = "0.15.0";
 const BRIDGE_CLIENT_VERSION = "0.13.3";
+const CODING_AGENT_DEV_COMMIT = "e3b3a76a590081ded16214a1188857524d40e701";
+const CODING_AGENT_ARTIFACT_NAME = `gajae-code-coding-agent-${CODING_AGENT_DEV_COMMIT}-8ba25005.tgz`;
+const CODING_AGENT_ARTIFACT_PATH = `vendor/${CODING_AGENT_ARTIFACT_NAME}`;
+const CODING_AGENT_ARTIFACT_SHA256 = "8ba25005471c66871842cddefcdb98c0118ab26c3890b58f1f93665da524f4cb";
 const BUN_IMAGE_DIGEST = "sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4";
 const PYTHON_IMAGE_DIGEST = "sha256:8a7e7cc04fd3e2bd787f7f24e22d5d119aa590d429b50c95dfe12b3abe52f48b";
 
@@ -24,21 +30,35 @@ function releaseRoute(event: "repository_dispatch" | "schedule" | "workflow_disp
 }
 
 describe("GJC SDK runtime provenance", () => {
-	test("pins all published GJC runtime packages to the current exact release", async () => {
+	test("pins the published runtime pair and exact vendored coding-agent development artifact", async () => {
 		const manifest = await Bun.file(join(ROOT, "package.json")).json();
 		const dependencies = Reflect.get(manifest, "dependencies");
 
-		for (const packageName of ["@gajae-code/ai", "@gajae-code/coding-agent", "@gajae-code/natives"])
+		for (const packageName of ["@gajae-code/ai", "@gajae-code/natives"])
 			expect(Reflect.get(dependencies, packageName)).toBe(GJC_VERSION);
+		expect(Reflect.get(dependencies, "@gajae-code/coding-agent")).toBe(`file:${CODING_AGENT_ARTIFACT_PATH}`);
 		expect(Reflect.get(dependencies, "@gajae-code/bridge-client")).toBe(BRIDGE_CLIENT_VERSION);
+		const artifact = Bun.file(join(ROOT, CODING_AGENT_ARTIFACT_PATH));
+		expect(await artifact.exists()).toBe(true);
+		expect(CODING_AGENT_ARTIFACT_NAME).toBe(
+			"gajae-code-coding-agent-e3b3a76a590081ded16214a1188857524d40e701-8ba25005.tgz",
+		);
+		expect(CODING_AGENT_ARTIFACT_NAME).toContain(CODING_AGENT_DEV_COMMIT);
+		expect(
+			createHash("sha256")
+				.update(new Uint8Array(await artifact.arrayBuffer()))
+				.digest("hex"),
+		).toBe(CODING_AGENT_ARTIFACT_SHA256);
 		expect(Reflect.get(manifest, "patchedDependencies")).toBeUndefined();
 		expect(Reflect.get(manifest, "files")).not.toContain("patches");
+		expect(existsSync(join(ROOT, "patches"))).toBe(false);
 	});
 
-	test("installs and invokes the released CLI from the production dependency tree", async () => {
+	test("installs and invokes the vendored CLI from the production dependency tree", async () => {
 		const dockerfile = await Bun.file(join(ROOT, "Dockerfile.adapter")).text();
 
 		expect(dockerfile).toContain("COPY package.json bun.lock ./");
+		expect(dockerfile).toContain(`COPY ${CODING_AGENT_ARTIFACT_PATH} ${CODING_AGENT_ARTIFACT_PATH}`);
 		expect(dockerfile).toContain("bun install --frozen-lockfile --production");
 		expect(dockerfile).toContain(
 			'gjc_version="$(bun --no-env-file --config=/dev/null ./node_modules/.bin/gjc --version)"',
@@ -55,6 +75,24 @@ describe("GJC SDK runtime provenance", () => {
 		expect(dockerfile).not.toContain("git apply");
 		expect(dockerfile).not.toContain("packages/natives");
 		expect(dockerfile).not.toContain("GJC_UPSTREAM_COMMIT");
+	});
+
+	test("documents bridge-client as legacy-only removal work and keeps the public managed SDK gated", async () => {
+		const readme = await Bun.file(join(ROOT, "README.md")).text();
+		const changelog = await Bun.file(join(ROOT, "CHANGELOG.md")).text();
+
+		for (const document of [readme, changelog]) {
+			expect(document).toContain(CODING_AGENT_ARTIFACT_PATH);
+			expect(document).toContain(CODING_AGENT_DEV_COMMIT);
+			expect(document).toContain(CODING_AGENT_ARTIFACT_SHA256);
+			expect(document).toContain("not the registry 0.15.0 tarball");
+			expect(document).toContain("Production");
+			expect(document).toContain("legacy path");
+			expect(document).toContain("removal-only during atomic Slice 3");
+			expect(document).toContain("not a final-architecture target or fallback");
+			expect(document).toContain("public managed SDK");
+			expect(document).toContain("atomic cutover");
+		}
 	});
 
 	test("keeps pinned base images and runs as a non-root adapter user", async () => {

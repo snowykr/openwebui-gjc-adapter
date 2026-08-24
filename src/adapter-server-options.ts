@@ -21,6 +21,7 @@ import type { GjcCloseReceipt } from "./gjc/turn-runner";
 import type { LiveGatewayEventSink, LiveGatewayMessageSink } from "./live/chat-completions";
 import type { LiveGatewayFileContextResolver } from "./live/file-contexts";
 import { createGjcIdleSessionReaper } from "./live/gjc-idle-session-reaper";
+import type { ManagedSdkRuntimeDependency, ManagedSdkTenantFence } from "./live/gjc-routing-lifecycle";
 import {
 	createGjcRoutingLiveGatewayRunner,
 	createPublicSdkGjcTurnRunner,
@@ -52,7 +53,12 @@ import { resolveAllowedRoots } from "./security/paths";
 import { createUserWorkspaceRegistry } from "./security/user-workspace";
 import { createWorkspaceCleanupService, type WorkspaceCleanupAuthorityCoordinator } from "./security/workspace-cleanup";
 import { createWorkspaceLeaseManager } from "./security/workspace-lease";
-import { type AdapterServerHandle, type AdapterServerOptions, startAdapterServer } from "./server";
+import {
+	type AdapterServerHandle,
+	type AdapterServerOptions,
+	type ManagedSdkRuntimeHealth,
+	startAdapterServer,
+} from "./server";
 import { FileBackedOutboxStore, type OutboxStore } from "./state/outbox";
 import { type ProjectionOperationApplier, reconcilePendingOperations } from "./state/reconciler";
 
@@ -63,6 +69,14 @@ const SESSION_MAPPING_STORE_FILE = SESSION_AUTHORITY_MAPPING_FILE;
 const PROJECTION_OUTBOX_STORE_FILE = "openwebui-projection-outbox.json";
 
 export interface BuildAdapterServerOptionsDependencies {
+	/** Test seam for the one process-owned public-SDK runtime. */
+	readonly managedSdkRuntime?: ManagedSdkRuntimeDependency;
+	/** Test seam; receives only the explicitly resolved managed agent directory. */
+	readonly createManagedSdkRuntime?: (agentDir: string) => ManagedSdkRuntimeDependency;
+	/** Slice 3 authority seam; legacy traffic does not invoke it. */
+	readonly managedSdkTenantFence?: ManagedSdkTenantFence;
+	/** Lets tests inspect unwired ownership deterministically without opening a Router. */
+	readonly skipManagedSdkRuntimeStart?: boolean;
 	readonly turnRunner?: GjcSessionTurnRunner;
 	readonly mappings?: SessionMappingStore;
 	readonly eventSink?: LiveGatewayEventSink;
@@ -121,6 +135,25 @@ export async function buildResolvedAdapterServerOptions(
 	let projectStore: SqliteProjectRegistrationStore | undefined;
 	let idleSessionReaper: ReturnType<typeof createGjcIdleSessionReaper> | undefined;
 	let routingRunner: ReturnType<typeof createGjcRoutingLiveGatewayRunner> | undefined;
+	const skipManagedSdkRuntimeStart = dependencies.skipManagedSdkRuntimeStart ?? true;
+	const managedSdkRuntime =
+		dependencies.managedSdkRuntime ??
+		(dependencies.createManagedSdkRuntime === undefined
+			? skipManagedSdkRuntimeStart
+				? undefined
+				: new (await import("./gjc/managed-sdk-runtime")).ManagedSdkRuntime({
+						agentDir: config.runtimeLocations.agentDir,
+					})
+			: dependencies.createManagedSdkRuntime(config.runtimeLocations.agentDir));
+	const managedSdkRuntimeHealth: ManagedSdkRuntimeHealth = {
+		phase: skipManagedSdkRuntimeStart ? "not_started" : "starting",
+	};
+	let managedSdkRuntimeDisposePromise: Promise<void> | undefined;
+	const disposeManagedSdkRuntime = (): Promise<void> => {
+		if (managedSdkRuntimeDisposePromise === undefined)
+			managedSdkRuntimeDisposePromise = managedSdkRuntime?.dispose() ?? Promise.resolve();
+		return managedSdkRuntimeDisposePromise;
+	};
 	try {
 		const isolationDiagnostics: RuntimeIsolationDiagnostic[] = [];
 		if (internalStore)
@@ -196,6 +229,10 @@ export async function buildResolvedAdapterServerOptions(
 				cliPath,
 				runtimeLocations: config.runtimeLocations,
 				turnTimeoutMs: config.turnTimeoutMs,
+				...(managedSdkRuntime === undefined ? {} : { managedSdkRuntime }),
+				...(dependencies.managedSdkTenantFence === undefined
+					? {}
+					: { managedSdkTenantFence: dependencies.managedSdkTenantFence }),
 				sessionPortFactory: dependencies.sessionPortFactory,
 			});
 		const modelReaderFactory =
@@ -212,7 +249,12 @@ export async function buildResolvedAdapterServerOptions(
 					}),
 				sessionPortFactory: dependencies.sessionPortFactory,
 			});
-		const closeSession = createAdapterSessionCloser(config, cliPath, { ...dependencies, turnRunner }, mappings);
+		const closeSession = createAdapterSessionCloser(
+			config,
+			cliPath,
+			{ ...dependencies, ...(managedSdkRuntime === undefined ? {} : { managedSdkRuntime }), turnRunner },
+			mappings,
+		);
 		const baseRoutingRunner = createGjcRoutingLiveGatewayRunner({
 			turnRunner,
 			mappings,
@@ -338,18 +380,57 @@ export async function buildResolvedAdapterServerOptions(
 						authorityCoordinator: workspaceAuthorityCoordinator,
 						...(owner.ownerUserId.trim().length === 0 ? {} : { adminPrincipalId: owner.ownerUserId }),
 					});
-		const shutdownCleanup = internalStore
-			? () => {
+		const shutdownCleanup = async (): Promise<void> => {
+			const failures: unknown[] = [];
+			try {
+				await disposeManagedSdkRuntime();
+			} catch (error) {
+				failures.push(error);
+			}
+			if (internalStore) {
+				try {
 					projectStore?.close();
+				} catch (error) {
+					failures.push(error);
 				}
-			: undefined;
+			}
+			if (failures.length > 0) throw new AggregateError(failures, "Adapter shutdown cleanup failed");
+		};
 		const options = {
 			host: config.bindHost,
 			port: config.bindPort,
 			runtimeRoot: config.statePath,
 			runtimeLock: lock,
 			turnTimeoutMs: config.turnTimeoutMs,
-			checks: buildRuntimeHealthChecks(config, isolationDiagnostics),
+			checks: [
+				...buildRuntimeHealthChecks(config, isolationDiagnostics),
+				...(managedSdkRuntime === undefined
+					? []
+					: [
+							{
+								name: "managed-sdk-runtime",
+								get status() {
+									return managedSdkRuntimeHealth.phase === "ready" ? "ok" : "degraded";
+								},
+								get detail() {
+									return (
+										managedSdkRuntimeHealth.reason ??
+										`Managed SDK runtime is ${managedSdkRuntimeHealth.phase}.`
+									);
+								},
+							},
+						]),
+			],
+			...(managedSdkRuntime === undefined
+				? {}
+				: {
+						managedSdkRuntime: {
+							runtime: managedSdkRuntime,
+							start: !skipManagedSdkRuntimeStart,
+							health: managedSdkRuntimeHealth,
+							dispose: disposeManagedSdkRuntime,
+						},
+					}),
 			routes: {
 				projects: [...projectLinkService.listLinkedProjects()],
 				projectProvider: async () => {
@@ -386,7 +467,7 @@ export async function buildResolvedAdapterServerOptions(
 				...(messageSink === undefined ? {} : { messageSink }),
 				...(fileContextResolver === undefined ? {} : { fileContextResolver }),
 			},
-			...(shutdownCleanup === undefined ? {} : { shutdownCleanup }),
+			shutdownCleanup,
 		};
 		return options;
 	} catch (error) {
@@ -395,6 +476,11 @@ export async function buildResolvedAdapterServerOptions(
 			await (idleSessionReaper?.stop() ?? routingRunner?.stop?.());
 		} catch (stopError) {
 			startupError = new AggregateError([startupError, stopError], "Adapter initialization cleanup failed");
+		}
+		try {
+			await disposeManagedSdkRuntime();
+		} catch (disposeError) {
+			startupError = appendStartupCleanupError(startupError, disposeError);
 		}
 		if (internalStore && projectStore !== undefined) {
 			try {

@@ -12,6 +12,36 @@ import type { SessionAttachmentProof } from "./session-authority";
 import type { AcknowledgedSuccessor } from "./session-authority-types";
 import type { SessionMapping } from "./session-mapping-store";
 
+/** Complete, durable authority required before a managed SDK operation can cross process ownership. */
+export interface ManagedTurnAuthority {
+	readonly principalId: string;
+	readonly projectId: string;
+	readonly canonicalWorkspace: string;
+	readonly chatId: string;
+	readonly sessionId: string;
+	readonly generation: number;
+	readonly leaseId: string;
+	readonly epoch: string;
+	readonly requestKey: string;
+}
+
+/** Explicit managed variants prevent legacy inputs from being mistaken for tenant-authorized traffic. */
+export type ManagedContinueSessionInput = GjcContinueSessionInput & { readonly authority: ManagedTurnAuthority };
+export type ManagedStartNewSessionInput = GjcStartNewSessionInput & { readonly authority: ManagedTurnAuthority };
+export type ManagedSwitchSessionInput = GjcSwitchSessionInput & { readonly authority: ManagedTurnAuthority };
+export type ManagedSessionStateInput = GjcSessionStateInput & { readonly authority: ManagedTurnAuthority };
+export type ManagedRespondWorkflowGateInput = GjcRespondWorkflowGateInput & {
+	readonly authority: ManagedTurnAuthority;
+};
+export type ManagedCancelTurnInput = GjcCancelTurnInput & { readonly authority: ManagedTurnAuthority };
+export interface ManagedLifecycleControlInput {
+	readonly authority: ManagedTurnAuthority;
+	readonly operation: "session.create" | "session.resume" | "session.close" | "session.delete";
+}
+export interface ManagedCloseInput {
+	readonly authority: ManagedTurnAuthority;
+}
+
 export type GjcTurnEventObserver = (event: GjcTurnEvent) => Promise<void> | void;
 export type {
 	GjcLifecycleOwner,
