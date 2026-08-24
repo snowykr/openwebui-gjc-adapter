@@ -381,19 +381,29 @@ export class SessionAuthorityJournal {
 	attach(
 		chatId: string,
 		ingressId: string,
-		attachment: Pick<ProvisionalSessionOperation, "sessionId" | "sessionFile" | "attachment">,
+		attachment: Pick<ProvisionalSessionOperation, "sessionId" | "sessionFile" | "attachment" | "managedAuthority">,
 	): ProvisionalSessionOperation {
 		const key = provisionalKey(chatId, ingressId),
 			current = this.provisional.get(key);
 		if (current === undefined || current.state !== "pending")
 			throw new Error(`Session operation ${ingressId} requires reconciliation.`);
-		if (
-			attachment.sessionId === undefined ||
-			attachment.attachment?.tmuxSocket === undefined ||
-			attachment.attachment.tmuxPane === undefined ||
-			attachment.attachment.tmuxPanePid === undefined ||
-			attachment.attachment.tmuxOwnershipTag === undefined
-		)
+		const legacyValid =
+			attachment.attachment?.tmuxSocket !== undefined &&
+			attachment.attachment.tmuxPane !== undefined &&
+			attachment.attachment.tmuxPanePid !== undefined &&
+			attachment.attachment.tmuxOwnershipTag !== undefined;
+		const managed = attachment.managedAuthority;
+		const managedValid =
+			managed !== undefined &&
+			managed.chatId === current.chatId &&
+			managed.projectId === current.projectId &&
+			managed.sessionId === attachment.sessionId &&
+			Number.isSafeInteger(managed.generation) &&
+			managed.generation > 0 &&
+			[managed.principalId, managed.canonicalWorkspace, managed.leaseId, managed.epoch, managed.requestKey].every(
+				value => typeof value === "string" && value.length > 0,
+			);
+		if (attachment.sessionId === undefined || legacyValid === managedValid)
 			throw new Error("Provisional session authority requires an exact endpoint and owned-pane proof.");
 		const next = { ...current, ...attachment };
 		this.setProvisional(key, next);

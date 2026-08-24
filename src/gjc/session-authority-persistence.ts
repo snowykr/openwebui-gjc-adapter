@@ -275,7 +275,7 @@ export class FileSessionAuthority extends SessionAuthority {
 	override attachProvisionalOperation(
 		chatId: string,
 		ingressId: string,
-		attachment: Pick<ProvisionalSessionOperation, "sessionId" | "sessionFile" | "attachment">,
+		attachment: Pick<ProvisionalSessionOperation, "sessionId" | "sessionFile" | "attachment" | "managedAuthority">,
 	): ProvisionalSessionOperation {
 		return this.mutate(() => super.attachProvisionalOperation(chatId, ingressId, attachment));
 	}

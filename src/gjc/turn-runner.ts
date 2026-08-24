@@ -226,6 +226,16 @@ export interface GjcTurnRunner {
 		) => Promise<void>,
 		onFailure?: (lifecycle: GjcLifecycleTransaction, error: unknown) => Promise<void>,
 	): Promise<T>;
+	startManagedSession?<T>(
+		input: GjcStartNewSessionInput & { readonly preparedManagedAuthority: ManagedPreparedTurnAuthority },
+		publish: (result: GjcSessionAddress & GjcTurnResult, lifecycle: GjcLifecycleTransaction) => Promise<T>,
+		beforePrompt: (
+			address: GjcSessionAddress,
+			proof: ManagedGenerationProof,
+			lifecycle: GjcLifecycleTransaction,
+		) => Promise<void>,
+		onFailure?: (lifecycle: GjcLifecycleTransaction, error: unknown) => Promise<void>,
+	): Promise<T>;
 	continueSession(input: GjcContinueSessionInput): Promise<GjcTurnResult>;
 	switchSession(input: GjcSwitchSessionInput): Promise<void>;
 	getState(input: GjcSessionStateInput): Promise<GjcSessionState>;

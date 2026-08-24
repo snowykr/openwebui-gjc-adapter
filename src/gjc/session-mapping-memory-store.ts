@@ -501,7 +501,7 @@ export class SessionMappingStore {
 	attachProvisionalOperation(
 		chatId: string,
 		ingressId: string,
-		attachment: Pick<ProvisionalSessionOperation, "sessionId" | "sessionFile" | "attachment">,
+		attachment: Pick<ProvisionalSessionOperation, "sessionId" | "sessionFile" | "attachment" | "managedAuthority">,
 	): void {
 		assertLegacyKeyAvailable(this.authority, chatId);
 		this.authority.attachProvisionalOperation(chatId, ingressId, attachment);
@@ -509,7 +509,7 @@ export class SessionMappingStore {
 	attachProvisionalOperationScoped(
 		scope: SessionMappingScope,
 		ingressId: string,
-		attachment: Pick<ProvisionalSessionOperation, "sessionId" | "sessionFile" | "attachment">,
+		attachment: Pick<ProvisionalSessionOperation, "sessionId" | "sessionFile" | "attachment" | "managedAuthority">,
 	): void {
 		const canonicalScope = canonicalScopeFor(scope);
 		assertScopedKeyAvailable(this.authority, canonicalScope);

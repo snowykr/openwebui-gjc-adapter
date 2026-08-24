@@ -68,6 +68,16 @@ export interface ManagedGjcTurnRunner {
 		publish: (result: GjcSessionAddress & GjcTurnResult) => Promise<T>,
 		beforePrompt: (address: GjcSessionAddress) => Promise<void>,
 	): Promise<T>;
+	startManagedSession<T>(
+		input: GjcStartNewSessionInput & { readonly preparedManagedAuthority: ManagedPreparedTurnAuthority },
+		publish: (result: GjcSessionAddress & GjcTurnResult, lifecycle: GjcLifecycleTransaction) => Promise<T>,
+		beforePrompt: (
+			address: GjcSessionAddress,
+			proof: import("../gjc/turn-runner").ManagedGenerationProof,
+			lifecycle: GjcLifecycleTransaction,
+		) => Promise<void>,
+		onFailure?: (lifecycle: GjcLifecycleTransaction, error: unknown) => Promise<void>,
+	): Promise<T>;
 }
 
 export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedGjcTurnRunner {
@@ -164,6 +174,70 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 				authority,
 			);
 			return await publish({ ...address, ...result });
+		},
+		async startManagedSession(input, publish, beforePrompt, onFailure) {
+			const lifecycleResult = await operations.create({
+				authority: input.preparedManagedAuthority,
+				target: { path: input.cwd },
+			});
+			const authority: ManagedTurnAuthority = {
+				...input.preparedManagedAuthority,
+				sessionId: lifecycleResult.tenant.sessionId,
+				generation: lifecycleResult.tenant.generation,
+			};
+			const address = {
+				cwd: input.cwd,
+				sessionRoot: input.sessionRoot,
+				projectId: input.projectId,
+				chatId: input.chatId,
+				sessionId: authority.sessionId,
+			};
+			const transaction = managedLifecycleTransaction(address, authority);
+			try {
+				await beforePrompt(address, managedProof(authority), transaction);
+				const result = withManagedProof(
+					await operations.prompt(
+						turnInput(
+							{ ...input, preparedManagedAuthority: input.preparedManagedAuthority, authority },
+							"turn.prompt",
+						),
+					),
+					authority,
+				);
+				return await publish({ ...address, ...result }, transaction);
+			} catch (error) {
+				await onFailure?.(transaction, error);
+				await closeAfterPrePromptFailure(operations, authority, { path: input.cwd }, error);
+				throw error;
+			}
+		},
+	};
+}
+
+function managedLifecycleTransaction(
+	address: GjcLifecyclePublicationAddress,
+	authority: ManagedTurnAuthority,
+): GjcLifecycleTransaction {
+	const owner = {};
+	return {
+		address,
+		owner,
+		assertClosePreflight(): never {
+			throw new Error("Managed lifecycle close uses exact generation retirement proof.");
+		},
+		async publish(): Promise<never> {
+			throw new Error("Managed lifecycle cannot publish legacy attachment authority.");
+		},
+		async publishManaged(proof, write) {
+			if (proof.sessionId !== authority.sessionId || proof.generation !== authority.generation)
+				throw new Error("Managed lifecycle publication proof changed.");
+			return write();
+		},
+		async publishClosed(): Promise<never> {
+			throw new Error("Managed lifecycle close publication requires managed retirement state.");
+		},
+		async handoff(): Promise<never> {
+			throw new Error("Managed successor handoff uses public lifecycle fork authority.");
 		},
 	};
 }

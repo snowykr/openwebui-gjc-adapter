@@ -137,7 +137,7 @@ export class SessionAuthority {
 	attachProvisionalOperation(
 		chatId: string,
 		ingressId: string,
-		attachment: Pick<ProvisionalSessionOperation, "sessionId" | "sessionFile" | "attachment">,
+		attachment: Pick<ProvisionalSessionOperation, "sessionId" | "sessionFile" | "attachment" | "managedAuthority">,
 	): ProvisionalSessionOperation {
 		return this.#journal.attach(chatId, ingressId, attachment);
 	}

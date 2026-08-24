@@ -26,6 +26,7 @@ import type {
 	GjcSwitchSessionInput,
 	GjcTurnResult,
 	GjcTurnRunner,
+	ManagedPreparedTurnAuthority,
 } from "../src/gjc/turn-runner";
 import { GjcCloseReceipt, GjcTurnCancelledError } from "../src/gjc/turn-runner";
 import type { RegisteredProject } from "../src/projects/registry";
@@ -182,6 +183,162 @@ describe("routeGjcTurn", () => {
 			}),
 		});
 		expect(mappings.entries()).toHaveLength(1);
+	});
+
+	test("uses the managed lifecycle transaction for a prepared authority and persists its generation authority", async () => {
+		const runner = new FakeGjcTurnRunner();
+		const mappings = new SessionMappingStore();
+		const prepared: ManagedPreparedTurnAuthority = {
+			principalId: "principal-1",
+			projectId: "project",
+			canonicalWorkspace: "/workspace/project",
+			chatId: "chat-1",
+			leaseId: "lease-1",
+			epoch: "epoch-1",
+			requestKey: "request-1",
+		};
+		const calls: string[] = [];
+		let provisional = undefined as ReturnType<SessionMappingStore["provisionalOperation"]>;
+		runner.startNewSession = async () => {
+			calls.push("legacy");
+			throw new Error("legacy startup must not run for managed authority");
+		};
+		(runner as GjcTurnRunner).startManagedSession = async (input, publish, beforePrompt) => {
+			calls.push("managed-start");
+			const address = {
+				cwd: input.cwd,
+				sessionRoot: input.sessionRoot,
+				projectId: input.projectId,
+				chatId: input.chatId,
+				sessionId: "session-1",
+			};
+			const proof = {
+				kind: "managed-generation" as const,
+				sessionId: "session-1",
+				generation: 7,
+				leaseId: "lease-1",
+				epoch: "epoch-1",
+			};
+			const lifecycle: GjcLifecycleTransaction = {
+				...lifecycleFixture(address),
+				async publishManaged(candidate, write) {
+					calls.push("publish-managed");
+					expect(candidate).toEqual(proof);
+					return write();
+				},
+			};
+			await beforePrompt(address, proof, lifecycle);
+			calls.push("before-prompt");
+			provisional = mappings.provisionalOperation("chat-1", "message-1");
+			return publish(
+				{
+					...address,
+					text: "new:hello",
+					events: [{ type: "assistant", text: "new:hello" }],
+					sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
+					activeLeaf: "leaf-1",
+					rawFrameCursor: 7,
+					eventCursor: 3,
+					managedProof: proof,
+				},
+				lifecycle,
+			);
+		};
+
+		const result = await routeGjcTurn(routeInput(runner, mappings, { preparedManagedAuthority: prepared }));
+
+		expect(calls).toEqual(["managed-start", "before-prompt", "publish-managed"]);
+		expect(provisional).toMatchObject({
+			sessionId: "session-1",
+			managedAuthority: {
+				...prepared,
+				sessionId: "session-1",
+				generation: 7,
+			},
+		});
+		expect(provisional?.attachment).toBeUndefined();
+		expect(result.mapping).toMatchObject({
+			managedAuthority: {
+				...prepared,
+				sessionId: "session-1",
+				generation: 7,
+			},
+		});
+		expect(result.mapping.attachment).toBeUndefined();
+	});
+
+	test("fails closed when managed startup is unavailable and retains an uncertain reservation", async () => {
+		const runner = new FakeGjcTurnRunner();
+		const mappings = new SessionMappingStore();
+
+		await expect(
+			routeGjcTurn(
+				routeInput(runner, mappings, {
+					preparedManagedAuthority: {
+						principalId: "principal-1",
+						projectId: "project",
+						canonicalWorkspace: "/workspace/project",
+						chatId: "chat-1",
+						leaseId: "lease-1",
+						epoch: "epoch-1",
+						requestKey: "request-1",
+					},
+				}),
+			),
+		).rejects.toThrow("must provide managed session startup");
+
+		expect(runner.starts).toHaveLength(0);
+		expect(mappings.provisionalOperation("chat-1", "message-1")?.state).toBe("uncertain");
+	});
+
+	test("marks a managed provisional operation uncertain after managed prompt failure without attaching legacy authority", async () => {
+		const runner = new FakeGjcTurnRunner();
+		const mappings = new SessionMappingStore();
+		(runner as GjcTurnRunner).startManagedSession = async (input, _publish, beforePrompt, onFailure) => {
+			const address = {
+				cwd: input.cwd,
+				sessionRoot: input.sessionRoot,
+				projectId: input.projectId,
+				chatId: input.chatId,
+				sessionId: "session-1",
+			};
+			const lifecycle = lifecycleFixture(address);
+			const error = new Error("managed prompt failed");
+			await beforePrompt(
+				address,
+				{
+					kind: "managed-generation",
+					sessionId: "session-1",
+					generation: 7,
+					leaseId: "lease-1",
+					epoch: "epoch-1",
+				},
+				lifecycle,
+			);
+			await onFailure?.(lifecycle, error);
+			throw error;
+		};
+
+		await expect(
+			routeGjcTurn(
+				routeInput(runner, mappings, {
+					preparedManagedAuthority: {
+						principalId: "principal-1",
+						projectId: "project",
+						canonicalWorkspace: "/workspace/project",
+						chatId: "chat-1",
+						leaseId: "lease-1",
+						epoch: "epoch-1",
+						requestKey: "request-1",
+					},
+				}),
+			),
+		).rejects.toThrow("managed prompt failed");
+
+		const provisional = mappings.provisionalOperation("chat-1", "message-1");
+		expect(provisional).toMatchObject({ state: "uncertain", sessionId: "session-1" });
+		expect(provisional?.managedAuthority).toMatchObject({ generation: 7, requestKey: "request-1" });
+		expect(provisional?.attachment).toBeUndefined();
 	});
 
 	test("continues a mapped session after switching and reading state", async () => {
