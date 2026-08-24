@@ -47,6 +47,9 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 				...(input.onObservedTurn === undefined ? {} : { observer: input.onObservedTurn }),
 				...(input.signal === undefined ? {} : { signal: input.signal }),
 				...(input.principalId === undefined ? {} : { principalId: input.principalId }),
+				...(input.preparedManagedAuthority === undefined
+					? {}
+					: { preparedManagedAuthority: input.preparedManagedAuthority }),
 			},
 			async (result, lifecycle) => {
 				throwIfAborted(input.signal);

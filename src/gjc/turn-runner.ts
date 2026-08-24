@@ -92,6 +92,7 @@ export interface GjcStartNewSessionInput {
 	readonly observer?: GjcTurnEventObserver;
 	readonly signal?: AbortSignal;
 	readonly principalId?: string;
+	readonly preparedManagedAuthority?: ManagedPreparedTurnAuthority;
 }
 
 export interface GjcContinueSessionInput extends GjcSessionAddress, GjcLifecycleScoped {

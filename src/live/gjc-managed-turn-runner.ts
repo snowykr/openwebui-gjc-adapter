@@ -10,6 +10,7 @@ import type {
 	GjcSessionStateInput,
 	GjcStartNewSessionInput,
 	GjcTurnResult,
+	ManagedPreparedTurnAuthority,
 	ManagedTurnAuthority,
 } from "../gjc/turn-runner";
 import { GjcTurnCancelledError } from "../gjc/turn-runner";
@@ -23,9 +24,7 @@ import {
 } from "./gjc-managed-session-operations";
 
 export type ManagedRunnerStartInput = GjcStartNewSessionInput & {
-	readonly authority: Omit<ManagedTurnAuthority, "sessionId" | "generation">;
-	/** Create always maps to public lifecycle createExternal existing_path. */
-	readonly lifecycleTarget: Readonly<{ path: string }>;
+	readonly preparedManagedAuthority: ManagedPreparedTurnAuthority;
 };
 export type ManagedRunnerContinueInput = import("../gjc/turn-runner").GjcContinueSessionInput & {
 	readonly authority: ManagedTurnAuthority;
@@ -78,11 +77,11 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 		async create(input) {
 			throwIfAborted(input.signal);
 			const lifecycle = await operations.create({
-				authority: input.authority as ManagedTurnAuthority,
-				target: input.lifecycleTarget,
+				authority: input.preparedManagedAuthority,
+				target: { path: input.cwd },
 			});
 			const authority: ManagedTurnAuthority = {
-				...input.authority,
+				...input.preparedManagedAuthority,
 				sessionId: lifecycle.tenant.sessionId,
 				generation: lifecycle.tenant.generation,
 			};
@@ -92,7 +91,7 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 					authority,
 				);
 			} catch (error) {
-				await closeAfterPrePromptFailure(operations, authority, input.lifecycleTarget, error);
+				await closeAfterPrePromptFailure(operations, authority, { path: input.cwd }, error);
 				throw error;
 			}
 		},
@@ -144,11 +143,11 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 		getAvailableModels: input => operations.getModels(input.authority),
 		async startNewSession(input, publish, beforePrompt) {
 			const lifecycle = await operations.create({
-				authority: input.authority as ManagedTurnAuthority,
-				target: input.lifecycleTarget,
+				authority: input.preparedManagedAuthority,
+				target: { path: input.cwd },
 			});
 			const authority: ManagedTurnAuthority = {
-				...input.authority,
+				...input.preparedManagedAuthority,
 				sessionId: lifecycle.tenant.sessionId,
 				generation: lifecycle.tenant.generation,
 			};

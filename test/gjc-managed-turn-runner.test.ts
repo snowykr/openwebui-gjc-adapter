@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { ManagedSdkRuntime } from "../src/gjc/managed-sdk-runtime";
-import type { ManagedTurnAuthority } from "../src/gjc/turn-runner";
+import type { ManagedPreparedTurnAuthority, ManagedTurnAuthority } from "../src/gjc/turn-runner";
 import { createManagedGjcTurnRunner } from "../src/live/gjc-managed-turn-runner";
 
 const authority: ManagedTurnAuthority = {
@@ -21,14 +21,13 @@ describe("unwired managed turn runner", () => {
 		const runner = createManagedGjcTurnRunner(fake.runtime);
 		const observed: string[] = [];
 		const result = await runner.create({
-			authority: withoutIdentity(),
+			preparedManagedAuthority: withoutIdentity(),
 			cwd: authority.canonicalWorkspace,
 			sessionRoot: "/sessions",
 			projectId: authority.projectId,
 			chatId: authority.chatId,
 			userMessageId: "message-1",
 			text: "hello",
-			lifecycleTarget: { path: authority.canonicalWorkspace },
 			observer: event => {
 				observed.push(event.type);
 			},
@@ -96,14 +95,13 @@ describe("unwired managed turn runner", () => {
 		fake.failPrompt = true;
 		await expect(
 			runner.create({
-				authority: withoutIdentity(),
+				preparedManagedAuthority: withoutIdentity(),
 				cwd: authority.canonicalWorkspace,
 				sessionRoot: "/sessions",
 				projectId: authority.projectId,
 				chatId: authority.chatId,
 				userMessageId: "message-4",
 				text: "fail",
-				lifecycleTarget: { path: authority.canonicalWorkspace },
 			}),
 		).rejects.toThrow("prompt failure");
 		expect(fake.closeCalls).toBe(2);
@@ -114,7 +112,7 @@ describe("unwired managed turn runner", () => {
 	});
 });
 
-function withoutIdentity(): Omit<ManagedTurnAuthority, "sessionId" | "generation"> {
+function withoutIdentity(): ManagedPreparedTurnAuthority {
 	const { sessionId: _sessionId, generation: _generation, ...value } = authority;
 	return value;
 }

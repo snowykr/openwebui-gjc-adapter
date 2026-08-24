@@ -1,7 +1,13 @@
 import type { NormalizedModelSelection } from "../contracts";
 import type { RegisteredProject } from "../projects/registry";
 import type { SessionMapping, SessionMappingStore } from "./session-mapping-store";
-import type { GjcTurnEvent, GjcTurnEventObserver, GjcTurnResult, GjcTurnRunner } from "./turn-runner";
+import type {
+	GjcTurnEvent,
+	GjcTurnEventObserver,
+	GjcTurnResult,
+	GjcTurnRunner,
+	ManagedPreparedTurnAuthority,
+} from "./turn-runner";
 
 export interface RouteGjcTurnInput {
 	readonly project: RegisteredProject;
@@ -12,6 +18,7 @@ export interface RouteGjcTurnInput {
 	readonly runner: GjcTurnRunner;
 	readonly mappings: SessionMappingStore;
 	readonly principalId?: string;
+	readonly preparedManagedAuthority?: ManagedPreparedTurnAuthority;
 	readonly modelSelection?: NormalizedModelSelection;
 	readonly projectAssistantText?: (result: GjcTurnResult) => string;
 	readonly afterPublish?: (result: RouteGjcTurnResult) => void;
