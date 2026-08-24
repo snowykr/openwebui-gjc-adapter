@@ -1,0 +1,416 @@
+import { createHash } from "node:crypto";
+import {
+	assertManagedLifecycleTransition,
+	isManagedLifecycleState,
+	type ManagedLifecycleState,
+} from "./managed-lifecycle-state";
+
+export const MANAGED_SESSION_AUTHORITY_EPOCH = "gjc-public-sdk-v015-managed/1" as const;
+
+const SHA256_HEX = /^[a-f0-9]{64}$/;
+const RECORD_KEYS = [
+	"authorityEpoch",
+	"principalId",
+	"projectId",
+	"canonicalWorkspace",
+	"chatId",
+	"sessionId",
+	"generation",
+	"operationHash",
+	"requestHash",
+	"payloadHash",
+	"session",
+	"projection",
+	"lifecycle",
+] as const;
+const SESSION_KEYS = ["sessionId", "observedAt"] as const;
+const PROJECTION_KEYS = ["rawFrameCursor", "eventCursor", "activeLeaf"] as const;
+const LIFECYCLE_KEYS = ["state", "recordedAt"] as const;
+const MIGRATION_DIGEST_KEYS = ["sourceDigest", "backupDigest", "walDigest", "targetManifestDigest"] as const;
+const MIGRATION_ITEM_KEYS = ["identity", "status", "reason"] as const;
+const MIGRATION_CHECKPOINT_KEYS = [
+	"authorityEpoch",
+	"digests",
+	"records",
+	"canonicalReplaced",
+	"activeMarkerReady",
+] as const;
+
+export interface ManagedSessionAuthorityTenant {
+	readonly principalId: string;
+	readonly projectId: string;
+	readonly canonicalWorkspace: string;
+	readonly chatId: string;
+	readonly sessionId: string;
+}
+
+/** Credential-free evidence only; no attachment, endpoint, descriptor, process, or payload is retained. */
+export interface ManagedSessionAuthorityRecord extends ManagedSessionAuthorityTenant {
+	readonly authorityEpoch: typeof MANAGED_SESSION_AUTHORITY_EPOCH;
+	readonly generation: number;
+	readonly operationHash: string;
+	readonly requestHash: string;
+	readonly payloadHash: string;
+	readonly session: Readonly<{
+		readonly sessionId: string;
+		readonly observedAt: string;
+	}>;
+	readonly projection: Readonly<{
+		readonly rawFrameCursor: number;
+		readonly eventCursor: number;
+		readonly activeLeaf?: string;
+	}>;
+	readonly lifecycle: Readonly<{
+		readonly state: ManagedLifecycleState;
+		readonly recordedAt: string;
+	}>;
+}
+
+export type ManagedSessionAuthorityMigrationStatus =
+	| "intent_prepared"
+	| "migration_blocked"
+	| "quarantined"
+	| "active_generation_proven"
+	| "retired";
+
+export interface ManagedSessionAuthorityMigrationDigests {
+	readonly sourceDigest: string;
+	readonly backupDigest: string;
+	readonly walDigest: string;
+	readonly targetManifestDigest: string;
+}
+
+export interface ManagedSessionAuthorityMigrationRecord {
+	readonly identity: string;
+	readonly status: ManagedSessionAuthorityMigrationStatus;
+	readonly reason?: string;
+}
+
+/** A serializable, inactive migration checkpoint. The flags remain false until a later atomic activator owns them. */
+export interface ManagedSessionAuthorityMigrationCheckpoint {
+	readonly authorityEpoch: typeof MANAGED_SESSION_AUTHORITY_EPOCH;
+	readonly digests: ManagedSessionAuthorityMigrationDigests;
+	readonly records: readonly ManagedSessionAuthorityMigrationRecord[];
+	readonly canonicalReplaced: boolean;
+	readonly activeMarkerReady: boolean;
+}
+
+/** Narrow, already-read legacy evidence. This module neither reads nor writes user artifacts. */
+export interface LegacyManagedSessionAuthorityEvidence {
+	readonly sourceDigest: string;
+	readonly backupDigest: string;
+	readonly walDigest: string;
+	readonly targetManifestDigest: string;
+	readonly records: readonly Readonly<{
+		readonly principalId?: string;
+		readonly projectId?: string;
+		readonly canonicalWorkspace?: string;
+		readonly chatId?: string;
+		readonly sessionId?: string;
+		readonly status?: "quarantined" | "active_generation_proven" | "retired";
+	}>[];
+}
+
+export class ManagedSessionAuthorityError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "ManagedSessionAuthorityError";
+	}
+}
+
+export function isManagedSessionAuthorityRecord(value: unknown): value is ManagedSessionAuthorityRecord {
+	if (!hasOnlyKeys(value, RECORD_KEYS) || value.authorityEpoch !== MANAGED_SESSION_AUTHORITY_EPOCH) return false;
+	if (
+		!isTenant(value) ||
+		!isPositiveGeneration(value.generation) ||
+		!hashes(value.operationHash, value.requestHash, value.payloadHash)
+	)
+		return false;
+	if (
+		!hasOnlyKeys(value.session, SESSION_KEYS) ||
+		value.session.sessionId !== value.sessionId ||
+		!isCanonicalTimestamp(value.session.observedAt)
+	)
+		return false;
+	if (
+		!hasOnlyKeys(value.projection, PROJECTION_KEYS) ||
+		!isNonnegativeSafeInteger(value.projection.rawFrameCursor) ||
+		!isNonnegativeSafeInteger(value.projection.eventCursor) ||
+		(value.projection.activeLeaf !== undefined && !isNonEmptyString(value.projection.activeLeaf))
+	)
+		return false;
+	return (
+		hasOnlyKeys(value.lifecycle, LIFECYCLE_KEYS) &&
+		isManagedLifecycleState(value.lifecycle.state) &&
+		isCanonicalTimestamp(value.lifecycle.recordedAt)
+	);
+}
+
+export function parseManagedSessionAuthorityRecord(value: unknown): ManagedSessionAuthorityRecord {
+	if (!isManagedSessionAuthorityRecord(value))
+		throw new ManagedSessionAuthorityError("Invalid managed session authority record.");
+	return copyManagedSessionAuthorityRecord(value);
+}
+
+export function encodeManagedSessionAuthorityRecord(record: ManagedSessionAuthorityRecord): string {
+	return JSON.stringify(canonicalRecord(parseManagedSessionAuthorityRecord(record)));
+}
+
+export function decodeManagedSessionAuthorityRecord(value: unknown): ManagedSessionAuthorityRecord {
+	let parsed: unknown;
+	try {
+		parsed = typeof value === "string" ? JSON.parse(value) : value;
+	} catch {
+		throw new ManagedSessionAuthorityError("Malformed managed session authority record.");
+	}
+	return parseManagedSessionAuthorityRecord(parsed);
+}
+
+export function copyManagedSessionAuthorityRecord(
+	record: ManagedSessionAuthorityRecord,
+): ManagedSessionAuthorityRecord {
+	const parsed = isManagedSessionAuthorityRecord(record) ? record : parseManagedSessionAuthorityRecord(record);
+	return {
+		...parsed,
+		session: { ...parsed.session },
+		projection: { ...parsed.projection },
+		lifecycle: { ...parsed.lifecycle },
+	};
+}
+
+/** Stable identity excludes replaceable observation and lifecycle evidence. */
+export function managedSessionAuthorityIdentity(record: ManagedSessionAuthorityRecord): string {
+	const valid = parseManagedSessionAuthorityRecord(record);
+	return sha256(
+		JSON.stringify({
+			authorityEpoch: valid.authorityEpoch,
+			principalId: valid.principalId,
+			projectId: valid.projectId,
+			canonicalWorkspace: valid.canonicalWorkspace,
+			chatId: valid.chatId,
+			sessionId: valid.sessionId,
+			generation: valid.generation,
+			operationHash: valid.operationHash,
+			requestHash: valid.requestHash,
+			payloadHash: valid.payloadHash,
+		}),
+	);
+}
+
+export function managedSessionAuthorityHash(record: ManagedSessionAuthorityRecord): string {
+	return sha256(encodeManagedSessionAuthorityRecord(record));
+}
+
+export function transitionManagedSessionAuthorityRecord(
+	record: ManagedSessionAuthorityRecord,
+	next: ManagedLifecycleState,
+	recordedAt: string,
+): ManagedSessionAuthorityRecord {
+	const valid = parseManagedSessionAuthorityRecord(record);
+	if (!isCanonicalTimestamp(recordedAt)) throw new ManagedSessionAuthorityError("Invalid lifecycle timestamp.");
+	assertManagedLifecycleTransition(valid.lifecycle.state, next);
+	return { ...valid, lifecycle: { state: next, recordedAt } };
+}
+
+export function isManagedSessionAuthorityMigrationCheckpoint(
+	value: unknown,
+): value is ManagedSessionAuthorityMigrationCheckpoint {
+	if (!hasOnlyKeys(value, MIGRATION_CHECKPOINT_KEYS) || value.authorityEpoch !== MANAGED_SESSION_AUTHORITY_EPOCH)
+		return false;
+	if (!hasOnlyKeys(value.digests, MIGRATION_DIGEST_KEYS) || !hashes(...Object.values(value.digests))) return false;
+	if (!Array.isArray(value.records) || !value.records.every(isMigrationRecord)) return false;
+	if (typeof value.canonicalReplaced !== "boolean" || typeof value.activeMarkerReady !== "boolean") return false;
+	return new Set(value.records.map(record => record.identity)).size === value.records.length;
+}
+
+export function parseManagedSessionAuthorityMigrationCheckpoint(
+	value: unknown,
+): ManagedSessionAuthorityMigrationCheckpoint {
+	if (!isManagedSessionAuthorityMigrationCheckpoint(value))
+		throw new ManagedSessionAuthorityError("Invalid managed session authority migration checkpoint.");
+	return copyManagedSessionAuthorityMigrationCheckpoint(value);
+}
+
+export function encodeManagedSessionAuthorityMigrationCheckpoint(
+	checkpoint: ManagedSessionAuthorityMigrationCheckpoint,
+): string {
+	return JSON.stringify(parseManagedSessionAuthorityMigrationCheckpoint(checkpoint));
+}
+
+export function decodeManagedSessionAuthorityMigrationCheckpoint(
+	value: unknown,
+): ManagedSessionAuthorityMigrationCheckpoint {
+	let parsed: unknown;
+	try {
+		parsed = typeof value === "string" ? JSON.parse(value) : value;
+	} catch {
+		throw new ManagedSessionAuthorityError("Malformed managed session authority migration checkpoint.");
+	}
+	return parseManagedSessionAuthorityMigrationCheckpoint(parsed);
+}
+
+export function copyManagedSessionAuthorityMigrationCheckpoint(
+	checkpoint: ManagedSessionAuthorityMigrationCheckpoint,
+): ManagedSessionAuthorityMigrationCheckpoint {
+	const valid = isManagedSessionAuthorityMigrationCheckpoint(checkpoint)
+		? checkpoint
+		: parseManagedSessionAuthorityMigrationCheckpoint(checkpoint);
+	return {
+		...valid,
+		digests: { ...valid.digests },
+		records: valid.records.map(record => ({ ...record })),
+	};
+}
+
+/**
+ * Produces an inactive, deterministic checkpoint from supplied evidence. Missing or ambiguous tenant identity is blocked,
+ * rather than guessed. A matching prior checkpoint is copied unchanged, making repeated planning idempotent.
+ */
+export function planManagedSessionAuthorityMigration(
+	evidence: LegacyManagedSessionAuthorityEvidence,
+	prior?: ManagedSessionAuthorityMigrationCheckpoint,
+): ManagedSessionAuthorityMigrationCheckpoint {
+	const digests = parseMigrationDigests(evidence);
+	if (!evidence.records.every(isLegacyEvidenceRecord))
+		throw new ManagedSessionAuthorityError("Invalid legacy managed authority record evidence.");
+	const identities = evidence.records.map(legacyIdentity);
+	const duplicateIdentities = new Set(
+		identities.flatMap((identity, index) =>
+			identity !== undefined && identities.indexOf(identity) !== index ? [identity] : [],
+		),
+	);
+	const records = evidence.records.map((record, index): ManagedSessionAuthorityMigrationRecord => {
+		const identity = identities[index];
+		if (identity === undefined || duplicateIdentities.has(identity))
+			return {
+				identity: `legacy:${index}`,
+				status: "migration_blocked",
+				reason: "missing or ambiguous tenant identity",
+			};
+		return { identity, status: record.status ?? "intent_prepared" };
+	});
+	const planned: ManagedSessionAuthorityMigrationCheckpoint = {
+		authorityEpoch: MANAGED_SESSION_AUTHORITY_EPOCH,
+		digests,
+		records,
+		canonicalReplaced: false,
+		activeMarkerReady: false,
+	};
+	if (prior !== undefined) {
+		const checked = parseManagedSessionAuthorityMigrationCheckpoint(prior);
+		if (
+			encodeManagedSessionAuthorityMigrationCheckpoint(checked) ===
+			encodeManagedSessionAuthorityMigrationCheckpoint(planned)
+		)
+			return checked;
+	}
+	return planned;
+}
+
+function canonicalRecord(record: ManagedSessionAuthorityRecord): ManagedSessionAuthorityRecord {
+	return {
+		authorityEpoch: record.authorityEpoch,
+		principalId: record.principalId,
+		projectId: record.projectId,
+		canonicalWorkspace: record.canonicalWorkspace,
+		chatId: record.chatId,
+		sessionId: record.sessionId,
+		generation: record.generation,
+		operationHash: record.operationHash,
+		requestHash: record.requestHash,
+		payloadHash: record.payloadHash,
+		session: { sessionId: record.session.sessionId, observedAt: record.session.observedAt },
+		projection: {
+			rawFrameCursor: record.projection.rawFrameCursor,
+			eventCursor: record.projection.eventCursor,
+			...(record.projection.activeLeaf === undefined ? {} : { activeLeaf: record.projection.activeLeaf }),
+		},
+		lifecycle: { state: record.lifecycle.state, recordedAt: record.lifecycle.recordedAt },
+	};
+}
+
+function parseMigrationDigests(
+	evidence: LegacyManagedSessionAuthorityEvidence,
+): ManagedSessionAuthorityMigrationDigests {
+	if (
+		!hasOnlyKeys(evidence, ["sourceDigest", "backupDigest", "walDigest", "targetManifestDigest", "records"]) ||
+		!Array.isArray(evidence.records)
+	)
+		throw new ManagedSessionAuthorityError("Invalid legacy managed authority evidence.");
+	const digests = {
+		sourceDigest: evidence.sourceDigest,
+		backupDigest: evidence.backupDigest,
+		walDigest: evidence.walDigest,
+		targetManifestDigest: evidence.targetManifestDigest,
+	};
+	if (!hashes(...Object.values(digests))) throw new ManagedSessionAuthorityError("Invalid legacy migration digest.");
+	return digests;
+}
+
+function isMigrationRecord(value: unknown): value is ManagedSessionAuthorityMigrationRecord {
+	return (
+		hasOnlyKeys(value, MIGRATION_ITEM_KEYS) &&
+		isNonEmptyString(value.identity) &&
+		["intent_prepared", "migration_blocked", "quarantined", "active_generation_proven", "retired"].includes(
+			value.status as string,
+		) &&
+		(value.reason === undefined || isNonEmptyString(value.reason))
+	);
+}
+
+function legacyIdentity(record: LegacyManagedSessionAuthorityEvidence["records"][number]): string | undefined {
+	const parts = [record.principalId, record.projectId, record.canonicalWorkspace, record.chatId, record.sessionId];
+	return parts.every(isNonEmptyString) ? JSON.stringify(parts) : undefined;
+}
+
+function isLegacyEvidenceRecord(value: unknown): value is LegacyManagedSessionAuthorityEvidence["records"][number] {
+	return (
+		hasOnlyKeys(value, ["principalId", "projectId", "canonicalWorkspace", "chatId", "sessionId", "status"]) &&
+		(value.principalId === undefined || typeof value.principalId === "string") &&
+		(value.projectId === undefined || typeof value.projectId === "string") &&
+		(value.canonicalWorkspace === undefined || typeof value.canonicalWorkspace === "string") &&
+		(value.chatId === undefined || typeof value.chatId === "string") &&
+		(value.sessionId === undefined || typeof value.sessionId === "string") &&
+		(value.status === undefined ||
+			["quarantined", "active_generation_proven", "retired"].includes(value.status as string))
+	);
+}
+
+function isTenant(value: Record<string, unknown>): boolean {
+	return [value.principalId, value.projectId, value.canonicalWorkspace, value.chatId, value.sessionId].every(
+		isNonEmptyString,
+	);
+}
+
+function hasOnlyKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+	return (
+		value !== null &&
+		typeof value === "object" &&
+		!Array.isArray(value) &&
+		Object.keys(value).every(key => keys.includes(key))
+	);
+}
+
+function hashes(...values: unknown[]): boolean {
+	return values.every(value => typeof value === "string" && SHA256_HEX.test(value));
+}
+
+function isPositiveGeneration(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function isNonnegativeSafeInteger(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isNonEmptyString(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0;
+}
+
+function isCanonicalTimestamp(value: unknown): value is string {
+	return typeof value === "string" && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value;
+}
+
+function sha256(value: string): string {
+	return createHash("sha256").update(value).digest("hex");
+}
