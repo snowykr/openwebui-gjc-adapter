@@ -1,3 +1,4 @@
+import type { ManagedPreparedTurnAuthority } from "../gjc/turn-runner";
 import type { OpenWebUIOwnerContext, OpenWebUIPrincipal } from "../openwebui/auth";
 import type { OpenWebUIProjectionRepository } from "../openwebui/client";
 import type { OpenWebUIMessageEvent } from "../openwebui/events";
@@ -36,6 +37,8 @@ export interface LiveGatewayRunnerInput {
 	/** Authenticated OpenWebUI owner bound by the request handler for branch controls. */
 	/** Authenticated OpenWebUI principal bound by the request handler for branch controls. */
 	readonly ownerUserId?: string;
+	/** Generation-free managed authority admitted with the current workspace lease. */
+	readonly preparedManagedAuthority?: ManagedPreparedTurnAuthority;
 	/** Principal/workspace/lease scope for model selection during this turn. */
 	readonly modelReaderContext?: import("./model-reader").ModelReaderContext;
 	/** Message lineage supplied by OpenWebUI for the regenerated message. */

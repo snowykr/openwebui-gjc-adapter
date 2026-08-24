@@ -25,6 +25,20 @@ export interface ManagedTurnAuthority {
 	readonly requestKey: string;
 }
 
+/**
+ * Credential-free authority admitted before managed session creation. Session
+ * identity and generation are assigned only by the managed lifecycle service.
+ */
+export interface ManagedPreparedTurnAuthority {
+	readonly principalId: string;
+	readonly projectId: string;
+	readonly canonicalWorkspace: string;
+	readonly chatId: string;
+	readonly leaseId: string;
+	readonly epoch: string;
+	readonly requestKey: string;
+}
+
 /** Durable managed authority proof; unlike legacy proof it contains no descriptor or terminal identity. */
 export interface ManagedGenerationProof {
 	readonly kind: "managed-generation";
@@ -36,7 +50,9 @@ export interface ManagedGenerationProof {
 
 /** Explicit managed variants prevent legacy inputs from being mistaken for tenant-authorized traffic. */
 export type ManagedContinueSessionInput = GjcContinueSessionInput & { readonly authority: ManagedTurnAuthority };
-export type ManagedStartNewSessionInput = GjcStartNewSessionInput & { readonly authority: ManagedTurnAuthority };
+export type ManagedStartNewSessionInput = GjcStartNewSessionInput & {
+	readonly authority: ManagedPreparedTurnAuthority;
+};
 export type ManagedSwitchSessionInput = GjcSwitchSessionInput & { readonly authority: ManagedTurnAuthority };
 export type ManagedSessionStateInput = GjcSessionStateInput & { readonly authority: ManagedTurnAuthority };
 export type ManagedRespondWorkflowGateInput = GjcRespondWorkflowGateInput & {

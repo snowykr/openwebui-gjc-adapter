@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
 import { constants, readFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
@@ -61,6 +61,20 @@ export interface WorkspaceLeaseReference {
 	readonly holderId: string;
 	readonly generation: number;
 	readonly operation: WorkspaceLeaseOperation;
+}
+
+/**
+ * Returns a stable, credential-free identifier for one exact lease fence.
+ * It intentionally excludes lease expiry and all process-local state.
+ */
+export function workspaceLeaseId(reference: WorkspaceLeaseReference): string {
+	return createHash("sha256")
+		.update(reference.safeKey)
+		.update("\u0000")
+		.update(reference.holderId)
+		.update("\u0000")
+		.update(String(reference.generation))
+		.digest("hex");
 }
 
 export interface WorkspaceLeaseRenewOptions extends WorkspaceLeaseReference {
@@ -408,6 +422,16 @@ export class WorkspaceLease {
 
 	get operation(): WorkspaceLeaseOperation {
 		return this.#record.operation;
+	}
+
+	/** Immutable, credential-free handle for the currently held lease fence. */
+	get reference(): WorkspaceLeaseReference {
+		return Object.freeze({
+			safeKey: this.#safeKey,
+			holderId: this.#record.holderId,
+			generation: this.#record.generation,
+			operation: this.#record.operation,
+		});
 	}
 
 	get leaseExpiresAt(): number {

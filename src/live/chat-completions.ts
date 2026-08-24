@@ -1,8 +1,11 @@
 import { randomUUID } from "node:crypto";
+import { resolve } from "node:path";
+import { MANAGED_SESSION_AUTHORITY_EPOCH } from "../gjc/managed-session-authority";
 import { GjcTurnCancelledError } from "../gjc/turn-runner";
 import { resolveForwardedPrincipal } from "../openwebui/auth";
 import { parseOpenWebUIHeaders } from "../openwebui/headers";
 import type { WorkspaceLease } from "../security/workspace-lease";
+import { workspaceLeaseId } from "../security/workspace-lease";
 import { deliverChatCompletion } from "./chat-completion-delivery";
 import {
 	type HandleChatCompletionsInput,
@@ -259,6 +262,24 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 
 		await assertWorkspaceLease(leaseAdmission);
 		throwIfAborted(input.signal);
+		const leaseReference = leaseAdmission?.reference;
+		const preparedManagedAuthority =
+			principal.role !== "user" ||
+			workspace === undefined ||
+			leaseReference === undefined ||
+			headers.userMessageParentId !== null
+				? undefined
+				: Object.freeze({
+						principalId: principal.userId,
+						projectId: project.id,
+						canonicalWorkspace: resolve(project.cwd),
+						chatId: headers.chatId,
+						leaseId: workspaceLeaseId(leaseReference),
+						epoch: MANAGED_SESSION_AUTHORITY_EPOCH,
+						requestKey: headers.userMessageId,
+					});
+		// Constructing a prepared authority is itself an admission boundary.
+		await assertWorkspaceLease(leaseAdmission);
 		let liveEventsDelivered = false;
 		const guardedEventSink =
 			input.eventSink === undefined
@@ -277,6 +298,7 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 			continued: headers.userMessageParentId !== null,
 			requestedModelId,
 			ownerUserId: principal.userId,
+			...(preparedManagedAuthority === undefined ? {} : { preparedManagedAuthority }),
 			...(workspace === undefined
 				? {}
 				: {
@@ -442,6 +464,10 @@ class WorkspaceLeaseAdmission {
 
 	get failed(): boolean {
 		return this.#failure;
+	}
+
+	get reference() {
+		return this.#lease.reference;
 	}
 
 	async assertFence(): Promise<void> {
