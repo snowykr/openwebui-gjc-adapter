@@ -1,0 +1,668 @@
+import { isAbsolute } from "node:path";
+import type { NormalizedModelSelection } from "../contracts";
+import {
+	isJsonValue,
+	isNonEmptyString,
+	isNonnegativeSafeInteger,
+	isRecord,
+	isTimestamp,
+} from "./session-authority-validation-primitives";
+import { normalizeModelSelection } from "./session-operation-codec";
+import type { GjcTurnEvent, ManagedTurnAuthority } from "./turn-runner";
+
+export const SESSION_AUTHORITY_V3_VERSION = 3 as const;
+export const SESSION_AUTHORITY_V3_EPOCH = "managed/1" as const;
+export const MANAGED_TURN_AUTHORITY_V3_EPOCH = SESSION_AUTHORITY_V3_EPOCH;
+
+export type SessionAuthorityV3OperationState = "pending" | "complete" | "uncertain" | "conflict";
+export type SessionAuthorityV3OperationKind =
+	| "create"
+	| "resume"
+	| "close"
+	| "prompt"
+	| "reply"
+	| "gate"
+	| "branch"
+	| "model"
+	| "thinking";
+
+export interface ManagedTurnAuthorityV3 extends ManagedTurnAuthority {
+	readonly authorityEpoch: typeof SESSION_AUTHORITY_V3_EPOCH;
+}
+
+export interface SessionAuthorityV3Result {
+	readonly kind: "turn" | "control" | "close";
+	readonly assistantText: string;
+	readonly managedAuthority: ManagedTurnAuthorityV3;
+	readonly events?: readonly GjcTurnEvent[];
+	readonly mapping: Readonly<{
+		chatId: string;
+		projectId: string;
+		sessionId: string;
+		rawFrameCursor: number;
+		eventCursor: number;
+		operationId: string;
+		modelSelection?: NormalizedModelSelection;
+	}>;
+	readonly correlation?: Readonly<Record<string, string>>;
+	readonly gate?: Readonly<{ gateId: string; commandId?: string; turnId?: string; sessionId?: string }>;
+}
+
+export interface SessionAuthorityV3AcknowledgedSuccessor {
+	readonly sessionId: string;
+	readonly managedAuthority: ManagedTurnAuthorityV3;
+}
+
+export interface SessionAuthorityV3Operation {
+	readonly id: string;
+	readonly kind: SessionAuthorityV3OperationKind;
+	readonly state: SessionAuthorityV3OperationState;
+	readonly ingressId?: string;
+	readonly startedAt: string;
+	readonly completedAt?: string;
+	readonly detail?: string;
+	readonly result?: SessionAuthorityV3Result;
+	readonly acknowledgedSuccessor?: SessionAuthorityV3AcknowledgedSuccessor;
+}
+
+export interface SessionAuthorityV3Tombstone {
+	readonly version: typeof SESSION_AUTHORITY_V3_VERSION;
+	readonly authorityEpoch: typeof SESSION_AUTHORITY_V3_EPOCH;
+	readonly chatId: string;
+	readonly projectId: string;
+	readonly sessionId: string;
+	readonly createdAt: string;
+	readonly header: Readonly<{ chatId: string; projectId: string; sessionId: string }>;
+	readonly rawFrameCursor: number;
+	readonly eventCursor: number;
+	readonly operationId: string;
+	readonly assistantText?: string;
+	readonly events?: readonly GjcTurnEvent[];
+	readonly modelSelection?: NormalizedModelSelection;
+	readonly observations?: Readonly<Record<string, unknown>>;
+	readonly managedAuthority: ManagedTurnAuthorityV3;
+	readonly journal: readonly SessionAuthorityV3Operation[];
+	readonly retiredAt: string;
+	readonly prior?: SessionAuthorityV3Tombstone;
+}
+
+export interface SessionAuthorityV3Reassignment {
+	readonly state: "pending" | "rolled_back" | "committed";
+	readonly sourceProjectId: string;
+	readonly targetProjectId: string;
+	readonly startedAt: string;
+	readonly completedAt?: string;
+	readonly target?: Readonly<{
+		id: string;
+		ingressId?: string;
+		kind: SessionAuthorityV3OperationKind;
+		detail?: string;
+	}>;
+	readonly sourceTombstone?: SessionAuthorityV3Tombstone;
+	readonly priorTombstone?: SessionAuthorityV3Tombstone;
+}
+
+export interface SessionAuthorityV3Mapping {
+	readonly version: typeof SESSION_AUTHORITY_V3_VERSION;
+	readonly authorityEpoch: typeof SESSION_AUTHORITY_V3_EPOCH;
+	readonly chatId: string;
+	readonly projectId: string;
+	readonly sessionId: string;
+	readonly createdAt: string;
+	readonly header: Readonly<{ chatId: string; projectId: string; sessionId: string }>;
+	readonly rawFrameCursor: number;
+	readonly eventCursor: number;
+	readonly operationId: string;
+	readonly assistantText?: string;
+	readonly events?: readonly GjcTurnEvent[];
+	readonly modelSelection?: NormalizedModelSelection;
+	readonly observations?: Readonly<Record<string, unknown>>;
+	readonly managedAuthority: ManagedTurnAuthorityV3;
+	readonly journal: readonly SessionAuthorityV3Operation[];
+	readonly reassignment?: SessionAuthorityV3Reassignment;
+}
+
+export interface SessionAuthorityV3ProvisionalOperation extends SessionAuthorityV3Operation {
+	readonly chatId: string;
+	readonly projectId: string;
+	readonly sessionId: string;
+	readonly managedAuthority: ManagedTurnAuthorityV3;
+}
+
+export interface SessionAuthorityV3Document {
+	readonly version: typeof SESSION_AUTHORITY_V3_VERSION;
+	readonly authorityEpoch: typeof SESSION_AUTHORITY_V3_EPOCH;
+	readonly mappings: readonly SessionAuthorityV3Mapping[];
+	readonly provisionalOperations: readonly SessionAuthorityV3ProvisionalOperation[];
+}
+
+const FORBIDDEN_FIELDS = new Set([
+	"attachment",
+	"descriptor",
+	"descriptorPath",
+	"descriptorStat",
+	"payloadDigest",
+	"expectedSessionId",
+	"expectedCwd",
+	"tmuxSocket",
+	"tmuxPane",
+	"tmuxPanePid",
+	"tmuxOwnershipTag",
+	"ownedAt",
+	"sessionFile",
+	"activeLeaf",
+	"recoveryAttachment",
+]);
+const operationKinds = new Set<SessionAuthorityV3OperationKind>([
+	"create",
+	"resume",
+	"close",
+	"prompt",
+	"reply",
+	"gate",
+	"branch",
+	"model",
+	"thinking",
+]);
+const operationStates = new Set<SessionAuthorityV3OperationState>(["pending", "complete", "uncertain", "conflict"]);
+
+export function copyManagedTurnAuthorityV3(authority: ManagedTurnAuthorityV3): ManagedTurnAuthorityV3 {
+	return { ...authority };
+}
+
+export function copySessionAuthorityV3Document(document: SessionAuthorityV3Document): SessionAuthorityV3Document {
+	return structuredClone(document);
+}
+
+export const copySessionAuthorityV3 = copySessionAuthorityV3Document;
+
+export function isSessionAuthorityV3Document(value: unknown): value is SessionAuthorityV3Document {
+	if (
+		containsForbiddenLegacyField(value) ||
+		!exactKeys(value, ["version", "authorityEpoch", "mappings", "provisionalOperations"])
+	)
+		return false;
+	if (value.version !== SESSION_AUTHORITY_V3_VERSION || value.authorityEpoch !== SESSION_AUTHORITY_V3_EPOCH)
+		return false;
+	if (!Array.isArray(value.mappings) || !Array.isArray(value.provisionalOperations)) return false;
+	return (
+		value.mappings.every(isMapping) &&
+		value.provisionalOperations.every(isProvisional) &&
+		isSessionAuthorityV3RelationallyValid(
+			value as unknown as Pick<SessionAuthorityV3Document, "mappings" | "provisionalOperations">,
+		)
+	);
+}
+
+export function isSessionAuthorityV3RelationallyValid(
+	document: Pick<SessionAuthorityV3Document, "mappings" | "provisionalOperations">,
+): boolean {
+	const mappings = new Map<string, SessionAuthorityV3Mapping>();
+	const identities = new Map<string, string>();
+	for (const mapping of document.mappings) {
+		if (mappings.has(mapping.chatId)) return false;
+		mappings.set(mapping.chatId, mapping);
+		if (!validateJournal(mapping, mapping.journal, identities)) return false;
+		for (const root of tombstoneRoots(mapping.reassignment))
+			for (
+				let tombstone: SessionAuthorityV3Tombstone | undefined = root;
+				tombstone !== undefined;
+				tombstone = tombstone.prior
+			) {
+				if (tombstone.chatId !== mapping.chatId || !validateAuthority(tombstone.managedAuthority, tombstone))
+					return false;
+				if (!validateJournal(tombstone, tombstone.journal, identities)) return false;
+			}
+	}
+	for (const provisional of document.provisionalOperations) {
+		const mapping = mappings.get(provisional.chatId);
+		if (!validateAuthority(provisional.managedAuthority, provisional)) return false;
+		if (
+			mapping !== undefined &&
+			mapping.projectId !== provisional.projectId &&
+			!isPermittedReassignmentProvisional(mapping, provisional)
+		)
+			return false;
+		if (!addOperationIdentity(identities, provisional.chatId, provisional)) return false;
+	}
+	return true;
+}
+
+export function parseSessionAuthorityV3Document(input: string | Uint8Array): SessionAuthorityV3Document | undefined {
+	try {
+		const value: unknown = JSON.parse(typeof input === "string" ? input : new TextDecoder().decode(input));
+		return isSessionAuthorityV3Document(value) ? copySessionAuthorityV3Document(value) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+export const decodeSessionAuthorityV3Document = parseSessionAuthorityV3Document;
+
+export function encodeSessionAuthorityV3Document(document: SessionAuthorityV3Document): string {
+	if (!isSessionAuthorityV3Document(document))
+		throw new Error("Refusing to encode an invalid v3 session authority document.");
+	return `${JSON.stringify(canonicalize(copySessionAuthorityV3Document(document)))}\n`;
+}
+
+function isMapping(value: unknown): value is SessionAuthorityV3Mapping {
+	return (
+		isRecordShape(value, [
+			"version",
+			"authorityEpoch",
+			"chatId",
+			"projectId",
+			"sessionId",
+			"createdAt",
+			"header",
+			"rawFrameCursor",
+			"eventCursor",
+			"operationId",
+			"assistantText",
+			"events",
+			"modelSelection",
+			"observations",
+			"managedAuthority",
+			"journal",
+			"reassignment",
+		]) &&
+		value.version === SESSION_AUTHORITY_V3_VERSION &&
+		value.authorityEpoch === SESSION_AUTHORITY_V3_EPOCH &&
+		isIdentity(value) &&
+		isTimestamp(value.createdAt) &&
+		isCursors(value) &&
+		optionalFieldsValid(value) &&
+		validateAuthority(
+			value.managedAuthority,
+			value as Readonly<{ chatId: unknown; projectId: unknown; sessionId: unknown }>,
+		) &&
+		Array.isArray(value.journal) &&
+		value.journal.every(isOperation) &&
+		(value.reassignment === undefined ||
+			isReassignment(value.reassignment, value as unknown as SessionAuthorityV3Mapping))
+	);
+}
+
+function isProvisional(value: unknown): value is SessionAuthorityV3ProvisionalOperation {
+	if (
+		!isRecordShape(value, [
+			"id",
+			"kind",
+			"state",
+			"ingressId",
+			"startedAt",
+			"completedAt",
+			"detail",
+			"result",
+			"acknowledgedSuccessor",
+			"chatId",
+			"projectId",
+			"sessionId",
+			"managedAuthority",
+		])
+	)
+		return false;
+	return (
+		isNonEmptyString(value.chatId) &&
+		isNonEmptyString(value.projectId) &&
+		isNonEmptyString(value.sessionId) &&
+		isOperation(value) &&
+		validateAuthority(
+			value.managedAuthority,
+			value as unknown as Readonly<{ chatId: unknown; projectId: unknown; sessionId: unknown }>,
+		)
+	);
+}
+
+function isOperation(value: unknown): value is SessionAuthorityV3Operation {
+	if (
+		!isRecordShape(value, [
+			"id",
+			"kind",
+			"state",
+			"ingressId",
+			"startedAt",
+			"completedAt",
+			"detail",
+			"result",
+			"acknowledgedSuccessor",
+			"chatId",
+			"projectId",
+			"sessionId",
+			"managedAuthority",
+		])
+	)
+		return false;
+	if (
+		!isNonEmptyString(value.id) ||
+		typeof value.kind !== "string" ||
+		!operationKinds.has(value.kind as SessionAuthorityV3OperationKind) ||
+		typeof value.state !== "string" ||
+		!operationStates.has(value.state as SessionAuthorityV3OperationState) ||
+		!isTimestamp(value.startedAt)
+	)
+		return false;
+	if (value.ingressId !== undefined && !isNonEmptyString(value.ingressId)) return false;
+	if (value.detail !== undefined && typeof value.detail !== "string") return false;
+	if (value.state === "complete") {
+		if (!isTimestamp(value.completedAt) || Date.parse(value.completedAt) < Date.parse(value.startedAt)) return false;
+		if (value.result !== undefined && !isResult(value.result)) return false;
+	} else if (value.completedAt !== undefined || value.result !== undefined) return false;
+	return (
+		value.acknowledgedSuccessor === undefined ||
+		((value.kind === "create" || value.kind === "branch") &&
+			(value.state === "pending" || value.state === "uncertain") &&
+			isSuccessor(value.acknowledgedSuccessor))
+	);
+}
+
+function isResult(value: unknown): value is SessionAuthorityV3Result {
+	if (
+		!isRecordShape(value, [
+			"kind",
+			"assistantText",
+			"managedAuthority",
+			"events",
+			"mapping",
+			"correlation",
+			"gate",
+		]) ||
+		(value.kind !== "turn" && value.kind !== "control" && value.kind !== "close") ||
+		typeof value.assistantText !== "string" ||
+		!isResultMapping(value.mapping) ||
+		!validateAuthority(value.managedAuthority, value.mapping)
+	)
+		return false;
+	const correlation = value.correlation as Record<string, unknown> | undefined;
+	const gate = value.gate as Record<string, unknown> | undefined;
+	if (value.events !== undefined && (!Array.isArray(value.events) || !value.events.every(isEvent))) return false;
+	if (correlation !== undefined && (!isRecord(correlation) || !Object.values(correlation).every(isNonEmptyString)))
+		return false;
+	if (
+		gate !== undefined &&
+		(!isRecordShape(gate, ["gateId", "commandId", "turnId", "sessionId"]) ||
+			!isNonEmptyString(gate.gateId) ||
+			![gate.commandId, gate.turnId, gate.sessionId].every(item => item === undefined || isNonEmptyString(item)))
+	)
+		return false;
+	return (
+		value.kind !== "close" ||
+		(correlation !== undefined &&
+			correlation.closeStatus === "closed" &&
+			Object.keys(correlation).every(key => key === "closeStatus" || key === "mappingOperationId"))
+	);
+}
+
+function isResultMapping(value: unknown): value is SessionAuthorityV3Result["mapping"] {
+	return (
+		isRecordShape(value, [
+			"chatId",
+			"projectId",
+			"sessionId",
+			"rawFrameCursor",
+			"eventCursor",
+			"operationId",
+			"modelSelection",
+		]) &&
+		[value.chatId, value.projectId, value.sessionId, value.operationId].every(isNonEmptyString) &&
+		isCursors(value) &&
+		(value.modelSelection === undefined || normalizeModelSelection(value.modelSelection) !== undefined)
+	);
+}
+
+function isSuccessor(value: unknown): value is SessionAuthorityV3AcknowledgedSuccessor {
+	const authority = isRecord(value) ? (value.managedAuthority as Record<string, unknown> | undefined) : undefined;
+	return (
+		isRecordShape(value, ["sessionId", "managedAuthority"]) &&
+		isNonEmptyString(value.sessionId) &&
+		validateAuthority(value.managedAuthority, {
+			chatId: authority?.chatId,
+			projectId: authority?.projectId,
+			sessionId: value.sessionId,
+		})
+	);
+}
+
+function isReassignment(value: unknown, mapping: SessionAuthorityV3Mapping): value is SessionAuthorityV3Reassignment {
+	if (
+		!isRecordShape(value, [
+			"state",
+			"sourceProjectId",
+			"targetProjectId",
+			"startedAt",
+			"completedAt",
+			"target",
+			"sourceTombstone",
+			"priorTombstone",
+		]) ||
+		(value.state !== "pending" && value.state !== "rolled_back" && value.state !== "committed") ||
+		!isNonEmptyString(value.sourceProjectId) ||
+		!isNonEmptyString(value.targetProjectId) ||
+		value.sourceProjectId === value.targetProjectId ||
+		!isTimestamp(value.startedAt) ||
+		(value.completedAt !== undefined && !isTimestamp(value.completedAt))
+	)
+		return false;
+	const target = value.target as Record<string, unknown> | undefined;
+	if ((value.state === "committed" ? value.targetProjectId : value.sourceProjectId) !== mapping.projectId)
+		return false;
+	if (
+		target !== undefined &&
+		(!isRecordShape(target, ["id", "ingressId", "kind", "detail"]) ||
+			!isNonEmptyString(target.id) ||
+			(target.ingressId !== undefined && !isNonEmptyString(target.ingressId)) ||
+			typeof target.kind !== "string" ||
+			!operationKinds.has(target.kind as SessionAuthorityV3OperationKind) ||
+			(target.detail !== undefined && typeof target.detail !== "string"))
+	)
+		return false;
+	if (value.state === "pending" && value.sourceTombstone !== undefined) return false;
+	if (value.state === "committed" && !isTombstone(value.sourceTombstone)) return false;
+	return (
+		(value.sourceTombstone === undefined ||
+			(isTombstone(value.sourceTombstone) &&
+				value.sourceTombstone.chatId === mapping.chatId &&
+				value.sourceTombstone.projectId === value.sourceProjectId)) &&
+		(value.priorTombstone === undefined || isTombstone(value.priorTombstone))
+	);
+}
+
+function isTombstone(value: unknown): value is SessionAuthorityV3Tombstone {
+	return (
+		isRecordShape(value, [
+			"version",
+			"authorityEpoch",
+			"chatId",
+			"projectId",
+			"sessionId",
+			"createdAt",
+			"header",
+			"rawFrameCursor",
+			"eventCursor",
+			"operationId",
+			"assistantText",
+			"events",
+			"modelSelection",
+			"observations",
+			"managedAuthority",
+			"journal",
+			"retiredAt",
+			"prior",
+		]) &&
+		value.version === SESSION_AUTHORITY_V3_VERSION &&
+		value.authorityEpoch === SESSION_AUTHORITY_V3_EPOCH &&
+		isIdentity(value) &&
+		isTimestamp(value.createdAt) &&
+		isTimestamp(value.retiredAt) &&
+		isCursors(value) &&
+		optionalFieldsValid(value) &&
+		validateAuthority(
+			value.managedAuthority,
+			value as Readonly<{ chatId: unknown; projectId: unknown; sessionId: unknown }>,
+		) &&
+		Array.isArray(value.journal) &&
+		value.journal.every(isOperation) &&
+		(value.prior === undefined || isTombstone(value.prior))
+	);
+}
+
+function validateJournal(
+	owner: Pick<SessionAuthorityV3Mapping, "chatId" | "projectId" | "sessionId">,
+	journal: readonly SessionAuthorityV3Operation[],
+	identities: Map<string, string>,
+): boolean {
+	const local = new Set<string>();
+	for (const operation of journal) {
+		for (const identifier of operationIdentifiers(operation))
+			if (local.has(identifier)) return false;
+			else local.add(identifier);
+		if (
+			operation.result !== undefined &&
+			(operation.result.mapping.chatId !== owner.chatId ||
+				operation.result.mapping.projectId !== owner.projectId ||
+				operation.result.mapping.sessionId !== owner.sessionId ||
+				operation.result.mapping.operationId !== operation.id ||
+				!validateAuthority(operation.result.managedAuthority, owner))
+		)
+			return false;
+		if (!addOperationIdentity(identities, owner.chatId, operation)) return false;
+	}
+	return true;
+}
+
+function isPermittedReassignmentProvisional(
+	mapping: SessionAuthorityV3Mapping,
+	provisional: SessionAuthorityV3ProvisionalOperation,
+): boolean {
+	const reassignment = mapping.reassignment;
+	if (
+		reassignment === undefined ||
+		reassignment.targetProjectId !== provisional.projectId ||
+		reassignment.target === undefined
+	)
+		return false;
+	if (reassignment.state === "rolled_back" && provisional.state !== "uncertain" && provisional.state !== "conflict")
+		return false;
+	return (
+		reassignment.state !== "committed" &&
+		operationIdentity(provisional) ===
+			JSON.stringify([reassignment.target.id, reassignment.target.ingressId ?? reassignment.target.id]) &&
+		provisional.kind === reassignment.target.kind &&
+		provisional.detail === reassignment.target.detail
+	);
+}
+
+function validateAuthority(
+	value: unknown,
+	identity: Readonly<{ chatId: unknown; projectId: unknown; sessionId: unknown }>,
+): value is ManagedTurnAuthorityV3 {
+	return (
+		isRecordShape(value, [
+			"authorityEpoch",
+			"principalId",
+			"projectId",
+			"canonicalWorkspace",
+			"chatId",
+			"sessionId",
+			"generation",
+			"leaseId",
+			"epoch",
+			"requestKey",
+		]) &&
+		value.authorityEpoch === SESSION_AUTHORITY_V3_EPOCH &&
+		isNonEmptyString(value.principalId) &&
+		value.projectId === identity.projectId &&
+		isNonEmptyString(value.canonicalWorkspace) &&
+		isAbsolute(value.canonicalWorkspace) &&
+		value.chatId === identity.chatId &&
+		value.sessionId === identity.sessionId &&
+		isNonnegativeSafeInteger(value.generation) &&
+		value.generation > 0 &&
+		isNonEmptyString(value.leaseId) &&
+		isNonEmptyString(value.epoch) &&
+		isNonEmptyString(value.requestKey)
+	);
+}
+
+function isIdentity(value: Record<string, unknown>): boolean {
+	const header = value.header as Record<string, unknown> | undefined;
+	return (
+		[value.chatId, value.projectId, value.sessionId, value.operationId].every(isNonEmptyString) &&
+		isRecordShape(header, ["chatId", "projectId", "sessionId"]) &&
+		header.chatId === value.chatId &&
+		header.projectId === value.projectId &&
+		header.sessionId === value.sessionId
+	);
+}
+function isCursors(value: Record<string, unknown>): boolean {
+	return isNonnegativeSafeInteger(value.rawFrameCursor) && isNonnegativeSafeInteger(value.eventCursor);
+}
+function optionalFieldsValid(value: Record<string, unknown>): boolean {
+	return (
+		(value.assistantText === undefined || typeof value.assistantText === "string") &&
+		(value.events === undefined || (Array.isArray(value.events) && value.events.every(isEvent))) &&
+		(value.modelSelection === undefined || normalizeModelSelection(value.modelSelection) !== undefined) &&
+		(value.observations === undefined || (isRecord(value.observations) && isJsonValue(value.observations)))
+	);
+}
+function isEvent(value: unknown): value is GjcTurnEvent {
+	return (
+		isRecordShape(value, ["type", "text", "id", "payload"]) &&
+		isNonEmptyString(value.type) &&
+		(value.text === undefined || typeof value.text === "string") &&
+		(value.id === undefined || isNonEmptyString(value.id)) &&
+		(value.payload === undefined || (isRecord(value.payload) && isJsonValue(value.payload)))
+	);
+}
+function isRecordShape(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+	return isRecord(value) && Object.keys(value).every(key => keys.includes(key));
+}
+function exactKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+	return isRecord(value) && Object.keys(value).length === keys.length && keys.every(key => key in value);
+}
+function operationIdentifiers(operation: Pick<SessionAuthorityV3Operation, "id" | "ingressId">): readonly string[] {
+	return operation.ingressId === undefined || operation.ingressId === operation.id
+		? [operation.id]
+		: [operation.id, operation.ingressId];
+}
+function operationIdentity(operation: Pick<SessionAuthorityV3Operation, "id" | "ingressId">): string {
+	return JSON.stringify([operation.id, operation.ingressId ?? operation.id]);
+}
+function addOperationIdentity(
+	identities: Map<string, string>,
+	chatId: string,
+	operation: SessionAuthorityV3Operation,
+): boolean {
+	const identity = operationIdentity(operation);
+	for (const identifier of operationIdentifiers(operation)) {
+		const key = `${chatId}\u0000${identifier}`;
+		if (identities.has(key)) return false;
+		identities.set(key, identity);
+	}
+	return true;
+}
+function tombstoneRoots(
+	reassignment: SessionAuthorityV3Reassignment | undefined,
+): readonly SessionAuthorityV3Tombstone[] {
+	return reassignment?.sourceTombstone !== undefined
+		? [reassignment.sourceTombstone]
+		: reassignment?.priorTombstone === undefined
+			? []
+			: [reassignment.priorTombstone];
+}
+function containsForbiddenLegacyField(value: unknown): boolean {
+	if (Array.isArray(value)) return value.some(containsForbiddenLegacyField);
+	if (!isRecord(value)) return false;
+	return Object.entries(value).some(
+		([key, child]) => FORBIDDEN_FIELDS.has(key) || containsForbiddenLegacyField(child),
+	);
+}
+function canonicalize(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(canonicalize);
+	if (!isRecord(value)) return value;
+	return Object.fromEntries(
+		Object.keys(value)
+			.sort()
+			.map(key => [key, canonicalize(value[key])]),
+	);
+}
