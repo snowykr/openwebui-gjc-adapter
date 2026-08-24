@@ -80,6 +80,12 @@ interface FrameSubscription {
 	active: boolean;
 }
 
+export interface ManagedSdkFrameSubscription {
+	(): void;
+	/** Stops delivery and waits for already accepted frames to settle in order. */
+	drain(): Promise<void>;
+}
+
 const DEFAULT_MAX_SUBSCRIPTIONS = 128;
 const DEFAULT_MAX_FRAMES_PER_SUBSCRIPTION = 64;
 const DEFAULT_MAX_FRAME_HISTORY = 256;
@@ -149,6 +155,18 @@ export class ManagedSdkRuntime {
 		return this.#lifecycle.create(request);
 	}
 
+	createExternalLifecycleSession(
+		request: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["createExternal"]>[0],
+	): ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["createExternal"]> {
+		return this.#lifecycle.createExternal(request);
+	}
+
+	resumeExternalLifecycleSession(
+		request: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["resumeExternal"]>[0],
+	): ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["resumeExternal"]> {
+		return this.#lifecycle.resumeExternal(request);
+	}
+
 	forkLifecycleSession(
 		request: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["fork"]>[0],
 	): ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["fork"]> {
@@ -186,6 +204,21 @@ export class ManagedSdkRuntime {
 	registerTenant(key: TenantSessionKey): void {
 		assertTenantKey(key);
 		this.#registrations.set(tenantIdentity(key), key);
+	}
+
+	/** Reconciles a credential-free lifecycle identity before exposing its exact tenant authority. */
+	async registerLifecycleTenant(key: TenantSessionKey): Promise<ManagedSdkAttachment> {
+		assertTenantKey(key);
+		this.registerTenant(key);
+		try {
+			await this.reconcile();
+			const attachment = await this.acquireAttachment(key);
+			if (!attachment.attachment.isCurrent()) throw new Error("Lifecycle tenant attachment is no longer current.");
+			return attachment;
+		} catch (error) {
+			this.unregisterTenant(key);
+			throw error;
+		}
 	}
 
 	unregisterTenant(key: TenantSessionKey): void {
@@ -287,7 +320,7 @@ export class ManagedSdkRuntime {
 		operation: string,
 		correlation: ManagedSdkFrameCorrelation,
 		listener: (frame: ManagedSdkObservedFrame) => void | Promise<void>,
-	): () => void {
+	): ManagedSdkFrameSubscription {
 		if (this.#state !== "running") throw new Error("Managed SDK runtime is not running.");
 		if (!nonEmpty(operation) || !hasCorrelation(correlation))
 			throw new TypeError("Operation and correlation are required.");
@@ -310,7 +343,9 @@ export class ManagedSdkRuntime {
 			active: true,
 		};
 		this.#subscriptions.set(subscription.id, subscription);
-		return () => this.#cleanupSubscription(subscription);
+		const unsubscribe = (() => this.#cleanupSubscription(subscription)) as ManagedSdkFrameSubscription;
+		unsubscribe.drain = async () => await subscription.tail;
+		return unsubscribe;
 	}
 
 	async #assertAuthorized(key: TenantSessionKey, bootstrap: boolean): Promise<void> {

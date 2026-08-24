@@ -4,7 +4,8 @@ import { GjcTurnCancelledError, type ManagedTurnAuthority } from "../gjc/turn-ru
 
 export interface ManagedSuccessorInput {
 	readonly source: ManagedTurnAuthority;
-	readonly target: ManagedTurnAuthority;
+	/** Target tenancy, never a caller-supplied successor session or generation. */
+	readonly target: Omit<ManagedTurnAuthority, "sessionId" | "generation">;
 	readonly timeoutMs?: number;
 	readonly signal?: AbortSignal;
 	/** Called only after the exact target generation is reconciled, fenced, and current. */
@@ -37,10 +38,10 @@ export function createManagedSuccessorFlow(runtime: ManagedSdkRuntime): ManagedS
 			assertSuccessorAuthority(input.source, input.target);
 			throwIfAborted(input.signal);
 			const source = tenant(input.source);
-			const target = tenant(input.target);
-			const operationHash = successorHash(source, target);
+			const operationHash = successorHash(source, input.target);
 			let invoked = false;
 			let acknowledged = false;
+			let returnedTarget: TenantSessionKey | undefined;
 			try {
 				// Reconciliation plus acquire re-proves source registration, currentness, and tenant fencing.
 				await runtime.reconcile();
@@ -55,8 +56,6 @@ export function createManagedSuccessorFlow(runtime: ManagedSdkRuntime): ManagedS
 						target: {
 							sourceSessionId: source.sessionId,
 							sourceGeneration: source.generation,
-							targetSessionId: target.sessionId,
-							endpointGeneration: target.generation,
 							operationHash,
 						},
 						timeoutMs: input.timeoutMs,
@@ -64,9 +63,13 @@ export function createManagedSuccessorFlow(runtime: ManagedSdkRuntime): ManagedS
 				);
 				if (!isSuccess(outcome)) throw new Error("Managed session.fork failed.");
 				acknowledged = true;
+				returnedTarget = tenantFromFork(input.target, outcome);
+				if (returnedTarget === undefined)
+					throw new ManagedSuccessorUncertainError("Managed fork acknowledgement lacks a target identity.");
 				// An abort after lifecycle invocation is ambiguous even when the fork later acknowledges.
 				if (input.signal?.aborted) throw new GjcTurnCancelledError();
-				const successor = await proveTarget(runtime, target);
+				const successor = await runtime.registerLifecycleTenant(returnedTarget);
+				await proveTarget(runtime, returnedTarget);
 				throwIfAborted(input.signal);
 				await input.publish(successor);
 				return { successor, operationHash };
@@ -74,7 +77,7 @@ export function createManagedSuccessorFlow(runtime: ManagedSdkRuntime): ManagedS
 				if (!invoked) throw error;
 				return await cleanupOrThrow(
 					runtime,
-					target,
+					returnedTarget,
 					input,
 					error,
 					!acknowledged || error instanceof GjcTurnCancelledError,
@@ -84,7 +87,12 @@ export function createManagedSuccessorFlow(runtime: ManagedSdkRuntime): ManagedS
 	};
 }
 
-function tenant(authority: ManagedTurnAuthority): TenantSessionKey {
+function tenant(
+	authority: Pick<
+		ManagedTurnAuthority,
+		"principalId" | "projectId" | "canonicalWorkspace" | "chatId" | "sessionId" | "generation" | "leaseId" | "epoch"
+	>,
+): TenantSessionKey {
 	return {
 		principalId: authority.principalId,
 		projectId: authority.projectId,
@@ -97,24 +105,24 @@ function tenant(authority: ManagedTurnAuthority): TenantSessionKey {
 	};
 }
 
-function assertSuccessorAuthority(source: ManagedTurnAuthority, target: ManagedTurnAuthority): void {
+function assertSuccessorAuthority(
+	source: ManagedTurnAuthority,
+	target: Omit<ManagedTurnAuthority, "sessionId" | "generation">,
+): void {
 	for (const authority of [source, target]) {
 		if (
 			!authority.principalId ||
 			!authority.projectId ||
 			!authority.canonicalWorkspace ||
 			!authority.chatId ||
-			!authority.sessionId ||
 			!authority.leaseId ||
 			!authority.epoch ||
-			!authority.requestKey ||
-			!Number.isSafeInteger(authority.generation) ||
-			authority.generation <= 0
+			!authority.requestKey
 		)
-			throw new TypeError("Complete positive managed successor authority is required.");
+			throw new TypeError("Complete managed successor tenancy is required.");
 	}
-	if (source.sessionId === target.sessionId)
-		throw new TypeError("Managed successor target must have a distinct session id.");
+	if (!source.sessionId || !Number.isSafeInteger(source.generation) || source.generation <= 0)
+		throw new TypeError("Managed successor source requires an exact positive generation.");
 	for (const field of ["principalId", "projectId", "canonicalWorkspace", "chatId", "leaseId", "epoch"] as const) {
 		if (source[field] !== target[field]) throw new Error("Managed successor crosses a tenant authority boundary.");
 	}
@@ -133,11 +141,15 @@ async function proveTarget(runtime: ManagedSdkRuntime, target: TenantSessionKey)
 
 async function cleanupOrThrow(
 	runtime: ManagedSdkRuntime,
-	target: TenantSessionKey,
+	target: TenantSessionKey | undefined,
 	input: ManagedSuccessorInput,
 	cause: unknown,
 	invocationUncertain: boolean,
 ): Promise<never> {
+	if (target === undefined)
+		throw new ManagedSuccessorUncertainError("Managed successor target is unknown; cleanup cannot be proven.", {
+			cause,
+		});
 	try {
 		await runtime.closeLifecycleSession({
 			actor: { namespace: "openwebui-gjc-adapter", id: input.source.principalId },
@@ -149,6 +161,7 @@ async function cleanupOrThrow(
 		await runtime.reconcile();
 		const status = await runtime.generationStatus(target);
 		if (status.status === "retired") {
+			runtime.unregisterTenant(target);
 			if (invocationUncertain)
 				throw new ManagedSuccessorUncertainError(
 					"Managed successor invocation outcome is uncertain after cleanup.",
@@ -179,8 +192,29 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 	if (signal?.aborted) throw new GjcTurnCancelledError();
 }
 
-function successorHash(source: TenantSessionKey, target: TenantSessionKey): string {
+function successorHash(
+	source: TenantSessionKey,
+	target: Omit<ManagedTurnAuthority, "sessionId" | "generation">,
+): string {
 	return createHash("sha256").update(JSON.stringify({ source, target })).digest("hex");
+}
+
+function tenantFromFork(
+	target: Omit<ManagedTurnAuthority, "sessionId" | "generation">,
+	outcome: unknown,
+): TenantSessionKey | undefined {
+	if (!isRecord(outcome) || outcome.ok !== true || !isRecord(outcome.result)) return undefined;
+	const sessionId = outcome.result.sessionId;
+	const generation = outcome.result.endpointGeneration;
+	if (
+		typeof sessionId !== "string" ||
+		sessionId.length === 0 ||
+		typeof generation !== "number" ||
+		!Number.isSafeInteger(generation) ||
+		generation <= 0
+	)
+		return undefined;
+	return tenant({ ...target, sessionId, generation });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

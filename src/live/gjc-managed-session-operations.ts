@@ -19,9 +19,23 @@ export class ManagedTurnUncertainError extends Error {
 }
 
 export interface ManagedLifecycleInput {
-	readonly authority: ManagedTurnAuthority;
+	readonly authority: Omit<ManagedTurnAuthority, "sessionId" | "generation"> &
+		Partial<Pick<ManagedTurnAuthority, "sessionId" | "generation">>;
 	readonly target: Readonly<Record<string, unknown>>;
 	readonly timeoutMs?: number;
+}
+
+/** A lifecycle acknowledgement whose identity has been adopted, fenced, and proven current. */
+export interface ManagedLifecycleResult {
+	readonly outcome: Readonly<Record<string, unknown>>;
+	readonly tenant: TenantSessionKey;
+	readonly attachment: ManagedSdkAttachment;
+}
+
+export interface ManagedRouterPage {
+	readonly items: readonly unknown[];
+	readonly complete: boolean;
+	readonly continuationCursor?: string;
 }
 
 export interface ManagedRequestInput {
@@ -53,9 +67,9 @@ export interface ManagedSessionOperations {
 	readonly runtime: ManagedSdkRuntime;
 	tenant(authority: ManagedTurnAuthority): TenantSessionKey;
 	payloadHash(payload: unknown): string;
-	create(input: ManagedLifecycleInput): Promise<unknown>;
-	resume(input: ManagedLifecycleInput): Promise<unknown>;
-	fork(input: ManagedLifecycleInput): Promise<unknown>;
+	create(input: ManagedLifecycleInput): Promise<ManagedLifecycleResult>;
+	resume(input: ManagedLifecycleInput): Promise<ManagedLifecycleResult>;
+	fork(input: ManagedLifecycleInput): Promise<ManagedLifecycleResult>;
 	close(input: ManagedLifecycleInput): Promise<unknown>;
 	delete(input: ManagedLifecycleInput): Promise<unknown>;
 	list(input: ManagedLifecycleInput): Promise<unknown>;
@@ -129,10 +143,10 @@ export function createManagedSessionOperations(runtime: ManagedSdkRuntime): Mana
 		input: ManagedLifecycleInput,
 	): Promise<unknown> => {
 		const authority = input.authority;
-		const key = tenant(authority);
+		const key = hasExactGeneration(authority) ? tenant(authority as ManagedTurnAuthority) : undefined;
 		const actor = { namespace: "openwebui-gjc-adapter", id: authority.principalId };
 		const requestKey = authority.requestKey;
-		const target = { ...input.target };
+		const target = lifecycleTarget(operation, input.target);
 		const request =
 			operation === "list"
 				? { actor, capability: "session.list" as const, target, timeoutMs: input.timeoutMs }
@@ -151,12 +165,15 @@ export function createManagedSessionOperations(runtime: ManagedSdkRuntime): Mana
 								? runtime.deleteLifecycleSession(request as never)
 								: runtime.listLifecycleSessions(request as never));
 		} catch (error) {
-			if (operation === "close" || operation === "delete") await requireRetired(runtime, key, error);
+			if ((operation === "close" || operation === "delete") && key !== undefined)
+				await requireRetired(runtime, key, error);
 			throw error;
 		}
 		outcome = externalOutcome(outcome);
 		if (!isLifecycleSuccess(outcome)) {
 			if (operation === "close" || operation === "delete") {
+				if (key === undefined)
+					throw new ManagedTurnUncertainError("Managed retirement lacks an exact generation authority.");
 				await requireRetired(runtime, key);
 				return outcome;
 			}
@@ -164,17 +181,27 @@ export function createManagedSessionOperations(runtime: ManagedSdkRuntime): Mana
 				throw new ManagedTurnUncertainError(`Managed session.${operation} outcome is uncertain.`);
 			throw new Error(lifecycleMessage(outcome, `Managed session.${operation} failed.`));
 		}
-		if (operation === "close" || operation === "delete") await requireRetired(runtime, key);
-		else {
+		if (operation === "close" || operation === "delete") {
+			if (key === undefined)
+				throw new ManagedTurnUncertainError("Managed retirement lacks an exact generation authority.");
+			await requireRetired(runtime, key);
+		} else if (operation !== "list") {
+			const lifecycleTenant = tenantFromLifecycle(authority, outcome, operation, target);
+			if (lifecycleTenant === undefined)
+				throw new Error("Managed lifecycle acknowledgement lacks the expected session id and positive generation.");
 			try {
-				await acquire(authority);
+				return {
+					outcome,
+					tenant: lifecycleTenant,
+					attachment: await runtime.registerLifecycleTenant(lifecycleTenant),
+				} satisfies ManagedLifecycleResult;
 			} catch (error) {
 				// A successful lifecycle acknowledgement without current attachment proof
 				// cannot be reinterpreted as failure. Retire this exact generation first.
 				try {
 					await lifecycle("close", {
-						authority,
-						target: { sessionId: authority.sessionId, endpointGeneration: authority.generation },
+						authority: { ...lifecycleTenant, requestKey: authority.requestKey },
+						target: { sessionId: lifecycleTenant.sessionId, endpointGeneration: lifecycleTenant.generation },
 						timeoutMs: input.timeoutMs,
 					});
 				} catch (cleanup) {
@@ -189,15 +216,18 @@ export function createManagedSessionOperations(runtime: ManagedSdkRuntime): Mana
 	};
 	const request = async (input: ManagedRequestInput) => {
 		if (!input.operation) throw new TypeError("Managed operation is required.");
-		return await invoke(
-			input.authority,
-			{
-				type: "control_request",
-				operation: input.operation,
-				input: { ...(input.input ?? {}) },
-				idempotencyKey: input.idempotencyKey ?? input.authority.requestKey,
-			},
-			input,
+		return decodeControlResponse(
+			await invoke(
+				input.authority,
+				{
+					type: "control_request",
+					operation: input.operation,
+					input: { ...(input.input ?? {}) },
+					idempotencyKey: input.idempotencyKey ?? input.authority.requestKey,
+				},
+				input,
+			),
+			input.operation,
 		);
 	};
 	const query = async (
@@ -216,14 +246,17 @@ export function createManagedSessionOperations(runtime: ManagedSdkRuntime): Mana
 				{ type: "query_request", query: name, input: { ...input }, ...(cursor === undefined ? {} : { cursor }) },
 				{ authority, operation: name, timeoutMs },
 			);
-			const parsed = parsePage(result, name);
+			const parsed = decodeRouterPage(result, name);
 			if (items.length + parsed.items.length > MAX_QUERY_ITEMS)
 				throw new Error(`Managed ${name} query exceeded item bound.`);
 			items.push(...parsed.items);
-			if (parsed.cursor === undefined) return items;
-			if (cursors.has(parsed.cursor)) throw new Error(`Managed ${name} query repeated a continuation cursor.`);
-			cursors.add(parsed.cursor);
-			cursor = parsed.cursor;
+			if (parsed.complete) return items;
+			if (parsed.continuationCursor === undefined)
+				throw new Error(`Managed ${name} query is incomplete without a continuation cursor.`);
+			if (cursors.has(parsed.continuationCursor))
+				throw new Error(`Managed ${name} query repeated a continuation cursor.`);
+			cursors.add(parsed.continuationCursor);
+			cursor = parsed.continuationCursor;
 		}
 		throw new Error(`Managed ${name} query exceeded page bound.`);
 	};
@@ -233,6 +266,30 @@ export function createManagedSessionOperations(runtime: ManagedSdkRuntime): Mana
 	): Promise<GjcTurnResult> => {
 		throwIfAborted(input.signal);
 		const authority = input.authority;
+		const correlation =
+			"correlation" in input
+				? input.correlation
+				: deterministicCorrelation(authority, operation, input.idempotencyKey ?? authority.requestKey);
+		const attachment = await acquire(authority);
+		const events: GjcTurnEvent[] = [];
+		const eventIds = new Set<string>();
+		const observe = async (event: GjcTurnEvent) => {
+			const identity = event.id ?? payloadHash(event.payload ?? { type: event.type, text: event.text });
+			if (eventIds.has(identity)) return;
+			eventIds.add(identity);
+			events.push(event);
+			await (input as ManagedTurnInput | ManagedGateInput).observer?.(event);
+		};
+		let closed = false;
+		const unsubscribe = runtime.subscribeFrames(attachment, operation, correlation, async observed => {
+			if (closed) return;
+			const event = normalizeFrame({
+				...observed.frame.body,
+				...(observed.frame.seq === undefined ? {} : { seq: observed.frame.seq }),
+				...(observed.frame.publicationId === undefined ? {} : { publicationId: observed.frame.publicationId }),
+			});
+			if (event !== undefined) await observe(event);
+		});
 		let dispatched = false;
 		let abortPromise: Promise<Readonly<Record<string, unknown>>> | undefined;
 		const cancelAfterDispatch = () => {
@@ -246,9 +303,8 @@ export function createManagedSessionOperations(runtime: ManagedSdkRuntime): Mana
 			void abortPromise.catch(() => undefined);
 		};
 		input.signal?.addEventListener("abort", cancelAfterDispatch, { once: true });
-		let response: Readonly<Record<string, unknown>>;
 		try {
-			response = await request({
+			const response = await request({
 				...input,
 				operation,
 				input:
@@ -257,46 +313,26 @@ export function createManagedSessionOperations(runtime: ManagedSdkRuntime): Mana
 								id: (input as ManagedGateInput).gateId,
 								response: (input as ManagedGateInput).answer,
 								expectedSessionId: authority.sessionId,
+								commandId: correlation.commandId,
+								turnId: correlation.turnId,
 							}
-						: { text: (input as ManagedTurnInput).text },
+						: {
+								text: (input as ManagedTurnInput).text,
+								commandId: correlation.commandId,
+								turnId: correlation.turnId,
+							},
 				onDispatch: () => {
 					dispatched = true;
 					input.onDispatch?.();
 					if (input.signal?.aborted) cancelAfterDispatch();
 				},
 			});
-		} finally {
-			input.signal?.removeEventListener("abort", cancelAfterDispatch);
-		}
-		if (input.signal?.aborted) {
-			await abortPromise;
-			throw new GjcTurnCancelledError();
-		}
-		throwIfAborted(input.signal);
-		const correlation = "correlation" in input ? input.correlation : correlationFrom(response, authority.requestKey);
-		const events: GjcTurnEvent[] = [];
-		const eventIds = new Set<string>();
-		const observe = async (event: GjcTurnEvent) => {
-			const identity = event.id ?? payloadHash(event.payload ?? { type: event.type, text: event.text });
-			if (eventIds.has(identity)) return;
-			eventIds.add(identity);
-			events.push(event);
-			await (input as ManagedTurnInput | ManagedGateInput).observer?.(event);
-		};
-		let closed = false;
-		const attachment = await acquire(authority);
-		const unsubscribe = runtime.subscribeFrames(attachment, operation, correlation, async observed => {
-			if (closed) return;
-			const event = normalizeFrame(observed.frame as unknown as Record<string, unknown>);
-			if (event === undefined) return;
-			await observe(event);
-		});
-		try {
-			// Router.request is the sole request settler. Subscriptions only project ordered frames.
-			const responseEvents = responseEventsFrom(response);
-			for (const event of responseEvents) {
-				await observe(event);
+			if (input.signal?.aborted) {
+				await abortPromise;
+				throw new GjcTurnCancelledError();
 			}
+			for (const event of responseEventsFrom(response)) await observe(event);
+			await unsubscribe.drain();
 			const projected =
 				"artifactProject" in input && input.artifactProject !== undefined
 					? await input.artifactProject(events)
@@ -304,10 +340,11 @@ export function createManagedSessionOperations(runtime: ManagedSdkRuntime): Mana
 			return {
 				text: finalizedText(response, projected),
 				events: projected,
-				rawFrameCursor: 0,
+				rawFrameCursor: frameCursor(events),
 				eventCursor: projected.length,
 			};
 		} finally {
+			input.signal?.removeEventListener("abort", cancelAfterDispatch);
 			closed = true;
 			unsubscribe();
 		}
@@ -316,9 +353,9 @@ export function createManagedSessionOperations(runtime: ManagedSdkRuntime): Mana
 		runtime,
 		tenant,
 		payloadHash,
-		create: input => lifecycle("create", input),
-		resume: input => lifecycle("resume", input),
-		fork: input => lifecycle("fork", input),
+		create: input => lifecycle("create", input) as Promise<ManagedLifecycleResult>,
+		resume: input => lifecycle("resume", input) as Promise<ManagedLifecycleResult>,
+		fork: input => lifecycle("fork", input) as Promise<ManagedLifecycleResult>,
 		close: input => lifecycle("close", input),
 		delete: input => lifecycle("delete", input),
 		list: input => lifecycle("list", input),
@@ -377,7 +414,7 @@ function canonicalJson(value: unknown): string {
 function throwIfAborted(signal: AbortSignal | undefined): void {
 	if (signal?.aborted) throw new GjcTurnCancelledError();
 }
-function isLifecycleSuccess(value: unknown): boolean {
+function isLifecycleSuccess(value: unknown): value is Readonly<Record<string, unknown>> & { readonly ok: true } {
 	return isRecord(value) && value.ok === true;
 }
 function externalOutcome(value: unknown): unknown {
@@ -400,26 +437,100 @@ async function requireRetired(runtime: ManagedSdkRuntime, key: TenantSessionKey,
 			cause === undefined ? undefined : { cause },
 		);
 }
-function parsePage(
-	frame: Readonly<Record<string, unknown>>,
-	query: string,
-): { readonly items: readonly unknown[]; readonly cursor?: string } {
-	const result = isRecord(frame.result) ? frame.result : frame;
-	if (!Array.isArray(result.items)) throw new Error(`Managed ${query} query response has no items array.`);
-	const cursor = result.continuationCursor ?? result.cursor;
-	if (cursor !== undefined && (typeof cursor !== "string" || cursor.length === 0))
+export function decodeRouterPage(frame: unknown, query: string): ManagedRouterPage {
+	if (!isRecord(frame) || frame.type !== "query_response")
+		throw new Error(`Managed ${query} query response has an invalid envelope.`);
+	if (frame.ok !== true) throw new Error(routerErrorMessage(frame, `Managed ${query} query failed.`));
+	if (!isRecord(frame.page) || !Array.isArray(frame.page.items) || typeof frame.page.complete !== "boolean")
+		throw new Error(`Managed ${query} query response has an invalid page.`);
+	const continuationCursor = frame.page.continuationCursor;
+	if (continuationCursor !== undefined && (typeof continuationCursor !== "string" || continuationCursor.length === 0))
 		throw new Error(`Managed ${query} query has an invalid continuation cursor.`);
-	return { items: result.items, ...(cursor === undefined ? {} : { cursor }) };
-}
-function correlationFrom(
-	result: Readonly<Record<string, unknown>>,
-	fallback: string,
-): { readonly commandId: string; readonly turnId: string } {
-	const value = isRecord(result.result) ? result.result : result;
+	if (frame.page.complete && continuationCursor !== undefined)
+		throw new Error(`Managed ${query} query returned a cursor on a complete page.`);
 	return {
-		commandId: typeof value.commandId === "string" ? value.commandId : fallback,
-		turnId: typeof value.turnId === "string" ? value.turnId : fallback,
+		items: frame.page.items,
+		complete: frame.page.complete,
+		...(continuationCursor === undefined ? {} : { continuationCursor }),
 	};
+}
+
+export function decodeControlResponse(frame: unknown, operation: string): Readonly<Record<string, unknown>> {
+	if (!isRecord(frame) || frame.type !== "control_response")
+		throw new Error(`Managed ${operation} control response has an invalid envelope.`);
+	if (frame.ok !== true) throw new Error(routerErrorMessage(frame, `Managed ${operation} control request failed.`));
+	if (!isRecord(frame.result)) throw new Error(`Managed ${operation} control response has no result.`);
+	return frame.result;
+}
+
+function routerErrorMessage(frame: Record<string, unknown>, fallback: string): string {
+	return isRecord(frame.error) && typeof frame.error.message === "string" ? frame.error.message : fallback;
+}
+
+function lifecycleTarget(
+	operation: "create" | "resume" | "fork" | "close" | "delete" | "list",
+	target: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+	if (operation === "create") {
+		if (typeof target.path !== "string" || target.path.length === 0)
+			throw new TypeError("Managed session.create requires an existing_path target path.");
+		return { kind: "existing_path", path: target.path };
+	}
+	if (operation === "resume") {
+		if (typeof target.sessionIdOrPrefix !== "string" || target.sessionIdOrPrefix.length === 0)
+			throw new TypeError("Managed session.resume requires a sessionIdOrPrefix target.");
+		if (target.path !== undefined && (typeof target.path !== "string" || target.path.length === 0))
+			throw new TypeError("Managed session.resume target path must be a non-empty string.");
+		return {
+			sessionIdOrPrefix: target.sessionIdOrPrefix,
+			...(target.path === undefined ? {} : { path: target.path }),
+		};
+	}
+	return { ...target };
+}
+
+function tenantFromLifecycle(
+	authority: ManagedLifecycleInput["authority"],
+	outcome: unknown,
+	operation: "create" | "resume" | "fork" | "close" | "delete" | "list",
+	target: Readonly<Record<string, unknown>>,
+): TenantSessionKey | undefined {
+	if (!isRecord(outcome) || outcome.ok !== true || !isRecord(outcome.result)) return undefined;
+	const sessionId = outcome.result.sessionId;
+	const generation = outcome.result.endpointGeneration;
+	if (
+		typeof sessionId !== "string" ||
+		sessionId.length === 0 ||
+		typeof generation !== "number" ||
+		!Number.isSafeInteger(generation) ||
+		generation <= 0
+	)
+		return undefined;
+	if (operation === "resume" && target.sessionIdOrPrefix !== sessionId) return undefined;
+	return { ...authority, sessionId, generation };
+}
+
+function hasExactGeneration(authority: ManagedLifecycleInput["authority"]): authority is ManagedTurnAuthority {
+	return (
+		typeof authority.sessionId === "string" &&
+		authority.sessionId.length > 0 &&
+		typeof authority.generation === "number" &&
+		Number.isSafeInteger(authority.generation) &&
+		authority.generation > 0
+	);
+}
+function deterministicCorrelation(
+	authority: ManagedTurnAuthority,
+	operation: string,
+	idempotencyKey: string,
+): { readonly commandId: string; readonly turnId: string; readonly sessionId: string } {
+	const identity = payloadHash({
+		operation,
+		requestKey: idempotencyKey,
+		sessionId: authority.sessionId,
+		generation: authority.generation,
+	});
+	return { commandId: `managed-${identity}`, turnId: `managed-${identity}`, sessionId: authority.sessionId };
 }
 function responseEventsFrom(result: Readonly<Record<string, unknown>>): readonly GjcTurnEvent[] {
 	const value = isRecord(result.result) ? result.result : result;
@@ -440,6 +551,14 @@ function finalizedText(result: Readonly<Record<string, unknown>>, events: readon
 		.filter(event => event.type === "message_update" && typeof event.text === "string")
 		.map(event => event.text)
 		.join("");
+}
+function frameCursor(events: readonly GjcTurnEvent[]): number {
+	let cursor = 0;
+	for (const event of events) {
+		const seq = event.payload?.seq;
+		if (typeof seq === "number" && Number.isSafeInteger(seq) && seq >= 0) cursor = Math.max(cursor, seq);
+	}
+	return cursor;
 }
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);

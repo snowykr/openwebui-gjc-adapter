@@ -1,6 +1,8 @@
+import { resolve } from "node:path";
 import type { ManagedSdkAttachment, ManagedSdkRuntime, TenantSessionKey } from "../gjc/managed-sdk-runtime";
 import { GjcTurnCancelledError } from "../gjc/turn-runner";
-import type { ModelReader, ModelReaderFactory } from "./model-reader";
+import { decodeRouterPage } from "./gjc-managed-session-operations";
+import type { ModelReader, ModelReaderContext, ModelReaderFactory } from "./model-reader";
 
 export interface ManagedModelReaderAttachment {
 	readonly tenant: TenantSessionKey;
@@ -42,15 +44,17 @@ export class ManagedModelReaderUnavailableError extends Error {
 export function createManagedModelReaderFactory(input: CreateManagedModelReaderFactoryInput): ModelReaderFactory {
 	if (input.resolveAttachment === undefined && input.temporary === undefined)
 		throw new TypeError("A managed model attachment or temporary lifecycle input is required.");
-	return async (_context, signal) => {
-		throwIfAborted(signal);
+	return async (context, signal) => {
+		const effectiveSignal = signal ?? context?.signal;
+		await assertReaderContext(context, effectiveSignal, input.temporary?.canonicalWorkspace);
+		throwIfAborted(effectiveSignal);
 		if (input.resolveAttachment !== undefined) {
-			const resolved = await awaitWithAbort(input.resolveAttachment(signal), signal);
-			throwIfAborted(signal);
-			const attachment = await acquire(input.runtime, resolved.tenant, signal);
-			return new ManagedModelReader(input.runtime, attachment, undefined, signal);
+			const resolved = await awaitWithAbort(input.resolveAttachment(effectiveSignal), effectiveSignal);
+			await assertReaderContext(context, effectiveSignal, resolved.tenant.canonicalWorkspace);
+			const attachment = await acquire(input.runtime, resolved.tenant, effectiveSignal);
+			return new ManagedModelReader(input.runtime, attachment, undefined, effectiveSignal);
 		}
-		return await createTemporaryReader(input.runtime, input.temporary!, signal);
+		return await createTemporaryReader(input.runtime, input.temporary!, effectiveSignal);
 	};
 }
 
@@ -61,12 +65,12 @@ async function createTemporaryReader(
 ): Promise<ModelReader> {
 	assertTemporaryInput(input);
 	const actor = { namespace: "openwebui-gjc-adapter", id: input.principalId };
-	const creation = runtime.createLifecycleSession({
+	const creation = runtime.createExternalLifecycleSession({
 		actor,
 		capability: "session.create",
 		requestKey: input.requestKey,
-		target: { cwd: input.canonicalWorkspace },
-		timeoutMs: input.timeoutMs,
+		target: { kind: "existing_path", path: input.canonicalWorkspace },
+		readinessTimeoutMs: input.timeoutMs,
 	});
 	void creation.then(
 		result => {
@@ -85,7 +89,7 @@ async function createTemporaryReader(
 		throw new GjcTurnCancelledError();
 	}
 	try {
-		const attachment = await acquire(runtime, tenant, signal);
+		const attachment = await runtime.registerLifecycleTenant(tenant);
 		return new ManagedModelReader(runtime, attachment, { tenant, timeoutMs: input.timeoutMs }, signal);
 	} catch (error) {
 		try {
@@ -149,7 +153,7 @@ class ManagedModelReader implements ModelReader {
 				{ beforeDispatch: () => throwIfAborted(this.signal) },
 			);
 			throwIfAborted(this.signal);
-			return parseItems(frame, name);
+			return decodeRouterPage(frame, name).items;
 		} catch (error) {
 			if (this.temporary !== undefined) {
 				try {
@@ -188,6 +192,7 @@ async function closeAndProveRetired(
 		const status = await runtime.generationStatus(tenant);
 		if (status.status !== "retired")
 			throw new ManagedModelReaderUnavailableError("Exact managed catalog generation retirement is not proven.");
+		runtime.unregisterTenant(tenant);
 	} catch (proofError) {
 		throw closeError === undefined
 			? proofError
@@ -221,12 +226,6 @@ function tenantFromCreate(input: ManagedTemporaryModelReaderInput, value: unknow
 	};
 }
 
-function parseItems(frame: Readonly<Record<string, unknown>>, query: string): readonly unknown[] {
-	const result = isRecord(frame.result) ? frame.result : frame;
-	if (!Array.isArray(result.items))
-		throw new ManagedModelReaderUnavailableError(`Managed ${query} response has no items array.`);
-	return result.items;
-}
 function unwrapOutcome(value: unknown): unknown {
 	return isRecord(value) && value.kind === "result" && "outcome" in value ? value.outcome : value;
 }
@@ -248,6 +247,32 @@ function assertTemporaryInput(input: ManagedTemporaryModelReaderInput): void {
 	])
 		if (typeof value !== "string" || value.length === 0)
 			throw new TypeError("Complete temporary model-reader authority is required.");
+}
+async function assertReaderContext(
+	context: ModelReaderContext | undefined,
+	signal: AbortSignal | undefined,
+	canonicalWorkspace: string | undefined,
+): Promise<void> {
+	throwIfAborted(signal);
+	if (context === undefined) return;
+	if (!context.principal || (context.principal.role !== "admin" && context.principal.role !== "user"))
+		throw new ManagedModelReaderUnavailableError("A valid OpenWebUI principal is required.");
+	if (context.principal.role !== "user") return;
+	if (context.workspace === undefined || context.lease === undefined)
+		throw new ManagedModelReaderUnavailableError("A normal-user model reader requires a workspace lease.");
+	if (
+		context.workspace.userId !== context.principal.userId ||
+		(canonicalWorkspace !== undefined && resolve(context.workspace.root) !== resolve(canonicalWorkspace))
+	)
+		throw new ManagedModelReaderUnavailableError("Managed model reader authority escaped its tenant workspace.");
+	try {
+		await awaitWithAbort(context.lease.assertFence(), signal);
+	} catch (error) {
+		if (error instanceof GjcTurnCancelledError) throw error;
+		throw new ManagedModelReaderUnavailableError("The normal-user workspace lease is no longer valid.", {
+			cause: error,
+		});
+	}
 }
 function throwIfAborted(signal: AbortSignal | undefined): void {
 	if (signal?.aborted) throw new GjcTurnCancelledError();

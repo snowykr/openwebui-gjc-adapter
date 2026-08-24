@@ -2,7 +2,10 @@ import type { ManagedSdkRuntime } from "../gjc/managed-sdk-runtime";
 import type {
 	GjcCancelTurnInput,
 	GjcControlResult,
+	GjcLifecyclePublicationAddress,
+	GjcLifecycleTransaction,
 	GjcRespondWorkflowGateInput,
+	GjcSessionAddress,
 	GjcSessionState,
 	GjcSessionStateInput,
 	GjcStartNewSessionInput,
@@ -20,8 +23,9 @@ import {
 } from "./gjc-managed-session-operations";
 
 export type ManagedRunnerStartInput = GjcStartNewSessionInput & {
-	readonly authority: ManagedTurnAuthority;
-	readonly lifecycleTarget: Readonly<Record<string, unknown>>;
+	readonly authority: Omit<ManagedTurnAuthority, "sessionId" | "generation">;
+	/** Create always maps to public lifecycle createExternal existing_path. */
+	readonly lifecycleTarget: Readonly<{ path: string }>;
 };
 export type ManagedRunnerContinueInput = import("../gjc/turn-runner").GjcContinueSessionInput & {
 	readonly authority: ManagedTurnAuthority;
@@ -43,12 +47,28 @@ export interface ManagedGjcTurnRunner {
 	create(input: ManagedRunnerStartInput): Promise<GjcTurnResult>;
 	resume(input: ManagedLifecycleInput): Promise<unknown>;
 	continue(input: ManagedRunnerContinueInput): Promise<GjcTurnResult>;
+	continueSession(input: ManagedRunnerContinueInput): Promise<GjcTurnResult>;
 	control(input: ManagedRunnerGateInput | ManagedRunnerContinueInput): Promise<GjcControlResult>;
 	gate(input: ManagedRunnerGateInput): Promise<GjcTurnResult>;
+	respondWorkflowGate(input: ManagedRunnerGateInput): Promise<GjcTurnResult>;
 	cancel(input: GjcCancelTurnInput & { readonly authority: ManagedTurnAuthority }): Promise<void>;
+	cancelTurn(input: GjcCancelTurnInput & { readonly authority: ManagedTurnAuthority }): Promise<void>;
 	closePreflight(input: ManagedRunnerCloseInput): Promise<unknown>;
 	getState(input: ManagedRunnerStateInput): Promise<GjcSessionState>;
 	getAvailableModels(input: ManagedRunnerStateInput): Promise<readonly unknown[]>;
+	withLifecyclePublication?<T>(
+		_address: GjcLifecyclePublicationAddress,
+		effect: (lifecycle: GjcLifecycleTransaction) => Promise<T>,
+	): Promise<T>;
+	withLifecycleClosePreflight?<T>(
+		_address: GjcLifecyclePublicationAddress,
+		effect: (lifecycle: GjcLifecycleTransaction) => Promise<T>,
+	): Promise<T>;
+	startNewSession?<T>(
+		input: ManagedRunnerStartInput,
+		publish: (result: GjcSessionAddress & GjcTurnResult) => Promise<T>,
+		beforePrompt: (address: GjcSessionAddress) => Promise<void>,
+	): Promise<T>;
 }
 
 export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedGjcTurnRunner {
@@ -57,16 +77,25 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 		operations,
 		async create(input) {
 			throwIfAborted(input.signal);
-			await operations.create({ authority: input.authority, target: input.lifecycleTarget });
+			const lifecycle = await operations.create({
+				authority: input.authority as ManagedTurnAuthority,
+				target: input.lifecycleTarget,
+			});
+			const authority = {
+				...input.authority,
+				sessionId: lifecycle.tenant.sessionId,
+				generation: lifecycle.tenant.generation,
+			};
 			try {
-				return await operations.prompt(turnInput(input, "turn.prompt"));
+				return await operations.prompt(turnInput({ ...input, authority }, "turn.prompt"));
 			} catch (error) {
-				await closeAfterPrePromptFailure(operations, input.authority, input.lifecycleTarget, error);
+				await closeAfterPrePromptFailure(operations, authority, input.lifecycleTarget, error);
 				throw error;
 			}
 		},
 		resume: input => operations.resume(input),
 		continue: input => operations.followUp(turnInput(input, "turn.follow_up")),
+		continueSession: input => operations.followUp(turnInput(input, "turn.follow_up")),
 		async control(input) {
 			if ("gateId" in input) return { result: await operations.answerGate(gateInput(input)) };
 			return {
@@ -81,7 +110,15 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 			};
 		},
 		gate: input => operations.answerGate(gateInput(input)),
+		respondWorkflowGate: input => operations.answerGate(gateInput(input)),
 		async cancel(input) {
+			await operations.abort({
+				authority: input.authority,
+				operation: "turn.abort",
+				idempotencyKey: input.authority.requestKey,
+			});
+		},
+		async cancelTurn(input) {
 			await operations.abort({
 				authority: input.authority,
 				operation: "turn.abort",
@@ -98,10 +135,34 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 			};
 		},
 		getAvailableModels: input => operations.getModels(input.authority),
+		async startNewSession(input, publish, beforePrompt) {
+			const lifecycle = await operations.create({
+				authority: input.authority as ManagedTurnAuthority,
+				target: input.lifecycleTarget,
+			});
+			const authority = {
+				...input.authority,
+				sessionId: lifecycle.tenant.sessionId,
+				generation: lifecycle.tenant.generation,
+			};
+			const address = {
+				cwd: input.cwd,
+				sessionRoot: input.sessionRoot,
+				projectId: input.projectId,
+				chatId: input.chatId,
+				sessionId: authority.sessionId,
+			};
+			await beforePrompt(address);
+			const result = await operations.prompt(turnInput({ ...input, authority }, "turn.prompt"));
+			return await publish({ ...address, ...result });
+		},
 	};
 }
 
-function turnInput(input: ManagedRunnerStartInput | ManagedRunnerContinueInput, operation: string): ManagedTurnInput {
+function turnInput(
+	input: (ManagedRunnerStartInput & { readonly authority: ManagedTurnAuthority }) | ManagedRunnerContinueInput,
+	operation: string,
+): ManagedTurnInput {
 	return {
 		authority: input.authority,
 		operation,

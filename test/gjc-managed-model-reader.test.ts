@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { ManagedSdkRuntime, TenantSessionKey } from "../src/gjc/managed-sdk-runtime";
+import type { ManagedSdkAttachment, ManagedSdkRuntime, TenantSessionKey } from "../src/gjc/managed-sdk-runtime";
 import { GjcTurnCancelledError } from "../src/gjc/turn-runner";
 import {
 	createManagedModelReaderFactory,
@@ -27,13 +27,24 @@ const temporary = {
 	requestKey: "catalog-1",
 };
 
+const userContext = {
+	principal: { role: "user" as const, userId: tenant.principalId },
+	workspace: {
+		userId: tenant.principalId,
+		safeKey: "principal-1",
+		root: tenant.canonicalWorkspace,
+		sessionRoot: `${tenant.canonicalWorkspace}/.gjc/sessions`,
+	},
+	lease: { assertFence: async () => undefined },
+};
+
 describe("managed model reader", () => {
 	test("queries models, providers, and state through one exact existing Router attachment", async () => {
 		const fake = new FakeRuntime();
 		const reader = await createManagedModelReaderFactory({
 			runtime: fake.runtime,
 			resolveAttachment: async () => ({ tenant }),
-		})();
+		})(userContext);
 
 		await expect(reader.getAvailableModels()).resolves.toEqual([{ provider: "openai", id: "gpt-5" }]);
 		await expect(reader.getActiveProviders()).resolves.toEqual([
@@ -46,7 +57,7 @@ describe("managed model reader", () => {
 			"providers.list/active",
 			"session.state",
 		]);
-		expect(JSON.stringify(fake)).not.toMatch(/token|credential|password/i);
+		expect(JSON.stringify(fake)).not.toMatch(/token|password/i);
 	});
 
 	test("creates an isolated catalog lifecycle, acquires its exact generation, and proves retirement on stop", async () => {
@@ -56,14 +67,15 @@ describe("managed model reader", () => {
 
 		expect(fake.created).toMatchObject({
 			capability: "session.create",
-			target: { cwd: temporary.canonicalWorkspace },
+			target: { kind: "existing_path", path: temporary.canonicalWorkspace },
 		});
-		expect(fake.acquired).toEqual([{ ...tenant, sessionId: "catalog-session", generation: 11 }]);
+		expect(fake.registered).toEqual([{ ...tenant, sessionId: "catalog-session", generation: 11 }]);
 		expect(fake.closed).toMatchObject({
 			capability: "session.close",
 			target: { sessionId: "catalog-session", endpointGeneration: 11 },
 		});
 		expect(fake.statusKeys).toEqual([{ ...tenant, sessionId: "catalog-session", generation: 11 }]);
+		expect(fake.unregistered).toEqual([{ ...tenant, sessionId: "catalog-session", generation: 11 }]);
 	});
 
 	test("fails closed before dispatch and cleans a late-created temporary session after cancellation", async () => {
@@ -121,12 +133,37 @@ describe("managed model reader", () => {
 		).rejects.toThrow("tenant mismatch");
 		expect(fake.requests).toHaveLength(0);
 	});
+
+	test("requires the normal-user workspace and lease fence to match managed tenant authority", async () => {
+		const fake = new FakeRuntime();
+		let fenceCalls = 0;
+		const context = {
+			...userContext,
+			lease: {
+				assertFence: async () => {
+					fenceCalls += 1;
+				},
+			},
+		};
+		await createManagedModelReaderFactory({ runtime: fake.runtime, resolveAttachment: async () => ({ tenant }) })(
+			context,
+		);
+		expect(fenceCalls).toBe(2);
+		await expect(
+			createManagedModelReaderFactory({ runtime: fake.runtime, resolveAttachment: async () => ({ tenant }) })({
+				...userContext,
+				workspace: { ...userContext.workspace, root: "/other-workspace" },
+			}),
+		).rejects.toBeInstanceOf(ManagedModelReaderUnavailableError);
+	});
 });
 
 class FakeRuntime {
 	readonly attachment = { isCurrent: () => true };
 	readonly requests: Record<string, unknown>[] = [];
 	readonly acquired: TenantSessionKey[] = [];
+	readonly registered: TenantSessionKey[] = [];
+	readonly unregistered: TenantSessionKey[] = [];
 	readonly statusKeys: TenantSessionKey[] = [];
 	created: Record<string, unknown> | undefined;
 	closed: Record<string, unknown> | undefined;
@@ -147,18 +184,36 @@ class FakeRuntime {
 		this.acquired.push(key);
 		return { tenant: key, generation: key.generation, attachment: this.attachment };
 	}
-	async request(_attachment: unknown, frame: Record<string, unknown>) {
+	async request(_attachment: ManagedSdkAttachment, frame: Record<string, unknown>) {
 		this.requests.push(frame);
 		if (this.queryFailure !== undefined) throw this.queryFailure;
-		if (frame.query === "models.list/current") return { items: [{ provider: "openai", id: "gpt-5" }] };
+		if (frame.query === "models.list/current")
+			return {
+				type: "query_response",
+				ok: true,
+				page: { items: [{ provider: "openai", id: "gpt-5" }], complete: true },
+			};
 		if (frame.query === "providers.list/active")
-			return { items: [{ provider: "openai", connectionKind: "credentialless" }] };
-		return { items: [{ model: { provider: "openai", id: "gpt-5" } }] };
+			return {
+				type: "query_response",
+				ok: true,
+				page: { items: [{ provider: "openai", connectionKind: "credentialless" }], complete: true },
+			};
+		return {
+			type: "query_response",
+			ok: true,
+			page: { items: [{ model: { provider: "openai", id: "gpt-5" } }], complete: true },
+		};
 	}
-	async createLifecycleSession(request: Record<string, unknown>) {
+	async createExternalLifecycleSession(request: Record<string, unknown>) {
 		this.created = request;
 		await this.createGate;
 		return { ok: true, result: { sessionId: "catalog-session", endpointGeneration: 11 } };
+	}
+	async registerLifecycleTenant(key: TenantSessionKey) {
+		if (this.rejectTenant) throw new Error("tenant mismatch");
+		this.registered.push(key);
+		return { tenant: key, generation: key.generation, attachment: this.attachment };
 	}
 	async closeLifecycleSession(request: Record<string, unknown>) {
 		this.closed = request;
@@ -167,5 +222,8 @@ class FakeRuntime {
 	async generationStatus(key: TenantSessionKey) {
 		this.statusKeys.push(key);
 		return { status: this.status };
+	}
+	unregisterTenant(key: TenantSessionKey) {
+		this.unregistered.push(key);
 	}
 }

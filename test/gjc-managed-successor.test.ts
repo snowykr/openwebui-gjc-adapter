@@ -14,7 +14,16 @@ const source: ManagedTurnAuthority = {
 	epoch: "epoch-a",
 	requestKey: "branch-message-7",
 };
-const target: ManagedTurnAuthority = { ...source, sessionId: "target-session", generation: 5 };
+const successor = { sessionId: "forked-session", endpointGeneration: 9 };
+const target = {
+	principalId: source.principalId,
+	projectId: source.projectId,
+	canonicalWorkspace: source.canonicalWorkspace,
+	chatId: source.chatId,
+	leaseId: source.leaseId,
+	epoch: source.epoch,
+	requestKey: source.requestKey,
+};
 
 describe("unwired managed successor", () => {
 	test("forks with stable actor/request key/hash and publishes only after target proof", async () => {
@@ -28,15 +37,19 @@ describe("unwired managed successor", () => {
 				fake.order.push("publish");
 			},
 		});
-		expect(result.successor.tenant).toMatchObject({ sessionId: target.sessionId, generation: target.generation });
-		expect(published).toEqual([target.sessionId]);
+		expect(result.successor.tenant).toMatchObject({
+			sessionId: successor.sessionId,
+			generation: successor.endpointGeneration,
+		});
+		expect(published).toEqual([successor.sessionId]);
 		expect(fake.order).toEqual([
 			"reconcile",
 			"acquire:source-session:4",
 			"fork",
+			"register:forked-session:9",
 			"reconcile",
-			"acquire:target-session:5",
-			"status:target-session:5",
+			"acquire:forked-session:9",
+			"status:forked-session:9",
 			"publish",
 		]);
 		expect(fake.forks[0]).toMatchObject({
@@ -44,7 +57,6 @@ describe("unwired managed successor", () => {
 			requestKey: source.requestKey,
 			target: {
 				sourceSessionId: source.sessionId,
-				targetSessionId: target.sessionId,
 				operationHash: result.operationHash,
 			},
 		});
@@ -65,7 +77,7 @@ describe("unwired managed successor", () => {
 
 	test("does not publish stale or replaced target generations and retires the failed successor", async () => {
 		const fake = new FakeRuntime();
-		fake.status = "replaced";
+		fake.targetStatus = "replaced";
 		let published = false;
 		await expect(
 			createManagedSuccessorFlow(fake.runtime).fork({
@@ -75,10 +87,10 @@ describe("unwired managed successor", () => {
 					published = true;
 				},
 			}),
-		).rejects.toThrow("not current");
+		).rejects.toBeInstanceOf(ManagedSuccessorUncertainError);
 		expect(published).toBeFalse();
 		expect(fake.order).toContain("close");
-		expect(fake.closeTargets).toEqual([{ sessionId: target.sessionId, endpointGeneration: target.generation }]);
+		expect(fake.closeTargets).toEqual([successor]);
 	});
 
 	test("does not invoke a pre-cancelled fork", async () => {
@@ -110,39 +122,38 @@ describe("unwired managed successor", () => {
 			}),
 		).rejects.toBeInstanceOf(ManagedSuccessorUncertainError);
 		expect(fake.order).toContain("close");
-		expect(fake.order.filter(entry => entry === "status:target-session:5").length).toBe(1);
+		expect(fake.order.filter(entry => entry === "status:forked-session:9").length).toBe(1);
 	});
 
-	test("treats a lifecycle timeout after invocation as uncertain after retirement cleanup", async () => {
+	test("treats a lifecycle timeout without returned target identity as uncertain without guessed cleanup", async () => {
 		const fake = new FakeRuntime();
 		fake.forkFailure = new Error("fork timeout");
 		await expect(
 			createManagedSuccessorFlow(fake.runtime).fork({ source, target, publish: () => undefined }),
 		).rejects.toBeInstanceOf(ManagedSuccessorUncertainError);
-		expect(fake.order).toContain("close");
-		expect(fake.closeTargets).toEqual([{ sessionId: target.sessionId, endpointGeneration: target.generation }]);
+		expect(fake.order).not.toContain("close");
+		expect(fake.closeTargets).toEqual([]);
 	});
 
 	test("reports ambiguous cleanup when exact target retirement is not proven", async () => {
 		const fake = new FakeRuntime();
-		fake.status = "unknown";
+		fake.targetStatus = "unknown";
 		await expect(
 			createManagedSuccessorFlow(fake.runtime).fork({ source, target, publish: () => undefined }),
 		).rejects.toBeInstanceOf(ManagedSuccessorUncertainError);
 		expect(fake.order).toContain("close");
-		expect(fake.order).toContain("status:target-session:5");
+		expect(fake.order).toContain("status:forked-session:9");
 	});
 
-	test("rejects tenant-crossing successors before lifecycle visibility or invocation", async () => {
+	test("derives successor tenancy from the authorized target rather than lifecycle metadata", async () => {
 		const fake = new FakeRuntime();
-		await expect(
-			createManagedSuccessorFlow(fake.runtime).fork({
-				source,
-				target: { ...target, principalId: "user-b" },
-				publish: () => undefined,
-			}),
-		).rejects.toThrow("tenant authority boundary");
-		expect(fake.order).toEqual([]);
+		fake.successorPrincipalId = "user-b";
+		const result = await createManagedSuccessorFlow(fake.runtime).fork({
+			source,
+			target,
+			publish: () => undefined,
+		});
+		expect(result.successor.tenant.principalId).toBe(source.principalId);
 	});
 });
 
@@ -150,7 +161,9 @@ class FakeRuntime {
 	readonly order: string[] = [];
 	readonly forks: Record<string, unknown>[] = [];
 	readonly closeTargets: Record<string, unknown>[] = [];
-	status: "current" | "retired" | "replaced" | "unknown" = "current";
+	readonly registered = new Map<string, { sessionId: string; generation: number; principalId: string }>();
+	targetStatus: "current" | "retired" | "replaced" | "unknown" = "current";
+	successorPrincipalId = source.principalId;
 	afterFork: (() => void) | undefined;
 	forkFailure: Error | undefined;
 	get runtime(): ManagedSdkRuntime {
@@ -161,27 +174,47 @@ class FakeRuntime {
 	}
 	async acquireAttachment(key: { sessionId: string; generation: number }) {
 		this.order.push(`acquire:${key.sessionId}:${key.generation}`);
+		if (key.sessionId === successor.sessionId && !this.registered.has(`${key.sessionId}:${key.generation}`))
+			throw new Error("Returned successor was not registered.");
 		return {
 			tenant: key,
 			generation: key.generation,
-			attachment: { isCurrent: () => this.status === "current" },
+			attachment: { isCurrent: () => key.sessionId === source.sessionId || this.targetStatus === "current" },
 		};
 	}
 	async generationStatus(key: { sessionId: string; generation: number }) {
 		this.order.push(`status:${key.sessionId}:${key.generation}`);
-		return { status: this.status };
+		return { status: key.sessionId === source.sessionId ? "current" : this.targetStatus };
+	}
+	registerTenant(key: { sessionId: string; generation: number; principalId: string }) {
+		this.order.push(`register:${key.sessionId}:${key.generation}`);
+		this.registered.set(`${key.sessionId}:${key.generation}`, key);
+	}
+	async registerLifecycleTenant(key: { sessionId: string; generation: number; principalId: string }) {
+		this.registerTenant(key);
+		return { tenant: key, generation: key.generation, attachment: this.attachmentFor(key) };
+	}
+	private attachmentFor(key: { sessionId: string }) {
+		return { isCurrent: () => key.sessionId === source.sessionId || this.targetStatus === "current" };
 	}
 	async forkLifecycleSession(request: Record<string, unknown>) {
 		this.order.push("fork");
 		this.forks.push(request);
 		this.afterFork?.();
 		if (this.forkFailure !== undefined) throw this.forkFailure;
-		return { ok: true };
+		return {
+			ok: true,
+			result: {
+				sessionId: successor.sessionId,
+				endpointGeneration: successor.endpointGeneration,
+				principalId: this.successorPrincipalId,
+			},
+		};
 	}
 	async closeLifecycleSession(request: Record<string, unknown>) {
 		this.order.push("close");
 		this.closeTargets.push(request.target as Record<string, unknown>);
-		if (this.status !== "unknown") this.status = "retired";
+		if (this.targetStatus !== "unknown") this.targetStatus = "retired";
 		return { ok: true };
 	}
 }
