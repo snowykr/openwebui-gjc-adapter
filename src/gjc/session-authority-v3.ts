@@ -12,6 +12,7 @@ import type { GjcTurnEvent, ManagedTurnAuthority } from "./turn-runner";
 
 export const SESSION_AUTHORITY_V3_VERSION = 3 as const;
 export const SESSION_AUTHORITY_V3_EPOCH = "managed/1" as const;
+export const SESSION_AUTHORITY_V3_KIND = "openwebui-gjc-session-authority" as const;
 export const MANAGED_TURN_AUTHORITY_V3_EPOCH = SESSION_AUTHORITY_V3_EPOCH;
 
 export type SessionAuthorityV3OperationState = "pending" | "complete" | "uncertain" | "conflict";
@@ -130,6 +131,7 @@ export interface SessionAuthorityV3ProvisionalOperation extends SessionAuthority
 }
 
 export interface SessionAuthorityV3Document {
+	readonly kind: typeof SESSION_AUTHORITY_V3_KIND;
 	readonly version: typeof SESSION_AUTHORITY_V3_VERSION;
 	readonly authorityEpoch: typeof SESSION_AUTHORITY_V3_EPOCH;
 	readonly mappings: readonly SessionAuthorityV3Mapping[];
@@ -179,10 +181,14 @@ export const copySessionAuthorityV3 = copySessionAuthorityV3Document;
 export function isSessionAuthorityV3Document(value: unknown): value is SessionAuthorityV3Document {
 	if (
 		containsForbiddenLegacyField(value) ||
-		!exactKeys(value, ["version", "authorityEpoch", "mappings", "provisionalOperations"])
+		!exactKeys(value, ["kind", "version", "authorityEpoch", "mappings", "provisionalOperations"])
 	)
 		return false;
-	if (value.version !== SESSION_AUTHORITY_V3_VERSION || value.authorityEpoch !== SESSION_AUTHORITY_V3_EPOCH)
+	if (
+		value.kind !== SESSION_AUTHORITY_V3_KIND ||
+		value.version !== SESSION_AUTHORITY_V3_VERSION ||
+		value.authorityEpoch !== SESSION_AUTHORITY_V3_EPOCH
+	)
 		return false;
 	if (!Array.isArray(value.mappings) || !Array.isArray(value.provisionalOperations)) return false;
 	return (
@@ -238,6 +244,16 @@ export function parseSessionAuthorityV3Document(input: string | Uint8Array): Ses
 }
 
 export const decodeSessionAuthorityV3Document = parseSessionAuthorityV3Document;
+
+export function isSessionAuthorityV3Mapping(value: unknown): value is SessionAuthorityV3Mapping {
+	return !containsForbiddenLegacyField(value) && isMapping(value);
+}
+
+export function isSessionAuthorityV3ProvisionalOperation(
+	value: unknown,
+): value is SessionAuthorityV3ProvisionalOperation {
+	return !containsForbiddenLegacyField(value) && isProvisional(value);
+}
 
 export function encodeSessionAuthorityV3Document(document: SessionAuthorityV3Document): string {
 	if (!isSessionAuthorityV3Document(document))

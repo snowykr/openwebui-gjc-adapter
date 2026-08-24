@@ -13,6 +13,7 @@ import {
 	isSessionAuthorityV3Document,
 	type ManagedTurnAuthorityV3,
 	SESSION_AUTHORITY_V3_EPOCH,
+	SESSION_AUTHORITY_V3_KIND,
 	SESSION_AUTHORITY_V3_VERSION,
 	type SessionAuthorityV3Document,
 	type SessionAuthorityV3Mapping,
@@ -127,6 +128,7 @@ export function migrateSessionAuthorityV2ToV3(
 	if (reasons.length > 0 || mappings.some(isUndefined) || provisionalOperations.some(isUndefined))
 		return blocked(reasons);
 	const result: SessionAuthorityV3Document = {
+		kind: SESSION_AUTHORITY_V3_KIND,
 		version: SESSION_AUTHORITY_V3_VERSION,
 		authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
 		mappings: mappings as SessionAuthorityV3Mapping[],

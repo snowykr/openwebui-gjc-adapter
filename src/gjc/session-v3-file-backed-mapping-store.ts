@@ -28,6 +28,7 @@ import {
 	type ManagedTurnAuthorityV3,
 	parseSessionAuthorityV3Document,
 	SESSION_AUTHORITY_V3_EPOCH,
+	SESSION_AUTHORITY_V3_KIND,
 	type SessionAuthorityV3Document,
 	type SessionAuthorityV3Mapping,
 	type SessionAuthorityV3Operation,
@@ -221,6 +222,7 @@ class V3FileSessionAuthority extends SessionAuthority {
 
 	private persist(): void {
 		const document: SessionAuthorityV3Document = {
+			kind: SESSION_AUTHORITY_V3_KIND,
 			version: 3,
 			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
 			mappings: this.entries().map(toV3Mapping),

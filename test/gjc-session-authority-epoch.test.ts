@@ -3,46 +3,24 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MANAGED_SESSION_AUTHORITY_EPOCH } from "../src/gjc/managed-session-authority";
 import { probeSessionAuthorityEpoch, selectSessionAuthorityStore } from "../src/gjc/session-authority-epoch";
+import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 
-const digest = createHash("sha256").update("managed-manifest").digest("hex");
-
+const digestOf = (value: string) => createHash("sha256").update(value).digest("hex");
 function v3(overrides: Record<string, unknown> = {}): string {
 	return JSON.stringify({
 		kind: "openwebui-gjc-session-authority",
 		version: 3,
-		authorityEpoch: MANAGED_SESSION_AUTHORITY_EPOCH,
-		digest,
-		records: [
-			{
-				authorityEpoch: MANAGED_SESSION_AUTHORITY_EPOCH,
-				principalId: "principal",
-				projectId: "project",
-				canonicalWorkspace: "/workspace",
-				chatId: "chat",
-				sessionId: "session",
-				generation: 1,
-				operationHash: digest,
-				requestHash: digest,
-				payloadHash: digest,
-				session: { sessionId: "session", observedAt: "2026-08-24T00:00:00.000Z" },
-				projection: { rawFrameCursor: 0, eventCursor: 0 },
-				lifecycle: { state: "intent_prepared", recordedAt: "2026-08-24T00:00:00.000Z" },
-			},
-		],
+		authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+		mappings: [],
+		provisionalOperations: [],
 		...overrides,
 	});
 }
-
 async function fixture() {
 	const root = await mkdtemp(join(tmpdir(), "gjc-authority-epoch-"));
 	const authority = join(root, "authority.json");
-	return {
-		root,
-		authority,
-		cleanup: () => rm(root, { recursive: true, force: true }),
-	};
+	return { root, authority, cleanup: () => rm(root, { recursive: true, force: true }) };
 }
 
 describe("session authority epoch probe", () => {
@@ -57,11 +35,12 @@ describe("session authority epoch probe", () => {
 		}
 	});
 
-	test("selects the managed store only for the exact trusted v3 epoch", async () => {
+	test("selects the managed store only for the exact trusted full-graph v3 bytes", async () => {
 		const f = await fixture();
 		try {
-			await writeFile(f.authority, v3());
-			const probe = probeSessionAuthorityEpoch(f.authority, { managedDigest: digest });
+			const bytes = v3();
+			await writeFile(f.authority, bytes);
+			const probe = probeSessionAuthorityEpoch(f.authority, { managedDigest: digestOf(bytes) });
 			expect(probe).toEqual({ status: "v3", selection: "managed-store" });
 			expect(selectSessionAuthorityStore(probe)).toBe("managed-store");
 			expect(probeSessionAuthorityEpoch(f.authority)).toEqual({ status: "blocked", selection: "blocked" });
@@ -81,10 +60,10 @@ describe("session authority epoch probe", () => {
 				"not json",
 				'{"kind":"other","version":2}',
 				v3({ authorityEpoch: "wrong" }),
-				v3({ digest: "x" }),
+				v3({ mappings: "invalid" }),
 			]) {
 				await writeFile(f.authority, bytes);
-				expect(probeSessionAuthorityEpoch(f.authority, { managedDigest: digest })).toEqual({
+				expect(probeSessionAuthorityEpoch(f.authority, { managedDigest: digestOf(bytes) })).toEqual({
 					status: "blocked",
 					selection: "blocked",
 				});
@@ -97,7 +76,7 @@ describe("session authority epoch probe", () => {
 			expect(probeSessionAuthorityEpoch(f.authority)).toEqual({ status: "blocked", selection: "blocked" });
 			await rm(f.authority, { recursive: true });
 			await writeFile(f.authority, Buffer.alloc(16 * 1024 * 1024 + 1));
-			expect(probeSessionAuthorityEpoch(f.authority, { managedDigest: digest })).toEqual({
+			expect(probeSessionAuthorityEpoch(f.authority, { managedDigest: "0".repeat(64) })).toEqual({
 				status: "blocked",
 				selection: "blocked",
 			});
@@ -113,7 +92,7 @@ describe("session authority epoch probe", () => {
 			await writeFile(f.authority, v3());
 			await writeFile(replacement, '{"kind":"openwebui-gjc-session-authority","version":2,"records":[]}');
 			await rename(replacement, f.authority);
-			expect(probeSessionAuthorityEpoch(f.authority, { managedDigest: digest })).toEqual({
+			expect(probeSessionAuthorityEpoch(f.authority, { managedDigest: "0".repeat(64) })).toEqual({
 				status: "v2",
 				selection: "managed-bootstrap",
 			});

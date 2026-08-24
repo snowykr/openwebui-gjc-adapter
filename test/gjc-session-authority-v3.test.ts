@@ -4,6 +4,7 @@ import {
 	isSessionAuthorityV3Document,
 	parseSessionAuthorityV3Document,
 	SESSION_AUTHORITY_V3_EPOCH,
+	SESSION_AUTHORITY_V3_KIND,
 } from "../src/gjc/session-authority-v3";
 
 const timestamp = "2026-08-24T00:00:00.000Z";
@@ -113,6 +114,7 @@ function mapping(projectId = "project-a", sessionId = "session-current") {
 
 function golden() {
 	return {
+		kind: SESSION_AUTHORITY_V3_KIND,
 		version: 3,
 		authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
 		mappings: [mapping()],
@@ -156,6 +158,7 @@ describe("session authority v3 full graph", () => {
 				mappings: source.mappings,
 				authorityEpoch: source.authorityEpoch,
 				version: source.version,
+				kind: source.kind,
 			}),
 		)!;
 		expect(encodeSessionAuthorityV3Document(first)).toBe(encodeSessionAuthorityV3Document(second));

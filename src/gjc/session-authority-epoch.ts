@@ -1,10 +1,14 @@
+import { createHash } from "node:crypto";
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from "node:fs";
 
-import { isManagedSessionAuthorityRecord, MANAGED_SESSION_AUTHORITY_EPOCH } from "./managed-session-authority";
+import {
+	isSessionAuthorityV3Document,
+	SESSION_AUTHORITY_V3_EPOCH,
+	SESSION_AUTHORITY_V3_VERSION,
+} from "./session-authority-v3";
 
 const MAX_AUTHORITY_HEADER_BYTES = 16 * 1024 * 1024;
 const SHA256 = /^[a-f0-9]{64}$/;
-const V3_KEYS = ["kind", "version", "authorityEpoch", "digest", "records"] as const;
 
 export type SessionAuthorityEpochStatus = "absent" | "v2" | "v3" | "blocked";
 export type SessionAuthorityStoreSelection = "managed-bootstrap" | "managed-store" | "blocked";
@@ -71,16 +75,12 @@ function classify(bytes: Buffer, managedDigest: string | undefined): SessionAuth
 	if (!isRecord(value) || value.kind !== "openwebui-gjc-session-authority") return blocked();
 	if (value.version === 2) return { status: "v2", selection: "managed-bootstrap" };
 	if (
-		value.version !== 3 ||
-		!hasExactKeys(value, V3_KEYS) ||
-		value.authorityEpoch !== MANAGED_SESSION_AUTHORITY_EPOCH ||
-		typeof value.digest !== "string" ||
-		!SHA256.test(value.digest) ||
+		value.version !== SESSION_AUTHORITY_V3_VERSION ||
+		value.authorityEpoch !== SESSION_AUTHORITY_V3_EPOCH ||
+		!isSessionAuthorityV3Document(value) ||
 		managedDigest === undefined ||
 		!SHA256.test(managedDigest) ||
-		value.digest !== managedDigest ||
-		!Array.isArray(value.records) ||
-		!value.records.every(isManagedSessionAuthorityRecord)
+		createHash("sha256").update(bytes).digest("hex") !== managedDigest
 	)
 		return blocked();
 	return { status: "v3", selection: "managed-store" };
@@ -105,11 +105,6 @@ function sameIdentity(left: ReturnType<typeof fstatSync>, right: ReturnType<type
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
-	const actual = Object.keys(value);
-	return actual.length === keys.length && actual.every(key => keys.includes(key));
 }
 
 function absent(): SessionAuthorityEpochProbe {
