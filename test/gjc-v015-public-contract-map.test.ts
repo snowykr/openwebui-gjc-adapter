@@ -276,7 +276,8 @@ describe("GJC upstream dev generation-status contract map", () => {
 			packageName: "@gajae-code/coding-agent",
 			packageVersion: "0.15.0",
 			build: "release-shaped dist/type generation and published-manifest rewriting from exact dev merge e3b3a76a590081ded16214a1188857524d40e701",
-			slice1Dependency: "file:vendor/gajae-code-coding-agent-e3b3a76a590081ded16214a1188857524d40e701-8ba25005.tgz",
+			slice1Dependency:
+				"https://raw.githubusercontent.com/snowykr/openwebui-gjc-adapter/c09e31dc85c514cffaf7e44827b47d311620c49f/vendor/gajae-code-coding-agent-e3b3a76a590081ded16214a1188857524d40e701-8ba25005.tgz",
 		});
 		expect(fixture.devArtifact.sha256).toMatch(/^[a-f0-9]{64}$/);
 		expect(fixture.devArtifact.shasum).toMatch(/^[a-f0-9]{40}$/);
