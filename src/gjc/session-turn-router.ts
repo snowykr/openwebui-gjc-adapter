@@ -180,6 +180,7 @@ export async function routeGjcTurn(input: ScopedRouteGjcTurnInput): Promise<Rout
 		chatId: input.chatId,
 		operationId: input.userMessageId,
 		...(input.principalId === undefined ? {} : { principalId: input.principalId }),
+		...(input.managedAuthority === undefined ? {} : { managedAuthority: input.managedAuthority }),
 		...(initialMapping?.projectId === input.project.id ? { sessionId: initialMapping.sessionId } : {}),
 	};
 	let cancellationRequested = false;
@@ -288,6 +289,7 @@ export async function routeGjcTurn(input: ScopedRouteGjcTurnInput): Promise<Rout
 						lifecycle,
 						sessionFile: existingSessionFile,
 						recoveryAttachment: existing.attachment,
+						...(input.managedAuthority === undefined ? {} : { managedAuthority: input.managedAuthority }),
 					});
 					throwIfAborted(input.signal);
 					const state = await input.runner.getState({
@@ -295,6 +297,7 @@ export async function routeGjcTurn(input: ScopedRouteGjcTurnInput): Promise<Rout
 						lifecycle,
 						sessionFile: existingSessionFile,
 						recoveryAttachment: existing.attachment,
+						...(input.managedAuthority === undefined ? {} : { managedAuthority: input.managedAuthority }),
 					});
 					throwIfAborted(input.signal);
 					const result = await input.runner.continueSession({
@@ -313,6 +316,7 @@ export async function routeGjcTurn(input: ScopedRouteGjcTurnInput): Promise<Rout
 						...(input.onObservedTurn === undefined ? {} : { observer: input.onObservedTurn }),
 						...(input.signal === undefined ? {} : { signal: input.signal }),
 						...(input.principalId === undefined ? {} : { principalId: input.principalId }),
+						...(input.managedAuthority === undefined ? {} : { managedAuthority: input.managedAuthority }),
 						onDispatch: () => {
 							promptDispatched = true;
 						},
@@ -344,10 +348,25 @@ export async function routeGjcTurn(input: ScopedRouteGjcTurnInput): Promise<Rout
 							? {}
 							: { attachment: result.attachment ?? state.attachment ?? existing.attachment }),
 						...(completedSelection === undefined ? {} : { modelSelection: completedSelection }),
+						...(result.managedAuthority === undefined
+							? input.managedAuthority === undefined
+								? {}
+								: { managedAuthority: input.managedAuthority }
+							: { managedAuthority: result.managedAuthority }),
 					};
 					const proof = result.attachment ?? state.attachment ?? existing.attachment;
-					if (proof === undefined) throw new Error("GJC turn did not return a validated current attachment.");
-					const mapping = await lifecycle.publish(proof, () => {
+					const managedProof = result.managedProof ?? state.managedProof;
+					const publish =
+						input.managedAuthority === undefined
+							? proof === undefined
+								? undefined
+								: (write: () => SessionMapping) => lifecycle.publish(proof, write)
+							: managedProof === undefined || lifecycle.publishManaged === undefined
+								? undefined
+								: (write: () => SessionMapping) => lifecycle.publishManaged!(managedProof, write);
+					if (publish === undefined)
+						throw new Error("GJC turn did not return validated current generation authority.");
+					const mapping = await publish(() => {
 						throwIfAborted(input.signal);
 						const published = mappings.completeOperationWithMapping(
 							input.chatId,

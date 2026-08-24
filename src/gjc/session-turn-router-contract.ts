@@ -7,6 +7,7 @@ import type {
 	GjcTurnResult,
 	GjcTurnRunner,
 	ManagedPreparedTurnAuthority,
+	ManagedTurnAuthority,
 } from "./turn-runner";
 
 export interface RouteGjcTurnInput {
@@ -19,6 +20,8 @@ export interface RouteGjcTurnInput {
 	readonly mappings: SessionMappingStore;
 	readonly principalId?: string;
 	readonly preparedManagedAuthority?: ManagedPreparedTurnAuthority;
+	/** Persisted authority for an existing managed mapping; never synthesized from prepared authority. */
+	readonly managedAuthority?: ManagedTurnAuthority;
 	readonly modelSelection?: NormalizedModelSelection;
 	readonly projectAssistantText?: (result: GjcTurnResult) => string;
 	readonly afterPublish?: (result: RouteGjcTurnResult) => void;

@@ -1,6 +1,9 @@
+import { resolve } from "node:path";
 import type { ManagedSdkRuntime } from "../gjc/managed-sdk-runtime";
+import type { SessionAttachmentProof } from "../gjc/session-authority";
 import type {
 	GjcCancelTurnInput,
+	GjcContinueSessionInput,
 	GjcControlResult,
 	GjcLifecyclePublicationAddress,
 	GjcLifecycleTransaction,
@@ -9,12 +12,13 @@ import type {
 	GjcSessionState,
 	GjcSessionStateInput,
 	GjcStartNewSessionInput,
+	GjcSwitchSessionInput,
 	GjcTurnResult,
+	GjcTurnRunner,
 	ManagedPreparedTurnAuthority,
 	ManagedTurnAuthority,
 } from "../gjc/turn-runner";
 import { GjcTurnCancelledError } from "../gjc/turn-runner";
-import type { LiveGatewayRunnerInput } from "./chat-completions";
 import {
 	createManagedSessionOperations,
 	type ManagedGateInput,
@@ -36,37 +40,39 @@ export type ManagedRunnerCloseInput = {
 	readonly target: Readonly<Record<string, unknown>>;
 };
 
-/**
- * Deliberately unwired managed equivalent of the supported GjcTurnRunner surface.
- * Session switching is absent: a managed tenant key is exact-generation authority,
- * not a mutable current-session pointer.
- */
-export interface ManagedGjcTurnRunner {
+/** Managed implementation of the supported GjcTurnRunner surface. */
+export interface ManagedGjcTurnRunner extends GjcTurnRunner {
 	readonly operations: ManagedSessionOperations;
 	create(input: ManagedRunnerStartInput): Promise<GjcTurnResult>;
 	resume(input: ManagedLifecycleInput): Promise<unknown>;
 	continue(input: ManagedRunnerContinueInput): Promise<GjcTurnResult>;
-	continueSession(input: ManagedRunnerContinueInput): Promise<GjcTurnResult>;
+	continueSession(input: GjcContinueSessionInput): Promise<GjcTurnResult>;
 	control(input: ManagedRunnerGateInput | ManagedRunnerContinueInput): Promise<GjcControlResult>;
 	gate(input: ManagedRunnerGateInput): Promise<GjcTurnResult>;
-	respondWorkflowGate(input: ManagedRunnerGateInput): Promise<GjcTurnResult>;
+	respondWorkflowGate(input: GjcRespondWorkflowGateInput): Promise<GjcTurnResult>;
 	cancel(input: GjcCancelTurnInput & { readonly authority: ManagedTurnAuthority }): Promise<void>;
-	cancelTurn(input: GjcCancelTurnInput & { readonly authority: ManagedTurnAuthority }): Promise<void>;
+	cancelTurn(input: GjcCancelTurnInput): Promise<void>;
 	closePreflight(input: ManagedRunnerCloseInput): Promise<unknown>;
-	getState(input: ManagedRunnerStateInput): Promise<GjcSessionState>;
-	getAvailableModels(input: ManagedRunnerStateInput): Promise<readonly unknown[]>;
-	withLifecyclePublication?<T>(
-		_address: GjcLifecyclePublicationAddress,
+	getState(input: GjcSessionStateInput): Promise<GjcSessionState>;
+	getAvailableModels(input: GjcSessionStateInput): Promise<readonly unknown[]>;
+	switchSession(input: GjcSwitchSessionInput): Promise<void>;
+	withLifecyclePublication<T>(
+		address: GjcLifecyclePublicationAddress,
 		effect: (lifecycle: GjcLifecycleTransaction) => Promise<T>,
 	): Promise<T>;
-	withLifecycleClosePreflight?<T>(
-		_address: GjcLifecyclePublicationAddress,
+	withLifecycleClosePreflight<T>(
+		address: GjcLifecyclePublicationAddress,
 		effect: (lifecycle: GjcLifecycleTransaction) => Promise<T>,
 	): Promise<T>;
-	startNewSession?<T>(
-		input: ManagedRunnerStartInput,
-		publish: (result: GjcSessionAddress & GjcTurnResult) => Promise<T>,
-		beforePrompt: (address: GjcSessionAddress) => Promise<void>,
+	startNewSession<T>(
+		input: GjcStartNewSessionInput,
+		publish: (result: GjcSessionAddress & GjcTurnResult, lifecycle: GjcLifecycleTransaction) => Promise<T>,
+		beforePrompt: (
+			address: GjcSessionAddress,
+			attachment: SessionAttachmentProof,
+			lifecycle: GjcLifecycleTransaction,
+		) => Promise<void>,
+		onFailure?: (lifecycle: GjcLifecycleTransaction, error: unknown) => Promise<void>,
 	): Promise<T>;
 	startManagedSession<T>(
 		input: GjcStartNewSessionInput & { readonly preparedManagedAuthority: ManagedPreparedTurnAuthority },
@@ -108,8 +114,13 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 		resume: input => operations.resume(input),
 		continue: async input =>
 			withManagedProof(await operations.followUp(turnInput(input, "turn.follow_up")), input.authority),
-		continueSession: async input =>
-			withManagedProof(await operations.followUp(turnInput(input, "turn.follow_up")), input.authority),
+		continueSession: async input => {
+			const authority = managedAuthorityFor(input, "turn.follow_up");
+			return withManagedProof(
+				await operations.followUp(turnInput({ ...input, authority }, "turn.follow_up")),
+				authority,
+			);
+		},
 		async control(input) {
 			if ("gateId" in input) return { result: await operations.answerGate(gateInput(input)) };
 			return {
@@ -124,8 +135,10 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 			};
 		},
 		gate: async input => withManagedProof(await operations.answerGate(gateInput(input)), input.authority),
-		respondWorkflowGate: async input =>
-			withManagedProof(await operations.answerGate(gateInput(input)), input.authority),
+		respondWorkflowGate: async input => {
+			const authority = managedAuthorityFor(input, "workflow.gate_answer");
+			return withManagedProof(await operations.answerGate(gateInput({ ...input, authority })), authority);
+		},
 		async cancel(input) {
 			await operations.abort({
 				authority: input.authority,
@@ -134,46 +147,38 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 			});
 		},
 		async cancelTurn(input) {
+			const authority = managedAuthorityForCancel(input);
 			await operations.abort({
-				authority: input.authority,
+				authority,
 				operation: "turn.abort",
-				idempotencyKey: input.authority.requestKey,
+				idempotencyKey: authority.requestKey,
 			});
 		},
 		closePreflight: input => operations.close({ authority: input.authority, target: input.target }),
 		async getState(input) {
-			await operations.getState(input.authority);
+			const authority = managedAuthorityFor(input, "session.state");
+			await operations.getState(authority);
 			return {
 				...(input.sessionFile === undefined ? {} : { sessionFile: input.sessionFile }),
 				rawFrameCursor: 0,
 				eventCursor: 0,
-				managedProof: managedProof(input.authority),
+				managedProof: managedProof(authority),
+				managedAuthority: authority,
 			};
 		},
-		getAvailableModels: input => operations.getModels(input.authority),
-		async startNewSession(input, publish, beforePrompt) {
-			const lifecycle = await operations.create({
-				authority: input.preparedManagedAuthority,
-				target: { path: input.cwd },
-			});
-			const authority: ManagedTurnAuthority = {
-				...input.preparedManagedAuthority,
-				sessionId: lifecycle.tenant.sessionId,
-				generation: lifecycle.tenant.generation,
-			};
-			const address = {
-				cwd: input.cwd,
-				sessionRoot: input.sessionRoot,
-				projectId: input.projectId,
-				chatId: input.chatId,
-				sessionId: authority.sessionId,
-			};
-			await beforePrompt(address);
-			const result = withManagedProof(
-				await operations.prompt(turnInput({ ...input, authority }, "turn.prompt")),
+		getAvailableModels: input => operations.getModels(managedAuthorityFor(input, "models.list/current")),
+		async switchSession(input) {
+			const authority = managedAuthorityFor(input, "session.resume");
+			const resumed = await operations.resume({
 				authority,
-			);
-			return await publish({ ...address, ...result });
+				target: { sessionIdOrPrefix: authority.sessionId, path: input.cwd },
+			});
+			assertResumedExactAuthority(resumed, authority);
+		},
+		withLifecyclePublication: async (address, effect) => effect(managedLifecycleTransaction(address)),
+		withLifecycleClosePreflight: async (address, effect) => effect(managedLifecycleTransaction(address)),
+		async startNewSession(_input, _publish, _beforePrompt, _onFailure) {
+			throw new Error("Managed GJC runner rejects the legacy startNewSession entry point.");
 		},
 		async startManagedSession(input, publish, beforePrompt, onFailure) {
 			const lifecycleResult = await operations.create({
@@ -216,7 +221,7 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 
 function managedLifecycleTransaction(
 	address: GjcLifecyclePublicationAddress,
-	authority: ManagedTurnAuthority,
+	authority?: ManagedTurnAuthority,
 ): GjcLifecycleTransaction {
 	const owner = {};
 	return {
@@ -229,7 +234,11 @@ function managedLifecycleTransaction(
 			throw new Error("Managed lifecycle cannot publish legacy attachment authority.");
 		},
 		async publishManaged(proof, write) {
-			if (proof.sessionId !== authority.sessionId || proof.generation !== authority.generation)
+			if (
+				proof.sessionId !== address.sessionId ||
+				(authority !== undefined &&
+					(proof.sessionId !== authority.sessionId || proof.generation !== authority.generation))
+			)
 				throw new Error("Managed lifecycle publication proof changed.");
 			return write();
 		},
@@ -240,6 +249,61 @@ function managedLifecycleTransaction(
 			throw new Error("Managed successor handoff uses public lifecycle fork authority.");
 		},
 	};
+}
+
+function managedAuthorityFor(
+	input: {
+		readonly managedAuthority?: ManagedTurnAuthority;
+		readonly cwd: string;
+		readonly projectId: string;
+		readonly chatId: string;
+		readonly sessionId: string;
+		readonly principalId?: string;
+	},
+	operation: string,
+): ManagedTurnAuthority {
+	const authority = input.managedAuthority;
+	if (authority === undefined) throw new Error(`Managed ${operation} requires persisted managed authority.`);
+	if (
+		authority.projectId !== input.projectId ||
+		authority.chatId !== input.chatId ||
+		authority.sessionId !== input.sessionId ||
+		authority.canonicalWorkspace !== resolve(input.cwd) ||
+		(input.principalId !== undefined && authority.principalId !== input.principalId)
+	)
+		throw new Error(`Managed ${operation} authority does not exactly match the session address.`);
+	return authority;
+}
+
+function managedAuthorityForCancel(input: GjcCancelTurnInput): ManagedTurnAuthority {
+	const authority = input.managedAuthority;
+	if (authority === undefined) throw new Error("Managed turn.abort requires persisted managed authority.");
+	if (
+		authority.projectId !== input.projectId ||
+		authority.chatId !== input.chatId ||
+		(input.sessionId !== undefined && authority.sessionId !== input.sessionId) ||
+		(input.principalId !== undefined && authority.principalId !== input.principalId)
+	)
+		throw new Error("Managed turn.abort authority does not exactly match the cancellation address.");
+	return authority;
+}
+
+function assertResumedExactAuthority(
+	resumed: Awaited<ReturnType<ManagedSessionOperations["resume"]>>,
+	authority: ManagedTurnAuthority,
+): void {
+	const tenant = resumed.tenant;
+	if (
+		tenant.principalId !== authority.principalId ||
+		tenant.projectId !== authority.projectId ||
+		tenant.canonicalWorkspace !== authority.canonicalWorkspace ||
+		tenant.chatId !== authority.chatId ||
+		tenant.sessionId !== authority.sessionId ||
+		tenant.generation !== authority.generation ||
+		tenant.leaseId !== authority.leaseId ||
+		tenant.epoch !== authority.epoch
+	)
+		throw new Error("Managed session.resume changed exact managed authority.");
 }
 
 function turnInput(
@@ -299,6 +363,3 @@ function managedProof(authority: ManagedTurnAuthority) {
 function withManagedProof(result: GjcTurnResult, authority: ManagedTurnAuthority): GjcTurnResult {
 	return { ...result, managedProof: managedProof(authority), managedAuthority: authority };
 }
-
-// Keeps the import contract visible to the eventual routing cutover without wiring it today.
-export type ManagedControlInput = LiveGatewayRunnerInput;

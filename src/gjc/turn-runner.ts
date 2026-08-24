@@ -109,17 +109,21 @@ export interface GjcContinueSessionInput extends GjcSessionAddress, GjcLifecycle
 	readonly observer?: GjcTurnEventObserver;
 	readonly signal?: AbortSignal;
 	readonly principalId?: string;
+	/** Persisted managed authority. It is distinct from new-session prepared authority. */
+	readonly managedAuthority?: ManagedTurnAuthority;
 	readonly onDispatch?: () => void;
 }
 
 export interface GjcSwitchSessionInput extends GjcSessionAddress, GjcLifecycleScoped {
 	readonly sessionFile?: string;
 	readonly recoveryAttachment?: SessionAttachmentProof;
+	readonly managedAuthority?: ManagedTurnAuthority;
 }
 
 export interface GjcSessionStateInput extends GjcSessionAddress, GjcLifecycleScoped {
 	readonly sessionFile?: string;
 	readonly recoveryAttachment?: SessionAttachmentProof;
+	readonly managedAuthority?: ManagedTurnAuthority;
 }
 
 export interface GjcRespondWorkflowGateInput extends GjcSessionAddress, GjcLifecycleScoped {
@@ -139,6 +143,7 @@ export interface GjcRespondWorkflowGateInput extends GjcSessionAddress, GjcLifec
 	readonly observer?: GjcTurnEventObserver;
 	readonly signal?: AbortSignal;
 	readonly principalId?: string;
+	readonly managedAuthority?: ManagedTurnAuthority;
 	readonly onDispatch?: () => void;
 }
 
@@ -171,6 +176,7 @@ export interface GjcCancelTurnInput {
 	readonly sessionId?: string;
 	readonly operationId?: string;
 	readonly principalId?: string;
+	readonly managedAuthority?: ManagedTurnAuthority;
 }
 
 export class GjcTurnCancelledError extends Error {

@@ -84,7 +84,7 @@ export function createGjcRoutingLiveGatewayRunner(
 			}
 			// A persisted managed authority is all-or-nothing. Legacy mappings are deliberately
 			// separate; once a mapping declares managed routing, missing tenant facts fail closed.
-			if (existing !== undefined) managedAuthorityForGateway(turn, existing);
+			const managedAuthority = existing === undefined ? undefined : managedAuthorityForGateway(turn, existing);
 			const priorProvisional = scopedMappings.provisionalOperation(turn.chatId, turn.userMessageId);
 			if (
 				priorProvisional !== undefined &&
@@ -275,6 +275,7 @@ export function createGjcRoutingLiveGatewayRunner(
 						...(turn.preparedManagedAuthority === undefined
 							? {}
 							: { preparedManagedAuthority: turn.preparedManagedAuthority }),
+						...(managedAuthority === undefined ? {} : { managedAuthority }),
 						...(modelSelection === undefined ? {} : { modelSelection }),
 					});
 					reassignmentStarted = false;
@@ -331,6 +332,7 @@ export function createGjcRoutingLiveGatewayRunner(
 				...(turn.preparedManagedAuthority === undefined
 					? {}
 					: { preparedManagedAuthority: turn.preparedManagedAuthority }),
+				...(managedAuthority === undefined ? {} : { managedAuthority }),
 				onObservedTurn: async event => {
 					if (event.type !== "agent_failed") markActivityStarted();
 					if (isNativeLifecycleEvent(event.type)) observedNativeLifecycle = true;
