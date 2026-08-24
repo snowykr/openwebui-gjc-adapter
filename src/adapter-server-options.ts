@@ -26,10 +26,11 @@ import { readSessionAuthorityV3ActiveMarker } from "./gjc/session-authority-v3-a
 import { loadGjcSessionFile } from "./gjc/session-loader";
 import { FileBackedSessionMappingStore, type SessionMapping, SessionMappingStore } from "./gjc/session-router";
 import { V3FileBackedSessionMappingStore } from "./gjc/session-v3-file-backed-mapping-store";
-import type { GjcCloseReceipt } from "./gjc/turn-runner";
+import type { GjcCloseReceipt, ManagedPreparedTurnAuthority, ManagedTurnAuthority } from "./gjc/turn-runner";
 import type { LiveGatewayEventSink, LiveGatewayMessageSink } from "./live/chat-completions";
 import type { LiveGatewayFileContextResolver } from "./live/file-contexts";
 import { createGjcIdleSessionReaper } from "./live/gjc-idle-session-reaper";
+import { createManagedModelReaderFactory } from "./live/gjc-managed-model-reader";
 import type { ManagedSdkRuntimeDependency, ManagedSdkTenantFence } from "./live/gjc-routing-lifecycle";
 import {
 	createGjcRoutingLiveGatewayRunner,
@@ -416,20 +417,25 @@ export async function buildResolvedAdapterServerOptions(
 				...(managedSdkTenantFence === undefined ? {} : { managedSdkTenantFence }),
 				sessionPortFactory: dependencies.sessionPortFactory,
 			});
+		const managedModelRuntime = activeManagedV3Runtime?.runtime ?? managedBootstrapDependencies?.runtime;
 		const modelReaderFactory =
-			dependencies.modelReaderFactory ??
-			createModelReaderFactory({
-				cliPath,
-				runtimeLocations: config.runtimeLocations,
-				resolveAttachment:
-					dependencies.resolveModelAttachment ??
-					createPublicSdkModelAttachmentResolver({
-						cliPath,
-						cwd: config.runtimeLocations.readerWorkspace,
-						childEnvironment: config.runtimeLocations.childEnvironment,
-					}),
-				sessionPortFactory: dependencies.sessionPortFactory,
-			});
+			managedModelRuntime === undefined
+				? dependencies.turnRunner === undefined
+					? undefined
+					: (dependencies.modelReaderFactory ??
+						createModelReaderFactory({
+							cliPath,
+							runtimeLocations: config.runtimeLocations,
+							resolveAttachment:
+								dependencies.resolveModelAttachment ??
+								createPublicSdkModelAttachmentResolver({
+									cliPath,
+									cwd: config.runtimeLocations.readerWorkspace,
+									childEnvironment: config.runtimeLocations.childEnvironment,
+								}),
+							sessionPortFactory: dependencies.sessionPortFactory,
+						}))
+				: createManagedReaderFactory(managedModelRuntime, config.turnTimeoutMs);
 		const closeSession = createAdapterSessionCloser(
 			config,
 			cliPath,
@@ -711,6 +717,54 @@ export async function buildResolvedAdapterServerOptions(
 		}
 		throw startupError;
 	}
+}
+
+function createManagedReaderFactory(runtime: ManagedSdkRuntime, timeoutMs: number): ModelReaderFactory {
+	return async (context, signal) => {
+		const authority = context?.managedAuthority;
+		if (authority === undefined)
+			throw new Error("Managed model catalog access requires explicit tenant or temporary service authority.");
+		if (isManagedTurnAuthority(authority)) {
+			return createManagedModelReaderFactory({
+				runtime,
+				resolveAttachment: async () => ({
+					tenant: {
+						principalId: authority.principalId,
+						projectId: authority.projectId,
+						canonicalWorkspace: authority.canonicalWorkspace,
+						chatId: authority.chatId,
+						sessionId: authority.sessionId,
+						generation: authority.generation,
+						leaseId: authority.leaseId,
+						epoch: authority.epoch,
+					},
+				}),
+			})(context, signal);
+		}
+		if (context?.lease === undefined)
+			throw new Error("Managed temporary model catalog access requires a workspace lease fence.");
+		return createManagedModelReaderFactory({
+			runtime,
+			temporary: {
+				...authority,
+				assertFence: () => context.lease!.assertFence(),
+				timeoutMs,
+			},
+		})(context, signal);
+	};
+}
+
+function isManagedTurnAuthority(
+	authority: ManagedTurnAuthority | ManagedPreparedTurnAuthority,
+): authority is ManagedTurnAuthority {
+	return (
+		"sessionId" in authority &&
+		typeof authority.sessionId === "string" &&
+		authority.sessionId.length > 0 &&
+		typeof authority.generation === "number" &&
+		Number.isSafeInteger(authority.generation) &&
+		authority.generation > 0
+	);
 }
 
 async function assertActiveManagedV3TenantFence(

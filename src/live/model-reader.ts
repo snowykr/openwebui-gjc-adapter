@@ -3,6 +3,7 @@ import type { GjcRuntimeLocations } from "../contracts";
 import { snapshotPublishedSdkEndpointGenerations } from "../gjc/public-sdk-attachment";
 import type { PublicSdkSessionAttachment, PublicSdkSessionPort } from "../gjc/public-sdk-contract";
 import { PublicSdkSessionClient } from "../gjc/public-sdk-session-port";
+import type { ManagedPreparedTurnAuthority, ManagedTurnAuthority } from "../gjc/turn-runner";
 import { GjcTurnCancelledError } from "../gjc/turn-runner";
 import type { OpenWebUIPrincipal } from "../openwebui/auth";
 import type { UserWorkspace } from "../security/user-workspace";
@@ -18,6 +19,8 @@ export interface ModelReader {
 /** Request scope used to bind normal-user model readers to one leased workspace. */
 export interface ModelReaderContext {
 	readonly principal: OpenWebUIPrincipal;
+	/** Credential-free authority for the exact managed tenant or a one-shot managed catalog session. */
+	readonly managedAuthority?: ManagedTurnAuthority | ManagedPreparedTurnAuthority;
 	/** Durable user workspace. Required for normal-user readers. */
 	readonly workspace?: UserWorkspace;
 	/** Lease fence proving exclusive access to the workspace. Required for normal-user readers. */

@@ -86,6 +86,13 @@ export function createGjcRoutingLiveGatewayRunner(
 			// A persisted managed authority is all-or-nothing. Legacy mappings are deliberately
 			// separate; once a mapping declares managed routing, missing tenant facts fail closed.
 			const managedAuthority = existing === undefined ? undefined : managedAuthorityForGateway(turn, existing);
+			const modelReaderTurn =
+				managedAuthority === undefined
+					? turn
+					: {
+							...turn,
+							modelReaderContext: managedModelReaderContextForGateway(turn, managedAuthority),
+						};
 			const priorProvisional = scopedMappings.provisionalOperation(turn.chatId, turn.userMessageId);
 			if (
 				priorProvisional !== undefined &&
@@ -251,7 +258,9 @@ export function createGjcRoutingLiveGatewayRunner(
 			}
 			if (gateReplyResult !== null) return withCanonicalModel(gateReplyResult, boundSelection);
 			const modelSelection =
-				requestedModelId === undefined ? undefined : await resolveNormalSelection(input, turn, requestedModelId);
+				requestedModelId === undefined
+					? undefined
+					: await resolveNormalSelection(input, modelReaderTurn, requestedModelId);
 
 			if (turn.onLiveEvents === undefined) beginReassignment();
 			if (turn.onLiveEvents === undefined) {
@@ -429,7 +438,8 @@ export function managedAuthorityForGateway(
 		authority.canonicalWorkspace !== resolve(turn.project.cwd) ||
 		authority.chatId !== turn.chatId ||
 		authority.sessionId !== mapping.sessionId ||
-		authority.requestKey !== turn.userMessageId ||
+		typeof authority.requestKey !== "string" ||
+		authority.requestKey.length === 0 ||
 		typeof authority.generation !== "number" ||
 		!Number.isSafeInteger(authority.generation) ||
 		authority.generation <= 0 ||
@@ -440,6 +450,24 @@ export function managedAuthorityForGateway(
 	)
 		throw new Error("Managed session mapping lacks exact principal, generation, lease, epoch, or request authority.");
 	return authority as ManagedTurnAuthority;
+}
+
+/** Adds only persisted, identity-checked tenant authority to continuation catalog reads. */
+function managedModelReaderContextForGateway(
+	turn: LiveGatewayRunnerInput,
+	authority: ManagedTurnAuthority,
+): NonNullable<LiveGatewayRunnerInput["modelReaderContext"]> {
+	const context = turn.modelReaderContext;
+	if (
+		context === undefined ||
+		context.principal.userId !== authority.principalId ||
+		context.principal.role !== "user" ||
+		context.workspace === undefined ||
+		resolve(context.workspace.root) !== authority.canonicalWorkspace ||
+		context.lease === undefined
+	)
+		throw new Error("Managed continuation model reader lacks exact principal, workspace, and lease authority.");
+	return { ...context, managedAuthority: authority };
 }
 
 /** Validates admission-derived authority without inventing a session generation. */

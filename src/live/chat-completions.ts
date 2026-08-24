@@ -307,6 +307,7 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 							principal,
 							workspace,
 							...(leaseAdmission === undefined ? {} : { lease: leaseAdmission }),
+							...(preparedManagedAuthority === undefined ? {} : { managedAuthority: preparedManagedAuthority }),
 							correlationId: `${headers.chatId}:${headers.userMessageId}`,
 						},
 					}),
