@@ -17,7 +17,6 @@ COPY --from=bun-runtime /usr/local/bin/bun /opt/bun/bin/bun
 WORKDIR /opt/openwebui-gjc-adapter
 
 COPY package.json bun.lock ./
-COPY vendor/gajae-code-coding-agent-e3b3a76a590081ded16214a1188857524d40e701-8ba25005.tgz vendor/gajae-code-coding-agent-e3b3a76a590081ded16214a1188857524d40e701-8ba25005.tgz
 RUN bun install --frozen-lockfile --production \
     && gjc_version="$(bun --no-env-file --config=/dev/null ./node_modules/.bin/gjc --version)" \
     && gjc_version="${gjc_version#gjc/}" \

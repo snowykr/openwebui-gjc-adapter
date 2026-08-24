@@ -7,7 +7,7 @@
       "dependencies": {
         "@gajae-code/ai": "0.15.0",
         "@gajae-code/bridge-client": "0.13.3",
-        "@gajae-code/coding-agent": "file:vendor/gajae-code-coding-agent-e3b3a76a590081ded16214a1188857524d40e701-8ba25005.tgz",
+        "@gajae-code/coding-agent": "https://raw.githubusercontent.com/snowykr/openwebui-gjc-adapter/c09e31dc85c514cffaf7e44827b47d311620c49f/vendor/gajae-code-coding-agent-e3b3a76a590081ded16214a1188857524d40e701-8ba25005.tgz",
         "@gajae-code/natives": "0.15.0",
       },
       "devDependencies": {
@@ -66,7 +66,7 @@
 
     "@gajae-code/bridge-client": ["@gajae-code/bridge-client@0.13.3", "", {}, "sha512-vo9BsoZcZekvSJomTa4jj+tamejOxUWV+BAvjrefSKTGmZzOxHKNmwerD7ByNjktSzZQ+sMqcHjyHc9IuItkUQ=="],
 
-    "@gajae-code/coding-agent": ["@gajae-code/coding-agent@vendor/gajae-code-coding-agent-e3b3a76a590081ded16214a1188857524d40e701-8ba25005.tgz", { "dependencies": { "@agentclientprotocol/sdk": "1.3.0", "@babel/parser": "^7.29.3", "@gajae-code/agent-core": "0.15.0", "@gajae-code/ai": "0.15.0", "@gajae-code/natives": "0.15.0", "@gajae-code/stats": "0.15.0", "@gajae-code/tui": "0.15.0", "@gajae-code/utils": "0.15.0", "@mozilla/readability": "^0.6.0", "@puppeteer/browsers": "^2.13.0", "@types/turndown": "5.0.6", "@xterm/headless": "^6.0.0", "chalk": "^5.6.2", "diff": "^9.0.0", "fflate": "0.8.2", "handlebars": "^4.7.9", "linkedom": "^0.18.12", "lru-cache": "11.3.6", "marked": "18.0.6", "markit-ai": "0.5.3", "puppeteer-core": "^24.42.0", "turndown": "7.2.4", "turndown-plugin-gfm": "1.0.2", "zod": "4.4.3" }, "bin": { "gjc": "bin/gjc.js", "가재씨": "bin/gajaessi.js" } }, "sha512-C5wDGvy2KOf+0DQKmo+q7Gi0y8XvUYjgXCZv03lGt+3zd+HPDPjz/Ll/cb6rf6FZPv+tY2AeqqymRlVYjz4HLA=="],
+    "@gajae-code/coding-agent": ["@gajae-code/coding-agent@https://raw.githubusercontent.com/snowykr/openwebui-gjc-adapter/c09e31dc85c514cffaf7e44827b47d311620c49f/vendor/gajae-code-coding-agent-e3b3a76a590081ded16214a1188857524d40e701-8ba25005.tgz", { "dependencies": { "@agentclientprotocol/sdk": "1.3.0", "@babel/parser": "^7.29.3", "@gajae-code/agent-core": "0.15.0", "@gajae-code/ai": "0.15.0", "@gajae-code/natives": "0.15.0", "@gajae-code/stats": "0.15.0", "@gajae-code/tui": "0.15.0", "@gajae-code/utils": "0.15.0", "@mozilla/readability": "^0.6.0", "@puppeteer/browsers": "^2.13.0", "@types/turndown": "5.0.6", "@xterm/headless": "^6.0.0", "chalk": "^5.6.2", "diff": "^9.0.0", "fflate": "0.8.2", "handlebars": "^4.7.9", "linkedom": "^0.18.12", "lru-cache": "11.3.6", "marked": "18.0.6", "markit-ai": "0.5.3", "puppeteer-core": "^24.42.0", "turndown": "7.2.4", "turndown-plugin-gfm": "1.0.2", "zod": "4.4.3" }, "bin": { "gjc": "bin/gjc.js", "가재씨": "bin/gajaessi.js" } }, "sha512-C5wDGvy2KOf+0DQKmo+q7Gi0y8XvUYjgXCZv03lGt+3zd+HPDPjz/Ll/cb6rf6FZPv+tY2AeqqymRlVYjz4HLA=="],
 
     "@gajae-code/natives": ["@gajae-code/natives@0.15.0", "", { "optionalDependencies": { "@gajae-code/natives-darwin-arm64": "0.15.0", "@gajae-code/natives-darwin-x64": "0.15.0", "@gajae-code/natives-linux-arm64": "0.15.0", "@gajae-code/natives-linux-x64": "0.15.0", "@gajae-code/natives-win32-x64": "0.15.0" } }, "sha512-R9VQi9xk5GjdTln5cM+dSs/xLNnAGEa8qsHfetZs/UQsuIdiuZqzjnVrm7QZP0Zfmx64nkX1XsEPr4MllEPCeg=="],
 

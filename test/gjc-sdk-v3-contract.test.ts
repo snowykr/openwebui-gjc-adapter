@@ -461,7 +461,7 @@ describe("latest dev SDK v3 transport contract", () => {
 			import: "./src/gjc/public-sdk-contract.ts",
 		});
 		expect(Reflect.get(Reflect.get(manifest, "dependencies"), "@gajae-code/coding-agent")).toBe(
-			"file:vendor/gajae-code-coding-agent-e3b3a76a590081ded16214a1188857524d40e701-8ba25005.tgz",
+			"https://raw.githubusercontent.com/snowykr/openwebui-gjc-adapter/c09e31dc85c514cffaf7e44827b47d311620c49f/vendor/gajae-code-coding-agent-e3b3a76a590081ded16214a1188857524d40e701-8ba25005.tgz",
 		);
 		expect(Reflect.get(manifest, "patchedDependencies")).toBeUndefined();
 		expect(await Bun.file(join(root, "patches", "@gajae-code%2Fcoding-agent@0.10.0.patch")).exists()).toBe(false);

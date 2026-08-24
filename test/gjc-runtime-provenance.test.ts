@@ -10,6 +10,7 @@ const BRIDGE_CLIENT_VERSION = "0.13.3";
 const CODING_AGENT_DEV_COMMIT = "e3b3a76a590081ded16214a1188857524d40e701";
 const CODING_AGENT_ARTIFACT_NAME = `gajae-code-coding-agent-${CODING_AGENT_DEV_COMMIT}-8ba25005.tgz`;
 const CODING_AGENT_ARTIFACT_PATH = `vendor/${CODING_AGENT_ARTIFACT_NAME}`;
+const CODING_AGENT_ARTIFACT_URL = `https://raw.githubusercontent.com/snowykr/openwebui-gjc-adapter/c09e31dc85c514cffaf7e44827b47d311620c49f/${CODING_AGENT_ARTIFACT_PATH}`;
 const CODING_AGENT_ARTIFACT_SHA256 = "8ba25005471c66871842cddefcdb98c0118ab26c3890b58f1f93665da524f4cb";
 const BUN_IMAGE_DIGEST = "sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4";
 const PYTHON_IMAGE_DIGEST = "sha256:8a7e7cc04fd3e2bd787f7f24e22d5d119aa590d429b50c95dfe12b3abe52f48b";
@@ -36,7 +37,7 @@ describe("GJC SDK runtime provenance", () => {
 
 		for (const packageName of ["@gajae-code/ai", "@gajae-code/natives"])
 			expect(Reflect.get(dependencies, packageName)).toBe(GJC_VERSION);
-		expect(Reflect.get(dependencies, "@gajae-code/coding-agent")).toBe(`file:${CODING_AGENT_ARTIFACT_PATH}`);
+		expect(Reflect.get(dependencies, "@gajae-code/coding-agent")).toBe(CODING_AGENT_ARTIFACT_URL);
 		expect(Reflect.get(dependencies, "@gajae-code/bridge-client")).toBe(BRIDGE_CLIENT_VERSION);
 		const artifact = Bun.file(join(ROOT, CODING_AGENT_ARTIFACT_PATH));
 		expect(await artifact.exists()).toBe(true);
@@ -58,7 +59,7 @@ describe("GJC SDK runtime provenance", () => {
 		const dockerfile = await Bun.file(join(ROOT, "Dockerfile.adapter")).text();
 
 		expect(dockerfile).toContain("COPY package.json bun.lock ./");
-		expect(dockerfile).toContain(`COPY ${CODING_AGENT_ARTIFACT_PATH} ${CODING_AGENT_ARTIFACT_PATH}`);
+		expect(dockerfile).not.toContain(`COPY ${CODING_AGENT_ARTIFACT_PATH} ${CODING_AGENT_ARTIFACT_PATH}`);
 		expect(dockerfile).toContain("bun install --frozen-lockfile --production");
 		expect(dockerfile).toContain(
 			'gjc_version="$(bun --no-env-file --config=/dev/null ./node_modules/.bin/gjc --version)"',
@@ -82,7 +83,7 @@ describe("GJC SDK runtime provenance", () => {
 		const changelog = await Bun.file(join(ROOT, "CHANGELOG.md")).text();
 
 		for (const document of [readme, changelog]) {
-			expect(document).toContain(CODING_AGENT_ARTIFACT_PATH);
+			expect(document).toContain(CODING_AGENT_ARTIFACT_URL);
 			expect(document).toContain(CODING_AGENT_DEV_COMMIT);
 			expect(document).toContain(CODING_AGENT_ARTIFACT_SHA256);
 			expect(document).toContain("not the registry 0.15.0 tarball");
