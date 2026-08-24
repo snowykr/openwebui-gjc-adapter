@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { WorkspaceLeaseManager } from "../src/security/workspace-lease";
+import { parseWorkspaceLeaseId, WorkspaceLeaseManager, workspaceLeaseId } from "../src/security/workspace-lease";
 
 const SAFE_KEY = "a".repeat(64);
 
@@ -78,6 +78,60 @@ async function withForeignProcessUid<T>(operation: () => Promise<T>): Promise<T>
 }
 
 describe("durable workspace leases", () => {
+	test("encodes and parses a canonical credential-free lease fence identifier", () => {
+		const reference = {
+			safeKey: SAFE_KEY,
+			holderId: "managed-holder-42",
+			generation: 7,
+			operation: "cold-resume",
+		} as const;
+		const identifier = workspaceLeaseId(reference);
+
+		expect(identifier).toBe(workspaceLeaseId({ ...reference }));
+		expect(parseWorkspaceLeaseId(identifier)).toEqual(reference);
+		expect(workspaceLeaseId(parseWorkspaceLeaseId(identifier))).toBe(identifier);
+		expect(identifier).not.toContain("raw-user-id");
+		expect(identifier).not.toContain("secret-value");
+		expect(identifier).not.toContain("/users/alice/workspace");
+	});
+
+	test("rejects malformed, non-canonical, unknown, and unsafe lease identifiers", () => {
+		const reference = {
+			safeKey: SAFE_KEY,
+			holderId: "holder-a",
+			generation: 1,
+			operation: "turn",
+		};
+		const identifier = workspaceLeaseId(reference);
+		const encode = (value: unknown) => `wsl.${Buffer.from(JSON.stringify(value)).toString("base64url")}`;
+
+		for (const candidate of [
+			"",
+			"wsl.",
+			"wsl.not+base64",
+			`${identifier}a`,
+			encode({ ...reference, v: 2 }),
+			encode({ v: 1, ...reference, unexpected: true }),
+			encode({ v: 1, ...reference, safeKey: "unsafe" }),
+			encode({ v: 1, ...reference, holderId: "holder\u0000a" }),
+			encode({ v: 1, ...reference, generation: 0 }),
+			encode({ v: 1, ...reference, operation: "TURN" }),
+		]) {
+			expect(() => parseWorkspaceLeaseId(candidate)).toThrow();
+		}
+	});
+
+	test("distinguishes every lease fence component", () => {
+		const base = { safeKey: SAFE_KEY, holderId: "holder-a", generation: 1, operation: "turn" } as const;
+		const identifiers = new Set([
+			workspaceLeaseId(base),
+			workspaceLeaseId({ ...base, holderId: "holder-b" }),
+			workspaceLeaseId({ ...base, generation: 2 }),
+			workspaceLeaseId({ ...base, operation: "control" }),
+		]);
+		expect(identifiers.size).toBe(4);
+	});
+
 	test("uses a safe lock path outside user workspace roots and private records", async () => {
 		const { manager, stateRoot } = await createManager();
 		const lockPath = manager.lockPath(SAFE_KEY);
