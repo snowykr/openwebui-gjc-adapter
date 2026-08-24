@@ -593,6 +593,7 @@ function toRecord(
 		operationHash: intent.operationHash,
 		requestHash: intent.requestHash,
 		payloadHash: intent.payloadHash,
+		operationId: intent.stableKey,
 		session: { sessionId: intent.sessionId, observedAt: intent.observedAt },
 		projection: {
 			rawFrameCursor: intent.rawFrameCursor,

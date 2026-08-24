@@ -1,9 +1,13 @@
 import { createHash } from "node:crypto";
+import { isAbsolute, relative, resolve } from "node:path";
+import type { NormalizedModelSelection } from "../contracts";
 import {
 	assertManagedLifecycleTransition,
 	isManagedLifecycleState,
 	type ManagedLifecycleState,
 } from "./managed-lifecycle-state";
+import { isEvent, isNormalizedModelSelection } from "./session-authority-operation-validation";
+import type { GjcTurnEvent } from "./turn-runner";
 
 export const MANAGED_SESSION_AUTHORITY_EPOCH = "gjc-public-sdk-v015-managed/1" as const;
 
@@ -19,6 +23,12 @@ const RECORD_KEYS = [
 	"operationHash",
 	"requestHash",
 	"payloadHash",
+	"sessionFile",
+	"projectSessionRoot",
+	"operationId",
+	"assistantText",
+	"events",
+	"modelSelection",
 	"session",
 	"projection",
 	"lifecycle",
@@ -27,7 +37,7 @@ const SESSION_KEYS = ["sessionId", "observedAt"] as const;
 const PROJECTION_KEYS = ["rawFrameCursor", "eventCursor", "activeLeaf"] as const;
 const LIFECYCLE_KEYS = ["state", "recordedAt"] as const;
 const MIGRATION_DIGEST_KEYS = ["sourceDigest", "backupDigest", "walDigest", "targetManifestDigest"] as const;
-const MIGRATION_ITEM_KEYS = ["identity", "status", "reason"] as const;
+const MIGRATION_ITEM_KEYS = ["identity", "status", "reason", "intent"] as const;
 const MIGRATION_CHECKPOINT_KEYS = [
 	"authorityEpoch",
 	"digests",
@@ -44,13 +54,21 @@ export interface ManagedSessionAuthorityTenant {
 	readonly sessionId: string;
 }
 
-/** Credential-free evidence only; no attachment, endpoint, descriptor, process, or payload is retained. */
+/** Credential-free evidence only; no attachment, endpoint, descriptor, tmux/process data, or opaque attachment is retained. */
 export interface ManagedSessionAuthorityRecord extends ManagedSessionAuthorityTenant {
 	readonly authorityEpoch: typeof MANAGED_SESSION_AUTHORITY_EPOCH;
 	readonly generation: number;
 	readonly operationHash: string;
 	readonly requestHash: string;
 	readonly payloadHash: string;
+	/** Canonical transcript path, once discovered. It is bounded by the workspace default or registered root evidence. */
+	readonly sessionFile?: string;
+	/** Canonical registered project root when it differs from canonicalWorkspace/.gjc/sessions. */
+	readonly projectSessionRoot?: string;
+	readonly operationId: string;
+	readonly assistantText?: string;
+	readonly events?: readonly GjcTurnEvent[];
+	readonly modelSelection?: NormalizedModelSelection;
 	readonly session: Readonly<{
 		readonly sessionId: string;
 		readonly observedAt: string;
@@ -84,6 +102,20 @@ export interface ManagedSessionAuthorityMigrationRecord {
 	readonly identity: string;
 	readonly status: ManagedSessionAuthorityMigrationStatus;
 	readonly reason?: string;
+	/** Generation-free replay/mapping evidence copied from v2; never read from a session JSONL. */
+	readonly intent?: ManagedSessionAuthorityMigrationIntent;
+}
+
+export interface ManagedSessionAuthorityMigrationIntent extends ManagedSessionAuthorityTenant {
+	readonly sessionFile: string;
+	readonly projectSessionRoot?: string;
+	readonly operationId: string;
+	readonly assistantText?: string;
+	readonly events?: readonly GjcTurnEvent[];
+	readonly modelSelection?: NormalizedModelSelection;
+	readonly rawFrameCursor: number;
+	readonly eventCursor: number;
+	readonly activeLeaf?: string;
 }
 
 /** A serializable, inactive migration checkpoint. The flags remain false until a later atomic activator owns them. */
@@ -107,6 +139,15 @@ export interface LegacyManagedSessionAuthorityEvidence {
 		readonly canonicalWorkspace?: string;
 		readonly chatId?: string;
 		readonly sessionId?: string;
+		readonly sessionFile?: string;
+		readonly projectSessionRoot?: string;
+		readonly operationId?: string;
+		readonly assistantText?: string;
+		readonly events?: readonly GjcTurnEvent[];
+		readonly modelSelection?: NormalizedModelSelection;
+		readonly rawFrameCursor?: number;
+		readonly eventCursor?: number;
+		readonly activeLeaf?: string;
 		readonly status?: "quarantined" | "active_generation_proven" | "retired";
 	}>[];
 }
@@ -124,6 +165,17 @@ export function isManagedSessionAuthorityRecord(value: unknown): value is Manage
 		!isTenant(value) ||
 		!isPositiveGeneration(value.generation) ||
 		!hashes(value.operationHash, value.requestHash, value.payloadHash)
+	)
+		return false;
+	if (
+		!isCanonicalAbsolutePath(value.canonicalWorkspace) ||
+		(value.sessionFile !== undefined &&
+			!isCanonicalSessionPath(value.canonicalWorkspace, value.sessionFile, value.projectSessionRoot)) ||
+		(value.sessionFile === undefined && value.projectSessionRoot !== undefined) ||
+		!isNonEmptyString(value.operationId) ||
+		(value.assistantText !== undefined && typeof value.assistantText !== "string") ||
+		(value.events !== undefined && (!Array.isArray(value.events) || !value.events.every(isCredentialFreeEvent))) ||
+		(value.modelSelection !== undefined && !isNormalizedModelSelection(value.modelSelection))
 	)
 		return false;
 	if (
@@ -172,6 +224,8 @@ export function copyManagedSessionAuthorityRecord(
 	const parsed = isManagedSessionAuthorityRecord(record) ? record : parseManagedSessionAuthorityRecord(record);
 	return {
 		...parsed,
+		...(parsed.events === undefined ? {} : { events: copyEvents(parsed.events) }),
+		...(parsed.modelSelection === undefined ? {} : { modelSelection: { ...parsed.modelSelection } }),
 		session: { ...parsed.session },
 		projection: { ...parsed.projection },
 		lifecycle: { ...parsed.lifecycle },
@@ -193,6 +247,9 @@ export function managedSessionAuthorityIdentity(record: ManagedSessionAuthorityR
 			operationHash: valid.operationHash,
 			requestHash: valid.requestHash,
 			payloadHash: valid.payloadHash,
+			...(valid.sessionFile === undefined ? {} : { sessionFile: valid.sessionFile }),
+			...(valid.projectSessionRoot === undefined ? {} : { projectSessionRoot: valid.projectSessionRoot }),
+			operationId: valid.operationId,
 		}),
 	);
 }
@@ -290,7 +347,10 @@ export function copyManagedSessionAuthorityMigrationCheckpoint(
 	return {
 		...valid,
 		digests: { ...valid.digests },
-		records: valid.records.map(record => ({ ...record })),
+		records: valid.records.map(record => ({
+			...record,
+			...(record.intent === undefined ? {} : { intent: copyMigrationIntent(record.intent) }),
+		})),
 	};
 }
 
@@ -327,7 +387,12 @@ export function planManagedSessionAuthorityMigration(
 				status: "migration_blocked",
 				reason: "legacy retired label lacks positive exact-generation evidence",
 			};
-		return { identity, status: record.status === "quarantined" ? "quarantined" : "intent_prepared" };
+		const intent = legacyMigrationIntent(record);
+		return {
+			identity,
+			status: record.status === "quarantined" ? "quarantined" : "intent_prepared",
+			...(intent === undefined ? {} : { intent }),
+		};
 	});
 	const planned: ManagedSessionAuthorityMigrationCheckpoint = {
 		authorityEpoch: MANAGED_SESSION_AUTHORITY_EPOCH,
@@ -359,6 +424,12 @@ function canonicalRecord(record: ManagedSessionAuthorityRecord): ManagedSessionA
 		operationHash: record.operationHash,
 		requestHash: record.requestHash,
 		payloadHash: record.payloadHash,
+		...(record.sessionFile === undefined ? {} : { sessionFile: record.sessionFile }),
+		...(record.projectSessionRoot === undefined ? {} : { projectSessionRoot: record.projectSessionRoot }),
+		operationId: record.operationId,
+		...(record.assistantText === undefined ? {} : { assistantText: record.assistantText }),
+		...(record.events === undefined ? {} : { events: copyEvents(record.events) }),
+		...(record.modelSelection === undefined ? {} : { modelSelection: { ...record.modelSelection } }),
 		session: { sessionId: record.session.sessionId, observedAt: record.session.observedAt },
 		projection: {
 			rawFrameCursor: record.projection.rawFrameCursor,
@@ -394,7 +465,8 @@ function isMigrationRecord(value: unknown): value is ManagedSessionAuthorityMigr
 		["intent_prepared", "migration_blocked", "quarantined", "active_generation_proven", "retired"].includes(
 			value.status as string,
 		) &&
-		(value.reason === undefined || isNonEmptyString(value.reason))
+		(value.reason === undefined || isNonEmptyString(value.reason)) &&
+		(value.intent === undefined || isMigrationIntent(value.intent))
 	);
 }
 
@@ -405,18 +477,152 @@ function legacyIdentity(record: LegacyManagedSessionAuthorityEvidence["records"]
 
 function isLegacyEvidenceRecord(value: unknown): value is LegacyManagedSessionAuthorityEvidence["records"][number] {
 	return (
-		hasOnlyKeys(value, ["principalId", "projectId", "canonicalWorkspace", "chatId", "sessionId", "status"]) &&
+		hasOnlyKeys(value, [
+			"principalId",
+			"projectId",
+			"canonicalWorkspace",
+			"chatId",
+			"sessionId",
+			"sessionFile",
+			"projectSessionRoot",
+			"operationId",
+			"assistantText",
+			"events",
+			"modelSelection",
+			"rawFrameCursor",
+			"eventCursor",
+			"activeLeaf",
+			"status",
+		]) &&
 		(value.principalId === undefined || typeof value.principalId === "string") &&
 		(value.projectId === undefined || typeof value.projectId === "string") &&
 		(value.canonicalWorkspace === undefined || typeof value.canonicalWorkspace === "string") &&
 		(value.chatId === undefined || typeof value.chatId === "string") &&
 		(value.sessionId === undefined || typeof value.sessionId === "string") &&
+		(value.sessionFile === undefined || typeof value.sessionFile === "string") &&
+		(value.projectSessionRoot === undefined || typeof value.projectSessionRoot === "string") &&
+		(value.operationId === undefined || typeof value.operationId === "string") &&
+		(value.assistantText === undefined || typeof value.assistantText === "string") &&
+		(value.events === undefined || (Array.isArray(value.events) && value.events.every(isCredentialFreeEvent))) &&
+		(value.modelSelection === undefined || isNormalizedModelSelection(value.modelSelection)) &&
+		(value.rawFrameCursor === undefined || isNonnegativeSafeInteger(value.rawFrameCursor)) &&
+		(value.eventCursor === undefined || isNonnegativeSafeInteger(value.eventCursor)) &&
+		(value.activeLeaf === undefined || isNonEmptyString(value.activeLeaf)) &&
 		(value.status === undefined ||
 			["quarantined", "active_generation_proven", "retired"].includes(value.status as string))
 	);
 }
 
-function isTenant(value: Record<string, unknown>): boolean {
+function legacyMigrationIntent(
+	record: LegacyManagedSessionAuthorityEvidence["records"][number],
+): ManagedSessionAuthorityMigrationIntent | undefined {
+	if (
+		!isTenant(record) ||
+		!isCanonicalSessionPath(record.canonicalWorkspace, record.sessionFile, record.projectSessionRoot) ||
+		!isNonEmptyString(record.operationId) ||
+		!isNonnegativeSafeInteger(record.rawFrameCursor) ||
+		!isNonnegativeSafeInteger(record.eventCursor)
+	)
+		return undefined;
+	return {
+		principalId: record.principalId!,
+		projectId: record.projectId!,
+		canonicalWorkspace: record.canonicalWorkspace!,
+		chatId: record.chatId!,
+		sessionId: record.sessionId!,
+		sessionFile: record.sessionFile!,
+		...(record.projectSessionRoot === undefined ? {} : { projectSessionRoot: record.projectSessionRoot }),
+		operationId: record.operationId!,
+		...(record.assistantText === undefined ? {} : { assistantText: record.assistantText }),
+		...(record.events === undefined ? {} : { events: copyEvents(record.events) }),
+		...(record.modelSelection === undefined ? {} : { modelSelection: { ...record.modelSelection } }),
+		rawFrameCursor: record.rawFrameCursor,
+		eventCursor: record.eventCursor,
+		...(record.activeLeaf === undefined ? {} : { activeLeaf: record.activeLeaf }),
+	};
+}
+
+function isMigrationIntent(value: unknown): value is ManagedSessionAuthorityMigrationIntent {
+	if (
+		!hasOnlyKeys(value, [
+			"principalId",
+			"projectId",
+			"canonicalWorkspace",
+			"chatId",
+			"sessionId",
+			"sessionFile",
+			"projectSessionRoot",
+			"operationId",
+			"assistantText",
+			"events",
+			"modelSelection",
+			"rawFrameCursor",
+			"eventCursor",
+			"activeLeaf",
+		])
+	)
+		return false;
+	return (
+		isTenant(value) &&
+		isCanonicalSessionPath(value.canonicalWorkspace, value.sessionFile, value.projectSessionRoot) &&
+		isNonEmptyString(value.operationId) &&
+		(value.assistantText === undefined || typeof value.assistantText === "string") &&
+		(value.events === undefined || (Array.isArray(value.events) && value.events.every(isCredentialFreeEvent))) &&
+		(value.modelSelection === undefined || isNormalizedModelSelection(value.modelSelection)) &&
+		isNonnegativeSafeInteger(value.rawFrameCursor) &&
+		isNonnegativeSafeInteger(value.eventCursor) &&
+		(value.activeLeaf === undefined || isNonEmptyString(value.activeLeaf))
+	);
+}
+
+function copyMigrationIntent(intent: ManagedSessionAuthorityMigrationIntent): ManagedSessionAuthorityMigrationIntent {
+	return {
+		...intent,
+		...(intent.events === undefined ? {} : { events: copyEvents(intent.events) }),
+		...(intent.modelSelection === undefined ? {} : { modelSelection: { ...intent.modelSelection } }),
+	};
+}
+
+function copyEvents(events: readonly GjcTurnEvent[]): GjcTurnEvent[] {
+	return events.map(event => ({
+		...event,
+		...(event.payload === undefined ? {} : { payload: structuredClone(event.payload) }),
+	}));
+}
+
+function isCredentialFreeEvent(value: unknown): value is GjcTurnEvent {
+	return isEvent(value) && !containsForbiddenField(value);
+}
+
+function containsForbiddenField(value: unknown): boolean {
+	if (Array.isArray(value)) return value.some(containsForbiddenField);
+	if (value === null || typeof value !== "object") return false;
+	return Object.entries(value).some(
+		([key, child]) => /(?:attachment|descriptor|endpoint|token|tmux|pid)/i.test(key) || containsForbiddenField(child),
+	);
+}
+
+function isCanonicalSessionPath(workspace: unknown, sessionFile: unknown, projectSessionRoot: unknown): boolean {
+	if (!isCanonicalAbsolutePath(workspace) || !isCanonicalAbsolutePath(sessionFile)) return false;
+	if (projectSessionRoot !== undefined && !isCanonicalAbsolutePath(projectSessionRoot)) return false;
+	const root = (projectSessionRoot as string | undefined) ?? resolve(workspace, ".gjc", "sessions");
+	const pathFromRoot = relative(root, sessionFile as string);
+	return pathFromRoot.length > 0 && !pathFromRoot.startsWith("..") && !isAbsolute(pathFromRoot);
+}
+
+function isCanonicalAbsolutePath(value: unknown): value is string {
+	return typeof value === "string" && isNonEmptyString(value) && isAbsolute(value) && resolve(value) === value;
+}
+
+function isTenant(
+	value: Readonly<{
+		principalId?: unknown;
+		projectId?: unknown;
+		canonicalWorkspace?: unknown;
+		chatId?: unknown;
+		sessionId?: unknown;
+	}>,
+): boolean {
 	return [value.principalId, value.projectId, value.canonicalWorkspace, value.chatId, value.sessionId].every(
 		isNonEmptyString,
 	);

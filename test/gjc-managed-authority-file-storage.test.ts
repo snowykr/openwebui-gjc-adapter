@@ -95,6 +95,8 @@ function authorityRecord(): ManagedSessionAuthorityRecord {
 		chatId: "chat",
 		sessionId: "session",
 		generation: 1,
+		sessionFile: "/workspace/project/.gjc/sessions/session.jsonl",
+		operationId: "operation",
 		operationHash: hash,
 		requestHash: hash,
 		payloadHash: hash,

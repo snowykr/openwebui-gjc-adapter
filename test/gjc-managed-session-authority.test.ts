@@ -29,6 +29,14 @@ const evidence: LegacyManagedSessionAuthorityEvidence = {
 			canonicalWorkspace: "/work/project-1",
 			chatId: "chat-1",
 			sessionId: "session-1",
+			sessionFile: "/work/project-1/.gjc/sessions/session-1.jsonl",
+			operationId: "operation-1",
+			assistantText: "Completed.",
+			events: [{ type: "assistant", id: "message-1", text: "Completed.", payload: { sequence: 1 } }],
+			modelSelection: { provider: "openai", modelId: "gpt-5", thinkingLevel: "low" },
+			rawFrameCursor: 1,
+			eventCursor: 2,
+			activeLeaf: "message-1",
 		},
 	],
 };
@@ -47,6 +55,11 @@ function record(
 		operationHash: digest("1"),
 		requestHash: digest("2"),
 		payloadHash: digest("3"),
+		sessionFile: "/work/project-1/.gjc/sessions/session-1.jsonl",
+		operationId: "operation-1",
+		assistantText: "Completed.",
+		events: [{ type: "assistant", id: "message-1", text: "Completed.", payload: { sequence: 1 } }],
+		modelSelection: { provider: "openai", modelId: "gpt-5", thinkingLevel: "low" },
 		session: { sessionId: "session-1", observedAt: "2026-01-01T00:00:00.000Z" },
 		projection: { rawFrameCursor: 1, eventCursor: 2, activeLeaf: "message-1" },
 		lifecycle: { state, recordedAt: "2026-01-01T00:00:00.000Z" },
@@ -69,13 +82,18 @@ describe("managed session authority", () => {
 				operationHash: digest("1"),
 				requestHash: digest("2"),
 				payloadHash: digest("3"),
+				sessionFile: "/work/project-1/.gjc/sessions/session-1.jsonl",
+				operationId: "operation-1",
+				assistantText: "Completed.",
+				events: original.events,
+				modelSelection: original.modelSelection,
 				session: original.session,
 				projection: original.projection,
 				lifecycle: original.lifecycle,
 			}),
 		);
 		expect(decodeManagedSessionAuthorityRecord(encoded)).toEqual(original);
-		expect(encoded).not.toMatch(/attachment|endpoint|token|descriptor|tmux|pid|payload[^H]/i);
+		expect(encoded).not.toMatch(/attachment|endpoint|token|descriptor|tmux|pid/i);
 	});
 
 	test("rejects credentials, private attachments, undeclared fields, invalid generation, and tenant fences", () => {
@@ -85,12 +103,34 @@ describe("managed session authority", () => {
 			{ ...record(), generation: 0 },
 			{ ...record(), generation: 1.5 },
 			{ ...record(), operationHash: "ABC" },
+			{ ...record(), operationId: "" },
+			{ ...record(), sessionFile: "relative.jsonl" },
+			{ ...record(), sessionFile: "/work/project-1/.gjc/sessions/../outside.jsonl" },
+			{ ...record(), sessionFile: "/work/project-1/private/session.jsonl" },
+			{ ...record(), events: [{ type: "assistant", token: "secret" }] },
+			{ ...record(), modelSelection: { provider: "openai", modelId: "gpt-5", thinkingLevel: "invalid" } },
 			{ ...record(), session: { ...record().session, sessionId: "other-session" } },
 			{ ...record(), lifecycle: { ...record().lifecycle, state: "active" } },
 		]) {
 			expect(isManagedSessionAuthorityRecord(invalid)).toBeFalse();
 			expect(() => parseManagedSessionAuthorityRecord(invalid)).toThrow();
 		}
+	});
+
+	test("accepts only canonical session paths under default or recorded registered roots", () => {
+		const registeredRoot = "/durable/project-1-sessions";
+		const alternateRootRecord = {
+			...record(),
+			projectSessionRoot: registeredRoot,
+			sessionFile: `${registeredRoot}/session-1.jsonl`,
+		};
+		expect(isManagedSessionAuthorityRecord(alternateRootRecord)).toBeTrue();
+		expect(
+			isManagedSessionAuthorityRecord({ ...alternateRootRecord, projectSessionRoot: `${registeredRoot}/..` }),
+		).toBeFalse();
+		expect(
+			isManagedSessionAuthorityRecord({ ...alternateRootRecord, sessionFile: "/durable/other/session-1.jsonl" }),
+		).toBeFalse();
 	});
 
 	test("uses the existing lifecycle transition fence for every state and illegal edge", () => {
@@ -110,6 +150,9 @@ describe("managed session authority", () => {
 		expect(copied).toEqual(original);
 		expect(copied.session).not.toBe(original.session);
 		expect(copied.projection).not.toBe(original.projection);
+		expect(copied.events).not.toBe(original.events);
+		expect(copied.events?.[0]).not.toBe(original.events?.[0]);
+		expect(copied.modelSelection).not.toBe(original.modelSelection);
 		expect(managedSessionAuthorityIdentity(copied)).toBe(managedSessionAuthorityIdentity(original));
 		expect(managedSessionAuthorityHash(copied)).toBe(managedSessionAuthorityHash(original));
 		expect(
@@ -134,6 +177,21 @@ describe("managed session authority", () => {
 				{
 					identity: JSON.stringify(["principal-1", "project-1", "/work/project-1", "chat-1", "session-1"]),
 					status: "intent_prepared",
+					intent: {
+						principalId: "principal-1",
+						projectId: "project-1",
+						canonicalWorkspace: "/work/project-1",
+						chatId: "chat-1",
+						sessionId: "session-1",
+						sessionFile: "/work/project-1/.gjc/sessions/session-1.jsonl",
+						operationId: "operation-1",
+						assistantText: "Completed.",
+						events: [{ type: "assistant", id: "message-1", text: "Completed.", payload: { sequence: 1 } }],
+						modelSelection: { provider: "openai", modelId: "gpt-5", thinkingLevel: "low" },
+						rawFrameCursor: 1,
+						eventCursor: 2,
+						activeLeaf: "message-1",
+					},
 				},
 			],
 			canonicalReplaced: false,
@@ -142,6 +200,9 @@ describe("managed session authority", () => {
 		expect(planManagedSessionAuthorityMigration(evidence, checkpoint)).toEqual(checkpoint);
 		expect(planManagedSessionAuthorityMigration(evidence, checkpoint)).not.toBe(checkpoint);
 		expect(copyManagedSessionAuthorityMigrationCheckpoint(checkpoint)).toEqual(checkpoint);
+		const copiedIntent = copyManagedSessionAuthorityMigrationCheckpoint(checkpoint).records[0]?.intent;
+		expect(copiedIntent).not.toBe(checkpoint.records[0]?.intent);
+		expect(copiedIntent?.events).not.toBe(checkpoint.records[0]?.intent?.events);
 		expect(
 			planManagedSessionAuthorityMigration({
 				...evidence,
