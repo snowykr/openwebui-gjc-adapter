@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
+import { type ActiveManagedV3Runtime, startActiveManagedRuntime } from "./adapter-managed-v3-runtime";
 import type { GjcRuntimeLocations } from "./contracts";
 import type {
 	ManagedAuthorityLifecycleOutcome,
@@ -13,8 +14,20 @@ import {
 } from "./gjc/managed-bootstrap";
 import type { ManagedSdkRuntime, TenantSessionKey } from "./gjc/managed-sdk-runtime";
 import type { LegacyManagedSessionAuthorityEvidence } from "./gjc/managed-session-authority";
+import type {
+	ProvisionalSessionOperation,
+	SessionAuthorityRecord,
+	SessionAuthorityTombstone,
+} from "./gjc/session-authority";
+import {
+	activateSessionAuthorityV3,
+	type SessionAuthorityV3ActivationResult,
+} from "./gjc/session-authority-v3-activation";
+import type { ManagedTurnAuthorityBinding } from "./gjc/session-authority-v3-migration";
 import { validateSessionFile } from "./gjc/session-file";
 import type { SessionMapping, SessionMappingStore } from "./gjc/session-router";
+import { V3FileBackedSessionMappingStore } from "./gjc/session-v3-file-backed-mapping-store";
+import type { ManagedTurnAuthority } from "./gjc/turn-runner";
 import type { RegisteredProject } from "./projects/registry";
 import type { RuntimeSingletonLock } from "./runtime-singleton-lock";
 
@@ -48,6 +61,57 @@ export interface AdapterManagedBootstrap {
 	readonly options: ManagedBootstrapOptions;
 	readonly service: ManagedBootstrapService;
 	start(): Promise<ManagedBootstrapStartResult>;
+}
+
+export type AdapterSessionAuthorityV3Activation =
+	| Readonly<{ status: "blocked"; activation: SessionAuthorityV3ActivationResult }>
+	| Readonly<{
+			status: "activated";
+			activation: SessionAuthorityV3ActivationResult;
+			store: V3FileBackedSessionMappingStore;
+			managed: ActiveManagedV3Runtime;
+	  }>;
+
+/**
+ * Converts an already-open V2 authority directly to canonical V3. This path
+ * only reads durable authority metadata through its mapping store; it never
+ * opens a mapped session file, transcript, or workspace artifact.
+ */
+export async function activateAdapterSessionAuthorityV3(
+	input: AdapterManagedBootstrapInput,
+): Promise<AdapterSessionAuthorityV3Activation> {
+	assertAbsolute(input.locations.agentDir, "agentDir");
+	assertAbsolute(input.locations.stateRoot, "stateRoot");
+	assertAbsolute(input.sourcePath, "sourcePath");
+
+	// An absent source is the one permitted source mutation before activation:
+	// install the canonical empty V2 document, then snapshot it in the V3 activator.
+	await readOrCreateLegacySource(input.sourcePath);
+	const authorities = new Map<string, ManagedBootstrapAuthority>();
+	const bindings = await v3Bindings(input, authorities);
+	if (bindings === undefined)
+		return {
+			status: "blocked",
+			activation: {
+				status: "blocked",
+				canonicalPath: resolve(input.sourcePath),
+				markerPath: `${resolve(input.sourcePath)}.v3-active.json`,
+				reasons: ["A complete managed authority could not be derived for the V2 authority graph."],
+			},
+		};
+	const activation = activateSessionAuthorityV3({
+		canonicalPath: input.sourcePath,
+		stagingRoot: input.locations.stateRoot,
+		bindings,
+	});
+	if (activation.status === "blocked") return { status: "blocked", activation };
+	const store = new V3FileBackedSessionMappingStore(input.sourcePath);
+	const managed = await startActiveManagedRuntime({
+		mappings: store,
+		runtime: input.runtime,
+		liveTenantFence: async key => await tenantFence(input, authorities, key),
+	});
+	return { status: "activated", activation, store, managed };
 }
 
 /**
@@ -126,6 +190,195 @@ async function legacyEvidence(
 		targetManifestDigest: digest(manifestBytes),
 		records,
 	};
+}
+
+/** Internal authority access is deliberately read-only and remains behind the
+ * SessionMappingStore boundary. It is needed because `SessionMapping` omits
+ * V2 journal, reassignment, provisional, and tombstone graph nodes. */
+interface V2AuthorityGraphStore {
+	readonly authority?: Readonly<{
+		recordsIterable(): Iterable<SessionAuthorityRecord>;
+		provisionalEntries(): readonly ProvisionalSessionOperation[];
+	}>;
+}
+
+async function v3Bindings(
+	input: AdapterManagedBootstrapInput,
+	authorities: Map<string, ManagedBootstrapAuthority>,
+): Promise<readonly ManagedTurnAuthorityBinding[] | undefined> {
+	const graph = (input.mappings as unknown as V2AuthorityGraphStore).authority;
+	const visible = [...input.mappings.mappingRecordsIterable()];
+	if (graph === undefined) return visible.length === 0 ? [] : undefined;
+	const candidates = new Map<string, SessionMapping>();
+	const required = new Set<string>();
+	const successorSessions = new Set<string>();
+	for (const record of graph.recordsIterable()) {
+		collectRecord(record, visible, input.configuredOwnerUserId, candidates, required, successorSessions);
+	}
+	for (const provisional of graph.provisionalEntries()) {
+		if (provisional.sessionId === undefined) return undefined;
+		const provisionalMapping: SessionMapping = {
+			...(provisional.managedAuthority === undefined
+				? {}
+				: {
+						principalId: provisional.managedAuthority.principalId,
+						managedAuthority: provisional.managedAuthority,
+					}),
+			chatId: provisional.chatId,
+			projectId: provisional.projectId,
+			sessionId: provisional.sessionId,
+			...(provisional.sessionFile === undefined ? {} : { sessionFile: provisional.sessionFile }),
+			rawFrameCursor: 0,
+			eventCursor: 0,
+			operationId: provisional.id,
+			...(provisional.attachment === undefined ? {} : { attachment: provisional.attachment }),
+		};
+		collectCandidate(provisionalMapping, visible, input.configuredOwnerUserId, candidates);
+		collectOperationIdentities(provisional, required, successorSessions);
+		required.add(identityKey(provisionalMapping));
+	}
+	const bindings: ManagedTurnAuthorityBinding[] = [];
+	for (const [identity, mapping] of candidates) {
+		const prepared = await prepare(input, mapping, authorities);
+		if (prepared === undefined || !(await preparedFence(input, authorities, prepared.intent))) return undefined;
+		const resumed = await resumeExternal(input.runtime, prepared.intent);
+		if (resumed === undefined) return undefined;
+		const managedAuthority: ManagedTurnAuthority = Object.freeze({
+			principalId: prepared.intent.principalId,
+			projectId: prepared.intent.projectId,
+			canonicalWorkspace: prepared.intent.canonicalWorkspace,
+			chatId: prepared.intent.chatId,
+			sessionId: resumed.sessionId,
+			generation: resumed.generation,
+			leaseId: prepared.intent.leaseId,
+			epoch: prepared.intent.epoch,
+			requestKey: prepared.intent.stableKey,
+		});
+		bindings.push({
+			chatId: mapping.chatId,
+			projectId: mapping.projectId,
+			sessionId: mapping.sessionId,
+			managedAuthority,
+		});
+		if (identity !== identityKey(mapping)) return undefined;
+	}
+	const bound = new Set(bindings.map(binding => identityKey(binding)));
+	const successorCounts = new Map<string, number>();
+	for (const binding of bindings)
+		successorCounts.set(binding.sessionId, (successorCounts.get(binding.sessionId) ?? 0) + 1);
+	return [...required].every(identity => bound.has(identity)) &&
+		[...successorSessions].every(sessionId => successorCounts.get(sessionId) === 1)
+		? bindings
+		: undefined;
+}
+
+function collectRecord(
+	record: SessionAuthorityRecord,
+	visible: readonly SessionMapping[],
+	owner: string,
+	candidates: Map<string, SessionMapping>,
+	required: Set<string>,
+	successorSessions: Set<string>,
+): void {
+	collectCandidate(record, visible, owner, candidates);
+	required.add(identityKey(record));
+	collectOperationIdentities(record, required, successorSessions);
+	const reassignment = record.reassignment;
+	if (reassignment?.sourceTombstone !== undefined)
+		collectTombstone(reassignment.sourceTombstone, visible, owner, candidates, required, successorSessions);
+	if (reassignment?.priorTombstone !== undefined)
+		collectTombstone(reassignment.priorTombstone, visible, owner, candidates, required, successorSessions);
+}
+
+function collectTombstone(
+	tombstone: SessionAuthorityTombstone,
+	visible: readonly SessionMapping[],
+	owner: string,
+	candidates: Map<string, SessionMapping>,
+	required: Set<string>,
+	successorSessions: Set<string>,
+): void {
+	collectCandidate(tombstone, visible, owner, candidates);
+	required.add(identityKey(tombstone));
+	collectOperationIdentities(tombstone, required, successorSessions);
+	if (tombstone.prior !== undefined)
+		collectTombstone(tombstone.prior, visible, owner, candidates, required, successorSessions);
+}
+
+function collectOperationIdentities(
+	value: Pick<SessionAuthorityRecord, "journal"> | ProvisionalSessionOperation,
+	required: Set<string>,
+	successorSessions: Set<string>,
+): void {
+	const operations = "journal" in value ? value.journal : [value];
+	for (const operation of operations) {
+		if (operation.result !== undefined) required.add(identityKey(operation.result.mapping));
+		if (operation.acknowledgedSuccessor !== undefined)
+			successorSessions.add(operation.acknowledgedSuccessor.sessionId);
+	}
+}
+
+function collectCandidate(
+	value: Pick<
+		SessionMapping,
+		| "chatId"
+		| "projectId"
+		| "sessionId"
+		| "sessionFile"
+		| "operationId"
+		| "rawFrameCursor"
+		| "eventCursor"
+		| "attachment"
+		| "activeLeaf"
+	>,
+	visible: readonly SessionMapping[],
+	owner: string,
+	candidates: Map<string, SessionMapping>,
+): void {
+	const matching = visible.find(
+		mapping =>
+			mapping.projectId === value.projectId &&
+			mapping.sessionId === value.sessionId &&
+			(mapping.chatId === value.chatId || JSON.stringify([mapping.principalId, mapping.chatId]) === value.chatId),
+	);
+	const principalId = matching?.principalId ?? (matching?.chatId === value.chatId ? owner : undefined);
+	if (principalId === undefined) return;
+	const mapping: SessionMapping = { ...value, principalId };
+	const key = identityKey(mapping);
+	const current = candidates.get(key);
+	if (current === undefined) candidates.set(key, mapping);
+	else if (current.sessionFile !== mapping.sessionFile || current.attachment !== mapping.attachment)
+		candidates.delete(key);
+}
+
+async function resumeExternal(
+	runtime: ManagedSdkRuntime,
+	intent: ManagedAuthorityPreparedRebindIntent,
+): Promise<Readonly<{ sessionId: string; generation: number }> | undefined> {
+	try {
+		const response = await runtime.resumeExternalLifecycleSession({
+			actor: { namespace: "openwebui-gjc-adapter", id: intent.principalId },
+			capability: "session.resume",
+			requestKey: intent.stableKey,
+			target: { sessionIdOrPrefix: intent.sessionId, path: intent.canonicalWorkspace },
+		} as never);
+		const external = response as unknown as { kind?: unknown; outcome?: { ok?: unknown; result?: unknown } };
+		const outcome = external.kind === "result" ? external.outcome : response;
+		const result = outcome as { ok?: unknown; result?: { sessionId?: unknown; endpointGeneration?: unknown } };
+		if (
+			result.ok !== true ||
+			result.result?.sessionId !== intent.sessionId ||
+			!positive(result.result.endpointGeneration)
+		)
+			return undefined;
+		return { sessionId: intent.sessionId, generation: result.result.endpointGeneration };
+	} catch {
+		return undefined;
+	}
+}
+
+function identityKey(value: Pick<SessionMapping, "chatId" | "projectId" | "sessionId">): string {
+	return JSON.stringify([value.chatId, value.projectId, value.sessionId]);
 }
 
 async function readOrCreateLegacySource(sourcePath: string): Promise<Buffer> {

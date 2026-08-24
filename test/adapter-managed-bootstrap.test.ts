@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createAdapterManagedBootstrap } from "../src/adapter-managed-bootstrap";
+import { activateAdapterSessionAuthorityV3, createAdapterManagedBootstrap } from "../src/adapter-managed-bootstrap";
 import type { SessionMapping } from "../src/gjc/session-router";
 import type { RegisteredProject } from "../src/projects/registry";
 
@@ -37,6 +37,57 @@ function mapping(principalId: string | undefined, sessionFile: string, workspace
 }
 
 describe("adapter managed bootstrap composition", () => {
+	test("activates an absent authority as an empty canonical V3 store without reading session files", async () => {
+		const root = await mkdtemp(join(tmpdir(), "adapter-managed-v3-empty-"));
+		const sourcePath = join(root, "authority.v2.json");
+		const runtime = {
+			state: "new",
+			start: async () => {},
+			dispose: async () => {},
+			reconcile: async () => {},
+			registerTenant: () => {},
+			acquireAttachment: async () => ({ attachment: { isCurrent: () => true } }),
+			generationStatus: async () => ({ status: "current" }),
+		} as never;
+		const result = await activateAdapterSessionAuthorityV3({
+			locations: { agentDir: root, stateRoot: root },
+			configuredOwnerUserId: "owner",
+			mappings: { mappingRecordsIterable: function* () {} },
+			sourcePath,
+			runtimeLock: { release: async () => {} } as never,
+			authority: { resolve: async () => undefined },
+			runtime,
+			lifecycle: {} as never,
+		});
+		expect(result.status).toBe("activated");
+		if (result.status !== "activated") return;
+		expect(result.store.mappingRecords()).toEqual([]);
+		await result.managed.dispose();
+	});
+
+	test("blocks incomplete V2 graph authority before touching canonical source bytes", async () => {
+		const root = await mkdtemp(join(tmpdir(), "adapter-managed-v3-blocked-"));
+		const sourcePath = join(root, "authority.v2.json");
+		const bytes = '{"kind":"openwebui-gjc-session-authority","version":2,"mappings":[]}\n';
+		await writeFile(sourcePath, bytes);
+		const result = await activateAdapterSessionAuthorityV3({
+			locations: { agentDir: root, stateRoot: root },
+			configuredOwnerUserId: "owner",
+			mappings: {
+				mappingRecordsIterable: function* () {
+					yield { chatId: "chat", projectId: "project", sessionId: "session" } as SessionMapping;
+				},
+			},
+			sourcePath,
+			runtimeLock: { release: async () => {} } as never,
+			authority: { resolve: async () => undefined },
+			runtime: {} as never,
+			lifecycle: {} as never,
+		});
+		expect(result.status).toBe("blocked");
+		expect(await Bun.file(sourcePath).text()).toBe(bytes);
+	});
+
 	test("derives deterministic owner-fallback evidence from mapping metadata without opening routes", async () => {
 		const root = await mkdtemp(join(tmpdir(), "adapter-managed-bootstrap-"));
 		const workspace = join(root, "workspace");
