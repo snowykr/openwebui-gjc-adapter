@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import { isAbsolute, resolve } from "node:path";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, resolve } from "node:path";
 import type { GjcRuntimeLocations } from "./contracts";
 import type {
 	ManagedAuthorityLifecycleOutcome,
@@ -59,7 +59,6 @@ export function createAdapterManagedBootstrap(input: AdapterManagedBootstrapInpu
 	assertAbsolute(input.locations.agentDir, "agentDir");
 	assertAbsolute(input.locations.stateRoot, "stateRoot");
 	assertAbsolute(input.sourcePath, "sourcePath");
-	if (input.configuredOwnerUserId.trim().length === 0) throw new TypeError("configuredOwnerUserId is required.");
 
 	const authorityByStableKey = new Map<string, ManagedBootstrapAuthority>();
 	const preparedByIdentity = new Map<string, Readonly<{ intent: ManagedAuthorityPreparedRebindIntent }>>();
@@ -101,7 +100,7 @@ async function legacyEvidence(
 	input: AdapterManagedBootstrapInput,
 	authorities: Map<string, ManagedBootstrapAuthority>,
 ): Promise<LegacyManagedSessionAuthorityEvidence> {
-	const source = await readFile(input.sourcePath);
+	const source = await readOrCreateLegacySource(input.sourcePath);
 	const wal = await readOptional(`${input.sourcePath}.wal`);
 	const records: Array<LegacyManagedSessionAuthorityEvidence["records"][number]> = [];
 	for (const mapping of input.mappings.mappingRecordsIterable()) {
@@ -127,6 +126,21 @@ async function legacyEvidence(
 		targetManifestDigest: digest(manifestBytes),
 		records,
 	};
+}
+
+async function readOrCreateLegacySource(sourcePath: string): Promise<Buffer> {
+	try {
+		return await readFile(sourcePath);
+	} catch (error) {
+		if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
+		const source = Buffer.from('{"kind":"openwebui-gjc-session-authority","version":2,"mappings":[]}\n');
+		await mkdir(dirname(sourcePath), { recursive: true });
+		await writeFile(sourcePath, source, { flag: "wx", mode: 0o600 }).catch(async writeError => {
+			if (!(writeError instanceof Error) || !("code" in writeError) || writeError.code !== "EEXIST")
+				throw writeError;
+		});
+		return await readFile(sourcePath);
+	}
 }
 
 async function prepare(
