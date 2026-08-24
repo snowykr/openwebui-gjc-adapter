@@ -159,7 +159,38 @@ describe("runtime location composition", () => {
 		}
 	});
 
-	test("retains the explicit V2 legacy composition path", async () => {
+	test("activates an empty V2 canonical authority into the managed V3 runtime", async () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-v2-runtime-activation-")));
+		const calls: string[] = [];
+		const runtime = {
+			state: "new",
+			start: async () => void calls.push("runtime-start"),
+			dispose: async () => void calls.push("runtime-dispose"),
+			reconcile: async () => undefined,
+			registerTenant: () => undefined,
+			acquireAttachment: async () => ({ attachment: { isCurrent: () => true } }),
+			generationStatus: async () => ({ status: "current" }),
+		};
+		try {
+			const config = resolvedBuilderConfig(root);
+			mkdirSync(config.sessionRoot);
+			writeFileSync(
+				join(config.sessionRoot, "openwebui-gjc-session-authority.json"),
+				'{"kind":"openwebui-gjc-session-authority","version":2,"mappings":[]}\n',
+			);
+			const options = await buildResolvedAdapterServerOptions(config, { managedSdkRuntime: runtime as never });
+
+			expect(options.routes?.mappings?.constructor.name).toBe("V3FileBackedSessionMappingStore");
+			expect(options.routes?.runner).not.toBeUndefined();
+			expect(calls).toEqual(["runtime-start"]);
+			await options.shutdownCleanup?.();
+			expect(calls).toEqual(["runtime-start", "runtime-dispose"]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("retains the explicit V2 legacy test seam", async () => {
 		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-v2-runtime-regression-")));
 		const mappings = new SessionMappingStore();
 		try {
@@ -169,7 +200,10 @@ describe("runtime location composition", () => {
 				join(config.sessionRoot, "openwebui-gjc-session-authority.json"),
 				'{"kind":"openwebui-gjc-session-authority","version":2}\n',
 			);
-			const options = await buildResolvedAdapterServerOptions(config, { mappings });
+			const options = await buildResolvedAdapterServerOptions(config, {
+				mappings,
+				turnRunner: { stop: async () => undefined } as never,
+			});
 			expect(options.routes?.mappings).toBe(mappings);
 		} finally {
 			rmSync(root, { recursive: true, force: true });

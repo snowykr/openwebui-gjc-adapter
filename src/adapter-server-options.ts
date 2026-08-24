@@ -1,6 +1,8 @@
+import { randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import * as path from "node:path";
 import { createAdapterSessionCloser } from "./adapter-close-options";
+import { activateAdapterSessionAuthorityV3, type ManagedBootstrapAuthorityResolver } from "./adapter-managed-bootstrap";
 import { type ActiveManagedV3Runtime, startActiveManagedRuntime } from "./adapter-managed-v3-runtime";
 import {
 	buildOpenWebUIPrincipalClientFactory,
@@ -19,6 +21,7 @@ import type { ManagedBootstrapRunnerDependencies, ManagedBootstrapService } from
 import { ManagedSdkRuntime, type TenantSessionKey } from "./gjc/managed-sdk-runtime";
 import { probeSessionAuthorityEpoch } from "./gjc/session-authority-epoch";
 import { preflightSessionAuthorityMigrationCandidates } from "./gjc/session-authority-migration";
+import { SESSION_AUTHORITY_V3_EPOCH } from "./gjc/session-authority-v3";
 import { readSessionAuthorityV3ActiveMarker } from "./gjc/session-authority-v3-activation";
 import { loadGjcSessionFile } from "./gjc/session-loader";
 import { FileBackedSessionMappingStore, type SessionMapping, SessionMappingStore } from "./gjc/session-router";
@@ -51,14 +54,19 @@ import type { OpenWebUIProjectionRepository } from "./openwebui/client";
 import type { OpenWebUIPrincipalClient } from "./openwebui/http-client";
 import { projectGjcSessionToOpenWebUIChat } from "./projection/chat-tree";
 import { importProjectedSession } from "./projection/importer";
-import { ProjectLinkService, type SessionCloseResult } from "./projects/link-service";
+import { assertProjectsAdmitted, ProjectLinkService, type SessionCloseResult } from "./projects/link-service";
 import { preflightProjectRegistrationDatabase } from "./projects/registration-preflight";
 import { auditProjectRegistrations, SqliteProjectRegistrationStore } from "./projects/registration-store";
 import { RuntimeSingletonLock } from "./runtime-singleton-lock";
 import { resolveAllowedRoots } from "./security/paths";
 import { createUserWorkspaceRegistry } from "./security/user-workspace";
 import { createWorkspaceCleanupService, type WorkspaceCleanupAuthorityCoordinator } from "./security/workspace-cleanup";
-import { createWorkspaceLeaseManager, parseWorkspaceLeaseId } from "./security/workspace-lease";
+import {
+	createWorkspaceLeaseManager,
+	parseWorkspaceLeaseId,
+	type WorkspaceLease,
+	workspaceLeaseId,
+} from "./security/workspace-lease";
 import {
 	type AdapterServerHandle,
 	type AdapterServerOptions,
@@ -148,6 +156,21 @@ export async function buildResolvedAdapterServerOptions(
 	let managedBootstrap: ManagedBootstrapService | undefined;
 	let managedBootstrapDependencies: ManagedBootstrapRunnerDependencies | undefined;
 	let activeManagedV3Runtime: ActiveManagedV3Runtime | undefined;
+	const migrationLeases: WorkspaceLease[] = [];
+	let migrationLeasesReleased = false;
+	const releaseMigrationLeases = async (): Promise<void> => {
+		if (migrationLeasesReleased) return;
+		migrationLeasesReleased = true;
+		const failures: unknown[] = [];
+		for (const lease of [...migrationLeases].reverse()) {
+			try {
+				await lease.release();
+			} catch (error) {
+				failures.push(error);
+			}
+		}
+		if (failures.length > 0) throw new AggregateError(failures, "Migration workspace lease cleanup failed");
+	};
 	const skipManagedSdkRuntimeStart = dependencies.skipManagedSdkRuntimeStart ?? true;
 	let managedSdkRuntime: ManagedSdkRuntimeDependency | undefined;
 	let managedSdkTenantFence: ManagedSdkTenantFence | undefined;
@@ -190,12 +213,20 @@ export async function buildResolvedAdapterServerOptions(
 		const workspaceLeaseDurationMs = workspaceLeaseDuration(config.turnTimeoutMs);
 		const workspaceLeaseHeartbeatMs = workspaceLeaseHeartbeat(workspaceLeaseDurationMs);
 		const mappingStorePath = path.join(config.sessionRoot, SESSION_MAPPING_STORE_FILE);
+		const explicitLegacyTestSeam =
+			dependencies.turnRunner !== undefined ||
+			dependencies.mappings !== undefined ||
+			dependencies.managedBootstrap !== undefined ||
+			dependencies.createManagedBootstrap !== undefined;
 		const activeV3Marker = readSessionAuthorityV3ActiveMarker(mappingStorePath);
 		const authorityEpoch = probeSessionAuthorityEpoch(mappingStorePath, {
 			...(activeV3Marker === undefined ? {} : { managedDigest: activeV3Marker.canonicalDigest }),
 		});
 		if (authorityEpoch.status === "blocked") throw new Error("Canonical session authority activation is blocked.");
-		if (authorityEpoch.status !== "v3" && dependencies.mappings === undefined && owner.ownerUserId.length > 0) {
+		const previouslyLinkedProjectIdsBeforeConfiguredSeed = new Set(
+			projectStore.listLinkedProjects().map(project => project.id),
+		);
+		if (authorityEpoch.status !== "v3" && !explicitLegacyTestSeam && owner.ownerUserId.length > 0) {
 			const sourcePaths =
 				behavior.sessionAuthorityMigrationSourcePaths ??
 				(config.mode === "managed" ? [path.join("/run/gjc-session", SESSION_MAPPING_STORE_FILE)] : []);
@@ -215,7 +246,16 @@ export async function buildResolvedAdapterServerOptions(
 				detail: `Session authority migration ${migration.status}.`,
 			});
 		}
-		const mappings =
+		if (authorityEpoch.status !== "v3" && !explicitLegacyTestSeam) {
+			await assertProjectsAdmitted(
+				projects,
+				config.runtimeLocations.protectedProjectPaths,
+				protectedProjectRoots,
+				allowedSessionRoots,
+			);
+			projectStore.seedConfiguredProjects(projects);
+		}
+		let mappings: SessionMappingStore =
 			authorityEpoch.status === "v3"
 				? new V3FileBackedSessionMappingStore(mappingStorePath)
 				: (dependencies.mappings ?? new FileBackedSessionMappingStore(mappingStorePath));
@@ -232,6 +272,7 @@ export async function buildResolvedAdapterServerOptions(
 				dependencies.managedSdkRuntime ??
 				dependencies.createManagedSdkRuntime?.(config.runtimeLocations.agentDir) ??
 				new ManagedSdkRuntime({ agentDir: config.runtimeLocations.agentDir });
+			managedSdkRuntime = runtime;
 			activeManagedV3Runtime = await startActiveManagedRuntime({
 				mappings: mappings as V3FileBackedSessionMappingStore,
 				runtime: runtime as ManagedSdkRuntime,
@@ -240,6 +281,79 @@ export async function buildResolvedAdapterServerOptions(
 			});
 			managedSdkRuntime = activeManagedV3Runtime.runtime;
 			managedSdkTenantFence = activeManagedV3Runtime.tenantFence;
+			managedSdkRuntimeHealth.phase = "ready";
+		} else if (!explicitLegacyTestSeam) {
+			const runtime =
+				dependencies.managedSdkRuntime ??
+				dependencies.createManagedSdkRuntime?.(config.runtimeLocations.agentDir) ??
+				new ManagedSdkRuntime({ agentDir: config.runtimeLocations.agentDir });
+			managedSdkRuntime = runtime;
+			const leasesBySafeKey = new Map<string, WorkspaceLease>();
+			let activatedMappings: SessionMappingStore | undefined;
+			const authority: ManagedBootstrapAuthorityResolver = {
+				resolve: async (principalId, projectId) => {
+					const workspace = await workspaceRegistry.resolve(principalId);
+					const project = projectStore?.getProject(projectId);
+					if (
+						workspace === undefined ||
+						project === undefined ||
+						project.status !== "linked" ||
+						path.resolve(project.cwd) !== path.resolve(workspace.root)
+					)
+						return undefined;
+					let lease = leasesBySafeKey.get(workspace.safeKey);
+					if (lease === undefined) {
+						lease = await workspaceLeaseManager.acquire({
+							safeKey: workspace.safeKey,
+							holderId: `session-authority-migration:${randomUUID()}`,
+							operation: "migration",
+							leaseDurationMs: workspaceLeaseDurationMs,
+						});
+						leasesBySafeKey.set(workspace.safeKey, lease);
+						migrationLeases.push(lease);
+					}
+					return {
+						project,
+						canonicalWorkspace: path.resolve(workspace.root),
+						leaseId: workspaceLeaseId(lease),
+						epoch: SESSION_AUTHORITY_V3_EPOCH,
+						assertFence: async () => {
+							await workspaceLeaseManager.assertFence(lease);
+						},
+					};
+				},
+			};
+			const activated = await activateAdapterSessionAuthorityV3({
+				locations: { agentDir: config.runtimeLocations.agentDir, stateRoot: config.statePath },
+				configuredOwnerUserId: owner.ownerUserId,
+				mappings,
+				sourcePath: mappingStorePath,
+				runtimeLock: lock,
+				authority,
+				liveTenantFence: key =>
+					assertActiveManagedV3TenantFence(
+						key,
+						activatedMappings,
+						workspaceRegistry,
+						projectStore,
+						workspaceLeaseManager,
+					),
+				runtime: runtime as ManagedSdkRuntime,
+				lifecycle: runtime as ManagedSdkRuntime,
+			});
+			if (activated.status !== "activated")
+				throw new Error(
+					`Canonical session authority activation is blocked: ${
+						activated.activation.status === "blocked"
+							? (activated.activation.reasons?.join(" ") ?? "migration authority is incomplete")
+							: "activation did not produce a managed V3 authority"
+					}`,
+				);
+			mappings = activated.store;
+			activatedMappings = mappings;
+			activeManagedV3Runtime = activated.managed;
+			managedSdkRuntime = activated.managed.runtime;
+			managedSdkTenantFence = activated.managed.tenantFence;
 			managedSdkRuntimeHealth.phase = "ready";
 		} else {
 			managedBootstrap = dependencies.managedBootstrap ?? dependencies.createManagedBootstrap?.();
@@ -262,7 +376,7 @@ export async function buildResolvedAdapterServerOptions(
 			managedBootstrapDependencies = dependencies;
 			managedSdkRuntime = dependencies.runtime;
 			managedSdkTenantFence = dependencies.tenantFence;
-		} else if (authorityEpoch.status !== "v3") {
+		} else if (authorityEpoch.status !== "v3" && explicitLegacyTestSeam) {
 			managedSdkRuntime =
 				dependencies.managedSdkRuntime ??
 				(dependencies.createManagedSdkRuntime === undefined
@@ -369,7 +483,7 @@ export async function buildResolvedAdapterServerOptions(
 			runtimeLocations: config.runtimeLocations,
 			...(closeSessionForRoutes === undefined ? {} : { closeSession: closeSessionForRoutes }),
 		});
-		const previouslyLinkedProjectIds = new Set(projectLinkService.listLinkedProjects().map(project => project.id));
+		const previouslyLinkedProjectIds = previouslyLinkedProjectIdsBeforeConfiguredSeed;
 		await projectLinkService.seedConfiguredProjects(projects);
 		const projectionSynchronizer: ProjectionSessionSynchronizer = {
 			syncLinkedProject: projectLinkService.syncLinkedProject.bind(projectLinkService),
@@ -456,6 +570,11 @@ export async function buildResolvedAdapterServerOptions(
 			const failures: unknown[] = [];
 			try {
 				if (managedBootstrap === undefined) await disposeManagedSdkRuntime();
+			} catch (error) {
+				failures.push(error);
+			}
+			try {
+				await releaseMigrationLeases();
 			} catch (error) {
 				failures.push(error);
 			}
@@ -573,6 +692,11 @@ export async function buildResolvedAdapterServerOptions(
 		} catch (disposeError) {
 			startupError = appendStartupCleanupError(startupError, disposeError);
 		}
+		try {
+			await releaseMigrationLeases();
+		} catch (releaseError) {
+			startupError = appendStartupCleanupError(startupError, releaseError);
+		}
 		if (internalStore && projectStore !== undefined) {
 			try {
 				projectStore.close();
@@ -591,7 +715,7 @@ export async function buildResolvedAdapterServerOptions(
 
 async function assertActiveManagedV3TenantFence(
 	key: TenantSessionKey,
-	mappings: SessionMappingStore,
+	mappings: SessionMappingStore | undefined,
 	workspaceRegistry: ReturnType<typeof createUserWorkspaceRegistry>,
 	projectStore: SqliteProjectRegistrationStore | undefined,
 	workspaceLeaseManager: ReturnType<typeof createWorkspaceLeaseManager>,
@@ -600,7 +724,7 @@ async function assertActiveManagedV3TenantFence(
 		const lease = parseWorkspaceLeaseId(key.leaseId);
 		const workspace = await workspaceRegistry.resolveBySafeKey(lease.safeKey);
 		const project = projectStore?.getProject(key.projectId);
-		const mapping = mappings.getScoped({ principalId: key.principalId, chatId: key.chatId });
+		const mapping = mappings?.getScoped({ principalId: key.principalId, chatId: key.chatId });
 		const authority = mapping?.managedAuthority;
 		if (
 			workspace === undefined ||
@@ -608,18 +732,19 @@ async function assertActiveManagedV3TenantFence(
 			path.resolve(workspace.root) !== key.canonicalWorkspace ||
 			project?.id !== key.projectId ||
 			project.status !== "linked" ||
-			mapping?.principalId !== key.principalId ||
-			mapping.projectId !== key.projectId ||
-			mapping.sessionId !== key.sessionId ||
-			authority === undefined ||
-			authority.principalId !== key.principalId ||
-			authority.projectId !== key.projectId ||
-			authority.canonicalWorkspace !== key.canonicalWorkspace ||
-			authority.chatId !== key.chatId ||
-			authority.sessionId !== key.sessionId ||
-			authority.generation !== key.generation ||
-			authority.leaseId !== key.leaseId ||
-			authority.epoch !== key.epoch
+			(mappings !== undefined &&
+				(mapping?.principalId !== key.principalId ||
+					mapping.projectId !== key.projectId ||
+					mapping.sessionId !== key.sessionId ||
+					authority === undefined ||
+					authority.principalId !== key.principalId ||
+					authority.projectId !== key.projectId ||
+					authority.canonicalWorkspace !== key.canonicalWorkspace ||
+					authority.chatId !== key.chatId ||
+					authority.sessionId !== key.sessionId ||
+					authority.generation !== key.generation ||
+					authority.leaseId !== key.leaseId ||
+					authority.epoch !== key.epoch))
 		)
 			return false;
 		await workspaceLeaseManager.assertFence(lease);
