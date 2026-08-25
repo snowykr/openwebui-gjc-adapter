@@ -96,6 +96,7 @@ export interface ManagedSessionOperations {
 	): Promise<Readonly<Record<string, unknown>>>;
 	prompt(input: ManagedTurnInput): Promise<GjcTurnResult>;
 	followUp(input: ManagedTurnInput): Promise<GjcTurnResult>;
+	abortAndPrompt(input: ManagedTurnInput): Promise<GjcTurnResult>;
 	answerGate(input: ManagedGateInput): Promise<GjcTurnResult>;
 	abort(input: ManagedRequestInput): Promise<Readonly<Record<string, unknown>>>;
 }
@@ -261,7 +262,7 @@ export function createManagedSessionOperations(runtime: ManagedSdkRuntime): Mana
 		throw new Error(`Managed ${name} query exceeded page bound.`);
 	};
 	const runTurn = async (
-		operation: "turn.prompt" | "turn.follow_up" | "workflow.gate_answer",
+		operation: "turn.prompt" | "turn.follow_up" | "turn.abort_and_prompt" | "workflow.gate_answer",
 		input: ManagedTurnInput | ManagedGateInput,
 	): Promise<GjcTurnResult> => {
 		throwIfAborted(input.signal);
@@ -370,6 +371,7 @@ export function createManagedSessionOperations(runtime: ManagedSdkRuntime): Mana
 			request({ authority, operation: "thinking.set", input: { level: thinkingLevel }, timeoutMs }),
 		prompt: input => runTurn("turn.prompt", input),
 		followUp: input => runTurn("turn.follow_up", input),
+		abortAndPrompt: input => runTurn("turn.abort_and_prompt", input),
 		answerGate: input => runTurn("workflow.gate_answer", input),
 		abort: input => request({ ...input, operation: "turn.abort", input: { mode: "terminal", scope: "turn" } }),
 	};

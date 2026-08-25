@@ -92,6 +92,68 @@ describe("managed turn runner", () => {
 		expect("switch" in runner).toBeFalse();
 	});
 
+	test("returns the ordered managed turn outcome for abort-and-prompt", async () => {
+		const fake = new RunnerRuntime();
+		const runner = createManagedGjcTurnRunner(fake.runtime);
+		const result = await runner.runControl!(managedAbortAndPromptInput(), managedControlMapping(), {} as never);
+		expect(result.result).toMatchObject({
+			text: "done",
+			rawFrameCursor: 2,
+			eventCursor: 2,
+			managedAuthority: authority,
+			managedProof: {
+				kind: "managed-generation",
+				sessionId: authority.sessionId,
+				generation: authority.generation,
+			},
+		});
+		expect(result.result?.events.map(event => event.id)).toEqual(["a", "b"]);
+		expect(fake.requests.map(frame => frame.operation)).toEqual(["turn.abort_and_prompt"]);
+		expect(fake.subscriptionCountAtRequest).toEqual([1]);
+		expect(fake.unsubscribed).toBe(1);
+	});
+
+	test("fails closed on managed abort-and-prompt cancellation or failure", async () => {
+		const cancelled = new RunnerRuntime();
+		const cancellation = new AbortController();
+		cancellation.abort();
+		const cancelledRunner = createManagedGjcTurnRunner(cancelled.runtime);
+		await expect(
+			cancelledRunner.runControl!(
+				managedAbortAndPromptInput(cancellation.signal),
+				managedControlMapping(),
+				{} as never,
+			),
+		).rejects.toMatchObject({ code: "gjc_turn_cancelled" });
+		expect(cancelled.requests).toHaveLength(0);
+
+		const failed = new RunnerRuntime();
+		failed.failAbortAndPrompt = true;
+		const failedRunner = createManagedGjcTurnRunner(failed.runtime);
+		await expect(
+			failedRunner.runControl!(managedAbortAndPromptInput(), managedControlMapping(), {} as never),
+		).rejects.toThrow("abort-and-prompt failure");
+		expect(failed.requests.map(frame => frame.operation)).toEqual(["turn.abort_and_prompt"]);
+		expect(failed.unsubscribed).toBe(1);
+	});
+
+	test("cancels a dispatched managed abort-and-prompt before exposing a result", async () => {
+		const fake = new RunnerRuntime();
+		const cancellation = new AbortController();
+		const runner = createManagedGjcTurnRunner(fake.runtime);
+		await expect(
+			runner.runControl!(
+				managedAbortAndPromptInput(cancellation.signal),
+				managedControlMapping(),
+				{} as never,
+				undefined,
+				() => cancellation.abort(),
+			),
+		).rejects.toMatchObject({ code: "gjc_turn_cancelled" });
+		expect(fake.requests.map(frame => frame.operation)).toEqual(["turn.abort_and_prompt", "turn.abort"]);
+		expect(fake.unsubscribed).toBe(1);
+	});
+
 	test("applies model then thinking selection setters before create and continue dispatch", async () => {
 		const fake = new RunnerRuntime();
 		const runner = createManagedGjcTurnRunner(fake.runtime);
@@ -294,6 +356,34 @@ function address() {
 	};
 }
 
+function managedControlMapping() {
+	return {
+		principalId: authority.principalId,
+		chatId: authority.chatId,
+		projectId: authority.projectId,
+		sessionId: authority.sessionId,
+		rawFrameCursor: 0,
+		eventCursor: 0,
+		operationId: "operation-abort-and-prompt",
+		managedAuthority: authority,
+	} as never;
+}
+
+function managedAbortAndPromptInput(signal?: AbortSignal) {
+	return {
+		project: { cwd: authority.canonicalWorkspace } as never,
+		prompt: "fallback prompt",
+		chatId: authority.chatId,
+		messageId: "message-abort-and-prompt",
+		userMessageId: "message-abort-and-prompt",
+		userMessageParentId: null,
+		continued: true,
+		ownerUserId: authority.principalId,
+		control: { operation: "abort_and_prompt", text: "replacement prompt" },
+		...(signal === undefined ? {} : { signal }),
+	} as never;
+}
+
 class RunnerRuntime {
 	readonly attachment = { isCurrent: () => true };
 	readonly requests: Record<string, unknown>[] = [];
@@ -310,6 +400,7 @@ class RunnerRuntime {
 	unsubscribed = 0;
 	closeCalls = 0;
 	failPrompt = false;
+	failAbortAndPrompt = false;
 	setterFailure: "model.set" | "thinking.set" | undefined;
 	modelSetResult: Readonly<Record<string, unknown>> | undefined;
 	forkResult: { readonly sessionId: string; readonly endpointGeneration: number } = {
@@ -359,10 +450,13 @@ class RunnerRuntime {
 			};
 		}
 		if (frame.operation === "turn.prompt" && this.failPrompt) throw new Error("prompt failure");
+		if (frame.operation === "turn.abort_and_prompt" && this.failAbortAndPrompt)
+			throw new Error("abort-and-prompt failure");
 		options?.onDispatch?.();
 		if (
 			frame.operation === "turn.prompt" ||
 			frame.operation === "turn.follow_up" ||
+			frame.operation === "turn.abort_and_prompt" ||
 			frame.operation === "workflow.gate_answer"
 		) {
 			const active = this.subscriptions.at(-1);

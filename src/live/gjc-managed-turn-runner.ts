@@ -204,6 +204,20 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 					result: withManagedProof(emptyControlResult(), authority),
 				};
 			}
+			if (control.operation === "abort_and_prompt") {
+				const result = await operations.abortAndPrompt({
+					authority,
+					operation: "turn.abort_and_prompt",
+					text: control.text ?? input.prompt,
+					idempotencyKey: authority.requestKey,
+					signal: input.signal,
+					onDispatch,
+				});
+				throwIfAborted(input.signal);
+				await operations.acquire(authority);
+				throwIfAborted(input.signal);
+				return { result: withManagedProof(result, authority) };
+			}
 			const operation = managedControlOperation(control);
 			await operations.request({
 				authority,
