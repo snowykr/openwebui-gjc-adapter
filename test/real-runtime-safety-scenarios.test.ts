@@ -200,6 +200,7 @@ async function createWorkspace(label: string): Promise<string> {
 function runtimeEnv(workspace: string, port: number, projects = ""): Record<string, string | undefined> {
 	return {
 		HOME: path.join(workspace, "home"),
+		GJC_OPENWEBUI_MODE: "existing",
 		GJC_OPENWEBUI_BIND_HOST: "127.0.0.1",
 		GJC_OPENWEBUI_BIND_PORT: String(port),
 		GJC_OPENWEBUI_ADAPTER_API_TOKEN: "adapter-token",

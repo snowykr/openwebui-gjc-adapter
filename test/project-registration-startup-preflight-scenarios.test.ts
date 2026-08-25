@@ -378,6 +378,7 @@ async function makeContext(label: string) {
 function runtimeEnv(root: string, allowedRoot = root): Record<string, string | undefined> {
 	return Object.assign({}, process.env, {
 		HOME: path.join(root, "home"),
+		GJC_OPENWEBUI_MODE: "existing",
 		GJC_OPENWEBUI_STATE_PATH: path.join(root, "state"),
 		GJC_OPENWEBUI_SESSION_ROOT: path.join(root, "sessions"),
 		GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS: allowedRoot,
