@@ -369,7 +369,7 @@ describe("project admin routes", () => {
 			"--",
 			"sh",
 			"-c",
-			`while IFS= read -r line; do if [ "$line" = /exit ]; then printf 'exit\n' >> '${trace}'; rm -f '${descriptor}'; exit; fi; done`,
+			`while IFS= read -r line; do if [ "$line" = /exit ]; then printf 'exit\n' >> '${trace}'; sleep 0.1; rm -f '${descriptor}'; exit; fi; done`,
 		]);
 		if (started.exitCode !== 0) throw new Error(started.stderr);
 		const [tmuxPane, pid] = started.stdout.trim().split("|");
