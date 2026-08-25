@@ -20,7 +20,7 @@ describe("managed session operations", () => {
 		const fake = new FakeRuntime();
 		const operations = createManagedSessionOperations(fake.runtime);
 		await operations.create({ authority: withoutIdentity(), target: { path: authority.canonicalWorkspace } });
-		await operations.resume({ authority: withoutIdentity(), target: { sessionIdOrPrefix: authority.sessionId } });
+		await operations.resume({ authority, target: { sessionIdOrPrefix: authority.sessionId } });
 		await operations.fork({
 			authority,
 			target: { sourceSessionId: authority.sessionId, cwd: authority.canonicalWorkspace },
@@ -123,10 +123,6 @@ class FakeRuntime {
 	status: "retired" | "current" | "unknown" = "current";
 	rejectTenant = false;
 	repeatCursor = false;
-	readonly lifecycleService = {
-		createExternal: (request: Record<string, unknown>) => this.createExternalLifecycleSession(request),
-		resumeExternal: (request: Record<string, unknown>) => this.resumeExternalLifecycleSession(request),
-	};
 	get runtime(): ManagedSdkRuntime {
 		return this as unknown as ManagedSdkRuntime;
 	}
@@ -139,11 +135,11 @@ class FakeRuntime {
 		this.registered.push({ key, outcome });
 		return { tenant: key, generation: authority.generation, attachment: this.attachment };
 	}
-	async createExternalLifecycleSession(request: Record<string, unknown>) {
+	async createPreparedExternalLifecycleSession(_authority: unknown, request: Record<string, unknown>) {
 		this.externalLifecycle.push({ operation: "create", request });
 		return lifecycleSuccess();
 	}
-	async resumeExternalLifecycleSession(request: Record<string, unknown>) {
+	async resumeExternalLifecycleSession(_tenant: unknown, request: Record<string, unknown>) {
 		this.externalLifecycle.push({ operation: "resume", request });
 		return { kind: "result", outcome: lifecycleSuccess() };
 	}

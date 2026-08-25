@@ -80,7 +80,7 @@ export async function connectFor(
 	const deadline = Date.now() + lifecycleDeadlineMs;
 	for (;;) {
 		const attachment = state.router.attachment(sessionId, expectedGeneration);
-		if (attachment !== null && attachment.isCurrent()) return sessionFor(state, attachment);
+		if (attachment?.isCurrent()) return sessionFor(state, attachment);
 		const remaining = deadline - Date.now();
 		if (remaining <= 0)
 			throw new Error(`public SDK Router did not attach ${sessionId} before the lifecycle deadline`);
