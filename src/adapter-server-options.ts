@@ -224,10 +224,9 @@ export async function buildResolvedAdapterServerOptions(
 		// Managed deployment owns the process/runtime lock required for the atomic swap.
 		const mayActivateManagedV3 = config.mode === "managed" && !explicitLegacyTestSeam;
 		const activeV3Marker = readSessionAuthorityV3ActiveMarker(mappingStorePath);
-		const authorityEpoch = probeSessionAuthorityEpoch(mappingStorePath, {
-			...(activeV3Marker === undefined ? {} : { managedDigest: activeV3Marker.canonicalDigest }),
-		});
-		if (authorityEpoch.status === "blocked") throw new Error("Canonical session authority activation is blocked.");
+		const authorityEpoch = probeSessionAuthorityEpoch(mappingStorePath);
+		if (authorityEpoch.status === "blocked" || (authorityEpoch.status === "v3" && activeV3Marker === undefined))
+			throw new Error("Canonical session authority activation is blocked.");
 		const previouslyLinkedProjectIdsBeforeConfiguredSeed = new Set(
 			projectStore.listLinkedProjects().map(project => project.id),
 		);
@@ -260,10 +259,10 @@ export async function buildResolvedAdapterServerOptions(
 			);
 			projectStore.seedConfiguredProjects(projects);
 		}
-		let mappings: SessionMappingStore =
-			authorityEpoch.status === "v3"
-				? new V3FileBackedSessionMappingStore(mappingStorePath)
-				: (dependencies.mappings ?? new FileBackedSessionMappingStore(mappingStorePath));
+		let mappings: SessionMappingStore | undefined;
+		if (authorityEpoch.status === "v3") mappings = new V3FileBackedSessionMappingStore(mappingStorePath);
+		else if (!mayActivateManagedV3)
+			mappings = dependencies.mappings ?? new FileBackedSessionMappingStore(mappingStorePath);
 		if (mappings instanceof FileBackedSessionMappingStore && mappings.bootCompaction !== undefined) {
 			isolationDiagnostics.push({
 				name: "session-authority-compaction",
@@ -331,7 +330,6 @@ export async function buildResolvedAdapterServerOptions(
 			const activated = await activateAdapterSessionAuthorityV3({
 				locations: { agentDir: config.runtimeLocations.agentDir, stateRoot: config.statePath },
 				configuredOwnerUserId: owner.ownerUserId,
-				mappings,
 				sourcePath: mappingStorePath,
 				runtimeLock: lock,
 				authority,
@@ -363,6 +361,7 @@ export async function buildResolvedAdapterServerOptions(
 		} else {
 			managedBootstrap = dependencies.managedBootstrap ?? dependencies.createManagedBootstrap?.();
 		}
+		if (mappings === undefined) throw new Error("Managed V3 activation did not produce a session mapping store.");
 		if (managedBootstrap !== undefined) {
 			const started = await managedBootstrap.start();
 			const dependencies = started.dependencies;

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { type ActiveManagedV3Runtime, startActiveManagedRuntime } from "./adapter-managed-v3-runtime";
 import type { GjcRuntimeLocations } from "./contracts";
@@ -23,7 +23,7 @@ import {
 	activateSessionAuthorityV3,
 	type SessionAuthorityV3ActivationResult,
 } from "./gjc/session-authority-v3-activation";
-import type { ManagedTurnAuthorityBinding } from "./gjc/session-authority-v3-migration";
+import type { ManagedTurnAuthorityBinding, SessionAuthorityV2Document } from "./gjc/session-authority-v3-migration";
 import { validateSessionFile } from "./gjc/session-file";
 import type { SessionMapping, SessionMappingStore } from "./gjc/session-router";
 import { V3FileBackedSessionMappingStore } from "./gjc/session-v3-file-backed-mapping-store";
@@ -47,7 +47,8 @@ export interface ManagedBootstrapAuthorityResolver {
 export interface AdapterManagedBootstrapInput {
 	readonly locations: Pick<GjcRuntimeLocations, "agentDir"> & Readonly<{ stateRoot: string }>;
 	readonly configuredOwnerUserId: string;
-	readonly mappings: Pick<SessionMappingStore, "mappingRecordsIterable">;
+	/** Explicit legacy bootstrap seam; production V3 activation omits this view. */
+	readonly mappings?: Pick<SessionMappingStore, "mappingRecordsIterable">;
 	readonly sourcePath: string;
 	readonly runtimeLock: RuntimeSingletonLock;
 	readonly authority: ManagedBootstrapAuthorityResolver;
@@ -73,9 +74,9 @@ export type AdapterSessionAuthorityV3Activation =
 	  }>;
 
 /**
- * Converts an already-open V2 authority directly to canonical V3. This path
- * only reads durable authority metadata through its mapping store; it never
- * opens a mapped session file, transcript, or workspace artifact.
+ * Converts the canonical V2 authority directly to canonical V3. Binding
+ * derivation consumes only the private replay graph supplied by activation;
+ * it never opens a mapped session file, transcript, or workspace artifact.
  */
 export async function activateAdapterSessionAuthorityV3(
 	input: AdapterManagedBootstrapInput,
@@ -86,30 +87,32 @@ export async function activateAdapterSessionAuthorityV3(
 
 	// An absent source is the one permitted source mutation before activation:
 	// install the canonical empty V2 document, then snapshot it in the V3 activator.
-	await readOrCreateLegacySource(input.sourcePath);
+	await ensureLegacySource(input.sourcePath);
 	const authorities = new Map<string, ManagedBootstrapAuthority>();
-	const bindings = await v3Bindings(input, authorities);
-	if (bindings === undefined)
-		return {
-			status: "blocked",
-			activation: {
-				status: "blocked",
-				canonicalPath: resolve(input.sourcePath),
-				markerPath: `${resolve(input.sourcePath)}.v3-active.json`,
-				reasons: ["A complete managed authority could not be derived for the V2 authority graph."],
-			},
-		};
-	const activation = activateSessionAuthorityV3({
+	let replayedGraph: SessionAuthorityV2Document | undefined;
+	const activation = await activateSessionAuthorityV3({
 		canonicalPath: input.sourcePath,
 		stagingRoot: input.locations.stateRoot,
-		bindings,
+		resolveBindings: async decodedDocument => {
+			replayedGraph = decodedDocument;
+			// Preserve the explicit legacy seam's fail-closed behavior for callers
+			// that still provide an independent mapping view. Production managed
+			// activation omits this view and derives only from the private replay.
+			if (
+				decodedDocument.mappings.length === 0 &&
+				input.mappings !== undefined &&
+				[...input.mappings.mappingRecordsIterable()].length > 0
+			)
+				return undefined;
+			return await v3Bindings(input, decodedDocument, authorities);
+		},
 	});
 	if (activation.status === "blocked") return { status: "blocked", activation };
 	const store = new V3FileBackedSessionMappingStore(input.sourcePath);
 	const managed = await startActiveManagedRuntime({
 		mappings: store,
 		runtime: input.runtime,
-		liveTenantFence: async key => await tenantFence(input, authorities, key),
+		liveTenantFence: async key => await tenantFence(input, authorities, key, replayedGraph),
 	});
 	return { status: "activated", activation, store, managed };
 }
@@ -132,10 +135,11 @@ export function createAdapterManagedBootstrap(input: AdapterManagedBootstrapInpu
 		sourcePath: input.sourcePath,
 		runtimeLock: input.runtimeLock,
 		legacyEvidence: async () => {
+			const mappings = requireMappings(input);
 			preparedByIdentity.clear();
 			authorityByStableKey.clear();
 			const evidence = await legacyEvidence(input, authorityByStableKey);
-			for (const mapping of input.mappings.mappingRecordsIterable()) {
+			for (const mapping of mappings.mappingRecordsIterable()) {
 				const prepared = await prepare(input, mapping, authorityByStableKey);
 				if (prepared !== undefined) preparedByIdentity.set(identityFor(prepared.intent), prepared);
 			}
@@ -166,8 +170,9 @@ async function legacyEvidence(
 ): Promise<LegacyManagedSessionAuthorityEvidence> {
 	const source = await readOrCreateLegacySource(input.sourcePath);
 	const wal = await readOptional(`${input.sourcePath}.wal`);
+	const mappings = requireMappings(input);
 	const records: Array<LegacyManagedSessionAuthorityEvidence["records"][number]> = [];
-	for (const mapping of input.mappings.mappingRecordsIterable()) {
+	for (const mapping of mappings.mappingRecordsIterable()) {
 		const prepared = await prepare(input, mapping, authorities);
 		if (prepared === undefined) {
 			records.push({ sessionId: mapping.sessionId });
@@ -192,30 +197,19 @@ async function legacyEvidence(
 	};
 }
 
-/** Internal authority access is deliberately read-only and remains behind the
- * SessionMappingStore boundary. It is needed because `SessionMapping` omits
- * V2 journal, reassignment, provisional, and tombstone graph nodes. */
-interface V2AuthorityGraphStore {
-	readonly authority?: Readonly<{
-		recordsIterable(): Iterable<SessionAuthorityRecord>;
-		provisionalEntries(): readonly ProvisionalSessionOperation[];
-	}>;
-}
-
 async function v3Bindings(
 	input: AdapterManagedBootstrapInput,
+	graph: SessionAuthorityV2Document,
 	authorities: Map<string, ManagedBootstrapAuthority>,
 ): Promise<readonly ManagedTurnAuthorityBinding[] | undefined> {
-	const graph = (input.mappings as unknown as V2AuthorityGraphStore).authority;
-	const visible = [...input.mappings.mappingRecordsIterable()];
-	if (graph === undefined) return visible.length === 0 ? [] : undefined;
+	const visible = graph.mappings.map(mapping => toSessionMapping(mapping));
 	const candidates = new Map<string, SessionMapping>();
 	const required = new Set<string>();
 	const successorSessions = new Set<string>();
-	for (const record of graph.recordsIterable()) {
+	for (const record of graph.mappings) {
 		collectRecord(record, visible, input.configuredOwnerUserId, candidates, required, successorSessions);
 	}
-	for (const provisional of graph.provisionalEntries()) {
+	for (const provisional of graph.provisionalOperations ?? []) {
 		if (provisional.sessionId === undefined) return undefined;
 		const provisionalMapping: SessionMapping = {
 			...(provisional.managedAuthority === undefined
@@ -240,7 +234,8 @@ async function v3Bindings(
 	const bindings: ManagedTurnAuthorityBinding[] = [];
 	for (const [identity, mapping] of candidates) {
 		const prepared = await prepare(input, mapping, authorities);
-		if (prepared === undefined || !(await preparedFence(input, authorities, prepared.intent))) return undefined;
+		if (prepared === undefined || !(await preparedFence(input, authorities, prepared.intent, graph)))
+			return undefined;
 		const resumed = await resumeExternal(input.runtime, prepared.intent);
 		if (resumed === undefined) return undefined;
 		const managedAuthority: ManagedTurnAuthority = Object.freeze({
@@ -270,6 +265,25 @@ async function v3Bindings(
 		[...successorSessions].every(sessionId => successorCounts.get(sessionId) === 1)
 		? bindings
 		: undefined;
+}
+
+function toSessionMapping(record: SessionAuthorityRecord): SessionMapping {
+	return {
+		...(record.managedAuthority === undefined ? {} : { principalId: record.managedAuthority.principalId }),
+		chatId: record.chatId,
+		projectId: record.projectId,
+		sessionId: record.sessionId,
+		...(record.managedAuthority === undefined ? {} : { managedAuthority: record.managedAuthority }),
+		...(record.sessionFile === undefined ? {} : { sessionFile: record.sessionFile }),
+		...(record.activeLeaf === undefined ? {} : { activeLeaf: record.activeLeaf }),
+		rawFrameCursor: record.rawFrameCursor,
+		eventCursor: record.eventCursor,
+		operationId: record.operationId,
+		...(record.assistantText === undefined ? {} : { assistantText: record.assistantText }),
+		...(record.events === undefined ? {} : { events: record.events }),
+		...(record.modelSelection === undefined ? {} : { modelSelection: record.modelSelection }),
+		...(record.attachment === undefined ? {} : { attachment: record.attachment }),
+	};
 }
 
 function collectRecord(
@@ -396,6 +410,20 @@ async function readOrCreateLegacySource(sourcePath: string): Promise<Buffer> {
 	}
 }
 
+async function ensureLegacySource(sourcePath: string): Promise<void> {
+	try {
+		await lstat(sourcePath);
+		return;
+	} catch (error) {
+		if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
+	}
+	const source = Buffer.from('{"kind":"openwebui-gjc-session-authority","version":2,"mappings":[]}\n');
+	await mkdir(dirname(sourcePath), { recursive: true });
+	await writeFile(sourcePath, source, { flag: "wx", mode: 0o600 }).catch(async writeError => {
+		if (!(writeError instanceof Error) || !("code" in writeError) || writeError.code !== "EEXIST") throw writeError;
+	});
+}
+
 async function prepare(
 	input: AdapterManagedBootstrapInput,
 	mapping: SessionMapping,
@@ -483,6 +511,7 @@ async function preparedFence(
 	input: AdapterManagedBootstrapInput,
 	authorities: Map<string, ManagedBootstrapAuthority>,
 	intent: ManagedAuthorityPreparedRebindIntent,
+	graph?: SessionAuthorityV2Document,
 ): Promise<boolean> {
 	const authority = authorities.get(intent.stableKey);
 	if (authority === undefined || authority.leaseId !== intent.leaseId || authority.epoch !== intent.epoch)
@@ -495,7 +524,7 @@ async function preparedFence(
 			resolve(current.canonicalWorkspace) !== intent.canonicalWorkspace ||
 			current.leaseId !== intent.leaseId ||
 			current.epoch !== intent.epoch ||
-			findOperationId(input, intent) === undefined
+			findOperationId(input, intent, graph) === undefined
 		)
 			return false;
 		await authority.assertFence();
@@ -510,8 +539,9 @@ async function tenantFence(
 	input: AdapterManagedBootstrapInput,
 	authorities: Map<string, ManagedBootstrapAuthority>,
 	key: TenantSessionKey,
+	graph?: SessionAuthorityV2Document,
 ): Promise<boolean> {
-	const operationId = findOperationId(input, key);
+	const operationId = findOperationId(input, key, graph);
 	if (operationId === undefined) return false;
 	const stableKey = hash(
 		JSON.stringify([key.principalId, key.projectId, key.canonicalWorkspace, key.chatId, key.sessionId, operationId]),
@@ -540,9 +570,16 @@ async function tenantFence(
 function findOperationId(
 	input: AdapterManagedBootstrapInput,
 	key: Pick<TenantSessionKey, "principalId" | "projectId" | "chatId" | "sessionId">,
+	graph?: SessionAuthorityV2Document,
 ): string | undefined {
 	let operationId: string | undefined;
-	for (const mapping of input.mappings.mappingRecordsIterable()) {
+	const mappings =
+		graph === undefined
+			? input.mappings === undefined
+				? []
+				: input.mappings.mappingRecordsIterable()
+			: graph.mappings.map(toSessionMapping);
+	for (const mapping of mappings) {
 		if (
 			(mapping.principalId?.trim() || input.configuredOwnerUserId) === key.principalId &&
 			mapping.projectId === key.projectId &&
@@ -554,6 +591,12 @@ function findOperationId(
 		}
 	}
 	return operationId;
+}
+
+function requireMappings(input: AdapterManagedBootstrapInput): Pick<SessionMappingStore, "mappingRecordsIterable"> {
+	if (input.mappings === undefined)
+		throw new Error("A SessionMappingStore is required for the explicit legacy managed bootstrap seam.");
+	return input.mappings;
 }
 
 function identityFor(intent: ManagedAuthorityPreparedRebindIntent): string {

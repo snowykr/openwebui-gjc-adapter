@@ -1,12 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { probeSessionAuthorityEpoch, selectSessionAuthorityStore } from "../src/gjc/session-authority-epoch";
 import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 
-const digestOf = (value: string) => createHash("sha256").update(value).digest("hex");
 function v3(overrides: Record<string, unknown> = {}): string {
 	return JSON.stringify({
 		kind: "openwebui-gjc-session-authority",
@@ -35,19 +33,14 @@ describe("session authority epoch probe", () => {
 		}
 	});
 
-	test("selects the managed store only for the exact trusted full-graph v3 bytes", async () => {
+	test("selects the managed store for a strictly valid full-graph v3 document", async () => {
 		const f = await fixture();
 		try {
 			const bytes = v3();
 			await writeFile(f.authority, bytes);
-			const probe = probeSessionAuthorityEpoch(f.authority, { managedDigest: digestOf(bytes) });
+			const probe = probeSessionAuthorityEpoch(f.authority);
 			expect(probe).toEqual({ status: "v3", selection: "managed-store" });
 			expect(selectSessionAuthorityStore(probe)).toBe("managed-store");
-			expect(probeSessionAuthorityEpoch(f.authority)).toEqual({ status: "blocked", selection: "blocked" });
-			expect(probeSessionAuthorityEpoch(f.authority, { managedDigest: "0".repeat(64) })).toEqual({
-				status: "blocked",
-				selection: "blocked",
-			});
 		} finally {
 			await f.cleanup();
 		}
@@ -63,7 +56,7 @@ describe("session authority epoch probe", () => {
 				v3({ mappings: "invalid" }),
 			]) {
 				await writeFile(f.authority, bytes);
-				expect(probeSessionAuthorityEpoch(f.authority, { managedDigest: digestOf(bytes) })).toEqual({
+				expect(probeSessionAuthorityEpoch(f.authority)).toEqual({
 					status: "blocked",
 					selection: "blocked",
 				});
@@ -76,7 +69,7 @@ describe("session authority epoch probe", () => {
 			expect(probeSessionAuthorityEpoch(f.authority)).toEqual({ status: "blocked", selection: "blocked" });
 			await rm(f.authority, { recursive: true });
 			await writeFile(f.authority, Buffer.alloc(16 * 1024 * 1024 + 1));
-			expect(probeSessionAuthorityEpoch(f.authority, { managedDigest: "0".repeat(64) })).toEqual({
+			expect(probeSessionAuthorityEpoch(f.authority)).toEqual({
 				status: "blocked",
 				selection: "blocked",
 			});
@@ -92,7 +85,7 @@ describe("session authority epoch probe", () => {
 			await writeFile(f.authority, v3());
 			await writeFile(replacement, '{"kind":"openwebui-gjc-session-authority","version":2,"records":[]}');
 			await rename(replacement, f.authority);
-			expect(probeSessionAuthorityEpoch(f.authority, { managedDigest: "0".repeat(64) })).toEqual({
+			expect(probeSessionAuthorityEpoch(f.authority)).toEqual({
 				status: "v2",
 				selection: "managed-bootstrap",
 			});

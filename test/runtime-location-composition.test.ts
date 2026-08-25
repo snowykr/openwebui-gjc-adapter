@@ -15,6 +15,7 @@ import {
 	renderResolvedExistingSystemdUnit,
 	renderResolvedSystemdComposeUnit,
 } from "../src/configure/systemd";
+import * as sessionRouter from "../src/gjc/session-router";
 import { SessionMappingStore } from "../src/gjc/session-router";
 import { buildResolvedInstalledAdapterServerOptions } from "../src/installed-adapter-server-options";
 
@@ -86,14 +87,14 @@ function writeV3Activation(canonicalPath: string, digestOverride?: string): void
 		})}\n`,
 	);
 	writeFileSync(canonicalPath, authority);
-	const canonicalDigest = digestOverride ?? createHash("sha256").update(authority).digest("hex");
+	const activationV3Digest = digestOverride ?? createHash("sha256").update(authority).digest("hex");
 	writeFileSync(
 		`${canonicalPath}.v3-active.json`,
 		`${JSON.stringify({
 			kind: "openwebui-gjc-session-authority-active",
 			version: 1,
 			authorityEpoch: "managed/1",
-			canonicalDigest,
+			activationV3Digest,
 			source: {
 				baseDigest: "0".repeat(64),
 				walDigest: "0".repeat(64),
@@ -141,15 +142,16 @@ describe("runtime location composition", () => {
 		}
 	});
 
-	test("blocks invalid active V3 markers and digests before any legacy mapping store is selected", async () => {
+	test("blocks invalid or absent active V3 markers before any legacy mapping store is selected", async () => {
 		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-v3-runtime-blocked-")));
 		try {
 			const config = resolvedBuilderConfig(root);
 			mkdirSync(config.sessionRoot);
 			const canonicalPath = join(config.sessionRoot, "openwebui-session-mappings.json");
 			for (const marker of ["{\n", undefined] as const) {
-				writeV3Activation(canonicalPath, marker === undefined ? "f".repeat(64) : undefined);
-				if (marker !== undefined) writeFileSync(`${canonicalPath}.v3-active.json`, marker);
+				writeV3Activation(canonicalPath);
+				if (marker === undefined) rmSync(`${canonicalPath}.v3-active.json`);
+				else writeFileSync(`${canonicalPath}.v3-active.json`, marker);
 				await expect(
 					buildResolvedAdapterServerOptions(config, { mappings: new SessionMappingStore() }),
 				).rejects.toThrow("Canonical session authority activation is blocked.");
@@ -162,6 +164,7 @@ describe("runtime location composition", () => {
 	test("activates an empty V2 canonical authority into the managed V3 runtime", async () => {
 		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-v2-runtime-activation-")));
 		const calls: string[] = [];
+		const legacyStoreConstructor = spyOn(sessionRouter, "FileBackedSessionMappingStore");
 		const runtime = {
 			state: "new",
 			start: async () => void calls.push("runtime-start"),
@@ -180,12 +183,14 @@ describe("runtime location composition", () => {
 			);
 			const options = await buildResolvedAdapterServerOptions(config, { managedSdkRuntime: runtime as never });
 
+			expect(legacyStoreConstructor).not.toHaveBeenCalled();
 			expect(options.routes?.mappings?.constructor.name).toBe("V3FileBackedSessionMappingStore");
 			expect(options.routes?.runner).not.toBeUndefined();
 			expect(calls).toEqual(["runtime-start"]);
 			await options.shutdownCleanup?.();
 			expect(calls).toEqual(["runtime-start", "runtime-dispose"]);
 		} finally {
+			legacyStoreConstructor.mockRestore();
 			rmSync(root, { recursive: true, force: true });
 		}
 	});

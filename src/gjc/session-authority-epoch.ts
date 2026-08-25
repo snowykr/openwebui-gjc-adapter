@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from "node:fs";
 
 import {
@@ -8,18 +7,9 @@ import {
 } from "./session-authority-v3";
 
 const MAX_AUTHORITY_HEADER_BYTES = 16 * 1024 * 1024;
-const SHA256 = /^[a-f0-9]{64}$/;
 
 export type SessionAuthorityEpochStatus = "absent" | "v2" | "v3" | "blocked";
 export type SessionAuthorityStoreSelection = "managed-bootstrap" | "managed-store" | "blocked";
-
-export interface SessionAuthorityEpochProbeOptions {
-	/**
-	 * Digest from the adapter-owned active marker/manifest. A v3 canonical file
-	 * is never accepted unless this trusted value exactly matches its digest.
-	 */
-	readonly managedDigest?: string;
-}
 
 export interface SessionAuthorityEpochProbe {
 	readonly status: SessionAuthorityEpochStatus;
@@ -27,13 +17,11 @@ export interface SessionAuthorityEpochProbe {
 }
 
 /**
- * Reads only the canonical authority header through a held no-follow descriptor.
- * It neither opens a mapping store nor reads session transcripts or artifacts.
+ * Reads and strictly parses the canonical authority through a held no-follow
+ * descriptor. It neither opens a mapping store nor reads session transcripts or
+ * artifacts. Active-marker validation is a separate caller responsibility.
  */
-export function probeSessionAuthorityEpoch(
-	canonicalAuthorityPath: string,
-	options: SessionAuthorityEpochProbeOptions = {},
-): SessionAuthorityEpochProbe {
+export function probeSessionAuthorityEpoch(canonicalAuthorityPath: string): SessionAuthorityEpochProbe {
 	const named = lstatSync(canonicalAuthorityPath, { throwIfNoEntry: false });
 	if (named === undefined) return absent();
 	if (named.isSymbolicLink() || !named.isFile()) return blocked();
@@ -52,7 +40,7 @@ export function probeSessionAuthorityEpoch(
 		const final = fstatSync(descriptor);
 		if (!sameIdentity(held, final) || final.size !== bytes.length) return blocked();
 		if (!currentPathHasIdentity(canonicalAuthorityPath, held)) return blocked();
-		return classify(bytes, options.managedDigest);
+		return classify(bytes);
 	} catch {
 		return blocked();
 	} finally {
@@ -65,7 +53,7 @@ export function selectSessionAuthorityStore(probe: SessionAuthorityEpochProbe): 
 	return probe.status === "v3" ? "managed-store" : probe.status === "blocked" ? "blocked" : "managed-bootstrap";
 }
 
-function classify(bytes: Buffer, managedDigest: string | undefined): SessionAuthorityEpochProbe {
+function classify(bytes: Buffer): SessionAuthorityEpochProbe {
 	let value: unknown;
 	try {
 		value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
@@ -77,10 +65,7 @@ function classify(bytes: Buffer, managedDigest: string | undefined): SessionAuth
 	if (
 		value.version !== SESSION_AUTHORITY_V3_VERSION ||
 		value.authorityEpoch !== SESSION_AUTHORITY_V3_EPOCH ||
-		!isSessionAuthorityV3Document(value) ||
-		managedDigest === undefined ||
-		!SHA256.test(managedDigest) ||
-		createHash("sha256").update(bytes).digest("hex") !== managedDigest
+		!isSessionAuthorityV3Document(value)
 	)
 		return blocked();
 	return { status: "v3", selection: "managed-store" };

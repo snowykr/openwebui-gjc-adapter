@@ -39,7 +39,9 @@ import {
 import { SessionMappingStore } from "./session-mapping-memory-store";
 
 /** Canonical V3 authority storage. This deliberately has no V2 compatibility,
- * attachment, descriptor, or terminal persistence path. */
+ * attachment, descriptor, or terminal persistence path. The activation marker
+ * is an immutable activation identity; ordinary writes replace only this
+ * canonical document and never rewrite or validate that marker. */
 class V3FileSessionAuthority extends SessionAuthority {
 	#generation = 0;
 	#closed = false;

@@ -20,7 +20,11 @@ import {
 	parseSessionAuthorityV3Document,
 	SESSION_AUTHORITY_V3_EPOCH,
 } from "./session-authority-v3";
-import { type ManagedTurnAuthorityBinding, stageSessionAuthorityV3Migration } from "./session-authority-v3-migration";
+import {
+	type ManagedTurnAuthorityBinding,
+	type SessionAuthorityV2Document,
+	stageSessionAuthorityV3Migration,
+} from "./session-authority-v3-migration";
 import { V3FileBackedSessionMappingStore } from "./session-v3-file-backed-mapping-store";
 
 const MAX_AUTHORITY_BYTES = 128 * 1024 * 1024;
@@ -33,7 +37,14 @@ export interface SessionAuthorityV3ActivationOptions {
 	/** The V2 canonical authority. Its mutation and runtime locks are held by the caller. */
 	readonly canonicalPath: string;
 	/** Exact, managed authority identities; no runtime-derived authority is consulted. */
-	readonly bindings: readonly ManagedTurnAuthorityBinding[];
+	readonly bindings?: readonly ManagedTurnAuthorityBinding[];
+	/** Resolves exact managed identities from the private, replayed V2 graph. */
+	readonly resolveBindings?: (
+		decodedDocument: SessionAuthorityV2Document,
+	) =>
+		| readonly ManagedTurnAuthorityBinding[]
+		| undefined
+		| Promise<readonly ManagedTurnAuthorityBinding[] | undefined>;
 	/** Private adapter-owned directory. It must not be the canonical authority directory. */
 	readonly stagingRoot: string;
 	/** Test-only crash seam, called only after the named boundary is durable. */
@@ -44,7 +55,8 @@ export interface SessionAuthorityV3ActiveMarker {
 	readonly kind: "openwebui-gjc-session-authority-active";
 	readonly version: 1;
 	readonly authorityEpoch: typeof SESSION_AUTHORITY_V3_EPOCH;
-	readonly canonicalDigest: string;
+	/** Digest of the deterministic V3 document produced at activation time. */
+	readonly activationV3Digest: string;
 	readonly source: Readonly<{
 		baseDigest: string;
 		walDigest: string;
@@ -56,8 +68,7 @@ export interface SessionAuthorityV3ActivationResult {
 	readonly status: "activated" | "blocked";
 	readonly canonicalPath: string;
 	readonly markerPath: string;
-	readonly markerDigest?: string;
-	readonly canonicalDigest?: string;
+	readonly activationV3Digest?: string;
 	readonly reasons?: readonly string[];
 }
 
@@ -71,9 +82,9 @@ export function readSessionAuthorityV3ActiveMarker(canonicalPath: string): Sessi
  * and private activation files; it never inspects user workspaces, transcripts,
  * or artifacts.
  */
-export function activateSessionAuthorityV3(
+export async function activateSessionAuthorityV3(
 	options: SessionAuthorityV3ActivationOptions,
-): SessionAuthorityV3ActivationResult {
+): Promise<SessionAuthorityV3ActivationResult> {
 	const canonicalPath = resolve(options.canonicalPath);
 	const root = privateRoot(options.stagingRoot, canonicalPath);
 	const markerPath = `${canonicalPath}.v3-active.json`;
@@ -86,6 +97,14 @@ export function activateSessionAuthorityV3(
 	options.afterBoundary?.("snapshot");
 	writePrivate(root, "source.v2.json", snapshot.base);
 	if (snapshot.walPresent) writePrivate(root, "source.v2.wal", snapshot.wal);
+	else {
+		const staleWal = lstatSync(join(root, "source.v2.wal"), { throwIfNoEntry: false });
+		if (staleWal !== undefined) {
+			if (staleWal.isSymbolicLink() || !staleWal.isFile())
+				throw new Error("Immutable V2 WAL backup is not a regular file.");
+			unlinkSync(join(root, "source.v2.wal"));
+		}
+	}
 	writePrivate(
 		root,
 		"source.v2.absence.json",
@@ -97,7 +116,35 @@ export function activateSessionAuthorityV3(
 	const privateV2 = join(root, "replay.v2.json");
 	writePrivate(root, "replay.v2.json", snapshot.base);
 	if (snapshot.walPresent) writePrivate(root, "replay.v2.json.wal", snapshot.wal);
+	else {
+		const staleReplayWal = lstatSync(join(root, "replay.v2.json.wal"), { throwIfNoEntry: false });
+		if (staleReplayWal !== undefined) {
+			if (staleReplayWal.isSymbolicLink() || !staleReplayWal.isFile())
+				throw new Error("Private V2 replay WAL is not a regular file.");
+			unlinkSync(join(root, "replay.v2.json.wal"));
+		}
+	}
 	const replayed = new FileSessionAuthority(privateV2);
+	const decodedDocument: SessionAuthorityV2Document = {
+		mappings: replayed.entries(),
+		provisionalOperations: replayed.provisionalEntries(),
+	};
+	const bindings =
+		options.resolveBindings === undefined ? options.bindings : await options.resolveBindings(decodedDocument);
+	if (bindings === undefined)
+		return {
+			status: "blocked",
+			canonicalPath,
+			markerPath,
+			reasons: ["A complete managed authority could not be derived for the replayed V2 authority graph."],
+		};
+	if (!canonicalSnapshotMatches(canonicalPath, snapshot))
+		return {
+			status: "blocked",
+			canonicalPath,
+			markerPath,
+			reasons: ["Canonical V2 authority changed during private replay or binding resolution."],
+		};
 	const staged = stageSessionAuthorityV3Migration({
 		snapshot: {
 			originalBaseBytes: snapshot.base,
@@ -106,10 +153,10 @@ export function activateSessionAuthorityV3(
 			originalWalDigest: snapshot.walDigest,
 		},
 		decodedDocument: {
-			mappings: replayed.entries(),
-			provisionalOperations: replayed.provisionalEntries(),
+			mappings: decodedDocument.mappings,
+			provisionalOperations: decodedDocument.provisionalOperations,
 		},
-		bindings: options.bindings,
+		bindings,
 	});
 	if (staged.status === "blocked") {
 		return { status: "blocked", canonicalPath, markerPath, reasons: staged.reasons };
@@ -132,12 +179,19 @@ export function activateSessionAuthorityV3(
 		kind: "openwebui-gjc-session-authority-v3-activation",
 		version: 1,
 		phase: "prepared",
-		canonicalDigest: staged.v3Digest,
+		activationV3Digest: staged.v3Digest,
 		source: { baseDigest: snapshot.baseDigest, walDigest: snapshot.walDigest, walPresent: snapshot.walPresent },
 	};
 	writePrivate(root, "activation.json", encode(journal));
 	fsyncDirectory(root);
 	options.afterBoundary?.("stage");
+	if (!canonicalSnapshotMatches(canonicalPath, snapshot))
+		return {
+			status: "blocked",
+			canonicalPath,
+			markerPath,
+			reasons: ["Canonical V2 authority changed before the activation swap."],
+		};
 
 	writePrivate(root, "activation.json", encode({ ...journal, phase: "committing" }));
 	fsyncDirectory(root);
@@ -150,11 +204,13 @@ export function activateSessionAuthorityV3(
 	fsyncDirectory(root);
 	options.afterBoundary?.("swap");
 
+	// This is the sole marker creation point. The canonical V3 store never
+	// rewrites this activation identity when mutable authority state changes.
 	const marker: SessionAuthorityV3ActiveMarker = {
 		kind: "openwebui-gjc-session-authority-active",
 		version: 1,
 		authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
-		canonicalDigest: staged.v3Digest,
+		activationV3Digest: staged.v3Digest,
 		source: journal.source,
 	};
 	writeAtomic(markerPath, encode(marker));
@@ -171,23 +227,41 @@ function recover(
 	root: string,
 	journalPath: string,
 ): SessionAuthorityV3ActivationResult | undefined {
+	const markerNamed = lstatSync(markerPath, { throwIfNoEntry: false });
 	const marker = readMarker(markerPath);
-	if (marker !== undefined && markerMatchesCanonical(marker, canonicalPath))
-		return activated(canonicalPath, markerPath, marker);
 	const journal = readJournal(journalPath);
+	if (
+		markerNamed !== undefined &&
+		(markerNamed.isSymbolicLink() || !markerNamed.isFile() || marker === undefined) &&
+		journal?.phase !== "committing" &&
+		journal?.phase !== "swapped"
+	)
+		throw new Error("Active V3 marker is invalid.");
+	if (marker !== undefined) {
+		if (journal !== undefined && !journalMatchesMarker(journal, marker))
+			throw new Error("Active V3 marker does not match the activation journal.");
+		if (canonicalV3Shape(canonicalPath) && sourceSnapshotMatches(root, marker.source)) {
+			// The marker is the activation commit record. A crash after its fsync but
+			// before the journal checkpoint is forward-only: never restore V2 or
+			// compare against later mutable canonical bytes.
+			if (journal !== undefined && journal.phase !== "marked") {
+				writePrivate(root, "activation.json", encode({ ...journal, phase: "marked" }));
+				fsyncDirectory(root);
+			}
+			return activated(canonicalPath, markerPath, marker);
+		}
+		if (journal?.phase !== "committing" && journal?.phase !== "swapped")
+			throw new Error("Active V3 marker does not bind a valid canonical V3 authority.");
+	}
 	if (journal === undefined) return undefined;
 	if (journal.phase === "marked")
 		throw new Error("Activation journal is marked but the active marker does not bind the canonical V3 authority.");
 	if (journal.phase === "committing" || journal.phase === "swapped") {
-		const base = readRegular(join(root, "source.v2.json"), MAX_AUTHORITY_BYTES, "immutable V2 backup");
-		if (digest(base) !== journal.source.baseDigest)
-			throw new Error("Immutable V2 backup digest does not match activation journal.");
+		const base = readSourceBase(root, journal.source);
 		renameReplace(join(root, "restore.v2.json"), canonicalPath, base);
 		const walPath = `${canonicalPath}.wal`;
 		if (journal.source.walPresent) {
-			const wal = readRegular(join(root, "source.v2.wal"), MAX_WAL_BYTES, "immutable V2 WAL backup");
-			if (digest(wal) !== journal.source.walDigest)
-				throw new Error("Immutable V2 WAL backup digest does not match activation journal.");
+			const wal = readSourceWal(root, journal.source);
 			renameReplace(join(root, "restore.v2.wal"), walPath, wal);
 		} else {
 			const named = lstatSync(walPath, { throwIfNoEntry: false });
@@ -216,6 +290,22 @@ function snapshotV2(canonicalPath: string): {
 	if (walPresent) fsyncRegular(walPath, "canonical V2 WAL");
 	fsyncDirectory(dirname(canonicalPath));
 	return { base, wal, walPresent, baseDigest: digest(base), walDigest: digest(wal) };
+}
+
+function canonicalSnapshotMatches(canonicalPath: string, snapshot: ReturnType<typeof snapshotV2>): boolean {
+	try {
+		if (digest(readRegular(canonicalPath, MAX_AUTHORITY_BYTES, "canonical V2 authority")) !== snapshot.baseDigest)
+			return false;
+		const walPath = `${canonicalPath}.wal`;
+		const walNamed = lstatSync(walPath, { throwIfNoEntry: false });
+		if (walNamed?.isSymbolicLink() || (walNamed !== undefined && !walNamed.isFile())) return false;
+		if ((walNamed !== undefined) !== snapshot.walPresent) return false;
+		return (
+			!snapshot.walPresent || digest(readRegular(walPath, MAX_WAL_BYTES, "canonical V2 WAL")) === snapshot.walDigest
+		);
+	} catch {
+		return false;
+	}
 }
 
 function privateRoot(stagingRoot: string, canonicalPath: string): string {
@@ -326,15 +416,50 @@ function readMarker(path: string): SessionAuthorityV3ActiveMarker | undefined {
 		return undefined;
 	}
 }
-function markerMatchesCanonical(marker: SessionAuthorityV3ActiveMarker, canonicalPath: string): boolean {
+
+function canonicalV3Shape(canonicalPath: string): boolean {
 	try {
-		return (
-			digest(readRegular(canonicalPath, MAX_AUTHORITY_BYTES, "canonical V3 authority")) === marker.canonicalDigest
-		);
+		const bytes = readRegular(canonicalPath, MAX_AUTHORITY_BYTES, "canonical V3 authority");
+		return parseSessionAuthorityV3Document(bytes) !== undefined;
 	} catch {
 		return false;
 	}
 }
+
+function sourceSnapshotMatches(root: string, source: SessionAuthorityV3ActiveMarker["source"]): boolean {
+	try {
+		readSourceBase(root, source);
+		if (source.walPresent) readSourceWal(root, source);
+		else if (lstatSync(join(root, "source.v2.wal"), { throwIfNoEntry: false }) !== undefined) return false;
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function readSourceBase(root: string, source: SessionAuthorityV3ActiveMarker["source"]): Buffer {
+	const base = readRegular(join(root, "source.v2.json"), MAX_AUTHORITY_BYTES, "immutable V2 backup");
+	if (digest(base) !== source.baseDigest)
+		throw new Error("Immutable V2 backup digest does not match activation identity.");
+	return base;
+}
+
+function readSourceWal(root: string, source: SessionAuthorityV3ActiveMarker["source"]): Buffer {
+	const wal = readRegular(join(root, "source.v2.wal"), MAX_WAL_BYTES, "immutable V2 WAL backup");
+	if (digest(wal) !== source.walDigest)
+		throw new Error("Immutable V2 WAL backup digest does not match activation identity.");
+	return wal;
+}
+
+function journalMatchesMarker(journal: ActivationJournal, marker: SessionAuthorityV3ActiveMarker): boolean {
+	return (
+		journal.activationV3Digest === marker.activationV3Digest &&
+		journal.source.baseDigest === marker.source.baseDigest &&
+		journal.source.walDigest === marker.source.walDigest &&
+		journal.source.walPresent === marker.source.walPresent
+	);
+}
+
 function activated(
 	canonicalPath: string,
 	markerPath: string,
@@ -344,8 +469,7 @@ function activated(
 		status: "activated",
 		canonicalPath,
 		markerPath,
-		canonicalDigest: marker.canonicalDigest,
-		markerDigest: digest(encode(marker)),
+		activationV3Digest: marker.activationV3Digest,
 	};
 }
 
@@ -353,7 +477,7 @@ type ActivationJournal = Readonly<{
 	kind: "openwebui-gjc-session-authority-v3-activation";
 	version: 1;
 	phase: "prepared" | "committing" | "swapped" | "marked";
-	canonicalDigest: string;
+	activationV3Digest: string;
 	source: SessionAuthorityV3ActiveMarker["source"];
 }>;
 function readJournal(path: string): ActivationJournal | undefined {
@@ -368,34 +492,39 @@ function readJournal(path: string): ActivationJournal | undefined {
 function isMarker(value: unknown): value is SessionAuthorityV3ActiveMarker {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const marker = value as Partial<SessionAuthorityV3ActiveMarker>;
+	const source = marker.source;
 	return (
+		Object.keys(value).length === 5 &&
 		marker.kind === "openwebui-gjc-session-authority-active" &&
 		marker.version === 1 &&
 		marker.authorityEpoch === SESSION_AUTHORITY_V3_EPOCH &&
-		SHA256.test(marker.canonicalDigest ?? "") &&
-		typeof marker.source === "object" &&
-		marker.source !== null &&
-		SHA256.test(marker.source.baseDigest ?? "") &&
-		SHA256.test(marker.source.walDigest ?? "") &&
-		typeof marker.source.walPresent === "boolean"
+		SHA256.test(marker.activationV3Digest ?? "") &&
+		typeof source === "object" &&
+		source !== null &&
+		!Array.isArray(source) &&
+		Object.keys(source).length === 3 &&
+		SHA256.test(source.baseDigest ?? "") &&
+		SHA256.test(source.walDigest ?? "") &&
+		typeof source.walPresent === "boolean"
 	);
 }
 function isJournal(value: unknown): value is ActivationJournal {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const journal = value as Partial<ActivationJournal>;
 	return (
+		Object.keys(value).length === 5 &&
 		journal.kind === "openwebui-gjc-session-authority-v3-activation" &&
 		journal.version === 1 &&
 		(journal.phase === "prepared" ||
 			journal.phase === "committing" ||
 			journal.phase === "swapped" ||
 			journal.phase === "marked") &&
-		SHA256.test(journal.canonicalDigest ?? "") &&
+		SHA256.test(journal.activationV3Digest ?? "") &&
 		isMarker({
 			kind: "openwebui-gjc-session-authority-active",
 			version: 1,
 			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
-			canonicalDigest: journal.canonicalDigest,
+			activationV3Digest: journal.activationV3Digest,
 			source: journal.source,
 		})
 	);
