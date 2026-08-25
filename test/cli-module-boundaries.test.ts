@@ -227,6 +227,7 @@ describe("CLI module boundaries", () => {
 	test("pins config outputs diagnostics and validation message order", () => {
 		// Given: stable environment inputs spanning project and artifact parsing.
 		const config = loadAdapterConfig({
+			GJC_OPENWEBUI_MODE: "existing",
 			GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS: "/allowed",
 			GJC_OPENWEBUI_ARTIFACT_BASE_URL: "https://artifacts.test/base/",
 			GJC_OPENWEBUI_PROJECTS: "/repo|Demo|folder-1|/sessions",
@@ -238,6 +239,7 @@ describe("CLI module boundaries", () => {
 
 		// Then: defaults, parsed bytes, diagnostics, and errors remain exact.
 		expect(config).toEqual({
+			mode: "existing",
 			bindHost: "127.0.0.1",
 			bindPort: 8765,
 			openWebUIBaseUrl: "http://localhost:8080",
@@ -269,12 +271,12 @@ describe("CLI module boundaries", () => {
 				"GJC_OPENWEBUI_API_TOKEN is not set; OpenWebUI API calls are not authenticated.",
 			],
 		});
-		expect(() => loadAdapterConfig({ GJC_OPENWEBUI_PROJECTS: "|" })).toThrow(
+		expect(() => loadAdapterConfig({ GJC_OPENWEBUI_MODE: "existing", GJC_OPENWEBUI_PROJECTS: "|" })).toThrow(
 			"GJC_OPENWEBUI_PROJECTS entry 1 must include a non-empty cwd",
 		);
-		expect(() => loadAdapterConfig({ GJC_OPENWEBUI_ARTIFACT_BASE_URL: "not-a-url" })).toThrow(
-			"GJC_OPENWEBUI_ARTIFACT_BASE_URL must be a valid URL",
-		);
+		expect(() =>
+			loadAdapterConfig({ GJC_OPENWEBUI_MODE: "existing", GJC_OPENWEBUI_ARTIFACT_BASE_URL: "not-a-url" }),
+		).toThrow("GJC_OPENWEBUI_ARTIFACT_BASE_URL must be a valid URL");
 	});
 
 	test("requires exactly the two planned extraction modules", () => {
@@ -437,7 +439,7 @@ describe("CLI module boundaries", () => {
 			resolvedServerChain:
 				baseSource.includes("buildResolvedAdapterServerOptions(config, dependencies, {") &&
 				baseSource.includes(
-					"sessionAuthorityMigrationSourcePaths: resolveLegacySessionAuthoritySourcePaths(env)",
+					"sessionAuthorityMigrationSourcePaths: resolveLegacySessionAuthoritySourcePaths(env, config.mode)",
 				) &&
 				cliSource.includes("buildResolvedInstalledAdapterServerOptions(config)") &&
 				installedSource.includes("buildResolvedAdapterServerOptions(config") &&

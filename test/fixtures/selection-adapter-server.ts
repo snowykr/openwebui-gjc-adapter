@@ -21,7 +21,7 @@ function record(value: unknown): void {
 }
 
 const options = await buildAdapterServerOptionsFromEnv(
-	{ ...process.env, GJC_OPENWEBUI_MODE: "managed" },
+	{ ...process.env, GJC_OPENWEBUI_MODE: "existing" },
 	{
 		eventSink: input => record({ type: "event", input }),
 		messageSink: input => record({ type: "message", input }),
