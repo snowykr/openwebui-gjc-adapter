@@ -11,8 +11,13 @@ import {
 	readPublishedSdkEndpointDescriptor,
 } from "../src/gjc/public-sdk-session-port";
 import { type SessionMapping, SessionMappingStore } from "../src/gjc/session-router";
-import { GjcCloseReceipt, type GjcLifecyclePublicationAddress } from "../src/gjc/turn-runner";
+import {
+	GjcCloseReceipt,
+	type GjcLifecyclePublicationAddress,
+	type ManagedTurnAuthority,
+} from "../src/gjc/turn-runner";
 import type { LiveGatewayRunner } from "../src/live/chat-completions";
+import type { ManagedSdkRuntimeDependency, ManagedSdkTenantFence } from "../src/live/gjc-routing-lifecycle";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
 import { ProjectLinkService } from "../src/projects/link-service";
@@ -213,6 +218,138 @@ describe("project admin routes", () => {
 		expect(unlinked.closeResults).toMatchObject([{ chatId: "dynamic-chat", result: { status: "uncertain" } }]);
 		expect(calls).toEqual([]);
 		expect(fallbackCalls).toBe(0);
+	});
+	test("closes a managed generation through public lifecycle retirement and replays without legacy lifecycle", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-close-"));
+		tempDirs.push(workspace);
+		const projectDirectory = path.join(workspace, "Managed Project");
+		await fs.mkdir(projectDirectory, { recursive: true });
+		const mappings = new SessionMappingStore();
+		const managed = managedCloseRuntime("retired");
+		const fenceKeys: string[] = [];
+		const turnRunner = strictCloseTurnRunner();
+		let legacyPreflights = 0;
+		turnRunner.withLifecycleClosePreflight = async () => {
+			legacyPreflights += 1;
+			throw new Error("managed close must not enter the legacy lifecycle");
+		};
+		const options = await buildAdapterServerOptionsFromEnv(adapterEnv(workspace), {
+			turnRunner,
+			mappings,
+			modelReaderFactory,
+			managedSdkRuntime: managed.runtime,
+			managedSdkTenantFence: (key => {
+				fenceKeys.push(`${key.sessionId}:${key.generation}`);
+				return true;
+			}) satisfies ManagedSdkTenantFence,
+		});
+		const routes = options.routes;
+		if (routes?.closeSession === undefined) throw new Error("expected project close route");
+		const authority = managedAuthority(projectDirectory, "managed-session", "managed-request");
+		const mapping = { ...mappingFor("managed-project", "managed-session"), managedAuthority: authority };
+		mappings.setScoped({ principalId: authority.principalId, chatId: mapping.chatId }, mapping);
+		const ingress = { ingressId: "managed-close", ingressHash: "managed-close" };
+		await expect(
+			routes.closeSession(
+				mappings.getScoped({ principalId: authority.principalId, chatId: mapping.chatId })!,
+				ingress,
+			),
+		).resolves.toEqual({ status: "closed" });
+		expect(managed.requests).toEqual(["managed-close"]);
+		expect(managed.calls).toEqual(["close", "reconcile", "status"]);
+		expect(fenceKeys).toEqual(["managed-session:7", "managed-session:7"]);
+		expect(legacyPreflights).toBe(0);
+		expect(
+			mappings.operationScoped({ principalId: authority.principalId, chatId: mapping.chatId }, ingress.ingressId),
+		).toMatchObject({ state: "complete" });
+		await expect(
+			routes.closeSession(
+				mappings.getScoped({ principalId: authority.principalId, chatId: mapping.chatId })!,
+				ingress,
+			),
+		).resolves.toEqual({ status: "closed" });
+		expect(managed.requests).toEqual(["managed-close"]);
+	});
+	test("fails closed without managed runtime and fence instead of entering legacy lifecycle", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-close-unwired-"));
+		tempDirs.push(workspace);
+		const projectDirectory = path.join(workspace, "Managed Unwired");
+		await fs.mkdir(projectDirectory, { recursive: true });
+		const mappings = new SessionMappingStore();
+		const turnRunner = strictCloseTurnRunner();
+		let legacyPreflights = 0;
+		turnRunner.withLifecycleClosePreflight = async () => {
+			legacyPreflights += 1;
+			throw new Error("managed close must not enter the legacy lifecycle");
+		};
+		const options = await buildAdapterServerOptionsFromEnv(adapterEnv(workspace), {
+			turnRunner,
+			mappings,
+			modelReaderFactory,
+		});
+		const routes = options.routes;
+		if (routes?.closeSession === undefined) throw new Error("expected project close route");
+		const authority = managedAuthority(projectDirectory, "managed-unwired", "managed-unwired-request");
+		const mapping = { ...mappingFor("managed-project", "managed-unwired"), managedAuthority: authority };
+		mappings.setScoped({ principalId: authority.principalId, chatId: mapping.chatId }, mapping);
+		await expect(
+			routes.closeSession(mappings.getScoped({ principalId: authority.principalId, chatId: mapping.chatId })!, {
+				ingressId: "managed-unwired-close",
+				ingressHash: "managed-unwired-close",
+			}),
+		).resolves.toMatchObject({ status: "uncertain" });
+		expect(legacyPreflights).toBe(0);
+		expect(
+			mappings.operationScoped(
+				{ principalId: authority.principalId, chatId: mapping.chatId },
+				"managed-unwired-close",
+			),
+		).toBeUndefined();
+	});
+	test("fails closed for managed unknown, replaced, non-dispatch, and fence-loss outcomes", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-close-outcomes-"));
+		tempDirs.push(workspace);
+		const projectDirectory = path.join(workspace, "Managed Outcomes");
+		await fs.mkdir(projectDirectory, { recursive: true });
+		const mappings = new SessionMappingStore();
+		const managed = managedCloseRuntime("unknown");
+		let fenceOpen = true;
+		const options = await buildAdapterServerOptionsFromEnv(adapterEnv(workspace), {
+			turnRunner: strictCloseTurnRunner(),
+			mappings,
+			modelReaderFactory,
+			managedSdkRuntime: managed.runtime,
+			managedSdkTenantFence: (key => fenceOpen && key.generation === 7) satisfies ManagedSdkTenantFence,
+		});
+		const routes = options.routes;
+		if (routes?.closeSession === undefined) throw new Error("expected project close route");
+		const authority = managedAuthority(projectDirectory, "managed-outcomes", "outcome-request");
+		const mapping = { ...mappingFor("managed-project", "managed-outcomes"), managedAuthority: authority };
+		mappings.setScoped({ principalId: authority.principalId, chatId: mapping.chatId }, mapping);
+		const close = (ingressId: string) =>
+			routes.closeSession!(mappings.getScoped({ principalId: authority.principalId, chatId: mapping.chatId })!, {
+				ingressId,
+				ingressHash: ingressId,
+			});
+		await expect(close("managed-unknown")).resolves.toMatchObject({ status: "uncertain" });
+		expect(
+			mappings.operationScoped({ principalId: authority.principalId, chatId: mapping.chatId }, "managed-unknown"),
+		).toMatchObject({ state: "conflict" });
+		managed.status = "replaced";
+		await expect(close("managed-replaced")).resolves.toMatchObject({ status: "uncertain" });
+		managed.status = "current";
+		managed.outcome = { ok: false, certainty: "retryable" };
+		await expect(close("managed-not-dispatched")).resolves.toMatchObject({ status: "unavailable" });
+		managed.throws = true;
+		fenceOpen = true;
+		await expect(close("managed-throws")).resolves.toMatchObject({ status: "uncertain" });
+		expect(
+			mappings.operationScoped({ principalId: authority.principalId, chatId: mapping.chatId }, "managed-throws"),
+		).toMatchObject({ state: "uncertain" });
+		managed.throws = false;
+		fenceOpen = false;
+		await expect(close("managed-fence-lost")).resolves.toMatchObject({ status: "uncertain" });
+		expect(managed.requests).toEqual(["managed-unknown", "managed-replaced", "managed-not-dispatched"]);
 	});
 	test("uses exact owned /exit proof without invoking released SDK session.close and replays the completed close", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-default-close-wiring-"));
@@ -831,6 +968,75 @@ function mappingFor(projectId: string, sessionId: string): SessionMapping {
 		operationId: "dynamic-operation",
 	};
 }
+
+function managedAuthority(cwd: string, sessionId: string, requestKey: string): ManagedTurnAuthority {
+	return {
+		principalId: "owner-test",
+		projectId: "managed-project",
+		canonicalWorkspace: path.resolve(cwd),
+		chatId: "dynamic-chat",
+		sessionId,
+		generation: 7,
+		leaseId: "managed-lease",
+		epoch: "managed-epoch",
+		requestKey,
+	};
+}
+
+function managedCloseRuntime(initialStatus: "current" | "retired" | "replaced" | "unknown") {
+	const subject: {
+		runtime: ManagedSdkRuntimeDependency;
+		readonly calls: string[];
+		readonly requests: string[];
+		status: "current" | "retired" | "replaced" | "unknown";
+		outcome: { ok: boolean; certainty?: string };
+		throws: boolean;
+	} = {
+		runtime: undefined as never,
+		calls: [],
+		requests: [],
+		status: initialStatus,
+		outcome: { ok: true },
+		throws: false,
+	};
+	subject.runtime = {
+		async start() {},
+		async reconcile() {
+			subject.calls.push("reconcile");
+		},
+		async dispose() {},
+		async acquireAttachment() {
+			throw new Error("managed close fixture must not acquire an attachment");
+		},
+		async request() {
+			throw new Error("managed close fixture must not issue a Router request");
+		},
+		subscribeFrames() {
+			throw new Error("managed close fixture must not subscribe frames");
+		},
+		async generationStatus() {
+			subject.calls.push("status");
+			return { status: subject.status };
+		},
+		async createLifecycleSession() {
+			throw new Error("managed close fixture must not create a session");
+		},
+		async resumeLifecycleSession() {
+			throw new Error("managed close fixture must not resume a session");
+		},
+		async closeLifecycleSession(request: { readonly requestKey: string }) {
+			if (subject.throws) throw new Error("managed close transport failed");
+			subject.calls.push("close");
+			subject.requests.push(request.requestKey);
+			return subject.outcome;
+		},
+		async deleteLifecycleSession() {
+			throw new Error("managed close fixture must not delete a session");
+		},
+	} as unknown as ManagedSdkRuntimeDependency;
+	return subject;
+}
+
 async function currentLifecycleMapping(
 	projectId: string,
 	sessionId: string,

@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import type { ManagedSdkRuntime } from "../gjc/managed-sdk-runtime";
 import type { SessionAttachmentProof } from "../gjc/session-authority";
+import type { SessionMapping } from "../gjc/session-router";
 import type {
 	GjcCancelTurnInput,
 	GjcContinueSessionInput,
@@ -19,6 +20,7 @@ import type {
 	ManagedTurnAuthority,
 } from "../gjc/turn-runner";
 import { GjcTurnCancelledError } from "../gjc/turn-runner";
+import type { LiveGatewayRunnerInput } from "./chat-completions";
 import {
 	createManagedSessionOperations,
 	type ManagedGateInput,
@@ -26,6 +28,7 @@ import {
 	type ManagedSessionOperations,
 	type ManagedTurnInput,
 } from "./gjc-managed-session-operations";
+import { createManagedSuccessorFlow, type ManagedSuccessorFlow } from "./gjc-managed-successor";
 
 export type ManagedRunnerStartInput = GjcStartNewSessionInput & {
 	readonly preparedManagedAuthority: ManagedPreparedTurnAuthority;
@@ -43,6 +46,7 @@ export type ManagedRunnerCloseInput = {
 /** Managed implementation of the supported GjcTurnRunner surface. */
 export interface ManagedGjcTurnRunner extends GjcTurnRunner {
 	readonly operations: ManagedSessionOperations;
+	readonly forkManagedSuccessor: ManagedSuccessorFlow["fork"];
 	create(input: ManagedRunnerStartInput): Promise<GjcTurnResult>;
 	resume(input: ManagedLifecycleInput): Promise<unknown>;
 	continue(input: ManagedRunnerContinueInput): Promise<GjcTurnResult>;
@@ -88,8 +92,10 @@ export interface ManagedGjcTurnRunner extends GjcTurnRunner {
 
 export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedGjcTurnRunner {
 	const operations = createManagedSessionOperations(runtime);
+	const forkManagedSuccessor = createManagedSuccessorFlow(runtime);
 	return {
 		operations,
+		forkManagedSuccessor: forkManagedSuccessor.fork,
 		async create(input) {
 			throwIfAborted(input.signal);
 			const lifecycle = await operations.create({
@@ -112,14 +118,16 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 			}
 		},
 		resume: input => operations.resume(input),
-		continue: async input =>
-			withManagedProof(await operations.followUp(turnInput(input, "turn.follow_up")), input.authority),
+		continue: async input => {
+			const result = await operations.followUp(turnInput(input, "turn.follow_up"));
+			await operations.acquire(input.authority);
+			return withManagedProof(result, input.authority);
+		},
 		continueSession: async input => {
 			const authority = managedAuthorityFor(input, "turn.follow_up");
-			return withManagedProof(
-				await operations.followUp(turnInput({ ...input, authority }, "turn.follow_up")),
-				authority,
-			);
+			const result = await operations.followUp(turnInput({ ...input, authority }, "turn.follow_up"));
+			await operations.acquire(authority);
+			return withManagedProof(result, authority);
 		},
 		async control(input) {
 			if ("gateId" in input) return { result: await operations.answerGate(gateInput(input)) };
@@ -153,6 +161,42 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 				operation: "turn.abort",
 				idempotencyKey: authority.requestKey,
 			});
+		},
+		async runControl(input, mapping, _lifecycle, _onAcknowledgedSuccessor, onDispatch) {
+			const control = input.control;
+			if (control === undefined) throw new Error("OpenWebUI control request was not supplied.");
+			const authority = managedControlAuthority(input, mapping);
+			if (control.operation === "branch")
+				throw new Error("Managed branch controls must use the public successor flow.");
+			if (control.operation === "session.switch") throw new Error("Managed controls do not expose session.switch.");
+			if (control.operation === "session.new" || control.operation === "session.resume") {
+				const lifecycleResult =
+					control.operation === "session.new"
+						? await operations.create({ authority, target: { path: authority.canonicalWorkspace } })
+						: await operations.resume({
+								authority,
+								target: {
+									sessionIdOrPrefix: control.sessionId ?? authority.sessionId,
+									path: authority.canonicalWorkspace,
+								},
+							});
+				assertResumedExactAuthority(lifecycleResult, authority);
+				return {
+					sessionId: authority.sessionId,
+					result: withManagedProof(emptyControlResult(), authority),
+				};
+			}
+			const operation = managedControlOperation(control);
+			await operations.request({
+				authority,
+				operation,
+				input: managedControlInput(control, input),
+				idempotencyKey: authority.requestKey,
+				signal: input.signal,
+				onDispatch,
+			});
+			await operations.acquire(authority);
+			return { result: withManagedProof(emptyControlResult(), authority) };
 		},
 		closePreflight: input => operations.close({ authority: input.authority, target: input.target }),
 		async getState(input) {
@@ -362,4 +406,51 @@ function managedProof(authority: ManagedTurnAuthority) {
 
 function withManagedProof(result: GjcTurnResult, authority: ManagedTurnAuthority): GjcTurnResult {
 	return { ...result, managedProof: managedProof(authority), managedAuthority: authority };
+}
+
+function managedControlAuthority(input: LiveGatewayRunnerInput, mapping: SessionMapping): ManagedTurnAuthority {
+	const authority = mapping.managedAuthority;
+	if (authority === undefined) throw new Error("Managed control requires persisted managed authority.");
+	if (
+		authority.projectId !== mapping.projectId ||
+		authority.chatId !== mapping.chatId ||
+		authority.sessionId !== mapping.sessionId ||
+		authority.canonicalWorkspace !== resolve(input.project.cwd) ||
+		authority.principalId !== input.ownerUserId
+	)
+		throw new Error("Managed control authority does not exactly match the session mapping.");
+	return authority;
+}
+
+function managedControlOperation(control: NonNullable<LiveGatewayRunnerInput["control"]>): string {
+	switch (control.operation) {
+		case "abort":
+			return "turn.abort";
+		case "steer":
+			return "turn.steer";
+		case "follow_up":
+			return "turn.follow_up";
+		case "abort_and_prompt":
+			return "turn.abort_and_prompt";
+		case "action_reply":
+			return "ask.answer";
+		case "workflow.plan_approve":
+			return "workflow.plan_approve";
+		default:
+			throw new Error(`Unsupported managed control surface: ${control.operation}.`);
+	}
+}
+
+function managedControlInput(
+	control: NonNullable<LiveGatewayRunnerInput["control"]>,
+	input: LiveGatewayRunnerInput,
+): Readonly<Record<string, unknown>> {
+	if (control.operation === "abort") return { mode: "terminal", scope: "turn" };
+	if (control.operation === "action_reply") return { id: control.actionId, answer: control.answer };
+	if (control.operation === "workflow.plan_approve") return control.input;
+	return { text: "text" in control && control.text !== undefined ? control.text : input.prompt };
+}
+
+function emptyControlResult(): GjcTurnResult {
+	return { text: "", events: [], rawFrameCursor: 0, eventCursor: 0 };
 }

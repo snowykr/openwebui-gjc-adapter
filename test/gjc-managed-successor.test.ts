@@ -41,6 +41,10 @@ describe("unwired managed successor", () => {
 			sessionId: successor.sessionId,
 			generation: successor.endpointGeneration,
 		});
+		expect(result.successor).not.toHaveProperty("descriptorPath");
+		expect(result.successor).not.toHaveProperty("tmuxPane");
+		expect(result.successor).not.toHaveProperty("tmuxOwnershipTag");
+		expect(JSON.stringify(result)).not.toMatch(/descriptor|tmux|sessionFile/i);
 		expect(published).toEqual([successor.sessionId]);
 		expect(fake.order).toEqual([
 			"reconcile",
@@ -109,6 +113,29 @@ describe("unwired managed successor", () => {
 		expect(fake.closeTargets).toHaveLength(0);
 	});
 
+	test("rejects a foreign target authority before invoking the public lifecycle", async () => {
+		const fake = new FakeRuntime();
+		await expect(
+			createManagedSuccessorFlow(fake.runtime).fork({
+				source,
+				target: { ...target, principalId: "user-b" },
+				publish: () => undefined,
+			}),
+		).rejects.toThrow("tenant authority boundary");
+		expect(fake.forks).toHaveLength(0);
+		expect(fake.order).toEqual([]);
+	});
+
+	test("fails closed when the source tenant fence cannot be reacquired", async () => {
+		const fake = new FakeRuntime();
+		fake.sourceFence = false;
+		await expect(
+			createManagedSuccessorFlow(fake.runtime).fork({ source, target, publish: () => undefined }),
+		).rejects.toThrow("source fence");
+		expect(fake.forks).toHaveLength(0);
+		expect(fake.closeTargets).toHaveLength(0);
+	});
+
 	test("treats cancellation after invocation as uncertain until cleanup proves retirement", async () => {
 		const fake = new FakeRuntime();
 		const controller = new AbortController();
@@ -166,6 +193,7 @@ class FakeRuntime {
 	successorPrincipalId = source.principalId;
 	afterFork: (() => void) | undefined;
 	forkFailure: Error | undefined;
+	sourceFence = true;
 	get runtime(): ManagedSdkRuntime {
 		return this as unknown as ManagedSdkRuntime;
 	}
@@ -174,6 +202,7 @@ class FakeRuntime {
 	}
 	async acquireAttachment(key: { sessionId: string; generation: number }) {
 		this.order.push(`acquire:${key.sessionId}:${key.generation}`);
+		if (key.sessionId === source.sessionId && !this.sourceFence) throw new Error("source fence was lost");
 		if (key.sessionId === successor.sessionId && !this.registered.has(`${key.sessionId}:${key.generation}`))
 			throw new Error("Returned successor was not registered.");
 		return {

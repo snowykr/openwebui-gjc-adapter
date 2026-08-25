@@ -68,8 +68,8 @@ export function createManagedSuccessorFlow(runtime: ManagedSdkRuntime): ManagedS
 					throw new ManagedSuccessorUncertainError("Managed fork acknowledgement lacks a target identity.");
 				// An abort after lifecycle invocation is ambiguous even when the fork later acknowledges.
 				if (input.signal?.aborted) throw new GjcTurnCancelledError();
-				const successor = await runtime.registerLifecycleTenant(returnedTarget);
-				await proveTarget(runtime, returnedTarget);
+				await runtime.registerLifecycleTenant(returnedTarget);
+				const successor = await proveTarget(runtime, returnedTarget);
 				throwIfAborted(input.signal);
 				await input.publish(successor);
 				return { successor, operationHash };

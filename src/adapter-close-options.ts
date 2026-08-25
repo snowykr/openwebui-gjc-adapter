@@ -12,8 +12,10 @@ import type { GjcSessionTurnRunner } from "./live/gjc-routing-runner";
 import type { SessionCloseResult } from "./projects/link-service";
 
 export interface AdapterCloseOptionsDependencies {
-	/** Process-owned managed runtime, deliberately unused while close receipts remain legacy-owned. */
+	/** Process-owned managed runtime for mappings with complete managed authority. */
 	readonly managedSdkRuntime?: ManagedSdkRuntimeDependency;
+	/** Exact managed tenant lease/epoch fence. */
+	readonly managedSdkTenantFence?: import("./live/gjc-routing-lifecycle").ManagedSdkTenantFence;
 	readonly turnRunner: GjcSessionTurnRunner;
 }
 
@@ -26,10 +28,31 @@ export function createAdapterSessionCloser(
 	const withLifecycleClosePreflight = dependencies.turnRunner.withLifecycleClosePreflight?.bind(
 		dependencies.turnRunner,
 	);
-	if (withLifecycleClosePreflight === undefined) return undefined;
+	const managedCloseAvailable =
+		dependencies.managedSdkRuntime !== undefined && dependencies.managedSdkTenantFence !== undefined;
+	if (withLifecycleClosePreflight === undefined && !managedCloseAvailable) return undefined;
 	const closeWithOwnedPaneProof = (mapping: SessionMapping, receipt: GjcCloseReceipt) =>
 		requestExitAndProveOwnedSessionClosed(config, cliPath, mapping, receipt);
 	return async (mapping, ingress) => {
+		if (hasCompleteManagedAuthority(mapping)) {
+			if (!managedCloseAvailable)
+				return {
+					status: "uncertain",
+					message: "Managed GJC close requires a process-owned runtime and exact tenant fence.",
+				};
+			return routeGjcSessionClose({
+				mapping,
+				mappings,
+				ingressId: ingress.ingressId,
+				ingressHash: ingress.ingressHash,
+				legacyIngress: ingress.legacyIngress,
+				managedSdkRuntime: dependencies.managedSdkRuntime,
+				managedSdkTenantFence: dependencies.managedSdkTenantFence,
+				lifecycle: undefined as never,
+				close: undefined as never,
+			});
+		}
+		if (withLifecycleClosePreflight === undefined) throw new Error("GJC close lifecycle preflight is unavailable.");
 		const cwd = mapping.attachment?.expectedCwd;
 		if (cwd === undefined) throw new Error("GJC close requires a persisted canonical cwd.");
 		return withLifecycleClosePreflight(
@@ -55,6 +78,32 @@ export function createAdapterSessionCloser(
 		);
 	};
 }
+
+function hasCompleteManagedAuthority(
+	mapping: SessionMapping,
+): mapping is SessionMapping & { readonly managedAuthority: NonNullable<SessionMapping["managedAuthority"]> } {
+	const authority = mapping.managedAuthority;
+	return (
+		authority !== undefined &&
+		authority.chatId === mapping.chatId &&
+		authority.projectId === mapping.projectId &&
+		authority.sessionId === mapping.sessionId &&
+		(typeof mapping.principalId !== "string" || authority.principalId === mapping.principalId) &&
+		[
+			authority.principalId,
+			authority.projectId,
+			authority.canonicalWorkspace,
+			authority.chatId,
+			authority.sessionId,
+		].every(value => typeof value === "string" && value.length > 0) &&
+		Number.isSafeInteger(authority.generation) &&
+		authority.generation > 0 &&
+		[authority.leaseId, authority.epoch, authority.requestKey].every(
+			value => typeof value === "string" && value.length > 0,
+		)
+	);
+}
+
 function ownedLifecycleBackend(
 	config: ResolvedAdapterConfig,
 	cliPath: string,

@@ -1,3 +1,5 @@
+import type { ManagedSdkRuntimeDependency, ManagedSdkTenantFence } from "../live/gjc-routing-lifecycle";
+import type { TenantSessionKey } from "./managed-sdk-runtime";
 import type { SessionOperation, SessionOperationResult } from "./session-authority";
 import type { SessionMapping, SessionMappingStore } from "./session-mapping-store";
 import { replayCloseOperation } from "./session-operation-codec";
@@ -20,6 +22,8 @@ export interface RouteGjcSessionCloseInput extends SessionCloseIngress {
 	readonly mappings: SessionMappingStore;
 	readonly lifecycle: GjcLifecycleTransaction;
 	readonly close: (receipt: GjcCloseReceipt) => Promise<SessionCloseResult>;
+	readonly managedSdkRuntime?: ManagedSdkRuntimeDependency;
+	readonly managedSdkTenantFence?: ManagedSdkTenantFence;
 	readonly afterPublish?: (mapping: SessionMapping) => void;
 }
 
@@ -41,6 +45,7 @@ export async function routeGjcSessionClose(input: RouteGjcSessionCloseInput): Pr
 				: scopedInput;
 		return replayPriorClose(replayInput, prior);
 	}
+	if (isCompleteManagedAuthority(scopedInput.mapping)) return routeManagedSessionClose(scopedInput);
 	scopedInput.mappings.beginOperation(scopedInput.mapping.chatId, {
 		id: scopedInput.ingressId,
 		kind: "close",
@@ -107,6 +112,112 @@ export async function routeGjcSessionClose(input: RouteGjcSessionCloseInput): Pr
 	}
 }
 
+async function routeManagedSessionClose(input: RouteGjcSessionCloseInput): Promise<SessionCloseResult> {
+	const authority = input.mapping.managedAuthority;
+	if (!isCompleteManagedAuthority(input.mapping) || authority === undefined)
+		throw new Error("Managed GJC close requires complete managed authority.");
+	input.mappings.beginOperation(input.mapping.chatId, {
+		id: input.ingressId,
+		kind: "close",
+		ingressId: input.ingressId,
+		detail: input.ingressHash,
+	});
+	const runtime = input.managedSdkRuntime;
+	const tenantFence = input.managedSdkTenantFence;
+	if (runtime === undefined || tenantFence === undefined) {
+		return managedCloseFailure(input, "Managed GJC close runtime or tenant fence is unavailable.");
+	}
+	const tenant: TenantSessionKey = {
+		principalId: authority.principalId,
+		projectId: authority.projectId,
+		canonicalWorkspace: authority.canonicalWorkspace,
+		chatId: authority.chatId,
+		sessionId: authority.sessionId,
+		generation: authority.generation,
+		leaseId: authority.leaseId,
+		epoch: authority.epoch,
+	};
+	try {
+		if (!(await tenantFence(tenant)))
+			return managedCloseFailure(input, "Managed tenant authority fence was lost before close.");
+		const outcome = await runtime.closeLifecycleSession({
+			actor: { id: authority.principalId, namespace: "openwebui-gjc-adapter" },
+			capability: "session.close",
+			requestKey: input.ingressId,
+			target: { sessionId: authority.sessionId, endpointGeneration: authority.generation },
+		});
+		if (!(await tenantFence(tenant)))
+			return managedCloseFailure(
+				input,
+				"Managed tenant authority fence was lost after close.",
+				"uncertain",
+				"uncertain",
+			);
+		await runtime.reconcile();
+		const status = await runtime.generationStatus(tenant);
+		if (status.status === "retired") {
+			const mapping = input.mappings.completeOperationWithMapping(
+				input.mapping.chatId,
+				input.ingressId,
+				input.ingressHash,
+				input.mapping,
+				"close",
+			);
+			input.afterPublish?.(mapping);
+			return { status: "closed" };
+		}
+		if (status.status === "current" && !outcome.ok && outcome.certainty === "retryable")
+			return managedCloseFailure(
+				input,
+				"Managed session close was not dispatched; the exact generation remains current.",
+				"unavailable",
+			);
+		return managedCloseFailure(input, `Exact managed generation close is ${status.status}.`);
+	} catch (error) {
+		return managedCloseFailure(
+			input,
+			error instanceof Error ? error.message : "Managed generation close is uncertain.",
+			"uncertain",
+			"uncertain",
+		);
+	}
+}
+
+function managedCloseFailure(
+	input: RouteGjcSessionCloseInput,
+	message: string,
+	status: "uncertain" | "unavailable" = "uncertain",
+	operationState: "conflict" | "uncertain" = "conflict",
+): SessionCloseResult {
+	input.mappings.transitionOperation(input.mapping.chatId, input.ingressId, operationState, input.ingressHash);
+	return { status, message };
+}
+
+function isCompleteManagedAuthority(
+	mapping: SessionMapping,
+): mapping is SessionMapping & { readonly managedAuthority: NonNullable<SessionMapping["managedAuthority"]> } {
+	const authority = mapping.managedAuthority;
+	return (
+		authority !== undefined &&
+		authority.chatId === mapping.chatId &&
+		authority.projectId === mapping.projectId &&
+		authority.sessionId === mapping.sessionId &&
+		(typeof mapping.principalId !== "string" || authority.principalId === mapping.principalId) &&
+		[
+			authority.principalId,
+			authority.projectId,
+			authority.canonicalWorkspace,
+			authority.chatId,
+			authority.sessionId,
+		].every(value => typeof value === "string" && value.length > 0) &&
+		Number.isSafeInteger(authority.generation) &&
+		authority.generation > 0 &&
+		[authority.leaseId, authority.epoch, authority.requestKey].every(
+			value => typeof value === "string" && value.length > 0,
+		)
+	);
+}
+
 function replayPriorClose(input: RouteGjcSessionCloseInput, prior: SessionOperation): SessionCloseResult {
 	if (prior.kind !== "close" || prior.detail !== input.ingressHash)
 		throw new Error(`GJC close ${input.ingressId} conflicts with a different ingress payload.`);
@@ -119,11 +230,34 @@ function replayPriorClose(input: RouteGjcSessionCloseInput, prior: SessionOperat
 			input.ingressId,
 			prior.result,
 			currentMapping.operationId,
-			legacyCloseMappingCompatible(prior.result, currentMapping, prior, currentOperation, persistedOperations),
+			isCompleteManagedAuthority(currentMapping)
+				? managedCloseMappingCompatible(prior.result, currentMapping, prior, currentOperation, persistedOperations)
+				: legacyCloseMappingCompatible(prior.result, currentMapping, prior, currentOperation, persistedOperations),
 		);
 	}
 	if (prior.state === "pending") throw new Error(`GJC close ${input.ingressId} is pending and cannot be replayed.`);
 	throw new Error(`GJC close ${input.ingressId} requires reconciliation.`);
+}
+
+function managedCloseMappingCompatible(
+	result: SessionOperationResult | undefined,
+	mapping: SessionMapping,
+	closeOperation: SessionOperation,
+	currentOperation: SessionOperation | undefined,
+	persistedOperations: readonly SessionOperation[],
+): boolean {
+	const resultMapping = result?.mapping;
+	if (
+		resultMapping === undefined ||
+		resultMapping.chatId !== mapping.chatId ||
+		resultMapping.projectId !== mapping.projectId ||
+		resultMapping.sessionId !== mapping.sessionId ||
+		resultMapping.sessionFile !== mapping.sessionFile ||
+		resultMapping.attachment !== undefined ||
+		mapping.attachment !== undefined
+	)
+		return false;
+	return operationFollowsMapping(closeOperation, currentOperation, persistedOperations);
 }
 
 function legacyCloseMappingCompatible(
