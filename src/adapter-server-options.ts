@@ -219,6 +219,10 @@ export async function buildResolvedAdapterServerOptions(
 			dependencies.mappings !== undefined ||
 			dependencies.managedBootstrap !== undefined ||
 			dependencies.createManagedBootstrap !== undefined;
+		// An existing deployment does not own its GJC runtime lifecycle, so it may
+		// reopen a verified canonical V3 authority but must not migrate V2 in place.
+		// Managed deployment owns the process/runtime lock required for the atomic swap.
+		const mayActivateManagedV3 = config.mode === "managed" && !explicitLegacyTestSeam;
 		const activeV3Marker = readSessionAuthorityV3ActiveMarker(mappingStorePath);
 		const authorityEpoch = probeSessionAuthorityEpoch(mappingStorePath, {
 			...(activeV3Marker === undefined ? {} : { managedDigest: activeV3Marker.canonicalDigest }),
@@ -227,7 +231,7 @@ export async function buildResolvedAdapterServerOptions(
 		const previouslyLinkedProjectIdsBeforeConfiguredSeed = new Set(
 			projectStore.listLinkedProjects().map(project => project.id),
 		);
-		if (authorityEpoch.status !== "v3" && !explicitLegacyTestSeam && owner.ownerUserId.length > 0) {
+		if (authorityEpoch.status !== "v3" && mayActivateManagedV3 && owner.ownerUserId.length > 0) {
 			const sourcePaths =
 				behavior.sessionAuthorityMigrationSourcePaths ??
 				(config.mode === "managed" ? [path.join("/run/gjc-session", SESSION_MAPPING_STORE_FILE)] : []);
@@ -247,7 +251,7 @@ export async function buildResolvedAdapterServerOptions(
 				detail: `Session authority migration ${migration.status}.`,
 			});
 		}
-		if (authorityEpoch.status !== "v3" && !explicitLegacyTestSeam) {
+		if (authorityEpoch.status !== "v3" && mayActivateManagedV3) {
 			await assertProjectsAdmitted(
 				projects,
 				config.runtimeLocations.protectedProjectPaths,
@@ -283,7 +287,7 @@ export async function buildResolvedAdapterServerOptions(
 			managedSdkRuntime = activeManagedV3Runtime.runtime;
 			managedSdkTenantFence = activeManagedV3Runtime.tenantFence;
 			managedSdkRuntimeHealth.phase = "ready";
-		} else if (!explicitLegacyTestSeam) {
+		} else if (mayActivateManagedV3) {
 			const runtime =
 				dependencies.managedSdkRuntime ??
 				dependencies.createManagedSdkRuntime?.(config.runtimeLocations.agentDir) ??
@@ -420,21 +424,19 @@ export async function buildResolvedAdapterServerOptions(
 		const managedModelRuntime = activeManagedV3Runtime?.runtime ?? managedBootstrapDependencies?.runtime;
 		const modelReaderFactory =
 			managedModelRuntime === undefined
-				? dependencies.turnRunner === undefined
-					? undefined
-					: (dependencies.modelReaderFactory ??
-						createModelReaderFactory({
-							cliPath,
-							runtimeLocations: config.runtimeLocations,
-							resolveAttachment:
-								dependencies.resolveModelAttachment ??
-								createPublicSdkModelAttachmentResolver({
-									cliPath,
-									cwd: config.runtimeLocations.readerWorkspace,
-									childEnvironment: config.runtimeLocations.childEnvironment,
-								}),
-							sessionPortFactory: dependencies.sessionPortFactory,
-						}))
+				? (dependencies.modelReaderFactory ??
+					createModelReaderFactory({
+						cliPath,
+						runtimeLocations: config.runtimeLocations,
+						resolveAttachment:
+							dependencies.resolveModelAttachment ??
+							createPublicSdkModelAttachmentResolver({
+								cliPath,
+								cwd: config.runtimeLocations.readerWorkspace,
+								childEnvironment: config.runtimeLocations.childEnvironment,
+							}),
+						sessionPortFactory: dependencies.sessionPortFactory,
+					}))
 				: createManagedReaderFactory(managedModelRuntime, config.turnTimeoutMs);
 		const closeSession = createAdapterSessionCloser(
 			config,

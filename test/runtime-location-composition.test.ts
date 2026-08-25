@@ -172,10 +172,10 @@ describe("runtime location composition", () => {
 			generationStatus: async () => ({ status: "current" }),
 		};
 		try {
-			const config = resolvedBuilderConfig(root);
+			const config = { ...resolvedBuilderConfig(root), mode: "managed" as const };
 			mkdirSync(config.sessionRoot);
 			writeFileSync(
-				join(config.sessionRoot, "openwebui-gjc-session-authority.json"),
+				join(config.sessionRoot, "openwebui-session-mappings.json"),
 				'{"kind":"openwebui-gjc-session-authority","version":2,"mappings":[]}\n',
 			);
 			const options = await buildResolvedAdapterServerOptions(config, { managedSdkRuntime: runtime as never });
