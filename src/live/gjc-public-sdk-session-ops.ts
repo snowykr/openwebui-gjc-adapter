@@ -10,7 +10,6 @@ import type {
 	GjcSessionState,
 	GjcSessionStateInput,
 	GjcStartNewSessionInput,
-	GjcSwitchSessionInput,
 	GjcTurnResult,
 } from "../gjc/turn-runner";
 import { GjcTurnCancelledError } from "../gjc/turn-runner";
@@ -257,10 +256,6 @@ export async function startNewSession<T>(
 		if (cleanupPromise === undefined) cleanupPromise = backend.fallbackBeforeCloseAcknowledgement(attachment);
 		return cleanupPromise;
 	}
-}
-
-export async function switchSession(context: PublicSdkRunnerContext, input: GjcSwitchSessionInput): Promise<void> {
-	await ensureAttachment(context, input, input.lifecycle);
 }
 
 export async function getState(context: PublicSdkRunnerContext, input: GjcSessionStateInput): Promise<GjcSessionState> {

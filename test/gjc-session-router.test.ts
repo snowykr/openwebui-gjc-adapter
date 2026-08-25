@@ -23,7 +23,6 @@ import type {
 	GjcSessionState,
 	GjcSessionStateInput,
 	GjcStartNewSessionInput,
-	GjcSwitchSessionInput,
 	GjcTurnResult,
 	GjcTurnRunner,
 	ManagedPreparedTurnAuthority,
@@ -49,7 +48,6 @@ function ownedAttachmentProof<T extends { readonly cwd: string; readonly session
 class FakeGjcTurnRunner implements GjcTurnRunner {
 	readonly starts: GjcStartNewSessionInput[] = [];
 	readonly continues: GjcContinueSessionInput[] = [];
-	readonly switches: GjcSwitchSessionInput[] = [];
 	readonly states: GjcSessionStateInput[] = [];
 
 	state: GjcSessionState = {
@@ -61,7 +59,7 @@ class FakeGjcTurnRunner implements GjcTurnRunner {
 	returnedSelection: NormalizedModelSelection | undefined;
 	failPrompt = false;
 	cancelBeforePrompt = false;
-	mappedCancellation: "switch" | "state" | "continue-before-dispatch" | "continue-after-dispatch" | undefined;
+	mappedCancellation: "state" | "continue-before-dispatch" | "continue-after-dispatch" | undefined;
 
 	async startNewSession<T>(
 		input: GjcStartNewSessionInput,
@@ -126,10 +124,6 @@ class FakeGjcTurnRunner implements GjcTurnRunner {
 		};
 	}
 
-	async switchSession(input: GjcSwitchSessionInput): Promise<void> {
-		this.switches.push(input);
-		if (this.mappedCancellation === "switch") throw new GjcTurnCancelledError();
-	}
 	async withLifecyclePublication<T>(
 		address: GjcLifecyclePublicationAddress,
 		effect: (lifecycle: GjcLifecycleTransaction) => Promise<T>,
@@ -161,7 +155,6 @@ describe("routeGjcTurn", () => {
 			userMessageId: "message-1",
 			text: "hello",
 		});
-		expect(runner.switches).toHaveLength(0);
 		expect(result.assistantText).toBe("new:hello");
 		expect(result.mapping).toEqual({
 			chatId: "chat-1",
@@ -341,7 +334,7 @@ describe("routeGjcTurn", () => {
 		expect(provisional?.attachment).toBeUndefined();
 	});
 
-	test("continues a mapped session after switching and reading state", async () => {
+	test("continues a mapped session after reading state", async () => {
 		const runner = new FakeGjcTurnRunner();
 		const mappings = new SessionMappingStore();
 		const project = createProject();
@@ -365,7 +358,6 @@ describe("routeGjcTurn", () => {
 		);
 
 		expect(runner.starts).toHaveLength(0);
-		expect(runner.switches).toHaveLength(1);
 		expect(runner.states).toHaveLength(1);
 		expect(runner.continues).toHaveLength(1);
 		expect(runner.continues[0]).toMatchObject({
@@ -380,7 +372,6 @@ describe("routeGjcTurn", () => {
 			eventCursor: 3,
 			operationId: "message-2",
 		});
-		expect(runner.switches[0]?.lifecycle).toBe(runner.states[0]?.lifecycle);
 		expect(runner.continues[0]?.lifecycle).toBe(runner.states[0]?.lifecycle);
 		expect(result.assistantText).toBe("continued:again");
 		expect(result.mapping).toMatchObject({
@@ -392,7 +383,7 @@ describe("routeGjcTurn", () => {
 	});
 
 	test("discards a mapped pending operation when cancellation precedes prompt dispatch", async () => {
-		for (const phase of ["switch", "state", "continue-before-dispatch"] as const) {
+		for (const phase of ["state", "continue-before-dispatch"] as const) {
 			const runner = new FakeGjcTurnRunner();
 			const mappings = new SessionMappingStore();
 			mappings.set({
@@ -494,7 +485,6 @@ describe("routeGjcTurn", () => {
 				}),
 			),
 		).rejects.toBeInstanceOf(SessionFileBoundaryError);
-		expect(runner.switches).toHaveLength(0);
 		expect(mappings.operation("chat-1", "message-2")).toMatchObject({
 			id: "message-2",
 			state: "uncertain",

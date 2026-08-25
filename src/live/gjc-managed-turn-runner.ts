@@ -13,7 +13,6 @@ import type {
 	GjcSessionState,
 	GjcSessionStateInput,
 	GjcStartNewSessionInput,
-	GjcSwitchSessionInput,
 	GjcTurnResult,
 	GjcTurnRunner,
 	ManagedPreparedTurnAuthority,
@@ -59,7 +58,6 @@ export interface ManagedGjcTurnRunner extends GjcTurnRunner {
 	closePreflight(input: ManagedRunnerCloseInput): Promise<unknown>;
 	getState(input: GjcSessionStateInput): Promise<GjcSessionState>;
 	getAvailableModels(input: GjcSessionStateInput): Promise<readonly unknown[]>;
-	switchSession(input: GjcSwitchSessionInput): Promise<void>;
 	withLifecyclePublication<T>(
 		address: GjcLifecyclePublicationAddress,
 		effect: (lifecycle: GjcLifecycleTransaction) => Promise<T>,
@@ -168,7 +166,6 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 			const authority = managedControlAuthority(input, mapping);
 			if (control.operation === "branch")
 				throw new Error("Managed branch controls must use the public successor flow.");
-			if (control.operation === "session.switch") throw new Error("Managed controls do not expose session.switch.");
 			if (control.operation === "session.new" || control.operation === "session.resume") {
 				const lifecycleResult =
 					control.operation === "session.new"
@@ -211,14 +208,6 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 			};
 		},
 		getAvailableModels: input => operations.getModels(managedAuthorityFor(input, "models.list/current")),
-		async switchSession(input) {
-			const authority = managedAuthorityFor(input, "session.resume");
-			const resumed = await operations.resume({
-				authority,
-				target: { sessionIdOrPrefix: authority.sessionId, path: input.cwd },
-			});
-			assertResumedExactAuthority(resumed, authority);
-		},
 		withLifecyclePublication: async (address, effect) => effect(managedLifecycleTransaction(address)),
 		withLifecycleClosePreflight: async (address, effect) => effect(managedLifecycleTransaction(address)),
 		async startNewSession(_input, _publish, _beforePrompt, _onFailure) {

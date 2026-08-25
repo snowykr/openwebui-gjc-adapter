@@ -8,7 +8,6 @@ import type {
 	GjcSessionState,
 	GjcSessionStateInput,
 	GjcStartNewSessionInput,
-	GjcSwitchSessionInput,
 	GjcTurnResult,
 	GjcTurnRunner,
 } from "../src/gjc/turn-runner";
@@ -18,7 +17,6 @@ import { attachmentProof, lifecycleFixture } from "./gjc-lifecycle-fixtures";
 export class FakeGjcTurnRunner implements GjcTurnRunner {
 	readonly starts: GjcStartNewSessionInput[] = [];
 	readonly continues: GjcContinueSessionInput[] = [];
-	readonly switches: GjcSwitchSessionInput[] = [];
 	readonly states: GjcSessionStateInput[] = [];
 	readonly gateResponses: GjcRespondWorkflowGateInput[] = [];
 	cancelTurn?: (input: GjcCancelTurnInput) => void;
@@ -90,10 +88,6 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 				: { modelSelection: this.continueModelSelection }),
 			attachment: attachmentProof(input),
 		};
-	}
-
-	async switchSession(input: GjcSwitchSessionInput): Promise<void> {
-		this.switches.push(input);
 	}
 
 	async withLifecyclePublication<T>(

@@ -33,7 +33,7 @@ const controlTurn = (userMessageId: string): LiveGatewayRunnerInput => ({
 
 const lifecycleControlTurn = (
 	userMessageId: string,
-	operation: "session.new" | "session.resume" | "session.switch" = "session.new",
+	operation: "session.new" | "session.resume" = "session.new",
 ): LiveGatewayRunnerInput => ({
 	...controlTurn(userMessageId),
 	control:
@@ -343,9 +343,8 @@ describe("control operation replay", () => {
 			id: userMessageId,
 		});
 	});
-	test.each(["session.resume", "session.switch"] as const)(
-		"reports the actual %s SDK invocation boundary",
-		async operation => {
+	test("reports the actual session.resume SDK invocation boundary", async () => {
+		const operation = "session.resume" as const;
 			const root = mkdtempSync(join(tmpdir(), `gjc-${operation.replace(".", "-")}-boundary-`));
 			const sessionRoot = join(root, ".gjc", "sessions");
 			const endpointRoot = join(root, ".gjc", "state", "sdk");
@@ -367,12 +366,6 @@ describe("control operation replay", () => {
 				async attach() {},
 				detach() {},
 				async resumeSession() {
-					invocations += 1;
-					const successor = await readPublishedSdkEndpoint(root, "session-1");
-					if (successor === undefined) throw new Error("test endpoint was not published");
-					return successor;
-				},
-				async switchSession() {
 					invocations += 1;
 					const successor = await readPublishedSdkEndpoint(root, "session-1");
 					if (successor === undefined) throw new Error("test endpoint was not published");
@@ -435,8 +428,7 @@ describe("control operation replay", () => {
 			expect(invocations).toBe(1);
 			expect(dispatches).toBe(1);
 			rmSync(root, { recursive: true, force: true });
-		},
-	);
+		});
 	test("does not send a terminal abort before control dispatch and retries the same message", async () => {
 		const root = mkdtempSync(join(tmpdir(), "gjc-control-dispatch-boundary-"));
 		const sessionRoot = join(root, ".gjc", "sessions");

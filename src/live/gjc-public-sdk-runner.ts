@@ -10,7 +10,6 @@ import type {
 	GjcSessionState,
 	GjcSessionStateInput,
 	GjcStartNewSessionInput,
-	GjcSwitchSessionInput,
 	GjcTurnResult,
 	GjcTurnRunner,
 } from "../gjc/turn-runner";
@@ -24,7 +23,6 @@ import {
 	type OwnedAbortRegistration,
 	respondWorkflowGate,
 	startNewSession,
-	switchSession,
 } from "./gjc-public-sdk-session-ops";
 import { attachmentKey } from "./gjc-routing-endpoints";
 import {
@@ -109,10 +107,6 @@ class PublicSdkGjcTurnRunner implements GjcTurnRunner {
 		onFailure?: Parameters<GjcTurnRunner["startNewSession"]>[3],
 	): Promise<T> {
 		return startNewSession(this.#context, input, publish, beforePrompt, onFailure, this.registerOwnedAbort);
-	}
-
-	switchSession(input: GjcSwitchSessionInput): Promise<void> {
-		return switchSession(this.#context, input);
 	}
 
 	getState(input: GjcSessionStateInput): Promise<GjcSessionState> {

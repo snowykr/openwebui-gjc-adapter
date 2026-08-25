@@ -79,7 +79,7 @@ describe("createGjcRoutingLiveGatewayRunner", () => {
 		expect(delegate.starts[0]?.sessionRoot).toBe(sessionRoot);
 	});
 
-	test("continues mapped HTTP-style turns through switchSession and getState", async () => {
+	test("continues mapped HTTP-style turns through state lookup", async () => {
 		const turnRunner = new FakeGjcTurnRunner();
 		const mappings = new SessionMappingStore();
 		mappings.set({
@@ -106,8 +106,12 @@ describe("createGjcRoutingLiveGatewayRunner", () => {
 
 		expect(result).toEqual({ content: "continued:again" });
 		expect(turnRunner.starts).toHaveLength(0);
-		expect(turnRunner.switches).toHaveLength(1);
 		expect(turnRunner.states).toHaveLength(1);
+		expect(turnRunner.states[0]).toMatchObject({
+			chatId: "chat-1",
+			sessionId: "session-1",
+			sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
+		});
 		expect(turnRunner.continues).toHaveLength(1);
 		expect(turnRunner.continues[0]).toMatchObject({
 			chatId: "chat-1",
@@ -208,10 +212,16 @@ describe("createGjcRoutingLiveGatewayRunner", () => {
 		});
 
 		// Then: the SDK path remains the continuation authority.
-		expect(turnRunner.switches[0]?.sessionFile).toBe(
+		expect(turnRunner.states[0]?.sessionFile).toBe(
 			resolveExistingOrProspectivePath("/var/lib/gjc/agent/sessions/--workspace-project--/session-sdk.jsonl"),
 		);
-		expect(turnRunner.continues[0]?.sessionRoot).toBe("/var/lib/gjc/agent/sessions/--workspace-project--");
+		expect(turnRunner.continues[0]).toMatchObject({
+			sessionId: "session-sdk",
+			sessionFile: resolveExistingOrProspectivePath(
+				"/var/lib/gjc/agent/sessions/--workspace-project--/session-sdk.jsonl",
+			),
+			sessionRoot: "/var/lib/gjc/agent/sessions/--workspace-project--",
+		});
 	});
 
 	test("migrates a legacy mapped transcript into the SDK-owned root before continuation", async () => {
@@ -249,7 +259,8 @@ describe("createGjcRoutingLiveGatewayRunner", () => {
 			});
 
 			expect(readFileSync(sdkFile, "utf8")).toBe(legacyTranscript);
-			expect(turnRunner.switches[0]?.sessionFile).toBe(realpathSync(sdkFile));
+			expect(turnRunner.states[0]?.sessionFile).toBe(realpathSync(sdkFile));
+			expect(turnRunner.continues[0]?.sessionFile).toBe(realpathSync(sdkFile));
 			expect(mappings.get("chat-legacy")?.sessionFile).toBe(realpathSync(sdkFile));
 			expect(readFileSync(legacyFile, "utf8")).toBe(legacyTranscript);
 		} finally {
@@ -413,7 +424,6 @@ describe("createGjcRoutingLiveGatewayRunner", () => {
 		});
 		const effectsBeforeRetries = {
 			starts: turnRunner.starts.length,
-			switches: turnRunner.switches.length,
 			continues: turnRunner.continues.length,
 			states: turnRunner.states.length,
 		};
@@ -434,7 +444,6 @@ describe("createGjcRoutingLiveGatewayRunner", () => {
 		expect(mappings.get("chat-reassign-stale")?.projectId).toBe(projectB.id);
 		expect({
 			starts: turnRunner.starts.length,
-			switches: turnRunner.switches.length,
 			continues: turnRunner.continues.length,
 			states: turnRunner.states.length,
 		}).toEqual(effectsBeforeRetries);

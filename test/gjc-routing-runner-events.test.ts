@@ -6,7 +6,6 @@ import type {
 	GjcSessionState,
 	GjcSessionStateInput,
 	GjcStartNewSessionInput,
-	GjcSwitchSessionInput,
 	GjcTurnResult,
 	GjcTurnRunner,
 } from "../src/gjc/turn-runner";
@@ -59,8 +58,6 @@ class FakeGjcTurnRunner implements GjcTurnRunner {
 			...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
 		};
 	}
-
-	async switchSession(_input: GjcSwitchSessionInput): Promise<void> {}
 
 	async getState(_input: GjcSessionStateInput): Promise<GjcSessionState> {
 		return this.state;

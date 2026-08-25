@@ -578,7 +578,6 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 			async continueSession(_input) {
 				throw new Error("Unexpected mapped-session continuation in lease lifecycle test.");
 			},
-			async switchSession(_input) {},
 			async getState(_input) {
 				return { rawFrameCursor: 1, eventCursor: 1 };
 			},

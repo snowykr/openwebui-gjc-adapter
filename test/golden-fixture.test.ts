@@ -209,9 +209,16 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 			},
 		});
 		expect(continued.ok).toBe(true);
-		expect(turnRunner.switches).toHaveLength(1);
 		expect(turnRunner.states).toHaveLength(1);
+		expect(turnRunner.states[0]).toMatchObject({
+			chatId: "chat-live",
+			sessionId: "session-live",
+			sessionFile,
+		});
 		expect(turnRunner.continues[0]).toMatchObject({
+			chatId: "chat-live",
+			sessionId: "session-live",
+			sessionFile,
 			activeLeaf: "assistant-1",
 			rawFrameCursor: 1,
 			eventCursor: 1,

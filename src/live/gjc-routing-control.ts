@@ -478,16 +478,6 @@ async function continueBranch(
 				try {
 					throwIfAborted(turn.signal);
 					assertCurrentBranchPredecessor(input.mappings, turn.chatId, existing, turn.userMessageId);
-					await controlled.switchSession({
-						cwd: turn.project.cwd,
-						sessionRoot,
-						projectId: existing.projectId,
-						chatId: existing.chatId,
-						sessionId,
-						sessionFile,
-						recoveryAttachment: attachment,
-						lifecycle,
-					});
 					const state = await controlled.getState({
 						cwd: turn.project.cwd,
 						sessionRoot,

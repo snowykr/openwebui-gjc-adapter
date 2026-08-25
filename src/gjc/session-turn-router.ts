@@ -284,14 +284,6 @@ export async function routeGjcTurn(input: ScopedRouteGjcTurnInput): Promise<Rout
 				const operation = beginDurableOperation(scopedInput, mappings);
 				let promptDispatched = false;
 				try {
-					await input.runner.switchSession({
-						...address,
-						lifecycle,
-						sessionFile: existingSessionFile,
-						recoveryAttachment: existing.attachment,
-						...(input.managedAuthority === undefined ? {} : { managedAuthority: input.managedAuthority }),
-					});
-					throwIfAborted(input.signal);
 					const state = await input.runner.getState({
 						...address,
 						lifecycle,

@@ -236,7 +236,7 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 					).rejects.toThrow("not authorized");
 			expect(restarted.get("chat-reassignment-commit")?.projectId).toBe(projectB.id);
 			expect(retryRunner.starts).toHaveLength(0);
-			expect(retryRunner.switches).toHaveLength(0);
+			expect(retryRunner.states).toHaveLength(0);
 			expect(retryRunner.continues).toHaveLength(0);
 		} finally {
 			rmSync(directory, { recursive: true, force: true });
@@ -3030,7 +3030,7 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			}),
 		).toEqual({ content: "new:hello" });
 		expect(secondRunner.starts).toHaveLength(0);
-		expect(secondRunner.switches).toHaveLength(0);
+		expect(secondRunner.states).toHaveLength(0);
 		expect(secondRunner.continues).toHaveLength(0);
 	});
 	test("replays an older persisted prompt after later completions without runner effects", async () => {
@@ -3068,7 +3068,6 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 		});
 		expect(await replay.run(firstTurn)).toEqual({ content: "new:first" });
 		expect(replayRunner.starts).toHaveLength(0);
-		expect(replayRunner.switches).toHaveLength(0);
 		expect(replayRunner.states).toHaveLength(0);
 		expect(replayRunner.continues).toHaveLength(0);
 		expect(replayRunner.gateResponses).toHaveLength(0);
@@ -3138,7 +3137,7 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				content: "continued:resume-b",
 			});
 			expect(replayRunner.starts).toHaveLength(0);
-			expect(replayRunner.switches).toHaveLength(0);
+			expect(replayRunner.states).toHaveLength(0);
 			expect(replayRunner.continues).toHaveLength(0);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
@@ -3315,10 +3314,16 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 			continued: true,
 		});
 		expect(coldRunner.continues).toHaveLength(1);
-		expect(coldRunner.switches).toHaveLength(1);
-		expect(coldRunner.switches[0]).toMatchObject({ sessionId: "successor", sessionFile: successorPath });
-		expect(coldRunner.switches[0]?.sessionFile).not.toBe(predecessorPath);
-		expect(coldRunner.continues[0]).toMatchObject({ sessionId: "successor" });
+		expect(coldRunner.states).toHaveLength(1);
+		expect(coldRunner.states[0]).toMatchObject({ sessionId: "successor", sessionFile: successorPath });
+		expect(coldRunner.states[0]?.sessionFile).not.toBe(predecessorPath);
+		expect(coldRunner.continues[0]).toMatchObject({
+			sessionId: "successor",
+			sessionFile: successorPath,
+			activeLeaf: "leaf-successor",
+			rawFrameCursor: 0,
+			eventCursor: 0,
+		});
 	});
 
 	test("enqueues a stable session_mapping outbox operation when provided", async () => {
@@ -3620,18 +3625,19 @@ describe("createGjcRoutingLiveGatewayRunner persistence", () => {
 				sessionFile: fixture.successorPath,
 			};
 			await withLifecyclePublication(restartedTurnRunner, restartAddress, lifecycle =>
-				restartedTurnRunner.switchSession({ ...restartAddress, lifecycle }),
-			);
-			await withLifecyclePublication(restartedTurnRunner, restartAddress, lifecycle =>
-				restartedTurnRunner.continueSession({
-					...restartAddress,
-					text: "restart successor",
-					userMessageId: "restart-q16",
-					rawFrameCursor: 0,
-					eventCursor: 0,
-					operationId: "restart-q16",
-					lifecycle,
-				}),
+				(async () => {
+					const state = await restartedTurnRunner.getState({ ...restartAddress, lifecycle });
+					return restartedTurnRunner.continueSession({
+						...restartAddress,
+						text: "restart successor",
+						userMessageId: "restart-q16",
+						activeLeaf: state.activeLeaf,
+						rawFrameCursor: state.rawFrameCursor,
+						eventCursor: state.eventCursor,
+						operationId: "restart-q16",
+						lifecycle,
+					});
+				})(),
 			);
 			expect(
 				fixture.server.frames.filter(
@@ -3999,7 +4005,7 @@ test("reuses a live published endpoint from a file-backed restart without invoki
 			} as GjcRuntimeLocations,
 			turnTimeoutMs: 1_000,
 		});
-		await withLifecyclePublication(
+		const state = await withLifecyclePublication(
 			runner,
 			{
 				cwd: root,
@@ -4010,7 +4016,7 @@ test("reuses a live published endpoint from a file-backed restart without invoki
 				sessionFile: mapping.sessionFile,
 			},
 			lifecycle =>
-				runner.switchSession({
+				runner.getState({
 					cwd: root,
 					sessionRoot,
 					projectId: mapping.projectId,
@@ -4020,6 +4026,7 @@ test("reuses a live published endpoint from a file-backed restart without invoki
 					lifecycle,
 				}),
 		);
+		expect(state.attachment).toBeDefined();
 		expect(metadataQueries).toBe(0);
 	} finally {
 		server.stop(true);
@@ -4057,14 +4064,17 @@ test("refreshes a cached attachment when the same session ID endpoint is replace
 			turnTimeoutMs: 1_000,
 		});
 		const address = { cwd: root, sessionRoot, projectId: "project", chatId: "chat", sessionId, sessionFile };
-		await withLifecyclePublication(runner, address, lifecycle => runner.switchSession({ ...address, lifecycle }));
+		const firstState = await withLifecyclePublication(runner, address, lifecycle =>
+			runner.getState({ ...address, lifecycle }),
+		);
 		const first = await withLifecyclePublication(runner, address, lifecycle =>
 			runner.continueSession({
 				...address,
 				text: "first",
 				userMessageId: "first-message",
-				rawFrameCursor: 0,
-				eventCursor: 0,
+				activeLeaf: firstState.activeLeaf,
+				rawFrameCursor: firstState.rawFrameCursor,
+				eventCursor: firstState.eventCursor,
 				operationId: "first-message",
 				lifecycle,
 			}),
@@ -4074,14 +4084,17 @@ test("refreshes a cached attachment when the same session ID endpoint is replace
 			join(endpointRoot, `${sessionId}.json`),
 			JSON.stringify({ version: 1, url: secondServer.url, token: secondServer.token }),
 		);
-		await withLifecyclePublication(runner, address, lifecycle => runner.switchSession({ ...address, lifecycle }));
+		const secondState = await withLifecyclePublication(runner, address, lifecycle =>
+			runner.getState({ ...address, lifecycle }),
+		);
 		const second = await withLifecyclePublication(runner, address, lifecycle =>
 			runner.continueSession({
 				...address,
 				text: "second",
 				userMessageId: "second-message",
-				rawFrameCursor: 0,
-				eventCursor: 0,
+				activeLeaf: secondState.activeLeaf,
+				rawFrameCursor: secondState.rawFrameCursor,
+				eventCursor: secondState.eventCursor,
 				operationId: "second-message",
 				lifecycle,
 			}),
@@ -4161,16 +4174,17 @@ test("keeps duplicate session IDs isolated across canonical project cwd values i
 			sessionId,
 			sessionFile: firstSessionFile,
 		};
-		await withLifecyclePublication(runner, firstAddress, lifecycle =>
-			runner.switchSession({ ...firstAddress, lifecycle }),
+		const firstState = await withLifecyclePublication(runner, firstAddress, lifecycle =>
+			runner.getState({ ...firstAddress, lifecycle }),
 		);
 		const first = await withLifecyclePublication(runner, firstAddress, lifecycle =>
 			runner.continueSession({
 				...firstAddress,
 				text: "first",
 				userMessageId: "first-message",
-				rawFrameCursor: 0,
-				eventCursor: 0,
+				activeLeaf: firstState.activeLeaf,
+				rawFrameCursor: firstState.rawFrameCursor,
+				eventCursor: firstState.eventCursor,
 				operationId: "first-message",
 				lifecycle,
 			}),
@@ -4183,16 +4197,17 @@ test("keeps duplicate session IDs isolated across canonical project cwd values i
 			sessionId,
 			sessionFile: secondSessionFile,
 		};
-		await withLifecyclePublication(runner, secondAddress, lifecycle =>
-			runner.switchSession({ ...secondAddress, lifecycle }),
+		const secondState = await withLifecyclePublication(runner, secondAddress, lifecycle =>
+			runner.getState({ ...secondAddress, lifecycle }),
 		);
 		const second = await withLifecyclePublication(runner, secondAddress, lifecycle =>
 			runner.continueSession({
 				...secondAddress,
 				text: "second",
 				userMessageId: "second-message",
-				rawFrameCursor: 0,
-				eventCursor: 0,
+				activeLeaf: secondState.activeLeaf,
+				rawFrameCursor: secondState.rawFrameCursor,
+				eventCursor: secondState.eventCursor,
 				operationId: "second-message",
 				lifecycle,
 			}),
@@ -4338,7 +4353,7 @@ test.each(["post_mutation_pre_proof", "pre_durable_publication"] as const)(
 		const fixture = setupPublicRunnerBarrierFixture(phase);
 		try {
 			await withLifecyclePublication(fixture.runner, fixture.address, lifecycle =>
-				fixture.runner.switchSession({ ...fixture.address, lifecycle }),
+				fixture.runner.getState({ ...fixture.address, lifecycle }),
 			);
 			const continued = withLifecyclePublication(fixture.runner, fixture.address, async lifecycle => {
 				const result = await fixture.runner.continueSession({
@@ -4372,7 +4387,7 @@ test("rejects a close commit when its public SDK descriptor changes after proof"
 	const fixture = setupPublicRunnerBarrierFixture("post_close_proof_pre_commit");
 	try {
 		await withLifecyclePublication(fixture.runner, fixture.address, lifecycle =>
-			fixture.runner.switchSession({ ...fixture.address, lifecycle }),
+			fixture.runner.getState({ ...fixture.address, lifecycle }),
 		);
 		const close = withLifecyclePublication(fixture.runner, fixture.address, async lifecycle => {
 			const result = await fixture.runner.continueSession({

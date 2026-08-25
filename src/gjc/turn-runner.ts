@@ -53,7 +53,6 @@ export type ManagedContinueSessionInput = GjcContinueSessionInput & { readonly a
 export type ManagedStartNewSessionInput = GjcStartNewSessionInput & {
 	readonly authority: ManagedPreparedTurnAuthority;
 };
-export type ManagedSwitchSessionInput = GjcSwitchSessionInput & { readonly authority: ManagedTurnAuthority };
 export type ManagedSessionStateInput = GjcSessionStateInput & { readonly authority: ManagedTurnAuthority };
 export type ManagedRespondWorkflowGateInput = GjcRespondWorkflowGateInput & {
 	readonly authority: ManagedTurnAuthority;
@@ -112,12 +111,6 @@ export interface GjcContinueSessionInput extends GjcSessionAddress, GjcLifecycle
 	/** Persisted managed authority. It is distinct from new-session prepared authority. */
 	readonly managedAuthority?: ManagedTurnAuthority;
 	readonly onDispatch?: () => void;
-}
-
-export interface GjcSwitchSessionInput extends GjcSessionAddress, GjcLifecycleScoped {
-	readonly sessionFile?: string;
-	readonly recoveryAttachment?: SessionAttachmentProof;
-	readonly managedAuthority?: ManagedTurnAuthority;
 }
 
 export interface GjcSessionStateInput extends GjcSessionAddress, GjcLifecycleScoped {
@@ -243,7 +236,6 @@ export interface GjcTurnRunner {
 		onFailure?: (lifecycle: GjcLifecycleTransaction, error: unknown) => Promise<void>,
 	): Promise<T>;
 	continueSession(input: GjcContinueSessionInput): Promise<GjcTurnResult>;
-	switchSession(input: GjcSwitchSessionInput): Promise<void>;
 	getState(input: GjcSessionStateInput): Promise<GjcSessionState>;
 	getAvailableModels?(input: GjcSessionStateInput): Promise<readonly unknown[]>;
 	respondWorkflowGate?(input: GjcRespondWorkflowGateInput): Promise<GjcTurnResult>;

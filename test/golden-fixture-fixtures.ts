@@ -6,7 +6,6 @@ import type {
 	GjcSessionState,
 	GjcSessionStateInput,
 	GjcStartNewSessionInput,
-	GjcSwitchSessionInput,
 	GjcTurnResult,
 	GjcTurnRunner,
 } from "../src/gjc/turn-runner";
@@ -43,7 +42,6 @@ export function goldenEntries(): SessionEntry[] {
 export class GoldenTurnRunner implements GjcTurnRunner {
 	readonly starts: GjcStartNewSessionInput[] = [];
 	readonly continues: GjcContinueSessionInput[] = [];
-	readonly switches: GjcSwitchSessionInput[] = [];
 	readonly states: GjcSessionStateInput[] = [];
 
 	constructor(private readonly sessionFile: string) {}
@@ -86,10 +84,6 @@ export class GoldenTurnRunner implements GjcTurnRunner {
 			...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
 			attachment: attachmentProof(input),
 		};
-	}
-
-	async switchSession(input: GjcSwitchSessionInput): Promise<void> {
-		this.switches.push(input);
 	}
 
 	async withLifecyclePublication<T>(

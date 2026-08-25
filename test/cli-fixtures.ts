@@ -5,7 +5,6 @@ import type {
 	GjcSessionState,
 	GjcSessionStateInput,
 	GjcStartNewSessionInput,
-	GjcSwitchSessionInput,
 	GjcTurnResult,
 	GjcTurnRunner,
 } from "../src/gjc/turn-runner";
@@ -118,7 +117,6 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 		};
 	}
 
-	async switchSession(_input: GjcSwitchSessionInput): Promise<void> {}
 	async withLifecyclePublication<T>(
 		address: GjcSessionAddress,
 		effect: (lifecycle: ReturnType<typeof lifecycleFixture>) => Promise<T>,
