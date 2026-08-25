@@ -7,6 +7,7 @@ Experimental TS/Bun adapter that treats GJC session JSONL/artifacts as the sourc
 Start the adapter service with Bun:
 
 ```sh
+GJC_OPENWEBUI_MODE=existing \
 GJC_OPENWEBUI_BIND_HOST=127.0.0.1 \
 GJC_OPENWEBUI_BIND_PORT=8765 \
 GJC_OPENWEBUI_ADAPTER_API_TOKEN=<adapter-openai-key> \
@@ -16,6 +17,8 @@ GJC_OPENWEBUI_PROJECTS="/home/me/src/my-repo|my-repo" \
 GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS="/home/me/src" \
 bun run start
 ```
+
+`GJC_OPENWEBUI_MODE` must be exactly `managed` or `existing`. The adapter fails closed during startup when it is omitted, empty, whitespace-padded, a case variant, or any other value, with `GJC_OPENWEBUI_MODE must be exactly managed or existing`.
 
 Configure OpenWebUI to use the adapter as an OpenAI-compatible backend:
 
@@ -41,7 +44,7 @@ Add the required custom headers on the OpenAI connection:
 
 Normal users cannot resolve linked host projects, project-admin routes, or another principal's chat, file, message, session, replay, close, or reaper state. Administrator project operations remain available through the configured owner identity. Workspace cleanup is administrator-only: `POST /admin/workspaces/{userId}/cleanup/preview` returns a short-lived confirmation token, and `POST /admin/workspaces/{userId}/cleanup` consumes `{ "confirmationToken": "…" }`. Cleanup is lease-fenced and leaves the workspace blocked when completion is uncertain.
 
-Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. Slice 1 is an unwired foundation: `@gajae-code/ai` and `@gajae-code/natives` are pinned to 0.15.0, while `@gajae-code/coding-agent` is consumed from the exact immutable hosted release-shaped development artifact `https://raw.githubusercontent.com/snowykr/openwebui-gjc-adapter/c09e31dc85c514cffaf7e44827b47d311620c49f/vendor/gajae-code-coding-agent-e3b3a76a590081ded16214a1188857524d40e701-8ba25005.tgz`, built from dev merge `e3b3a76a590081ded16214a1188857524d40e701` with SHA-256 `8ba25005471c66871842cddefcdb98c0118ab26c3890b58f1f93665da524f4cb`. It is not the registry 0.15.0 tarball. Production traffic still uses the legacy path until the atomic cutover. `@gajae-code/bridge-client` 0.13.3 is retained only for that still-wired legacy traffic; it is removal-only during atomic Slice 3, not a final-architecture target or fallback. The public managed SDK is the target architecture, but activates only at the atomic cutover after its public-SDK contract, lifecycle, and managed-deployment gates pass. The image runs the hosted-artifact `gjc` executable as the non-root `adapter` user, including `tmux`; it does not build a private broker or apply an upstream source patch. Background task calls such as title generation are no-ops and must not create GJC sessions.
+Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. Production serving uses the released public managed SDK; managed deployments activate canonical managed V3 session authority, and missing, malformed, conflicting, or ambiguous authority fails closed. The runtime dependencies retain exact `@gajae-code/ai` and `@gajae-code/natives` 0.15.0 pins, while `@gajae-code/coding-agent` is consumed from the exact immutable hosted release-shaped development artifact `https://raw.githubusercontent.com/snowykr/openwebui-gjc-adapter/c09e31dc85c514cffaf7e44827b47d311620c49f/vendor/gajae-code-coding-agent-e3b3a76a590081ded16214a1188857524d40e701-8ba25005.tgz`, built from dev merge `e3b3a76a590081ded16214a1188857524d40e701` with SHA-256 `8ba25005471c66871842cddefcdb98c0118ab26c3890b58f1f93665da524f4cb`; it is not the registry 0.15.0 tarball. The source still imports `@gajae-code/bridge-client` 0.13.3 for the current SDK transport, so bridge removal remains an in-progress atomic cutover: the dependency has not been deleted and is neither a fallback nor a final-architecture authority. The image runs the hosted-artifact `gjc` executable as the non-root `adapter` user, including `tmux`; it does not build a private broker or apply an upstream source patch. Background task calls such as title generation are no-ops and must not create GJC sessions.
 
 ## CLI first-install configuration
 

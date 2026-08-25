@@ -1,20 +1,20 @@
+import { createHash } from "node:crypto";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import type { SdkClient } from "@gajae-code/bridge-client";
-import { connectFor, lifecycleDeadlineMs, snapshotPublicEndpoints } from "./gjc-release-compat-sdk";
+import type { lifecycle } from "@gajae-code/coding-agent/sdk";
+import {
+	connectFor,
+	lifecycleDeadlineMs,
+	type PublicSdkSession,
+	snapshotPublicSessions,
+} from "./gjc-release-compat-sdk";
 
 type Observe = (name: string, action: () => Promise<unknown>) => Promise<unknown>;
-type Run = (
-	command: string,
-	args: readonly string[],
-	env?: Record<string, string | undefined>,
-	allowFailure?: boolean,
-) => Promise<string>;
 type TurnCorrelation = { sessionId: string; commandId: string; turnId: string };
-type SessionBootstrap = { readonly sessionId?: string; readonly sessionFile?: string };
+export type SessionTranscriptIdentity = lifecycle.SessionLifecycleTranscriptIdentity;
 
 export async function promptAndAwaitTerminal(
-	client: SdkClient,
+	client: PublicSdkSession,
 	sessionId: string,
 	name: string,
 	text: string,
@@ -26,8 +26,9 @@ export async function promptAndAwaitTerminal(
 	await observe(`${name}.terminal`, async () => frame);
 	return { accepted, terminal: frame };
 }
+
 export async function promptAndAbortTerminal(
-	client: SdkClient,
+	client: PublicSdkSession,
 	sessionId: string,
 	name: string,
 	text: string,
@@ -48,30 +49,40 @@ export async function promptAndAbortTerminal(
 	await observe(`${name}.terminal`, async () => frame);
 	return { accepted, abort, abortReplay, terminal: frame };
 }
+
 function awaitTerminal(
-	client: SdkClient,
+	client: PublicSdkSession,
 	allowFailure = false,
 ): (correlation: TurnCorrelation) => Promise<Record<string, unknown>> {
 	let pendingCorrelation: TurnCorrelation | undefined;
 	let resolveTerminal: ((frame: Record<string, unknown>) => void) | undefined;
-	const terminal = new Promise<Record<string, unknown>>(resolve => {
-		resolveTerminal = resolve;
+	const terminal = new Promise<Record<string, unknown>>(resolvePromise => {
+		resolveTerminal = resolvePromise;
 	});
-	const pendingFrames: Record<string, unknown>[] = [];
-	const matches = (frame: Record<string, unknown>, correlation: TurnCorrelation) =>
+	const pendingFrames: Array<{ readonly correlation: TurnCorrelation; readonly body: Record<string, unknown> }> = [];
+	const matches = (frame: TurnCorrelation, correlation: TurnCorrelation) =>
 		frame.sessionId === correlation.sessionId &&
 		frame.commandId === correlation.commandId &&
 		frame.turnId === correlation.turnId;
 	const resolveMatching = () => {
 		if (pendingCorrelation === undefined) return;
-		const index = pendingFrames.findIndex(frame => matches(frame, pendingCorrelation!));
+		const index = pendingFrames.findIndex(frame => matches(frame.correlation, pendingCorrelation!));
 		if (index === -1) return;
-		resolveTerminal?.(pendingFrames[index]!);
+		resolveTerminal?.(pendingFrames[index]!.body);
 		resolveTerminal = undefined;
 	};
 	const unsubscribe = client.onFrame(frame => {
-		if (!isRecord(frame) || (frame.type !== "agent_end" && frame.type !== "agent_failed")) return;
-		pendingFrames.push(frame);
+		const body = frame.body;
+		if (body.type !== "agent_end" && body.type !== "agent_failed") return;
+		if (frame.sessionId !== client.sessionId || frame.commandId === undefined || frame.turnId === undefined) return;
+		pendingFrames.push({
+			correlation: {
+				sessionId: frame.sessionId,
+				commandId: frame.commandId,
+				turnId: frame.turnId,
+			},
+			body,
+		});
 		resolveMatching();
 	});
 	return async correlation => {
@@ -94,6 +105,7 @@ function awaitTerminal(
 		}
 	};
 }
+
 function assertTerminalAbortAcknowledgement(value: unknown, operation: string): void {
 	if (
 		!isRecord(value) ||
@@ -105,6 +117,7 @@ function assertTerminalAbortAcknowledgement(value: unknown, operation: string): 
 	)
 		throw new Error(`${operation} returned an invalid terminal abort acknowledgement`);
 }
+
 function turnCorrelation(value: unknown, sessionId: string): TurnCorrelation {
 	if (!isRecord(value)) throw new Error("turn.prompt did not return an accepted correlation");
 	const result = isRecord(value.result) ? value.result : value;
@@ -113,72 +126,70 @@ function turnCorrelation(value: unknown, sessionId: string): TurnCorrelation {
 	return { sessionId, commandId: result.commandId, turnId: result.turnId };
 }
 
-export async function openSessionDashboard(target: string, run: Run): Promise<SessionBootstrap> {
-	let sent = false;
-	for (let attempt = 0; attempt < 300; attempt += 1) {
-		const output = await run("tmux", ["capture-pane", "-p", "-t", target, "-S", "-200"]);
-		if (output.includes("Sessions dashboard")) {
-			await run("tmux", ["send-keys", "-t", target, "Escape"]);
-			await Bun.sleep(1_000);
-			return sessionBootstrapFrom(output);
-		}
-		const bootstrap = sessionBootstrapFrom(output);
-		if (output.includes("Session Info") && bootstrap.sessionId !== undefined && bootstrap.sessionFile !== undefined)
-			return bootstrap;
-		if (!sent && output.includes("Type your message")) {
-			await run("tmux", ["send-keys", "-t", target, "/session", "Enter"]);
-			sent = true;
-		}
-		await Bun.sleep(100);
-	}
-	throw new Error(`interactive session ${target} did not open /session`);
-}
-function sessionBootstrapFrom(output: string): SessionBootstrap {
-	const sessionId = /(?:^|\n)\s*(?:ID|Session ID)\s*:\s*([^\s]+)\s*$/im.exec(output)?.[1];
-	const sessionFile = /(?:^|\n)\s*File\s*:\s*(\S(?:.*\S)?)\s*$/im.exec(output)?.[1];
-	return { ...(sessionId === undefined ? {} : { sessionId }), ...(sessionFile === undefined ? {} : { sessionFile }) };
-}
-export async function sessionIdFromEndpoint(directory: string): Promise<string> {
+export async function sessionIdFromPublicSdk(directory: string): Promise<string> {
 	const deadline = Date.now() + lifecycleDeadlineMs;
 	while (Date.now() < deadline) {
-		const endpoints = await snapshotPublicEndpoints(directory);
-		if (endpoints.size === 1) return endpoints.values().next().value!.sessionId;
-		if (endpoints.size > 1)
-			throw new Error(`interactive public SDK endpoint discovery is ambiguous (${endpoints.size} endpoints)`);
+		const sessions = await snapshotPublicSessions(directory);
+		if (sessions.size === 1) return sessions.keys().next().value!;
+		if (sessions.size > 1) throw new Error(`public SDK session discovery is ambiguous (${sessions.size} sessions)`);
 		await Bun.sleep(100);
 	}
-	throw new Error("could not discover an interactive public SDK endpoint");
+	throw new Error("could not discover a public SDK session");
 }
+
 export async function rediscoverSessionId(directory: string, previousSessionId: string): Promise<string> {
-	const stateDirectory = join(directory, ".gjc", "state", "sdk");
-	for (let attempt = 0; attempt < 300; attempt += 1) {
-		try {
-			for (const entry of await readdir(stateDirectory)) {
-				if (!entry.endsWith(".json") || entry === `${previousSessionId}.json`) continue;
-				const value: unknown = JSON.parse(await readFile(join(stateDirectory, entry), "utf8"));
-				if (isRecord(value) && typeof value.sessionId === "string") return value.sessionId;
-			}
-		} catch {}
-		await Bun.sleep(100);
+	const deadline = Date.now() + lifecycleDeadlineMs;
+	for (;;) {
+		const sessions = await snapshotPublicSessions(directory);
+		for (const sessionId of sessions.keys()) if (sessionId !== previousSessionId) return sessionId;
+		const remaining = deadline - Date.now();
+		if (remaining <= 0) throw new Error("public lifecycle did not expose a successor session");
+		await Bun.sleep(Math.min(100, remaining));
 	}
-	throw new Error("branch did not expose a sessionId and no rotated SDK descriptor was published");
 }
+
 export async function sessionFromFilesystem(
 	directory: string,
 	expectedSessionId: string,
-): Promise<{ sessionId: string; transcript: string; headerSessionId: string }> {
-	for (let attempt = 0; attempt < 300; attempt += 1) {
+): Promise<{
+	readonly sessionId: string;
+	readonly transcript: string;
+	readonly headerSessionId: string;
+	readonly identity: SessionTranscriptIdentity;
+}> {
+	const deadline = Date.now() + lifecycleDeadlineMs;
+	for (;;) {
 		for (const transcript of await jsonlFiles(directory))
 			try {
 				const firstLine = (await readFile(transcript, "utf8")).split(/\r?\n/, 1)[0];
 				const value: unknown = firstLine === undefined ? undefined : JSON.parse(firstLine);
 				if (isRecord(value) && typeof value.id === "string" && value.id === expectedSessionId)
-					return { sessionId: value.id, transcript: resolve(transcript), headerSessionId: value.id };
+					return {
+						sessionId: value.id,
+						transcript: resolve(transcript),
+						headerSessionId: value.id,
+						identity: await transcriptIdentity(transcript),
+					};
 			} catch {}
-		await Bun.sleep(100);
+		const remaining = deadline - Date.now();
+		if (remaining <= 0) throw new Error(`could not discover session transcript with header ${expectedSessionId}`);
+		await Bun.sleep(Math.min(100, remaining));
 	}
-	throw new Error(`could not discover an interactive session transcript with header ${expectedSessionId}`);
 }
+
+async function transcriptIdentity(path: string): Promise<SessionTranscriptIdentity> {
+	const file = await readFile(path);
+	const metadata = await stat(path, { bigint: true });
+	return {
+		dev: metadata.dev.toString(),
+		ino: metadata.ino.toString(),
+		size: Number(metadata.size),
+		mtimeMs: Number(metadata.mtimeMs),
+		mtimeNs: metadata.mtimeNs.toString(),
+		sha256: createHash("sha256").update(file).digest("hex"),
+	};
+}
+
 async function jsonlFiles(directory: string): Promise<string[]> {
 	const entries = await readdir(directory, { withFileTypes: true });
 	const files: string[] = [];
@@ -191,7 +202,11 @@ async function jsonlFiles(directory: string): Promise<string[]> {
 	return files;
 }
 
-export async function validateCurrentModel(client: SdkClient, value: unknown, observe: Observe): Promise<boolean> {
+export async function validateCurrentModel(
+	client: PublicSdkSession,
+	value: unknown,
+	observe: Observe,
+): Promise<boolean> {
 	for (let page = 0, current = value; page < 100; page += 1) {
 		const model = currentModelFrom(current);
 		if (model !== undefined)
@@ -208,6 +223,7 @@ export async function validateCurrentModel(client: SdkClient, value: unknown, ob
 	}
 	throw new Error("Q10 did not expose compat-local/hermetic-model as the current model");
 }
+
 function currentModelFrom(value: unknown): Record<string, unknown> | undefined {
 	if (isRecord(value)) {
 		if (value.provider === "compat-local" && value.id === "hermetic-model" && value.current === true) return value;
@@ -222,6 +238,7 @@ function currentModelFrom(value: unknown): Record<string, unknown> | undefined {
 		}
 	return undefined;
 }
+
 export async function branchEntryId(directory: string, sessionId: string, observe: Observe): Promise<string> {
 	for (let attempt = 0; attempt < 100; attempt += 1) {
 		const probe = await connectFor(directory, sessionId);
@@ -239,6 +256,7 @@ export async function branchEntryId(directory: string, sessionId: string, observ
 	}
 	throw new Error("Q16 did not expose a branch entryId");
 }
+
 function branchEntryIdFrom(value: unknown): string | undefined {
 	if (isRecord(value)) {
 		const entry = value.entry;
@@ -261,9 +279,11 @@ function branchEntryIdFrom(value: unknown): string | undefined {
 		}
 	return undefined;
 }
+
 export function sessionIdFrom(value: unknown): string | undefined {
 	return findString(value, "sessionId");
 }
+
 function findString(value: unknown, key: string): string | undefined {
 	if (isRecord(value)) {
 		if (typeof value[key] === "string") return value[key] as string;
@@ -278,6 +298,7 @@ function findString(value: unknown, key: string): string | undefined {
 		}
 	return undefined;
 }
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
 }

@@ -1,191 +1,252 @@
-import { readdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
-import { SdkClient } from "@gajae-code/bridge-client";
+import { join, resolve } from "node:path";
+import { lifecycle, router } from "@gajae-code/coding-agent/sdk";
 
 export const lifecycleDeadlineMs = 15_000;
-export type PublishedEndpoint = {
+const lifecycleActor = { id: "gjc-release-compat", namespace: "release-compatibility" } as const;
+
+type Observe = (name: string, action: () => Promise<unknown>) => Promise<unknown>;
+type RequestOptions = { readonly timeoutMs?: number; readonly idempotencyKey?: string };
+type FrameHandler = (frame: router.SessionRouterFrame) => void;
+
+export type PublicSdkSession = {
 	readonly sessionId: string;
-	readonly url: string;
-	readonly token: string;
-	readonly descriptor: string;
+	readonly generation: number;
+	readonly attachment: router.SessionAttachment;
+	query(query: string, input?: Record<string, unknown>, cursor?: string, options?: RequestOptions): Promise<unknown>;
+	control(operation: string, input?: Record<string, unknown>, options?: RequestOptions): Promise<unknown>;
+	onFrame(handler: FrameHandler): () => void;
+	generationStatus(): Promise<router.SessionGenerationStatus>;
+	close(): Promise<void>;
 };
+
 export type LifecycleAttachment = {
-	readonly client: SdkClient;
+	readonly client: PublicSdkSession;
 	readonly sessionId: string;
 	readonly cwd: string;
-	readonly endpoint: PublishedEndpoint;
+	readonly generation: number;
 };
-type Observe = (name: string, action: () => Promise<unknown>) => Promise<unknown>;
 
-export async function connectFor(directory: string, sessionId: string): Promise<SdkClient> {
-	const endpoint = await endpointFor(directory, sessionId);
-	return SdkClient.connect(endpoint.url, endpoint.token, { timeoutMs: lifecycleDeadlineMs });
+type PublicSdkState = {
+	readonly lifecycle: ReturnType<typeof lifecycle.createSessionLifecycleService>;
+	readonly listeners: Set<{ readonly attachment: router.SessionAttachment; readonly handler: FrameHandler }>;
+	readonly router: router.SessionRouter;
+};
+
+const states = new Map<string, PublicSdkState>();
+
+function stateFor(directory: string): PublicSdkState {
+	const key = resolve(directory);
+	const existing = states.get(key);
+	if (existing !== undefined) return existing;
+	const listeners = new Set<{ readonly attachment: router.SessionAttachment; readonly handler: FrameHandler }>();
+	const agentDir = join(key, ".gjc", "agent");
+	const state = {} as PublicSdkState;
+	const sdkRouter = new router.SessionRouter({
+		agentDir,
+		deps: {
+			onFrame: (attachment, frame) => {
+				for (const listener of listeners) if (listener.attachment === attachment) listener.handler(frame);
+			},
+		},
+	});
+	Object.assign(state, { lifecycle: lifecycle.createSessionLifecycleService(agentDir), listeners, router: sdkRouter });
+	states.set(key, state);
+	return state;
 }
 
-export async function endpointFor(directory: string, sessionId: string): Promise<PublishedEndpoint> {
-	const endpoint = (await snapshotPublicEndpoints(directory)).get(sessionId);
-	if (endpoint === undefined) throw new Error(`public SDK endpoint was not published for ${sessionId}`);
-	return endpoint;
+export async function startPublicSdk(directory: string): Promise<void> {
+	await stateFor(directory).router.start();
 }
 
-export async function snapshotPublicEndpoints(directory: string): Promise<Map<string, PublishedEndpoint>> {
-	const stateDirectory = join(directory, ".gjc", "state", "sdk");
-	const endpoints = new Map<string, PublishedEndpoint>();
-	try {
-		for (const entry of await readdir(stateDirectory)) {
-			if (!entry.endsWith(".json")) continue;
-			const descriptor = join(stateDirectory, entry);
-			const value: unknown = JSON.parse(await readFile(descriptor, "utf8"));
-			if (
-				!isRecord(value) ||
-				typeof value.sessionId !== "string" ||
-				typeof value.url !== "string" ||
-				typeof value.token !== "string"
-			)
-				continue;
-			if (entry !== `${value.sessionId}.json`)
-				throw new Error(`public SDK endpoint descriptor identity is ambiguous: ${entry}`);
-			if (endpoints.has(value.sessionId)) throw new Error(`duplicate public SDK endpoint for ${value.sessionId}`);
-			endpoints.set(value.sessionId, { sessionId: value.sessionId, url: value.url, token: value.token, descriptor });
-		}
-	} catch (error) {
-		if (error instanceof Error && "code" in error && error.code === "ENOENT") return endpoints;
-		throw error;
+export async function stopPublicSdk(directory: string): Promise<void> {
+	const key = resolve(directory);
+	const state = states.get(key);
+	if (state === undefined) return;
+	states.delete(key);
+	await state.router.stop();
+}
+
+export function publicLifecycle(directory: string): ReturnType<typeof lifecycle.createSessionLifecycleService> {
+	return stateFor(directory).lifecycle;
+}
+
+export async function connectFor(
+	directory: string,
+	sessionId: string,
+	expectedGeneration?: number,
+): Promise<PublicSdkSession> {
+	const state = stateFor(directory);
+	await startPublicSdk(directory);
+	const deadline = Date.now() + lifecycleDeadlineMs;
+	for (;;) {
+		const attachment = state.router.attachment(sessionId, expectedGeneration);
+		if (attachment !== null && attachment.isCurrent()) return sessionFor(state, attachment);
+		const remaining = deadline - Date.now();
+		if (remaining <= 0)
+			throw new Error(`public SDK Router did not attach ${sessionId} before the lifecycle deadline`);
+		await Bun.sleep(Math.min(100, remaining));
+		await state.router.reconcile().catch(() => undefined);
 	}
-	return endpoints;
 }
 
-export function endpointFingerprint(endpoint: PublishedEndpoint): string {
-	return `${endpoint.sessionId}\u0000${endpoint.url}\u0000${endpoint.token}`;
+function sessionFor(state: PublicSdkState, attachment: router.SessionAttachment): PublicSdkSession {
+	const sessionId = attachment.sessionId;
+	const generation = attachment.generation;
+	return {
+		sessionId,
+		generation,
+		attachment,
+		query: async (query, input = {}, cursor, options = {}) =>
+			await state.router.request(
+				sessionId,
+				{ type: "query_request", query, input, ...(cursor === undefined ? {} : { cursor }) },
+				generation,
+				attachment,
+				{ timeoutMs: options.timeoutMs },
+			),
+		control: async (operation, input = {}, options = {}) =>
+			await state.router.request(
+				sessionId,
+				{
+					type: "control_request",
+					operation,
+					input,
+					...(options.idempotencyKey === undefined ? {} : { idempotencyKey: options.idempotencyKey }),
+				},
+				generation,
+				attachment,
+				{ timeoutMs: options.timeoutMs },
+			),
+		onFrame: handler => {
+			const listener = { attachment, handler };
+			state.listeners.add(listener);
+			return () => state.listeners.delete(listener);
+		},
+		generationStatus: async () => await state.router.generationStatus(sessionId, generation),
+		close: async () => undefined,
+	};
+}
+
+export type PublicSessionIdentity = {
+	readonly sessionId: string;
+	readonly generation?: number;
+};
+
+export async function snapshotPublicSessions(directory: string): Promise<Map<string, PublicSessionIdentity>> {
+	const response = await publicLifecycle(directory).list({
+		actor: lifecycleActor,
+		capability: "session.list",
+		target: { cwd: resolve(directory) },
+	});
+	if (!response.ok || !Array.isArray(response.result.sessions))
+		throw new Error("public lifecycle session.list returned an incomplete response");
+	const sessions = new Map<string, PublicSessionIdentity>();
+	for (const item of response.result.sessions) {
+		if (!isRecord(item) || typeof item.sessionId !== "string") continue;
+		const generation =
+			typeof item.endpointGeneration === "number" && Number.isSafeInteger(item.endpointGeneration)
+				? item.endpointGeneration
+				: undefined;
+		sessions.set(item.sessionId, { sessionId: item.sessionId, ...(generation === undefined ? {} : { generation }) });
+	}
+	return sessions;
 }
 
 export async function lifecycleSuccessor(
-	client: SdkClient | undefined,
-	operation: "session.new" | "session.resume" | "session.switch",
+	_client: PublicSdkSession | undefined,
+	operation: "session.create" | "session.resume" | "session.fork",
 	input: Record<string, unknown>,
 	workspace: string,
 	observe: Observe,
 	record: (name: string, value: unknown) => void,
 	expectedSessionId?: string,
 ): Promise<LifecycleAttachment> {
-	if (client === undefined)
-		throw new Error(`${operation} cannot run without an attached released public SDK controller`);
-	const deadline = Date.now() + lifecycleDeadlineMs;
-	const remaining = () => {
-		const timeoutMs = deadline - Date.now();
-		if (timeoutMs <= 0) throw new Error(`released public SDK ${operation} lifecycle deadline exhausted`);
-		return timeoutMs;
-	};
-	const before = await snapshotPublicEndpoints(workspace);
-	const accepted = await observe(operation, () => client.control(operation, input, { timeoutMs: remaining() }));
-	assertLifecycleAcknowledgement(operation, accepted);
-	await awaitLifecycleDeadline(
-		client.close().catch(() => undefined),
-		remaining,
-	);
-	const requestedSessionId = operation === "session.new" ? undefined : expectedSessionId;
-	if (operation !== "session.new" && requestedSessionId === undefined)
-		throw new Error(`${operation} requires an expected target sessionId`);
-	const endpoint = await discoverSuccessorEndpoint(workspace, before, operation, requestedSessionId, remaining);
-	const successor = await SdkClient.connect(endpoint.url, endpoint.token, { deadline, timeoutMs: remaining() });
-	try {
-		const metadata = sessionMetadataFrom(
-			await observe(`${operation}.session.metadata`, () =>
-				awaitLifecycleDeadline(
-					successor.query("session.metadata", {}, undefined, { timeoutMs: remaining() }),
-					remaining,
-				),
-			),
-		);
-		if (typeof metadata.sessionId !== "string" || typeof metadata.cwd !== "string")
-			throw new Error(`released public SDK ${operation} successor lacks a session.metadata sessionId/cwd contract`);
-		if (metadata.sessionId !== endpoint.sessionId || metadata.cwd !== workspace)
-			throw new Error(`released public SDK ${operation} reattached to a metadata-mismatched endpoint`);
-		if (requestedSessionId !== undefined && metadata.sessionId !== requestedSessionId)
-			throw new Error(`released public SDK ${operation} reattached to the wrong target session`);
-		record(`${operation}.reattached`, {
-			previousEndpointCount: before.size,
-			descriptor: endpoint.descriptor,
-			sessionId: metadata.sessionId,
-			cwd: metadata.cwd,
-			targetSessionId: requestedSessionId,
+	const before = await snapshotPublicSessions(workspace);
+	const requestKey = `release-compat-${operation}-${crypto.randomUUID()}`;
+	const service = publicLifecycle(workspace);
+	const accepted = await observe(operation, () => {
+		if (operation === "session.create")
+			return service.create({
+				actor: lifecycleActor,
+				capability: "session.create",
+				requestKey,
+				target: input as lifecycle.SessionCreateTarget,
+			});
+		if (operation === "session.resume")
+			return service.resume({
+				actor: lifecycleActor,
+				capability: "session.resume",
+				requestKey,
+				target: input as lifecycle.SessionResumeTarget,
+			});
+		return service.fork({
+			actor: lifecycleActor,
+			capability: "session.fork",
+			requestKey,
+			target: input as lifecycle.SessionForkTarget,
 		});
-		return { client: successor, sessionId: metadata.sessionId, cwd: metadata.cwd, endpoint };
-	} catch (error) {
-		await successor.close().catch(() => undefined);
-		throw error;
-	}
+	});
+	const result = lifecycleResultFrom(accepted, operation);
+	if (expectedSessionId !== undefined && operation !== "session.create" && result.sessionId !== expectedSessionId)
+		throw new Error(`public lifecycle ${operation} returned the wrong target session`);
+	const generation = result.endpointGeneration;
+	await stateFor(workspace).router.reconcile();
+	const successor = await connectFor(workspace, result.sessionId, generation);
+	const metadata = sessionMetadataFrom(
+		await observe(`${operation}.session.metadata`, () => successor.query("session.metadata", {}, undefined)),
+	);
+	if (metadata.sessionId !== successor.sessionId || metadata.cwd !== resolve(workspace))
+		throw new Error(`public lifecycle ${operation} reattached to a metadata-mismatched session`);
+	record(`${operation}.reattached`, {
+		previousSessionCount: before.size,
+		sessionId: successor.sessionId,
+		generation: successor.generation,
+		cwd: metadata.cwd,
+		targetSessionId: expectedSessionId,
+	});
+	return { client: successor, sessionId: successor.sessionId, cwd: metadata.cwd, generation: successor.generation };
 }
 
-function sessionMetadataFrom(value: unknown): Record<string, unknown> {
+export async function closePublicSession(directory: string, sessionId: string, generation: number): Promise<unknown> {
+	const requestKey = `release-compat-session-close-${sessionId}-${generation}-${crypto.randomUUID()}`;
+	return await publicLifecycle(directory).close({
+		actor: lifecycleActor,
+		capability: "session.close",
+		requestKey,
+		target: { sessionId },
+	});
+}
+
+function lifecycleResultFrom(
+	value: unknown,
+	operation: string,
+): {
+	readonly sessionId: string;
+	readonly endpointGeneration?: number;
+} {
+	if (!isRecord(value) || value.ok !== true || !isRecord(value.result) || typeof value.result.sessionId !== "string")
+		throw new Error(`public lifecycle ${operation} returned an unsuccessful or incomplete response`);
+	const endpointGeneration =
+		typeof value.result.endpointGeneration === "number" && Number.isSafeInteger(value.result.endpointGeneration)
+			? value.result.endpointGeneration
+			: undefined;
+	return { sessionId: value.result.sessionId, endpointGeneration };
+}
+
+function sessionMetadataFrom(value: unknown): { readonly sessionId: string; readonly cwd: string } {
 	if (
 		!isRecord(value) ||
 		value.ok !== true ||
 		!isRecord(value.page) ||
 		value.page.complete !== true ||
-		!Array.isArray(value.page.items)
+		!Array.isArray(value.page.items) ||
+		value.page.items.length !== 1 ||
+		!isRecord(value.page.items[0]) ||
+		typeof value.page.items[0].sessionId !== "string" ||
+		typeof value.page.items[0].cwd !== "string"
 	)
-		throw new Error("released public SDK session.metadata returned an incomplete or unsuccessful response");
-	if (value.page.items.length !== 1 || !isRecord(value.page.items[0]))
-		throw new Error("released public SDK session.metadata response must contain exactly one metadata item");
-	return value.page.items[0];
-}
-
-function assertLifecycleAcknowledgement(operation: string, value: unknown): void {
-	if (!isRecord(value) || !isRecord(value.result))
-		throw new Error(
-			`released public SDK ${operation} returned a non-object acknowledgement${isRecord(value) ? " result" : ""}`,
-		);
-	const field = operation === "session.new" ? "created" : operation === "session.resume" ? "resumed" : "switched";
-	if (value.result[field] !== true)
-		throw new Error(`released public SDK ${operation} acknowledgement omitted ${field}: true`);
-}
-
-function awaitLifecycleDeadline<T>(promise: Promise<T>, remaining: () => number): Promise<T> {
-	return new Promise((resolve, reject) => {
-		const timeout = setTimeout(
-			() => reject(new Error("released public SDK lifecycle deadline exhausted")),
-			remaining(),
-		);
-		timeout.unref?.();
-		void promise.then(
-			value => {
-				clearTimeout(timeout);
-				resolve(value);
-			},
-			error => {
-				clearTimeout(timeout);
-				reject(error);
-			},
-		);
-	});
-}
-
-async function discoverSuccessorEndpoint(
-	directory: string,
-	before: ReadonlyMap<string, PublishedEndpoint>,
-	operation: "session.new" | "session.resume" | "session.switch",
-	targetSessionId: string | undefined,
-	remaining: () => number,
-): Promise<PublishedEndpoint> {
-	for (;;) {
-		remaining();
-		const after = await snapshotPublicEndpoints(directory);
-		if (operation !== "session.new") {
-			if (targetSessionId === undefined) throw new Error(`${operation} requires a target id`);
-			const endpoint = after.get(targetSessionId);
-			if (endpoint !== undefined) return endpoint;
-		} else {
-			const candidates = [...after.values()].filter(endpoint => {
-				const previous = before.get(endpoint.sessionId);
-				return previous === undefined || endpointFingerprint(previous) !== endpointFingerprint(endpoint);
-			});
-			if (candidates.length === 1) return candidates[0]!;
-			if (candidates.length > 1)
-				throw new Error(`public SDK successor discovery is ambiguous (${candidates.length} endpoints)`);
-		}
-		await Bun.sleep(Math.min(100, remaining()));
-	}
+		throw new Error("public SDK session.metadata returned an incomplete response");
+	return { sessionId: value.page.items[0].sessionId, cwd: value.page.items[0].cwd };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

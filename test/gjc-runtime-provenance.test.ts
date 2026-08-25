@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { closeTmux, exitAndObservePostCloseFailure } from "../scripts/gjc-release-compat-lifecycle";
 
 const ROOT = join(import.meta.dir, "..");
 const GJC_VERSION = "0.15.0";
@@ -176,145 +175,64 @@ describe("GJC SDK runtime provenance", () => {
 		expect(reusable).not.toContain("git apply");
 	});
 
-	test("records actual SDK responses through split SDK, runtime, and lifecycle harnesses", async () => {
-		const runner = await Bun.file(join(ROOT, "scripts/gjc-release-compat.ts")).text();
-		const sdk = await Bun.file(join(ROOT, "scripts/gjc-release-compat-sdk.ts")).text();
-		const runtime = await Bun.file(join(ROOT, "scripts/gjc-release-compat-runtime.ts")).text();
-		const lifecycle = await Bun.file(join(ROOT, "scripts/gjc-release-compat-lifecycle.ts")).text();
-		const fixtures = await Bun.file(join(ROOT, "scripts/gjc-release-compat-fixtures.ts")).text();
+	test("uses only the public managed SDK lifecycle and Router harness", async () => {
+		const sources = await Promise.all(
+			[
+				"scripts/gjc-release-compat.ts",
+				"scripts/gjc-release-compat-sdk.ts",
+				"scripts/gjc-release-compat-runtime.ts",
+				"scripts/gjc-release-compat-lifecycle.ts",
+			].map(async path => await Bun.file(join(ROOT, path)).text()),
+		);
+		const [runner, sdk, runtime, lifecycle] = sources;
+		const harness = sources.join("\n");
 
-		expect(runner).toContain('from "./gjc-release-compat-sdk"');
-		expect(runner).toContain('from "./gjc-release-compat-runtime"');
-		expect(runner).toContain('from "./gjc-release-compat-lifecycle"');
-		expect(runner).toContain('client!.query("session.metadata")');
-		expect(runner).toContain('client!.query("workflow.gates.list")');
-		expect(runner).toContain('client!.query("models.list/current")');
-		expect(runner).toContain('client!.control("model.set"');
-		expect(runner).toContain('client!.control("thinking.set"');
+		expect(sdk).toContain('from "@gajae-code/coding-agent/sdk"');
+		expect(sdk).toContain("router.SessionRouter");
+		expect(sdk).toContain("lifecycle.createSessionLifecycleService");
+		expect(sdk).toContain('type: "query_request"');
+		expect(sdk).toContain('type: "control_request"');
+		expect(sdk).toContain("generationStatus");
+		expect(runner).toContain('"session.create"');
+		expect(runner).toContain('"session.resume"');
+		expect(runner).toContain('"session.fork"');
 		expect(runner).toContain("push({ name, shape: shapeOf(value), observed: value })");
 		expect(runner).toContain('Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: providerResponse })');
-		expect(fixtures).toContain("providers:\n  compat-local:");
-		expect(runner).toMatch(/"--model",\s*"compat-local\/hermetic-model"/);
-		expect(runner).not.toContain("promptInteractive");
-		expect(runner).not.toContain("--op");
-
-		expect(sdk).toContain("session.metadata");
-		expect(sdk).toContain("targetSessionId: requestedSessionId");
-
 		expect(runtime).toContain('client.control("turn.prompt", { text })');
 		expect(runtime).toContain('client.control("turn.abort", abortInput, { idempotencyKey })');
-		expect(runtime).toContain('mode: "terminal", scope: "turn"');
-		expect(runtime).toContain("abortReplay");
-		expect(runtime).toContain('probe.query("session.branch_candidates")');
-		expect(runtime).toContain("rediscoverSessionId");
 		expect(runtime).toContain("client.onFrame(frame =>");
-		expect(runtime).toContain('frame.type !== "agent_end" && frame.type !== "agent_failed"');
-		expect(runtime).toContain("matches(frame, pendingCorrelation!)");
-		expect(runtime).toContain("pendingFrames.push(frame)");
-		expect(runtime).toContain('send-keys", "-t", target, "/session", "Enter"');
-
+		expect(runtime).toContain("frame.body");
 		expect(lifecycle).toContain('phase: "sdkLogicalClose"');
-		expect(lifecycle).toContain('phase: "cliLifecycleTermination"');
-		expect(lifecycle).toContain("postAcknowledgement:");
-		expect(lifecycle).toContain("tmuxTargetLive: live");
-		expect(lifecycle).toContain("awaitLifecycleTermination(");
-		expect(lifecycle).toContain('action: "/exit"');
-		expect(lifecycle).toContain('send-keys", "-t", target, "/exit", "Enter"]);');
-		expect(lifecycle).toContain("tmuxTargetAbsent: true");
-		expect(lifecycle).toContain("tmuxPanePid(tmuxTarget)");
-		expect(lifecycle).toContain("const originalPanePid = await tmuxPanePid(tmuxTarget);");
-		expect(lifecycle).toContain("postAcknowledgementPanePid !== originalPanePid");
-		expect(lifecycle).toContain("originalPanePidLive");
-		expect(lifecycle).toContain("endpoint: { descriptor: endpoint.descriptor, fingerprint, originalPanePid },");
-		expect(lifecycle).toContain("originalPanePidAbsent: true");
-		expect(lifecycle).toContain("process.kill(pid, 0)");
-		expect(runner).toContain('awaitTmuxTermination(resumedTarget, "resumed compatibility tmux session")');
-		expect(lifecycle).toContain('phase: "gracefulTmuxTermination"');
-		expect(runner).toContain("observed.cleanup = { forcedTmuxSessions: [] };");
-		expect(runner).not.toContain("forbiddenFallbacks:");
+		expect(lifecycle).toContain('status.status === "retired"');
+		for (const forbidden of [
+			"@gajae-code/bridge-client",
+			"@gajae-code/coding-agent/sdk/client",
+			"@gajae-code/coding-agent/sdk/acp",
+			"@gajae-code/coding-agent/sdk/broker",
+			"SdkClient",
+			"session.switch",
+			"tmux",
+			"descriptor",
+		])
+			expect(harness).not.toContain(forbidden);
 	});
 
-	test("allows broad tmux cleanup only before public close invocation", async () => {
+	test("parses strict released CLI version output without legacy startup wiring", async () => {
 		const runner = await Bun.file(join(ROOT, "scripts/gjc-release-compat.ts")).text();
-		const lifecycle = await Bun.file(join(ROOT, "scripts/gjc-release-compat-lifecycle.ts")).text();
-		const commands: string[][] = [];
-		const run = async (_command: string, args: readonly string[]) => {
-			commands.push([...args]);
-			return args[0] === "list-sessions" ? "gjc-compat-before\nunrelated\n" : "";
-		};
-
-		expect(await closeTmux("gjc-compat-", run)).toEqual(["gjc-compat-before"]);
-		expect(commands).toContainEqual(["kill-session", "-t", "gjc-compat-before"]);
-		commands.length = 0;
-		const evidence = await exitAndObservePostCloseFailure("/unused", undefined, "gjc-compat-after", run);
-		expect(commands).toEqual([["send-keys", "-t", "gjc-compat-after", "/exit", "Enter"]]);
-		expect(evidence).toMatchObject({
-			phase: "postCloseFailureCleanup",
-			action: "/exit",
-			uncertainty: { reason: "exact endpoint identity unavailable" },
-		});
-
-		const publicCloseInvokedAt = runner.indexOf("publicCloseInvoked = true;");
-		const publicCloseAt = runner.indexOf("closeWithPublicSdkProof", publicCloseInvokedAt);
-		const guardedCleanupAt = runner.indexOf("observed.cleanup = publicCloseInvoked");
-		const postCloseCleanupAt = runner.indexOf(
-			"postClose: await exitAndObservePostCloseFailure(workspace, sdkLogicalClose?.endpoint, tmuxSession, run)",
-			guardedCleanupAt,
-		);
-		const prePublicCloseBranchAt = runner.indexOf(": { forcedTmuxSessions:", postCloseCleanupAt);
-		const broadCleanupAt = runner.indexOf("await closeTmux(tmuxSession, run)", prePublicCloseBranchAt);
-		expect(publicCloseInvokedAt).toBeGreaterThan(0);
-		expect(publicCloseAt).toBeGreaterThan(publicCloseInvokedAt);
-		expect(guardedCleanupAt).toBeGreaterThan(publicCloseAt);
-		expect(postCloseCleanupAt).toBeGreaterThan(guardedCleanupAt);
-		expect(prePublicCloseBranchAt).toBeGreaterThan(postCloseCleanupAt);
-		expect(broadCleanupAt).toBeGreaterThan(prePublicCloseBranchAt);
-		expect(lifecycle).toContain('phase: "postCloseFailureCleanup"');
-	});
-	test("parses released /session surfaces and strict released CLI version output, then conditions startup flags by probed version", async () => {
-		const runner = await Bun.file(join(ROOT, "scripts/gjc-release-compat.ts")).text();
-		const runtime = await Bun.file(join(ROOT, "scripts/gjc-release-compat-runtime.ts")).text();
-		const parseSessionBootstrap = (output: string) => ({
-			sessionId: /(?:^|\n)\s*(?:ID|Session ID)\s*:\s*([^\s]+)\s*$/im.exec(output)?.[1],
-			sessionFile: /(?:^|\n)\s*File\s*:\s*(\S(?:.*\S)?)\s*$/im.exec(output)?.[1],
-		});
-		const startupArguments = (version: string) => {
-			const arguments_ = ["--model", "compat-local/hermetic-model"];
-			const supportsOffThinkingFlag = version.startsWith("0.11.") && version !== "0.11.1";
-			return supportsOffThinkingFlag ? [...arguments_, "--thinking", "off"] : arguments_;
-		};
 		const parseReleasedCliVersion = (output: string) => {
 			const match = /^(?:gjc\/)?(\d+\.\d+\.\d+)$/.exec(output.trim());
 			if (match === null) throw new Error("invalid version");
 			return match[1];
 		};
-
-		expect(parseSessionBootstrap("Session Info\nFile: /tmp/sessions/alpha.jsonl\nID: alpha-123\n")).toEqual({
-			sessionId: "alpha-123",
-			sessionFile: "/tmp/sessions/alpha.jsonl",
-		});
-		expect(parseSessionBootstrap("Sessions dashboard\nSession ID: beta-456\n")).toEqual({
-			sessionId: "beta-456",
-			sessionFile: undefined,
-		});
-		expect(startupArguments("0.11.1")).not.toContain("--thinking");
-		expect(startupArguments("0.11.6")).toEqual(["--model", "compat-local/hermetic-model", "--thinking", "off"]);
-		expect(startupArguments("0.12.7")).toEqual(["--model", "compat-local/hermetic-model"]);
 		expect(parseReleasedCliVersion("gjc/0.11.1\n")).toBe("0.11.1");
 		expect(parseReleasedCliVersion("0.11.6\n")).toBe("0.11.6");
 		expect(() => parseReleasedCliVersion("gjc/0.11.1 extra")).toThrow("invalid version");
 		expect(runner).toContain("const match = /^(?:gjc\\/)?(\\d+\\.\\d+\\.\\d+)$/.exec(output);");
-		expect(runner).toContain('await run(command, ["--version"])');
-		expect(runner).toContain('const supportsOffThinkingFlag = version.startsWith("0.11.") && version !== "0.11.1"');
-		expect(runtime).toContain('output.includes("Sessions dashboard")');
-		expect(runtime).toContain(
-			'output.includes("Session Info") && bootstrap.sessionId !== undefined && bootstrap.sessionFile !== undefined',
-		);
-		expect(runtime).toContain(
-			"const sessionFile = /(?:^|\\n)\\s*File\\s*:\\s*(\\S(?:.*\\S)?)\\s*$/im.exec(output)?.[1];",
-		);
-		expect(runner).toContain('if (thinkingSupported) await observe("thinking.set"');
+		expect(runner).toContain('Bun.spawn([command, "--version"]');
+		expect(runner).not.toContain("startupArguments");
+		expect(runner).not.toContain("--thinking");
 	});
+
 	test("cites the structural scanner as a separate artifact without fabricating runtime observation", async () => {
 		const runner = await Bun.file(join(ROOT, "scripts/gjc-release-compat.ts")).text();
 
