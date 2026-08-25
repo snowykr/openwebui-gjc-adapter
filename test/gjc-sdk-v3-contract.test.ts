@@ -456,10 +456,7 @@ describe("latest dev SDK v3 transport contract", () => {
 		}
 		const exports = Reflect.get(manifest, "exports");
 		expect(Reflect.get(exports, "./gjc/*")).toBeUndefined();
-		expect(Reflect.get(exports, "./gjc/public-sdk-contract")).toEqual({
-			types: "./src/gjc/public-sdk-contract.ts",
-			import: "./src/gjc/public-sdk-contract.ts",
-		});
+		expect(Reflect.get(exports, "./gjc/public-sdk-contract")).toBeUndefined();
 		expect(Reflect.get(Reflect.get(manifest, "dependencies"), "@gajae-code/coding-agent")).toBe(
 			"https://raw.githubusercontent.com/snowykr/openwebui-gjc-adapter/c09e31dc85c514cffaf7e44827b47d311620c49f/vendor/gajae-code-coding-agent-e3b3a76a590081ded16214a1188857524d40e701-8ba25005.tgz",
 		);
