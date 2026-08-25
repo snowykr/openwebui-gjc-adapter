@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalSessionMappingKey } from "../src/gjc/session-authority";
@@ -165,6 +165,72 @@ describe("SessionV3FileBackedMappingStore", () => {
 				managedAuthority: { chatId: scope.chatId },
 			});
 			reopened.close();
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	test("reloads a managed successor proof without fabricating attachment state", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-v3-successor-proof-"));
+		const filePath = join(directory, "authority.json");
+		try {
+			const store = new SessionV3FileBackedMappingStore(filePath);
+			store.set(mapping());
+			store.beginOperation("chat-1", { id: "create-1", kind: "create", detail: "create" });
+			store.close();
+
+			const document = JSON.parse(readFileSync(filePath, "utf8"));
+			const operation = document.mappings[0].journal.find((value: { id: string }) => value.id === "create-1");
+			if (operation === undefined) throw new Error("expected create journal operation");
+			operation.acknowledgedSuccessor = {
+				sessionId: "successor-1",
+				managedAuthority: authority("chat-1", "project-1", "successor-1"),
+			};
+			writeFileSync(filePath, JSON.stringify(document));
+
+			const recovered = new SessionV3FileBackedMappingStore(filePath);
+			const successor = recovered.operation("chat-1", "create-1")?.acknowledgedSuccessor;
+			expect(successor as unknown).toEqual({
+				sessionId: "successor-1",
+				managedAuthority: authority("chat-1", "project-1", "successor-1"),
+			});
+			expect(successor).not.toHaveProperty("attachment");
+			expect(JSON.parse(readFileSync(filePath, "utf8"))).not.toHaveProperty(
+				"mappings[0].journal[0].acknowledgedSuccessor.attachment",
+			);
+			recovered.close();
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects obsolete attachment-shaped successor persistence", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-v3-obsolete-successor-"));
+		const filePath = join(directory, "authority.json");
+		try {
+			const store = new SessionV3FileBackedMappingStore(filePath);
+			store.set(mapping());
+			store.beginOperation("chat-1", { id: "create-1", kind: "create", detail: "create" });
+			store.close();
+
+			for (const acknowledgedSuccessor of [
+				{
+					sessionId: "successor-1",
+					attachment: mapping().attachment,
+				},
+				{
+					sessionId: "successor-1",
+					attachment: mapping().attachment,
+					managedAuthority: authority("chat-1", "project-1", "successor-1"),
+				},
+			]) {
+				const document = JSON.parse(readFileSync(filePath, "utf8"));
+				const operation = document.mappings[0].journal.find((value: { id: string }) => value.id === "create-1");
+				if (operation === undefined) throw new Error("expected create journal operation");
+				operation.acknowledgedSuccessor = acknowledgedSuccessor;
+				writeFileSync(filePath, JSON.stringify(document));
+				expect(() => new SessionV3FileBackedMappingStore(filePath)).toThrow("authority document is not strict V3");
+			}
 		} finally {
 			rmSync(directory, { recursive: true, force: true });
 		}

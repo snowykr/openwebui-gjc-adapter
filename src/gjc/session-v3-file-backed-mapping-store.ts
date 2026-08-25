@@ -22,6 +22,7 @@ import {
 	type SessionOperationResult,
 	type SessionOperationState,
 } from "./session-authority";
+import type { ManagedAcknowledgedSuccessor, ManagedSessionOperation } from "./session-authority-copy";
 import { AuthorityMutationLock } from "./session-authority-file";
 import { type AcknowledgedSuccessor, SessionAuthorityLoadError } from "./session-authority-types";
 import {
@@ -30,6 +31,7 @@ import {
 	parseSessionAuthorityV3Document,
 	SESSION_AUTHORITY_V3_EPOCH,
 	SESSION_AUTHORITY_V3_KIND,
+	type SessionAuthorityV3AcknowledgedSuccessor,
 	type SessionAuthorityV3Document,
 	type SessionAuthorityV3Mapping,
 	type SessionAuthorityV3Operation,
@@ -39,6 +41,25 @@ import {
 } from "./session-authority-v3";
 import { SessionMappingStore } from "./session-mapping-memory-store";
 import type { ManagedTurnAuthority } from "./turn-runner";
+
+type ManagedSessionAuthorityTombstone = Omit<SessionAuthorityTombstone, "journal" | "prior"> & {
+	readonly journal: readonly ManagedSessionOperation[];
+	readonly prior?: ManagedSessionAuthorityTombstone;
+};
+type ManagedSessionAuthorityReassignment = Omit<
+	NonNullable<SessionAuthorityRecord["reassignment"]>,
+	"sourceTombstone" | "priorTombstone"
+> & {
+	readonly sourceTombstone?: ManagedSessionAuthorityTombstone;
+	readonly priorTombstone?: ManagedSessionAuthorityTombstone;
+};
+type ManagedSessionAuthorityRecord = Omit<SessionAuthorityRecord, "journal" | "reassignment"> & {
+	readonly journal: readonly ManagedSessionOperation[];
+	readonly reassignment?: ManagedSessionAuthorityReassignment;
+};
+type ManagedProvisionalSessionOperation = Omit<ProvisionalSessionOperation, "acknowledgedSuccessor"> & {
+	readonly acknowledgedSuccessor?: ManagedAcknowledgedSuccessor;
+};
 
 /** Canonical V3 authority storage. This deliberately has no V2 compatibility,
  * attachment, descriptor, or terminal persistence path. The activation marker
@@ -238,8 +259,8 @@ class V3FileSessionAuthority extends SessionAuthority {
 		if (document === undefined)
 			throw new SessionAuthorityLoadError(this.filePath, "authority document is not strict V3");
 		this.replaceAllWithReferences(
-			document.mappings.map(fromV3Mapping),
-			document.provisionalOperations.map(fromV3Provisional),
+			document.mappings.map(fromV3Mapping) as unknown as SessionAuthorityRecord[],
+			document.provisionalOperations.map(fromV3Provisional) as unknown as ProvisionalSessionOperation[],
 		);
 		this.clearDirtyJournal();
 		this.#generation += 1;
@@ -400,7 +421,18 @@ function authorityV3(value: unknown, context: string): ManagedTurnAuthorityV3 {
 	const authority = value as Omit<ManagedTurnAuthorityV3, "authorityEpoch">;
 	if (authority.epoch !== SESSION_AUTHORITY_V3_EPOCH)
 		throw new Error(`V3 managed authority epoch is required for ${context}.`);
-	return { ...authority, authorityEpoch: SESSION_AUTHORITY_V3_EPOCH };
+	return {
+		principalId: authority.principalId,
+		projectId: authority.projectId,
+		canonicalWorkspace: authority.canonicalWorkspace,
+		chatId: authority.chatId,
+		sessionId: authority.sessionId,
+		generation: authority.generation,
+		leaseId: authority.leaseId,
+		epoch: authority.epoch,
+		requestKey: authority.requestKey,
+		authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+	};
 }
 function authorityV3ForDurableChat(
 	value: unknown,
@@ -421,14 +453,7 @@ function toV3Operation(
 		...(acknowledgedSuccessor === undefined
 			? {}
 			: {
-					acknowledgedSuccessor: {
-						sessionId: acknowledgedSuccessor.sessionId,
-						managedAuthority: authorityV3ForDurableChat(
-							(acknowledgedSuccessor as unknown as { managedAuthority?: unknown }).managedAuthority,
-							`${context} successor`,
-							durableChatId,
-						),
-					},
+					acknowledgedSuccessor: toV3Successor(acknowledgedSuccessor, `${context} successor`, durableChatId),
 				}),
 		...(result === undefined
 			? {}
@@ -445,7 +470,31 @@ function toV3Operation(
 				}),
 	};
 }
-function fromV3Operation(operation: SessionAuthorityV3Operation): SessionOperation {
+
+function toV3Successor(
+	successor: unknown,
+	context: string,
+	durableChatId?: string,
+): SessionAuthorityV3AcknowledgedSuccessor {
+	if (typeof successor !== "object" || successor === null) {
+		throw new Error(`V3 managed successor proof is required for ${context}.`);
+	}
+	const value = successor as Record<string, unknown>;
+	if (
+		Object.keys(value).some(key => key !== "sessionId" && key !== "managedAuthority") ||
+		typeof value.sessionId !== "string"
+	) {
+		throw new Error(
+			`V3 managed successor proof is required for ${context}; legacy attachment state is not accepted.`,
+		);
+	}
+	return {
+		sessionId: value.sessionId,
+		managedAuthority: authorityV3ForDurableChat(value.managedAuthority, context, durableChatId),
+	};
+}
+
+function fromV3Operation(operation: SessionAuthorityV3Operation): ManagedSessionOperation {
 	const { acknowledgedSuccessor, result, ...rest } = operation;
 	return {
 		...rest,
@@ -454,9 +503,8 @@ function fromV3Operation(operation: SessionAuthorityV3Operation): SessionOperati
 			: {
 					acknowledgedSuccessor: {
 						sessionId: acknowledgedSuccessor.sessionId,
-						attachment: {} as AcknowledgedSuccessor["attachment"],
-						managedAuthority: acknowledgedSuccessor.managedAuthority,
-					} as AcknowledgedSuccessor,
+						managedAuthority: authorityV3(acknowledgedSuccessor.managedAuthority, "reloaded successor"),
+					},
 				}),
 		...(result === undefined ? {} : { result: { ...result, managedAuthority: result.managedAuthority } }),
 	};
@@ -497,7 +545,7 @@ function toV3Tombstone(tombstone: SessionAuthorityTombstone, durableChatId?: str
 		...(prior === undefined ? {} : { prior: toV3Tombstone(prior, durableChatId) }),
 	};
 }
-function fromV3Tombstone(tombstone: SessionAuthorityV3Tombstone): SessionAuthorityTombstone {
+function fromV3Tombstone(tombstone: SessionAuthorityV3Tombstone): ManagedSessionAuthorityTombstone {
 	const { version: _version, authorityEpoch: _epoch, journal, prior, ...rest } = tombstone;
 	return {
 		...rest,
@@ -517,9 +565,7 @@ function toV3Reassignment(
 		...(priorTombstone === undefined ? {} : { priorTombstone: toV3Tombstone(priorTombstone, durableChatId) }),
 	};
 }
-function fromV3Reassignment(
-	reassignment: SessionAuthorityV3Reassignment,
-): NonNullable<SessionAuthorityRecord["reassignment"]> {
+function fromV3Reassignment(reassignment: SessionAuthorityV3Reassignment): ManagedSessionAuthorityReassignment {
 	const { sourceTombstone, priorTombstone, ...rest } = reassignment;
 	return {
 		...rest,
@@ -555,7 +601,7 @@ function toV3Mapping(record: SessionAuthorityRecord): SessionAuthorityV3Mapping 
 			: { reassignment: toV3Reassignment(reassignment, scopedDurableChatId(record)) }),
 	};
 }
-function fromV3Mapping(mapping: SessionAuthorityV3Mapping): SessionAuthorityRecord {
+function fromV3Mapping(mapping: SessionAuthorityV3Mapping): ManagedSessionAuthorityRecord {
 	const { version: _version, authorityEpoch: _epoch, journal, reassignment, ...rest } = mapping;
 	return {
 		...rest,
@@ -577,7 +623,7 @@ function toV3Provisional(operation: ProvisionalSessionOperation): SessionAuthori
 		managedAuthority: authorityV3ForDurableChat(managedAuthority, `provisional ${operation.id}`, durableChatId),
 	};
 }
-function fromV3Provisional(operation: SessionAuthorityV3ProvisionalOperation): ProvisionalSessionOperation {
+function fromV3Provisional(operation: SessionAuthorityV3ProvisionalOperation): ManagedProvisionalSessionOperation {
 	const { managedAuthority, ...rest } = operation;
 	return {
 		...fromV3Operation(rest),

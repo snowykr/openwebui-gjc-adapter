@@ -22,6 +22,25 @@ const modelSelection: NormalizedModelSelection = {
 };
 
 describe("managed turn runner", () => {
+	test("requires complete managed authority for lifecycle invocation", async () => {
+		const fake = new RunnerRuntime();
+		await expect(
+			fake.createExternalLifecycleSession({
+				actor: { id: authority.principalId, namespace: "adapter" },
+				capability: "session.create",
+				requestKey: authority.requestKey,
+				target: { cwd: authority.canonicalWorkspace },
+			}),
+		).rejects.toThrow("Complete managed tenant authority");
+		await fake.createExternalLifecycleSession(authority, {
+			actor: { id: authority.principalId, namespace: "adapter" },
+			capability: "session.create",
+			requestKey: authority.requestKey,
+			target: { cwd: authority.canonicalWorkspace },
+		});
+		expect(fake.externalLifecycle).toHaveLength(1);
+	});
+
 	test("creates through external lifecycle adoption and streams ordered public Router frames before request settlement", async () => {
 		const fake = new RunnerRuntime();
 		const runner = createManagedGjcTurnRunner(fake.runtime);
@@ -135,6 +154,27 @@ describe("managed turn runner", () => {
 		).rejects.toThrow("abort-and-prompt failure");
 		expect(failed.requests.map(frame => frame.operation)).toEqual(["turn.abort_and_prompt"]);
 		expect(failed.unsubscribed).toBe(1);
+	});
+
+	test("propagates managed frame listener failures instead of swallowing them", async () => {
+		const fake = new RunnerRuntime();
+		fake.status = "retired";
+		const runner = createManagedGjcTurnRunner(fake.runtime);
+		await expect(
+			runner.create({
+				preparedManagedAuthority: withoutIdentity(),
+				cwd: authority.canonicalWorkspace,
+				sessionRoot: "/sessions",
+				projectId: authority.projectId,
+				chatId: authority.chatId,
+				userMessageId: "message-listener-error",
+				text: "listener error",
+				observer: () => {
+					throw new Error("managed listener failed");
+				},
+			}),
+		).rejects.toThrow("managed listener failed");
+		expect(fake.unsubscribed).toBe(1);
 	});
 
 	test("cancels a dispatched managed abort-and-prompt before exposing a result", async () => {
@@ -408,10 +448,6 @@ class RunnerRuntime {
 		endpointGeneration: authority.generation,
 	};
 	thinkingSetResult: Readonly<Record<string, unknown>> | undefined;
-	readonly lifecycleService = {
-		createExternal: (request: Record<string, unknown>) => this.createExternalLifecycleSession(request),
-		resumeExternal: (request: Record<string, unknown>) => this.resumeExternalLifecycleSession(request),
-	};
 	get runtime(): ManagedSdkRuntime {
 		return this as unknown as ManagedSdkRuntime;
 	}
@@ -423,11 +459,17 @@ class RunnerRuntime {
 		this.registered.push({ key, outcome });
 		return { tenant: key, generation: (key as { generation: number }).generation, attachment: this.attachment };
 	}
-	async createExternalLifecycleSession(request: Record<string, unknown>) {
+	async createExternalLifecycleSession(_tenant: unknown, request?: Record<string, unknown>) {
+		if (request === undefined) throw new Error("Complete managed tenant authority is required.");
 		this.externalLifecycle.push(request);
 		return lifecycleSuccess();
 	}
-	async resumeExternalLifecycleSession(_request: Record<string, unknown>) {
+	async createPreparedExternalLifecycleSession(_authority: unknown, request: Record<string, unknown>) {
+		this.externalLifecycle.push(request);
+		return lifecycleSuccess();
+	}
+	async resumeExternalLifecycleSession(_tenant: unknown, request?: Record<string, unknown>) {
+		if (request === undefined) throw new Error("Complete managed tenant authority is required.");
 		return { kind: "result", outcome: lifecycleSuccess() };
 	}
 	async request(_attachment: unknown, frame: Record<string, unknown>, options?: { onDispatch?: () => void }) {
@@ -511,18 +553,19 @@ class RunnerRuntime {
 	async generationStatus() {
 		return { status: this.status };
 	}
-	async forkLifecycleSession(request: Record<string, unknown>) {
+	async forkLifecycleSession(_tenantOrRequest: unknown, maybeRequest?: Record<string, unknown>) {
+		const request = maybeRequest ?? (_tenantOrRequest as Record<string, unknown>);
 		this.forkRequests.push(request);
 		return { ok: true as const, result: this.forkResult };
 	}
-	async closeLifecycleSession() {
+	async closeLifecycleSession(_tenantOrRequest?: unknown, _maybeRequest?: Record<string, unknown>) {
 		this.closeCalls += 1;
 		return lifecycleSuccess();
 	}
-	async deleteLifecycleSession() {
+	async deleteLifecycleSession(_tenantOrRequest?: unknown, _maybeRequest?: Record<string, unknown>) {
 		return lifecycleSuccess();
 	}
-	async listLifecycleSessions() {
+	async listLifecycleSessions(_tenantOrRequest?: unknown, _maybeRequest?: Record<string, unknown>) {
 		return { ok: true, result: { sessions: [] } };
 	}
 }

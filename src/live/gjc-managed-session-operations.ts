@@ -153,16 +153,16 @@ export function createManagedSessionOperations(runtime: ManagedSdkRuntime): Mana
 		let outcome: unknown;
 		try {
 			outcome = await (operation === "create"
-				? runtime.lifecycleService.createExternal(request as never)
+				? runtime.createPreparedExternalLifecycleSession(authority, request as never)
 				: operation === "resume"
-					? runtime.lifecycleService.resumeExternal(request as never)
+					? runtime.resumeExternalLifecycleSession(requireExactTenant(key), request as never)
 					: operation === "fork"
-						? runtime.forkLifecycleSession(request as never)
+						? runtime.forkLifecycleSession(requireExactTenant(key), request as never)
 						: operation === "close"
-							? runtime.closeLifecycleSession(request as never)
+							? runtime.closeLifecycleSession(requireExactTenant(key), request as never)
 							: operation === "delete"
-								? runtime.deleteLifecycleSession(request as never)
-								: runtime.listLifecycleSessions(request as never));
+								? runtime.deleteLifecycleSession(requireExactTenant(key), request as never)
+								: runtime.listLifecycleSessions(requireExactTenant(key), request as never));
 		} catch (error) {
 			if ((operation === "close" || operation === "delete") && key !== undefined)
 				await requireRetired(runtime, key, error);
@@ -511,6 +511,11 @@ function hasExactGeneration(authority: ManagedLifecycleInput["authority"]): auth
 		Number.isSafeInteger(authority.generation) &&
 		authority.generation > 0
 	);
+}
+
+function requireExactTenant(key: TenantSessionKey | undefined): TenantSessionKey {
+	if (key === undefined) throw new TypeError("Complete positive ManagedTurnAuthority is required.");
+	return key;
 }
 function decodeAcknowledgedCorrelation(
 	result: Readonly<Record<string, unknown>>,

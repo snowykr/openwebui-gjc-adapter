@@ -33,6 +33,12 @@ function fixture(options: { start?: () => Promise<void>; fence?: () => boolean; 
 		isCurrent: () => true,
 		send: () => undefined,
 	} as router.SessionAttachment;
+	const foreignAttachment = {
+		sessionId: tenant.sessionId,
+		generation: tenant.generation,
+		isCurrent: () => true,
+		send: () => undefined,
+	} as router.SessionAttachment;
 	const calls: string[] = [];
 	const sessionRouter = {
 		async start() {
@@ -82,8 +88,10 @@ function fixture(options: { start?: () => Promise<void>; fence?: () => boolean; 
 	return {
 		runtime,
 		attachment,
+		foreignAttachment,
 		calls,
-		emit: async (frame: router.SessionRouterFrame) => await onFrame?.(attachment, frame),
+		emit: async (frame: router.SessionRouterFrame, sourceAttachment = attachment) =>
+			await onFrame?.(sourceAttachment, frame),
 	};
 }
 
@@ -136,6 +144,32 @@ describe("managed SDK runtime", () => {
 		await fenced.runtime.start();
 		await expect(fenced.runtime.acquireAttachment(tenant)).rejects.toThrow("fence was lost");
 		await fenced.runtime.stop();
+	});
+
+	test("reserves one complete tenant for each session generation and rejects foreign boundaries", async () => {
+		const current = fixture();
+		current.runtime.registerTenant(tenant);
+		expect(() => current.runtime.registerTenant({ ...tenant, leaseId: "foreign-lease" })).toThrow("already owned");
+		await current.runtime.start();
+		const managed = await current.runtime.acquireAttachment(tenant);
+		const foreign = { ...managed, tenant: { ...tenant, leaseId: "foreign-lease" } };
+		await expect(current.runtime.request(foreign, {})).rejects.toThrow("not registered");
+		expect(() =>
+			current.runtime.subscribeFrames(foreign, "turn", { commandId: "command-foreign" }, () => {}),
+		).toThrow("Registered current tenant attachment");
+		await current.emit(
+			{
+				body: {},
+				name: "event",
+				sessionId: tenant.sessionId,
+				generation: tenant.generation,
+				commandId: "command-foreign",
+				seq: 1,
+			},
+			current.foreignAttachment,
+		);
+		expect(current.runtime.frameDiagnostics().foreign).toBe(1);
+		await current.runtime.stop();
 	});
 
 	test("delegates request settlement solely to Router and preserves dispatch hook order", async () => {
@@ -201,5 +235,43 @@ describe("managed SDK runtime", () => {
 		expect(JSON.stringify(current.runtime.frameDiagnostics())).not.toContain("token");
 		expect(JSON.stringify(current.runtime.frameDiagnostics())).not.toContain("url");
 		await current.runtime.dispose();
+	});
+
+	test("rejects lifecycle calls without complete managed tenant authority", async () => {
+		const current = fixture();
+		current.runtime.registerTenant(tenant);
+		await current.runtime.start();
+		await expect(
+			current.runtime.createLifecycleSession({
+				actor: { id: tenant.principalId, namespace: "adapter" },
+				capability: "session.create",
+				requestKey: "create-1",
+				target: { cwd: tenant.canonicalWorkspace },
+			} as never),
+		).rejects.toThrow("Complete managed tenant authority");
+		expect("lifecycleService" in current.runtime).toBeFalse();
+		await current.runtime.stop();
+	});
+
+	test("exposes listener failures through subscription drain and diagnostics", async () => {
+		const current = fixture();
+		current.runtime.registerTenant(tenant);
+		await current.runtime.start();
+		const managed = await current.runtime.acquireAttachment(tenant);
+		const unsubscribe = current.runtime.subscribeFrames(managed, "turn", { commandId: "command-error" }, () => {
+			throw new Error("listener failed");
+		});
+		await current.emit({
+			body: {},
+			name: "event",
+			sessionId: tenant.sessionId,
+			generation: tenant.generation,
+			commandId: "command-error",
+			seq: 1,
+		});
+		await expect(unsubscribe.drain()).rejects.toThrow("listener failed");
+		expect(current.runtime.frameDiagnostics().listenerError).toBe(1);
+		unsubscribe();
+		await current.runtime.stop();
 	});
 });

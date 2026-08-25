@@ -8,6 +8,18 @@ import type {
 } from "./session-authority-types";
 import type { GjcTurnEvent, ManagedTurnAuthority } from "./turn-runner";
 
+/** Managed V3 successor proof. Unlike the legacy successor shape, this record
+ * carries only the durable tenant/session authority and has no endpoint or
+ * attachment state. */
+export interface ManagedAcknowledgedSuccessor {
+	readonly sessionId: string;
+	readonly managedAuthority: ManagedTurnAuthority;
+}
+
+export type ManagedSessionOperation = Omit<SessionOperation, "acknowledgedSuccessor"> & {
+	readonly acknowledgedSuccessor?: ManagedAcknowledgedSuccessor;
+};
+
 export function copyManagedAuthority(authority: ManagedTurnAuthority): ManagedTurnAuthority {
 	const v3Authority = authority as ManagedTurnAuthority & { readonly authorityEpoch?: string };
 	return {
@@ -69,7 +81,7 @@ export function copy(record: SessionAuthorityRecord): SessionAuthorityRecord {
 		...(record.managedAuthority === undefined
 			? {}
 			: { managedAuthority: copyManagedAuthority(record.managedAuthority) }),
-		journal: record.journal.map(copyOperation),
+		journal: record.journal.map(operation => copyOperation(operation)),
 		...(record.reassignment === undefined
 			? {}
 			: {
@@ -86,7 +98,9 @@ export function copy(record: SessionAuthorityRecord): SessionAuthorityRecord {
 				}),
 	};
 }
-export function copyOperation(operation: SessionOperation): SessionOperation {
+export function copyOperation(operation: SessionOperation): SessionOperation;
+export function copyOperation(operation: ManagedSessionOperation): ManagedSessionOperation;
+export function copyOperation(operation: SessionOperation | ManagedSessionOperation) {
 	return {
 		...operation,
 		...(operation.result === undefined ? {} : { result: copyOperationResult(operation.result) }),
@@ -113,7 +127,20 @@ export function copyProvisionalOperation(operation: ProvisionalSessionOperation)
 	};
 }
 
-export function copyAcknowledgedSuccessor(successor: AcknowledgedSuccessor): AcknowledgedSuccessor {
+export function copyAcknowledgedSuccessor(successor: AcknowledgedSuccessor): AcknowledgedSuccessor;
+export function copyAcknowledgedSuccessor(successor: ManagedAcknowledgedSuccessor): ManagedAcknowledgedSuccessor;
+export function copyAcknowledgedSuccessor(
+	successor: AcknowledgedSuccessor | ManagedAcknowledgedSuccessor,
+): AcknowledgedSuccessor | ManagedAcknowledgedSuccessor;
+export function copyAcknowledgedSuccessor(
+	successor: AcknowledgedSuccessor | ManagedAcknowledgedSuccessor,
+): AcknowledgedSuccessor | ManagedAcknowledgedSuccessor {
+	if ("managedAuthority" in successor) {
+		return {
+			sessionId: successor.sessionId,
+			managedAuthority: copyManagedAuthority(successor.managedAuthority),
+		};
+	}
 	return {
 		...successor,
 		attachment: { ...successor.attachment, descriptorStat: { ...successor.attachment.descriptorStat } },
@@ -133,7 +160,7 @@ export function copyTombstone(tombstone: SessionAuthorityTombstone): SessionAuth
 		...(tombstone.managedAuthority === undefined
 			? {}
 			: { managedAuthority: copyManagedAuthority(tombstone.managedAuthority) }),
-		journal: tombstone.journal.map(copyOperation),
+		journal: tombstone.journal.map(operation => copyOperation(operation)),
 		...(tombstone.prior === undefined ? {} : { prior: copyTombstone(tombstone.prior) }),
 	};
 }

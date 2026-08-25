@@ -1,4 +1,5 @@
 import { lifecycle, router } from "@gajae-code/coding-agent/sdk";
+import type { ManagedPreparedTurnAuthority } from "./turn-runner";
 
 export const MANAGED_SDK_OWNER_STATES = [
 	"new",
@@ -51,6 +52,7 @@ export interface ManagedSdkFrameDiagnostics {
 	readonly unmatched: number;
 	readonly foreign: number;
 	readonly overflow: number;
+	readonly listenerError: number;
 }
 
 export interface ManagedSdkRuntimeDeps {
@@ -78,13 +80,20 @@ interface FrameSubscription {
 	queued: number;
 	buffered: router.SessionRouterFrame[];
 	tail: Promise<void>;
+	deliveryFailed: boolean;
+	deliveryError: unknown;
 	active: boolean;
 }
 
 export interface ManagedSdkFrameSubscription {
 	(): void;
-	/** Stops delivery and waits for already accepted frames to settle in order. */
+	/** Stops delivery and waits for already accepted frames to settle in order, rejecting on listener failure. */
 	drain(): Promise<void>;
+}
+
+interface ManagedLifecycleCall<TRequest> {
+	readonly tenant: TenantSessionKey;
+	readonly request: TRequest;
 }
 
 /** A session/generation-scoped subscription that is bound only from a Router acknowledgement. */
@@ -107,6 +116,7 @@ export class ManagedSdkRuntime {
 	readonly #maxSubscriptions: number;
 	readonly #maxFramesPerSubscription: number;
 	readonly #maxFrameHistory: number;
+	/** One full tenant owns a session generation for the lifetime of its registration. */
 	readonly #registrations = new Map<string, TenantSessionKey>();
 	readonly #subscriptions = new Map<number, FrameSubscription>();
 	readonly #expiredCorrelations = new Set<string>();
@@ -118,6 +128,7 @@ export class ManagedSdkRuntime {
 		foreign: 0,
 		overflow: 0,
 	};
+	#listenerErrorCount = 0;
 	#state: ManagedSdkOwnerState = "new";
 	#bootstrapAdmission = false;
 	#startPromise: Promise<void> | undefined;
@@ -151,65 +162,108 @@ export class ManagedSdkRuntime {
 		return this.#bootstrapAdmission;
 	}
 
-	get lifecycleService(): ReturnType<typeof lifecycle.createSessionLifecycleService> {
-		return this.#lifecycle;
-	}
-
 	createLifecycleSession(
-		request: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["create"]>[0],
+		tenantOrRequest:
+			| TenantSessionKey
+			| Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["create"]>[0]
+			| ManagedLifecycleCall<Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["create"]>[0]>,
+		request?: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["create"]>[0],
 	): ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["create"]> {
-		return this.#lifecycle.create(request);
+		return this.#invokeLifecycle(tenantOrRequest, request, value => this.#lifecycle.create(value));
 	}
 
 	createExternalLifecycleSession(
+		tenantOrRequest:
+			| TenantSessionKey
+			| Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["createExternal"]>[0]
+			| ManagedLifecycleCall<
+					Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["createExternal"]>[0]
+			  >,
+		request?: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["createExternal"]>[0],
+	): ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["createExternal"]> {
+		return this.#invokeLifecycle(tenantOrRequest, request, value => this.#lifecycle.createExternal(value));
+	}
+
+	createPreparedExternalLifecycleSession(
+		authority: ManagedPreparedTurnAuthority,
 		request: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["createExternal"]>[0],
 	): ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["createExternal"]> {
-		return this.#lifecycle.createExternal(request);
+		return this.#invokePreparedCreate(authority, request);
 	}
 
 	resumeExternalLifecycleSession(
-		request: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["resumeExternal"]>[0],
+		tenantOrRequest:
+			| TenantSessionKey
+			| Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["resumeExternal"]>[0]
+			| ManagedLifecycleCall<
+					Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["resumeExternal"]>[0]
+			  >,
+		request?: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["resumeExternal"]>[0],
 	): ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["resumeExternal"]> {
-		return this.#lifecycle.resumeExternal(request);
+		return this.#invokeLifecycle(tenantOrRequest, request, value => this.#lifecycle.resumeExternal(value));
 	}
 
 	forkLifecycleSession(
-		request: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["fork"]>[0],
+		tenantOrRequest:
+			| TenantSessionKey
+			| Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["fork"]>[0]
+			| ManagedLifecycleCall<Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["fork"]>[0]>,
+		request?: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["fork"]>[0],
 	): ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["fork"]> {
-		return this.#lifecycle.fork(request);
+		return this.#invokeLifecycle(tenantOrRequest, request, value => this.#lifecycle.fork(value));
 	}
 
 	resumeLifecycleSession(
-		request: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["resume"]>[0],
+		tenantOrRequest:
+			| TenantSessionKey
+			| Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["resume"]>[0]
+			| ManagedLifecycleCall<Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["resume"]>[0]>,
+		request?: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["resume"]>[0],
 	): ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["resume"]> {
-		return this.#lifecycle.resume(request);
+		return this.#invokeLifecycle(tenantOrRequest, request, value => this.#lifecycle.resume(value));
 	}
 
 	closeLifecycleSession(
-		request: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["close"]>[0],
+		tenantOrRequest:
+			| TenantSessionKey
+			| Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["close"]>[0]
+			| ManagedLifecycleCall<Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["close"]>[0]>,
+		request?: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["close"]>[0],
 	): ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["close"]> {
-		return this.#lifecycle.close(request);
+		return this.#invokeLifecycle(tenantOrRequest, request, value => this.#lifecycle.close(value));
 	}
 
 	deleteLifecycleSession(
-		request: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["delete"]>[0],
+		tenantOrRequest:
+			| TenantSessionKey
+			| Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["delete"]>[0]
+			| ManagedLifecycleCall<Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["delete"]>[0]>,
+		request?: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["delete"]>[0],
 	): ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["delete"]> {
-		return this.#lifecycle.delete(request);
+		return this.#invokeLifecycle(tenantOrRequest, request, value => this.#lifecycle.delete(value));
 	}
 
 	listLifecycleSessions(
-		request: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["list"]>[0],
+		tenantOrRequest:
+			| TenantSessionKey
+			| Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["list"]>[0]
+			| ManagedLifecycleCall<Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["list"]>[0]>,
+		request?: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["list"]>[0],
 	): ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["list"]> {
-		return this.#lifecycle.list(request);
+		return this.#invokeLifecycle(tenantOrRequest, request, value => this.#lifecycle.list(value));
 	}
 
 	frameDiagnostics(): ManagedSdkFrameDiagnostics {
-		return { ...this.#diagnostics };
+		return { ...this.#diagnostics, listenerError: this.#listenerErrorCount };
 	}
 
 	registerTenant(key: TenantSessionKey): void {
 		assertTenantKey(key);
-		this.#registrations.set(tenantIdentity(key), key);
+		const ownedKey = generationIdentity(key);
+		const registered = this.#registrations.get(ownedKey);
+		if (registered !== undefined && !sameTenantKey(registered, key))
+			throw new Error("Session generation is already owned by another managed tenant.");
+		this.#registrations.set(ownedKey, copyTenantKey(key));
 	}
 
 	/** Reconciles a credential-free lifecycle identity before exposing its exact tenant authority. */
@@ -223,7 +277,10 @@ export class ManagedSdkRuntime {
 	}
 
 	unregisterTenant(key: TenantSessionKey): void {
-		this.#registrations.delete(tenantIdentity(key));
+		assertTenantKey(key);
+		const ownedKey = generationIdentity(key);
+		const registered = this.#registrations.get(ownedKey);
+		if (registered !== undefined && sameTenantKey(registered, key)) this.#registrations.delete(ownedKey);
 	}
 
 	start(): Promise<void> {
@@ -303,8 +360,7 @@ export class ManagedSdkRuntime {
 	): Promise<Record<string, unknown>> {
 		const key = managed.tenant;
 		await this.#assertAuthorized(key, false);
-		if (managed.generation !== key.generation || !sameTenantKey(managed.tenant, key))
-			throw new Error("Exact tenant generation is required.");
+		this.#assertManagedAttachment(managed);
 		const current = this.#router.attachment(key.sessionId, key.generation);
 		if (!current || current !== managed.attachment || !current.isCurrent())
 			throw new Error("Current Router attachment is required.");
@@ -325,8 +381,8 @@ export class ManagedSdkRuntime {
 		if (this.#state !== "running") throw new Error("Managed SDK runtime is not running.");
 		if (!nonEmpty(operation) || !hasCorrelation(correlation))
 			throw new TypeError("Operation and correlation are required.");
-		if (!this.#isRegistered(managed.tenant) || !managed.attachment.isCurrent())
-			throw new Error("Registered current tenant attachment is required.");
+		this.#assertManagedAttachment(managed);
+		if (!managed.attachment.isCurrent()) throw new Error("Registered current tenant attachment is required.");
 		const current = this.#router.attachment(managed.tenant.sessionId, managed.generation);
 		if (current !== managed.attachment) throw new Error("Current Router attachment is required.");
 		if (this.#subscriptions.size >= this.#maxSubscriptions) {
@@ -342,11 +398,16 @@ export class ManagedSdkRuntime {
 			queued: 0,
 			buffered: [],
 			tail: Promise.resolve(),
+			deliveryFailed: false,
+			deliveryError: undefined,
 			active: true,
 		};
 		this.#subscriptions.set(subscription.id, subscription);
 		const unsubscribe = (() => this.#cleanupSubscription(subscription)) as ManagedSdkFrameSubscription;
-		unsubscribe.drain = async () => await subscription.tail;
+		unsubscribe.drain = async () => {
+			await subscription.tail;
+			if (subscription.deliveryFailed) throw subscription.deliveryError;
+		};
 		return unsubscribe;
 	}
 
@@ -361,8 +422,8 @@ export class ManagedSdkRuntime {
 	): ManagedSdkPendingFrameSubscription {
 		if (this.#state !== "running") throw new Error("Managed SDK runtime is not running.");
 		if (!nonEmpty(operation)) throw new TypeError("Operation is required.");
-		if (!this.#isRegistered(managed.tenant) || !managed.attachment.isCurrent())
-			throw new Error("Registered current tenant attachment is required.");
+		this.#assertManagedAttachment(managed);
+		if (!managed.attachment.isCurrent()) throw new Error("Registered current tenant attachment is required.");
 		const current = this.#router.attachment(managed.tenant.sessionId, managed.generation);
 		if (current !== managed.attachment) throw new Error("Current Router attachment is required.");
 		if (this.#subscriptions.size >= this.#maxSubscriptions) {
@@ -378,11 +439,16 @@ export class ManagedSdkRuntime {
 			queued: 0,
 			buffered: [],
 			tail: Promise.resolve(),
+			deliveryFailed: false,
+			deliveryError: undefined,
 			active: true,
 		};
 		this.#subscriptions.set(subscription.id, subscription);
 		const unsubscribe = (() => this.#cleanupSubscription(subscription)) as ManagedSdkPendingFrameSubscription;
-		unsubscribe.drain = async () => await subscription.tail;
+		unsubscribe.drain = async () => {
+			await subscription.tail;
+			if (subscription.deliveryFailed) throw subscription.deliveryError;
+		};
 		unsubscribe.bind = correlation => {
 			if (!subscription.active) throw new Error("Managed SDK frame subscription is closed.");
 			if (!hasCorrelation(correlation)) throw new TypeError("Acknowledged frame correlation is required.");
@@ -397,20 +463,55 @@ export class ManagedSdkRuntime {
 		return unsubscribe;
 	}
 
+	async #invokeLifecycle<TRequest, TResult>(
+		tenantOrRequest: TenantSessionKey | TRequest | ManagedLifecycleCall<TRequest>,
+		request: TRequest | undefined,
+		invoke: (request: TRequest) => Promise<TResult>,
+	): Promise<TResult> {
+		const call = lifecycleCall(tenantOrRequest, request);
+		if (call === undefined)
+			throw new Error("Complete managed tenant authority is required for lifecycle operations.");
+		await this.#assertAuthorized(call.tenant, false);
+		assertLifecycleRequestAuthority(call.tenant, call.request);
+		return await invoke(call.request);
+	}
+
+	async #invokePreparedCreate(
+		authority: ManagedPreparedTurnAuthority,
+		request: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["createExternal"]>[0],
+	): Promise<Awaited<ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["createExternal"]>>> {
+		assertPreparedAuthority(authority);
+		if (this.#state !== "running") throw new Error("Managed SDK runtime is not running.");
+		if (request.actor.id !== authority.principalId)
+			throw new Error("Lifecycle actor does not match prepared managed authority.");
+		if (request.target.kind !== "existing_path" || request.target.path !== authority.canonicalWorkspace)
+			throw new Error("Lifecycle create target does not match prepared managed authority.");
+		return await this.#lifecycle.createExternal(request);
+	}
+
 	async #assertAuthorized(key: TenantSessionKey, bootstrap: boolean): Promise<void> {
 		assertTenantKey(key);
 		if (this.#state !== "running" && !bootstrap) throw new Error("Managed SDK runtime is not running.");
 		if (!this.#isRegistered(key)) throw new Error("Tenant is not registered for this session authority.");
 		if (!(await this.#tenantFence(key))) throw new Error("Tenant authority fence was lost.");
+		if (!this.#isRegistered(key)) throw new Error("Tenant registration changed during authorization.");
+	}
+
+	#assertManagedAttachment(managed: ManagedSdkAttachment): void {
+		assertTenantKey(managed.tenant);
+		if (managed.generation !== managed.tenant.generation) throw new Error("Exact tenant generation is required.");
+		if (!this.#isRegistered(managed.tenant)) throw new Error("Registered current tenant attachment is required.");
 	}
 
 	#isRegistered(key: TenantSessionKey): boolean {
-		const registered = this.#registrations.get(tenantIdentity(key));
+		const registered = this.#registrations.get(generationIdentity(key));
 		return registered !== undefined && sameTenantKey(registered, key);
 	}
 
 	async #onFrame(attachment: router.SessionAttachment, frame: router.SessionRouterFrame): Promise<void> {
 		if (frame.sessionId === undefined || frame.generation === undefined) return this.#classify("foreign");
+		if (!this.#registrations.has(generationIdentityOf(frame.sessionId, frame.generation)))
+			return this.#classify("foreign");
 		const current = this.#router.attachment(frame.sessionId, frame.generation);
 		if (!current || current !== attachment || !attachment.isCurrent()) return this.#classify("foreign");
 		const matching = [...this.#subscriptions.values()].filter(
@@ -428,7 +529,9 @@ export class ManagedSdkRuntime {
 			await Promise.all(
 				matching.map(async subscription =>
 					this.#isRegistered(subscription.tenant) && (await this.#tenantFence(subscription.tenant))
-						? subscription
+						? this.#isRegistered(subscription.tenant)
+							? subscription
+							: undefined
 						: undefined,
 				),
 			)
@@ -455,21 +558,30 @@ export class ManagedSdkRuntime {
 			return;
 		}
 		subscription.queued += 1;
-		subscription.tail = subscription.tail
-			.then(async () => {
-				try {
-					if (subscription.active && subscription.correlation !== undefined)
-						await subscription.listener({
-							tenant: subscription.tenant,
-							operation: subscription.operation,
-							correlation: subscription.correlation,
-							frame,
-						});
-				} finally {
-					subscription.queued -= 1;
-				}
-			})
-			.catch(() => undefined);
+		const deliver = async () => {
+			try {
+				if (subscription.active && subscription.correlation !== undefined)
+					await subscription.listener({
+						tenant: subscription.tenant,
+						operation: subscription.operation,
+						correlation: subscription.correlation,
+						frame,
+					});
+			} catch (error) {
+				subscription.deliveryFailed = true;
+				if (subscription.deliveryError === undefined) subscription.deliveryError = error;
+				this.#listenerErrorCount += 1;
+			} finally {
+				subscription.queued -= 1;
+			}
+		};
+		subscription.tail = subscription.tail.then(deliver, async previousError => {
+			if (!subscription.deliveryFailed) {
+				subscription.deliveryFailed = true;
+				subscription.deliveryError = previousError;
+			}
+			await deliver();
+		});
 	}
 
 	#cleanupSubscription(subscription: FrameSubscription): void {
@@ -518,6 +630,58 @@ function assertTenantKey(key: TenantSessionKey): void {
 		);
 }
 
+function assertPreparedAuthority(authority: ManagedPreparedTurnAuthority): void {
+	if (
+		!nonEmpty(authority.principalId) ||
+		!nonEmpty(authority.projectId) ||
+		!nonEmpty(authority.canonicalWorkspace) ||
+		!nonEmpty(authority.chatId) ||
+		!nonEmpty(authority.leaseId) ||
+		!nonEmpty(authority.epoch) ||
+		!nonEmpty(authority.requestKey)
+	)
+		throw new TypeError("Complete prepared managed authority is required for session creation.");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isTenantKey(value: unknown): value is TenantSessionKey {
+	try {
+		assertTenantKey(value as TenantSessionKey);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function lifecycleCall<TRequest>(
+	tenantOrRequest: TenantSessionKey | TRequest | ManagedLifecycleCall<TRequest>,
+	request: TRequest | undefined,
+): ManagedLifecycleCall<TRequest> | undefined {
+	if (request !== undefined) return isTenantKey(tenantOrRequest) ? { tenant: tenantOrRequest, request } : undefined;
+	if (!isRecord(tenantOrRequest) || !isTenantKey(tenantOrRequest.tenant)) return undefined;
+	const tenant = tenantOrRequest.tenant;
+	if ("request" in tenantOrRequest) return { tenant, request: tenantOrRequest.request as TRequest };
+	const { tenant: _ignored, ...flatRequest } = tenantOrRequest;
+	return { tenant, request: flatRequest as TRequest };
+}
+
+function assertLifecycleRequestAuthority(tenant: TenantSessionKey, request: unknown): void {
+	if (!isRecord(request)) throw new TypeError("Lifecycle request is required.");
+	const actor = request.actor;
+	if (isRecord(actor) && actor.id !== tenant.principalId)
+		throw new Error("Lifecycle actor does not match managed tenant authority.");
+	const target = request.target;
+	if (!isRecord(target)) return;
+	const targetSessionId = target.sessionId ?? target.sourceSessionId;
+	if (targetSessionId !== undefined && targetSessionId !== tenant.sessionId)
+		throw new Error("Lifecycle target does not match managed tenant authority.");
+	if (target.endpointGeneration !== undefined && target.endpointGeneration !== tenant.generation)
+		throw new Error("Lifecycle target generation does not match managed tenant authority.");
+}
+
 function tenantIdentity(key: TenantSessionKey): string {
 	return [
 		key.principalId,
@@ -529,6 +693,14 @@ function tenantIdentity(key: TenantSessionKey): string {
 		key.leaseId,
 		key.epoch,
 	].join("\u0000");
+}
+
+function generationIdentity(key: TenantSessionKey): string {
+	return generationIdentityOf(key.sessionId, key.generation);
+}
+
+function generationIdentityOf(sessionId: string, generation: number): string {
+	return `${sessionId}\u0000${generation}`;
 }
 
 function copyTenantKey(key: TenantSessionKey): TenantSessionKey {

@@ -725,7 +725,7 @@ function toTombstone(record: SessionAuthorityRecord, retiredAt: string): Session
 		...(source.attachment === undefined
 			? {}
 			: { attachment: { ...source.attachment, descriptorStat: { ...source.attachment.descriptorStat } } }),
-		journal: source.journal.map(copyOperation),
+		journal: source.journal.map(operation => copyOperation(operation)),
 		...(record.reassignment?.priorTombstone === undefined
 			? {}
 			: { prior: copyTombstone(record.reassignment.priorTombstone) }),
