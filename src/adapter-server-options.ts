@@ -133,10 +133,8 @@ export async function buildAdapterServerOptionsFromEnv(
 	dependencies: BuildAdapterServerOptionsDependencies = {},
 ): Promise<AdapterServerOptions> {
 	const config = loadAdapterConfig(env);
-	if (config.mode !== "managed" && config.mode !== "existing")
-		throw new Error("GJC_OPENWEBUI_MODE must be exactly managed or existing");
 	return buildResolvedAdapterServerOptions(config, dependencies, {
-		sessionAuthorityMigrationSourcePaths: resolveLegacySessionAuthoritySourcePaths(env, config.mode),
+		sessionAuthorityMigrationSourcePaths: resolveLegacySessionAuthoritySourcePaths(env),
 	});
 }
 

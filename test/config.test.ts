@@ -29,7 +29,7 @@ describe("adapter config contracts", () => {
 	});
 
 	test("loads safe defaults without requiring an API token", () => {
-		const config = loadAdapterConfig({ GJC_OPENWEBUI_MODE: "existing" });
+		const config = loadAdapterConfig({});
 		expect(config.bindHost).toBe("127.0.0.1");
 		expect(config.bindPort).toBe(8765);
 		expect(config.adapterApiToken).toBeUndefined();
@@ -43,17 +43,8 @@ describe("adapter config contracts", () => {
 		expect(config.projects).toEqual([]);
 	});
 
-	test("requires an exact deployment mode", () => {
-		for (const mode of [undefined, "", " ", "Existing", "unknown"])
-			expect(() => loadAdapterConfig({ GJC_OPENWEBUI_MODE: mode })).toThrow(
-				"GJC_OPENWEBUI_MODE must be exactly managed or existing",
-			);
-		expect(loadAdapterConfig({ GJC_OPENWEBUI_MODE: "managed" }).mode).toBe("managed");
-		expect(loadAdapterConfig({ GJC_OPENWEBUI_MODE: "existing" }).mode).toBe("existing");
-	});
-
 	test("retains resolved runtime fields as frozen enumerable configuration", () => {
-		const config = loadAdapterConfig({ GJC_OPENWEBUI_MODE: "existing" });
+		const config = loadAdapterConfig({});
 		const spread = { ...config };
 		const json = JSON.parse(JSON.stringify(config)) as Record<string, unknown>;
 
@@ -81,7 +72,6 @@ describe("adapter config contracts", () => {
 
 	test("parses configured env values and colon-separated roots", () => {
 		const config = loadAdapterConfig({
-			GJC_OPENWEBUI_MODE: "existing",
 			GJC_OPENWEBUI_BIND_HOST: "0.0.0.0",
 			GJC_OPENWEBUI_BIND_PORT: "4321",
 			GJC_OPENWEBUI_ADAPTER_API_TOKEN: "adapter-token",
@@ -99,7 +89,6 @@ describe("adapter config contracts", () => {
 			GJC_OPENWEBUI_PROJECTS: "/repo/a|Project A|folder-a|/sessions/a;/repo/b|Project B",
 		});
 		expect(config).toEqual({
-			mode: "existing",
 			bindHost: "0.0.0.0",
 			bindPort: 4321,
 			adapterApiToken: "adapter-token",
@@ -125,15 +114,12 @@ describe("adapter config contracts", () => {
 	});
 
 	test("rejects malformed configured project entries", () => {
-		expect(() => loadAdapterConfig({ GJC_OPENWEBUI_MODE: "existing", GJC_OPENWEBUI_PROJECTS: "|" })).toThrow(
+		expect(() => loadAdapterConfig({ GJC_OPENWEBUI_PROJECTS: "|" })).toThrow(
 			"GJC_OPENWEBUI_PROJECTS entry 1 must include a non-empty cwd",
 		);
-		expect(() =>
-			loadAdapterConfig({
-				GJC_OPENWEBUI_MODE: "existing",
-				GJC_OPENWEBUI_PROJECTS: "/repo|Name|folder|session|extra",
-			}),
-		).toThrow("GJC_OPENWEBUI_PROJECTS entry 1 has too many fields");
+		expect(() => loadAdapterConfig({ GJC_OPENWEBUI_PROJECTS: "/repo|Name|folder|session|extra" })).toThrow(
+			"GJC_OPENWEBUI_PROJECTS entry 1 has too many fields",
+		);
 	});
 
 	test("rejects invalid ports", () => {
@@ -143,16 +129,16 @@ describe("adapter config contracts", () => {
 	});
 
 	test("rejects invalid GJC turn timeouts", () => {
-		expect(() => loadAdapterConfig({ GJC_OPENWEBUI_MODE: "existing", GJC_OPENWEBUI_TURN_TIMEOUT_MS: "0" })).toThrow(
+		expect(() => loadAdapterConfig({ GJC_OPENWEBUI_TURN_TIMEOUT_MS: "0" })).toThrow(
 			"GJC_OPENWEBUI_TURN_TIMEOUT_MS must be a positive integer",
 		);
-		expect(() =>
-			loadAdapterConfig({ GJC_OPENWEBUI_MODE: "existing", GJC_OPENWEBUI_TURN_TIMEOUT_MS: "12.5" }),
-		).toThrow("GJC_OPENWEBUI_TURN_TIMEOUT_MS must be a positive integer");
+		expect(() => loadAdapterConfig({ GJC_OPENWEBUI_TURN_TIMEOUT_MS: "12.5" })).toThrow(
+			"GJC_OPENWEBUI_TURN_TIMEOUT_MS must be a positive integer",
+		);
 	});
 
 	test("builds startup diagnostics without throwing for missing auth", () => {
-		const diagnostic = buildStartupDiagnostics(loadAdapterConfig({ GJC_OPENWEBUI_MODE: "existing" }));
+		const diagnostic = buildStartupDiagnostics(loadAdapterConfig({}));
 		expect(diagnostic.status).toBe("degraded");
 		expect(diagnostic.missingAuth).toBe(true);
 		expect(diagnostic.missingAdapterApiToken).toBe(true);
