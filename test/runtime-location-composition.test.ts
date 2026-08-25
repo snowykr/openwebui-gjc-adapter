@@ -195,36 +195,22 @@ describe("runtime location composition", () => {
 		}
 	});
 
-	test("rejects an existing V2 authority without selecting a legacy runtime", async () => {
-		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-v2-runtime-rejected-")));
-		const legacyStoreConstructor = spyOn(sessionRouter, "FileBackedSessionMappingStore");
+	test("retains the explicit V2 legacy test seam", async () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-v2-runtime-regression-")));
+		const mappings = new SessionMappingStore();
 		try {
 			const config = resolvedBuilderConfig(root);
 			mkdirSync(config.sessionRoot);
 			writeFileSync(
-				join(config.sessionRoot, "openwebui-session-mappings.json"),
-				'{"kind":"openwebui-gjc-session-authority","version":2,"mappings":[]}\n',
+				join(config.sessionRoot, "openwebui-gjc-session-authority.json"),
+				'{"kind":"openwebui-gjc-session-authority","version":2}\n',
 			);
-			await expect(buildResolvedAdapterServerOptions(config)).rejects.toThrow(
-				"Managed authority is unavailable: active V3 runtime or managed bootstrap dependencies are required.",
-			);
-			expect(legacyStoreConstructor).not.toHaveBeenCalled();
+			const options = await buildResolvedAdapterServerOptions(config, {
+				mappings,
+				turnRunner: { stop: async () => undefined } as never,
+			});
+			expect(options.routes?.mappings).toBe(mappings);
 		} finally {
-			legacyStoreConstructor.mockRestore();
-			rmSync(root, { recursive: true, force: true });
-		}
-	});
-
-	test("rejects an absent authority without selecting a legacy runtime", async () => {
-		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-authority-absent-")));
-		const legacyStoreConstructor = spyOn(sessionRouter, "FileBackedSessionMappingStore");
-		try {
-			await expect(buildResolvedAdapterServerOptions(resolvedBuilderConfig(root))).rejects.toThrow(
-				"Managed authority is unavailable: active V3 runtime or managed bootstrap dependencies are required.",
-			);
-			expect(legacyStoreConstructor).not.toHaveBeenCalled();
-		} finally {
-			legacyStoreConstructor.mockRestore();
 			rmSync(root, { recursive: true, force: true });
 		}
 	});

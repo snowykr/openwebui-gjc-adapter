@@ -39,8 +39,14 @@ import {
 } from "./live/gjc-managed-idle-reaper";
 import { createManagedModelReaderFactory } from "./live/gjc-managed-model-reader";
 import type { ManagedSdkRuntimeDependency, ManagedSdkTenantFence } from "./live/gjc-routing-lifecycle";
-import { createGjcRoutingLiveGatewayRunner, type GjcSessionTurnRunner } from "./live/gjc-routing-runner";
 import {
+	createGjcRoutingLiveGatewayRunner,
+	createPublicSdkGjcTurnRunner,
+	createPublicSdkModelAttachmentResolver,
+	type GjcSessionTurnRunner,
+} from "./live/gjc-routing-runner";
+import {
+	createModelReaderFactory,
 	type ModelReaderFactory,
 	type PublicSdkAttachmentResolver,
 	type PublicSdkSessionPortFactory,
@@ -229,10 +235,6 @@ export async function buildResolvedAdapterServerOptions(
 		const authorityEpoch = probeSessionAuthorityEpoch(mappingStorePath);
 		if (authorityEpoch.status === "blocked" || (authorityEpoch.status === "v3" && activeV3Marker === undefined))
 			throw new Error("Canonical session authority activation is blocked.");
-		if (authorityEpoch.status !== "v3" && !mayActivateManagedV3 && !explicitLegacyTestSeam)
-			throw new Error(
-				"Managed authority is unavailable: active V3 runtime or managed bootstrap dependencies are required.",
-			);
 		const previouslyLinkedProjectIdsBeforeConfiguredSeed = new Set(
 			projectStore.listLinkedProjects().map(project => project.id),
 		);
@@ -415,24 +417,34 @@ export async function buildResolvedAdapterServerOptions(
 				: new FileBackedOutboxStore(path.join(config.statePath, PROJECTION_OUTBOX_STORE_FILE)));
 		const cliPath = resolveGjcCliPath(config.gjcCommand);
 		const turnRunner =
-			activeManagedV3Runtime?.runner ?? managedBootstrapDependencies?.runner ?? dependencies.turnRunner;
+			activeManagedV3Runtime?.runner ??
+			managedBootstrapDependencies?.runner ??
+			dependencies.turnRunner ??
+			createPublicSdkGjcTurnRunner({
+				cliPath,
+				runtimeLocations: config.runtimeLocations,
+				turnTimeoutMs: config.turnTimeoutMs,
+				...(managedSdkRuntime === undefined ? {} : { managedSdkRuntime }),
+				...(managedSdkTenantFence === undefined ? {} : { managedSdkTenantFence }),
+				sessionPortFactory: dependencies.sessionPortFactory,
+			});
 		const managedModelRuntime = activeManagedV3Runtime?.runtime ?? managedBootstrapDependencies?.runtime;
 		const modelReaderFactory =
 			managedModelRuntime === undefined
-				? dependencies.modelReaderFactory
+				? (dependencies.modelReaderFactory ??
+					createModelReaderFactory({
+						cliPath,
+						runtimeLocations: config.runtimeLocations,
+						resolveAttachment:
+							dependencies.resolveModelAttachment ??
+							createPublicSdkModelAttachmentResolver({
+								cliPath,
+								cwd: config.runtimeLocations.readerWorkspace,
+								childEnvironment: config.runtimeLocations.childEnvironment,
+							}),
+						sessionPortFactory: dependencies.sessionPortFactory,
+					}))
 				: createManagedReaderFactory(managedModelRuntime, config.turnTimeoutMs);
-		if (turnRunner === undefined)
-			throw new Error(
-				"Managed authority is unavailable: active V3 runtime or managed bootstrap dependencies are required.",
-			);
-		if (
-			activeManagedV3Runtime === undefined &&
-			managedBootstrapDependencies === undefined &&
-			dependencies.turnRunner === undefined
-		)
-			throw new Error(
-				"Managed authority is unavailable: active V3 runtime or managed bootstrap dependencies are required.",
-			);
 		const closeSession = createAdapterSessionCloser(
 			config,
 			cliPath,
