@@ -6,7 +6,6 @@ import { closeTmux, exitAndObservePostCloseFailure } from "../scripts/gjc-releas
 
 const ROOT = join(import.meta.dir, "..");
 const GJC_VERSION = "0.15.0";
-const BRIDGE_CLIENT_VERSION = "0.13.3";
 const CODING_AGENT_DEV_COMMIT = "e3b3a76a590081ded16214a1188857524d40e701";
 const CODING_AGENT_ARTIFACT_NAME = `gajae-code-coding-agent-${CODING_AGENT_DEV_COMMIT}-8ba25005.tgz`;
 const CODING_AGENT_ARTIFACT_PATH = `vendor/${CODING_AGENT_ARTIFACT_NAME}`;
@@ -38,7 +37,6 @@ describe("GJC SDK runtime provenance", () => {
 		for (const packageName of ["@gajae-code/ai", "@gajae-code/natives"])
 			expect(Reflect.get(dependencies, packageName)).toBe(GJC_VERSION);
 		expect(Reflect.get(dependencies, "@gajae-code/coding-agent")).toBe(CODING_AGENT_ARTIFACT_URL);
-		expect(Reflect.get(dependencies, "@gajae-code/bridge-client")).toBe(BRIDGE_CLIENT_VERSION);
 		const artifact = Bun.file(join(ROOT, CODING_AGENT_ARTIFACT_PATH));
 		expect(await artifact.exists()).toBe(true);
 		expect(CODING_AGENT_ARTIFACT_NAME).toBe(
@@ -78,7 +76,7 @@ describe("GJC SDK runtime provenance", () => {
 		expect(dockerfile).not.toContain("GJC_UPSTREAM_COMMIT");
 	});
 
-	test("documents bridge-client as legacy-only removal work and keeps the public managed SDK gated", async () => {
+	test("documents exact coding-agent provenance and the public managed SDK cutover target", async () => {
 		const readme = await Bun.file(join(ROOT, "README.md")).text();
 		const changelog = await Bun.file(join(ROOT, "CHANGELOG.md")).text();
 
@@ -88,9 +86,6 @@ describe("GJC SDK runtime provenance", () => {
 			expect(document).toContain(CODING_AGENT_ARTIFACT_SHA256);
 			expect(document).toContain("not the registry 0.15.0 tarball");
 			expect(document).toContain("Production");
-			expect(document).toContain("legacy path");
-			expect(document).toContain("removal-only during atomic Slice 3");
-			expect(document).toContain("not a final-architecture target or fallback");
 			expect(document).toContain("public managed SDK");
 			expect(document).toContain("atomic cutover");
 		}
@@ -203,11 +198,6 @@ describe("GJC SDK runtime provenance", () => {
 		expect(runner).not.toContain("promptInteractive");
 		expect(runner).not.toContain("--op");
 
-		expect(sdk).toContain('from "@gajae-code/bridge-client"');
-		expect(sdk).not.toContain('from "@gajae-code/coding-agent/sdk"');
-		expect(sdk).toContain("client.control(operation, input");
-		expect(sdk).toContain("snapshotPublicEndpoints(workspace)");
-		expect(sdk).toContain("endpointFingerprint(previous) !== endpointFingerprint(endpoint)");
 		expect(sdk).toContain("session.metadata");
 		expect(sdk).toContain("targetSessionId: requestedSessionId");
 

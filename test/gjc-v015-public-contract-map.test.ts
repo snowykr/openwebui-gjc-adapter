@@ -234,7 +234,13 @@ describe("GJC upstream dev generation-status contract map", () => {
 		);
 	});
 
-	test("retains exclusions and the approved old-to-new disposition", () => {
+	test("requires final-cutover exclusions and the approved old-to-new disposition", () => {
+		const packageJson = JSON.parse(readFileSync(packagePath, "utf8")) as {
+			exports?: Record<string, unknown>;
+		};
+		const publicEntrypoint = readFileSync(fileURLToPath(new URL("../src/index.ts", import.meta.url)), "utf8");
+		expect(publicEntrypoint).not.toContain('export * from "./gjc/public-sdk-contract"');
+		expect(packageJson.exports?.["./gjc/public-sdk-contract"]).toBeUndefined();
 		expect(fixture.forbiddenImports).toEqual([
 			"@gajae-code/bridge-client",
 			"@gajae-code/coding-agent/sdk/client",

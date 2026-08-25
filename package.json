@@ -80,10 +80,6 @@
 			"types": "./src/security/*.ts",
 			"import": "./src/security/*.ts"
 		},
-		"./gjc/public-sdk-contract": {
-			"types": "./src/gjc/public-sdk-contract.ts",
-			"import": "./src/gjc/public-sdk-contract.ts"
-		},
 		"./live/chat-completions": {
 			"types": "./src/live/chat-completions.ts",
 			"import": "./src/live/chat-completions.ts"

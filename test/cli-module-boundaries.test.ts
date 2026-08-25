@@ -301,6 +301,15 @@ describe("CLI module boundaries", () => {
 		// Then: the facade remains reviewable without compressed lines.
 		expect(cliLines).toBeLessThanOrEqual(250);
 	});
+	test("does not publish the retired public SDK contract facade", () => {
+		const manifest = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")) as {
+			exports: Record<string, unknown>;
+		};
+		const publicEntrypoint = readFileSync(join(ROOT, "src", "index.ts"), "utf8");
+
+		expect(publicEntrypoint).not.toContain('export * from "./gjc/public-sdk-contract"');
+		expect(manifest.exports["./gjc/public-sdk-contract"]).toBeUndefined();
+	});
 	test("pins explicit live package exports and blocks internal live modules", () => {
 		const manifest = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")) as {
 			exports: Record<string, unknown>;

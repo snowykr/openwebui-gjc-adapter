@@ -6,7 +6,6 @@ export * from "./configure/grammar";
 export * from "./configure/private-config";
 export type { OpenWebUIHeaderName } from "./contracts";
 export * from "./contracts";
-export * from "./gjc/public-sdk-contract";
 export * from "./gjc/session-loader";
 export * from "./gjc/session-router";
 export * from "./health";
