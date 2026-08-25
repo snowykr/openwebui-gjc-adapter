@@ -173,8 +173,20 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 			const control = input.control;
 			if (control === undefined) throw new Error("OpenWebUI control request was not supplied.");
 			const authority = managedControlAuthority(input, mapping);
-			if (control.operation === "branch")
-				throw new Error("Managed branch controls must use the public successor flow.");
+			if (control.operation === "branch") {
+				const { sessionId: _sessionId, generation: _generation, ...target } = authority;
+				const successor = await forkManagedSuccessor.fork({
+					source: authority,
+					target,
+					signal: input.signal,
+					publish: () => undefined,
+				});
+				throwIfAborted(input.signal);
+				return {
+					sessionId: successor.managedAuthority.sessionId,
+					result: withManagedProof(emptyControlResult(), successor.managedAuthority),
+				};
+			}
 			if (control.operation === "session.new" || control.operation === "session.resume") {
 				const lifecycleResult =
 					control.operation === "session.new"

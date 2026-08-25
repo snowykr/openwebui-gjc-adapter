@@ -21,7 +21,7 @@ const modelSelection: NormalizedModelSelection = {
 	thinkingLevel: "high",
 };
 
-describe("unwired managed turn runner", () => {
+describe("managed turn runner", () => {
 	test("creates through external lifecycle adoption and streams ordered public Router frames before request settlement", async () => {
 		const fake = new RunnerRuntime();
 		const runner = createManagedGjcTurnRunner(fake.runtime);
@@ -193,6 +193,90 @@ describe("unwired managed turn runner", () => {
 			"retirement",
 		);
 	});
+
+	test("routes managed branch through public lifecycle and returns exact successor authority", async () => {
+		const fake = new RunnerRuntime();
+		fake.forkResult = { sessionId: "successor-session", endpointGeneration: 8 };
+		const runner = createManagedGjcTurnRunner(fake.runtime);
+		const result = await runner.runControl!(
+			{
+				project: { cwd: authority.canonicalWorkspace } as never,
+				prompt: "branch prompt",
+				chatId: authority.chatId,
+				messageId: "message-branch",
+				userMessageId: "message-branch",
+				userMessageParentId: null,
+				continued: true,
+				ownerUserId: authority.principalId,
+				control: { operation: "branch" },
+			} as never,
+			{
+				principalId: authority.principalId,
+				chatId: authority.chatId,
+				projectId: authority.projectId,
+				sessionId: authority.sessionId,
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "operation-branch",
+				managedAuthority: authority,
+			},
+			{} as never,
+		);
+		expect(result?.sessionId).toBe("successor-session");
+		expect(result?.result?.managedAuthority).toMatchObject({
+			...authority,
+			sessionId: "successor-session",
+			generation: 8,
+		});
+		expect(result?.result?.managedProof).toEqual({
+			kind: "managed-generation",
+			sessionId: "successor-session",
+			generation: 8,
+			leaseId: authority.leaseId,
+			epoch: authority.epoch,
+		});
+		expect(result?.result).not.toHaveProperty("attachment");
+		expect(JSON.stringify(result)).not.toMatch(/descriptor|sessionFile|tmux|token|credential/i);
+		expect(fake.requests).toHaveLength(0);
+		expect(fake.forkRequests).toHaveLength(1);
+		expect(fake.forkRequests[0]).toMatchObject({
+			capability: "session.fork",
+			requestKey: authority.requestKey,
+			target: { sourceSessionId: authority.sessionId },
+		});
+	});
+
+	test("rejects a lifecycle fork that returns the source identity without closing the source", async () => {
+		const fake = new RunnerRuntime();
+		const runner = createManagedGjcTurnRunner(fake.runtime);
+		await expect(
+			runner.runControl!(
+				{
+					project: { cwd: authority.canonicalWorkspace } as never,
+					prompt: "branch prompt",
+					chatId: authority.chatId,
+					messageId: "message-branch-source",
+					userMessageId: "message-branch-source",
+					userMessageParentId: null,
+					continued: true,
+					ownerUserId: authority.principalId,
+					control: { operation: "branch" },
+				} as never,
+				{
+					principalId: authority.principalId,
+					chatId: authority.chatId,
+					projectId: authority.projectId,
+					sessionId: authority.sessionId,
+					rawFrameCursor: 0,
+					eventCursor: 0,
+					operationId: "operation-branch-source",
+					managedAuthority: authority,
+				},
+				{} as never,
+			),
+		).rejects.toBeInstanceOf(Error);
+		expect(fake.closeCalls).toBe(0);
+	});
 });
 
 function withoutIdentity(): ManagedPreparedTurnAuthority {
@@ -219,6 +303,7 @@ class RunnerRuntime {
 		listener: (frame: unknown) => Promise<void>;
 	}[] = [];
 	readonly externalLifecycle: Record<string, unknown>[] = [];
+	readonly forkRequests: Record<string, unknown>[] = [];
 	readonly registered: unknown[] = [];
 	readonly subscriptionCountAtRequest: number[] = [];
 	status: "retired" | "current" | "replaced" = "current";
@@ -227,6 +312,10 @@ class RunnerRuntime {
 	failPrompt = false;
 	setterFailure: "model.set" | "thinking.set" | undefined;
 	modelSetResult: Readonly<Record<string, unknown>> | undefined;
+	forkResult: { readonly sessionId: string; readonly endpointGeneration: number } = {
+		sessionId: authority.sessionId,
+		endpointGeneration: authority.generation,
+	};
 	thinkingSetResult: Readonly<Record<string, unknown>> | undefined;
 	readonly lifecycleService = {
 		createExternal: (request: Record<string, unknown>) => this.createExternalLifecycleSession(request),
@@ -237,11 +326,11 @@ class RunnerRuntime {
 	}
 	async reconcile() {}
 	async acquireAttachment(key: unknown) {
-		return { tenant: key, generation: authority.generation, attachment: this.attachment };
+		return { tenant: key, generation: (key as { generation: number }).generation, attachment: this.attachment };
 	}
 	async registerLifecycleTenant(key: unknown, outcome: unknown) {
 		this.registered.push({ key, outcome });
-		return { tenant: key, generation: authority.generation, attachment: this.attachment };
+		return { tenant: key, generation: (key as { generation: number }).generation, attachment: this.attachment };
 	}
 	async createExternalLifecycleSession(request: Record<string, unknown>) {
 		this.externalLifecycle.push(request);
@@ -328,8 +417,9 @@ class RunnerRuntime {
 	async generationStatus() {
 		return { status: this.status };
 	}
-	async forkLifecycleSession() {
-		return lifecycleSuccess();
+	async forkLifecycleSession(request: Record<string, unknown>) {
+		this.forkRequests.push(request);
+		return { ok: true as const, result: this.forkResult };
 	}
 	async closeLifecycleSession() {
 		this.closeCalls += 1;

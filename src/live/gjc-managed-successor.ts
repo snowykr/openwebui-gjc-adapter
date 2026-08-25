@@ -14,12 +14,14 @@ export interface ManagedSuccessorInput {
 
 export interface ManagedSuccessorResult {
 	readonly successor: ManagedSdkAttachment;
+	/** Exact managed authority reconstructed from the source fence and lifecycle identity. */
+	readonly managedAuthority: ManagedTurnAuthority;
 	readonly operationHash: string;
 }
 
 /**
- * The unwired managed fork path. It never changes the source mapping; callers
- * retain it until `publish` receives a proven target attachment.
+ * Public lifecycle managed fork path. It never changes the source mapping;
+ * callers retain it until `publish` receives a proven target attachment.
  */
 export interface ManagedSuccessorFlow {
 	fork(input: ManagedSuccessorInput): Promise<ManagedSuccessorResult>;
@@ -45,7 +47,7 @@ export function createManagedSuccessorFlow(runtime: ManagedSdkRuntime): ManagedS
 			try {
 				// Reconciliation plus acquire re-proves source registration, currentness, and tenant fencing.
 				await runtime.reconcile();
-				await runtime.acquireAttachment(source);
+				assertExactAttachment(await runtime.acquireAttachment(source), source, "source");
 				throwIfAborted(input.signal);
 				invoked = true;
 				const outcome = unwrapOutcome(
@@ -70,9 +72,14 @@ export function createManagedSuccessorFlow(runtime: ManagedSdkRuntime): ManagedS
 				if (input.signal?.aborted) throw new GjcTurnCancelledError();
 				await runtime.registerLifecycleTenant(returnedTarget);
 				const successor = await proveTarget(runtime, returnedTarget);
+				const managedAuthority = managedSuccessorAuthority(input.source, returnedTarget);
 				throwIfAborted(input.signal);
 				await input.publish(successor);
-				return { successor, operationHash };
+				return {
+					successor,
+					managedAuthority,
+					operationHash,
+				};
 			} catch (error) {
 				if (!invoked) throw error;
 				return await cleanupOrThrow(
@@ -109,6 +116,8 @@ function assertSuccessorAuthority(
 	source: ManagedTurnAuthority,
 	target: Omit<ManagedTurnAuthority, "sessionId" | "generation">,
 ): void {
+	if ("sessionId" in target || "generation" in target)
+		throw new TypeError("Managed successor target identity is lifecycle-assigned.");
 	for (const authority of [source, target]) {
 		if (
 			!authority.principalId ||
@@ -126,17 +135,52 @@ function assertSuccessorAuthority(
 	for (const field of ["principalId", "projectId", "canonicalWorkspace", "chatId", "leaseId", "epoch"] as const) {
 		if (source[field] !== target[field]) throw new Error("Managed successor crosses a tenant authority boundary.");
 	}
+	if (source.requestKey !== target.requestKey) throw new Error("Managed successor request authority changed.");
 }
 
 async function proveTarget(runtime: ManagedSdkRuntime, target: TenantSessionKey): Promise<ManagedSdkAttachment> {
 	await runtime.reconcile();
 	const attachment = await runtime.acquireAttachment(target);
-	if (attachment.generation !== target.generation || attachment.tenant.sessionId !== target.sessionId)
-		throw new Error("Managed successor attachment is not the exact target generation.");
+	assertExactAttachment(attachment, target, "target");
 	const status = await runtime.generationStatus(target);
-	if (status.status !== "current" || !attachment.attachment.isCurrent())
-		throw new Error("Managed successor target generation is not current.");
+	if (status.status !== "current") throw new Error("Managed successor target generation is not current.");
 	return attachment;
+}
+
+function assertExactAttachment(
+	attachment: ManagedSdkAttachment,
+	target: TenantSessionKey,
+	role: "source" | "target",
+): void {
+	if (
+		attachment.generation !== target.generation ||
+		attachment.tenant.generation !== target.generation ||
+		attachment.tenant.sessionId !== target.sessionId ||
+		attachment.tenant.principalId !== target.principalId ||
+		attachment.tenant.projectId !== target.projectId ||
+		attachment.tenant.canonicalWorkspace !== target.canonicalWorkspace ||
+		attachment.tenant.chatId !== target.chatId ||
+		attachment.tenant.leaseId !== target.leaseId ||
+		attachment.tenant.epoch !== target.epoch
+	)
+		throw new Error(`Managed successor ${role} attachment is not the exact target generation.`);
+	if (!attachment.attachment.isCurrent()) throw new Error(`Managed successor ${role} attachment is not current.`);
+}
+
+function managedSuccessorAuthority(source: ManagedTurnAuthority, target: TenantSessionKey): ManagedTurnAuthority {
+	if (
+		target.principalId !== source.principalId ||
+		target.projectId !== source.projectId ||
+		target.canonicalWorkspace !== source.canonicalWorkspace ||
+		target.chatId !== source.chatId ||
+		target.leaseId !== source.leaseId ||
+		target.epoch !== source.epoch ||
+		target.sessionId === source.sessionId ||
+		!Number.isSafeInteger(target.generation) ||
+		target.generation <= 0
+	)
+		throw new Error("Managed successor crossed the source tenant authority boundary.");
+	return { ...source, sessionId: target.sessionId, generation: target.generation };
 }
 
 async function cleanupOrThrow(
@@ -146,6 +190,11 @@ async function cleanupOrThrow(
 	cause: unknown,
 	invocationUncertain: boolean,
 ): Promise<never> {
+	if (target?.sessionId === input.source.sessionId)
+		throw new ManagedSuccessorUncertainError(
+			"Managed successor returned the source session identity; source was retained.",
+			{ cause },
+		);
 	if (target === undefined)
 		throw new ManagedSuccessorUncertainError("Managed successor target is unknown; cleanup cannot be proven.", {
 			cause,
