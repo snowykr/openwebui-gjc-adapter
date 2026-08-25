@@ -22,7 +22,7 @@ export function controlFromMetadata(metadata: Record<string, unknown> | undefine
 	}
 	if (operation === "branch" || operation === "session.new") return { operation };
 	if (
-		(operation === "session.resume" || operation === "session.switch") &&
+		operation === "session.resume" &&
 		typeof control.sessionId === "string" &&
 		typeof control.sessionFile === "string"
 	) {

@@ -43,7 +43,7 @@ describe("unwired managed turn runner", () => {
 		expect(JSON.stringify(fake)).not.toMatch(/token|credential|password/i);
 	});
 
-	test("continues, answers an explicitly correlated gate, sends public terminal cancellation, and has no session switch", async () => {
+	test("continues, answers an explicitly correlated gate, and sends public terminal cancellation", async () => {
 		const fake = new RunnerRuntime();
 		const runner = createManagedGjcTurnRunner(fake.runtime);
 		await runner.continue({

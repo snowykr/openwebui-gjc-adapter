@@ -55,11 +55,7 @@ export async function runControl(
 			);
 		return runManagedControl(context, input, mapping, authority, registerOwnedAbort, onDispatch);
 	}
-	if (
-		control.operation === "session.new" ||
-		control.operation === "session.resume" ||
-		control.operation === "session.switch"
-	) {
+	if (control.operation === "session.new" || control.operation === "session.resume") {
 		return runSessionControl(
 			context,
 			input,
@@ -262,11 +258,7 @@ async function runManagedControl(
 	if (control === undefined) throw new Error("OpenWebUI control request was not supplied.");
 	const managed = context.managed(authority);
 	await managed.assertFence();
-	if (
-		control.operation === "session.new" ||
-		control.operation === "session.resume" ||
-		control.operation === "session.switch"
-	) {
+	if (control.operation === "session.new" || control.operation === "session.resume") {
 		const actor = { id: authority.principalId, namespace: authority.projectId };
 		const request = {
 			actor,
@@ -430,12 +422,7 @@ async function runSessionControl(
 	onDispatch?: () => void,
 ): Promise<GjcControlResult> {
 	const control = input.control;
-	if (
-		control === undefined ||
-		(control.operation !== "session.new" &&
-			control.operation !== "session.resume" &&
-			control.operation !== "session.switch")
-	) {
+	if (control === undefined || (control.operation !== "session.new" && control.operation !== "session.resume")) {
 		throw new Error("OpenWebUI session control request was not supplied.");
 	}
 	const sessionRoot = resolve(input.project.sessionRoot ?? `${input.project.cwd}/.gjc/sessions`);
@@ -512,18 +499,10 @@ async function runSessionControl(
 					"endpoint_stale",
 					"A persisted GJC session file is required for lifecycle target authority",
 				);
-			} else if (control.operation === "session.resume") {
-				operationDispatched = true;
-				onDispatch?.();
-				operation = port.resumeSession(
-					{ sessionId: target.sessionId, sessionPath: target.sessionFile },
-					key,
-					context.input.turnTimeoutMs,
-				);
 			} else {
 				operationDispatched = true;
 				onDispatch?.();
-				operation = port.switchSession(
+				operation = port.resumeSession(
 					{ sessionId: target.sessionId, sessionPath: target.sessionFile },
 					key,
 					context.input.turnTimeoutMs,

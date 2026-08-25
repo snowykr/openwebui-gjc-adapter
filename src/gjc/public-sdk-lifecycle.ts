@@ -199,7 +199,7 @@ function lifecycleTargetSessionId(operation: string, input: SdkRecord): string |
 	return input.sessionId;
 }
 function lifecycleControlInput(operation: string, input: SdkRecord, target: string | undefined): SdkRecord {
-	if (operation !== "session.resume" && operation !== "session.switch") return input;
+	if (operation !== "session.resume") return input;
 	if (target === undefined || typeof input.sessionPath !== "string" || input.sessionPath.length === 0)
 		throw new SdkV3ProtocolError(
 			`${operation} input`,
@@ -223,8 +223,6 @@ function lifecycleSuccessField(operation: string): string | undefined {
 			return "created";
 		case "session.resume":
 			return "resumed";
-		case "session.switch":
-			return "switched";
 		default:
 			return undefined;
 	}

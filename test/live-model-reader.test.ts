@@ -336,9 +336,6 @@ class FakePublicSessionPort implements PublicSdkSessionPort {
 		return attachment;
 	}
 
-	async switchSession() {
-		return attachment;
-	}
 	async reply(): Promise<never> {
 		return this.unexpected("reply");
 	}

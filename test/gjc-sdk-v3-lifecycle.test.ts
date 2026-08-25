@@ -287,21 +287,17 @@ describe("public SDK lifecycle contract", () => {
 		});
 		expect(order.at(-1)).toBe("after-throw");
 	});
-	test("sends the transcript path in the released resume and switch id wire field", async () => {
-		await expectLifecycleWireInput("session.resume", "resumed");
-		await expectLifecycleWireInput("session.switch", "switched");
+	test("sends the transcript path in the released resume id wire field", async () => {
+		await expectLifecycleWireInput("resumed");
 	});
 	test("fails closed when a lifecycle target endpoint generation is unchanged after acknowledgement", async () => {
-		await expectLifecycleWireInput("session.resume", "resumed", "unchanged");
-		await expectLifecycleWireInput("session.switch", "switched", "unchanged");
+		await expectLifecycleWireInput("resumed", "unchanged");
 	});
 	test("rejects missing lifecycle session identity or transcript path before issuing a control", async () => {
-		await expectMissingLifecycleTargetBlocksControl("session.resume");
-		await expectMissingLifecycleTargetBlocksControl("session.switch");
+		await expectMissingLifecycleTargetBlocksControl();
 	});
 	test("fails closed when a lifecycle successor metadata identity differs from the expected target", async () => {
-		await expectLifecycleSuccessorMismatch("session.resume", "resumed");
-		await expectLifecycleSuccessorMismatch("session.switch", "switched");
+		await expectLifecycleSuccessorMismatch();
 	});
 });
 
@@ -480,8 +476,7 @@ async function expectDescriptorReplacementAfterControl(
 	}
 }
 async function expectLifecycleWireInput(
-	operation: "session.resume" | "session.switch",
-	acknowledgement: "resumed" | "switched",
+	acknowledgement: "resumed",
 	outcome: "success" | "mismatch" | "unchanged" = "success",
 ): Promise<void> {
 	const root = mkdtempSync(join(tmpdir(), "gjc-sdk-lifecycle-wire-"));
@@ -559,7 +554,7 @@ async function expectLifecycleWireInput(
 							page: { items: [{ sessionId: sourceSessionId, cwd: root }], complete: true },
 						}),
 					);
-				} else if (frame.type === "control_request" && frame.operation === operation) {
+				} else if (frame.type === "control_request" && frame.operation === "session.resume") {
 					receivedInput = frame.input;
 					socket.send(
 						JSON.stringify({
@@ -606,10 +601,11 @@ async function expectLifecycleWireInput(
 				expectedCwd: root,
 			},
 		});
-		const mutation =
-			operation === "session.resume"
-				? client.resumeSession({ sessionId: targetSessionId, sessionPath: targetSessionPath }, undefined, 1_000)
-				: client.switchSession({ sessionId: targetSessionId, sessionPath: targetSessionPath }, undefined, 1_000);
+		const mutation = client.resumeSession(
+			{ sessionId: targetSessionId, sessionPath: targetSessionPath },
+			undefined,
+			1_000,
+		);
 		if (outcome === "mismatch") await expect(mutation).rejects.toThrow("does not match");
 		else if (outcome === "unchanged") await expect(mutation).rejects.toThrow("timed out");
 		else {
@@ -627,9 +623,7 @@ async function expectLifecycleWireInput(
 	}
 }
 
-async function expectMissingLifecycleTargetBlocksControl(
-	operation: "session.resume" | "session.switch",
-): Promise<void> {
+async function expectMissingLifecycleTargetBlocksControl(): Promise<void> {
 	const root = mkdtempSync(join(tmpdir(), "gjc-sdk-lifecycle-missing-target-"));
 	const stateDirectory = join(root, ".gjc", "state", "sdk");
 	mkdirSync(stateDirectory, { recursive: true });
@@ -670,15 +664,9 @@ async function expectMissingLifecycleTargetBlocksControl(
 				token: "token",
 			}),
 		);
-		const missingSessionId =
-			operation === "session.resume"
-				? client.resumeSession({ sessionPath: "/sessions/target.jsonl" })
-				: client.switchSession({ sessionPath: "/sessions/target.jsonl" });
+		const missingSessionId = client.resumeSession({ sessionPath: "/sessions/target.jsonl" });
 		await expect(missingSessionId).rejects.toThrow("sessionId must be a non-empty string");
-		const missingSessionPath =
-			operation === "session.resume"
-				? client.resumeSession({ sessionId: "target-session" })
-				: client.switchSession({ sessionId: "target-session" });
+		const missingSessionPath = client.resumeSession({ sessionId: "target-session" });
 		await expect(missingSessionPath).rejects.toThrow("sessionPath must be a non-empty string");
 		expect(controls).toBe(0);
 	} finally {
@@ -687,11 +675,8 @@ async function expectMissingLifecycleTargetBlocksControl(
 		rmSync(root, { recursive: true, force: true });
 	}
 }
-async function expectLifecycleSuccessorMismatch(
-	operation: "session.resume" | "session.switch",
-	acknowledgement: "resumed" | "switched",
-): Promise<void> {
-	await expectLifecycleWireInput(operation, acknowledgement, "mismatch");
+async function expectLifecycleSuccessorMismatch(): Promise<void> {
+	await expectLifecycleWireInput("resumed", "mismatch");
 }
 function digest(value: string): string {
 	return createHash("sha256").update(value).digest("hex");

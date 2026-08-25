@@ -190,9 +190,6 @@ describe("project admin routes", () => {
 				async resumeSession() {
 					return unexpectedSessionPortCall("resumeSession");
 				},
-				async switchSession() {
-					return unexpectedSessionPortCall("switchSession");
-				},
 			}),
 			fallbackCloseSession: async () => {
 				fallbackCalls += 1;
@@ -453,9 +450,6 @@ describe("project admin routes", () => {
 					async resumeSession() {
 						return unexpectedSessionPortCall("resumeSession");
 					},
-					async switchSession() {
-						return unexpectedSessionPortCall("switchSession");
-					},
 				}),
 			},
 		);
@@ -589,9 +583,6 @@ describe("project admin routes", () => {
 				},
 				async resumeSession() {
 					return unexpectedSessionPortCall("resumeSession");
-				},
-				async switchSession() {
-					return unexpectedSessionPortCall("switchSession");
 				},
 				async closeSession() {
 					closes += 1;
@@ -733,9 +724,6 @@ describe("project admin routes", () => {
 				},
 				async resumeSession() {
 					return unexpectedSessionPortCall("resumeSession");
-				},
-				async switchSession() {
-					return unexpectedSessionPortCall("switchSession");
 				},
 			}),
 			fallbackCloseSession: async () => {

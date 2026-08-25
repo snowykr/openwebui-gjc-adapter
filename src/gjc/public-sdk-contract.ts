@@ -178,10 +178,5 @@ export interface PublicSdkSessionPort {
 		idempotencyKey?: string,
 		timeoutMs?: number,
 	): Promise<PublicSdkSessionAttachment>;
-	switchSession(
-		input: Readonly<Record<string, unknown>>,
-		idempotencyKey?: string,
-		timeoutMs?: number,
-	): Promise<PublicSdkSessionAttachment>;
 	closeSession(idempotencyKey?: string, timeoutMs?: number): Promise<void>;
 }

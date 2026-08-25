@@ -250,10 +250,6 @@ export class PublicSdkSessionClient implements PublicSdkSessionPort {
 		return this.#lifecycle("session.resume", input, key, timeoutMs);
 	}
 
-	switchSession(input: SdkRecord, key?: string, timeoutMs?: number): Promise<PublicSdkSessionAttachment> {
-		return this.#lifecycle("session.switch", input, key, timeoutMs);
-	}
-
 	async closeSession(key?: string, timeoutMs?: number): Promise<void> {
 		await this.coordinated(() => closeSession(this.actionHost(), key, timeoutMs));
 	}

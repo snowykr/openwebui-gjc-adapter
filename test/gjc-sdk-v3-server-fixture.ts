@@ -340,13 +340,12 @@ function selectedFixtureThinking(
 function lifecycleControlResult(operation: string): SdkFrame {
 	if (operation === "session.new") return { created: true };
 	if (operation === "session.resume") return { resumed: true };
-	if (operation === "session.switch") return { switched: true };
 	if (operation === "session.branch") return { selectedText: "entry-q16", cancelled: false };
 	throw new TypeError(`unexpected lifecycle operation ${operation}`);
 }
 
 function lifecycleSuccessorId(operation: string, input: SdkFrame | undefined): string {
-	if (operation === "session.resume" || operation === "session.switch") {
+	if (operation === "session.resume") {
 		const path = requiredString(input ?? {}, "id");
 		return basename(path, ".jsonl");
 	}

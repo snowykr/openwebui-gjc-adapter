@@ -19,7 +19,7 @@ export type OpenWebUIControl =
 	/** Attached lifecycle operations remain on the public session controller. */
 	| { readonly operation: "session.new" }
 	| {
-			readonly operation: "session.resume" | "session.switch";
+			readonly operation: "session.resume";
 			readonly sessionId: string;
 			readonly sessionFile: string;
 	  }
