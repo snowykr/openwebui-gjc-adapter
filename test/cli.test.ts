@@ -30,6 +30,7 @@ describe("adapter CLI service", () => {
 			cwd: process.cwd(),
 			env: {
 				...process.env,
+				GJC_OPENWEBUI_MODE: "existing",
 				GJC_OPENWEBUI_BIND_HOST: "127.0.0.1",
 				GJC_OPENWEBUI_BIND_PORT: String(port),
 				GJC_OPENWEBUI_OWNER_USER_ID: "owner-test",
@@ -55,6 +56,7 @@ describe("adapter CLI service", () => {
 			cwd: process.cwd(),
 			env: {
 				...process.env,
+				GJC_OPENWEBUI_MODE: "existing",
 				GJC_OPENWEBUI_BIND_HOST: "127.0.0.1",
 				GJC_OPENWEBUI_BIND_PORT: String(await reserveTcpPort()),
 			},
@@ -81,6 +83,7 @@ describe("adapter CLI service", () => {
 		const options = await buildAdapterServerOptionsFromEnv(
 			{
 				...process.env,
+				GJC_OPENWEBUI_MODE: "existing",
 				GJC_OPENWEBUI_BIND_HOST: "127.0.0.1",
 				GJC_OPENWEBUI_BIND_PORT: "8765",
 				GJC_OPENWEBUI_ADAPTER_API_TOKEN: "adapter-token",
@@ -142,6 +145,7 @@ describe("adapter CLI service", () => {
 		const options = await buildAdapterServerOptionsFromEnv(
 			{
 				...process.env,
+				GJC_OPENWEBUI_MODE: "existing",
 				GJC_OPENWEBUI_BIND_HOST: "127.0.0.1",
 				GJC_OPENWEBUI_BIND_PORT: "8765",
 				GJC_OPENWEBUI_ADAPTER_API_TOKEN: "adapter-token",
@@ -191,6 +195,7 @@ describe("adapter CLI service", () => {
 		await buildAdapterServerOptionsFromEnv(
 			{
 				...process.env,
+				GJC_OPENWEBUI_MODE: "existing",
 				GJC_OPENWEBUI_BIND_HOST: "127.0.0.1",
 				GJC_OPENWEBUI_BIND_PORT: "8765",
 				GJC_OPENWEBUI_ADAPTER_API_TOKEN: "adapter-token",
@@ -225,6 +230,7 @@ describe("adapter CLI service", () => {
 		const options = await buildAdapterServerOptionsFromEnv(
 			{
 				...process.env,
+				GJC_OPENWEBUI_MODE: "existing",
 				GJC_OPENWEBUI_BIND_HOST: "127.0.0.1",
 				GJC_OPENWEBUI_BIND_PORT: "8765",
 				GJC_OPENWEBUI_ADAPTER_API_TOKEN: "adapter-token",
@@ -251,6 +257,7 @@ describe("adapter CLI service", () => {
 		const options = await buildAdapterServerOptionsFromEnv(
 			{
 				...process.env,
+				GJC_OPENWEBUI_MODE: "existing",
 				GJC_OPENWEBUI_BIND_HOST: "127.0.0.1",
 				GJC_OPENWEBUI_BIND_PORT: "8765",
 				GJC_OPENWEBUI_ADAPTER_API_TOKEN: "adapter-token",

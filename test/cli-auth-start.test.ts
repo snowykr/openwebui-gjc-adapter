@@ -26,6 +26,7 @@ describe("adapter CLI auth and start", () => {
 		const options = await buildAdapterServerOptionsFromEnv(
 			{
 				...process.env,
+				GJC_OPENWEBUI_MODE: "existing",
 				GJC_OPENWEBUI_BIND_HOST: "127.0.0.1",
 				GJC_OPENWEBUI_BIND_PORT: "8765",
 				GJC_OPENWEBUI_OWNER_USER_ID: "owner-test",
@@ -67,6 +68,7 @@ describe("adapter CLI auth and start", () => {
 			env: {
 				...process.env,
 				HOME: workspace,
+				GJC_OPENWEBUI_MODE: "existing",
 				GJC_OPENWEBUI_BIND_HOST: "127.0.0.1",
 				GJC_OPENWEBUI_BIND_PORT: String(port),
 				GJC_OPENWEBUI_ADAPTER_API_TOKEN: "adapter-token",

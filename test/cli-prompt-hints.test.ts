@@ -16,6 +16,7 @@ describe("adapter CLI prompt hints", () => {
 			await buildAdapterServerOptionsFromEnv(
 				{
 					...process.env,
+					GJC_OPENWEBUI_MODE: "existing",
 					GJC_OPENWEBUI_BASE_URL: fixture.baseUrl,
 					GJC_OPENWEBUI_API_TOKEN: "openwebui-token",
 					GJC_OPENWEBUI_ADAPTER_API_TOKEN: "adapter-token",
