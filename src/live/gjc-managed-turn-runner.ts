@@ -1,6 +1,9 @@
 import { resolve } from "node:path";
+import type { NormalizedModelSelection } from "../contracts";
 import type { ManagedSdkRuntime } from "../gjc/managed-sdk-runtime";
+import { SdkV3OperationError } from "../gjc/sdk-v3-protocol";
 import type { SessionAttachmentProof } from "../gjc/session-authority";
+import { normalizeModelSelection } from "../gjc/session-operation-codec";
 import type { SessionMapping } from "../gjc/session-router";
 import type {
 	GjcCancelTurnInput,
@@ -106,8 +109,12 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 				generation: lifecycle.tenant.generation,
 			};
 			try {
+				const modelSelection = await applyManagedModelSelection(operations, authority, input.modelSelection);
 				return withManagedProof(
-					await operations.prompt(turnInput({ ...input, authority }, "turn.prompt")),
+					withManagedModelSelection(
+						await operations.prompt(turnInput({ ...input, authority }, "turn.prompt")),
+						modelSelection,
+					),
 					authority,
 				);
 			} catch (error) {
@@ -117,15 +124,17 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 		},
 		resume: input => operations.resume(input),
 		continue: async input => {
+			const modelSelection = await applyManagedModelSelection(operations, input.authority, input.modelSelection);
 			const result = await operations.followUp(turnInput(input, "turn.follow_up"));
 			await operations.acquire(input.authority);
-			return withManagedProof(result, input.authority);
+			return withManagedProof(withManagedModelSelection(result, modelSelection), input.authority);
 		},
 		continueSession: async input => {
 			const authority = managedAuthorityFor(input, "turn.follow_up");
+			const modelSelection = await applyManagedModelSelection(operations, authority, input.modelSelection);
 			const result = await operations.followUp(turnInput({ ...input, authority }, "turn.follow_up"));
 			await operations.acquire(authority);
-			return withManagedProof(result, authority);
+			return withManagedProof(withManagedModelSelection(result, modelSelection), authority);
 		},
 		async control(input) {
 			if ("gateId" in input) return { result: await operations.answerGate(gateInput(input)) };
@@ -233,12 +242,16 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 			const transaction = managedLifecycleTransaction(address, authority);
 			try {
 				await beforePrompt(address, managedProof(authority), transaction);
+				const modelSelection = await applyManagedModelSelection(operations, authority, input.modelSelection);
 				const result = withManagedProof(
-					await operations.prompt(
-						turnInput(
-							{ ...input, preparedManagedAuthority: input.preparedManagedAuthority, authority },
-							"turn.prompt",
+					withManagedModelSelection(
+						await operations.prompt(
+							turnInput(
+								{ ...input, preparedManagedAuthority: input.preparedManagedAuthority, authority },
+								"turn.prompt",
+							),
 						),
+						modelSelection,
 					),
 					authority,
 				);
@@ -364,6 +377,78 @@ function gateInput(input: ManagedRunnerGateInput): ManagedGateInput {
 		idempotencyKey: input.idempotencyKey,
 	};
 }
+
+async function applyManagedModelSelection(
+	operations: ManagedSessionOperations,
+	authority: ManagedTurnAuthority,
+	selection: NormalizedModelSelection | undefined,
+): Promise<NormalizedModelSelection | undefined> {
+	if (selection === undefined) return undefined;
+	const requested = normalizeModelSelection(selection);
+	if (requested === undefined)
+		throw new SdkV3OperationError("invalid_result", "Managed model selection is not normalized.");
+
+	let modelResult: Readonly<Record<string, unknown>>;
+	try {
+		modelResult = await operations.setModel(authority, requested);
+	} catch (error) {
+		throw managedSelectionMutationError("model_set_failed", "model.set", error);
+	}
+	const modelSelection = normalizeModelSelection(modelResult);
+	if (!sameModelSelection(modelSelection, requested))
+		throw new SdkV3OperationError("invalid_result", "model.set did not confirm the requested selection.");
+
+	let thinkingResult: Readonly<Record<string, unknown>>;
+	try {
+		thinkingResult = await operations.setThinking(authority, requested.thinkingLevel);
+	} catch (error) {
+		throw managedSelectionMutationError("thinking_set_failed", "thinking.set", error);
+	}
+	const currentSelection = normalizeModelSelection(thinkingResult);
+	if (currentSelection !== undefined) {
+		if (!sameModelSelection(currentSelection, requested))
+			throw new SdkV3OperationError("invalid_result", "thinking.set did not confirm the requested selection.");
+	} else if (!isChangedAcknowledgement(thinkingResult)) {
+		throw new SdkV3OperationError("invalid_result", "thinking.set returned an invalid selection acknowledgement.");
+	}
+	return requested;
+}
+
+function managedSelectionMutationError(
+	code: "model_set_failed" | "thinking_set_failed",
+	operation: string,
+	error: unknown,
+): SdkV3OperationError | GjcTurnCancelledError {
+	if (error instanceof GjcTurnCancelledError) return error;
+	if (
+		error instanceof SdkV3OperationError &&
+		["model_set_failed", "thinking_set_failed", "invalid_result"].includes(error.code)
+	)
+		return error;
+	const message = error instanceof Error ? error.message : String(error);
+	return new SdkV3OperationError(code, `Managed ${operation} failed${message.length === 0 ? "" : `: ${message}`}`);
+}
+
+function isChangedAcknowledgement(value: Readonly<Record<string, unknown>>): boolean {
+	return Object.keys(value).length === 1 && value.changed === true;
+}
+
+function sameModelSelection(left: NormalizedModelSelection | undefined, right: NormalizedModelSelection): boolean {
+	return (
+		left !== undefined &&
+		left.provider === right.provider &&
+		left.modelId === right.modelId &&
+		left.thinkingLevel === right.thinkingLevel
+	);
+}
+
+function withManagedModelSelection(
+	result: GjcTurnResult,
+	selection: NormalizedModelSelection | undefined,
+): GjcTurnResult {
+	return selection === undefined ? result : { ...result, modelSelection: selection };
+}
+
 async function closeAfterPrePromptFailure(
 	operations: ManagedSessionOperations,
 	authority: ManagedTurnAuthority,

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import type { NormalizedModelSelection } from "../src/contracts";
 import type { ManagedSdkRuntime } from "../src/gjc/managed-sdk-runtime";
 import type { ManagedPreparedTurnAuthority, ManagedTurnAuthority } from "../src/gjc/turn-runner";
 import { createManagedGjcTurnRunner } from "../src/live/gjc-managed-turn-runner";
@@ -13,6 +14,11 @@ const authority: ManagedTurnAuthority = {
 	leaseId: "lease-1",
 	epoch: "epoch-1",
 	requestKey: "request-1",
+};
+const modelSelection: NormalizedModelSelection = {
+	provider: "openai",
+	modelId: "gpt-5",
+	thinkingLevel: "high",
 };
 
 describe("unwired managed turn runner", () => {
@@ -86,6 +92,83 @@ describe("unwired managed turn runner", () => {
 		expect("switch" in runner).toBeFalse();
 	});
 
+	test("applies model then thinking selection setters before create and continue dispatch", async () => {
+		const fake = new RunnerRuntime();
+		const runner = createManagedGjcTurnRunner(fake.runtime);
+		await runner.create({
+			preparedManagedAuthority: withoutIdentity(),
+			cwd: authority.canonicalWorkspace,
+			sessionRoot: "/sessions",
+			projectId: authority.projectId,
+			chatId: authority.chatId,
+			userMessageId: "message-selection-create",
+			text: "select on create",
+			modelSelection,
+		});
+		expect(fake.requests.map(frame => frame.operation)).toEqual(["model.set", "thinking.set", "turn.prompt"]);
+		expect(fake.requests[0]?.input).toEqual({ id: "openai/gpt-5", thinkingLevel: "high" });
+		expect(fake.requests[1]?.input).toEqual({ level: "high" });
+
+		fake.requests.length = 0;
+		const result = await runner.continue({
+			...address(),
+			authority,
+			userMessageId: "message-selection-continue",
+			text: "select on continue",
+			rawFrameCursor: 0,
+			eventCursor: 0,
+			operationId: "op-selection-continue",
+			modelSelection,
+		});
+		expect(fake.requests.map(frame => frame.operation)).toEqual(["model.set", "thinking.set", "turn.follow_up"]);
+		expect(result.modelSelection).toEqual(modelSelection);
+	});
+
+	test("surfaces setter failure without dispatching a prompt", async () => {
+		const fake = new RunnerRuntime();
+		fake.setterFailure = "thinking.set";
+		fake.status = "retired";
+		const runner = createManagedGjcTurnRunner(fake.runtime);
+		await expect(
+			runner.create({
+				preparedManagedAuthority: withoutIdentity(),
+				cwd: authority.canonicalWorkspace,
+				sessionRoot: "/sessions",
+				projectId: authority.projectId,
+				chatId: authority.chatId,
+				userMessageId: "message-selection-failure",
+				text: "setter failure",
+				modelSelection,
+			}),
+		).rejects.toMatchObject({ code: "thinking_set_failed" });
+		expect(fake.requests.map(frame => frame.operation)).toEqual(["model.set", "thinking.set"]);
+		expect(fake.closeCalls).toBe(1);
+	});
+
+	test("rejects malformed or mismatched model setter state before thinking or prompt", async () => {
+		for (const modelSetResult of [
+			{ ...modelSelection, provider: "other" },
+			{ ...modelSelection, extra: true },
+		] as const) {
+			const fake = new RunnerRuntime();
+			fake.modelSetResult = modelSetResult;
+			const runner = createManagedGjcTurnRunner(fake.runtime);
+			await expect(
+				runner.continue({
+					...address(),
+					authority,
+					userMessageId: "message-selection-mismatch",
+					text: "mismatched selection",
+					rawFrameCursor: 0,
+					eventCursor: 0,
+					operationId: "op-selection-mismatch",
+					modelSelection,
+				}),
+			).rejects.toMatchObject({ code: "invalid_result" });
+			expect(fake.requests.map(frame => frame.operation)).toEqual(["model.set"]);
+		}
+	});
+
 	test("requires exact retirement for close and performs pre-prompt cleanup once after failure", async () => {
 		const fake = new RunnerRuntime();
 		const runner = createManagedGjcTurnRunner(fake.runtime);
@@ -142,6 +225,9 @@ class RunnerRuntime {
 	unsubscribed = 0;
 	closeCalls = 0;
 	failPrompt = false;
+	setterFailure: "model.set" | "thinking.set" | undefined;
+	modelSetResult: Readonly<Record<string, unknown>> | undefined;
+	thinkingSetResult: Readonly<Record<string, unknown>> | undefined;
 	readonly lifecycleService = {
 		createExternal: (request: Record<string, unknown>) => this.createExternalLifecycleSession(request),
 		resumeExternal: (request: Record<string, unknown>) => this.resumeExternalLifecycleSession(request),
@@ -167,6 +253,22 @@ class RunnerRuntime {
 	async request(_attachment: unknown, frame: Record<string, unknown>, options?: { onDispatch?: () => void }) {
 		this.subscriptionCountAtRequest.push(this.subscriptions.length);
 		this.requests.push(frame);
+		if (frame.operation === "model.set") {
+			if (this.setterFailure === "model.set") throw new Error("model setter failure");
+			return {
+				type: "control_response",
+				ok: true as const,
+				result: this.modelSetResult ?? modelSelection,
+			};
+		}
+		if (frame.operation === "thinking.set") {
+			if (this.setterFailure === "thinking.set") throw new Error("thinking setter failure");
+			return {
+				type: "control_response",
+				ok: true as const,
+				result: this.thinkingSetResult ?? { changed: true },
+			};
+		}
 		if (frame.operation === "turn.prompt" && this.failPrompt) throw new Error("prompt failure");
 		options?.onDispatch?.();
 		if (
