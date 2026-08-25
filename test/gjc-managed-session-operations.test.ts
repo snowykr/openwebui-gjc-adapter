@@ -82,6 +82,24 @@ describe("managed session operations", () => {
 		expect(fake.requests).toHaveLength(0);
 	});
 
+	test("does not admit a stale generation or changed lease and epoch for Router traffic", async () => {
+		for (const candidate of [
+			{ generation: authority.generation - 1 },
+			{ leaseId: "lease-stale" },
+			{ epoch: "epoch-stale" },
+		] as const) {
+			const fake = new FakeRuntime();
+			const operations = createManagedSessionOperations(fake.runtime);
+			await expect(
+				operations.request({
+					authority: { ...authority, ...candidate },
+					operation: "turn.prompt",
+				}),
+			).rejects.toThrow("Exact tenant");
+			expect(fake.requests).toHaveLength(0);
+		}
+	});
+
 	test("uses public terminal abort control_response and never dispatches a pre-cancelled prompt", async () => {
 		const fake = new FakeRuntime();
 		const operations = createManagedSessionOperations(fake.runtime);
@@ -128,7 +146,19 @@ class FakeRuntime {
 	}
 	async reconcile() {}
 	async acquireAttachment(key: unknown) {
-		if (this.rejectTenant) throw new Error("Exact tenant mismatch");
+		const tenant = key as typeof authority;
+		if (
+			this.rejectTenant ||
+			tenant.principalId !== authority.principalId ||
+			tenant.projectId !== authority.projectId ||
+			tenant.canonicalWorkspace !== authority.canonicalWorkspace ||
+			tenant.chatId !== authority.chatId ||
+			tenant.sessionId !== authority.sessionId ||
+			tenant.generation !== authority.generation ||
+			tenant.leaseId !== authority.leaseId ||
+			tenant.epoch !== authority.epoch
+		)
+			throw new Error("Exact tenant mismatch");
 		return { tenant: key, generation: authority.generation, attachment: this.attachment };
 	}
 	async registerLifecycleTenant(key: unknown, outcome: unknown) {

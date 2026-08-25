@@ -91,6 +91,8 @@ export interface ManagedGjcTurnRunner extends GjcTurnRunner {
 	): Promise<T>;
 }
 
+const managedLifecycleAuthorities = new WeakMap<object, ManagedTurnAuthority>();
+
 export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedGjcTurnRunner {
 	const operations = createManagedSessionOperations(runtime);
 	const forkManagedSuccessor = createManagedSuccessorFlow(runtime);
@@ -124,6 +126,7 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 		},
 		resume: input => operations.resume(input),
 		continue: async input => {
+			bindManagedLifecycleAuthority(input.lifecycle, input.authority);
 			const modelSelection = await applyManagedModelSelection(operations, input.authority, input.modelSelection);
 			const result = await operations.followUp(turnInput(input, "turn.follow_up"));
 			await operations.acquire(input.authority);
@@ -131,13 +134,18 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 		},
 		continueSession: async input => {
 			const authority = managedAuthorityFor(input, "turn.follow_up");
+			bindManagedLifecycleAuthority(input.lifecycle, authority);
 			const modelSelection = await applyManagedModelSelection(operations, authority, input.modelSelection);
 			const result = await operations.followUp(turnInput({ ...input, authority }, "turn.follow_up"));
 			await operations.acquire(authority);
 			return withManagedProof(withManagedModelSelection(result, modelSelection), authority);
 		},
 		async control(input) {
-			if ("gateId" in input) return { result: await operations.answerGate(gateInput(input)) };
+			if ("gateId" in input) {
+				bindManagedLifecycleAuthority(input.lifecycle, input.authority);
+				return { result: await operations.answerGate(gateInput(input)) };
+			}
+			bindManagedLifecycleAuthority(input.lifecycle, input.authority);
 			return {
 				result: await operations
 					.request({ ...turnInput(input, "turn.steer"), operation: "turn.steer", input: { text: input.text } })
@@ -149,9 +157,13 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 					})),
 			};
 		},
-		gate: async input => withManagedProof(await operations.answerGate(gateInput(input)), input.authority),
+		gate: async input => {
+			bindManagedLifecycleAuthority(input.lifecycle, input.authority);
+			return withManagedProof(await operations.answerGate(gateInput(input)), input.authority);
+		},
 		respondWorkflowGate: async input => {
 			const authority = managedAuthorityFor(input, "workflow.gate_answer");
+			bindManagedLifecycleAuthority(input.lifecycle, authority);
 			return withManagedProof(await operations.answerGate(gateInput({ ...input, authority })), authority);
 		},
 		async cancel(input) {
@@ -169,10 +181,11 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 				idempotencyKey: authority.requestKey,
 			});
 		},
-		async runControl(input, mapping, _lifecycle, _onAcknowledgedSuccessor, onDispatch) {
+		async runControl(input, mapping, lifecycle, _onAcknowledgedSuccessor, onDispatch) {
 			const control = input.control;
 			if (control === undefined) throw new Error("OpenWebUI control request was not supplied.");
 			const authority = managedControlAuthority(input, mapping);
+			bindManagedLifecycleAuthority(lifecycle, authority);
 			if (control.operation === "branch") {
 				const { sessionId: _sessionId, generation: _generation, ...target } = authority;
 				const successor = await forkManagedSuccessor.fork({
@@ -233,6 +246,7 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 		closePreflight: input => operations.close({ authority: input.authority, target: input.target }),
 		async getState(input) {
 			const authority = managedAuthorityFor(input, "session.state");
+			bindManagedLifecycleAuthority(input.lifecycle, authority);
 			return {
 				...(input.sessionFile === undefined ? {} : { sessionFile: input.sessionFile }),
 				rawFrameCursor: 0,
@@ -241,7 +255,11 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 				managedAuthority: authority,
 			};
 		},
-		getAvailableModels: input => operations.getModels(managedAuthorityFor(input, "models.list/current")),
+		getAvailableModels: input => {
+			const authority = managedAuthorityFor(input, "models.list/current");
+			bindManagedLifecycleAuthority(input.lifecycle, authority);
+			return operations.getModels(authority);
+		},
 		withLifecyclePublication: async (address, effect) => effect(managedLifecycleTransaction(address)),
 		withLifecycleClosePreflight: async (address, effect) => effect(managedLifecycleTransaction(address)),
 		async startNewSession(_input, _publish, _beforePrompt, _onFailure) {
@@ -295,7 +313,7 @@ function managedLifecycleTransaction(
 	authority?: ManagedTurnAuthority,
 ): GjcLifecycleTransaction {
 	const owner = {};
-	return {
+	const transaction: GjcLifecycleTransaction = {
 		address,
 		owner,
 		assertClosePreflight(): never {
@@ -305,21 +323,93 @@ function managedLifecycleTransaction(
 			throw new Error("Managed lifecycle cannot publish legacy attachment authority.");
 		},
 		async publishManaged(proof, write) {
-			if (
-				proof.sessionId !== address.sessionId ||
-				(authority !== undefined &&
-					(proof.sessionId !== authority.sessionId || proof.generation !== authority.generation))
-			)
-				throw new Error("Managed lifecycle publication proof changed.");
+			const bound = managedLifecycleAuthorities.get(transaction);
+			if (bound === undefined) throw new Error("Managed lifecycle publication requires complete bound authority.");
+			assertManagedLifecyclePublication(address, bound, proof);
 			return write();
 		},
 		async publishClosed(): Promise<never> {
 			throw new Error("Managed lifecycle close publication requires managed retirement state.");
 		},
-		async handoff(): Promise<never> {
+		handoff(): Promise<never> {
 			throw new Error("Managed successor handoff uses public lifecycle fork authority.");
 		},
 	};
+	if (authority !== undefined) bindManagedLifecycleAuthority(transaction, authority);
+	return transaction;
+}
+
+function bindManagedLifecycleAuthority(
+	lifecycle: GjcLifecycleTransaction | undefined,
+	authority: ManagedTurnAuthority,
+): void {
+	if (lifecycle === undefined) return;
+	if (lifecycle.address === undefined) return;
+	const current = managedLifecycleAuthorities.get(lifecycle);
+	if (current !== undefined && !sameManagedAuthority(current, authority))
+		throw new Error("Managed lifecycle transaction authority changed.");
+	assertCompleteManagedAuthority(authority);
+	assertManagedLifecycleAddress(lifecycle.address, authority);
+	managedLifecycleAuthorities.set(lifecycle, authority);
+}
+
+function assertManagedLifecyclePublication(
+	address: GjcLifecyclePublicationAddress,
+	authority: ManagedTurnAuthority,
+	proof: import("../gjc/turn-runner").ManagedGenerationProof,
+): void {
+	assertCompleteManagedAuthority(authority);
+	assertManagedLifecycleAddress(address, authority);
+	if (
+		proof.kind !== "managed-generation" ||
+		proof.sessionId !== authority.sessionId ||
+		!Number.isSafeInteger(proof.generation) ||
+		proof.generation <= 0 ||
+		proof.generation !== authority.generation ||
+		proof.leaseId !== authority.leaseId ||
+		proof.epoch !== authority.epoch
+	)
+		throw new Error("Managed lifecycle publication proof changed.");
+}
+
+function assertManagedLifecycleAddress(address: GjcLifecyclePublicationAddress, authority: ManagedTurnAuthority): void {
+	if (
+		address.projectId !== authority.projectId ||
+		address.chatId !== authority.chatId ||
+		address.sessionId !== authority.sessionId ||
+		resolve(address.cwd) !== authority.canonicalWorkspace
+	)
+		throw new Error("Managed lifecycle transaction address does not match exact authority.");
+}
+
+function assertCompleteManagedAuthority(authority: ManagedTurnAuthority): void {
+	if (
+		!authority.principalId ||
+		!authority.projectId ||
+		!authority.canonicalWorkspace ||
+		!authority.chatId ||
+		!authority.sessionId ||
+		!Number.isSafeInteger(authority.generation) ||
+		authority.generation <= 0 ||
+		!authority.leaseId ||
+		!authority.epoch ||
+		!authority.requestKey
+	)
+		throw new Error("Complete positive ManagedTurnAuthority is required for lifecycle publication.");
+}
+
+function sameManagedAuthority(left: ManagedTurnAuthority, right: ManagedTurnAuthority): boolean {
+	return (
+		left.principalId === right.principalId &&
+		left.projectId === right.projectId &&
+		left.canonicalWorkspace === right.canonicalWorkspace &&
+		left.chatId === right.chatId &&
+		left.sessionId === right.sessionId &&
+		left.generation === right.generation &&
+		left.leaseId === right.leaseId &&
+		left.epoch === right.epoch &&
+		left.requestKey === right.requestKey
+	);
 }
 
 function managedAuthorityFor(

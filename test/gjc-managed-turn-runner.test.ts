@@ -41,6 +41,87 @@ describe("managed turn runner", () => {
 		expect(fake.externalLifecycle).toHaveLength(1);
 	});
 
+	test("publishes only an exact bound managed generation and rejects unbound or stale evidence", async () => {
+		const fake = new RunnerRuntime();
+		const runner = createManagedGjcTurnRunner(fake.runtime);
+		let writes = 0;
+		await runner.withLifecyclePublication(address(), async lifecycle => {
+			await expect(
+				lifecycle.publishManaged!(
+					{
+						kind: "managed-generation",
+						sessionId: authority.sessionId,
+						generation: authority.generation,
+						leaseId: authority.leaseId,
+						epoch: authority.epoch,
+					},
+					() => {
+						writes += 1;
+					},
+				),
+			).rejects.toThrow("complete bound authority");
+			await runner.getState({ ...address(), lifecycle, managedAuthority: authority });
+			await expect(
+				lifecycle.publishManaged!(
+					{
+						kind: "managed-generation",
+						sessionId: authority.sessionId,
+						generation: authority.generation - 1,
+						leaseId: authority.leaseId,
+						epoch: authority.epoch,
+					},
+					() => {
+						writes += 1;
+					},
+				),
+			).rejects.toThrow("proof changed");
+			await expect(
+				lifecycle.publishManaged!(
+					{
+						kind: "managed-generation",
+						sessionId: authority.sessionId,
+						generation: authority.generation,
+						leaseId: "lease-stale",
+						epoch: authority.epoch,
+					},
+					() => {
+						writes += 1;
+					},
+				),
+			).rejects.toThrow("proof changed");
+			await expect(
+				lifecycle.publishManaged!(
+					{
+						kind: "managed-generation",
+						sessionId: authority.sessionId,
+						generation: authority.generation,
+						leaseId: authority.leaseId,
+						epoch: "epoch-stale",
+					},
+					() => {
+						writes += 1;
+					},
+				),
+			).rejects.toThrow("proof changed");
+			await expect(
+				lifecycle.publishManaged!(
+					{
+						kind: "managed-generation",
+						sessionId: authority.sessionId,
+						generation: authority.generation,
+						leaseId: authority.leaseId,
+						epoch: authority.epoch,
+					},
+					() => {
+						writes += 1;
+						return "published";
+					},
+				),
+			).resolves.toBe("published");
+		});
+		expect(writes).toBe(1);
+	});
+
 	test("creates through external lifecycle adoption and streams ordered public Router frames before request settlement", async () => {
 		const fake = new RunnerRuntime();
 		const runner = createManagedGjcTurnRunner(fake.runtime);
