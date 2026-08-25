@@ -415,36 +415,49 @@ export async function buildResolvedAdapterServerOptions(
 			(projectionRepository === undefined
 				? undefined
 				: new FileBackedOutboxStore(path.join(config.statePath, PROJECTION_OUTBOX_STORE_FILE)));
-		const cliPath = resolveGjcCliPath(config.gjcCommand);
-		const turnRunner =
-			activeManagedV3Runtime?.runner ??
-			managedBootstrapDependencies?.runner ??
-			dependencies.turnRunner ??
-			createPublicSdkGjcTurnRunner({
-				cliPath,
-				runtimeLocations: config.runtimeLocations,
-				turnTimeoutMs: config.turnTimeoutMs,
-				...(managedSdkRuntime === undefined ? {} : { managedSdkRuntime }),
-				...(managedSdkTenantFence === undefined ? {} : { managedSdkTenantFence }),
-				sessionPortFactory: dependencies.sessionPortFactory,
-			});
+		// Canonical V3 and managed-bootstrap authorities are process-owned. Keep
+		// their runner and model reader composition on the managed surface even
+		// when legacy test seams are supplied; those seams must never become a
+		// fallback for an admitted managed authority.
+		const managedRunner = activeManagedV3Runtime?.runner ?? managedBootstrapDependencies?.runner;
 		const managedModelRuntime = activeManagedV3Runtime?.runtime ?? managedBootstrapDependencies?.runtime;
-		const modelReaderFactory =
-			managedModelRuntime === undefined
-				? (dependencies.modelReaderFactory ??
-					createModelReaderFactory({
-						cliPath,
-						runtimeLocations: config.runtimeLocations,
-						resolveAttachment:
-							dependencies.resolveModelAttachment ??
-							createPublicSdkModelAttachmentResolver({
-								cliPath,
-								cwd: config.runtimeLocations.readerWorkspace,
-								childEnvironment: config.runtimeLocations.childEnvironment,
-							}),
-						sessionPortFactory: dependencies.sessionPortFactory,
-					}))
-				: createManagedReaderFactory(managedModelRuntime, config.turnTimeoutMs);
+		if (authorityEpoch.status === "v3" && (managedRunner === undefined || managedModelRuntime === undefined))
+			throw new Error("Canonical V3 authority requires active managed runtime dependencies.");
+		let cliPath = config.gjcCommand;
+		let turnRunner: GjcSessionTurnRunner;
+		let modelReaderFactory: ModelReaderFactory;
+		if (managedRunner !== undefined || managedModelRuntime !== undefined) {
+			if (managedRunner === undefined || managedModelRuntime === undefined)
+				throw new Error("Managed authority requires complete managed runtime dependencies.");
+			turnRunner = managedRunner;
+			modelReaderFactory = createManagedReaderFactory(managedModelRuntime, config.turnTimeoutMs);
+		} else {
+			cliPath = resolveGjcCliPath(config.gjcCommand);
+			turnRunner =
+				dependencies.turnRunner ??
+				createPublicSdkGjcTurnRunner({
+					cliPath,
+					runtimeLocations: config.runtimeLocations,
+					turnTimeoutMs: config.turnTimeoutMs,
+					...(managedSdkRuntime === undefined ? {} : { managedSdkRuntime }),
+					...(managedSdkTenantFence === undefined ? {} : { managedSdkTenantFence }),
+					sessionPortFactory: dependencies.sessionPortFactory,
+				});
+			modelReaderFactory =
+				dependencies.modelReaderFactory ??
+				createModelReaderFactory({
+					cliPath,
+					runtimeLocations: config.runtimeLocations,
+					resolveAttachment:
+						dependencies.resolveModelAttachment ??
+						createPublicSdkModelAttachmentResolver({
+							cliPath,
+							cwd: config.runtimeLocations.readerWorkspace,
+							childEnvironment: config.runtimeLocations.childEnvironment,
+						}),
+					sessionPortFactory: dependencies.sessionPortFactory,
+				});
+		}
 		const closeSession = createAdapterSessionCloser(
 			config,
 			cliPath,

@@ -360,6 +360,27 @@ describe("CLI module boundaries", () => {
 		});
 	});
 
+	test("keeps managed V3 composition off the legacy bridge fallbacks", () => {
+		const source = readFileSync(join(ROOT, "src", "adapter-server-options.ts"), "utf8");
+		const managedCompositionStart = source.indexOf("const managedRunner =");
+		const legacyCompositionStart = source.indexOf("cliPath = resolveGjcCliPath", managedCompositionStart);
+		expect(managedCompositionStart).toBeGreaterThanOrEqual(0);
+		expect(legacyCompositionStart).toBeGreaterThan(managedCompositionStart);
+		const managedComposition = source.slice(managedCompositionStart, legacyCompositionStart);
+
+		expect(source).toContain(
+			'if (authorityEpoch.status === "v3" && (managedRunner === undefined || managedModelRuntime === undefined))',
+		);
+		expect(managedComposition).toContain("turnRunner = managedRunner");
+		expect(managedComposition).toContain("createManagedReaderFactory(managedModelRuntime, config.turnTimeoutMs)");
+		expect(managedComposition).not.toContain("dependencies.turnRunner");
+		expect(managedComposition).not.toContain("dependencies.modelReaderFactory");
+		expect(managedComposition).not.toContain("createPublicSdkGjcTurnRunner");
+		expect(managedComposition).not.toContain("createModelReaderFactory");
+		expect(managedComposition).not.toContain("createPublicSdkModelAttachmentResolver");
+		expect(managedComposition).not.toContain("resolveGjcCliPath");
+	});
+
 	test("enforces the exact acyclic CLI import graph", async () => {
 		// Given: extraction modules that may not yet exist during architecture RED.
 		if (CLI_MODULES.some(file => !existsSync(join(ROOT, "src", file)))) return;
