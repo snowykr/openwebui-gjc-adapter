@@ -345,90 +345,90 @@ describe("control operation replay", () => {
 	});
 	test("reports the actual session.resume SDK invocation boundary", async () => {
 		const operation = "session.resume" as const;
-			const root = mkdtempSync(join(tmpdir(), `gjc-${operation.replace(".", "-")}-boundary-`));
-			const sessionRoot = join(root, ".gjc", "sessions");
-			const endpointRoot = join(root, ".gjc", "state", "sdk");
-			const sessionFile = join(sessionRoot, "session-1.jsonl");
-			mkdirSync(sessionRoot, { recursive: true });
-			mkdirSync(endpointRoot, { recursive: true });
-			writeFileSync(
-				sessionFile,
-				`${JSON.stringify({ type: "session", version: 3, id: "session-1", timestamp: "2026-01-01T00:00:00.000Z", cwd: root })}\n`,
-			);
-			writeFileSync(
-				join(endpointRoot, "session-1.json"),
-				JSON.stringify({ version: 1, url: "ws://127.0.0.1:1", token: "test" }),
-			);
-			let cancelRegistration = true;
-			let invocations = 0;
-			let dispatches = 0;
-			const port = {
-				async attach() {},
-				detach() {},
-				async resumeSession() {
-					invocations += 1;
-					const successor = await readPublishedSdkEndpoint(root, "session-1");
-					if (successor === undefined) throw new Error("test endpoint was not published");
-					return successor;
-				},
-				async abort() {
-					throw new Error("terminal abort must not be sent before lifecycle invocation");
-				},
-			} as unknown as PublicSdkSessionPort;
-			const context = createPublicSdkRunnerContext({
-				cliPath: "missing-gjc-cli",
-				runtimeLocations: { childEnvironment: {} } as never,
-				turnTimeoutMs: 1_000,
-				sessionPortFactory: () => port,
-			});
-			const turn = {
-				...lifecycleControlTurn(`direct-${operation}`, operation),
-				project: { ...project, cwd: root, sessionRoot },
-				control: { operation, sessionId: "session-1", sessionFile },
-			};
-			const mapping = {
-				chatId: turn.chatId,
+		const root = mkdtempSync(join(tmpdir(), `gjc-${operation.replace(".", "-")}-boundary-`));
+		const sessionRoot = join(root, ".gjc", "sessions");
+		const endpointRoot = join(root, ".gjc", "state", "sdk");
+		const sessionFile = join(sessionRoot, "session-1.jsonl");
+		mkdirSync(sessionRoot, { recursive: true });
+		mkdirSync(endpointRoot, { recursive: true });
+		writeFileSync(
+			sessionFile,
+			`${JSON.stringify({ type: "session", version: 3, id: "session-1", timestamp: "2026-01-01T00:00:00.000Z", cwd: root })}\n`,
+		);
+		writeFileSync(
+			join(endpointRoot, "session-1.json"),
+			JSON.stringify({ version: 1, url: "ws://127.0.0.1:1", token: "test" }),
+		);
+		let cancelRegistration = true;
+		let invocations = 0;
+		let dispatches = 0;
+		const port = {
+			async attach() {},
+			detach() {},
+			async resumeSession() {
+				invocations += 1;
+				const successor = await readPublishedSdkEndpoint(root, "session-1");
+				if (successor === undefined) throw new Error("test endpoint was not published");
+				return successor;
+			},
+			async abort() {
+				throw new Error("terminal abort must not be sent before lifecycle invocation");
+			},
+		} as unknown as PublicSdkSessionPort;
+		const context = createPublicSdkRunnerContext({
+			cliPath: "missing-gjc-cli",
+			runtimeLocations: { childEnvironment: {} } as never,
+			turnTimeoutMs: 1_000,
+			sessionPortFactory: () => port,
+		});
+		const turn = {
+			...lifecycleControlTurn(`direct-${operation}`, operation),
+			project: { ...project, cwd: root, sessionRoot },
+			control: { operation, sessionId: "session-1", sessionFile },
+		};
+		const mapping = {
+			chatId: turn.chatId,
+			projectId: project.id,
+			sessionId: "session-1",
+			sessionFile,
+			rawFrameCursor: 0,
+			eventCursor: 0,
+			operationId: "prior",
+		};
+		const lifecycle = Object.assign(
+			lifecycleFixture({
+				cwd: root,
+				sessionRoot,
 				projectId: project.id,
+				chatId: turn.chatId,
 				sessionId: "session-1",
 				sessionFile,
-				rawFrameCursor: 0,
-				eventCursor: 0,
-				operationId: "prior",
-			};
-			const lifecycle = Object.assign(
-				lifecycleFixture({
-					cwd: root,
-					sessionRoot,
-					projectId: project.id,
-					chatId: turn.chatId,
-					sessionId: "session-1",
-					sessionFile,
-				}),
-				{ handoff: async () => undefined },
-			);
-			const register = (
-				_address: unknown,
-				_principal: string | undefined,
-				_operation: string,
-				abort: () => Promise<unknown>,
-			) => {
-				if (cancelRegistration) {
-					cancelRegistration = false;
-					void abort();
-				}
-				return { cancelled: false, unregister() {} };
-			};
-			await expect(
-				runControl(context, turn, mapping, lifecycle, undefined, register, () => (dispatches += 1)),
-			).rejects.toMatchObject({ name: "GjcTurnCancelledError" });
-			expect(invocations).toBe(0);
-			await expect(
-				runControl(context, turn, mapping, lifecycle, undefined, register, () => (dispatches += 1)),
-			).resolves.toMatchObject({ sessionId: "session-1" });
-			expect(invocations).toBe(1);
-			expect(dispatches).toBe(1);
-			rmSync(root, { recursive: true, force: true });
-		});
+			}),
+			{ handoff: async () => undefined },
+		);
+		const register = (
+			_address: unknown,
+			_principal: string | undefined,
+			_operation: string,
+			abort: () => Promise<unknown>,
+		) => {
+			if (cancelRegistration) {
+				cancelRegistration = false;
+				void abort();
+			}
+			return { cancelled: false, unregister() {} };
+		};
+		await expect(
+			runControl(context, turn, mapping, lifecycle, undefined, register, () => (dispatches += 1)),
+		).rejects.toMatchObject({ name: "GjcTurnCancelledError" });
+		expect(invocations).toBe(0);
+		await expect(
+			runControl(context, turn, mapping, lifecycle, undefined, register, () => (dispatches += 1)),
+		).resolves.toMatchObject({ sessionId: "session-1" });
+		expect(invocations).toBe(1);
+		expect(dispatches).toBe(1);
+		rmSync(root, { recursive: true, force: true });
+	});
 	test("does not send a terminal abort before control dispatch and retries the same message", async () => {
 		const root = mkdtempSync(join(tmpdir(), "gjc-control-dispatch-boundary-"));
 		const sessionRoot = join(root, ".gjc", "sessions");

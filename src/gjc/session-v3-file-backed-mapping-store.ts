@@ -589,7 +589,7 @@ function fromV3Provisional(operation: SessionAuthorityV3ProvisionalOperation): P
 }
 
 function scopedDurableChatId(record: SessionAuthorityRecord): string | undefined {
-	const observation = record.observations?.["__gjcSessionMappingScope"];
+	const observation = record.observations?.__gjcSessionMappingScope;
 	if (typeof observation !== "object" || observation === null || Array.isArray(observation)) return undefined;
 	const principalId = (observation as { readonly principalId?: unknown }).principalId;
 	const chatId = (observation as { readonly chatId?: unknown }).chatId;
