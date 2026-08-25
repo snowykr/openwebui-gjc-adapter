@@ -233,7 +233,6 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 		closePreflight: input => operations.close({ authority: input.authority, target: input.target }),
 		async getState(input) {
 			const authority = managedAuthorityFor(input, "session.state");
-			await operations.getState(authority);
 			return {
 				...(input.sessionFile === undefined ? {} : { sessionFile: input.sessionFile }),
 				rawFrameCursor: 0,

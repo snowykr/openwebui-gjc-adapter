@@ -80,7 +80,6 @@ export interface ManagedSessionOperations {
 		input?: Readonly<Record<string, unknown>>,
 		timeoutMs?: number,
 	): Promise<readonly unknown[]>;
-	getState(authority: ManagedTurnAuthority, timeoutMs?: number): Promise<readonly unknown[]>;
 	getModels(authority: ManagedTurnAuthority, timeoutMs?: number): Promise<readonly unknown[]>;
 	getProviders(authority: ManagedTurnAuthority, timeoutMs?: number): Promise<readonly unknown[]>;
 	getBranchCandidates(authority: ManagedTurnAuthority, timeoutMs?: number): Promise<readonly unknown[]>;
@@ -356,7 +355,6 @@ export function createManagedSessionOperations(runtime: ManagedSdkRuntime): Mana
 		acquire,
 		request,
 		query,
-		getState: (authority, timeoutMs) => query(authority, "session.state", {}, timeoutMs),
 		getModels: (authority, timeoutMs) => query(authority, "models.list/current", {}, timeoutMs),
 		getProviders: (authority, timeoutMs) => query(authority, "providers.list/active", {}, timeoutMs),
 		getBranchCandidates: (authority, timeoutMs) => query(authority, "session.branch_candidates", {}, timeoutMs),

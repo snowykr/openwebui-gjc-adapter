@@ -29,7 +29,6 @@ describe("managed session operations", () => {
 		await operations.setModel(authority, { provider: "openai", modelId: "gpt-5", thinkingLevel: "high" });
 		await operations.setThinking(authority, "low");
 		await expect(operations.query(authority, "models.list/current")).resolves.toEqual(["one", "two"]);
-		await expect(operations.getState(authority)).resolves.toEqual([]);
 		await expect(operations.getProviders(authority)).resolves.toEqual([]);
 		await expect(operations.getBranchCandidates(authority)).resolves.toEqual([]);
 		expect(fake.externalLifecycle.map(call => call.operation)).toEqual(["create", "resume"]);
@@ -47,7 +46,6 @@ describe("managed session operations", () => {
 			"thinking.set",
 			"models.list/current",
 			"models.list/current",
-			"session.state",
 			"providers.list/active",
 			"session.branch_candidates",
 		]);
