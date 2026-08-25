@@ -20,10 +20,13 @@ function record(value: unknown): void {
 	appendFileSync(observationPath, `${JSON.stringify(value)}\n`, "utf8");
 }
 
-const options = await buildAdapterServerOptionsFromEnv(process.env, {
-	eventSink: input => record({ type: "event", input }),
-	messageSink: input => record({ type: "message", input }),
-});
+const options = await buildAdapterServerOptionsFromEnv(
+	{ ...process.env, GJC_OPENWEBUI_MODE: "managed" },
+	{
+		eventSink: input => record({ type: "event", input }),
+		messageSink: input => record({ type: "message", input }),
+	},
+);
 writeFileSync(
 	runtimeReceiptPath,
 	JSON.stringify({

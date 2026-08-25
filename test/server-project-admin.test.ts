@@ -983,6 +983,7 @@ const modelReaderFactory = staticModelReaderFactory();
 function adapterEnv(workspace: string): Record<string, string | undefined> {
 	return {
 		...process.env,
+		GJC_OPENWEBUI_MODE: "existing",
 		GJC_OPENWEBUI_BIND_HOST: "127.0.0.1",
 		GJC_OPENWEBUI_BIND_PORT: "8765",
 		GJC_OPENWEBUI_ADAPTER_API_TOKEN: "adapter-token",
