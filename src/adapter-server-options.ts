@@ -28,8 +28,15 @@ import { FileBackedSessionMappingStore, type SessionMapping, SessionMappingStore
 import { V3FileBackedSessionMappingStore } from "./gjc/session-v3-file-backed-mapping-store";
 import type { GjcCloseReceipt, ManagedPreparedTurnAuthority, ManagedTurnAuthority } from "./gjc/turn-runner";
 import type { LiveGatewayEventSink, LiveGatewayMessageSink } from "./live/chat-completions";
+import { acquireWorkspaceAdmission } from "./live/chat-completions";
 import type { LiveGatewayFileContextResolver } from "./live/file-contexts";
 import { createGjcIdleSessionReaper } from "./live/gjc-idle-session-reaper";
+import {
+	createManagedIdleReaper,
+	createManagedV3GenerationStore,
+	DEFAULT_MANAGED_IDLE_TIMEOUT_MS,
+	type ManagedIdleReaper,
+} from "./live/gjc-managed-idle-reaper";
 import { createManagedModelReaderFactory } from "./live/gjc-managed-model-reader";
 import type { ManagedSdkRuntimeDependency, ManagedSdkTenantFence } from "./live/gjc-routing-lifecycle";
 import {
@@ -153,6 +160,7 @@ export async function buildResolvedAdapterServerOptions(
 	const databasePath = path.join(config.statePath, "adapter-state.sqlite");
 	let projectStore: SqliteProjectRegistrationStore | undefined;
 	let idleSessionReaper: ReturnType<typeof createGjcIdleSessionReaper> | undefined;
+	let managedIdleReaper: ManagedIdleReaper | undefined;
 	let routingRunner: ReturnType<typeof createGjcRoutingLiveGatewayRunner> | undefined;
 	let managedBootstrap: ManagedBootstrapService | undefined;
 	let managedBootstrapDependencies: ManagedBootstrapRunnerDependencies | undefined;
@@ -459,7 +467,69 @@ export async function buildResolvedAdapterServerOptions(
 		const workspaceAuthorityCoordinator =
 			dependencies.authorityCoordinator ??
 			(closeSession === undefined ? undefined : createWorkspaceAuthorityCoordinator(mappings, closeSession));
-		if (closeSession !== undefined) {
+		if (activeManagedV3Runtime !== undefined) {
+			const managedV3Runtime = activeManagedV3Runtime;
+			const v3Mappings = mappings;
+			if (v3Mappings === undefined) throw new Error("Managed V3 idle reaper requires a session mapping store.");
+			const managedRecords = createManagedV3GenerationStore(v3Mappings);
+			managedIdleReaper = createManagedIdleReaper({
+				runtime: managedV3Runtime.runtime,
+				records: managedRecords,
+				admission: {
+					acquire: async key => {
+						try {
+							const lease = parseWorkspaceLeaseId(key.leaseId);
+							return await acquireWorkspaceAdmission(
+								workspaceLeaseManager,
+								lease.safeKey,
+								workspaceLeaseDurationMs,
+								32,
+							);
+						} catch {
+							return undefined;
+						}
+					},
+				},
+				leases: {
+					acquire: async key => {
+						let reference: ReturnType<typeof parseWorkspaceLeaseId>;
+						try {
+							reference = parseWorkspaceLeaseId(key.leaseId);
+						} catch {
+							return undefined;
+						}
+						const workspace = await workspaceRegistry.resolveBySafeKey(reference.safeKey).catch(() => undefined);
+						if (
+							workspace === undefined ||
+							workspace.userId !== key.principalId ||
+							path.resolve(workspace.root) !== key.canonicalWorkspace
+						)
+							return undefined;
+						let lease: WorkspaceLease;
+						try {
+							lease = await workspaceLeaseManager.acquire({
+								safeKey: reference.safeKey,
+								holderId: `gjc-managed-idle-reaper-${process.pid}-${randomUUID()}`,
+								operation: "reaper",
+								leaseDurationMs: workspaceLeaseDurationMs,
+							});
+						} catch {
+							return undefined;
+						}
+						return {
+							assertFence: async () => {
+								await workspaceLeaseManager.assertFence(lease);
+								if (!(await managedV3Runtime.tenantFence(key)))
+									throw new Error("Managed V3 tenant authority fence was lost.");
+							},
+							release: () => lease.release(),
+						};
+					},
+				},
+				idleTimeoutMs: DEFAULT_MANAGED_IDLE_TIMEOUT_MS,
+				pollIntervalMs: DEFAULT_MANAGED_IDLE_TIMEOUT_MS,
+			});
+		} else if (closeSession !== undefined) {
 			idleSessionReaper = createGjcIdleSessionReaper({
 				runner: baseRoutingRunner,
 				mappings,
@@ -576,6 +646,11 @@ export async function buildResolvedAdapterServerOptions(
 		const shutdownCleanup = async (): Promise<void> => {
 			const failures: unknown[] = [];
 			try {
+				await managedIdleReaper?.stop();
+			} catch (error) {
+				failures.push(error);
+			}
+			try {
 				if (managedBootstrap === undefined) await disposeManagedSdkRuntime();
 			} catch (error) {
 				failures.push(error);
@@ -685,6 +760,7 @@ export async function buildResolvedAdapterServerOptions(
 	} catch (error) {
 		let startupError: unknown = error;
 		try {
+			await managedIdleReaper?.stop();
 			await (idleSessionReaper?.stop() ?? routingRunner?.stop?.());
 		} catch (stopError) {
 			startupError = new AggregateError([startupError, stopError], "Adapter initialization cleanup failed");

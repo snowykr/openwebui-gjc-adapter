@@ -4,11 +4,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildAdapterServerOptions } from "../src/adapter-server-options";
 import type { SessionAttachmentProof, SessionOperation } from "../src/gjc/session-authority";
+import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import type { SessionMapping } from "../src/gjc/session-router";
 import { SessionMappingStore } from "../src/gjc/session-router";
+import { V3FileBackedSessionMappingStore } from "../src/gjc/session-v3-file-backed-mapping-store";
+import type { ManagedTurnAuthority } from "../src/gjc/turn-runner";
 import type { LiveGatewayRunner, LiveGatewayRunnerInput, LiveGatewayRunnerResult } from "../src/live/chat-completions";
 import { acquireWorkspaceAdmission } from "../src/live/chat-completions";
 import { createGjcIdleSessionReaper, DEFAULT_IDLE_SESSION_TIMEOUT_MS } from "../src/live/gjc-idle-session-reaper";
+import {
+	createManagedIdleReaper,
+	createManagedV3GenerationStore,
+	type ManagedIdleLifecycleRuntime,
+} from "../src/live/gjc-managed-idle-reaper";
 import type { GjcSessionTurnRunner } from "../src/live/gjc-routing-runner";
 import type { OpenWebUIProjectionRepository } from "../src/openwebui/client";
 import { type WorkspaceLeaseAcquireOptions, WorkspaceLeaseManager } from "../src/security/workspace-lease";
@@ -139,6 +147,35 @@ function createMapping(operationId: string): SessionMapping {
 		eventCursor: 1,
 		operationId,
 		attachment: attachmentProof(),
+	};
+}
+
+function createManagedV3Authority(operationId = "turn-1", generation = 1): ManagedTurnAuthority {
+	return {
+		principalId: "owner-1",
+		projectId: project.id,
+		canonicalWorkspace: project.cwd,
+		chatId: "chat-1",
+		sessionId: "managed-session-1",
+		generation,
+		leaseId: "lease-v3-1",
+		epoch: SESSION_AUTHORITY_V3_EPOCH,
+		requestKey: operationId,
+		authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+	} as ManagedTurnAuthority;
+}
+
+function createManagedV3Mapping(operationId = "turn-1", generation = 1): SessionMapping {
+	const authority = createManagedV3Authority(operationId, generation);
+	return {
+		chatId: authority.chatId,
+		principalId: authority.principalId,
+		projectId: authority.projectId,
+		sessionId: authority.sessionId,
+		rawFrameCursor: 0,
+		eventCursor: 0,
+		operationId,
+		managedAuthority: authority,
 	};
 }
 
@@ -1614,4 +1651,238 @@ test("a linked-project projection failure does not stop the base routing runner"
 	} finally {
 		await rm(root, { force: true, recursive: true });
 	}
+});
+
+describe("managed V3 idle retirement", () => {
+	async function createV3Fixture(mapping = createManagedV3Mapping()) {
+		const root = await mkdtemp(join(tmpdir(), "gjc-managed-v3-idle-"));
+		const authorityPath = join(root, "session-authority.json");
+		const initial = new V3FileBackedSessionMappingStore(authorityPath);
+		const scope = { principalId: mapping.principalId!, chatId: mapping.chatId };
+		initial.setScoped(scope, mapping);
+		initial.beginOperationScoped(scope, {
+			id: mapping.operationId,
+			kind: "prompt",
+			ingressId: mapping.operationId,
+			detail: mapping.operationId,
+		});
+		initial.transitionOperationScoped(scope, mapping.operationId, "complete", mapping.operationId, {
+			kind: "turn",
+			assistantText: "",
+			events: [],
+			managedAuthority: mapping.managedAuthority!,
+			mapping: {
+				chatId: mapping.chatId,
+				projectId: mapping.projectId,
+				sessionId: mapping.sessionId,
+				rawFrameCursor: mapping.rawFrameCursor,
+				eventCursor: mapping.eventCursor,
+				operationId: mapping.operationId,
+			},
+		});
+		initial.close();
+		return {
+			mapping,
+			mappings: new V3FileBackedSessionMappingStore(authorityPath),
+			reopen: () => new V3FileBackedSessionMappingStore(authorityPath),
+			cleanup: async () => rm(root, { force: true, recursive: true }),
+		};
+	}
+
+	function runtimeFor(
+		close: ManagedIdleLifecycleRuntime["closeLifecycleSession"],
+		status: ManagedIdleLifecycleRuntime["generationStatus"],
+	): ManagedIdleLifecycleRuntime {
+		return {
+			closeLifecycleSession: close,
+			reconcile: async () => undefined,
+			generationStatus: status,
+		};
+	}
+
+	function reaperFor(
+		mappings: SessionMappingStore,
+		runtime: ManagedIdleLifecycleRuntime,
+		assertFence: () => Promise<void> = async () => undefined,
+		now: () => number = () => Date.now() + 100_000,
+	) {
+		return createManagedIdleReaper({
+			records: createManagedV3GenerationStore(mappings),
+			runtime,
+			idleTimeoutMs: 1,
+			now,
+			admission: { acquire: async () => () => undefined },
+			leases: {
+				acquire: async () => ({ assertFence, release: async () => undefined }),
+			},
+		});
+	}
+
+	test("proves exact retirement before evicting a V3 mapping with no legacy attachment", async () => {
+		const fixture = await createV3Fixture();
+		const { mappings, mapping } = fixture;
+		expect(await createManagedV3GenerationStore(mappings).active()).toHaveLength(1);
+		const closeTargets: Array<{ readonly sessionId: string; readonly endpointGeneration: number }> = [];
+		const reaper = reaperFor(
+			mappings,
+			runtimeFor(
+				async request => {
+					closeTargets.push(request.target);
+					return { ok: true };
+				},
+				async () => ({ status: "retired" }),
+			),
+		);
+
+		await reaper.runOnce();
+
+		expect(closeTargets).toEqual([{ sessionId: mapping.sessionId, endpointGeneration: 1 }]);
+		expect(mappings.getScoped({ principalId: mapping.principalId!, chatId: mapping.chatId })).toBeUndefined();
+		expect(mapping).not.toHaveProperty("attachment");
+		expect(mapping).not.toHaveProperty("sessionFile");
+		await reaper.stop();
+		mappings.close();
+		await fixture.cleanup();
+	});
+
+	test("durably prepares and retires a V3 close with scoped authority", async () => {
+		const fixture = await createV3Fixture();
+		const records = createManagedV3GenerationStore(fixture.mappings);
+		const [record] = await records.active();
+		expect(record).toBeDefined();
+		const scopedMapping = fixture.mappings.getScoped({
+			principalId: record!.authority.principalId,
+			chatId: record!.authority.chatId,
+		});
+		expect(scopedMapping).toBeDefined();
+		expect(scopedMapping!.managedAuthority).toEqual(record!.authority);
+		const prepared = await records.prepareClose(record!, {
+			key: "managed-close-prepare",
+			authority: record!.authority,
+			requestedAt: Date.now(),
+		});
+		expect(prepared).toBe(true);
+		fixture.mappings.retireScoped({
+			principalId: record!.authority.principalId,
+			chatId: record!.authority.chatId,
+		});
+		expect(
+			fixture.mappings.getScoped({ principalId: record!.authority.principalId, chatId: record!.authority.chatId }),
+		).toBeUndefined();
+		fixture.mappings.close();
+		await fixture.cleanup();
+	});
+
+	test("restarts a retryable close with a deterministic ingress and then retires", async () => {
+		const fixture = await createV3Fixture();
+		const { mappings } = fixture;
+		let now = Date.now() + 100_000;
+		let attempt = 0;
+		const ingressIds: string[] = [];
+		const runtime = runtimeFor(
+			async request => {
+				attempt += 1;
+				ingressIds.push(request.requestKey);
+				return attempt === 1 ? { ok: false, certainty: "retryable" } : { ok: true };
+			},
+			async () => ({ status: attempt === 1 ? "current" : "retired" }),
+		);
+		const first = reaperFor(
+			mappings,
+			runtime,
+			async () => undefined,
+			() => now,
+		);
+		await first.runOnce();
+		await first.stop();
+		now += 100_000;
+		const restarted = reaperFor(
+			mappings,
+			runtime,
+			async () => undefined,
+			() => now,
+		);
+		await restarted.runOnce();
+
+		expect(ingressIds).toHaveLength(2);
+		expect(ingressIds[1]).toContain(":retry:1");
+		expect(mappings.entries()).toHaveLength(0);
+		await restarted.stop();
+		mappings.close();
+		await fixture.cleanup();
+	});
+
+	test("rearms a previously completed close after the mapping operation advances", async () => {
+		const fixture = await createV3Fixture();
+		let { mappings } = fixture;
+		const { mapping: original } = fixture;
+		const scope = { principalId: original.principalId!, chatId: original.chatId };
+		mappings.beginOperationScoped(scope, {
+			id: "managed-close",
+			kind: "close",
+			ingressId: "managed-close",
+			detail: "managed-close",
+		});
+		mappings.transitionOperationScoped(scope, "managed-close", "complete", "managed-close", {
+			kind: "close",
+			assistantText: "",
+			events: [],
+			managedAuthority: original.managedAuthority!,
+			mapping: {
+				chatId: original.chatId,
+				projectId: original.projectId,
+				sessionId: original.sessionId,
+				rawFrameCursor: original.rawFrameCursor,
+				eventCursor: original.eventCursor,
+				operationId: "managed-close",
+			},
+			correlation: { closeStatus: "closed", mappingOperationId: original.operationId },
+		});
+		mappings.upsertScoped(scope, { ...original, operationId: "turn-2" });
+		mappings.close();
+		mappings = fixture.reopen();
+		const ingressIds: string[] = [];
+		const reaper = reaperFor(
+			mappings,
+			runtimeFor(
+				async request => {
+					ingressIds.push(request.requestKey);
+					return { ok: true };
+				},
+				async () => ({ status: "retired" }),
+			),
+		);
+		await reaper.runOnce();
+
+		expect(ingressIds[0]).toContain(":rearmed:turn-2:1");
+		expect(mappings.entries()).toHaveLength(0);
+		await reaper.stop();
+		mappings.close();
+		await fixture.cleanup();
+	});
+
+	test("does not evict after the live tenant fence fails", async () => {
+		const fixture = await createV3Fixture();
+		const { mappings, mapping } = fixture;
+		let fenceChecks = 0;
+		const reaper = reaperFor(
+			mappings,
+			runtimeFor(
+				async () => ({ ok: true }),
+				async () => ({ status: "retired" }),
+			),
+			async () => {
+				fenceChecks += 1;
+				if (fenceChecks >= 3) throw new Error("fence lost");
+			},
+		);
+
+		await reaper.runOnce();
+
+		expect(fenceChecks).toBeGreaterThanOrEqual(3);
+		expect(mappings.getScoped({ principalId: mapping.principalId!, chatId: mapping.chatId })).toBeDefined();
+		await reaper.stop();
+		mappings.close();
+		await fixture.cleanup();
+	});
 });

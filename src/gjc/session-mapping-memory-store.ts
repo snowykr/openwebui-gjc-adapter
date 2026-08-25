@@ -18,6 +18,7 @@ import type {
 import { copySessionMapping } from "./session-mapping-copy";
 import type { SessionMapping, SessionMappingScope } from "./session-mapping-store";
 import { operationResult } from "./session-operation-codec";
+import type { ManagedTurnAuthority } from "./turn-runner";
 
 const SCOPED_MAPPING_OBSERVATION = "__gjcSessionMappingScope";
 const SCOPED_MAPPING_RETIREMENT_OBSERVATION = "__gjcSessionMappingRetirement";
@@ -310,7 +311,7 @@ export class SessionMappingStore {
 	): void {
 		const canonicalScope = canonicalScopeFor(scope);
 		assertScopedKeyAvailable(this.authority, canonicalScope);
-		this.authority.beginOperation(canonicalScope.key, operation);
+		this.authority.beginOperation(canonicalScope.key, operationInputForScope(canonicalScope, operation));
 	}
 	recordAcknowledgedSuccessor(
 		chatId: string,
@@ -341,7 +342,12 @@ export class SessionMappingStore {
 		const canonicalScope = canonicalScopeFor(scope);
 		assertScopedKeyAvailable(this.authority, canonicalScope);
 		return operationForScope(
-			this.authority.recordAcknowledgedSuccessor(canonicalScope.key, operationId, operationHash, successor),
+			this.authority.recordAcknowledgedSuccessor(
+				canonicalScope.key,
+				operationId,
+				operationHash,
+				successorForScope(canonicalScope, successor),
+			),
 			canonicalScope,
 		);
 	}
@@ -385,7 +391,12 @@ export class SessionMappingStore {
 			operationId,
 			state,
 			detail,
-			result === undefined ? undefined : operationResultForScope(result, canonicalScope),
+			result === undefined
+				? undefined
+				: operationResultWithAuthority(
+						operationResultForScope(result, canonicalScope),
+						this.authority.get(canonicalScope.key)?.managedAuthority,
+					),
 		);
 	}
 	completeOperationWithMapping(
@@ -434,13 +445,17 @@ export class SessionMappingStore {
 						correlation: { ...result.correlation, mappingOperationId: mapping.operationId },
 					}
 				: result;
+		const resultWithAuthority =
+			authorityMapping.managedAuthority === undefined
+				? resultWithCloseGeneration
+				: { ...resultWithCloseGeneration, managedAuthority: authorityMapping.managedAuthority };
 		return mappingFromRecord(
 			this.authority.completeOperationWithMapping(
 				canonicalScope.key,
 				operationId,
 				detail,
 				authorityMapping,
-				resultWithCloseGeneration,
+				resultWithAuthority,
 			),
 		);
 	}
@@ -513,7 +528,12 @@ export class SessionMappingStore {
 	): void {
 		const canonicalScope = canonicalScopeFor(scope);
 		assertScopedKeyAvailable(this.authority, canonicalScope);
-		this.authority.attachProvisionalOperation(canonicalScope.key, ingressId, attachment);
+		this.authority.attachProvisionalOperation(canonicalScope.key, ingressId, {
+			...attachment,
+			...(attachment.managedAuthority === undefined
+				? {}
+				: { managedAuthority: managedAuthorityToScope(attachment.managedAuthority, canonicalScope) }),
+		});
 	}
 	transitionProvisionalOperation(
 		chatId: string,
@@ -641,6 +661,9 @@ function authorityInputForScope(scope: CanonicalScope, mapping: SessionMapping):
 	return {
 		...authorityMapping,
 		chatId: scope.key,
+		...(authorityMapping.managedAuthority === undefined
+			? {}
+			: { managedAuthority: managedAuthorityToScope(authorityMapping.managedAuthority, scope) }),
 		observations: {
 			[SCOPED_MAPPING_OBSERVATION]: {
 				principalId: scope.principalId,
@@ -656,14 +679,52 @@ function provisionalOperationInputForScope(
 ): Omit<ProvisionalSessionOperation, "state" | "startedAt" | "completedAt"> {
 	if (operation.chatId !== scope.chatId)
 		throw new Error(`Scoped session operation chat ID ${operation.chatId} does not match scope ${scope.chatId}.`);
-	return { ...operation, chatId: scope.key };
+	return {
+		...operationInputForScope(scope, operation),
+		chatId: scope.key,
+		projectId: operation.projectId,
+		sessionId: operation.sessionId,
+		...(operation.managedAuthority === undefined
+			? {}
+			: { managedAuthority: managedAuthorityToScope(operation.managedAuthority, scope) }),
+	};
+}
+
+function operationInputForScope(
+	scope: CanonicalScope,
+	operation: Omit<SessionOperation, "state" | "startedAt" | "completedAt">,
+): Omit<SessionOperation, "state" | "startedAt" | "completedAt"> {
+	return {
+		...operation,
+		...(operation.acknowledgedSuccessor === undefined
+			? {}
+			: { acknowledgedSuccessor: successorForScope(scope, operation.acknowledgedSuccessor) }),
+		...(operation.result === undefined ? {} : { result: operationResultForScope(operation.result, scope) }),
+	};
+}
+
+function successorForScope(scope: CanonicalScope, successor: AcknowledgedSuccessor): AcknowledgedSuccessor {
+	const authority = (successor as AcknowledgedSuccessor & { readonly managedAuthority?: ManagedTurnAuthority })
+		.managedAuthority;
+	return {
+		...successor,
+		...(authority === undefined ? {} : { managedAuthority: managedAuthorityToScope(authority, scope) }),
+	};
 }
 
 function provisionalOperationForScope(
 	operation: ProvisionalSessionOperation,
 	scope: CanonicalScope,
 ): ProvisionalSessionOperation {
-	return { ...operation, chatId: scope.chatId };
+	return {
+		...operationForScope(operation, scope),
+		chatId: scope.chatId,
+		projectId: operation.projectId,
+		sessionId: operation.sessionId,
+		...(operation.managedAuthority === undefined
+			? {}
+			: { managedAuthority: managedAuthorityForScope(operation.managedAuthority, scope) }),
+	};
 }
 
 function operationResultForScope(result: SessionOperationResult, scope: CanonicalScope): SessionOperationResult {
@@ -678,6 +739,9 @@ function operationResultForScope(result: SessionOperationResult, scope: Canonica
 		);
 	return {
 		...result,
+		...(result.managedAuthority === undefined
+			? {}
+			: { managedAuthority: managedAuthorityToScope(result.managedAuthority, scope) }),
 		mapping: {
 			...mapping,
 			chatId: scope.key,
@@ -693,6 +757,22 @@ function operationResultForScope(result: SessionOperationResult, scope: Canonica
 	};
 }
 
+function operationResultWithAuthority(
+	result: SessionOperationResult,
+	authority: ManagedTurnAuthority | undefined,
+): SessionOperationResult {
+	return result.managedAuthority === undefined && authority === undefined
+		? result
+		: {
+				...result,
+				...(result.managedAuthority === undefined
+					? authority === undefined
+						? {}
+						: { managedAuthority: authority }
+					: {}),
+			};
+}
+
 function operationForScope(operation: SessionOperation, scope: CanonicalScope): SessionOperation;
 function operationForScope(
 	operation: SessionOperation | undefined,
@@ -702,27 +782,49 @@ function operationForScope(
 	operation: SessionOperation | undefined,
 	scope: CanonicalScope,
 ): SessionOperation | undefined {
-	if (operation === undefined || operation.result === undefined) return operation;
+	if (operation === undefined) return undefined;
 	return {
 		...operation,
-		result: {
-			...operation.result,
-			mapping: {
-				...operation.result.mapping,
-				...(operation.result.mapping.chatId === scope.key
-					? { chatId: scope.chatId, principalId: scope.principalId }
-					: {}),
-			} as SessionOperationResult["mapping"],
-			...(operation.result.correlation === undefined
-				? {}
-				: {
-						correlation: {
-							...operation.result.correlation,
-							...(operation.result.correlation.chatId === scope.key ? { chatId: scope.chatId } : {}),
-						},
-					}),
-		},
+		...(operation.acknowledgedSuccessor === undefined
+			? {}
+			: {
+					acknowledgedSuccessor: {
+						...operation.acknowledgedSuccessor,
+						...managedAcknowledgedSuccessorAuthority(operation.acknowledgedSuccessor, scope),
+					} as AcknowledgedSuccessor,
+				}),
+		...(operation.result === undefined
+			? {}
+			: {
+					result: {
+						...operation.result,
+						managedAuthority: managedAuthorityForScope(operation.result.managedAuthority, scope),
+						mapping: {
+							...operation.result.mapping,
+							...(operation.result.mapping.chatId === scope.key
+								? { chatId: scope.chatId, principalId: scope.principalId }
+								: {}),
+						} as SessionOperationResult["mapping"],
+						...(operation.result.correlation === undefined
+							? {}
+							: {
+									correlation: {
+										...operation.result.correlation,
+										...(operation.result.correlation.chatId === scope.key ? { chatId: scope.chatId } : {}),
+									},
+								}),
+					},
+				}),
 	};
+}
+
+function managedAcknowledgedSuccessorAuthority(
+	successor: AcknowledgedSuccessor,
+	scope: CanonicalScope,
+): Readonly<Record<string, ManagedTurnAuthority>> {
+	const authority = (successor as AcknowledgedSuccessor & { readonly managedAuthority?: ManagedTurnAuthority })
+		.managedAuthority;
+	return authority === undefined ? {} : { managedAuthority: managedAuthorityForScope(authority, scope) };
 }
 
 function authorityRecordForScope(record: SessionAuthorityRecord, scope: CanonicalScope): SessionAuthorityRecord {
@@ -730,6 +832,9 @@ function authorityRecordForScope(record: SessionAuthorityRecord, scope: Canonica
 		...record,
 		chatId: scope.chatId,
 		header: { ...record.header, chatId: scope.chatId },
+		...(record.managedAuthority === undefined
+			? {}
+			: { managedAuthority: managedAuthorityForScope(record.managedAuthority, scope) }),
 		journal: record.journal.map(operation => operationForScope(operation, scope) as SessionOperation),
 		...(record.reassignment === undefined ? {} : { reassignment: reassignmentForScope(record.reassignment, scope) }),
 	};
@@ -758,9 +863,29 @@ function authorityTombstoneForScope(
 		...tombstone,
 		chatId: scope.chatId,
 		header: { ...tombstone.header, chatId: scope.chatId },
+		...(tombstone.managedAuthority === undefined
+			? {}
+			: { managedAuthority: managedAuthorityForScope(tombstone.managedAuthority, scope) }),
 		journal: tombstone.journal.map(operation => operationForScope(operation, scope) as SessionOperation),
 		...(tombstone.prior === undefined ? {} : { prior: authorityTombstoneForScope(tombstone.prior, scope) }),
 	};
+}
+
+function managedAuthorityForScope(authority: ManagedTurnAuthority, scope: CanonicalScope): ManagedTurnAuthority;
+function managedAuthorityForScope(
+	authority: ManagedTurnAuthority | undefined,
+	scope: CanonicalScope,
+): ManagedTurnAuthority | undefined;
+function managedAuthorityForScope(
+	authority: ManagedTurnAuthority | undefined,
+	scope: CanonicalScope,
+): ManagedTurnAuthority | undefined {
+	if (authority === undefined || authority.chatId !== scope.key) return authority;
+	return { ...authority, chatId: scope.chatId };
+}
+
+function managedAuthorityToScope(authority: ManagedTurnAuthority, scope: CanonicalScope): ManagedTurnAuthority {
+	return authority.chatId === scope.key ? authority : { ...authority, chatId: scope.key };
 }
 
 function mappingFromRecord(record: SessionAuthorityRecord): SessionMapping {
@@ -778,6 +903,9 @@ function mappingFromRecord(record: SessionAuthorityRecord): SessionMapping {
 		...mapping,
 		chatId: storedScope?.chatId ?? mapping.chatId,
 		...(storedScope === undefined ? {} : { principalId: storedScope.principalId }),
+		...(storedScope === undefined || record.managedAuthority === undefined
+			? {}
+			: { managedAuthority: managedAuthorityForScope(record.managedAuthority, canonicalScopeFor(storedScope)) }),
 	});
 }
 function mappingFromRecordShallow(record: SessionAuthorityRecord): SessionMapping {
@@ -801,6 +929,9 @@ function mappingFromRecordShallow(record: SessionAuthorityRecord): SessionMappin
 		...(mapping.events === undefined ? {} : { events: mapping.events }),
 		chatId: storedScope?.chatId ?? mapping.chatId,
 		...(storedScope === undefined ? {} : { principalId: storedScope.principalId }),
+		...(storedScope === undefined || record.managedAuthority === undefined
+			? {}
+			: { managedAuthority: managedAuthorityForScope(record.managedAuthority, canonicalScopeFor(storedScope)) }),
 	};
 }
 

@@ -9,6 +9,7 @@ import type {
 import type { GjcTurnEvent, ManagedTurnAuthority } from "./turn-runner";
 
 export function copyManagedAuthority(authority: ManagedTurnAuthority): ManagedTurnAuthority {
+	const v3Authority = authority as ManagedTurnAuthority & { readonly authorityEpoch?: string };
 	return {
 		principalId: authority.principalId,
 		projectId: authority.projectId,
@@ -19,6 +20,7 @@ export function copyManagedAuthority(authority: ManagedTurnAuthority): ManagedTu
 		leaseId: authority.leaseId,
 		epoch: authority.epoch,
 		requestKey: authority.requestKey,
+		...(v3Authority.authorityEpoch === undefined ? {} : { authorityEpoch: v3Authority.authorityEpoch }),
 	};
 }
 

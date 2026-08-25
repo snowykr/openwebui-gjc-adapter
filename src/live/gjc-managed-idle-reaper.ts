@@ -1,4 +1,7 @@
 import type { TenantSessionKey } from "../gjc/managed-sdk-runtime";
+import type { SessionOperation, SessionOperationResult } from "../gjc/session-authority";
+import { SESSION_AUTHORITY_V3_EPOCH } from "../gjc/session-authority-v3";
+import type { SessionMapping, SessionMappingStore } from "../gjc/session-router";
 import type { ManagedTurnAuthority } from "../gjc/turn-runner";
 
 export const DEFAULT_MANAGED_IDLE_TIMEOUT_MS = 600_000;
@@ -25,7 +28,10 @@ export interface ManagedIdleCloseIntent {
 /** Persistence owns authority records only; it has no user-file capability. */
 export interface ManagedIdleGenerationStore {
 	active(): Promise<readonly ManagedIdleGenerationRecord[]>;
-	prepareClose(record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent): Promise<boolean>;
+	prepareClose(
+		record: ManagedIdleGenerationRecord,
+		intent: ManagedIdleCloseIntent,
+	): Promise<boolean | ManagedIdleCloseIntent>;
 	restoreActive(record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent): Promise<void>;
 	retire(record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent): Promise<void>;
 	markUncertain(record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent, reason: string): Promise<void>;
@@ -66,11 +72,24 @@ export interface CreateManagedIdleReaperInput {
 	readonly idleTimeoutMs?: number;
 	readonly closeTimeoutMs?: number;
 	readonly now?: () => number;
+	/** Optional production polling. Tests and embedders may drive runOnce directly. */
+	readonly pollIntervalMs?: number;
+	readonly setInterval?: (handler: () => void, timeoutMs: number) => ReturnType<typeof setInterval>;
+	readonly clearInterval?: (timer: ReturnType<typeof setInterval>) => void;
 }
 
 export interface ManagedIdleReaper {
 	runOnce(): Promise<void>;
 	stop(): Promise<void>;
+}
+
+/**
+ * Adapts canonical V3 mappings to the idle reaper's credential-free record
+ * contract. Every mutation is a SessionMappingStore operation; no runtime
+ * endpoint or user artifact is inspected.
+ */
+export function createManagedV3GenerationStore(mappings: SessionMappingStore): ManagedIdleGenerationStore {
+	return new ManagedV3GenerationStore(mappings);
 }
 
 /**
@@ -85,6 +104,8 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 	readonly #timeoutMs: number;
 	readonly #now: () => number;
 	readonly #inFlight = new Map<string, Promise<void>>();
+	readonly #clearInterval: (timer: ReturnType<typeof setInterval>) => void;
+	#poller: ReturnType<typeof setInterval> | undefined;
 	#stopped = false;
 	#draining: Promise<void> | undefined;
 
@@ -93,6 +114,16 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 		if (!Number.isSafeInteger(this.#timeoutMs) || this.#timeoutMs <= 0)
 			throw new TypeError("idleTimeoutMs must be a positive safe integer.");
 		this.#now = input.now ?? Date.now;
+		this.#clearInterval = input.clearInterval ?? (timer => globalThis.clearInterval(timer));
+		if (input.pollIntervalMs !== undefined) {
+			if (!Number.isSafeInteger(input.pollIntervalMs) || input.pollIntervalMs <= 0)
+				throw new TypeError("pollIntervalMs must be a positive safe integer.");
+			const setInterval = input.setInterval ?? ((handler, timeoutMs) => globalThis.setInterval(handler, timeoutMs));
+			this.#poller = setInterval(() => {
+				void this.runOnce().catch(() => undefined);
+			}, input.pollIntervalMs);
+			(this.#poller as unknown as { unref?: () => void }).unref?.();
+		}
 	}
 
 	async runOnce(): Promise<void> {
@@ -117,6 +148,10 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 
 	async stop(): Promise<void> {
 		this.#stopped = true;
+		if (this.#poller !== undefined) {
+			this.#clearInterval(this.#poller);
+			this.#poller = undefined;
+		}
 		if (this.#draining === undefined) {
 			this.#draining = (async () => {
 				while (this.#inFlight.size > 0) await Promise.allSettled([...this.#inFlight.values()]);
@@ -130,6 +165,7 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 		let releaseAdmission: (() => void) | undefined;
 		let lease: ManagedIdleLease | undefined;
 		let intent: ManagedIdleCloseIntent | undefined;
+		let retired = false;
 		try {
 			releaseAdmission = await this.input.admission.acquire(key);
 			if (releaseAdmission === undefined || this.#stopped) return;
@@ -137,12 +173,14 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 			if (lease === undefined || this.#stopped) return;
 			await lease.assertFence();
 			intent = { key: closeKey(record.authority), authority: record.authority, requestedAt: this.#now() };
-			if (!(await this.input.records.prepareClose(record, intent))) return;
+			const prepared = await this.input.records.prepareClose(record, intent);
+			if (prepared === false) return;
+			if (prepared !== true) intent = prepared;
 			await lease.assertFence();
 			let outcome: Readonly<{ ok: boolean; certainty?: string }>;
 			try {
 				outcome = await this.input.runtime.closeLifecycleSession({
-					actor: { id: record.authority.principalId, namespace: record.authority.projectId },
+					actor: { id: record.authority.principalId, namespace: "openwebui-gjc-adapter" },
 					capability: "session.close",
 					requestKey: intent.key,
 					target: { sessionId: record.authority.sessionId, endpointGeneration: record.authority.generation },
@@ -155,9 +193,9 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 				if (status.status === "retired") {
 					await lease.assertFence();
 					await this.input.records.retire(record, intent);
+					retired = true;
 					await lease.assertFence();
 					await this.input.records.evict(record, intent);
-					await lease.assertFence();
 					await this.input.records.publishRetired?.(record, intent);
 					return;
 				}
@@ -167,7 +205,8 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 				}
 				await this.input.records.markUncertain(record, intent, `Exact generation status is ${status.status}.`);
 			} catch (error) {
-				if (intent !== undefined) await this.input.records.markUncertain(record, intent, errorMessage(error));
+				if (intent !== undefined && !retired)
+					await this.input.records.markUncertain(record, intent, errorMessage(error));
 			}
 		} finally {
 			try {
@@ -176,6 +215,174 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 			releaseAdmission?.();
 		}
 	}
+}
+
+class ManagedV3GenerationStore implements ManagedIdleGenerationStore {
+	constructor(private readonly mappings: SessionMappingStore) {}
+
+	async active(): Promise<readonly ManagedIdleGenerationRecord[]> {
+		const records: ManagedIdleGenerationRecord[] = [];
+		for (const mapping of this.mappings.mappingRecordsIterable()) {
+			const authority = mapping.managedAuthority;
+			if (!isManagedV3Authority(authority) || authority.chatId !== mapping.chatId) continue;
+			const scope = { principalId: authority.principalId, chatId: mapping.chatId };
+			const operations = this.mappings.operationsScoped(scope);
+			const pending = operations.some(operation => operation.state === "pending" && operation.kind !== "close");
+			records.push({
+				authority,
+				lastActivityAt: latestActivityAt(operations),
+				state: pending ? "inflight" : "active",
+			});
+		}
+		return records;
+	}
+
+	async prepareClose(
+		record: ManagedIdleGenerationRecord,
+		intent: ManagedIdleCloseIntent,
+	): Promise<boolean | ManagedIdleCloseIntent> {
+		const scope = scopeFor(record.authority);
+		const mapping = this.mappings.getScoped(scope);
+		if (mapping === undefined || !sameManagedAuthority(mapping, record.authority)) return false;
+		const operations = this.mappings.operationsScoped(scope);
+		const currentOperation = operations.find(operation => operation.id === mapping.operationId);
+		if (currentOperation !== undefined && currentOperation.state !== "complete") return false;
+		const closeOperations = operations.filter(operation => operation.kind === "close");
+		const prior =
+			closeOperations.find(operation => operation.id === intent.key) ?? closeOperations[closeOperations.length - 1];
+		const key = nextManagedCloseIngress(intent.key, mapping.operationId, closeOperations, prior);
+		this.mappings.beginOperationScoped(scope, {
+			id: key,
+			kind: "close",
+			ingressId: key,
+			detail: key,
+		});
+		return key === intent.key ? true : { ...intent, key };
+	}
+
+	async restoreActive(_record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent): Promise<void> {
+		const scope = scopeFor(intent.authority);
+		const mapping = this.mappings.getScoped(scope);
+		if (mapping === undefined || !sameManagedAuthority(mapping, intent.authority)) return;
+		if (this.mappings.operationScoped(scope, intent.key) === undefined) return;
+		this.mappings.transitionOperationScoped(
+			scope,
+			intent.key,
+			"conflict",
+			"Managed session close remains current and is retryable.",
+		);
+	}
+
+	async retire(record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent): Promise<void> {
+		const scope = scopeFor(record.authority);
+		const mapping = this.mappings.getScoped(scope);
+		if (mapping === undefined || !sameManagedAuthority(mapping, record.authority))
+			throw new Error("Managed V3 mapping changed before durable retirement.");
+		const result: SessionOperationResult = {
+			kind: "close",
+			assistantText: "",
+			events: [],
+			managedAuthority: record.authority,
+			mapping: {
+				chatId: mapping.chatId,
+				projectId: mapping.projectId,
+				sessionId: mapping.sessionId,
+				rawFrameCursor: mapping.rawFrameCursor,
+				eventCursor: mapping.eventCursor,
+				operationId: intent.key,
+			},
+			correlation: { closeStatus: "closed", mappingOperationId: mapping.operationId },
+		};
+		this.mappings.transitionOperationScoped(scope, intent.key, "complete", intent.key, result);
+	}
+
+	async markUncertain(
+		_record: ManagedIdleGenerationRecord,
+		intent: ManagedIdleCloseIntent,
+		reason: string,
+	): Promise<void> {
+		const scope = scopeFor(intent.authority);
+		const mapping = this.mappings.getScoped(scope);
+		if (mapping === undefined || !sameManagedAuthority(mapping, intent.authority)) return;
+		if (this.mappings.operationScoped(scope, intent.key) === undefined) return;
+		this.mappings.transitionOperationScoped(scope, intent.key, "uncertain", reason);
+	}
+
+	async evict(record: ManagedIdleGenerationRecord, _intent: ManagedIdleCloseIntent): Promise<void> {
+		const scope = scopeFor(record.authority);
+		const mapping = this.mappings.getScoped(scope);
+		if (mapping === undefined || !sameManagedAuthority(mapping, record.authority))
+			throw new Error("Managed V3 mapping changed before durable eviction.");
+		this.mappings.retireScoped(scope);
+	}
+}
+
+function scopeFor(authority: ManagedTurnAuthority): { readonly principalId: string; readonly chatId: string } {
+	return { principalId: authority.principalId, chatId: authority.chatId };
+}
+
+function sameManagedAuthority(mapping: SessionMapping, authority: ManagedTurnAuthority): boolean {
+	const candidate = mapping.managedAuthority;
+	return (
+		isManagedV3Authority(candidate) &&
+		candidate.principalId === authority.principalId &&
+		candidate.projectId === authority.projectId &&
+		candidate.canonicalWorkspace === authority.canonicalWorkspace &&
+		candidate.chatId === authority.chatId &&
+		candidate.sessionId === authority.sessionId &&
+		candidate.generation === authority.generation &&
+		candidate.leaseId === authority.leaseId &&
+		candidate.epoch === authority.epoch &&
+		candidate.requestKey === authority.requestKey
+	);
+}
+
+function isManagedV3Authority(
+	authority: ManagedTurnAuthority | undefined,
+): authority is ManagedTurnAuthority & { readonly authorityEpoch: typeof SESSION_AUTHORITY_V3_EPOCH } {
+	const candidate = authority as (ManagedTurnAuthority & { readonly authorityEpoch?: unknown }) | undefined;
+	return (
+		candidate?.authorityEpoch === SESSION_AUTHORITY_V3_EPOCH &&
+		candidate.principalId.length > 0 &&
+		candidate.projectId.length > 0 &&
+		candidate.canonicalWorkspace.length > 0 &&
+		candidate.chatId.length > 0 &&
+		candidate.sessionId.length > 0 &&
+		candidate.leaseId.length > 0 &&
+		candidate.epoch.length > 0 &&
+		candidate.requestKey.length > 0 &&
+		Number.isSafeInteger(candidate.generation) &&
+		candidate.generation > 0
+	);
+}
+
+function latestActivityAt(operations: readonly SessionOperation[]): number {
+	let latest = 0;
+	for (const operation of operations) {
+		const startedAt = Date.parse(operation.startedAt);
+		if (Number.isFinite(startedAt)) latest = Math.max(latest, startedAt);
+		if (operation.completedAt !== undefined) {
+			const completedAt = Date.parse(operation.completedAt);
+			if (Number.isFinite(completedAt)) latest = Math.max(latest, completedAt);
+		}
+	}
+	return latest;
+}
+
+function nextManagedCloseIngress(
+	base: string,
+	mappingOperationId: string,
+	operations: readonly SessionOperation[],
+	prior: SessionOperation | undefined,
+): string {
+	if (prior === undefined) return base;
+	const retryCount = operations.filter(operation => operation.id.startsWith(`${base}:retry:`)).length + 1;
+	const priorMappingOperationId = prior.result?.correlation?.mappingOperationId;
+	if (prior.state === "complete" && priorMappingOperationId !== mappingOperationId) {
+		const rearmCount = operations.filter(operation => operation.id.startsWith(`${base}:rearmed:`)).length + 1;
+		return `${base}:rearmed:${mappingOperationId}:${rearmCount}`;
+	}
+	return `${base}:retry:${retryCount}`;
 }
 
 function tenantKey(authority: ManagedTurnAuthority): TenantSessionKey {

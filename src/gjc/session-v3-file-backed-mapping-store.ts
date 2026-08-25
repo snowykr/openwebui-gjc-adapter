@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { dirname } from "node:path";
 import {
+	canonicalSessionMappingKey,
 	type ProvisionalSessionOperation,
 	SessionAuthority,
 	type SessionAuthorityInput,
@@ -37,6 +38,7 @@ import {
 	type SessionAuthorityV3Tombstone,
 } from "./session-authority-v3";
 import { SessionMappingStore } from "./session-mapping-memory-store";
+import type { ManagedTurnAuthority } from "./turn-runner";
 
 /** Canonical V3 authority storage. This deliberately has no V2 compatibility,
  * attachment, descriptor, or terminal persistence path. The activation marker
@@ -116,7 +118,14 @@ class V3FileSessionAuthority extends SessionAuthority {
 		detail?: string,
 		result?: SessionOperationResult,
 	): SessionAuthorityRecord {
-		return this.mutate(() => super.transitionOperation(chatId, operationId, state, detail, result));
+		return this.mutate(() => {
+			const authority = this.get(chatId)?.managedAuthority;
+			const durableResult =
+				result === undefined || result.managedAuthority !== undefined || authority === undefined
+					? result
+					: { ...result, managedAuthority: authority };
+			return super.transitionOperation(chatId, operationId, state, detail, durableResult);
+		});
 	}
 	override completeOperationWithMapping(
 		chatId: string,
@@ -126,7 +135,11 @@ class V3FileSessionAuthority extends SessionAuthority {
 		result: SessionOperationResult,
 	): SessionAuthorityRecord {
 		return this.mutate(() => {
-			super.transitionOperation(chatId, operationId, "complete", detail, result);
+			const durableResult =
+				result.managedAuthority === undefined && mapping.managedAuthority !== undefined
+					? { ...result, managedAuthority: mapping.managedAuthority }
+					: result;
+			super.transitionOperation(chatId, operationId, "complete", detail, durableResult);
 			return super.upsert(mapping);
 		});
 	}
@@ -157,7 +170,17 @@ class V3FileSessionAuthority extends SessionAuthority {
 		operation: Omit<ProvisionalSessionOperation, "state" | "startedAt" | "completedAt">,
 		mapping: SessionAuthorityInput,
 	): SessionAuthorityRecord {
-		return this.mutate(() => super.publishProvisionalOperation(operation, mapping));
+		return this.mutate(() => {
+			const published = super.publishProvisionalOperation(operation, mapping);
+			const normalized = normalizePublishedRecord(published);
+			if (normalized !== published) {
+				this.replaceAll(
+					this.entries().map(record => (record.chatId === normalized.chatId ? normalized : record)),
+					this.provisionalEntries(),
+				);
+			}
+			return normalized;
+		});
 	}
 	override attachProvisionalOperation(
 		chatId: string,
@@ -293,6 +316,85 @@ export class V3FileBackedSessionMappingStore extends SessionMappingStore {
 
 export { V3FileBackedSessionMappingStore as SessionV3FileBackedMappingStore };
 
+function normalizePublishedRecord(record: SessionAuthorityRecord): SessionAuthorityRecord {
+	const authority = record.managedAuthority;
+	if (authority === undefined) return record;
+	const managedAuthority = { ...authority, chatId: record.chatId };
+	const journal = record.journal.map(operation =>
+		normalizePublishedOperation(operation, managedAuthority, record.chatId),
+	);
+	const reassignment =
+		record.reassignment === undefined
+			? undefined
+			: {
+					...record.reassignment,
+					...(record.reassignment.sourceTombstone === undefined
+						? {}
+						: { sourceTombstone: normalizePublishedTombstone(record.reassignment.sourceTombstone) }),
+					...(record.reassignment.priorTombstone === undefined
+						? {}
+						: { priorTombstone: normalizePublishedTombstone(record.reassignment.priorTombstone) }),
+				};
+	const changed =
+		authority.chatId !== managedAuthority.chatId ||
+		record.journal.some((operation, index) => operation !== journal[index]) ||
+		record.reassignment !== reassignment;
+	return changed
+		? { ...record, managedAuthority, journal, ...(reassignment === undefined ? {} : { reassignment }) }
+		: record;
+}
+
+function normalizePublishedOperation(
+	operation: SessionOperation,
+	managedAuthority: ManagedTurnAuthority,
+	durableChatId: string,
+): SessionOperation {
+	const successor = operation.acknowledgedSuccessor;
+	const successorAuthority =
+		successor === undefined
+			? undefined
+			: (successor as AcknowledgedSuccessor & { readonly managedAuthority?: ManagedTurnAuthority }).managedAuthority;
+	const result = operation.result;
+	const normalizedResult =
+		result === undefined
+			? undefined
+			: {
+					...result,
+					managedAuthority: {
+						...(result.managedAuthority ?? managedAuthority),
+						chatId: durableChatId,
+					},
+					mapping: { ...result.mapping, chatId: durableChatId },
+				};
+	return {
+		...operation,
+		...(successor === undefined || successorAuthority === undefined
+			? {}
+			: {
+					acknowledgedSuccessor: {
+						...successor,
+						managedAuthority: { ...successorAuthority, chatId: durableChatId },
+					} as AcknowledgedSuccessor,
+				}),
+		...(normalizedResult === undefined ? {} : { result: normalizedResult }),
+	};
+}
+
+function normalizePublishedTombstone(tombstone: SessionAuthorityTombstone): SessionAuthorityTombstone {
+	const authority = tombstone.managedAuthority;
+	if (authority === undefined) return tombstone;
+	const managedAuthority = { ...authority, chatId: tombstone.chatId };
+	return {
+		...tombstone,
+		header: { ...tombstone.header, chatId: tombstone.chatId },
+		managedAuthority,
+		journal: tombstone.journal.map(operation =>
+			normalizePublishedOperation(operation, managedAuthority, tombstone.chatId),
+		),
+		...(tombstone.prior === undefined ? {} : { prior: normalizePublishedTombstone(tombstone.prior) }),
+	};
+}
+
 function authorityV3(value: unknown, context: string): ManagedTurnAuthorityV3 {
 	if (typeof value !== "object" || value === null) throw new Error(`V3 managed authority is required for ${context}.`);
 	const authority = value as Omit<ManagedTurnAuthorityV3, "authorityEpoch">;
@@ -300,7 +402,19 @@ function authorityV3(value: unknown, context: string): ManagedTurnAuthorityV3 {
 		throw new Error(`V3 managed authority epoch is required for ${context}.`);
 	return { ...authority, authorityEpoch: SESSION_AUTHORITY_V3_EPOCH };
 }
-function toV3Operation(operation: SessionOperation, context: string): SessionAuthorityV3Operation {
+function authorityV3ForDurableChat(
+	value: unknown,
+	context: string,
+	durableChatId: string | undefined,
+): ManagedTurnAuthorityV3 {
+	const authority = authorityV3(value, context);
+	return durableChatId === undefined ? authority : { ...authority, chatId: durableChatId };
+}
+function toV3Operation(
+	operation: SessionOperation,
+	context: string,
+	durableChatId?: string,
+): SessionAuthorityV3Operation {
 	const { acknowledgedSuccessor, result, ...rest } = operation;
 	return {
 		...rest,
@@ -309,9 +423,10 @@ function toV3Operation(operation: SessionOperation, context: string): SessionAut
 			: {
 					acknowledgedSuccessor: {
 						sessionId: acknowledgedSuccessor.sessionId,
-						managedAuthority: authorityV3(
+						managedAuthority: authorityV3ForDurableChat(
 							(acknowledgedSuccessor as unknown as { managedAuthority?: unknown }).managedAuthority,
 							`${context} successor`,
+							durableChatId,
 						),
 					},
 				}),
@@ -320,8 +435,12 @@ function toV3Operation(operation: SessionOperation, context: string): SessionAut
 			: {
 					result: {
 						...result,
-						mapping: stripMapping(result.mapping),
-						managedAuthority: authorityV3(result.managedAuthority, `${context} result`),
+						mapping: resultMappingForDurableChat(result.mapping, durableChatId),
+						managedAuthority: authorityV3ForDurableChat(
+							result.managedAuthority,
+							`${context} result`,
+							durableChatId,
+						),
 					},
 				}),
 	};
@@ -348,7 +467,14 @@ function stripMapping(
 	const { sessionFile: _sessionFile, activeLeaf: _activeLeaf, attachment: _attachment, ...v3 } = mapping;
 	return v3;
 }
-function toV3Tombstone(tombstone: SessionAuthorityTombstone): SessionAuthorityV3Tombstone {
+function resultMappingForDurableChat(
+	mapping: SessionOperationResult["mapping"],
+	durableChatId: string | undefined,
+): SessionAuthorityV3Operation["result"] extends infer _ ? any : never {
+	const v3 = stripMapping(mapping);
+	return durableChatId === undefined ? v3 : { ...v3, chatId: durableChatId };
+}
+function toV3Tombstone(tombstone: SessionAuthorityTombstone, durableChatId?: string): SessionAuthorityV3Tombstone {
 	const {
 		version: _version,
 		sessionFile: _sessionFile,
@@ -361,11 +487,14 @@ function toV3Tombstone(tombstone: SessionAuthorityTombstone): SessionAuthorityV3
 	} = tombstone;
 	return {
 		...rest,
+		...(durableChatId === undefined
+			? {}
+			: { chatId: durableChatId, header: { ...rest.header, chatId: durableChatId } }),
 		version: 3,
 		authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
-		managedAuthority: authorityV3(managedAuthority, "tombstone"),
-		journal: journal.map(item => toV3Operation(item, "tombstone operation")),
-		...(prior === undefined ? {} : { prior: toV3Tombstone(prior) }),
+		managedAuthority: authorityV3ForDurableChat(managedAuthority, "tombstone", durableChatId),
+		journal: journal.map(item => toV3Operation(item, "tombstone operation", durableChatId)),
+		...(prior === undefined ? {} : { prior: toV3Tombstone(prior, durableChatId) }),
 	};
 }
 function fromV3Tombstone(tombstone: SessionAuthorityV3Tombstone): SessionAuthorityTombstone {
@@ -379,12 +508,13 @@ function fromV3Tombstone(tombstone: SessionAuthorityV3Tombstone): SessionAuthori
 }
 function toV3Reassignment(
 	reassignment: NonNullable<SessionAuthorityRecord["reassignment"]>,
+	durableChatId?: string,
 ): SessionAuthorityV3Reassignment {
 	const { sourceTombstone, priorTombstone, ...rest } = reassignment;
 	return {
 		...rest,
-		...(sourceTombstone === undefined ? {} : { sourceTombstone: toV3Tombstone(sourceTombstone) }),
-		...(priorTombstone === undefined ? {} : { priorTombstone: toV3Tombstone(priorTombstone) }),
+		...(sourceTombstone === undefined ? {} : { sourceTombstone: toV3Tombstone(sourceTombstone, durableChatId) }),
+		...(priorTombstone === undefined ? {} : { priorTombstone: toV3Tombstone(priorTombstone, durableChatId) }),
 	};
 }
 function fromV3Reassignment(
@@ -412,9 +542,17 @@ function toV3Mapping(record: SessionAuthorityRecord): SessionAuthorityV3Mapping 
 		...rest,
 		version: 3,
 		authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
-		managedAuthority: authorityV3(managedAuthority, `mapping ${record.chatId}`),
-		journal: journal.map(item => toV3Operation(item, `mapping ${record.chatId} operation`)),
-		...(reassignment === undefined ? {} : { reassignment: toV3Reassignment(reassignment) }),
+		managedAuthority: authorityV3ForDurableChat(
+			managedAuthority,
+			`mapping ${record.chatId}`,
+			scopedDurableChatId(record),
+		),
+		journal: journal.map(item =>
+			toV3Operation(item, `mapping ${record.chatId} operation`, scopedDurableChatId(record)),
+		),
+		...(reassignment === undefined
+			? {}
+			: { reassignment: toV3Reassignment(reassignment, scopedDurableChatId(record)) }),
 	};
 }
 function fromV3Mapping(mapping: SessionAuthorityV3Mapping): SessionAuthorityRecord {
@@ -430,12 +568,13 @@ function toV3Provisional(operation: ProvisionalSessionOperation): SessionAuthori
 	const { sessionFile: _sessionFile, attachment: _attachment, managedAuthority, ...rest } = operation;
 	if (operation.sessionId === undefined)
 		throw new Error(`V3 provisional operation ${operation.id} requires a session ID.`);
+	const durableChatId = scopedProvisionalChatId(operation);
 	return {
-		...toV3Operation(rest, `provisional ${operation.id}`),
+		...toV3Operation(rest, `provisional ${operation.id}`, durableChatId),
 		chatId: operation.chatId,
 		projectId: operation.projectId,
 		sessionId: operation.sessionId,
-		managedAuthority: authorityV3(managedAuthority, `provisional ${operation.id}`),
+		managedAuthority: authorityV3ForDurableChat(managedAuthority, `provisional ${operation.id}`, durableChatId),
 	};
 }
 function fromV3Provisional(operation: SessionAuthorityV3ProvisionalOperation): ProvisionalSessionOperation {
@@ -447,4 +586,24 @@ function fromV3Provisional(operation: SessionAuthorityV3ProvisionalOperation): P
 		sessionId: operation.sessionId,
 		managedAuthority,
 	};
+}
+
+function scopedDurableChatId(record: SessionAuthorityRecord): string | undefined {
+	const observation = record.observations?.["__gjcSessionMappingScope"];
+	if (typeof observation !== "object" || observation === null || Array.isArray(observation)) return undefined;
+	const principalId = (observation as { readonly principalId?: unknown }).principalId;
+	const chatId = (observation as { readonly chatId?: unknown }).chatId;
+	return typeof principalId === "string" && typeof chatId === "string"
+		? canonicalSessionMappingKey(principalId, chatId) === record.chatId
+			? record.chatId
+			: undefined
+		: undefined;
+}
+
+function scopedProvisionalChatId(operation: ProvisionalSessionOperation): string | undefined {
+	const authority = operation.managedAuthority;
+	if (authority === undefined || authority.chatId === operation.chatId) return undefined;
+	return canonicalSessionMappingKey(authority.principalId, authority.chatId) === operation.chatId
+		? operation.chatId
+		: undefined;
 }
