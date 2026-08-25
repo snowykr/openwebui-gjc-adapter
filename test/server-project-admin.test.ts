@@ -10,6 +10,7 @@ import {
 	attachmentFromPublishedSdkEndpoint,
 	readPublishedSdkEndpointDescriptor,
 } from "../src/gjc/public-sdk-session-port";
+import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import { type SessionMapping, SessionMappingStore } from "../src/gjc/session-router";
 import {
 	GjcCloseReceipt,
@@ -254,7 +255,7 @@ describe("project admin routes", () => {
 		).resolves.toEqual({ status: "closed" });
 		expect(managed.requests).toEqual(["managed-close"]);
 		expect(managed.calls).toEqual(["close", "reconcile", "status"]);
-		expect(fenceKeys).toEqual(["managed-session:7", "managed-session:7"]);
+		expect(fenceKeys).toEqual(["managed-session:7", "managed-session:7", "managed-session:7"]);
 		expect(legacyPreflights).toBe(0);
 		expect(
 			mappings.operationScoped({ principalId: authority.principalId, chatId: mapping.chatId }, ingress.ingressId),
@@ -302,6 +303,54 @@ describe("project admin routes", () => {
 				"managed-unwired-close",
 			),
 		).toBeUndefined();
+	});
+	test("runs V3 workspace admin cleanup through managed retirement before evicting the exact generation", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-cleanup-"));
+		tempDirs.push(workspace);
+		const mappings = new SessionMappingStore();
+		const managed = managedCloseRuntime("retired");
+		const turnRunner = strictCloseTurnRunner();
+		let legacyPreflights = 0;
+		turnRunner.withLifecycleClosePreflight = async () => {
+			legacyPreflights += 1;
+			throw new Error("managed cleanup must not enter the legacy lifecycle");
+		};
+		const options = await buildAdapterServerOptionsFromEnv(
+			{ ...adapterEnv(workspace), GJC_OPENWEBUI_OWNER_USER_ID: "admin-test" },
+			{
+				turnRunner,
+				mappings,
+				modelReaderFactory,
+				managedSdkRuntime: managed.runtime,
+				managedSdkTenantFence: (() => true) satisfies ManagedSdkTenantFence,
+			},
+		);
+		try {
+			const routes = options.routes;
+			if (routes?.workspaceCleanupService === undefined || routes.workspaceRegistry === undefined)
+				throw new Error("expected workspace cleanup routes");
+			const userWorkspace = await routes.workspaceRegistry.open("owner-test");
+			const authority = managedAuthority(userWorkspace.root, "managed-cleanup", "managed-cleanup-request");
+			const mapping = {
+				...mappingFor("managed-project", "managed-cleanup"),
+				managedAuthority: authority,
+			};
+			mappings.setScoped({ principalId: authority.principalId, chatId: mapping.chatId }, mapping);
+			const preview = await routes.workspaceCleanupService.preview({ userId: "owner-test" });
+			if (preview.confirmationToken === undefined) throw new Error("expected cleanup confirmation token");
+			await expect(
+				routes.workspaceCleanupService.cleanup({
+					userId: "owner-test",
+					confirmationToken: preview.confirmationToken,
+				}),
+			).resolves.toMatchObject({ status: "removed", outcome: "success" });
+			expect(managed.requests).toHaveLength(1);
+			expect(managed.calls).toEqual(["close", "reconcile", "status"]);
+			expect(legacyPreflights).toBe(0);
+			expect(mappings.getScoped({ principalId: authority.principalId, chatId: mapping.chatId })).toBeUndefined();
+		} finally {
+			await options.shutdownCleanup?.();
+		}
 	});
 	test("fails closed for managed unknown, replaced, non-dispatch, and fence-loss outcomes", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-close-outcomes-"));
@@ -966,9 +1015,10 @@ function managedAuthority(cwd: string, sessionId: string, requestKey: string): M
 		sessionId,
 		generation: 7,
 		leaseId: "managed-lease",
-		epoch: "managed-epoch",
+		epoch: SESSION_AUTHORITY_V3_EPOCH,
 		requestKey,
-	};
+		authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+	} as ManagedTurnAuthority;
 }
 
 function managedCloseRuntime(initialStatus: "current" | "retired" | "replaced" | "unknown") {

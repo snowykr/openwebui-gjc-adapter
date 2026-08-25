@@ -1722,21 +1722,27 @@ describe("managed V3 idle retirement", () => {
 		const fixture = await createV3Fixture();
 		const { mappings, mapping } = fixture;
 		expect(await createManagedV3GenerationStore(mappings).active()).toHaveLength(1);
+		const lifecycleCalls: string[] = [];
 		const closeTargets: Array<{ readonly sessionId: string; readonly endpointGeneration: number }> = [];
-		const reaper = reaperFor(
-			mappings,
-			runtimeFor(
-				async request => {
-					closeTargets.push(request.target);
-					return { ok: true };
-				},
-				async () => ({ status: "retired" }),
-			),
-		);
+		const reaper = reaperFor(mappings, {
+			closeLifecycleSession: async request => {
+				lifecycleCalls.push("close");
+				closeTargets.push(request.target);
+				return { ok: true };
+			},
+			reconcile: async () => {
+				lifecycleCalls.push("reconcile");
+			},
+			generationStatus: async () => {
+				lifecycleCalls.push("status");
+				return { status: "retired" };
+			},
+		});
 
 		await reaper.runOnce();
 
 		expect(closeTargets).toEqual([{ sessionId: mapping.sessionId, endpointGeneration: 1 }]);
+		expect(lifecycleCalls).toEqual(["close", "reconcile", "status"]);
 		expect(mappings.getScoped({ principalId: mapping.principalId!, chatId: mapping.chatId })).toBeUndefined();
 		expect(mapping).not.toHaveProperty("attachment");
 		expect(mapping).not.toHaveProperty("sessionFile");

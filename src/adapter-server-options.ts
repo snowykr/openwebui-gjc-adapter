@@ -967,12 +967,66 @@ function createWorkspaceAuthorityCoordinator(
 				if (result.status !== "closed")
 					throw new Error(`Workspace cleanup could not close session authority for chat ${mapping.chatId}`);
 				await assertFence();
-				mappings.retireScoped({ principalId, chatId: mapping.chatId });
+				const scope = { principalId, chatId: mapping.chatId };
+				if (isCanonicalManagedV3Mapping(mapping)) {
+					const current = mappings.getScoped(scope);
+					if (current === undefined || !sameCanonicalManagedV3Authority(current, mapping))
+						throw new Error(
+							`Workspace cleanup found a changed canonical V3 generation for chat ${mapping.chatId}`,
+						);
+				}
+				mappings.retireScoped(scope);
 				await assertFence();
 			}
 		},
 	};
 }
+
+function isCanonicalManagedV3Mapping(mapping: SessionMapping): boolean {
+	const authority = mapping.managedAuthority as
+		| (ManagedTurnAuthority & { readonly authorityEpoch?: unknown })
+		| undefined;
+	return (
+		authority !== undefined &&
+		authority.authorityEpoch === SESSION_AUTHORITY_V3_EPOCH &&
+		authority.chatId === mapping.chatId &&
+		authority.projectId === mapping.projectId &&
+		authority.sessionId === mapping.sessionId &&
+		mapping.principalId === authority.principalId
+	);
+}
+
+function sameCanonicalManagedV3Authority(left: SessionMapping, right: SessionMapping): boolean {
+	const leftAuthority = left.managedAuthority as
+		| (ManagedTurnAuthority & { readonly authorityEpoch?: unknown })
+		| undefined;
+	const rightAuthority = right.managedAuthority as
+		| (ManagedTurnAuthority & { readonly authorityEpoch?: unknown })
+		| undefined;
+	if (
+		leftAuthority === undefined ||
+		rightAuthority === undefined ||
+		leftAuthority.authorityEpoch !== SESSION_AUTHORITY_V3_EPOCH ||
+		rightAuthority.authorityEpoch !== SESSION_AUTHORITY_V3_EPOCH
+	)
+		return false;
+	return (
+		left.chatId === right.chatId &&
+		left.projectId === right.projectId &&
+		left.sessionId === right.sessionId &&
+		left.principalId === right.principalId &&
+		leftAuthority.principalId === rightAuthority.principalId &&
+		leftAuthority.projectId === rightAuthority.projectId &&
+		leftAuthority.canonicalWorkspace === rightAuthority.canonicalWorkspace &&
+		leftAuthority.chatId === rightAuthority.chatId &&
+		leftAuthority.sessionId === rightAuthority.sessionId &&
+		leftAuthority.generation === rightAuthority.generation &&
+		leftAuthority.leaseId === rightAuthority.leaseId &&
+		leftAuthority.epoch === rightAuthority.epoch &&
+		leftAuthority.requestKey === rightAuthority.requestKey
+	);
+}
+
 function appendStartupCleanupError(startupError: unknown, cleanupError: unknown): unknown {
 	if (!(startupError instanceof Error))
 		return new AggregateError([startupError, cleanupError], "Startup failure cleanup failed");

@@ -1,5 +1,7 @@
+import { isAbsolute, resolve } from "node:path";
 import type { ResolvedAdapterConfig } from "./config";
 import { CliLifecycleBackend } from "./gjc/cli-lifecycle-backend";
+import { SESSION_AUTHORITY_V3_EPOCH } from "./gjc/session-authority-v3";
 import {
 	routeGjcSessionClose,
 	type SessionCloseIngress,
@@ -12,7 +14,7 @@ import type { GjcSessionTurnRunner } from "./live/gjc-routing-runner";
 import type { SessionCloseResult } from "./projects/link-service";
 
 export interface AdapterCloseOptionsDependencies {
-	/** Process-owned managed runtime for mappings with complete managed authority. */
+	/** Process-owned managed runtime for mappings at the canonical V3 authority epoch. */
 	readonly managedSdkRuntime?: ManagedSdkRuntimeDependency;
 	/** Exact managed tenant lease/epoch fence. */
 	readonly managedSdkTenantFence?: import("./live/gjc-routing-lifecycle").ManagedSdkTenantFence;
@@ -34,40 +36,68 @@ export function createAdapterSessionCloser(
 	const closeWithOwnedPaneProof = (mapping: SessionMapping, receipt: GjcCloseReceipt) =>
 		requestExitAndProveOwnedSessionClosed(config, cliPath, mapping, receipt);
 	return async (mapping, ingress) => {
-		if (hasCompleteManagedAuthority(mapping)) {
+		if (isCanonicalManagedV3Epoch(mapping)) {
+			if (!hasCompleteManagedAuthority(mapping))
+				return {
+					status: "uncertain",
+					message: "Managed V3 close requires complete managed authority at the canonical epoch.",
+				};
 			if (!managedCloseAvailable)
 				return {
 					status: "uncertain",
 					message: "Managed GJC close requires a process-owned runtime and exact tenant fence.",
 				};
+			const runtime = dependencies.managedSdkRuntime;
+			const tenantFence = dependencies.managedSdkTenantFence;
+			if (runtime === undefined || tenantFence === undefined)
+				throw new Error("Managed GJC close runtime or exact tenant fence is unavailable.");
+			const fencedRuntime = new Proxy(runtime, {
+				get(target, property) {
+					if (property !== "generationStatus") {
+						const value = Reflect.get(target, property, target);
+						return typeof value === "function" ? value.bind(target) : value;
+					}
+					return async (tenant: Parameters<ManagedSdkRuntimeDependency["generationStatus"]>[0]) => {
+						const status = await target.generationStatus(tenant);
+						if (!(await tenantFence(tenant)))
+							throw new Error("Managed tenant authority fence was lost after exact generation proof.");
+						return status;
+					};
+				},
+			});
 			return routeGjcSessionClose({
 				mapping,
 				mappings,
 				ingressId: ingress.ingressId,
 				ingressHash: ingress.ingressHash,
 				legacyIngress: ingress.legacyIngress,
-				managedSdkRuntime: dependencies.managedSdkRuntime,
-				managedSdkTenantFence: dependencies.managedSdkTenantFence,
+				managedSdkRuntime: fencedRuntime,
+				managedSdkTenantFence: tenantFence,
 				lifecycle: undefined as never,
 				close: undefined as never,
 			});
 		}
 		if (withLifecycleClosePreflight === undefined) throw new Error("GJC close lifecycle preflight is unavailable.");
-		const cwd = mapping.attachment?.expectedCwd;
+		// The legacy router still recognizes any complete managed authority. Strip
+		// non-canonical authority before entering that path so only the canonical
+		// V3 epoch can select the public managed close flow.
+		const legacyMapping =
+			mapping.managedAuthority === undefined ? mapping : { ...mapping, managedAuthority: undefined };
+		const cwd = legacyMapping.attachment?.expectedCwd;
 		if (cwd === undefined) throw new Error("GJC close requires a persisted canonical cwd.");
 		return withLifecycleClosePreflight(
 			{
 				cwd,
 				sessionRoot: "",
-				projectId: mapping.projectId,
-				chatId: mapping.chatId,
-				sessionId: mapping.sessionId,
-				sessionFile: mapping.sessionFile,
-				recoveryAttachment: mapping.attachment,
+				projectId: legacyMapping.projectId,
+				chatId: legacyMapping.chatId,
+				sessionId: legacyMapping.sessionId,
+				sessionFile: legacyMapping.sessionFile,
+				recoveryAttachment: legacyMapping.attachment,
 			},
 			lifecycle =>
 				routeGjcSessionClose({
-					mapping,
+					mapping: legacyMapping,
 					mappings,
 					ingressId: ingress.ingressId,
 					ingressHash: ingress.ingressHash,
@@ -79,16 +109,24 @@ export function createAdapterSessionCloser(
 	};
 }
 
+function isCanonicalManagedV3Epoch(mapping: SessionMapping): boolean {
+	return (
+		(mapping.managedAuthority as ManagedTurnAuthorityWithEpoch | undefined)?.authorityEpoch ===
+		SESSION_AUTHORITY_V3_EPOCH
+	);
+}
+
 function hasCompleteManagedAuthority(
 	mapping: SessionMapping,
 ): mapping is SessionMapping & { readonly managedAuthority: NonNullable<SessionMapping["managedAuthority"]> } {
 	const authority = mapping.managedAuthority;
 	return (
+		(authority as ManagedTurnAuthorityWithEpoch | undefined)?.authorityEpoch === SESSION_AUTHORITY_V3_EPOCH &&
 		authority !== undefined &&
 		authority.chatId === mapping.chatId &&
 		authority.projectId === mapping.projectId &&
 		authority.sessionId === mapping.sessionId &&
-		(typeof mapping.principalId !== "string" || authority.principalId === mapping.principalId) &&
+		mapping.principalId === authority.principalId &&
 		[
 			authority.principalId,
 			authority.projectId,
@@ -96,6 +134,8 @@ function hasCompleteManagedAuthority(
 			authority.chatId,
 			authority.sessionId,
 		].every(value => typeof value === "string" && value.length > 0) &&
+		isAbsolute(authority.canonicalWorkspace) &&
+		resolve(authority.canonicalWorkspace) === authority.canonicalWorkspace &&
 		Number.isSafeInteger(authority.generation) &&
 		authority.generation > 0 &&
 		[authority.leaseId, authority.epoch, authority.requestKey].every(
@@ -103,6 +143,10 @@ function hasCompleteManagedAuthority(
 		)
 	);
 }
+
+type ManagedTurnAuthorityWithEpoch = NonNullable<SessionMapping["managedAuthority"]> & {
+	readonly authorityEpoch?: unknown;
+};
 
 function ownedLifecycleBackend(
 	config: ResolvedAdapterConfig,

@@ -1,3 +1,4 @@
+import { isAbsolute, resolve } from "node:path";
 import type { TenantSessionKey } from "../gjc/managed-sdk-runtime";
 import type { SessionOperation, SessionOperationResult } from "../gjc/session-authority";
 import { SESSION_AUTHORITY_V3_EPOCH } from "../gjc/session-authority-v3";
@@ -224,7 +225,14 @@ class ManagedV3GenerationStore implements ManagedIdleGenerationStore {
 		const records: ManagedIdleGenerationRecord[] = [];
 		for (const mapping of this.mappings.mappingRecordsIterable()) {
 			const authority = mapping.managedAuthority;
-			if (!isManagedV3Authority(authority) || authority.chatId !== mapping.chatId) continue;
+			if (
+				!isManagedV3Authority(authority) ||
+				authority.chatId !== mapping.chatId ||
+				mapping.principalId !== authority.principalId ||
+				mapping.projectId !== authority.projectId ||
+				mapping.sessionId !== authority.sessionId
+			)
+				continue;
 			const scope = { principalId: authority.principalId, chatId: mapping.chatId };
 			const operations = this.mappings.operationsScoped(scope);
 			const pending = operations.some(operation => operation.state === "pending" && operation.kind !== "close");
@@ -325,6 +333,10 @@ function sameManagedAuthority(mapping: SessionMapping, authority: ManagedTurnAut
 	const candidate = mapping.managedAuthority;
 	return (
 		isManagedV3Authority(candidate) &&
+		mapping.principalId === authority.principalId &&
+		mapping.chatId === authority.chatId &&
+		mapping.projectId === authority.projectId &&
+		mapping.sessionId === authority.sessionId &&
 		candidate.principalId === authority.principalId &&
 		candidate.projectId === authority.projectId &&
 		candidate.canonicalWorkspace === authority.canonicalWorkspace &&
@@ -343,17 +355,22 @@ function isManagedV3Authority(
 	const candidate = authority as (ManagedTurnAuthority & { readonly authorityEpoch?: unknown }) | undefined;
 	return (
 		candidate?.authorityEpoch === SESSION_AUTHORITY_V3_EPOCH &&
-		candidate.principalId.length > 0 &&
-		candidate.projectId.length > 0 &&
-		candidate.canonicalWorkspace.length > 0 &&
-		candidate.chatId.length > 0 &&
-		candidate.sessionId.length > 0 &&
-		candidate.leaseId.length > 0 &&
-		candidate.epoch.length > 0 &&
-		candidate.requestKey.length > 0 &&
+		nonEmpty(candidate.principalId) &&
+		nonEmpty(candidate.projectId) &&
+		isAbsolute(candidate.canonicalWorkspace) &&
+		resolve(candidate.canonicalWorkspace) === candidate.canonicalWorkspace &&
+		nonEmpty(candidate.chatId) &&
+		nonEmpty(candidate.sessionId) &&
+		nonEmpty(candidate.leaseId) &&
+		nonEmpty(candidate.epoch) &&
+		nonEmpty(candidate.requestKey) &&
 		Number.isSafeInteger(candidate.generation) &&
 		candidate.generation > 0
 	);
+}
+
+function nonEmpty(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0;
 }
 
 function latestActivityAt(operations: readonly SessionOperation[]): number {
