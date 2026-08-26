@@ -16,8 +16,6 @@ import {
 } from "./turn-runner";
 
 export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<RouteGjcTurnResult> {
-	const preparedManagedAuthority = input.preparedManagedAuthority;
-	if (preparedManagedAuthority === undefined) throw new Error("New GJC session requires prepared managed authority.");
 	throwIfAborted(input.signal);
 	const operation = provisionalOperation(input);
 	const reserved = input.mappings.reserveProvisionalOperation(operation);
@@ -53,13 +51,31 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 			input.modelSelection === undefined ? undefined : normalizeModelSelection(result.modelSelection);
 		if (input.modelSelection !== undefined && completedSelection === undefined)
 			throw new TypeError("Missing selected GJC outcome");
-		const managedProof = result.managedProof;
-		if (managedProof === undefined) throw new Error("Managed GJC session did not return a generation proof.");
-		const managedAuthority = managedAuthorityFor(preparedManagedAuthority, managedProof, result.sessionId);
+		const managedAuthority =
+			input.preparedManagedAuthority === undefined
+				? result.managedAuthority
+				: managedAuthorityFor(input.preparedManagedAuthority, result.managedProof, result.sessionId);
+		if (result.attachment === undefined && result.managedProof === undefined)
+			throw new Error("New GJC session did not return validated generation authority.");
 		const assistantText = input.projectAssistantText?.(result) ?? result.text;
-		if (lifecycle.publishManaged === undefined)
+		const transactionPublish =
+			input.preparedManagedAuthority === undefined
+				? result.managedProof === undefined
+					? result.attachment === undefined
+						? undefined
+						: (write: () => import("./session-router").SessionMapping) =>
+								lifecycle.publish(result.attachment!, write)
+					: lifecycle.publishManaged === undefined
+						? undefined
+						: (write: () => import("./session-router").SessionMapping) =>
+								lifecycle.publishManaged!(result.managedProof!, write)
+				: result.managedProof === undefined || lifecycle.publishManaged === undefined
+					? undefined
+					: (write: () => import("./session-router").SessionMapping) =>
+							lifecycle.publishManaged!(result.managedProof!, write);
+		if (transactionPublish === undefined)
 			throw new Error("Lifecycle transaction cannot publish managed generation authority.");
-		const mapping = await lifecycle.publishManaged(managedProof, () => {
+		const mapping = await transactionPublish(() => {
 			throwIfAborted(input.signal);
 			const published = input.mappings.publishProvisionalOperation(operation, {
 				chatId: input.chatId,
@@ -72,7 +88,8 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 				operationId: input.userMessageId,
 				assistantText,
 				events: result.events,
-				managedAuthority,
+				...(result.attachment === undefined ? {} : { attachment: result.attachment }),
+				...(managedAuthority === undefined ? {} : { managedAuthority }),
 				...(completedSelection === undefined ? {} : { modelSelection: completedSelection }),
 			});
 			authorityCompleted = true;
@@ -99,17 +116,32 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 			...(input.onObservedTurn === undefined ? {} : { observer: input.onObservedTurn }),
 			...(input.signal === undefined ? {} : { signal: input.signal }),
 			...(input.principalId === undefined ? {} : { principalId: input.principalId }),
-			preparedManagedAuthority,
+			...(input.preparedManagedAuthority === undefined
+				? {}
+				: { preparedManagedAuthority: input.preparedManagedAuthority }),
 		} as const;
+		if (input.preparedManagedAuthority === undefined) {
+			return await input.runner.startNewSession(
+				startInput,
+				publish,
+				async (address, attachment) => {
+					input.mappings.attachProvisionalOperation(input.chatId, input.userMessageId, {
+						sessionId: address.sessionId,
+						attachment,
+					});
+				},
+				onFailure,
+			);
+		}
 		if (input.runner.startManagedSession === undefined)
 			throw new Error("GJC runner must provide managed session startup for prepared managed authority.");
 		return await input.runner.startManagedSession(
-			startInput,
+			{ ...startInput, preparedManagedAuthority: input.preparedManagedAuthority },
 			publish,
 			async (address, proof) => {
 				input.mappings.attachProvisionalOperation(input.chatId, input.userMessageId, {
 					sessionId: address.sessionId,
-					managedAuthority: managedAuthorityFor(preparedManagedAuthority, proof, address.sessionId),
+					managedAuthority: managedAuthorityFor(input.preparedManagedAuthority!, proof, address.sessionId),
 				});
 			},
 			onFailure,
