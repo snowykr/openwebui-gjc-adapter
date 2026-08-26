@@ -23,7 +23,7 @@ import { createPublicSdkRunnerContext } from "../src/live/gjc-routing-lifecycle"
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
 import { projectTurnEvents, synthesizeProjectionRows } from "../src/live/workflow-gate-projection";
 import { InMemoryOutboxStore } from "../src/state/outbox";
-import { lifecycleFixture } from "./gjc-lifecycle-fixtures";
+import { lifecycleFixture, managedPreparedAuthority } from "./gjc-lifecycle-fixtures";
 import {
 	decisionWorkflowGateEvent,
 	deepInterviewWorkflowGateEvent,
@@ -70,6 +70,13 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 			messageId: "assistant-1",
 			userMessageId: "user-1",
 			userMessageParentId: null,
+			ownerUserId: "owner-test",
+			preparedManagedAuthority: managedPreparedAuthority({
+				projectId: project.id,
+				canonicalWorkspace: project.cwd,
+				chatId: "chat-1",
+				requestKey: "user-1",
+			}),
 			continued: false,
 		});
 

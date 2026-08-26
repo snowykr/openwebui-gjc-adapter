@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { SessionMappingStore } from "../src/gjc/session-router";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
+import { managedPreparedAuthority } from "./gjc-lifecycle-fixtures";
 import { FakeGjcTurnRunner, project } from "./gjc-routing-runner-fixtures";
 import { staticModelReaderFactory } from "./model-selection-fixtures";
 
@@ -104,6 +105,13 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 			messageId: "assistant-1",
 			userMessageId: "user-1",
 			userMessageParentId: null,
+			ownerUserId: "owner-test",
+			preparedManagedAuthority: managedPreparedAuthority({
+				projectId: project.id,
+				canonicalWorkspace: project.cwd,
+				chatId: "chat-1",
+				requestKey: "user-1",
+			}),
 			continued: false,
 			requestedModelId: "gjc",
 			onLiveEvents: events => {
@@ -174,6 +182,13 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 			messageId: "assistant-lease-abort",
 			userMessageId: "user-lease-abort",
 			userMessageParentId: null,
+			ownerUserId: "owner-test",
+			preparedManagedAuthority: managedPreparedAuthority({
+				projectId: project.id,
+				canonicalWorkspace: project.cwd,
+				chatId: "chat-lease-abort",
+				requestKey: "user-lease-abort",
+			}),
 			continued: false,
 			requestedModelId: "gjc",
 			onLiveEvents: async () => {
@@ -209,6 +224,13 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 				messageId: "assistant-failed",
 				userMessageId: "user-failed",
 				userMessageParentId: null,
+				ownerUserId: "owner-test",
+				preparedManagedAuthority: managedPreparedAuthority({
+					projectId: project.id,
+					canonicalWorkspace: project.cwd,
+					chatId: "chat-failed",
+					requestKey: "user-failed",
+				}),
 				continued: false,
 				requestedModelId: "gjc",
 				onLiveEvents: events => {
@@ -242,6 +264,13 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 			messageId: "assistant-artifact-fallback",
 			userMessageId: "user-artifact-fallback",
 			userMessageParentId: null,
+			ownerUserId: "owner-test",
+			preparedManagedAuthority: managedPreparedAuthority({
+				projectId: project.id,
+				canonicalWorkspace: project.cwd,
+				chatId: "chat-artifact-fallback",
+				requestKey: "user-artifact-fallback",
+			}),
 			continued: false,
 			requestedModelId: "gjc",
 			onLiveEvents: events => {
@@ -266,6 +295,7 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 		"streams native text deltas from %s before terminal persistence completes",
 		async field => {
 			const turnRunner = new FakeGjcTurnRunner();
+			observeManagedEventsBeforeCompletion(turnRunner);
 			let release!: () => void;
 			turnRunner.completionBarrier = new Promise<void>(resolve => {
 				release = resolve;
@@ -289,6 +319,13 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 				messageId: "assistant-stream",
 				userMessageId: "user-stream",
 				userMessageParentId: null,
+				ownerUserId: "owner-test",
+				preparedManagedAuthority: managedPreparedAuthority({
+					projectId: project.id,
+					canonicalWorkspace: project.cwd,
+					chatId: "chat-stream",
+					requestKey: "user-stream",
+				}),
 				continued: false,
 				requestedModelId: "gjc",
 				onLiveEvents: () => undefined,
@@ -353,6 +390,20 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 		);
 	});
 });
+
+function observeManagedEventsBeforeCompletion(turnRunner: FakeGjcTurnRunner): void {
+	const originalStartManagedSession = turnRunner.startManagedSession.bind(turnRunner);
+	turnRunner.startManagedSession = async (input, publish, beforePrompt) => {
+		for (const event of turnRunner.observedEvents ?? turnRunner.events) await input.observer?.(event);
+		const observedEvents = turnRunner.observedEvents;
+		turnRunner.observedEvents = [];
+		try {
+			return await originalStartManagedSession(input, publish, beforePrompt);
+		} finally {
+			turnRunner.observedEvents = observedEvents;
+		}
+	};
+}
 
 function status(description: string, done?: boolean, frameKind?: string) {
 	return expect.objectContaining({
