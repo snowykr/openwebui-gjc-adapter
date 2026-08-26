@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import type { NormalizedModelSelection } from "../src/contracts";
+import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import type {
 	GjcCancelTurnInput,
 	GjcContinueSessionInput,
@@ -14,13 +15,14 @@ import type {
 	ManagedPreparedTurnAuthority,
 	ManagedTurnAuthority,
 } from "../src/gjc/turn-runner";
-import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import type { RegisteredProject } from "../src/projects/registry";
 import { attachmentProof, lifecycleFixture } from "./gjc-lifecycle-fixtures";
 
 export class FakeGjcTurnRunner implements GjcTurnRunner {
 	readonly starts: GjcStartNewSessionInput[] = [];
-	readonly managedStarts: (GjcStartNewSessionInput & { readonly preparedManagedAuthority: ManagedPreparedTurnAuthority })[] = [];
+	readonly managedStarts: (GjcStartNewSessionInput & {
+		readonly preparedManagedAuthority: ManagedPreparedTurnAuthority;
+	})[] = [];
 	readonly continues: GjcContinueSessionInput[] = [];
 	readonly states: GjcSessionStateInput[] = [];
 	readonly gateResponses: GjcRespondWorkflowGateInput[] = [];

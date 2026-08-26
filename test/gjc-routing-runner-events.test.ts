@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { SessionMappingStore } from "../src/gjc/session-router";
 import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
+import { SessionMappingStore } from "../src/gjc/session-router";
 import type {
 	GjcContinueSessionInput,
 	GjcSessionAddress,
