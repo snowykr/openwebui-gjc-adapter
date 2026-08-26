@@ -374,7 +374,10 @@ describe("CLI module boundaries", () => {
 	test("keeps managed V3 composition off the legacy bridge fallbacks", () => {
 		const source = readFileSync(join(ROOT, "src", "adapter-server-options.ts"), "utf8");
 		const managedCompositionStart = source.indexOf("const managedRunner =");
-		const legacyCompositionStart = source.indexOf("cliPath = resolveGjcCliPath", managedCompositionStart);
+		const legacyCompositionStart = source.indexOf(
+			"} else {\n\t\t\tcliPath = config.gjcCommand",
+			managedCompositionStart,
+		);
 		expect(managedCompositionStart).toBeGreaterThanOrEqual(0);
 		expect(legacyCompositionStart).toBeGreaterThan(managedCompositionStart);
 		const managedComposition = source.slice(managedCompositionStart, legacyCompositionStart);
