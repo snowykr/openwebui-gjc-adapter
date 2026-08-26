@@ -136,7 +136,7 @@ describe("SessionV3FileBackedMappingStore", () => {
 				expect(operation.result.managedAuthority.chatId).toBe(durableChatId);
 			}
 			expect(document?.provisionalOperations[0]?.chatId).toBe(durableChatId);
-			expect(document?.provisionalOperations[0]?.managedAuthority.chatId).toBe(durableChatId);
+			expect(document?.provisionalOperations[0]?.managedAuthority?.chatId).toBe(durableChatId);
 			store.close();
 
 			const reopened = new SessionV3FileBackedMappingStore(filePath);

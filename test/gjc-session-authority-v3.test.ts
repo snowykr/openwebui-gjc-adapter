@@ -146,7 +146,7 @@ describe("session authority v3 full graph", () => {
 		expect(replayed!.mappings[0]!.journal[0]!.result!.gate!.gateId).toBe("gate-1");
 		expect(replayed!.mappings[0]!.journal[1]!.acknowledgedSuccessor!.sessionId).toBe("session-next");
 		expect(replayed!.mappings[0]!.reassignment!.sourceTombstone!.prior!.projectId).toBe("project-older");
-		expect(replayed!.provisionalOperations[0]!.managedAuthority.generation).toBe(5);
+		expect(replayed!.provisionalOperations[0]!.managedAuthority!.generation).toBe(5);
 	});
 
 	test("encodes deterministic bytes independent of source key order", () => {

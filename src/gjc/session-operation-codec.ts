@@ -10,7 +10,7 @@ import type {
 	SessionOperationResult,
 } from "./session-authority-types";
 import { isRecord } from "./session-authority-validation-primitives";
-import type { GjcTurnEvent } from "./turn-runner";
+import type { GjcTurnEvent, ManagedTurnAuthority } from "./turn-runner";
 
 export interface SessionOperationMapping {
 	readonly chatId: string;
@@ -25,6 +25,7 @@ export interface SessionOperationMapping {
 	readonly events?: readonly GjcTurnEvent[];
 	readonly modelSelection?: NormalizedModelSelection;
 	readonly attachment?: SessionAttachmentProof;
+	readonly managedAuthority?: ManagedTurnAuthority;
 }
 
 export function hashTurnIngress(input: {
@@ -98,6 +99,7 @@ export function operationResult(
 			...(mapping.modelSelection === undefined ? {} : { modelSelection: mapping.modelSelection }),
 			...(mapping.attachment === undefined ? {} : { attachment: copyAttachment(mapping.attachment) }),
 		},
+		...(mapping.managedAuthority === undefined ? {} : { managedAuthority: { ...mapping.managedAuthority } }),
 		...(kind === "close" ? { correlation: { closeStatus: "closed" } } : {}),
 		...(gate === undefined ? {} : { gate }),
 	};

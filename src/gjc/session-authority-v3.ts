@@ -126,8 +126,8 @@ export interface SessionAuthorityV3Mapping {
 export interface SessionAuthorityV3ProvisionalOperation extends SessionAuthorityV3Operation {
 	readonly chatId: string;
 	readonly projectId: string;
-	readonly sessionId: string;
-	readonly managedAuthority: ManagedTurnAuthorityV3;
+	readonly sessionId?: string;
+	readonly managedAuthority?: ManagedTurnAuthorityV3;
 }
 
 export interface SessionAuthorityV3Document {
@@ -222,14 +222,26 @@ export function isSessionAuthorityV3RelationallyValid(
 	}
 	for (const provisional of document.provisionalOperations) {
 		const mapping = mappings.get(provisional.chatId);
-		if (!validateAuthority(provisional.managedAuthority, provisional)) return false;
+		if (
+			provisional.sessionId !== undefined &&
+			!validateAuthority(provisional.managedAuthority, {
+				chatId: provisional.chatId,
+				projectId: provisional.projectId,
+				sessionId: provisional.sessionId,
+			})
+		)
+			return false;
 		if (
 			mapping !== undefined &&
 			mapping.projectId !== provisional.projectId &&
 			!isPermittedReassignmentProvisional(mapping, provisional)
 		)
 			return false;
-		if (!addOperationIdentity(identities, provisional.chatId, provisional)) return false;
+		if (
+			!addOperationIdentity(identities, provisional.chatId, provisional) &&
+			!isCompletedPublicationReceipt(mapping, provisional)
+		)
+			return false;
 	}
 	return true;
 }
@@ -321,12 +333,13 @@ function isProvisional(value: unknown): value is SessionAuthorityV3ProvisionalOp
 	return (
 		isNonEmptyString(value.chatId) &&
 		isNonEmptyString(value.projectId) &&
-		isNonEmptyString(value.sessionId) &&
 		isOperation(value) &&
-		validateAuthority(
-			value.managedAuthority,
-			value as unknown as Readonly<{ chatId: unknown; projectId: unknown; sessionId: unknown }>,
-		)
+		((value.sessionId === undefined && value.managedAuthority === undefined) ||
+			(isNonEmptyString(value.sessionId) &&
+				validateAuthority(
+					value.managedAuthority,
+					value as unknown as Readonly<{ chatId: unknown; projectId: unknown; sessionId: unknown }>,
+				)))
 	);
 }
 
@@ -565,6 +578,22 @@ function isPermittedReassignmentProvisional(
 			JSON.stringify([reassignment.target.id, reassignment.target.ingressId ?? reassignment.target.id]) &&
 		provisional.kind === reassignment.target.kind &&
 		provisional.detail === reassignment.target.detail
+	);
+}
+
+function isCompletedPublicationReceipt(
+	mapping: SessionAuthorityV3Mapping | undefined,
+	provisional: SessionAuthorityV3ProvisionalOperation,
+): boolean {
+	if (mapping === undefined || provisional.state !== "complete") return false;
+	const operation = mapping.journal.find(candidate => operationIdentity(candidate) === operationIdentity(provisional));
+	return (
+		operation !== undefined &&
+		operation.state === "complete" &&
+		operation.kind === "prompt" &&
+		operation.detail === provisional.detail &&
+		operation.startedAt === provisional.startedAt &&
+		operation.completedAt === provisional.completedAt
 	);
 }
 

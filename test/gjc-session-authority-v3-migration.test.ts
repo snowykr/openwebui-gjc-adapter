@@ -123,7 +123,7 @@ describe("SessionAuthority V2 to V3 graph migration", () => {
 		expect(migrated.document.mappings[0].reassignment?.sourceTombstone?.prior?.managedAuthority.sessionId).toBe(
 			"session-a",
 		);
-		expect(migrated.document.provisionalOperations[0].managedAuthority.sessionId).toBe("session-a");
+		expect(migrated.document.provisionalOperations[0].managedAuthority!.sessionId).toBe("session-a");
 	});
 
 	test("preserves the original snapshot bytes and stages deterministic private V3 bytes", () => {

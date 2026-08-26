@@ -612,15 +612,21 @@ function fromV3Mapping(mapping: SessionAuthorityV3Mapping): ManagedSessionAuthor
 }
 function toV3Provisional(operation: ProvisionalSessionOperation): SessionAuthorityV3ProvisionalOperation {
 	const { sessionFile: _sessionFile, attachment: _attachment, managedAuthority, ...rest } = operation;
-	if (operation.sessionId === undefined)
-		throw new Error(`V3 provisional operation ${operation.id} requires a session ID.`);
 	const durableChatId = scopedProvisionalChatId(operation);
 	return {
 		...toV3Operation(rest, `provisional ${operation.id}`, durableChatId),
 		chatId: operation.chatId,
 		projectId: operation.projectId,
-		sessionId: operation.sessionId,
-		managedAuthority: authorityV3ForDurableChat(managedAuthority, `provisional ${operation.id}`, durableChatId),
+		...(operation.sessionId === undefined
+			? {}
+			: {
+					sessionId: operation.sessionId,
+					managedAuthority: authorityV3ForDurableChat(
+						managedAuthority,
+						`provisional ${operation.id}`,
+						durableChatId,
+					),
+				}),
 	};
 }
 function fromV3Provisional(operation: SessionAuthorityV3ProvisionalOperation): ManagedProvisionalSessionOperation {
@@ -629,8 +635,8 @@ function fromV3Provisional(operation: SessionAuthorityV3ProvisionalOperation): M
 		...fromV3Operation(rest),
 		chatId: operation.chatId,
 		projectId: operation.projectId,
-		sessionId: operation.sessionId,
-		managedAuthority,
+		...(operation.sessionId === undefined ? {} : { sessionId: operation.sessionId }),
+		...(managedAuthority === undefined ? {} : { managedAuthority }),
 	};
 }
 
