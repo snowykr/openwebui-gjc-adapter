@@ -210,13 +210,10 @@ export async function buildResolvedAdapterServerOptions(
 		const turnRunner = activeManagedV3Runtime.runner;
 		const modelReaderFactory = createManagedReaderFactory(activeManagedV3Runtime.runtime, config.turnTimeoutMs);
 		const closeSession = createAdapterSessionCloser(
-			config,
-			config.gjcCommand,
 			{
 				...dependencies,
 				...(managedSdkRuntime === undefined ? {} : { managedSdkRuntime }),
 				...(managedSdkTenantFence === undefined ? {} : { managedSdkTenantFence }),
-				turnRunner,
 			},
 			mappings,
 		);
