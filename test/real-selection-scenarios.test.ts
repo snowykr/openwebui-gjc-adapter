@@ -58,8 +58,8 @@ describe("real canonical model selection scenarios", () => {
 				selection: initial.coordinator.selection,
 				setterAttempts: initial.coordinator.setterAttempts,
 				promptCount: initial.coordinator.promptCount,
-				catalogReads: initial.coordinator.catalogReads + 4,
-				stateReads: initial.coordinator.stateReads + 3,
+				catalogReads: initial.coordinator.catalogReads + 6,
+				stateReads: initial.coordinator.stateReads + 2,
 			});
 			expect(afterReadErrors.projectLookups).toBe(initial.projectLookups + 2);
 			expectNoDeliveryMutation(initial, afterReadErrors);
@@ -183,11 +183,8 @@ describe("real canonical model selection scenarios", () => {
 			);
 			expect(provisional).toHaveLength(1);
 			const operation = provisional[0] as Record<string, unknown>;
-			const attachment = operation.attachment as Record<string, unknown>;
 			const sessionId = operation.sessionId as string;
-			const workspace = path.join(harness.root, ".gjc", "openwebui", "default-reader");
-			const descriptorStat = attachment.descriptorStat as Record<string, unknown>;
-			expect(attachment.generation).toBe(descriptorStat.mtimeMs);
+			const managedAuthority = operation.managedAuthority as Record<string, unknown>;
 			expect(operation).toMatchObject({
 				id: "user-prompt-failed",
 				ingressId: "user-prompt-failed",
@@ -197,49 +194,31 @@ describe("real canonical model selection scenarios", () => {
 				projectId: "openwebui",
 				detail: expect.stringMatching(/^[a-f0-9]{64}$/),
 			});
-			expect(sessionId).toMatch(/^[0-9a-f-]{36}$/);
+			expect(sessionId).toMatch(/^selection-session-[0-9a-f-]{36}$/);
 			expect(Object.keys(operation).sort()).toEqual([
-				"attachment",
 				"chatId",
 				"detail",
 				"id",
 				"ingressId",
 				"kind",
+				"managedAuthority",
 				"projectId",
 				"sessionId",
 				"startedAt",
 				"state",
 			]);
-			expect(attachment).toMatchObject({
-				descriptorPath: path.join(workspace, ".gjc", "state", "sdk", `${sessionId}.json`),
-				descriptorStat: {
-					dev: expect.any(Number),
-					ino: expect.any(Number),
-					size: expect.any(Number),
-					mtimeMs: expect.any(Number),
-				},
-				payloadDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
-				expectedSessionId: sessionId,
-				expectedCwd: workspace,
-				tmuxSocket: expect.any(String),
-				tmuxPane: expect.stringMatching(/^%\d+$/),
-				tmuxPanePid: expect.any(Number),
-				tmuxOwnershipTag: expect.stringMatching(/^openwebui-gjc-[0-9a-f-]{36}$/),
-				ownedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+			expect(managedAuthority).toMatchObject({
+				principalId: "owner-selection",
+				projectId: "openwebui",
+				canonicalWorkspace: path.join(harness.root, ".gjc", "openwebui", "default-reader"),
+				chatId: scopedChatId,
+				sessionId,
+				generation: expect.any(Number),
+				leaseId: "selection-fixture-lease",
+				epoch: "managed/1",
+				requestKey: "user-prompt-failed",
+				authorityEpoch: "managed/1",
 			});
-			expect(Object.keys(attachment).sort()).toEqual([
-				"descriptorPath",
-				"descriptorStat",
-				"expectedCwd",
-				"expectedSessionId",
-				"generation",
-				"ownedAt",
-				"payloadDigest",
-				"tmuxOwnershipTag",
-				"tmuxPane",
-				"tmuxPanePid",
-				"tmuxSocket",
-			]);
 			expect(JSON.stringify(operation)).not.toMatch(/assistant|PASS|private|TOKEN|\\u0000/);
 			const afterFailure = await harness.effects();
 			expect(afterFailure.coordinator.setterAttempts).toBe(beforeFailure.coordinator.setterAttempts + 2);

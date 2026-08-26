@@ -19,7 +19,7 @@ import * as sessionRouter from "../src/gjc/session-router";
 import { SessionMappingStore } from "../src/gjc/session-router";
 import { buildResolvedInstalledAdapterServerOptions } from "../src/installed-adapter-server-options";
 
-const { lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync } = fs;
+const { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync } = fs;
 const { readdirSync, rmSync, symlinkSync, writeFileSync } = fs;
 
 function managedConfig(): InstalledConfig {
@@ -156,6 +156,29 @@ describe("runtime location composition", () => {
 					buildResolvedAdapterServerOptions(config, { mappings: new SessionMappingStore() }),
 				).rejects.toThrow("Canonical session authority activation is blocked.");
 			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("existing mode rejects absent or V2 authority before state-store effects", async () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-existing-authority-preflight-")));
+		try {
+			const config = { ...resolvedBuilderConfig(root), mode: "existing" as const };
+			await expect(buildResolvedAdapterServerOptions(config)).rejects.toThrow(
+				"Canonical session authority activation is blocked.",
+			);
+			expect(existsSync(config.statePath)).toBeFalse();
+
+			mkdirSync(config.sessionRoot);
+			const canonicalPath = join(config.sessionRoot, "openwebui-session-mappings.json");
+			const v2 = '{"kind":"openwebui-gjc-session-authority","version":2,"mappings":[]}\n';
+			writeFileSync(canonicalPath, v2);
+			await expect(buildResolvedAdapterServerOptions(config)).rejects.toThrow(
+				"Canonical session authority activation is blocked.",
+			);
+			expect(readFileSync(canonicalPath, "utf8")).toBe(v2);
+			expect(existsSync(config.statePath)).toBeFalse();
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}

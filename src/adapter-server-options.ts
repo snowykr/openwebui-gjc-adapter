@@ -153,6 +153,17 @@ export async function buildResolvedAdapterServerOptions(
 	behavior: BuildAdapterServerOptionsBehavior = {},
 ): Promise<AdapterServerOptions> {
 	assertResolvedAdapterConfig(config);
+	const mappingStorePath = path.join(config.sessionRoot, SESSION_MAPPING_STORE_FILE);
+	// The packaged server supplies no composition dependencies. Any dependency
+	// injection is an in-process lifecycle component test, not deployment
+	// activation.
+	const inMemoryLifecycleComponent = Object.values(dependencies).some(dependency => dependency !== undefined);
+	if (config.mode === "existing" && !inMemoryLifecycleComponent) {
+		const marker = readSessionAuthorityV3ActiveMarker(mappingStorePath);
+		const epoch = probeSessionAuthorityEpoch(mappingStorePath);
+		if (epoch.status !== "v3" || marker === undefined)
+			throw new Error("Canonical session authority activation is blocked.");
+	}
 	const protectedProjectRoots = config.mode === "managed" ? [config.statePath] : [];
 	const allowedSessionRoots = config.mode === "managed" ? [config.sessionRoot] : [];
 	await mkdir(config.statePath, { recursive: true });
@@ -222,7 +233,6 @@ export async function buildResolvedAdapterServerOptions(
 		const workspaceLeaseManager = createWorkspaceLeaseManager({ stateRoot: config.statePath });
 		const workspaceLeaseDurationMs = workspaceLeaseDuration(config.turnTimeoutMs);
 		const workspaceLeaseHeartbeatMs = workspaceLeaseHeartbeat(workspaceLeaseDurationMs);
-		const mappingStorePath = path.join(config.sessionRoot, SESSION_MAPPING_STORE_FILE);
 		const explicitLegacyTestSeam =
 			dependencies.turnRunner !== undefined ||
 			dependencies.mappings !== undefined ||
@@ -289,8 +299,16 @@ export async function buildResolvedAdapterServerOptions(
 			activeManagedV3Runtime = await startActiveManagedRuntime({
 				mappings: mappings as V3FileBackedSessionMappingStore,
 				runtime: runtime as ManagedSdkRuntime,
-				liveTenantFence: key =>
-					assertActiveManagedV3TenantFence(key, mappings, workspaceRegistry, projectStore, workspaceLeaseManager),
+				liveTenantFence:
+					dependencies.managedSdkTenantFence ??
+					(key =>
+						assertActiveManagedV3TenantFence(
+							key,
+							mappings,
+							workspaceRegistry,
+							projectStore,
+							workspaceLeaseManager,
+						)),
 			});
 			managedSdkRuntime = activeManagedV3Runtime.runtime;
 			managedSdkTenantFence = activeManagedV3Runtime.tenantFence;
@@ -342,14 +360,16 @@ export async function buildResolvedAdapterServerOptions(
 				sourcePath: mappingStorePath,
 				runtimeLock: lock,
 				authority,
-				liveTenantFence: key =>
-					assertActiveManagedV3TenantFence(
-						key,
-						activatedMappings,
-						workspaceRegistry,
-						projectStore,
-						workspaceLeaseManager,
-					),
+				liveTenantFence:
+					dependencies.managedSdkTenantFence ??
+					(key =>
+						assertActiveManagedV3TenantFence(
+							key,
+							activatedMappings,
+							workspaceRegistry,
+							projectStore,
+							workspaceLeaseManager,
+						)),
 				runtime: runtime as ManagedSdkRuntime,
 				lifecycle: runtime as ManagedSdkRuntime,
 			});

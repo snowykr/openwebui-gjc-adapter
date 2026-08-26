@@ -32,6 +32,7 @@ import {
 } from "../src/configure/private-config";
 import { renderExistingSystemdUnit } from "../src/configure/systemd";
 import type { AdapterServerOptions } from "../src/server";
+import { writeDirectV3Authority } from "./cli-fixtures";
 
 test("fresh rollback does not stop an absent controller unit", async () => {
 	const t = tempPath();
@@ -178,6 +179,7 @@ describe("configure CLI grammar and acknowledgements", () => {
 					status: 200,
 				})) as unknown as typeof fetch;
 			mkdirSync(join(t.directory, "workspace"));
+			await writeDirectV3Authority(join(t.directory, "workspace", ".gjc", "sessions"));
 			writeInstalledConfig(
 				{
 					version: 1,
@@ -271,6 +273,7 @@ describe("configure CLI grammar and acknowledgements", () => {
 		const t = tempPath();
 		const originalFetch = globalThis.fetch;
 		try {
+			await writeDirectV3Authority(t.directory);
 			globalThis.fetch = (async () => {
 				throw new Error("OpenWebUI is still starting");
 			}) as unknown as typeof fetch;
@@ -329,6 +332,7 @@ describe("configure CLI grammar and acknowledgements", () => {
 			projects: [],
 		} satisfies AdapterConfig;
 		try {
+			await writeDirectV3Authority(t.directory);
 			globalThis.fetch = (async () => {
 				throw new Error("OpenWebUI is still starting");
 			}) as unknown as typeof fetch;

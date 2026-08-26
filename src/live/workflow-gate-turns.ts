@@ -217,6 +217,7 @@ export async function handleWorkflowGateReply(
 			eventCursor: mapping.eventCursor,
 			operationId: turn.userMessageId,
 			lifecycle,
+			...(mapping.managedAuthority === undefined ? {} : { managedAuthority: mapping.managedAuthority }),
 			...(observer === undefined ? {} : { observer }),
 			...(turn.signal === undefined ? {} : { signal: turn.signal }),
 			...(principalId === undefined ? {} : { principalId }),
@@ -236,7 +237,10 @@ export async function handleWorkflowGateReply(
 					}),
 		});
 		throwIfAborted(turn.signal);
-		if (result.attachment === undefined) {
+		if (
+			result.attachment === undefined &&
+			(result.managedAuthority === undefined || result.managedProof === undefined)
+		) {
 			throw new Error("Workflow gate response did not return a validated current GJC attachment.");
 		}
 		const nextPendingGate = latestPendingWorkflowGate(result.events);
@@ -264,7 +268,8 @@ export async function handleWorkflowGateReply(
 			operationId: turn.userMessageId,
 			assistantText: responseText,
 			events: [...carriedGateEvents, ...result.events],
-			attachment: result.attachment,
+			...(result.attachment === undefined ? {} : { attachment: result.attachment }),
+			...(result.managedAuthority === undefined ? {} : { managedAuthority: result.managedAuthority }),
 		};
 		// Compact answered-gate identity (no schema/options/context payload), so a
 		// replay can still recompute the durable request hash even after the gate
@@ -281,7 +286,7 @@ export async function handleWorkflowGateReply(
 						sessionId: pendingGate.sessionId,
 					}),
 		};
-		await lifecycle.publish(result.attachment, () => {
+		const publish = () => {
 			throwIfAborted(turn.signal);
 			const published = mappings.completeOperationWithMapping(
 				turn.chatId,
@@ -293,7 +298,16 @@ export async function handleWorkflowGateReply(
 			);
 			ensureProjectionRows(input.outbox, published, projectionOwnerUserId, principalId);
 			return published;
-		});
+		};
+		if (result.managedAuthority !== undefined && result.managedProof !== undefined) {
+			if (lifecycle.publishManaged === undefined)
+				throw new Error("Managed workflow gate response requires managed lifecycle publication.");
+			await lifecycle.publishManaged(result.managedProof, publish);
+		} else {
+			if (result.attachment === undefined)
+				throw new Error("Workflow gate response did not return a validated current GJC attachment.");
+			await lifecycle.publish(result.attachment, publish);
+		}
 		const projectedEvents = projectTurnEvents(
 			result.events,
 			mapping.modelSelection === undefined ? undefined : formatCanonicalModelId(mapping.modelSelection),

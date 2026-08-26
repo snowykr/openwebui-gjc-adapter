@@ -1,9 +1,11 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { throws } from "node:assert/strict";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { buildAdapterServerOptionsFromEnv as buildOptions } from "../src/adapter-server-options";
+import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import { ProjectLinkError as LinkError } from "../src/projects/link-service";
 import { SqliteProjectRegistrationStore as RegistrationStore } from "../src/projects/registration-store";
 import { RuntimeSingletonLock } from "../src/runtime-singleton-lock";
@@ -372,8 +374,32 @@ function rawRow(root: string, overrides: Readonly<Record<string, fixture.SqlValu
 const protectedDomain = (root: string) => path.join(root, "home", ".gjc");
 const sessionRoot = (root: string) => path.join(protectedDomain(root), "openwebui/default-reader/.gjc/sessions");
 async function makeContext(label: string) {
-	const root = await fixture.makeWorkspace(`gjc-preflight-${label}`, ["home"]);
+	const root = await fixture.makeWorkspace(`gjc-preflight-${label}`, ["home", "sessions"]);
+	await writeV3Authority(path.join(root, "sessions"));
 	return { root, databasePath: path.join(root, "state", "adapter-state.sqlite") };
+}
+async function writeV3Authority(root: string): Promise<void> {
+	const canonicalPath = path.join(root, "openwebui-session-mappings.json");
+	const canonical = Buffer.from(
+		`${JSON.stringify({
+			kind: "openwebui-gjc-session-authority",
+			version: 3,
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+			mappings: [],
+			provisionalOperations: [],
+		})}\n`,
+	);
+	await fs.writeFile(canonicalPath, canonical);
+	await fs.writeFile(
+		`${canonicalPath}.v3-active.json`,
+		`${JSON.stringify({
+			kind: "openwebui-gjc-session-authority-active",
+			version: 1,
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+			activationV3Digest: createHash("sha256").update(canonical).digest("hex"),
+			source: { baseDigest: "0".repeat(64), walDigest: "0".repeat(64), walPresent: false },
+		})}\n`,
+	);
 }
 function runtimeEnv(root: string, allowedRoot = root): Record<string, string | undefined> {
 	return Object.assign({}, process.env, {

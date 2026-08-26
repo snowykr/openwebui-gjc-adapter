@@ -1,4 +1,7 @@
+import { createHash } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
 import * as path from "node:path";
+import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import type {
 	GjcContinueSessionInput,
 	GjcSessionAddress,
@@ -9,6 +12,31 @@ import type {
 	GjcTurnRunner,
 } from "../src/gjc/turn-runner";
 import { attachmentProof, lifecycleFixture } from "./gjc-lifecycle-fixtures";
+
+export async function writeDirectV3Authority(sessionRoot: string): Promise<void> {
+	await mkdir(sessionRoot, { recursive: true });
+	const canonicalPath = path.join(sessionRoot, "openwebui-session-mappings.json");
+	const canonical = Buffer.from(
+		`${JSON.stringify({
+			kind: "openwebui-gjc-session-authority",
+			version: 3,
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+			mappings: [],
+			provisionalOperations: [],
+		})}\n`,
+	);
+	await writeFile(canonicalPath, canonical);
+	await writeFile(
+		`${canonicalPath}.v3-active.json`,
+		`${JSON.stringify({
+			kind: "openwebui-gjc-session-authority-active",
+			version: 1,
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+			activationV3Digest: createHash("sha256").update(canonical).digest("hex"),
+			source: { baseDigest: "0".repeat(64), walDigest: "0".repeat(64), walPresent: false },
+		})}\n`,
+	);
+}
 
 export async function reserveTcpPort(): Promise<number> {
 	const server = Bun.serve({

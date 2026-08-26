@@ -78,6 +78,11 @@ export function createGjcRoutingLiveGatewayRunner(
 					? input.mappings
 					: scopedSessionMappingStore(input.mappings, principalId, turn.chatId);
 			let existing = scopedMappings.get(turn.chatId);
+			// Admission occurs before routing can resolve an existing chat mapping. A
+			// new-turn authority therefore accompanies continuations too; it is never
+			// valid for an existing mapping and must not shadow its persisted proof.
+			if (existing !== undefined && turn.preparedManagedAuthority !== undefined)
+				turn = { ...turn, preparedManagedAuthority: undefined };
 			if (turn.preparedManagedAuthority !== undefined) {
 				if (existing !== undefined || turn.continued)
 					throw new Error("Prepared managed authority is valid only for a new managed turn.");

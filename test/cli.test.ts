@@ -7,7 +7,14 @@ import { SessionMappingStore } from "../src/gjc/session-router";
 import type { LiveGatewayEventDeliveryInput } from "../src/live/chat-completions";
 import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
 import { createAdapterRequestHandler } from "../src/server";
-import { chatRequest, FakeGjcTurnRunner, reserveTcpPort, stopProcess, waitForStartedServer } from "./cli-fixtures";
+import {
+	chatRequest,
+	FakeGjcTurnRunner,
+	reserveTcpPort,
+	stopProcess,
+	waitForStartedServer,
+	writeDirectV3Authority,
+} from "./cli-fixtures";
 import { staticModelReaderFactory } from "./model-selection-fixtures";
 import { messageEntry, writeSessionFile } from "./session-sync-fixtures";
 
@@ -26,6 +33,7 @@ describe("adapter CLI service", () => {
 		const stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-cli-health-"));
 		const sessionRoot = path.join(stateRoot, "sessions");
 		healthStateRoots.push(stateRoot);
+		await writeDirectV3Authority(sessionRoot);
 		const proc = Bun.spawn(["bun", "run", "start"], {
 			cwd: process.cwd(),
 			env: {

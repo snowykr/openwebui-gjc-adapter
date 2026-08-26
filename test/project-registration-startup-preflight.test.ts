@@ -1,8 +1,10 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, spyOn, test } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { buildAdapterServerOptionsFromEnv } from "../src/adapter-server-options";
+import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
 import { FakeGjcTurnRunner } from "./cli-fixtures";
 import * as fixture from "./project-registration-startup-preflight-fixtures";
@@ -255,8 +257,32 @@ function protectedPaths(root: string): readonly [string, string, string, string]
 	return [domain, path.join(domain, "agent"), reader, path.join(reader, ".gjc/sessions")];
 }
 async function makeContext(label: string): Promise<Context> {
-	const root = await fixture.makeWorkspace(`gjc-preflight-${label}`, ["home", "state"]);
+	const root = await fixture.makeWorkspace(`gjc-preflight-${label}`, ["home", "state", "sessions"]);
+	await writeV3Authority(path.join(root, "sessions"));
 	return { root, databasePath: path.join(root, "state", "adapter-state.sqlite") };
+}
+async function writeV3Authority(root: string): Promise<void> {
+	const canonicalPath = path.join(root, "openwebui-session-mappings.json");
+	const canonical = Buffer.from(
+		`${JSON.stringify({
+			kind: "openwebui-gjc-session-authority",
+			version: 3,
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+			mappings: [],
+			provisionalOperations: [],
+		})}\n`,
+	);
+	await fs.writeFile(canonicalPath, canonical);
+	await fs.writeFile(
+		`${canonicalPath}.v3-active.json`,
+		`${JSON.stringify({
+			kind: "openwebui-gjc-session-authority-active",
+			version: 1,
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+			activationV3Digest: createHash("sha256").update(canonical).digest("hex"),
+			source: { baseDigest: "0".repeat(64), walDigest: "0".repeat(64), walPresent: false },
+		})}\n`,
+	);
 }
 function runtimeEnv(root: string): Record<string, string | undefined> {
 	return {

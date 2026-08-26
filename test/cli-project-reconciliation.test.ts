@@ -8,7 +8,7 @@ import { SqliteProjectRegistrationStore } from "../src/projects/registration-sto
 import { registerProjectDirectory } from "../src/projects/registry";
 import { resolveAllowedRoots } from "../src/security/paths";
 import { createAdapterRequestHandler } from "../src/server";
-import { chatRequest, FakeGjcTurnRunner } from "./cli-fixtures";
+import { FakeGjcTurnRunner, writeDirectV3Authority } from "./cli-fixtures";
 import { staticModelReaderFactory } from "./model-selection-fixtures";
 import { messageEntry, writeSessionFile } from "./session-sync-fixtures";
 
@@ -18,6 +18,7 @@ describe("adapter CLI project reconciliation", () => {
 		const projectDirectory = path.join(workspace, "Configured Folder");
 		const sessionDirectory = path.join(projectDirectory, ".gjc", "sessions");
 		await fs.mkdir(sessionDirectory, { recursive: true });
+		await writeDirectV3Authority(path.join(workspace, "state"));
 		await writeSessionFile(path.join(sessionDirectory, "session-import.jsonl"), {
 			header: { id: "session-import", title: "Configured Folder Import", cwd: projectDirectory },
 			entries: [messageEntry("user-import", null, "user", "load me")],
@@ -54,6 +55,7 @@ describe("adapter CLI project reconciliation", () => {
 		const projectDirectory = path.join(workspace, "Deleted During Runtime");
 		const sessionDirectory = path.join(projectDirectory, ".gjc", "sessions");
 		await fs.mkdir(sessionDirectory, { recursive: true });
+		await writeDirectV3Authority(path.join(workspace, "state"));
 		await writeSessionFile(path.join(sessionDirectory, "session-import.jsonl"), {
 			header: { id: "session-import", title: "Runtime Delete Import", cwd: projectDirectory },
 			entries: [messageEntry("user-import", null, "user", "load me")],
@@ -93,13 +95,17 @@ describe("adapter CLI project reconciliation", () => {
 		const projectListResponse = await handler(projectListRequest());
 		const projectList = await projectListResponse.json();
 
-		expect(projectListText(projectList)).toContain("unlinked: deleted-during-runtime");
+		expect(projectListResponse.status).toBe(200);
+		expect(projectList).toMatchObject({
+			projects: [{ id: "deleted-during-runtime", status: "unlinked" }],
+		});
 		expect(store.getProject("deleted-during-runtime")).toMatchObject({ status: "unlinked" });
 	});
 	test("keeps serving when startup linked-project projection is temporarily unavailable", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-cli-reconcile-"));
 		const projectDirectory = path.join(workspace, "Unavailable Projection");
 		await fs.mkdir(path.join(projectDirectory, ".gjc", "sessions"), { recursive: true });
+		await writeDirectV3Authority(path.join(workspace, "state"));
 		const allowedRoots = await resolveAllowedRoots([workspace]);
 		const project = await registerProjectDirectory(
 			{ cwd: projectDirectory, name: "Unavailable Projection", openWebUIFolderId: "unavailable-folder" },
@@ -183,21 +189,8 @@ function envFor(workspace: string, projects: string): Record<string, string | un
 }
 
 function projectListRequest(): Request {
-	const source = chatRequest();
-	return new Request(source.url, {
-		method: "POST",
-		headers: source.headers,
-		body: JSON.stringify({ model: "gjc", messages: [{ role: "user", content: "/gjc project list" }] }),
+	return new Request("http://adapter.test/admin/projects", {
+		method: "GET",
+		headers: { authorization: "Bearer adapter-token", "X-OpenWebUI-User-Id": "owner-test" },
 	});
-}
-
-function projectListText(value: unknown): string {
-	if (!isRecord(value) || !Array.isArray(value.choices)) return "";
-	const first = value.choices[0];
-	if (!isRecord(first) || !isRecord(first.message) || typeof first.message.content !== "string") return "";
-	return first.message.content;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
