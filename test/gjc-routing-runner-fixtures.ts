@@ -10,12 +10,17 @@ import type {
 	GjcStartNewSessionInput,
 	GjcTurnResult,
 	GjcTurnRunner,
+	ManagedGenerationProof,
+	ManagedPreparedTurnAuthority,
+	ManagedTurnAuthority,
 } from "../src/gjc/turn-runner";
+import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import type { RegisteredProject } from "../src/projects/registry";
 import { attachmentProof, lifecycleFixture } from "./gjc-lifecycle-fixtures";
 
 export class FakeGjcTurnRunner implements GjcTurnRunner {
 	readonly starts: GjcStartNewSessionInput[] = [];
+	readonly managedStarts: (GjcStartNewSessionInput & { readonly preparedManagedAuthority: ManagedPreparedTurnAuthority })[] = [];
 	readonly continues: GjcContinueSessionInput[] = [];
 	readonly states: GjcSessionStateInput[] = [];
 	readonly gateResponses: GjcRespondWorkflowGateInput[] = [];
@@ -67,6 +72,59 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 		};
 		const lifecycle = lifecycleFixture(result);
 		return await publish({ ...result, attachment: attachmentProof(result) }, lifecycle);
+	}
+
+	async startManagedSession<T>(
+		input: GjcStartNewSessionInput & { readonly preparedManagedAuthority: ManagedPreparedTurnAuthority },
+		publish: (
+			result: GjcSessionAddress & GjcTurnResult,
+			lifecycle: ReturnType<typeof lifecycleFixture>,
+		) => Promise<T>,
+		beforePrompt: (
+			address: GjcSessionAddress,
+			proof: ManagedGenerationProof,
+			lifecycle: ReturnType<typeof lifecycleFixture>,
+		) => Promise<void>,
+	): Promise<T> {
+		this.managedStarts.push(input);
+		await this.completionBarrier;
+		if (this.completionError !== undefined) throw this.completionError;
+		const authority = {
+			...input.preparedManagedAuthority,
+			sessionId: "session-1",
+			generation: 1,
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+		} as ManagedTurnAuthority & { readonly authorityEpoch: typeof SESSION_AUTHORITY_V3_EPOCH };
+		const result = {
+			cwd: input.cwd,
+			sessionRoot: input.sessionRoot,
+			projectId: input.projectId,
+			chatId: input.chatId,
+			sessionId: authority.sessionId,
+			text: `new:${input.text}`,
+			events: this.events,
+			sessionFile: join(input.sessionRoot, "session-1.jsonl"),
+			activeLeaf: "leaf-1",
+			rawFrameCursor: 7,
+			eventCursor: 3,
+			managedProof: {
+				kind: "managed-generation" as const,
+				sessionId: authority.sessionId,
+				generation: authority.generation,
+				leaseId: authority.leaseId,
+				epoch: authority.epoch,
+			},
+			managedAuthority: authority,
+			...(this.startModelSelection === undefined
+				? input.modelSelection === undefined
+					? {}
+					: { modelSelection: input.modelSelection }
+				: { modelSelection: this.startModelSelection }),
+		};
+		const lifecycle = lifecycleFixture(result, authority);
+		await beforePrompt(result, result.managedProof, lifecycle);
+		for (const event of this.observedEvents ?? this.events) await input.observer?.(event);
+		return await publish(result, lifecycle);
 	}
 
 	async continueSession(input: GjcContinueSessionInput): Promise<GjcTurnResult> {
