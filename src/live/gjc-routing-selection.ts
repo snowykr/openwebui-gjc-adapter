@@ -1,5 +1,5 @@
 import type { NormalizedModelSelection } from "../contracts";
-import { SdkV3OperationError } from "../gjc/sdk-v3-protocol";
+import { ManagedSdkOperationError } from "../gjc/managed-sdk-runtime";
 import { normalizeModelSelection, type SessionMapping } from "../gjc/session-router";
 import type { GjcTurnRunner } from "../gjc/turn-runner";
 import type { LiveGatewayRunnerInput, LiveGatewayRunnerResult } from "./chat-completions";
@@ -87,7 +87,7 @@ export function withCanonicalModel(
 }
 
 export function isModelSelectionApplyFailure(error: unknown): boolean {
-	if (error instanceof SdkV3OperationError)
+	if (error instanceof ManagedSdkOperationError)
 		return ["model_set_failed", "thinking_set_failed", "invalid_result"].includes(error.code);
 	return (
 		typeof error === "object" && error !== null && Reflect.get(error, "command") === "set_default_model_selection"

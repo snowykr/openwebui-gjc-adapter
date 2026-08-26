@@ -13,6 +13,18 @@ export const MANAGED_SDK_OWNER_STATES = [
 
 export type ManagedSdkOwnerState = (typeof MANAGED_SDK_OWNER_STATES)[number];
 
+/** Typed managed Router/lifecycle operation failure; never carries endpoint authority. */
+export class ManagedSdkOperationError extends Error {
+	constructor(
+		readonly code: string,
+		message: string,
+		options?: ErrorOptions,
+	) {
+		super(message, options);
+		this.name = "ManagedSdkOperationError";
+	}
+}
+
 /** Complete tenant authority; session ids or generations alone are never authority. */
 export interface TenantSessionKey {
 	readonly principalId: string;

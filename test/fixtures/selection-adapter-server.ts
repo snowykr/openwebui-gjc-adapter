@@ -4,8 +4,7 @@ import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import type { router } from "@gajae-code/coding-agent/sdk";
 import { buildAdapterServerOptionsFromEnv } from "../../src/adapter-server-options";
-import { ManagedSdkRuntime } from "../../src/gjc/managed-sdk-runtime";
-import { SdkV3OperationError } from "../../src/gjc/sdk-v3-protocol";
+import { ManagedSdkOperationError, ManagedSdkRuntime } from "../../src/gjc/managed-sdk-runtime";
 import { encodeSessionAuthorityV3Document, SESSION_AUTHORITY_V3_EPOCH } from "../../src/gjc/session-authority-v3";
 import { createManagedModelReaderFactory } from "../../src/live/gjc-managed-model-reader";
 import type { ProjectProvider } from "../../src/live/openai-routes";
@@ -479,7 +478,7 @@ function createManagedSelectionRuntime(baseUrl: string): ManagedSdkRuntime {
 						})
 					: await currentThinkingSetter(input);
 			if (!result.ok || !isRecord(result.value.selection))
-				throw new SdkV3OperationError(
+				throw new ManagedSdkOperationError(
 					operation === "model.set" ? "model_set_failed" : "thinking_set_failed",
 					result.message,
 				);
@@ -489,9 +488,9 @@ function createManagedSelectionRuntime(baseUrl: string): ManagedSdkRuntime {
 				result: operation === "model.set" ? result.value.selection : { changed: true },
 			};
 		}
-		if (operation === "turn.prompt" || operation === "turn.follow_up" || operation === "turn.abort_and_prompt") {
+		if (operation === "turn.prompt" || operation === "turn.follow_up") {
 			const result = await coordinatorRequest("/prompt", { method: "POST" });
-			if (!result.ok) throw new SdkV3OperationError("prompt_failed", result.message);
+			if (!result.ok) throw new ManagedSdkOperationError("prompt_failed", result.message);
 			const correlation = {
 				commandId: `selection-command-${++nextCorrelation}`,
 				turnId: `selection-turn-${nextCorrelation}`,
@@ -512,7 +511,7 @@ function createManagedSelectionRuntime(baseUrl: string): ManagedSdkRuntime {
 		}
 		if (operation === "workflow.gate_answer") {
 			const result = await coordinatorRequest("/gate", { method: "POST" });
-			if (!result.ok) throw new SdkV3OperationError("gate_response_failed", result.message);
+			if (!result.ok) throw new ManagedSdkOperationError("gate_response_failed", result.message);
 			session.pendingGate = false;
 			const correlation = {
 				commandId: `selection-command-${++nextCorrelation}`,

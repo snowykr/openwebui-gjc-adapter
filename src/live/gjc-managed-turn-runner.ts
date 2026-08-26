@@ -1,7 +1,6 @@
 import { resolve } from "node:path";
 import type { NormalizedModelSelection } from "../contracts";
-import type { ManagedSdkRuntime } from "../gjc/managed-sdk-runtime";
-import { SdkV3OperationError } from "../gjc/sdk-v3-protocol";
+import { ManagedSdkOperationError, type ManagedSdkRuntime } from "../gjc/managed-sdk-runtime";
 import type { SessionAttachmentProof } from "../gjc/session-authority";
 import { SESSION_AUTHORITY_V3_EPOCH } from "../gjc/session-authority-v3";
 import { normalizeModelSelection } from "../gjc/session-operation-codec";
@@ -503,7 +502,7 @@ async function applyManagedModelSelection(
 	if (selection === undefined) return undefined;
 	const requested = normalizeModelSelection(selection);
 	if (requested === undefined)
-		throw new SdkV3OperationError("invalid_result", "Managed model selection is not normalized.");
+		throw new ManagedSdkOperationError("invalid_result", "Managed model selection is not normalized.");
 
 	let modelResult: Readonly<Record<string, unknown>>;
 	try {
@@ -513,7 +512,7 @@ async function applyManagedModelSelection(
 	}
 	const modelSelection = normalizeModelSelection(modelResult);
 	if (!sameModelSelection(modelSelection, requested))
-		throw new SdkV3OperationError("invalid_result", "model.set did not confirm the requested selection.");
+		throw new ManagedSdkOperationError("invalid_result", "model.set did not confirm the requested selection.");
 
 	let thinkingResult: Readonly<Record<string, unknown>>;
 	try {
@@ -524,9 +523,12 @@ async function applyManagedModelSelection(
 	const currentSelection = normalizeModelSelection(thinkingResult);
 	if (currentSelection !== undefined) {
 		if (!sameModelSelection(currentSelection, requested))
-			throw new SdkV3OperationError("invalid_result", "thinking.set did not confirm the requested selection.");
+			throw new ManagedSdkOperationError("invalid_result", "thinking.set did not confirm the requested selection.");
 	} else if (!isChangedAcknowledgement(thinkingResult)) {
-		throw new SdkV3OperationError("invalid_result", "thinking.set returned an invalid selection acknowledgement.");
+		throw new ManagedSdkOperationError(
+			"invalid_result",
+			"thinking.set returned an invalid selection acknowledgement.",
+		);
 	}
 	return requested;
 }
@@ -535,15 +537,18 @@ function managedSelectionMutationError(
 	code: "model_set_failed" | "thinking_set_failed",
 	operation: string,
 	error: unknown,
-): SdkV3OperationError | GjcTurnCancelledError {
+): ManagedSdkOperationError | GjcTurnCancelledError {
 	if (error instanceof GjcTurnCancelledError) return error;
 	if (
-		error instanceof SdkV3OperationError &&
+		error instanceof ManagedSdkOperationError &&
 		["model_set_failed", "thinking_set_failed", "invalid_result"].includes(error.code)
 	)
 		return error;
 	const message = error instanceof Error ? error.message : String(error);
-	return new SdkV3OperationError(code, `Managed ${operation} failed${message.length === 0 ? "" : `: ${message}`}`);
+	return new ManagedSdkOperationError(
+		code,
+		`Managed ${operation} failed${message.length === 0 ? "" : `: ${message}`}`,
+	);
 }
 
 function isChangedAcknowledgement(value: Readonly<Record<string, unknown>>): boolean {

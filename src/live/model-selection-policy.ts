@@ -1,5 +1,4 @@
 import type { NormalizedModelSelection } from "../contracts";
-import { SdkV3OperationError } from "../gjc/sdk-v3-protocol";
 import { normalizeModelSelection } from "../gjc/session-router";
 import { GjcTurnCancelledError } from "../gjc/turn-runner";
 import type { ModelReader, ModelReaderFactory } from "./model-reader";
@@ -124,7 +123,12 @@ async function availableProviderIds(
 	try {
 		return activeProviderIds(await awaitWithAbort(reader.getActiveProviders(), signal));
 	} catch (error) {
-		if (catalog !== null && error instanceof SdkV3OperationError && error.code === "operation_not_session_owned")
+		if (
+			catalog !== null &&
+			typeof error === "object" &&
+			error !== null &&
+			Reflect.get(error, "code") === "operation_not_session_owned"
+		)
 			return undefined;
 		throw error;
 	}
