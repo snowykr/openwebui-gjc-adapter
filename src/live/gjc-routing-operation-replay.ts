@@ -6,10 +6,6 @@ import type { LiveGatewayRunnerInput, LiveGatewayRunnerResult } from "./chat-com
 import type { GjcSessionTurnRunner } from "./gjc-routing-gateway";
 import { controlOperationHash } from "./gjc-routing-publication";
 import { replayWithLifecyclePublication, withCanonicalModel } from "./gjc-routing-selection";
-import {
-	findRecoveredAcknowledgedSuccessor,
-	publishRecoveredAcknowledgedSuccessor,
-} from "./gjc-routing-successor-recovery";
 import { formatCanonicalModelId } from "./models";
 import { ensureProjectionRows, projectTurnEvents, replayCompletedWorkflowGateReply } from "./workflow-gate-turns";
 
@@ -71,51 +67,6 @@ export async function replayRoutingOperation(
 				selection,
 			);
 		});
-	}
-	if (
-		turn.control?.operation === "session.new" &&
-		priorOperation?.state === "uncertain" &&
-		priorOperation.detail === controlOperationHash(turn)
-	) {
-		const predecessor = mappings.get(turn.chatId);
-		if (predecessor === undefined) throw new Error(`GJC operation ${turn.userMessageId} requires reconciliation.`);
-		if (input.turnRunner.withLifecyclePublication === undefined)
-			throw new Error("GJC runner must provide lifecycle publication for acknowledged successor recovery.");
-		throwIfAborted(turn.signal);
-		const recovered = await findRecoveredAcknowledgedSuccessor(
-			turn,
-			predecessor,
-			priorOperation,
-			controlOperationHash(turn),
-		);
-		throwIfAborted(turn.signal);
-		return input.turnRunner.withLifecyclePublication(
-			{
-				cwd: turn.project.cwd,
-				sessionRoot: turn.project.sessionRoot ?? `${turn.project.cwd}/.gjc/sessions`,
-				projectId: predecessor.projectId,
-				chatId: predecessor.chatId,
-				sessionId: priorOperation.acknowledgedSuccessor?.sessionId ?? predecessor.sessionId,
-				sessionFile: recovered.sessionFile,
-				recoveryAttachment: recovered.attachment,
-			},
-			async lifecycle => {
-				throwIfAborted(turn.signal);
-				const published = await publishRecoveredAcknowledgedSuccessor(
-					mappings,
-					turn,
-					predecessor,
-					lifecycle,
-					controlOperationHash(turn),
-					recovered,
-				);
-				const mapping = mappings.get(turn.chatId);
-				if (mapping === undefined || mapping.operationId !== turn.userMessageId)
-					throw new Error(`GJC operation ${turn.userMessageId} recovery did not publish a current mapping.`);
-				ensureProjectionRows(input.outbox, mapping, projectionOwnerUserId, principalId);
-				return published;
-			},
-		);
 	}
 	if (turn.control !== undefined && priorOperation?.state === "pending")
 		throw new Error(`GJC operation ${turn.userMessageId} is pending and cannot be replayed.`);
