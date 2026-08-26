@@ -3,6 +3,7 @@ import type { NormalizedModelSelection } from "../contracts";
 import type { ManagedSdkRuntime } from "../gjc/managed-sdk-runtime";
 import { SdkV3OperationError } from "../gjc/sdk-v3-protocol";
 import type { SessionAttachmentProof } from "../gjc/session-authority";
+import { SESSION_AUTHORITY_V3_EPOCH } from "../gjc/session-authority-v3";
 import { normalizeModelSelection } from "../gjc/session-operation-codec";
 import type { SessionMapping } from "../gjc/session-router";
 import type {
@@ -274,7 +275,8 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime): ManagedG
 				...input.preparedManagedAuthority,
 				sessionId: lifecycleResult.tenant.sessionId,
 				generation: lifecycleResult.tenant.generation,
-			};
+				authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+			} as ManagedTurnAuthority & { readonly authorityEpoch: typeof SESSION_AUTHORITY_V3_EPOCH };
 			const address = {
 				cwd: input.cwd,
 				sessionRoot: input.sessionRoot,

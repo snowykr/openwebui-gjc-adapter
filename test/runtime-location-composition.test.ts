@@ -15,8 +15,6 @@ import {
 	renderResolvedExistingSystemdUnit,
 	renderResolvedSystemdComposeUnit,
 } from "../src/configure/systemd";
-import * as sessionRouter from "../src/gjc/session-router";
-import { SessionMappingStore } from "../src/gjc/session-router";
 import { buildResolvedInstalledAdapterServerOptions } from "../src/installed-adapter-server-options";
 
 const { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync } = fs;
@@ -61,6 +59,7 @@ function recorded<T>(calls: string[], name: string, result: T): T {
 function resolvedBuilderConfig(root: string) {
 	const runtimeLocations = resolveGjcRuntimeLocations({ mode: "existing", serviceHome: root });
 	return {
+		mode: "existing" as const,
 		bindHost: "127.0.0.1",
 		bindPort: 0,
 		openWebUIBaseUrl: "http://localhost:8080",
@@ -105,7 +104,7 @@ function writeV3Activation(canonicalPath: string, digestOverride?: string): void
 }
 
 describe("runtime location composition", () => {
-	test("selects direct V3 mappings and the active managed runtime before legacy construction", async () => {
+	test("selects direct V3 mappings and the active managed runtime", async () => {
 		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-v3-runtime-selection-")));
 		const calls: string[] = [];
 		const runtime = {
@@ -117,20 +116,14 @@ describe("runtime location composition", () => {
 			acquireAttachment: async () => undefined,
 			generationStatus: async () => ({ status: "current" }),
 		};
-		const legacyMappings = new SessionMappingStore();
 		try {
 			const config = resolvedBuilderConfig(root);
 			mkdirSync(config.sessionRoot);
 			writeV3Activation(join(config.sessionRoot, "openwebui-session-mappings.json"));
-			const options = await buildResolvedAdapterServerOptions(config, {
-				mappings: legacyMappings,
-				managedSdkRuntime: runtime as never,
-				turnRunner: { stop: async () => void calls.push("legacy-runner-stop") } as never,
-			});
+			const options = await buildResolvedAdapterServerOptions(config, { managedSdkRuntime: runtime as never });
 
 			const selectedMappings = options.routes?.mappings;
 			expect(selectedMappings).not.toBeUndefined();
-			expect(selectedMappings).not.toBe(legacyMappings);
 			expect(selectedMappings!.constructor.name).toBe("V3FileBackedSessionMappingStore");
 			expect(options.routes?.runner).not.toBeUndefined();
 			expect(options.managedSdkRuntime?.runtime).toBe(runtime as never);
@@ -142,99 +135,41 @@ describe("runtime location composition", () => {
 		}
 	});
 
-	test("blocks invalid or absent active V3 markers before any legacy mapping store is selected", async () => {
-		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-v3-runtime-blocked-")));
-		try {
-			const config = resolvedBuilderConfig(root);
-			mkdirSync(config.sessionRoot);
-			const canonicalPath = join(config.sessionRoot, "openwebui-session-mappings.json");
-			for (const marker of ["{\n", undefined] as const) {
-				writeV3Activation(canonicalPath);
-				if (marker === undefined) rmSync(`${canonicalPath}.v3-active.json`);
-				else writeFileSync(`${canonicalPath}.v3-active.json`, marker);
+	test("rejects absent, V2, malformed, unmarked, and malformed-marker authorities before effects", async () => {
+		for (const kind of ["absent", "v2", "malformed", "unmarked", "malformed-marker"] as const) {
+			const root = realpathSync(mkdtempSync(join(tmpdir(), `gjc-v3-runtime-blocked-${kind}-`)));
+			const calls: string[] = [];
+			const runtime = {
+				state: "new",
+				start: async () => void calls.push("runtime-start"),
+				dispose: async () => void calls.push("runtime-dispose"),
+				reconcile: async () => undefined,
+				registerTenant: () => undefined,
+				acquireAttachment: async () => undefined,
+				generationStatus: async () => ({ status: "current" }),
+			};
+			try {
+				const config = resolvedBuilderConfig(root);
+				mkdirSync(config.sessionRoot);
+				const canonicalPath = join(config.sessionRoot, "openwebui-session-mappings.json");
+				if (kind === "absent") {
+					// No canonical authority or marker is present.
+				} else if (kind === "v2")
+					writeFileSync(canonicalPath, '{"kind":"openwebui-gjc-session-authority","version":2,"mappings":[]}\n');
+				else if (kind === "malformed") writeFileSync(canonicalPath, "{malformed\n");
+				else {
+					writeV3Activation(canonicalPath);
+					if (kind === "unmarked") rmSync(`${canonicalPath}.v3-active.json`);
+					if (kind === "malformed-marker") writeFileSync(`${canonicalPath}.v3-active.json`, "{\n");
+				}
 				await expect(
-					buildResolvedAdapterServerOptions(config, { mappings: new SessionMappingStore() }),
+					buildResolvedAdapterServerOptions(config, { managedSdkRuntime: runtime as never }),
 				).rejects.toThrow("Canonical session authority activation is blocked.");
+				expect(calls).toEqual([]);
+				expect(existsSync(config.statePath)).toBeFalse();
+			} finally {
+				rmSync(root, { recursive: true, force: true });
 			}
-		} finally {
-			rmSync(root, { recursive: true, force: true });
-		}
-	});
-
-	test("existing mode rejects absent or V2 authority before state-store effects", async () => {
-		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-existing-authority-preflight-")));
-		try {
-			const config = { ...resolvedBuilderConfig(root), mode: "existing" as const };
-			await expect(buildResolvedAdapterServerOptions(config)).rejects.toThrow(
-				"Canonical session authority activation is blocked.",
-			);
-			expect(existsSync(config.statePath)).toBeFalse();
-
-			mkdirSync(config.sessionRoot);
-			const canonicalPath = join(config.sessionRoot, "openwebui-session-mappings.json");
-			const v2 = '{"kind":"openwebui-gjc-session-authority","version":2,"mappings":[]}\n';
-			writeFileSync(canonicalPath, v2);
-			await expect(buildResolvedAdapterServerOptions(config)).rejects.toThrow(
-				"Canonical session authority activation is blocked.",
-			);
-			expect(readFileSync(canonicalPath, "utf8")).toBe(v2);
-			expect(existsSync(config.statePath)).toBeFalse();
-		} finally {
-			rmSync(root, { recursive: true, force: true });
-		}
-	});
-
-	test("activates an empty V2 canonical authority into the managed V3 runtime", async () => {
-		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-v2-runtime-activation-")));
-		const calls: string[] = [];
-		const legacyStoreConstructor = spyOn(sessionRouter, "FileBackedSessionMappingStore");
-		const runtime = {
-			state: "new",
-			start: async () => void calls.push("runtime-start"),
-			dispose: async () => void calls.push("runtime-dispose"),
-			reconcile: async () => undefined,
-			registerTenant: () => undefined,
-			acquireAttachment: async () => ({ attachment: { isCurrent: () => true } }),
-			generationStatus: async () => ({ status: "current" }),
-		};
-		try {
-			const config = { ...resolvedBuilderConfig(root), mode: "managed" as const };
-			mkdirSync(config.sessionRoot);
-			writeFileSync(
-				join(config.sessionRoot, "openwebui-session-mappings.json"),
-				'{"kind":"openwebui-gjc-session-authority","version":2,"mappings":[]}\n',
-			);
-			const options = await buildResolvedAdapterServerOptions(config, { managedSdkRuntime: runtime as never });
-
-			expect(legacyStoreConstructor).not.toHaveBeenCalled();
-			expect(options.routes?.mappings?.constructor.name).toBe("V3FileBackedSessionMappingStore");
-			expect(options.routes?.runner).not.toBeUndefined();
-			expect(calls).toEqual(["runtime-start"]);
-			await options.shutdownCleanup?.();
-			expect(calls).toEqual(["runtime-start", "runtime-dispose"]);
-		} finally {
-			legacyStoreConstructor.mockRestore();
-			rmSync(root, { recursive: true, force: true });
-		}
-	});
-
-	test("retains the explicit V2 legacy test seam", async () => {
-		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-v2-runtime-regression-")));
-		const mappings = new SessionMappingStore();
-		try {
-			const config = resolvedBuilderConfig(root);
-			mkdirSync(config.sessionRoot);
-			writeFileSync(
-				join(config.sessionRoot, "openwebui-gjc-session-authority.json"),
-				'{"kind":"openwebui-gjc-session-authority","version":2}\n',
-			);
-			const options = await buildResolvedAdapterServerOptions(config, {
-				mappings,
-				turnRunner: { stop: async () => undefined } as never,
-			});
-			expect(options.routes?.mappings).toBe(mappings);
-		} finally {
-			rmSync(root, { recursive: true, force: true });
 		}
 	});
 
@@ -254,88 +189,6 @@ describe("runtime location composition", () => {
 		expect(() => Reflect.apply(renderResolvedExistingSystemdUnit, undefined, [{ workingDirectory: "/srv" }])).toThrow(
 			new TypeError(message),
 		);
-	});
-
-	test("selects an active managed bootstrap runner and preserves its service identity", async () => {
-		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-managed-bootstrap-selection-")));
-		const calls: string[] = [];
-		const runtime = {};
-		const tenantFence = async () => true;
-		const runner = { stop: async () => void calls.push("managed-runner-stop") } as never;
-		const bootstrap = {
-			readiness: true,
-			health: { phase: "active", ready: true, routerAvailable: true },
-			start: async () => {
-				calls.push("bootstrap-start");
-				return {
-					result: { phase: "active", ready: true, routerAvailable: true },
-					health: { phase: "active", ready: true, routerAvailable: true },
-					dependencies: { runtime, runner, tenantFence },
-				};
-			},
-			dispose: async () => void calls.push("bootstrap-dispose"),
-		};
-		try {
-			const options = await buildResolvedAdapterServerOptions(resolvedBuilderConfig(root), {
-				managedBootstrap: bootstrap as never,
-				mappings: new SessionMappingStore(),
-				turnRunner: { stop: async () => void calls.push("legacy-runner-stop") } as never,
-			});
-
-			expect(options.managedBootstrap).toBe(bootstrap as never);
-			expect(options.managedSdkRuntime).toBeUndefined();
-			await options.routes?.runner.stop?.();
-			expect(calls).toEqual(["bootstrap-start", "managed-runner-stop"]);
-		} finally {
-			rmSync(root, { recursive: true, force: true });
-		}
-	});
-
-	test("fails closed and disposes a blocked managed bootstrap without constructing legacy routing", async () => {
-		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-managed-bootstrap-blocked-")));
-		const calls: string[] = [];
-		const bootstrap = {
-			readiness: false,
-			health: { phase: "blocked", ready: false, routerAvailable: false, reason: "blocked" },
-			start: async () => {
-				calls.push("bootstrap-start");
-				return {
-					result: { phase: "blocked", ready: false, routerAvailable: false, reason: "blocked" },
-					health: { phase: "blocked", ready: false, routerAvailable: false, reason: "blocked" },
-				};
-			},
-			dispose: async () => void calls.push("bootstrap-dispose"),
-		};
-		try {
-			await expect(
-				buildResolvedAdapterServerOptions(resolvedBuilderConfig(root), {
-					managedBootstrap: bootstrap as never,
-					mappings: new SessionMappingStore(),
-					turnRunner: { stop: async () => void calls.push("legacy-runner-stop") } as never,
-				}),
-			).rejects.toThrow("Managed bootstrap is not ready: blocked");
-			expect(calls).toEqual(["bootstrap-start", "bootstrap-dispose"]);
-		} finally {
-			rmSync(root, { recursive: true, force: true });
-		}
-	});
-
-	test("retains legacy turn-runner composition when no managed bootstrap is supplied", async () => {
-		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-legacy-bootstrap-regression-")));
-		const calls: string[] = [];
-		const legacyRunner = { stop: async () => void calls.push("legacy-runner-stop") } as never;
-		try {
-			const options = await buildResolvedAdapterServerOptions(resolvedBuilderConfig(root), {
-				mappings: new SessionMappingStore(),
-				turnRunner: legacyRunner,
-			});
-
-			expect(options.managedBootstrap).toBeUndefined();
-			await options.routes?.runner.stop?.();
-			expect(calls).toEqual(["legacy-runner-stop"]);
-		} finally {
-			rmSync(root, { recursive: true, force: true });
-		}
 	});
 
 	test("retains installed fields and resolves one frozen object", () => {

@@ -6,7 +6,7 @@ import { buildAdapterServerOptionsFromEnv } from "../src/cli";
 import { createAdapterRequestHandler } from "../src/server";
 import {
 	chatRequest,
-	FakeGjcTurnRunner,
+	FakeManagedSdkRuntime,
 	reserveTcpPort,
 	stopProcess,
 	waitForStartedServer,
@@ -24,7 +24,9 @@ describe("adapter CLI auth and start", () => {
 	test("rejects OpenAI-compatible requests when the adapter API token is not configured", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-cli-"));
 		const projectDirectory = path.join(workspace, "Demo Project");
+		const sessionRoot = path.join(workspace, "sessions");
 		await fs.mkdir(projectDirectory);
+		await writeDirectV3Authority(sessionRoot);
 		const options = await buildAdapterServerOptionsFromEnv(
 			{
 				...process.env,
@@ -34,9 +36,10 @@ describe("adapter CLI auth and start", () => {
 				GJC_OPENWEBUI_OWNER_USER_ID: "owner-test",
 				GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS: workspace,
 				GJC_OPENWEBUI_STATE_PATH: path.join(workspace, "adapter-state"),
+				GJC_OPENWEBUI_SESSION_ROOT: sessionRoot,
 				GJC_OPENWEBUI_PROJECTS: `${projectDirectory}|Demo Project`,
 			},
-			{ turnRunner: new FakeGjcTurnRunner() },
+			{ managedSdkRuntime: new FakeManagedSdkRuntime() },
 		);
 		const handler = createAdapterRequestHandler({ routes: options.routes });
 

@@ -52,6 +52,22 @@ describe("adapter config contracts", () => {
 		expect(loadAdapterConfig({ GJC_OPENWEBUI_MODE: "existing" }).mode).toBe("existing");
 	});
 
+	test("retains exact mode only for deployment and runtime-location policy", () => {
+		const managed = loadAdapterConfig({
+			GJC_OPENWEBUI_MODE: "managed",
+			GJC_OPENWEBUI_SESSION_ROOT: "/var/lib/gjc/sessions",
+		});
+		const existing = loadAdapterConfig({
+			GJC_OPENWEBUI_MODE: "existing",
+			GJC_OPENWEBUI_SESSION_ROOT: "/srv/gjc/sessions",
+		});
+
+		expect(managed.mode).toBe("managed");
+		expect(managed.sessionRoot).toBe("/var/lib/gjc/sessions");
+		expect(existing.mode).toBe("existing");
+		expect(existing.sessionRoot).toBe("/srv/gjc/sessions");
+	});
+
 	test("retains resolved runtime fields as frozen enumerable configuration", () => {
 		const config = loadAdapterConfig({ GJC_OPENWEBUI_MODE: "existing" });
 		const spread = { ...config };

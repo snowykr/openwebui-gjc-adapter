@@ -7,12 +7,20 @@ import { buildAdapterServerOptionsFromEnv } from "../src/cli";
 import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
 import { GJC_OPENWEBUI_PROMPT_HINTS } from "../src/openwebui/prompt-hints";
-import { FakeGjcTurnRunner } from "./cli-fixtures";
 
 describe("adapter CLI prompt hints", () => {
 	test("seeds OpenWebUI prompt hints during CLI startup when API auth is configured", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-cli-prompts-"));
 		const fixture = startPromptServer();
+		const managedRuntime = {
+			state: "new",
+			start: async () => undefined,
+			dispose: async () => undefined,
+			reconcile: async () => undefined,
+			registerTenant: () => undefined,
+			acquireAttachment: async () => undefined,
+			generationStatus: async () => ({ status: "current" as const }),
+		};
 
 		try {
 			await writeV3Authority(path.join(workspace, "sessions"));
@@ -29,7 +37,7 @@ describe("adapter CLI prompt hints", () => {
 					GJC_OPENWEBUI_STATE_PATH: path.join(workspace, "state"),
 				},
 				{
-					turnRunner: new FakeGjcTurnRunner(),
+					managedSdkRuntime: managedRuntime as never,
 					projectionRepository: new InMemoryOpenWebUIProjectionRepository(),
 				},
 			);

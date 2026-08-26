@@ -3,20 +3,19 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { buildAdapterServerOptionsFromEnv } from "../src/cli";
-import { SessionMappingStore } from "../src/gjc/session-router";
+import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import type { LiveGatewayEventDeliveryInput } from "../src/live/chat-completions";
 import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
 import { createAdapterRequestHandler } from "../src/server";
 import {
 	chatRequest,
-	FakeGjcTurnRunner,
+	FakeManagedSdkRuntime,
+	managedPreparedAuthority,
 	reserveTcpPort,
 	stopProcess,
 	waitForStartedServer,
 	writeDirectV3Authority,
 } from "./cli-fixtures";
-import { staticModelReaderFactory } from "./model-selection-fixtures";
-import { messageEntry, writeSessionFile } from "./session-sync-fixtures";
 
 const spawnedProcesses: Bun.Subprocess[] = [];
 const healthStateRoots: string[] = [];
@@ -80,13 +79,14 @@ describe("adapter CLI service", () => {
 		expect(await new Response(proc.stdout).text()).toContain("Usage: openwebui-gjc-adapter");
 	});
 
-	test("routes chat completions through an injected GJC turn runner when building options", async () => {
-		// Given: a configured project and a fake GJC turn runner injected at the CLI boundary.
+	test("routes managed chat completions through the runtime fake when building options", async () => {
+		// Given: a configured project and a managed runtime fake injected at the CLI boundary.
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-cli-"));
 		const projectDirectory = path.join(workspace, "Demo Project");
 		const sessionRoot = path.join(workspace, "sessions");
 		await fs.mkdir(projectDirectory);
-		const turnRunner = new FakeGjcTurnRunner();
+		await writeDirectV3Authority(sessionRoot);
+		const runtime = new FakeManagedSdkRuntime();
 
 		const options = await buildAdapterServerOptionsFromEnv(
 			{
@@ -101,7 +101,7 @@ describe("adapter CLI service", () => {
 				GJC_OPENWEBUI_STATE_PATH: path.join(workspace, "adapter-state"),
 				GJC_OPENWEBUI_PROJECTS: `${projectDirectory}|Demo Project`,
 			},
-			{ turnRunner },
+			{ managedSdkRuntime: runtime },
 		);
 		const routes = options.routes;
 		if (routes === undefined) throw new Error("expected route dependencies");
@@ -118,19 +118,35 @@ describe("adapter CLI service", () => {
 			userMessageParentId: null,
 			continued: false,
 			ownerUserId: "owner-test",
+			preparedManagedAuthority: managedPreparedAuthority({
+				projectId: project.id,
+				canonicalWorkspace: projectDirectory,
+				chatId: "chat-1",
+				requestKey: "user-1",
+			}),
 		});
 
-		// Then: the injected turn runner is called through routing and assistant content is returned.
+		// Then: the managed runtime is called through routing and assistant content is returned.
 		expect(result).toEqual({ content: "assistant from gjc: hello" });
-		expect(turnRunner.starts).toHaveLength(1);
-		expect(turnRunner.starts[0]).toMatchObject({
-			cwd: projectDirectory,
-			projectId: "demo-project",
-			chatId: "chat-1",
-			userMessageId: "user-1",
-			text: "hello",
-		});
+		expect(runtime.requests).toContainEqual(
+			expect.objectContaining({
+				operation: "turn.prompt",
+				input: { text: "hello" },
+				tenant: expect.objectContaining({
+					principalId: "owner-test",
+					projectId: "demo-project",
+					chatId: "chat-1",
+					generation: 1,
+					leaseId: "fixture-lease",
+					epoch: SESSION_AUTHORITY_V3_EPOCH,
+				}),
+			}),
+		);
+		expect(runtime.requests.filter(request => request.operation === "turn.prompt")).toHaveLength(1);
 		expect(await fs.readFile(path.join(sessionRoot, "openwebui-session-mappings.json"), "utf8")).toContain("chat-1");
+		expect(await fs.readFile(path.join(sessionRoot, "openwebui-session-mappings.json"), "utf8")).not.toContain(
+			"sessionFile",
+		);
 	});
 
 	test("delivers projected GJC events through the CLI event sink", async () => {
@@ -138,18 +154,11 @@ describe("adapter CLI service", () => {
 		const projectDirectory = path.join(workspace, "Demo Project");
 		const sessionRoot = path.join(workspace, "sessions");
 		await fs.mkdir(projectDirectory);
-		const turnRunner = new FakeGjcTurnRunner();
-		turnRunner.events = [{ type: "tool_execution_start", id: "tool-1", text: "bash" }];
+		await writeDirectV3Authority(sessionRoot);
+		const runtime = new FakeManagedSdkRuntime();
+		runtime.events = [{ type: "tool_execution_start", id: "tool-1", text: "bash" }];
 		const delivered: LiveGatewayEventDeliveryInput[] = [];
 		const repository = new InMemoryOpenWebUIProjectionRepository();
-		await repository.upsertChat({
-			id: "chat-1",
-			owner_user_id: "owner-test",
-			folder_id: "gjc-project-demo-project",
-			title: "Demo Project chat",
-			metadata: {},
-			history: { currentId: null, messages: {} },
-		});
 		const options = await buildAdapterServerOptionsFromEnv(
 			{
 				...process.env,
@@ -164,9 +173,8 @@ describe("adapter CLI service", () => {
 				GJC_OPENWEBUI_PROJECTS: `${projectDirectory}|Demo Project`,
 			},
 			{
-				turnRunner,
+				managedSdkRuntime: runtime,
 				projectionRepository: repository,
-				modelReaderFactory: staticModelReaderFactory(),
 				eventSink: input => {
 					delivered.push(input);
 				},
@@ -174,33 +182,28 @@ describe("adapter CLI service", () => {
 		);
 
 		const handler = createAdapterRequestHandler({ routes: options.routes });
-		const response = await handler(chatRequest());
+		const response = await handler(chatRequest({ userId: "normal-user" }));
 
 		expect(response.status).toBe(200);
 		expect(delivered).toHaveLength(1);
 		expect(delivered[0]).toMatchObject({
 			chatId: "chat-1",
 			messageId: "assistant-1",
-			ownerUserId: "owner-test",
-			projectId: "demo-project",
+			ownerUserId: "normal-user",
+			projectId: "openwebui",
 		});
 		expect(delivered[0]?.events).toHaveLength(1);
 	});
 
-	test("imports existing configured project sessions while building service options", async () => {
+	test("projects configured folders while building service options", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-cli-"));
 		const projectDirectory = path.join(workspace, "Demo Project");
-		const sessionDirectory = path.join(projectDirectory, ".gjc", "sessions");
 		const stateDirectory = path.join(workspace, "state");
-		await fs.mkdir(sessionDirectory, { recursive: true });
-		await writeSessionFile(path.join(sessionDirectory, "session-import.jsonl"), {
-			header: { id: "session-import", title: "Imported From Disk", cwd: projectDirectory },
-			entries: [messageEntry("user-import", null, "user", "load me")],
-		});
+		await fs.mkdir(projectDirectory);
+		await writeDirectV3Authority(stateDirectory);
 		const repository = new InMemoryOpenWebUIProjectionRepository();
-		const mappings = new SessionMappingStore();
 
-		await buildAdapterServerOptionsFromEnv(
+		const options = await buildAdapterServerOptionsFromEnv(
 			{
 				...process.env,
 				GJC_OPENWEBUI_MODE: "existing",
@@ -213,28 +216,22 @@ describe("adapter CLI service", () => {
 				GJC_OPENWEBUI_STATE_PATH: path.join(workspace, "adapter-state"),
 				GJC_OPENWEBUI_PROJECTS: `${projectDirectory}|Demo Project`,
 			},
-			{ turnRunner: new FakeGjcTurnRunner(), projectionRepository: repository, mappings },
+			{ managedSdkRuntime: new FakeManagedSdkRuntime(), projectionRepository: repository },
 		);
 
-		const chat = await repository.getChat("owner-test", "gjc-project-demo-project-session-session-import");
-		expect(chat).toMatchObject({
-			folder_id: "gjc-project-demo-project",
-			title: "Imported From Disk",
+		expect(options.routes?.projects).toMatchObject([{ id: "demo-project", status: "linked" }]);
+		expect(await repository.getFolder("owner-test", "gjc-project-demo-project")).toMatchObject({
+			id: "gjc-project-demo-project",
+			name: "Demo Project",
 		});
-		expect(chat?.history.messages["gjc-session-session-import-message-user-import"]?.content).toBe("load me");
-		expect(mappings.entries()).toMatchObject([
-			{
-				chatId: "gjc-project-demo-project-session-session-import",
-				projectId: "demo-project",
-				sessionId: "session-import",
-			},
-		]);
 	});
 
 	test("requires forwarded user headers for CLI chat requests", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-cli-"));
 		const projectDirectory = path.join(workspace, "Demo Project");
+		const sessionRoot = path.join(workspace, "sessions");
 		await fs.mkdir(projectDirectory);
+		await writeDirectV3Authority(sessionRoot);
 		const options = await buildAdapterServerOptionsFromEnv(
 			{
 				...process.env,
@@ -244,10 +241,11 @@ describe("adapter CLI service", () => {
 				GJC_OPENWEBUI_ADAPTER_API_TOKEN: "adapter-token",
 				GJC_OPENWEBUI_OWNER_USER_ID: "owner-test",
 				GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS: workspace,
+				GJC_OPENWEBUI_SESSION_ROOT: sessionRoot,
 				GJC_OPENWEBUI_STATE_PATH: path.join(workspace, "adapter-state"),
 				GJC_OPENWEBUI_PROJECTS: `${projectDirectory}|Demo Project`,
 			},
-			{ turnRunner: new FakeGjcTurnRunner() },
+			{ managedSdkRuntime: new FakeManagedSdkRuntime() },
 		);
 		const handler = createAdapterRequestHandler({ routes: options.routes });
 
@@ -260,8 +258,10 @@ describe("adapter CLI service", () => {
 	test("uses an isolated normal-user workspace when no administrator is configured", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-cli-"));
 		const projectDirectory = path.join(workspace, "Demo Project");
+		const sessionRoot = path.join(workspace, "sessions");
 		await fs.mkdir(projectDirectory);
-		const turnRunner = new FakeGjcTurnRunner();
+		await writeDirectV3Authority(sessionRoot);
+		const runtime = new FakeManagedSdkRuntime();
 		const options = await buildAdapterServerOptionsFromEnv(
 			{
 				...process.env,
@@ -270,17 +270,20 @@ describe("adapter CLI service", () => {
 				GJC_OPENWEBUI_BIND_PORT: "8765",
 				GJC_OPENWEBUI_ADAPTER_API_TOKEN: "adapter-token",
 				GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS: workspace,
+				GJC_OPENWEBUI_SESSION_ROOT: sessionRoot,
 				GJC_OPENWEBUI_STATE_PATH: path.join(workspace, "adapter-state"),
 				GJC_OPENWEBUI_PROJECTS: `${projectDirectory}|Demo Project`,
 			},
-			{ turnRunner, modelReaderFactory: staticModelReaderFactory() },
+			{ managedSdkRuntime: runtime },
 		);
 		const handler = createAdapterRequestHandler({ routes: options.routes });
 
 		const response = await handler(chatRequest({ userId: "unconfigured-owner" }));
 
 		expect(response.status).toBe(200);
-		expect(turnRunner.starts).toHaveLength(1);
-		expect(turnRunner.starts[0]?.cwd).toContain(path.join("workspaces", ""));
+		expect(runtime.requests.filter(request => request.operation === "turn.prompt")).toHaveLength(1);
+		expect(
+			runtime.requests.find(request => request.operation === "turn.prompt")?.tenant.canonicalWorkspace,
+		).toContain(path.join("workspaces", ""));
 	});
 });

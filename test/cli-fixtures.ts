@@ -1,6 +1,16 @@
 import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import * as path from "node:path";
+import type {
+	ManagedSdkAttachment,
+	ManagedSdkFrameCorrelation,
+	ManagedSdkFrameSubscription,
+	ManagedSdkObservedFrame,
+	ManagedSdkOwnerState,
+	ManagedSdkPendingFrameSubscription,
+	TenantSessionKey,
+} from "../src/gjc/managed-sdk-runtime";
+import { MANAGED_SESSION_AUTHORITY_EPOCH } from "../src/gjc/managed-session-authority";
 import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import type {
 	GjcContinueSessionInput,
@@ -8,9 +18,12 @@ import type {
 	GjcSessionState,
 	GjcSessionStateInput,
 	GjcStartNewSessionInput,
+	GjcTurnEvent,
 	GjcTurnResult,
 	GjcTurnRunner,
+	ManagedPreparedTurnAuthority,
 } from "../src/gjc/turn-runner";
+import type { ManagedSdkRuntimeDependency } from "../src/live/gjc-routing-lifecycle";
 import { attachmentProof, lifecycleFixture } from "./gjc-lifecycle-fixtures";
 
 export async function writeDirectV3Authority(sessionRoot: string): Promise<void> {
@@ -36,6 +49,282 @@ export async function writeDirectV3Authority(sessionRoot: string): Promise<void>
 			source: { baseDigest: "0".repeat(64), walDigest: "0".repeat(64), walPresent: false },
 		})}\n`,
 	);
+}
+
+export function managedPreparedAuthority(options: {
+	readonly principalId?: string;
+	readonly projectId: string;
+	readonly canonicalWorkspace: string;
+	readonly chatId: string;
+	readonly leaseId?: string;
+	readonly requestKey: string;
+}): ManagedPreparedTurnAuthority {
+	return {
+		principalId: options.principalId ?? "owner-test",
+		projectId: options.projectId,
+		canonicalWorkspace: path.resolve(options.canonicalWorkspace),
+		chatId: options.chatId,
+		leaseId: options.leaseId ?? "fixture-lease",
+		epoch: SESSION_AUTHORITY_V3_EPOCH,
+		requestKey: options.requestKey,
+	};
+}
+
+export interface FakeManagedRequest {
+	readonly operation: string;
+	readonly tenant: TenantSessionKey;
+	readonly input: Readonly<Record<string, unknown>>;
+}
+
+interface FakeManagedSession {
+	tenant?: TenantSessionKey;
+	status: "current" | "retired";
+}
+
+/**
+ * In-process direct managed-runtime fixture. It models the process-owned
+ * Runtime/Router/lifecycle boundary rather than exposing a legacy turn runner
+ * or endpoint/attachment injection seam to adapter startup.
+ */
+export class FakeManagedSdkRuntime implements ManagedSdkRuntimeDependency {
+	state: ManagedSdkOwnerState = "new";
+	events: GjcTurnEvent[] = [{ type: "assistant", text: "assistant from gjc" }];
+	readonly requests: FakeManagedRequest[] = [];
+	readonly tenants: TenantSessionKey[] = [];
+	#nextSession = 1;
+	readonly #sessions = new Map<string, FakeManagedSession>();
+	readonly #attachments = new Map<string, ManagedSdkAttachment["attachment"]>();
+
+	async start(): Promise<void> {
+		if (this.state === "new") this.state = "running";
+	}
+
+	async reconcile(): Promise<void> {
+		if (this.state !== "running") throw new Error(`Fake managed runtime is ${this.state}.`);
+	}
+
+	async dispose(): Promise<void> {
+		this.state = "stopped";
+	}
+
+	registerTenant(key: TenantSessionKey): void {
+		const existing = this.tenants.find(candidate => sameTenant(candidate, key));
+		if (existing === undefined) this.tenants.push({ ...key });
+	}
+
+	unregisterTenant(key: TenantSessionKey): void {
+		const index = this.tenants.findIndex(candidate => sameTenant(candidate, key));
+		if (index >= 0) this.tenants.splice(index, 1);
+	}
+
+	async registerLifecycleTenant(key: TenantSessionKey): Promise<ManagedSdkAttachment> {
+		this.registerTenant(key);
+		return await this.acquireAttachment(key);
+	}
+
+	async acquireAttachment(key: TenantSessionKey): Promise<ManagedSdkAttachment> {
+		if (this.state !== "running") throw new Error("Fake managed runtime is not running.");
+		if (!this.tenants.some(candidate => sameTenant(candidate, key)))
+			throw new Error("Fake managed tenant is not registered.");
+		const identity = sessionIdentity(key);
+		const session = this.#sessions.get(identity);
+		if (session?.status === "retired") throw new Error("Fake managed generation is retired.");
+		if (session === undefined) this.#sessions.set(identity, { tenant: { ...key }, status: "current" });
+		else if (session.tenant === undefined) session.tenant = { ...key };
+		else if (!sameTenant(session.tenant, key)) throw new Error("Fake managed tenant authority changed.");
+		let attachment = this.#attachments.get(identity);
+		if (attachment === undefined) {
+			attachment = {
+				isCurrent: () => this.#sessions.get(identity)?.status === "current",
+			} as ManagedSdkAttachment["attachment"];
+			this.#attachments.set(identity, attachment);
+		}
+		return { tenant: { ...key }, generation: key.generation, attachment };
+	}
+
+	async generationStatus(key: TenantSessionKey): Promise<any> {
+		return { status: this.#sessions.get(sessionIdentity(key))?.status ?? "current" };
+	}
+
+	prepareFrameSubscription(
+		managed: ManagedSdkAttachment,
+		_operation: string,
+		_listener: (frame: ManagedSdkObservedFrame) => void | Promise<void>,
+	): ManagedSdkPendingFrameSubscription {
+		this.assertManagedAttachment(managed);
+		const pending = (() => undefined) as ManagedSdkPendingFrameSubscription;
+		pending.bind = () => undefined;
+		pending.drain = async () => undefined;
+		return pending;
+	}
+
+	subscribeFrames(
+		managed: ManagedSdkAttachment,
+		_operation: string,
+		_correlation: ManagedSdkFrameCorrelation,
+		_listener: (frame: ManagedSdkObservedFrame) => void | Promise<void>,
+	): ManagedSdkFrameSubscription {
+		this.assertManagedAttachment(managed);
+		const subscription = (() => undefined) as ManagedSdkFrameSubscription;
+		subscription.drain = async () => undefined;
+		return subscription;
+	}
+
+	async request(
+		managed: ManagedSdkAttachment,
+		frame: Record<string, unknown>,
+		options?: {
+			readonly timeoutMs?: number;
+			readonly beforeDispatch?: () => void | Promise<void>;
+			readonly onDispatch?: () => void;
+		},
+	): Promise<Record<string, unknown>> {
+		this.assertManagedAttachment(managed);
+		await options?.beforeDispatch?.();
+		options?.onDispatch?.();
+		const operation = typeof frame.operation === "string" ? frame.operation : undefined;
+		const query = typeof frame.query === "string" ? frame.query : undefined;
+		const input = isRecord(frame.input) ? frame.input : {};
+		if (operation === undefined && query === undefined) throw new Error("Fake managed request lacks operation.");
+		this.requests.push({ operation: operation ?? query!, tenant: { ...managed.tenant }, input });
+		if (query !== undefined) return this.queryResponse(query);
+		if (operation === "model.set") {
+			const id = typeof input.id === "string" ? input.id : "fixture/model";
+			const separator = id.indexOf("/");
+			return {
+				type: "control_response",
+				ok: true,
+				result: {
+					provider: separator < 0 ? "fixture" : id.slice(0, separator),
+					modelId: separator < 0 ? id : id.slice(separator + 1),
+					thinkingLevel: typeof input.thinkingLevel === "string" ? input.thinkingLevel : "off",
+				},
+			};
+		}
+		if (operation === "thinking.set") return { type: "control_response", ok: true, result: { changed: true } };
+		if (operation === "turn.prompt" || operation === "turn.follow_up" || operation === "turn.abort_and_prompt") {
+			const text = typeof input.text === "string" ? input.text : "";
+			return {
+				type: "control_response",
+				ok: true,
+				result: {
+					accepted: true,
+					commandId: "command-fixture",
+					turnId: "turn-fixture",
+					finalizedAssistantText: `assistant from gjc: ${text}`,
+					events: this.events,
+				},
+			};
+		}
+		return {
+			type: "control_response",
+			ok: true,
+			result: { accepted: true, commandId: "command-fixture", turnId: "turn-fixture" },
+		};
+	}
+
+	async createPreparedExternalLifecycleSession(
+		authority: ManagedPreparedTurnAuthority,
+		_request: Readonly<Record<string, unknown>>,
+	): Promise<Record<string, unknown>> {
+		return this.createSession(authority);
+	}
+
+	async createExternalLifecycleSession(_request: any, _second?: any): Promise<any> {
+		return this.createSession();
+	}
+
+	async createLifecycleSession(_request: any, _second?: any): Promise<any> {
+		return this.createSession();
+	}
+
+	async resumeExternalLifecycleSession(_request: any, _second?: any): Promise<any> {
+		return { ok: true, result: { sessionId: "session-fixture-resumed", endpointGeneration: 1 } };
+	}
+
+	async resumeLifecycleSession(_request: any, _second?: any): Promise<any> {
+		return { ok: true, result: { sessionId: "session-fixture-resumed", endpointGeneration: 1 } };
+	}
+
+	async closeLifecycleSession(_tenantOrRequest: any, request?: any): Promise<any> {
+		const first = isRecord(_tenantOrRequest) ? _tenantOrRequest : {};
+		const target = isRecord(request?.target) ? request.target : isRecord(first.target) ? first.target : {};
+		const sessionId = typeof target.sessionId === "string" ? target.sessionId : undefined;
+		const generation = typeof target.endpointGeneration === "number" ? target.endpointGeneration : undefined;
+		if (sessionId !== undefined && generation !== undefined) {
+			const session = this.#sessions.get(`${sessionId}:${generation}`);
+			if (session !== undefined) session.status = "retired";
+		}
+		return { ok: true, result: { closed: true } };
+	}
+
+	async deleteLifecycleSession(_tenantOrRequest: any, request?: any): Promise<any> {
+		return await this.closeLifecycleSession(_tenantOrRequest, request);
+	}
+
+	private createSession(authority?: ManagedPreparedTurnAuthority): Record<string, unknown> {
+		const sessionId = `session-fixture-${this.#nextSession++}`;
+		const generation = 1;
+		const tenant: TenantSessionKey = {
+			principalId: authority?.principalId ?? "fixture-principal",
+			projectId: authority?.projectId ?? "fixture-project",
+			canonicalWorkspace: authority?.canonicalWorkspace ?? "/fixture/workspace",
+			chatId: authority?.chatId ?? `fixture-chat-${this.#nextSession}`,
+			sessionId,
+			generation,
+			leaseId: authority?.leaseId ?? "fixture-lease",
+			epoch: authority?.epoch ?? MANAGED_SESSION_AUTHORITY_EPOCH,
+		};
+		this.#sessions.set(sessionIdentity(tenant), {
+			tenant: authority === undefined ? undefined : tenant,
+			status: "current",
+		});
+		this.registerTenant(tenant);
+		return { ok: true, result: { sessionId, endpointGeneration: generation } };
+	}
+
+	private assertManagedAttachment(managed: ManagedSdkAttachment): void {
+		if (!this.tenants.some(candidate => sameTenant(candidate, managed.tenant)))
+			throw new Error("Fake managed tenant is not registered.");
+		const identity = sessionIdentity(managed.tenant);
+		if (this.#attachments.get(identity) !== managed.attachment || !managed.attachment.isCurrent())
+			throw new Error("Fake managed attachment is not current.");
+	}
+
+	private queryResponse(query: string): Record<string, unknown> {
+		if (query === "models.list/current") {
+			return {
+				type: "query_response",
+				ok: true,
+				page: {
+					items: [
+						{
+							provider: "fixture",
+							id: "model",
+							reasoning: false,
+							thinking: { validLevels: ["off"] },
+						},
+					],
+					complete: true,
+				},
+			};
+		}
+		if (query === "providers.list/active") {
+			return {
+				type: "query_response",
+				ok: true,
+				page: { items: [{ provider: "fixture", connectionKind: "credentialless" }], complete: true },
+			};
+		}
+		if (query === "session.state") {
+			return {
+				type: "query_response",
+				ok: true,
+				page: { items: [{ model: { provider: "fixture", id: "model" }, thinkingLevel: "off" }], complete: true },
+			};
+		}
+		return { type: "query_response", ok: true, page: { items: [], complete: true } };
+	}
 }
 
 export async function reserveTcpPort(): Promise<number> {
@@ -167,6 +456,27 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 			attachment: attachmentProof(input),
 		};
 	}
+}
+
+function sessionIdentity(key: Pick<TenantSessionKey, "sessionId" | "generation">): string {
+	return `${key.sessionId}:${key.generation}`;
+}
+
+function sameTenant(left: TenantSessionKey, right: TenantSessionKey): boolean {
+	return (
+		left.principalId === right.principalId &&
+		left.projectId === right.projectId &&
+		left.canonicalWorkspace === right.canonicalWorkspace &&
+		left.chatId === right.chatId &&
+		left.sessionId === right.sessionId &&
+		left.generation === right.generation &&
+		left.leaseId === right.leaseId &&
+		left.epoch === right.epoch
+	);
+}
+
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export function chatRequest(

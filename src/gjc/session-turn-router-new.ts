@@ -1,4 +1,5 @@
 import type { ProvisionalSessionOperation } from "./session-authority";
+import { SESSION_AUTHORITY_V3_EPOCH } from "./session-authority-v3";
 import { validateSessionFile } from "./session-file";
 import { hashTurnIngress, normalizeModelSelection } from "./session-operation-codec";
 import { resolveEffectiveGjcSessionRoot } from "./session-root";
@@ -184,10 +185,11 @@ function managedAuthorityFor(
 		chatId: prepared.chatId,
 		sessionId: proof.sessionId,
 		generation: proof.generation,
-		leaseId: proof.leaseId,
+		leaseId: prepared.leaseId,
 		epoch: proof.epoch,
 		requestKey: prepared.requestKey,
-	};
+		authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+	} as ManagedTurnAuthority & { readonly authorityEpoch: typeof SESSION_AUTHORITY_V3_EPOCH };
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {

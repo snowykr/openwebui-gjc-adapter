@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import * as path from "node:path";
 import { createAdapterSessionCloser } from "./adapter-close-options";
-import { activateAdapterSessionAuthorityV3, type ManagedBootstrapAuthorityResolver } from "./adapter-managed-bootstrap";
 import { type ActiveManagedV3Runtime, startActiveManagedRuntime } from "./adapter-managed-v3-runtime";
 import {
 	buildOpenWebUIPrincipalClientFactory,
@@ -16,21 +15,18 @@ import {
 import { assertResolvedAdapterConfig, loadConfiguredProjects, resolveAdapterConfig } from "./adapter-project-options";
 import { buildRuntimeHealthChecks, type RuntimeIsolationDiagnostic } from "./adapter-runtime-health";
 import { type AdapterConfig, loadAdapterConfig, type ResolvedAdapterConfig } from "./config";
-import { resolveLegacySessionAuthoritySourcePaths, SESSION_AUTHORITY_MAPPING_FILE } from "./config-env";
-import type { ManagedBootstrapRunnerDependencies, ManagedBootstrapService } from "./gjc/managed-bootstrap";
+import { SESSION_AUTHORITY_MAPPING_FILE } from "./config-env";
 import { ManagedSdkRuntime, type TenantSessionKey } from "./gjc/managed-sdk-runtime";
 import { probeSessionAuthorityEpoch } from "./gjc/session-authority-epoch";
-import { preflightSessionAuthorityMigrationCandidates } from "./gjc/session-authority-migration";
 import { SESSION_AUTHORITY_V3_EPOCH } from "./gjc/session-authority-v3";
 import { readSessionAuthorityV3ActiveMarker } from "./gjc/session-authority-v3-activation";
 import { loadGjcSessionFile } from "./gjc/session-loader";
-import { FileBackedSessionMappingStore, type SessionMapping, SessionMappingStore } from "./gjc/session-router";
+import type { SessionMapping, SessionMappingStore } from "./gjc/session-router";
 import { V3FileBackedSessionMappingStore } from "./gjc/session-v3-file-backed-mapping-store";
 import type { GjcCloseReceipt, ManagedPreparedTurnAuthority, ManagedTurnAuthority } from "./gjc/turn-runner";
 import type { LiveGatewayEventSink, LiveGatewayMessageSink } from "./live/chat-completions";
 import { acquireWorkspaceAdmission } from "./live/chat-completions";
 import type { LiveGatewayFileContextResolver } from "./live/file-contexts";
-import { createGjcIdleSessionReaper } from "./live/gjc-idle-session-reaper";
 import {
 	createManagedIdleReaper,
 	createManagedV3GenerationStore,
@@ -39,18 +35,8 @@ import {
 } from "./live/gjc-managed-idle-reaper";
 import { createManagedModelReaderFactory } from "./live/gjc-managed-model-reader";
 import type { ManagedSdkRuntimeDependency, ManagedSdkTenantFence } from "./live/gjc-routing-lifecycle";
-import {
-	createGjcRoutingLiveGatewayRunner,
-	createPublicSdkGjcTurnRunner,
-	createPublicSdkModelAttachmentResolver,
-	type GjcSessionTurnRunner,
-} from "./live/gjc-routing-runner";
-import {
-	createModelReaderFactory,
-	type ModelReaderFactory,
-	type PublicSdkAttachmentResolver,
-	type PublicSdkSessionPortFactory,
-} from "./live/model-reader";
+import { createGjcRoutingLiveGatewayRunner } from "./live/gjc-routing-runner";
+import type { ModelReaderFactory } from "./live/model-reader";
 import {
 	createProjectionOperationApplier,
 	type PrincipalProjectionSynchronizerInput,
@@ -61,19 +47,14 @@ import type { OpenWebUIProjectionRepository } from "./openwebui/client";
 import type { OpenWebUIPrincipalClient } from "./openwebui/http-client";
 import { projectGjcSessionToOpenWebUIChat } from "./projection/chat-tree";
 import { importProjectedSession } from "./projection/importer";
-import { assertProjectsAdmitted, ProjectLinkService, type SessionCloseResult } from "./projects/link-service";
+import { ProjectLinkService, type SessionCloseResult } from "./projects/link-service";
 import { preflightProjectRegistrationDatabase } from "./projects/registration-preflight";
 import { auditProjectRegistrations, SqliteProjectRegistrationStore } from "./projects/registration-store";
 import { RuntimeSingletonLock } from "./runtime-singleton-lock";
 import { resolveAllowedRoots } from "./security/paths";
 import { createUserWorkspaceRegistry } from "./security/user-workspace";
 import { createWorkspaceCleanupService, type WorkspaceCleanupAuthorityCoordinator } from "./security/workspace-cleanup";
-import {
-	createWorkspaceLeaseManager,
-	parseWorkspaceLeaseId,
-	type WorkspaceLease,
-	workspaceLeaseId,
-} from "./security/workspace-lease";
+import { createWorkspaceLeaseManager, parseWorkspaceLeaseId, type WorkspaceLease } from "./security/workspace-lease";
 import {
 	type AdapterServerHandle,
 	type AdapterServerOptions,
@@ -90,30 +71,19 @@ const SESSION_MAPPING_STORE_FILE = SESSION_AUTHORITY_MAPPING_FILE;
 const PROJECTION_OUTBOX_STORE_FILE = "openwebui-projection-outbox.json";
 
 export interface BuildAdapterServerOptionsDependencies {
-	/** Explicit managed authority composition seam. It is fail-closed and never falls back to legacy routing. */
-	readonly managedBootstrap?: ManagedBootstrapService;
-	/** Factory equivalent of managedBootstrap for tests that need deferred service construction. */
-	readonly createManagedBootstrap?: () => ManagedBootstrapService;
-	/** Test seam for the one process-owned public-SDK runtime. */
+	/** Test seam for the one process-owned managed runtime. */
 	readonly managedSdkRuntime?: ManagedSdkRuntimeDependency;
 	/** Test seam; receives only the explicitly resolved managed agent directory. */
 	readonly createManagedSdkRuntime?: (agentDir: string) => ManagedSdkRuntimeDependency;
-	/** Slice 3 authority seam; legacy traffic does not invoke it. */
+	/** Exact managed tenant lease/epoch fence. */
 	readonly managedSdkTenantFence?: ManagedSdkTenantFence;
-	/** Lets tests inspect unwired ownership deterministically without opening a Router. */
-	readonly skipManagedSdkRuntimeStart?: boolean;
-	readonly turnRunner?: GjcSessionTurnRunner;
-	readonly mappings?: SessionMappingStore;
 	readonly eventSink?: LiveGatewayEventSink;
 	readonly messageSink?: LiveGatewayMessageSink;
 	readonly fileContextResolver?: LiveGatewayFileContextResolver;
 	readonly projectionRepository?: OpenWebUIProjectionRepository;
 	readonly projectRegistrationStore?: SqliteProjectRegistrationStore;
-	readonly modelReaderFactory?: ModelReaderFactory;
 	readonly outbox?: OutboxStore;
 	readonly projectionOperationApplier?: ProjectionOperationApplier;
-	readonly resolveModelAttachment?: PublicSdkAttachmentResolver;
-	readonly sessionPortFactory?: PublicSdkSessionPortFactory;
 	/** Must destroy only a pane whose ownership has been proven for this mapping. */
 	readonly fallbackCloseSession?: (mapping: SessionMapping, cause: unknown) => Promise<SessionCloseResult>;
 	/** Post-ack proof must observe endpoint disappearance and the persisted owned pane/process; it must never kill. */
@@ -124,7 +94,6 @@ export interface BuildAdapterServerOptionsDependencies {
 
 interface BuildAdapterServerOptionsBehavior {
 	readonly deferOpenWebUIInitialization?: boolean;
-	readonly sessionAuthorityMigrationSourcePaths?: readonly string[];
 }
 
 export async function buildAdapterServerOptionsFromEnv(
@@ -132,11 +101,7 @@ export async function buildAdapterServerOptionsFromEnv(
 	dependencies: BuildAdapterServerOptionsDependencies = {},
 ): Promise<AdapterServerOptions> {
 	const config = loadAdapterConfig(env);
-	if (config.mode !== "managed" && config.mode !== "existing")
-		throw new Error("GJC_OPENWEBUI_MODE must be exactly managed or existing");
-	return buildResolvedAdapterServerOptions(config, dependencies, {
-		sessionAuthorityMigrationSourcePaths: resolveLegacySessionAuthoritySourcePaths(env, config.mode),
-	});
+	return buildResolvedAdapterServerOptions(config, dependencies);
 }
 
 export async function buildAdapterServerOptions(
@@ -154,16 +119,9 @@ export async function buildResolvedAdapterServerOptions(
 ): Promise<AdapterServerOptions> {
 	assertResolvedAdapterConfig(config);
 	const mappingStorePath = path.join(config.sessionRoot, SESSION_MAPPING_STORE_FILE);
-	// The packaged server supplies no composition dependencies. Any dependency
-	// injection is an in-process lifecycle component test, not deployment
-	// activation.
-	const inMemoryLifecycleComponent = Object.values(dependencies).some(dependency => dependency !== undefined);
-	if (config.mode === "existing" && !inMemoryLifecycleComponent) {
-		const marker = readSessionAuthorityV3ActiveMarker(mappingStorePath);
-		const epoch = probeSessionAuthorityEpoch(mappingStorePath);
-		if (epoch.status !== "v3" || marker === undefined)
-			throw new Error("Canonical session authority activation is blocked.");
-	}
+	// This is intentionally the first filesystem operation: no state directory,
+	// lock, database, store, outbox, or runtime may exist before direct V3 proof.
+	assertDirectV3Authority(mappingStorePath);
 	const protectedProjectRoots = config.mode === "managed" ? [config.statePath] : [];
 	const allowedSessionRoots = config.mode === "managed" ? [config.sessionRoot] : [];
 	await mkdir(config.statePath, { recursive: true });
@@ -171,44 +129,19 @@ export async function buildResolvedAdapterServerOptions(
 	const internalStore = dependencies.projectRegistrationStore === undefined;
 	const databasePath = path.join(config.statePath, "adapter-state.sqlite");
 	let projectStore: SqliteProjectRegistrationStore | undefined;
-	let idleSessionReaper: ReturnType<typeof createGjcIdleSessionReaper> | undefined;
 	let managedIdleReaper: ManagedIdleReaper | undefined;
 	let routingRunner: ReturnType<typeof createGjcRoutingLiveGatewayRunner> | undefined;
-	let managedBootstrap: ManagedBootstrapService | undefined;
-	let managedBootstrapDependencies: ManagedBootstrapRunnerDependencies | undefined;
 	let activeManagedV3Runtime: ActiveManagedV3Runtime | undefined;
-	const migrationLeases: WorkspaceLease[] = [];
-	let migrationLeasesReleased = false;
-	const releaseMigrationLeases = async (): Promise<void> => {
-		if (migrationLeasesReleased) return;
-		migrationLeasesReleased = true;
-		const failures: unknown[] = [];
-		for (const lease of [...migrationLeases].reverse()) {
-			try {
-				await lease.release();
-			} catch (error) {
-				failures.push(error);
-			}
-		}
-		if (failures.length > 0) throw new AggregateError(failures, "Migration workspace lease cleanup failed");
-	};
-	const skipManagedSdkRuntimeStart = dependencies.skipManagedSdkRuntimeStart ?? true;
 	let managedSdkRuntime: ManagedSdkRuntimeDependency | undefined;
 	let managedSdkTenantFence: ManagedSdkTenantFence | undefined;
 	const managedSdkRuntimeHealth: ManagedSdkRuntimeHealth = {
-		phase: skipManagedSdkRuntimeStart ? "not_started" : "starting",
+		phase: "starting",
 	};
 	let managedSdkRuntimeDisposePromise: Promise<void> | undefined;
 	const disposeManagedSdkRuntime = (): Promise<void> => {
 		if (managedSdkRuntimeDisposePromise === undefined)
 			managedSdkRuntimeDisposePromise = managedSdkRuntime?.dispose() ?? Promise.resolve();
 		return managedSdkRuntimeDisposePromise;
-	};
-	let managedBootstrapDisposePromise: Promise<void> | undefined;
-	const disposeManagedBootstrap = (): Promise<void> => {
-		if (managedBootstrapDisposePromise === undefined)
-			managedBootstrapDisposePromise = managedBootstrap?.dispose() ?? Promise.resolve();
-		return managedBootstrapDisposePromise;
 	};
 	try {
 		const isolationDiagnostics: RuntimeIsolationDiagnostic[] = [];
@@ -233,194 +166,26 @@ export async function buildResolvedAdapterServerOptions(
 		const workspaceLeaseManager = createWorkspaceLeaseManager({ stateRoot: config.statePath });
 		const workspaceLeaseDurationMs = workspaceLeaseDuration(config.turnTimeoutMs);
 		const workspaceLeaseHeartbeatMs = workspaceLeaseHeartbeat(workspaceLeaseDurationMs);
-		const explicitLegacyTestSeam =
-			dependencies.turnRunner !== undefined ||
-			dependencies.mappings !== undefined ||
-			dependencies.managedBootstrap !== undefined ||
-			dependencies.createManagedBootstrap !== undefined;
-		// An existing deployment does not own its GJC runtime lifecycle, so it may
-		// reopen a verified canonical V3 authority but must not migrate V2 in place.
-		// Managed deployment owns the process/runtime lock required for the atomic swap.
-		const mayActivateManagedV3 = config.mode === "managed" && !explicitLegacyTestSeam;
-		const activeV3Marker = readSessionAuthorityV3ActiveMarker(mappingStorePath);
-		const authorityEpoch = probeSessionAuthorityEpoch(mappingStorePath);
-		if (authorityEpoch.status === "blocked" || (authorityEpoch.status === "v3" && activeV3Marker === undefined))
-			throw new Error("Canonical session authority activation is blocked.");
 		const previouslyLinkedProjectIdsBeforeConfiguredSeed = new Set(
 			projectStore.listLinkedProjects().map(project => project.id),
 		);
-		if (authorityEpoch.status !== "v3" && mayActivateManagedV3 && owner.ownerUserId.length > 0) {
-			const sourcePaths =
-				behavior.sessionAuthorityMigrationSourcePaths ??
-				(config.mode === "managed" ? [path.join("/run/gjc-session", SESSION_MAPPING_STORE_FILE)] : []);
-			const migration = preflightSessionAuthorityMigrationCandidates({
-				candidateSourcePaths: sourcePaths,
-				destinationPath: mappingStorePath,
-				stateRoot: config.statePath,
-				adminPrincipalId: owner.ownerUserId,
-			});
-			if (migration.status === "degraded")
-				throw new Error(
-					`Session authority migration is degraded: ${migration.reason ?? "operator reconciliation is required"}`,
-				);
-			isolationDiagnostics.push({
-				name: "session-authority-migration",
-				status: "ok",
-				detail: `Session authority migration ${migration.status}.`,
-			});
-		}
-		if (authorityEpoch.status !== "v3" && mayActivateManagedV3) {
-			await assertProjectsAdmitted(
-				projects,
-				config.runtimeLocations.protectedProjectPaths,
-				protectedProjectRoots,
-				allowedSessionRoots,
-			);
-			projectStore.seedConfiguredProjects(projects);
-		}
-		let mappings: SessionMappingStore | undefined;
-		if (authorityEpoch.status === "v3") mappings = new V3FileBackedSessionMappingStore(mappingStorePath);
-		else if (!mayActivateManagedV3)
-			mappings = dependencies.mappings ?? new FileBackedSessionMappingStore(mappingStorePath);
-		if (mappings instanceof FileBackedSessionMappingStore && mappings.bootCompaction !== undefined) {
-			isolationDiagnostics.push({
-				name: "session-authority-compaction",
-				status: "ok",
-				detail: `Session authority compacted from ${mappings.bootCompaction.beforeBytes} to ${mappings.bootCompaction.afterBytes} bytes.`,
-			});
-		}
-		if (mappings instanceof SessionMappingStore) mappings.setLegacyAdminPrincipalId(owner.ownerUserId);
-		if (authorityEpoch.status === "v3") {
-			const runtime =
-				dependencies.managedSdkRuntime ??
-				dependencies.createManagedSdkRuntime?.(config.runtimeLocations.agentDir) ??
-				new ManagedSdkRuntime({ agentDir: config.runtimeLocations.agentDir });
-			managedSdkRuntime = runtime;
-			activeManagedV3Runtime = await startActiveManagedRuntime({
-				mappings: mappings as V3FileBackedSessionMappingStore,
-				runtime: runtime as ManagedSdkRuntime,
-				liveTenantFence:
-					dependencies.managedSdkTenantFence ??
-					(key =>
-						assertActiveManagedV3TenantFence(
-							key,
-							mappings,
-							workspaceRegistry,
-							projectStore,
-							workspaceLeaseManager,
-						)),
-			});
-			managedSdkRuntime = activeManagedV3Runtime.runtime;
-			managedSdkTenantFence = activeManagedV3Runtime.tenantFence;
-			managedSdkRuntimeHealth.phase = "ready";
-		} else if (mayActivateManagedV3) {
-			const runtime =
-				dependencies.managedSdkRuntime ??
-				dependencies.createManagedSdkRuntime?.(config.runtimeLocations.agentDir) ??
-				new ManagedSdkRuntime({ agentDir: config.runtimeLocations.agentDir });
-			managedSdkRuntime = runtime;
-			const leasesBySafeKey = new Map<string, WorkspaceLease>();
-			let activatedMappings: SessionMappingStore | undefined;
-			const authority: ManagedBootstrapAuthorityResolver = {
-				resolve: async (principalId, projectId) => {
-					const workspace = await workspaceRegistry.resolve(principalId);
-					const project = projectStore?.getProject(projectId);
-					if (
-						workspace === undefined ||
-						project === undefined ||
-						project.status !== "linked" ||
-						path.resolve(project.cwd) !== path.resolve(workspace.root)
-					)
-						return undefined;
-					let lease = leasesBySafeKey.get(workspace.safeKey);
-					if (lease === undefined) {
-						lease = await workspaceLeaseManager.acquire({
-							safeKey: workspace.safeKey,
-							holderId: `session-authority-migration:${randomUUID()}`,
-							operation: "migration",
-							leaseDurationMs: workspaceLeaseDurationMs,
-						});
-						leasesBySafeKey.set(workspace.safeKey, lease);
-						migrationLeases.push(lease);
-					}
-					return {
-						project,
-						canonicalWorkspace: path.resolve(workspace.root),
-						leaseId: workspaceLeaseId(lease),
-						epoch: SESSION_AUTHORITY_V3_EPOCH,
-						assertFence: async () => {
-							await workspaceLeaseManager.assertFence(lease);
-						},
-					};
-				},
-			};
-			const activated = await activateAdapterSessionAuthorityV3({
-				locations: { agentDir: config.runtimeLocations.agentDir, stateRoot: config.statePath },
-				configuredOwnerUserId: owner.ownerUserId,
-				sourcePath: mappingStorePath,
-				runtimeLock: lock,
-				authority,
-				liveTenantFence:
-					dependencies.managedSdkTenantFence ??
-					(key =>
-						assertActiveManagedV3TenantFence(
-							key,
-							activatedMappings,
-							workspaceRegistry,
-							projectStore,
-							workspaceLeaseManager,
-						)),
-				runtime: runtime as ManagedSdkRuntime,
-				lifecycle: runtime as ManagedSdkRuntime,
-			});
-			if (activated.status !== "activated")
-				throw new Error(
-					`Canonical session authority activation is blocked: ${
-						activated.activation.status === "blocked"
-							? (activated.activation.reasons?.join(" ") ?? "migration authority is incomplete")
-							: "activation did not produce a managed V3 authority"
-					}`,
-				);
-			mappings = activated.store;
-			activatedMappings = mappings;
-			activeManagedV3Runtime = activated.managed;
-			managedSdkRuntime = activated.managed.runtime;
-			managedSdkTenantFence = activated.managed.tenantFence;
-			managedSdkRuntimeHealth.phase = "ready";
-		} else {
-			managedBootstrap = dependencies.managedBootstrap ?? dependencies.createManagedBootstrap?.();
-		}
-		if (mappings === undefined) throw new Error("Managed V3 activation did not produce a session mapping store.");
-		if (managedBootstrap !== undefined) {
-			const started = await managedBootstrap.start();
-			const dependencies = started.dependencies;
-			if (
-				started.result.phase !== "active" ||
-				!started.result.ready ||
-				!started.result.routerAvailable ||
-				started.health.phase !== "active" ||
-				!started.health.ready ||
-				!started.health.routerAvailable ||
-				dependencies === undefined
-			)
-				throw new Error(
-					`Managed bootstrap is not ready: ${started.health.reason ?? started.result.reason ?? "activation blocked"}`,
-				);
-			managedBootstrapDependencies = dependencies;
-			managedSdkRuntime = dependencies.runtime;
-			managedSdkTenantFence = dependencies.tenantFence;
-		} else if (authorityEpoch.status !== "v3" && explicitLegacyTestSeam) {
-			managedSdkRuntime =
-				dependencies.managedSdkRuntime ??
-				(dependencies.createManagedSdkRuntime === undefined
-					? skipManagedSdkRuntimeStart
-						? undefined
-						: new (await import("./gjc/managed-sdk-runtime")).ManagedSdkRuntime({
-								agentDir: config.runtimeLocations.agentDir,
-							})
-					: dependencies.createManagedSdkRuntime(config.runtimeLocations.agentDir));
-			managedSdkTenantFence = dependencies.managedSdkTenantFence;
-		}
+		const mappings = new V3FileBackedSessionMappingStore(mappingStorePath);
+		const runtime =
+			dependencies.managedSdkRuntime ??
+			dependencies.createManagedSdkRuntime?.(config.runtimeLocations.agentDir) ??
+			new ManagedSdkRuntime({ agentDir: config.runtimeLocations.agentDir });
+		managedSdkRuntime = runtime;
+		activeManagedV3Runtime = await startActiveManagedRuntime({
+			mappings,
+			runtime: runtime as ManagedSdkRuntime,
+			liveTenantFence:
+				dependencies.managedSdkTenantFence ??
+				(key =>
+					assertActiveManagedV3TenantFence(key, mappings, workspaceRegistry, projectStore, workspaceLeaseManager)),
+		});
+		managedSdkRuntime = activeManagedV3Runtime.runtime;
+		managedSdkTenantFence = activeManagedV3Runtime.tenantFence;
+		managedSdkRuntimeHealth.phase = "ready";
 		const runtimeAdminClientFactory = buildOpenWebUIRuntimeAdminClientFactory(config);
 		const principalClientFactory = buildOpenWebUIPrincipalClientFactory(config, workspaceRegistry);
 		const runtimeAdminClient =
@@ -436,51 +201,17 @@ export async function buildResolvedAdapterServerOptions(
 			(projectionRepository === undefined
 				? undefined
 				: new FileBackedOutboxStore(path.join(config.statePath, PROJECTION_OUTBOX_STORE_FILE)));
-		// Canonical V3 and managed-bootstrap authorities are process-owned. Keep
-		// their runner and model reader composition on the managed surface even
-		// when legacy test seams are supplied; those seams must never become a
-		// fallback for an admitted managed authority.
-		const managedRunner = activeManagedV3Runtime?.runner ?? managedBootstrapDependencies?.runner;
-		const managedModelRuntime = activeManagedV3Runtime?.runtime ?? managedBootstrapDependencies?.runtime;
-		if (authorityEpoch.status === "v3" && (managedRunner === undefined || managedModelRuntime === undefined))
+		if (
+			activeManagedV3Runtime === undefined ||
+			managedSdkRuntime === undefined ||
+			managedSdkTenantFence === undefined
+		)
 			throw new Error("Canonical V3 authority requires active managed runtime dependencies.");
-		let cliPath = config.gjcCommand;
-		let turnRunner: GjcSessionTurnRunner;
-		let modelReaderFactory: ModelReaderFactory;
-		if (managedRunner !== undefined || managedModelRuntime !== undefined) {
-			if (managedRunner === undefined || managedModelRuntime === undefined)
-				throw new Error("Managed authority requires complete managed runtime dependencies.");
-			turnRunner = managedRunner;
-			modelReaderFactory = createManagedReaderFactory(managedModelRuntime, config.turnTimeoutMs);
-		} else {
-			cliPath = config.gjcCommand;
-			turnRunner =
-				dependencies.turnRunner ??
-				createPublicSdkGjcTurnRunner({
-					cliPath,
-					runtimeLocations: config.runtimeLocations,
-					turnTimeoutMs: config.turnTimeoutMs,
-					...(managedSdkRuntime === undefined ? {} : { managedSdkRuntime }),
-					...(managedSdkTenantFence === undefined ? {} : { managedSdkTenantFence }),
-					sessionPortFactory: dependencies.sessionPortFactory,
-				});
-			modelReaderFactory =
-				dependencies.modelReaderFactory ??
-				createModelReaderFactory({
-					runtimeLocations: config.runtimeLocations,
-					resolveAttachment:
-						dependencies.resolveModelAttachment ??
-						createPublicSdkModelAttachmentResolver({
-							cliPath,
-							cwd: config.runtimeLocations.readerWorkspace,
-							childEnvironment: config.runtimeLocations.childEnvironment,
-						}),
-					sessionPortFactory: dependencies.sessionPortFactory,
-				});
-		}
+		const turnRunner = activeManagedV3Runtime.runner;
+		const modelReaderFactory = createManagedReaderFactory(activeManagedV3Runtime.runtime, config.turnTimeoutMs);
 		const closeSession = createAdapterSessionCloser(
 			config,
-			cliPath,
+			config.gjcCommand,
 			{
 				...dependencies,
 				...(managedSdkRuntime === undefined ? {} : { managedSdkRuntime }),
@@ -562,25 +293,9 @@ export async function buildResolvedAdapterServerOptions(
 				idleTimeoutMs: DEFAULT_MANAGED_IDLE_TIMEOUT_MS,
 				pollIntervalMs: DEFAULT_MANAGED_IDLE_TIMEOUT_MS,
 			});
-		} else if (closeSession !== undefined) {
-			idleSessionReaper = createGjcIdleSessionReaper({
-				runner: baseRoutingRunner,
-				mappings,
-				closeSession,
-				...(turnRunner.discardSessionAttachment === undefined
-					? {}
-					: {
-							discardSessionAttachment: (cwd, sessionId) =>
-								turnRunner.discardSessionAttachment?.(cwd, sessionId),
-						}),
-				workspaceRegistry,
-				workspaceLeaseManager,
-				workspaceLeaseDurationMs,
-				...(owner.ownerUserId.trim().length === 0 ? {} : { adminPrincipalId: owner.ownerUserId }),
-			});
 		}
-		const runner = idleSessionReaper?.runner ?? baseRoutingRunner;
-		const closeSessionForRoutes = idleSessionReaper?.closeSession ?? closeSession;
+		const runner = baseRoutingRunner;
+		const closeSessionForRoutes = closeSession;
 		const projectLinkService = new ProjectLinkService({
 			allowedRoots,
 			store: projectStore,
@@ -684,12 +399,7 @@ export async function buildResolvedAdapterServerOptions(
 				failures.push(error);
 			}
 			try {
-				if (managedBootstrap === undefined) await disposeManagedSdkRuntime();
-			} catch (error) {
-				failures.push(error);
-			}
-			try {
-				await releaseMigrationLeases();
+				await disposeManagedSdkRuntime();
 			} catch (error) {
 				failures.push(error);
 			}
@@ -710,47 +420,22 @@ export async function buildResolvedAdapterServerOptions(
 			turnTimeoutMs: config.turnTimeoutMs,
 			checks: [
 				...buildRuntimeHealthChecks(config, isolationDiagnostics),
-				...(managedBootstrap === undefined
-					? []
-					: [
-							{
-								name: "managed-bootstrap",
-								get status() {
-									return managedBootstrap?.readiness ? "ok" : "degraded";
-								},
-								get detail() {
-									return managedBootstrap?.health.reason ?? "Managed bootstrap is active.";
-								},
-							},
-						]),
-				...(managedBootstrap !== undefined || managedSdkRuntime === undefined
-					? []
-					: [
-							{
-								name: "managed-sdk-runtime",
-								get status() {
-									return managedSdkRuntimeHealth.phase === "ready" ? "ok" : "degraded";
-								},
-								get detail() {
-									return (
-										managedSdkRuntimeHealth.reason ??
-										`Managed SDK runtime is ${managedSdkRuntimeHealth.phase}.`
-									);
-								},
-							},
-						]),
+				{
+					name: "managed-sdk-runtime",
+					get status() {
+						return managedSdkRuntimeHealth.phase === "ready" ? "ok" : "degraded";
+					},
+					get detail() {
+						return managedSdkRuntimeHealth.reason ?? `Managed SDK runtime is ${managedSdkRuntimeHealth.phase}.`;
+					},
+				},
 			],
-			...(managedBootstrap !== undefined || managedSdkRuntime === undefined
-				? {}
-				: {
-						managedSdkRuntime: {
-							runtime: managedSdkRuntime,
-							start: !skipManagedSdkRuntimeStart,
-							health: managedSdkRuntimeHealth,
-							dispose: disposeManagedSdkRuntime,
-						},
-					}),
-			...(managedBootstrap === undefined ? {} : { managedBootstrap }),
+			managedSdkRuntime: {
+				runtime: managedSdkRuntime,
+				start: false,
+				health: managedSdkRuntimeHealth,
+				dispose: disposeManagedSdkRuntime,
+			},
 			routes: {
 				projects: [...projectLinkService.listLinkedProjects()],
 				projectProvider: async () => {
@@ -794,24 +479,14 @@ export async function buildResolvedAdapterServerOptions(
 		let startupError: unknown = error;
 		try {
 			await managedIdleReaper?.stop();
-			await (idleSessionReaper?.stop() ?? routingRunner?.stop?.());
+			await routingRunner?.stop?.();
 		} catch (stopError) {
 			startupError = new AggregateError([startupError, stopError], "Adapter initialization cleanup failed");
 		}
 		try {
-			await disposeManagedBootstrap();
+			await disposeManagedSdkRuntime();
 		} catch (disposeError) {
 			startupError = appendStartupCleanupError(startupError, disposeError);
-		}
-		try {
-			if (managedBootstrap === undefined) await disposeManagedSdkRuntime();
-		} catch (disposeError) {
-			startupError = appendStartupCleanupError(startupError, disposeError);
-		}
-		try {
-			await releaseMigrationLeases();
-		} catch (releaseError) {
-			startupError = appendStartupCleanupError(startupError, releaseError);
 		}
 		if (internalStore && projectStore !== undefined) {
 			try {
@@ -827,6 +502,13 @@ export async function buildResolvedAdapterServerOptions(
 		}
 		throw startupError;
 	}
+}
+
+function assertDirectV3Authority(canonicalPath: string): void {
+	const authority = probeSessionAuthorityEpoch(canonicalPath);
+	if (authority.status !== "v3") throw new Error("Canonical session authority activation is blocked.");
+	const marker = readSessionAuthorityV3ActiveMarker(canonicalPath);
+	if (marker === undefined) throw new Error("Canonical session authority activation is blocked.");
 }
 
 function createManagedReaderFactory(runtime: ManagedSdkRuntime, timeoutMs: number): ModelReaderFactory {

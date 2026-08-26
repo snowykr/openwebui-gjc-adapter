@@ -1,11 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildAdapterServerOptions } from "../src/adapter-server-options";
 import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
-import { staticModelReaderFactory } from "./model-selection-fixtures";
 
 async function writeV3Authority(root: string, document: unknown): Promise<void> {
 	const canonicalPath = join(root, "openwebui-session-mappings.json");
@@ -24,7 +23,7 @@ async function writeV3Authority(root: string, document: unknown): Promise<void> 
 }
 
 describe("adapter server model wiring", () => {
-	test("selects only managed runner and model reader for an active V3 authority", async () => {
+	test("selects only the managed runner and model reader for an active V3 authority", async () => {
 		const root = await mkdtemp(join(tmpdir(), "gjc-adapter-managed-model-wiring-"));
 		const calls: string[] = [];
 		const managedRuntime = {
@@ -36,8 +35,6 @@ describe("adapter server model wiring", () => {
 			acquireAttachment: async () => undefined,
 			generationStatus: async () => ({ status: "current" as const }),
 		};
-		const legacyRunner = { stop: async () => void calls.push("legacy-runner-stop") } as never;
-		const legacyModelReaderFactory = staticModelReaderFactory();
 		try {
 			const sessionRoot = join(root, "sessions");
 			await mkdir(sessionRoot, { recursive: true });
@@ -61,17 +58,14 @@ describe("adapter server model wiring", () => {
 					gjcCommand: "/not-used-for-managed-v3",
 					turnTimeoutMs: 240_000,
 				},
-				{
-					managedSdkRuntime: managedRuntime as never,
-					turnRunner: legacyRunner,
-					modelReaderFactory: legacyModelReaderFactory,
-				},
+				{ managedSdkRuntime: managedRuntime as never },
 			);
 
-			expect(options.routes?.runner).not.toBe(legacyRunner);
+			expect(options.routes?.runner).toBeDefined();
 			const selectedModelReaderFactory = options.routes?.modelReaderFactory;
 			expect(selectedModelReaderFactory).toBeDefined();
-			expect(selectedModelReaderFactory).not.toBe(legacyModelReaderFactory);
+			expect(options.turnTimeoutMs).toBe(240_000);
+			expect(options.routes?.neutralWorkspace).toEndWith("/.gjc/openwebui/default-reader");
 			await expect(selectedModelReaderFactory!()).rejects.toThrow(
 				"Managed model catalog access requires explicit tenant or temporary service authority.",
 			);
@@ -83,7 +77,7 @@ describe("adapter server model wiring", () => {
 		}
 	});
 
-	test("fails closed for malformed V3 authority before legacy composition can be selected", async () => {
+	test("fails closed for malformed V3 authority before startup effects", async () => {
 		const root = await mkdtemp(join(tmpdir(), "gjc-adapter-malformed-v3-"));
 		const calls: string[] = [];
 		try {
@@ -110,13 +104,11 @@ describe("adapter server model wiring", () => {
 						gjcCommand: "/not-used-for-malformed-v3",
 						turnTimeoutMs: 240_000,
 					},
-					{
-						turnRunner: { stop: async () => void calls.push("legacy-runner-stop") } as never,
-						modelReaderFactory: staticModelReaderFactory(),
-					},
+					{ managedSdkRuntime: { start: async () => void calls.push("managed-start") } as never },
 				),
 			).rejects.toThrow("Canonical session authority activation is blocked.");
 			expect(calls).toEqual([]);
+			await expect(stat(join(root, "state"))).rejects.toThrow();
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}

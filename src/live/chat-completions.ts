@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
-import { MANAGED_SESSION_AUTHORITY_EPOCH } from "../gjc/managed-session-authority";
+import { SESSION_AUTHORITY_V3_EPOCH } from "../gjc/session-authority-v3";
 import { GjcTurnCancelledError } from "../gjc/turn-runner";
 import { resolveForwardedPrincipal } from "../openwebui/auth";
 import { parseOpenWebUIHeaders } from "../openwebui/headers";
@@ -276,7 +276,7 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 						canonicalWorkspace: resolve(project.cwd),
 						chatId: headers.chatId,
 						leaseId: workspaceLeaseId(leaseReference),
-						epoch: MANAGED_SESSION_AUTHORITY_EPOCH,
+						epoch: SESSION_AUTHORITY_V3_EPOCH,
 						requestKey: headers.userMessageId,
 					});
 		// Constructing a prepared authority is itself an admission boundary.

@@ -10,10 +10,93 @@ import { SqliteProjectRegistrationStore } from "../src/projects/registration-sto
 import type { RegisteredProject } from "../src/projects/registry";
 import { startAdapterServer } from "../src/server";
 import { observeStartup, spawnCli, terminateAndReap } from "./bounded-process-fixtures";
-import { FakeGjcTurnRunner, reserveTcpPort } from "./cli-fixtures";
+import { reserveTcpPort } from "./cli-fixtures";
 
 const tempDirs: string[] = [];
 const handles: { stop(): Promise<void> }[] = [];
+
+function managedRuntimeFixture() {
+	let state: "new" | "running" | "stopped" = "new";
+	const registrations = new Map<string, Record<string, unknown>>();
+	const tenantKey = (tenant: Record<string, unknown>) =>
+		JSON.stringify([
+			tenant.principalId,
+			tenant.projectId,
+			tenant.canonicalWorkspace,
+			tenant.chatId,
+			tenant.sessionId,
+			tenant.generation,
+			tenant.leaseId,
+			tenant.epoch,
+		]);
+	const runtime = {
+		get state() {
+			return state;
+		},
+		async start() {
+			state = "running";
+		},
+		async dispose() {
+			state = "stopped";
+		},
+		async reconcile() {},
+		registerTenant(tenant: Record<string, unknown>) {
+			registrations.set(tenantKey(tenant), tenant);
+		},
+		async acquireAttachment(tenant: Record<string, unknown>) {
+			const key = tenantKey(tenant);
+			if (!registrations.has(key)) throw new Error("Managed fixture tenant is not registered.");
+			return {
+				tenant,
+				generation: tenant.generation,
+				attachment: {
+					sessionId: tenant.sessionId,
+					generation: tenant.generation,
+					isCurrent: () => true,
+					send: () => undefined,
+				},
+			};
+		},
+		async generationStatus() {
+			return { status: "current" as const };
+		},
+		async request() {
+			return { ok: true };
+		},
+		subscribeFrames() {
+			return () => undefined;
+		},
+		async createLifecycleSession(tenant: Record<string, unknown>) {
+			return {
+				ok: true as const,
+				operation: "session.create" as const,
+				result: { sessionId: tenant.sessionId ?? "managed-session", endpointGeneration: tenant.generation ?? 1 },
+			};
+		},
+		async resumeLifecycleSession(tenant: Record<string, unknown>) {
+			return {
+				ok: true as const,
+				operation: "session.resume" as const,
+				result: { sessionId: tenant.sessionId ?? "managed-session", endpointGeneration: tenant.generation ?? 1 },
+			};
+		},
+		async closeLifecycleSession(tenant: Record<string, unknown>) {
+			return {
+				ok: true as const,
+				operation: "session.close" as const,
+				result: { sessionId: tenant.sessionId ?? "managed-session", endpointGeneration: tenant.generation ?? 1 },
+			};
+		},
+		async deleteLifecycleSession(tenant: Record<string, unknown>) {
+			return {
+				ok: true as const,
+				operation: "session.delete" as const,
+				result: { sessionId: tenant.sessionId ?? "managed-session", endpointGeneration: tenant.generation ?? 1 },
+			};
+		},
+	};
+	return runtime as never;
+}
 
 afterEach(async () => {
 	await Promise.all(handles.splice(0).map(handle => handle.stop()));
@@ -83,7 +166,7 @@ describe("real runtime project safety scenarios", () => {
 		// When: startup parses and admits the configured seed batch.
 		const failure = await captureProjectLinkError(
 			buildAdapterServerOptionsFromEnv(env, {
-				turnRunner: new FakeGjcTurnRunner(),
+				managedSdkRuntime: managedRuntimeFixture(),
 				projectRegistrationStore: store,
 			}),
 		);
@@ -101,7 +184,7 @@ describe("real runtime project safety scenarios", () => {
 		const store = new SqliteProjectRegistrationStore(path.join(workspace, "state", "adapter-state.sqlite"));
 		await writeV3Authority(path.join(workspace, "sessions"));
 		const options = await buildAdapterServerOptionsFromEnv(runtimeEnv(workspace, port), {
-			turnRunner: new FakeGjcTurnRunner(),
+			managedSdkRuntime: managedRuntimeFixture(),
 			projectRegistrationStore: store,
 		});
 		const handle = await startAdapterServer(options);

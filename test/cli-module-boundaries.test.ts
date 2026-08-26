@@ -371,28 +371,21 @@ describe("CLI module boundaries", () => {
 		});
 	});
 
-	test("keeps managed V3 composition off the legacy bridge fallbacks", () => {
+	test("uses only direct V3 managed startup composition", () => {
 		const source = readFileSync(join(ROOT, "src", "adapter-server-options.ts"), "utf8");
-		const managedCompositionStart = source.indexOf("const managedRunner =");
-		const legacyCompositionStart = source.indexOf(
-			"} else {\n\t\t\tcliPath = config.gjcCommand",
-			managedCompositionStart,
-		);
-		expect(managedCompositionStart).toBeGreaterThanOrEqual(0);
-		expect(legacyCompositionStart).toBeGreaterThan(managedCompositionStart);
-		const managedComposition = source.slice(managedCompositionStart, legacyCompositionStart);
-
-		expect(source).toContain(
-			'if (authorityEpoch.status === "v3" && (managedRunner === undefined || managedModelRuntime === undefined))',
-		);
-		expect(managedComposition).toContain("turnRunner = managedRunner");
-		expect(managedComposition).toContain("createManagedReaderFactory(managedModelRuntime, config.turnTimeoutMs)");
-		expect(managedComposition).not.toContain("dependencies.turnRunner");
-		expect(managedComposition).not.toContain("dependencies.modelReaderFactory");
-		expect(managedComposition).not.toContain("createPublicSdkGjcTurnRunner");
-		expect(managedComposition).not.toContain("createModelReaderFactory");
-		expect(managedComposition).not.toContain("createPublicSdkModelAttachmentResolver");
-		expect(managedComposition).not.toContain("resolveGjcCliPath");
+		expect(source).toContain("assertDirectV3Authority(mappingStorePath)");
+		expect(source).toContain("new V3FileBackedSessionMappingStore(mappingStorePath)");
+		expect(source).toContain("const turnRunner = activeManagedV3Runtime.runner");
+		expect(source).toContain("createManagedReaderFactory(activeManagedV3Runtime.runtime, config.turnTimeoutMs)");
+		for (const retired of [
+			"dependencies.turnRunner",
+			"dependencies.modelReaderFactory",
+			"createPublicSdkGjcTurnRunner",
+			"createModelReaderFactory",
+			"createPublicSdkModelAttachmentResolver",
+			"resolveLegacySessionAuthoritySourcePaths",
+		])
+			expect(source).not.toContain(retired);
 	});
 
 	test("enforces the exact acyclic CLI import graph", async () => {
@@ -405,12 +398,6 @@ describe("CLI module boundaries", () => {
 		const installedSource = readFileSync(join(ROOT, "src", CLI_MODULES[1]), "utf8");
 		const serverSource = readFileSync(join(ROOT, "src", "server-bootstrap.ts"), "utf8");
 		const runtimeSingletonLockSource = readFileSync(join(ROOT, "src", "runtime-singleton-lock.ts"), "utf8");
-		const runnerSource = readFileSync(join(ROOT, "src/live/gjc-routing-runner.ts"), "utf8");
-		const publicSdkRunnerSource = readFileSync(join(ROOT, "src/live/gjc-public-sdk-runner.ts"), "utf8");
-		const publicSdkSessionAttachmentSource = readFileSync(
-			join(ROOT, "src/live/gjc-public-sdk-session-attachment.ts"),
-			"utf8",
-		);
 		const deploymentSource = readFileSync(join(ROOT, "src/configure/deployment-artifacts.ts"), "utf8");
 		const cliImports = relativeImports(cliSource);
 		const baseImports = relativeImports(baseSource);
@@ -440,17 +427,13 @@ describe("CLI module boundaries", () => {
 				/\/?(?:adapter|router|cli)(?:[-/]|$)/.test(importPath),
 			),
 			resolvedServerChain:
-				baseSource.includes("buildResolvedAdapterServerOptions(config, dependencies, {") &&
-				baseSource.includes(
-					"sessionAuthorityMigrationSourcePaths: resolveLegacySessionAuthoritySourcePaths(env, config.mode)",
-				) &&
+				baseSource.includes("return buildResolvedAdapterServerOptions(config, dependencies);") &&
 				cliSource.includes("buildResolvedInstalledAdapterServerOptions(config)") &&
 				installedSource.includes("buildResolvedAdapterServerOptions(config") &&
-				baseSource.includes("createPublicSdkGjcTurnRunner({") &&
-				runnerSource.includes('from "./gjc-public-sdk-runner"') &&
-				publicSdkRunnerSource.includes('from "./gjc-public-sdk-session-ops"') &&
-				publicSdkSessionAttachmentSource.includes("new CliLifecycleBackend(") &&
-				publicSdkSessionAttachmentSource.includes("new PublicSdkSessionClient()"),
+				baseSource.includes("assertDirectV3Authority(mappingStorePath)") &&
+				baseSource.includes("new V3FileBackedSessionMappingStore(mappingStorePath)") &&
+				baseSource.includes("const turnRunner = activeManagedV3Runtime.runner") &&
+				!baseSource.includes("createPublicSdkGjcTurnRunner"),
 			resolvedDeploymentChain:
 				deploymentSource.includes("renderResolvedManagedCompose({") &&
 				deploymentSource.includes("renderResolvedSystemdComposeUnit({") &&

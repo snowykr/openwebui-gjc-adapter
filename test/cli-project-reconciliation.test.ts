@@ -8,28 +8,21 @@ import { SqliteProjectRegistrationStore } from "../src/projects/registration-sto
 import { registerProjectDirectory } from "../src/projects/registry";
 import { resolveAllowedRoots } from "../src/security/paths";
 import { createAdapterRequestHandler } from "../src/server";
-import { FakeGjcTurnRunner, writeDirectV3Authority } from "./cli-fixtures";
-import { staticModelReaderFactory } from "./model-selection-fixtures";
-import { messageEntry, writeSessionFile } from "./session-sync-fixtures";
+import { FakeManagedSdkRuntime, writeDirectV3Authority } from "./cli-fixtures";
 
 describe("adapter CLI project reconciliation", () => {
 	test("does not unlink a first-start env project with a configured folder id before sync creates it", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-cli-reconcile-"));
 		const projectDirectory = path.join(workspace, "Configured Folder");
-		const sessionDirectory = path.join(projectDirectory, ".gjc", "sessions");
-		await fs.mkdir(sessionDirectory, { recursive: true });
+		await fs.mkdir(projectDirectory);
 		await writeDirectV3Authority(path.join(workspace, "state"));
-		await writeSessionFile(path.join(sessionDirectory, "session-import.jsonl"), {
-			header: { id: "session-import", title: "Configured Folder Import", cwd: projectDirectory },
-			entries: [messageEntry("user-import", null, "user", "load me")],
-		});
 		const repository = new InMemoryOpenWebUIProjectionRepository();
 		const store = new SqliteProjectRegistrationStore(":memory:");
 
 		const options = await buildAdapterServerOptionsFromEnv(
 			envFor(workspace, `${projectDirectory}|Configured Folder|configured-folder`),
 			{
-				turnRunner: new FakeGjcTurnRunner(),
+				managedSdkRuntime: new FakeManagedSdkRuntime(),
 				projectionRepository: repository,
 				projectRegistrationStore: store,
 			},
@@ -43,23 +36,13 @@ describe("adapter CLI project reconciliation", () => {
 		expect(await repository.getFolder("owner-test", "configured-folder")).toMatchObject({
 			id: "configured-folder",
 		});
-		expect(
-			await repository.getChat("owner-test", "gjc-project-configured-folder-session-session-import"),
-		).toMatchObject({
-			title: "Configured Folder Import",
-		});
 	});
 
-	test("hides a project during model and project-list requests after its OpenWebUI folder is deleted", async () => {
+	test("hides a project during project-list requests after its OpenWebUI folder is deleted", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-cli-reconcile-"));
 		const projectDirectory = path.join(workspace, "Deleted During Runtime");
-		const sessionDirectory = path.join(projectDirectory, ".gjc", "sessions");
-		await fs.mkdir(sessionDirectory, { recursive: true });
+		await fs.mkdir(projectDirectory);
 		await writeDirectV3Authority(path.join(workspace, "state"));
-		await writeSessionFile(path.join(sessionDirectory, "session-import.jsonl"), {
-			header: { id: "session-import", title: "Runtime Delete Import", cwd: projectDirectory },
-			entries: [messageEntry("user-import", null, "user", "load me")],
-		});
 		const allowedRoots = await resolveAllowedRoots([workspace]);
 		const project = await registerProjectDirectory(
 			{
@@ -79,10 +62,9 @@ describe("adapter CLI project reconciliation", () => {
 			metadata: { gjc_adapter: { projectId: "deleted-during-runtime" } },
 		});
 		const options = await buildAdapterServerOptionsFromEnv(envFor(workspace, ""), {
-			turnRunner: new FakeGjcTurnRunner(),
+			managedSdkRuntime: new FakeManagedSdkRuntime(),
 			projectionRepository: repository,
 			projectRegistrationStore: store,
-			modelReaderFactory: staticModelReaderFactory(),
 		});
 		const routes = options.routes;
 		if (routes === undefined) throw new Error("expected route dependencies");
@@ -104,7 +86,7 @@ describe("adapter CLI project reconciliation", () => {
 	test("keeps serving when startup linked-project projection is temporarily unavailable", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-cli-reconcile-"));
 		const projectDirectory = path.join(workspace, "Unavailable Projection");
-		await fs.mkdir(path.join(projectDirectory, ".gjc", "sessions"), { recursive: true });
+		await fs.mkdir(projectDirectory);
 		await writeDirectV3Authority(path.join(workspace, "state"));
 		const allowedRoots = await resolveAllowedRoots([workspace]);
 		const project = await registerProjectDirectory(
@@ -145,10 +127,9 @@ describe("adapter CLI project reconciliation", () => {
 		let retriedProjects: readonly unknown[] | undefined;
 		try {
 			options = await buildAdapterServerOptionsFromEnv(envFor(workspace, ""), {
-				turnRunner: new FakeGjcTurnRunner(),
+				managedSdkRuntime: new FakeManagedSdkRuntime(),
 				projectionRepository: repository,
 				projectRegistrationStore: store,
-				modelReaderFactory: staticModelReaderFactory(),
 			});
 			projectionAvailable = true;
 			const projectProvider = options.routes?.projectProvider;

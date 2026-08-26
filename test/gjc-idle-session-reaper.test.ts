@@ -17,10 +17,9 @@ import {
 	createManagedV3GenerationStore,
 	type ManagedIdleLifecycleRuntime,
 } from "../src/live/gjc-managed-idle-reaper";
-import type { GjcSessionTurnRunner } from "../src/live/gjc-routing-runner";
 import type { OpenWebUIProjectionRepository } from "../src/openwebui/client";
 import { type WorkspaceLeaseAcquireOptions, WorkspaceLeaseManager } from "../src/security/workspace-lease";
-import { FakeGjcTurnRunner } from "./cli-fixtures";
+import { writeDirectV3Authority } from "./cli-fixtures";
 
 const project = {
 	id: "project-1",
@@ -29,6 +28,96 @@ const project = {
 	allowedRoot: "/workspace",
 	createdAt: new Date("2026-01-01T00:00:00.000Z"),
 };
+
+function managedRuntimeFixture() {
+	let state: "new" | "running" | "stopped" = "new";
+	let disposes = 0;
+	const registrations = new Map<string, Record<string, unknown>>();
+	const tenantKey = (tenant: Record<string, unknown>) =>
+		JSON.stringify([
+			tenant.principalId,
+			tenant.projectId,
+			tenant.canonicalWorkspace,
+			tenant.chatId,
+			tenant.sessionId,
+			tenant.generation,
+			tenant.leaseId,
+			tenant.epoch,
+		]);
+	const runtime = {
+		get state() {
+			return state;
+		},
+		async start() {
+			state = "running";
+		},
+		async dispose() {
+			disposes += 1;
+			state = "stopped";
+		},
+		async reconcile() {},
+		registerTenant(tenant: Record<string, unknown>) {
+			registrations.set(tenantKey(tenant), tenant);
+		},
+		async acquireAttachment(tenant: Record<string, unknown>) {
+			const key = tenantKey(tenant);
+			if (!registrations.has(key)) throw new Error("Managed fixture tenant is not registered.");
+			return {
+				tenant,
+				generation: tenant.generation,
+				attachment: {
+					sessionId: tenant.sessionId,
+					generation: tenant.generation,
+					isCurrent: () => true,
+					send: () => undefined,
+				},
+			};
+		},
+		async generationStatus() {
+			return { status: "current" as const };
+		},
+		async request() {
+			return { ok: true };
+		},
+		subscribeFrames() {
+			return () => undefined;
+		},
+		async createLifecycleSession(tenant: Record<string, unknown>) {
+			return {
+				ok: true as const,
+				operation: "session.create" as const,
+				result: { sessionId: tenant.sessionId ?? "managed-session", endpointGeneration: tenant.generation ?? 1 },
+			};
+		},
+		async resumeLifecycleSession(tenant: Record<string, unknown>) {
+			return {
+				ok: true as const,
+				operation: "session.resume" as const,
+				result: { sessionId: tenant.sessionId ?? "managed-session", endpointGeneration: tenant.generation ?? 1 },
+			};
+		},
+		async closeLifecycleSession(tenant: Record<string, unknown>) {
+			return {
+				ok: true as const,
+				operation: "session.close" as const,
+				result: { sessionId: tenant.sessionId ?? "managed-session", endpointGeneration: tenant.generation ?? 1 },
+			};
+		},
+		async deleteLifecycleSession(tenant: Record<string, unknown>) {
+			return {
+				ok: true as const,
+				operation: "session.delete" as const,
+				result: { sessionId: tenant.sessionId ?? "managed-session", endpointGeneration: tenant.generation ?? 1 },
+			};
+		},
+	};
+	return {
+		runtime: runtime as never,
+		get disposes() {
+			return disposes;
+		},
+	};
+}
 
 class MappingFixture {
 	mapping: SessionMapping = createMapping("turn-1");
@@ -1556,11 +1645,7 @@ describe("GJC idle session reaper", () => {
 test("a linked-project projection failure does not stop the constructed reaper", async () => {
 	const root = await mkdtemp(join(tmpdir(), "gjc-idle-reaper-init-"));
 	const failure = new Error("projection startup failure");
-	let stopCalls = 0;
-	const turnRunner = new FakeGjcTurnRunner() as GjcSessionTurnRunner;
-	turnRunner.stop = () => {
-		stopCalls += 1;
-	};
+	const managedSdkRuntime = managedRuntimeFixture();
 	const projectionRepository: OpenWebUIProjectionRepository = {
 		async upsertFolder() {
 			throw failure;
@@ -1576,6 +1661,7 @@ test("a linked-project projection failure does not stop the constructed reaper",
 		},
 	};
 	try {
+		await writeDirectV3Authority(join(root, "sessions"));
 		const options = await buildAdapterServerOptions(
 			{
 				mode: "existing",
@@ -1589,15 +1675,15 @@ test("a linked-project projection failure does not stop the constructed reaper",
 				gjcCommand: "/bin/true",
 				turnTimeoutMs: 60_000,
 			},
-			{ turnRunner, projectionRepository },
+			{ managedSdkRuntime: managedSdkRuntime.runtime, projectionRepository },
 		);
 		expect(options.checks).toContainEqual(
 			expect.objectContaining({ name: "openwebui-project-projection", status: "degraded" }),
 		);
-		expect(stopCalls).toBe(0);
-		await options.routes?.runner.stop?.();
+		expect(managedSdkRuntime.disposes).toBe(0);
+		await options.shutdownCleanup?.();
 		await options.runtimeLock.release();
-		expect(stopCalls).toBe(1);
+		expect(managedSdkRuntime.disposes).toBe(1);
 	} finally {
 		await rm(root, { force: true, recursive: true });
 	}
@@ -1605,12 +1691,7 @@ test("a linked-project projection failure does not stop the constructed reaper",
 test("a linked-project projection failure does not stop the base routing runner", async () => {
 	const root = await mkdtemp(join(tmpdir(), "gjc-idle-reaper-no-close-init-"));
 	const failure = new Error("projection startup failure");
-	let stopCalls = 0;
-	const turnRunner = new FakeGjcTurnRunner() as GjcSessionTurnRunner;
-	Object.defineProperty(turnRunner, "withLifecycleClosePreflight", { value: undefined });
-	turnRunner.stop = () => {
-		stopCalls += 1;
-	};
+	const managedSdkRuntime = managedRuntimeFixture();
 	const projectionRepository: OpenWebUIProjectionRepository = {
 		async upsertFolder() {
 			throw failure;
@@ -1626,6 +1707,7 @@ test("a linked-project projection failure does not stop the base routing runner"
 		},
 	};
 	try {
+		await writeDirectV3Authority(join(root, "sessions"));
 		const options = await buildAdapterServerOptions(
 			{
 				mode: "existing",
@@ -1639,15 +1721,15 @@ test("a linked-project projection failure does not stop the base routing runner"
 				gjcCommand: "/bin/true",
 				turnTimeoutMs: 60_000,
 			},
-			{ turnRunner, projectionRepository },
+			{ managedSdkRuntime: managedSdkRuntime.runtime, projectionRepository },
 		);
 		expect(options.checks).toContainEqual(
 			expect.objectContaining({ name: "openwebui-project-projection", status: "degraded" }),
 		);
-		expect(stopCalls).toBe(0);
-		await options.routes?.runner.stop?.();
+		expect(managedSdkRuntime.disposes).toBe(0);
+		await options.shutdownCleanup?.();
 		await options.runtimeLock.release();
-		expect(stopCalls).toBe(1);
+		expect(managedSdkRuntime.disposes).toBe(1);
 	} finally {
 		await rm(root, { force: true, recursive: true });
 	}
