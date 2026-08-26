@@ -101,7 +101,6 @@ describe("public SDK lifecycle contract", () => {
 			},
 		} as unknown as PublicSdkSessionPort;
 		const factory = createModelReaderFactory({
-			cliPath: "/opt/gjc",
 			runtimeLocations: {} as GjcRuntimeLocations,
 			resolveAttachment: async () => attachment,
 			sessionPortFactory: () => port,

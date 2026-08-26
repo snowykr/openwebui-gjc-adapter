@@ -16,7 +16,6 @@ describe("createModelReaderFactory", () => {
 	test("attaches a fresh public SDK port for each reader and detaches on stop", async () => {
 		const ports: FakePublicSessionPort[] = [];
 		const factory = createModelReaderFactory({
-			cliPath: "/opt/gjc",
 			runtimeLocations,
 			resolveAttachment: async () => attachment,
 			sessionPortFactory: () => {
@@ -41,7 +40,6 @@ describe("createModelReaderFactory", () => {
 			await activePort.closeSession();
 		});
 		const reader = await createModelReaderFactory({
-			cliPath: "/opt/gjc",
 			runtimeLocations,
 			resolveAttachment: async () => temporaryAttachment,
 			sessionPortFactory: () => port,
@@ -55,7 +53,6 @@ describe("createModelReaderFactory", () => {
 	test("quarantines a port when public attachment is rejected before acceptance", async () => {
 		const port = new FakePublicSessionPort(true);
 		const factory = createModelReaderFactory({
-			cliPath: "/opt/gjc",
 			runtimeLocations,
 			resolveAttachment: async () => attachment,
 			sessionPortFactory: () => port,
@@ -83,7 +80,6 @@ describe("createModelReaderFactory", () => {
 			port.attached = true;
 		};
 		const factory = createModelReaderFactory({
-			cliPath: "/opt/gjc",
 			runtimeLocations,
 			resolveAttachment: async () => attachment,
 			sessionPortFactory: () => port,
@@ -130,7 +126,6 @@ describe("createModelReaderFactory", () => {
 			port.attached = true;
 		};
 		const pending = createModelReaderFactory({
-			cliPath: "/opt/gjc",
 			runtimeLocations,
 			resolveAttachment: async () => temporaryAttachment,
 			sessionPortFactory: () => port,
@@ -184,7 +179,6 @@ describe("createModelReaderFactory", () => {
 			detachObserved();
 		};
 		const pending = createModelReaderFactory({
-			cliPath: "/opt/gjc",
 			runtimeLocations,
 			resolveAttachment: async () => temporaryAttachment,
 			sessionPortFactory: () => port,
@@ -225,7 +219,6 @@ describe("createModelReaderFactory", () => {
 		});
 		const port = new FakePublicSessionPort();
 		const pending = createModelReaderFactory({
-			cliPath: "/opt/gjc",
 			runtimeLocations,
 			resolveAttachment: async () => {
 				resolveAttachmentStarted();
@@ -253,7 +246,6 @@ describe("createModelReaderFactory", () => {
 		writeFileSync(descriptor, JSON.stringify({ sessionId, url: server.url, token: server.token }));
 		try {
 			const reader = await createModelReaderFactory({
-				cliPath: "/opt/gjc",
 				runtimeLocations: {
 					...runtimeLocations,
 					readerWorkspace: workspace,
@@ -269,7 +261,7 @@ describe("createModelReaderFactory", () => {
 	});
 
 	test("does not fall back to another transport when no public attachment resolver is configured", async () => {
-		const factory = createModelReaderFactory({ cliPath: "/opt/gjc", runtimeLocations });
+		const factory = createModelReaderFactory({ runtimeLocations });
 
 		await expect(factory()).rejects.toBeInstanceOf(ModelReaderUnavailableError);
 	});

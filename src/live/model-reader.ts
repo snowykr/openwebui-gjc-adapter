@@ -53,7 +53,6 @@ export function registerTemporaryModelAttachment(
 }
 
 export interface CreateModelReaderFactoryInput {
-	readonly cliPath: string;
 	readonly runtimeLocations: GjcRuntimeLocations;
 	/** Resolves a validated, already-running public per-session SDK attachment. */
 	readonly resolveAttachment?: PublicSdkAttachmentResolver;
@@ -157,10 +156,6 @@ export function createModelReaderFactory(input: CreateModelReaderFactoryInput): 
 			throw error;
 		}
 	};
-}
-
-export function resolveGjcCliPath(gjcCommand: string): string {
-	return gjcCommand;
 }
 
 async function resolvePublicSdkAttachment(

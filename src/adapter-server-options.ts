@@ -50,7 +50,6 @@ import {
 	type ModelReaderFactory,
 	type PublicSdkAttachmentResolver,
 	type PublicSdkSessionPortFactory,
-	resolveGjcCliPath,
 } from "./live/model-reader";
 import {
 	createProjectionOperationApplier,
@@ -434,7 +433,7 @@ export async function buildResolvedAdapterServerOptions(
 			turnRunner = managedRunner;
 			modelReaderFactory = createManagedReaderFactory(managedModelRuntime, config.turnTimeoutMs);
 		} else {
-			cliPath = resolveGjcCliPath(config.gjcCommand);
+			cliPath = config.gjcCommand;
 			turnRunner =
 				dependencies.turnRunner ??
 				createPublicSdkGjcTurnRunner({
@@ -448,7 +447,6 @@ export async function buildResolvedAdapterServerOptions(
 			modelReaderFactory =
 				dependencies.modelReaderFactory ??
 				createModelReaderFactory({
-					cliPath,
 					runtimeLocations: config.runtimeLocations,
 					resolveAttachment:
 						dependencies.resolveModelAttachment ??
