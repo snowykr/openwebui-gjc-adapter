@@ -4,7 +4,6 @@ import type { SessionOperation, SessionOperationResult } from "./session-authori
 import type { SessionMapping, SessionMappingStore } from "./session-mapping-store";
 import { replayCloseOperation } from "./session-operation-codec";
 import { scopedSessionMappingStore } from "./session-turn-router";
-import type { GjcCloseReceipt, GjcLifecycleTransaction } from "./turn-runner";
 
 export type SessionCloseResult =
 	| { readonly status: "closed" }
@@ -20,8 +19,6 @@ export interface SessionCloseIngress {
 export interface RouteGjcSessionCloseInput extends SessionCloseIngress {
 	readonly mapping: SessionMapping;
 	readonly mappings: SessionMappingStore;
-	readonly lifecycle: GjcLifecycleTransaction;
-	readonly close: (receipt: GjcCloseReceipt) => Promise<SessionCloseResult>;
 	readonly managedSdkRuntime?: ManagedSdkRuntimeDependency;
 	readonly managedSdkTenantFence?: ManagedSdkTenantFence;
 	readonly afterPublish?: (mapping: SessionMapping) => void;
@@ -33,6 +30,11 @@ export async function routeGjcSessionClose(input: RouteGjcSessionCloseInput): Pr
 			? scopedSessionMappingStore(input.mappings, input.mapping.principalId, input.mapping.chatId)
 			: input.mappings;
 	const scopedInput = scopedMappings === input.mappings ? input : { ...input, mappings: scopedMappings };
+	if (!isCompleteManagedAuthority(scopedInput.mapping))
+		return {
+			status: "uncertain",
+			message: "Managed GJC close requires complete managed authority.",
+		};
 	const prior =
 		scopedInput.mappings.operation(scopedInput.mapping.chatId, scopedInput.ingressId) ??
 		(scopedInput.legacyIngress === undefined
@@ -45,71 +47,7 @@ export async function routeGjcSessionClose(input: RouteGjcSessionCloseInput): Pr
 				: scopedInput;
 		return replayPriorClose(replayInput, prior);
 	}
-	if (isCompleteManagedAuthority(scopedInput.mapping)) return routeManagedSessionClose(scopedInput);
-	scopedInput.mappings.beginOperation(scopedInput.mapping.chatId, {
-		id: scopedInput.ingressId,
-		kind: "close",
-		ingressId: scopedInput.ingressId,
-		detail: scopedInput.ingressHash,
-	});
-	try {
-		const proof = scopedInput.mapping.attachment;
-		if (!hasOwnedPaneAttachment(proof)) {
-			scopedInput.mappings.transitionOperation(
-				scopedInput.mapping.chatId,
-				scopedInput.ingressId,
-				"conflict",
-				scopedInput.ingressHash,
-			);
-			return {
-				status: "uncertain",
-				message: "GJC close requires a complete owned-pane attachment before acknowledgement.",
-			};
-		}
-		let receipt: GjcCloseReceipt;
-		try {
-			receipt = scopedInput.lifecycle.assertClosePreflight(proof);
-		} catch (error) {
-			const message = error instanceof Error ? error.message : "GJC close receipt could not be established.";
-			scopedInput.mappings.transitionOperation(
-				scopedInput.mapping.chatId,
-				scopedInput.ingressId,
-				"conflict",
-				scopedInput.ingressHash,
-			);
-			return { status: "uncertain", message };
-		}
-		const result = await scopedInput.close(receipt);
-		if (result.status !== "closed") {
-			scopedInput.mappings.transitionOperation(
-				scopedInput.mapping.chatId,
-				scopedInput.ingressId,
-				"conflict",
-				scopedInput.ingressHash,
-			);
-			return result;
-		}
-		await scopedInput.lifecycle.publishClosed(receipt, () => {
-			const mapping = scopedInput.mappings.completeOperationWithMapping(
-				scopedInput.mapping.chatId,
-				scopedInput.ingressId,
-				scopedInput.ingressHash,
-				scopedInput.mapping,
-				"close",
-			);
-			scopedInput.afterPublish?.(mapping);
-			return mapping;
-		});
-		return result;
-	} catch (error) {
-		scopedInput.mappings.transitionOperation(
-			scopedInput.mapping.chatId,
-			scopedInput.ingressId,
-			"uncertain",
-			scopedInput.ingressHash,
-		);
-		throw error;
-	}
+	return routeManagedSessionClose(scopedInput);
 }
 
 async function routeManagedSessionClose(input: RouteGjcSessionCloseInput): Promise<SessionCloseResult> {
@@ -230,9 +168,7 @@ function replayPriorClose(input: RouteGjcSessionCloseInput, prior: SessionOperat
 			input.ingressId,
 			prior.result,
 			currentMapping.operationId,
-			isCompleteManagedAuthority(currentMapping)
-				? managedCloseMappingCompatible(prior.result, currentMapping, prior, currentOperation, persistedOperations)
-				: legacyCloseMappingCompatible(prior.result, currentMapping, prior, currentOperation, persistedOperations),
+			managedCloseMappingCompatible(prior.result, currentMapping, prior, currentOperation, persistedOperations),
 		);
 	}
 	if (prior.state === "pending") throw new Error(`GJC close ${input.ingressId} is pending and cannot be replayed.`);
@@ -260,26 +196,6 @@ function managedCloseMappingCompatible(
 	return operationFollowsMapping(closeOperation, currentOperation, persistedOperations);
 }
 
-function legacyCloseMappingCompatible(
-	result: SessionOperationResult | undefined,
-	mapping: SessionMapping,
-	closeOperation: SessionOperation,
-	currentOperation: SessionOperation | undefined,
-	persistedOperations: readonly SessionOperation[],
-): boolean {
-	const resultMapping = result?.mapping;
-	if (
-		result?.correlation?.mappingOperationId !== undefined ||
-		resultMapping === undefined ||
-		resultMapping.chatId !== mapping.chatId ||
-		resultMapping.projectId !== mapping.projectId ||
-		resultMapping.sessionId !== mapping.sessionId ||
-		resultMapping.sessionFile !== mapping.sessionFile ||
-		JSON.stringify(resultMapping.attachment) !== JSON.stringify(mapping.attachment)
-	)
-		return false;
-	return operationFollowsMapping(closeOperation, currentOperation, persistedOperations);
-}
 function operationFollowsMapping(
 	operation: SessionOperation,
 	currentOperation: SessionOperation | undefined,
@@ -319,18 +235,4 @@ function parseTimestamp(value: string | undefined): number | undefined {
 	if (value === undefined) return undefined;
 	const timestamp = Date.parse(value);
 	return Number.isFinite(timestamp) ? timestamp : undefined;
-}
-
-function hasOwnedPaneAttachment(
-	proof: SessionMapping["attachment"],
-): proof is NonNullable<SessionMapping["attachment"]> &
-	Required<
-		Pick<NonNullable<SessionMapping["attachment"]>, "tmuxSocket" | "tmuxPane" | "tmuxPanePid" | "tmuxOwnershipTag">
-	> {
-	return (
-		proof?.tmuxSocket !== undefined &&
-		proof.tmuxPane !== undefined &&
-		proof.tmuxPanePid !== undefined &&
-		proof.tmuxOwnershipTag !== undefined
-	);
 }

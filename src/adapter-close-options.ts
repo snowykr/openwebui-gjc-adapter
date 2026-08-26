@@ -55,8 +55,6 @@ export function createAdapterSessionCloser(
 			legacyIngress: ingress.legacyIngress,
 			managedSdkRuntime: fencedRuntime,
 			managedSdkTenantFence: tenantFence,
-			lifecycle: undefined as never,
-			close: undefined as never,
 		});
 	};
 }
