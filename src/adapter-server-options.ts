@@ -16,6 +16,7 @@ import { assertResolvedAdapterConfig, loadConfiguredProjects, resolveAdapterConf
 import { buildRuntimeHealthChecks, type RuntimeIsolationDiagnostic } from "./adapter-runtime-health";
 import { type AdapterConfig, loadAdapterConfig, type ResolvedAdapterConfig } from "./config";
 import { SESSION_AUTHORITY_MAPPING_FILE } from "./config-env";
+import type { ManagedSdkRuntimeDependency, ManagedSdkTenantFence } from "./gjc/managed-sdk-dependency";
 import { ManagedSdkRuntime, type TenantSessionKey } from "./gjc/managed-sdk-runtime";
 import { probeSessionAuthorityEpoch } from "./gjc/session-authority-epoch";
 import { SESSION_AUTHORITY_V3_EPOCH } from "./gjc/session-authority-v3";
@@ -34,7 +35,6 @@ import {
 	type ManagedIdleReaper,
 } from "./live/gjc-managed-idle-reaper";
 import { createManagedModelReaderFactory } from "./live/gjc-managed-model-reader";
-import type { ManagedSdkRuntimeDependency, ManagedSdkTenantFence } from "./live/gjc-routing-lifecycle";
 import { createGjcRoutingLiveGatewayRunner } from "./live/gjc-routing-runner";
 import type { ModelReaderFactory } from "./live/model-reader";
 import {

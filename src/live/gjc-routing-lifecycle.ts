@@ -1,5 +1,6 @@
 import type { GjcRuntimeLocations } from "../contracts";
-import type { ManagedSdkAttachment, ManagedSdkRuntime, TenantSessionKey } from "../gjc/managed-sdk-runtime";
+import type { ManagedSdkRuntimeDependency, ManagedSdkTenantFence } from "../gjc/managed-sdk-dependency";
+import type { ManagedSdkAttachment, TenantSessionKey } from "../gjc/managed-sdk-runtime";
 import type { PublicSdkSessionPort } from "../gjc/public-sdk-contract";
 import type {
 	GjcCloseReceipt,
@@ -22,23 +23,7 @@ export interface PublicSdkRunnerOptions {
 	readonly testBarrierHook?: GjcLifecycleTestBarrierHook;
 }
 
-export type ManagedSdkRuntimeDependency = Pick<
-	ManagedSdkRuntime,
-	| "state"
-	| "start"
-	| "reconcile"
-	| "dispose"
-	| "acquireAttachment"
-	| "request"
-	| "subscribeFrames"
-	| "generationStatus"
-	| "createLifecycleSession"
-	| "resumeLifecycleSession"
-	| "closeLifecycleSession"
-	| "deleteLifecycleSession"
->;
-
-export type ManagedSdkTenantFence = (key: TenantSessionKey) => boolean | Promise<boolean>;
+export type { ManagedSdkRuntimeDependency, ManagedSdkTenantFence } from "../gjc/managed-sdk-dependency";
 
 export interface PublicSdkRunnerContext {
 	readonly input: PublicSdkRunnerOptions;

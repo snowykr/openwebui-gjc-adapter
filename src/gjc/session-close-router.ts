@@ -1,4 +1,4 @@
-import type { ManagedSdkRuntimeDependency, ManagedSdkTenantFence } from "../live/gjc-routing-lifecycle";
+import type { ManagedSdkRuntimeDependency, ManagedSdkTenantFence } from "./managed-sdk-dependency";
 import type { TenantSessionKey } from "./managed-sdk-runtime";
 import type { SessionOperation, SessionOperationResult } from "./session-authority";
 import type { SessionMapping, SessionMappingStore } from "./session-mapping-store";

@@ -1,4 +1,5 @@
 import { isAbsolute, resolve } from "node:path";
+import type { ManagedSdkRuntimeDependency, ManagedSdkTenantFence } from "./gjc/managed-sdk-dependency";
 import { SESSION_AUTHORITY_V3_EPOCH } from "./gjc/session-authority-v3";
 import {
 	routeGjcSessionClose,
@@ -6,14 +7,13 @@ import {
 	type SessionMapping,
 	type SessionMappingStore,
 } from "./gjc/session-router";
-import type { ManagedSdkRuntimeDependency } from "./live/gjc-routing-lifecycle";
 import type { SessionCloseResult } from "./projects/link-service";
 
 export interface AdapterCloseOptionsDependencies {
 	/** Process-owned managed runtime for mappings at the canonical V3 authority epoch. */
 	readonly managedSdkRuntime?: ManagedSdkRuntimeDependency;
 	/** Exact managed tenant lease/epoch fence. */
-	readonly managedSdkTenantFence?: import("./live/gjc-routing-lifecycle").ManagedSdkTenantFence;
+	readonly managedSdkTenantFence?: ManagedSdkTenantFence;
 }
 
 export function createAdapterSessionCloser(

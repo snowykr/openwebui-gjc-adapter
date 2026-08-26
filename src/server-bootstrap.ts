@@ -1,6 +1,6 @@
 import type { ManagedBootstrapService } from "./gjc/managed-bootstrap";
+import type { ManagedSdkRuntimeDependency } from "./gjc/managed-sdk-dependency";
 import type { AdapterHealthCheck, AdapterReadinessOptions } from "./health";
-import type { ManagedSdkRuntimeDependency } from "./live/gjc-routing-lifecycle";
 import type { AdapterRouteDependencies } from "./live/openai-routes";
 import type { RuntimeSingletonLock } from "./runtime-singleton-lock";
 import { createAdapterRequestHandler } from "./server-request-handler";
