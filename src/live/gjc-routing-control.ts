@@ -1,6 +1,6 @@
 import type { ManagedSdkAttachment } from "../gjc/managed-sdk-runtime";
+import { scopedSessionMappingStore } from "../gjc/scoped-session-mapping-store";
 import type { routeGjcTurn, SessionMapping, SessionMappingStore } from "../gjc/session-router";
-import { scopedSessionMappingStore } from "../gjc/session-turn-router";
 import {
 	type GjcControlResult,
 	type GjcLifecycleTestBarrierHook,

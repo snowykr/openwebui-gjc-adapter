@@ -1,12 +1,12 @@
 import { resolve } from "node:path";
 import type { NormalizedModelSelection } from "../contracts";
+import { scopedSessionMappingStore } from "../gjc/scoped-session-mapping-store";
 import {
 	type RouteGjcTurnResult,
 	routeGjcTurn,
 	type SessionMapping,
 	type SessionMappingStore,
 } from "../gjc/session-router";
-import { scopedSessionMappingStore } from "../gjc/session-turn-router";
 import type {
 	GjcLifecycleTestBarrierHook,
 	ManagedPreparedTurnAuthority,

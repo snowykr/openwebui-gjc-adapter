@@ -1,8 +1,8 @@
+import { scopedSessionMappingStore } from "../gjc/scoped-session-mapping-store";
 import type { SessionOperationGateBinding } from "../gjc/session-authority-types";
 import { ensureSdkSessionFile } from "../gjc/session-file";
 import type { SessionMapping, SessionMappingStore } from "../gjc/session-router";
 import { validateSessionFile } from "../gjc/session-router";
-import { scopedSessionMappingStore } from "../gjc/session-turn-router";
 import { type GjcLifecycleTransaction, GjcTurnCancelledError, type GjcTurnEventObserver } from "../gjc/turn-runner";
 import {
 	answerFromWorkflowGateReply,

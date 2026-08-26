@@ -1,5 +1,5 @@
+import { scopedSessionMappingStore } from "../gjc/scoped-session-mapping-store";
 import type { SessionMappingStore } from "../gjc/session-router";
-import { scopedSessionMappingStore } from "../gjc/session-turn-router";
 import { GjcTurnCancelledError } from "../gjc/turn-runner";
 import type { OutboxStore } from "../state/outbox";
 import type { LiveGatewayRunnerInput, LiveGatewayRunnerResult } from "./chat-completions";

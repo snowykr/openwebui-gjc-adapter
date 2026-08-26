@@ -1,9 +1,9 @@
 import type { ManagedSdkRuntimeDependency, ManagedSdkTenantFence } from "./managed-sdk-dependency";
 import type { TenantSessionKey } from "./managed-sdk-runtime";
+import { scopedSessionMappingStore } from "./scoped-session-mapping-store";
 import type { SessionOperation, SessionOperationResult } from "./session-authority";
 import type { SessionMapping, SessionMappingStore } from "./session-mapping-store";
 import { replayCloseOperation } from "./session-operation-codec";
-import { scopedSessionMappingStore } from "./session-turn-router";
 
 export type SessionCloseResult =
 	| { readonly status: "closed" }
