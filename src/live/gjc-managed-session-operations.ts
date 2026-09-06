@@ -63,6 +63,8 @@ export interface ManagedRequestInput {
 	readonly timeoutMs?: number;
 	readonly idempotencyKey?: string;
 	readonly signal?: AbortSignal;
+	/** Additional synchronous owner check; never replaces runtime tenant authorization. */
+	readonly beforeDispatch?: () => void;
 	readonly onDispatch?: () => void;
 }
 
@@ -102,11 +104,13 @@ export interface ManagedSessionOperations {
 		authority: ManagedTurnAuthority,
 		selection: NormalizedModelSelection,
 		timeoutMs?: number,
+		beforeDispatch?: () => void,
 	): Promise<Readonly<Record<string, unknown>>>;
 	setThinking(
 		authority: ManagedTurnAuthority,
 		thinkingLevel: string,
 		timeoutMs?: number,
+		beforeDispatch?: () => void,
 	): Promise<Readonly<Record<string, unknown>>>;
 	prompt(input: ManagedTurnInput): Promise<GjcTurnResult>;
 	followUp(input: ManagedTurnInput): Promise<GjcTurnResult>;
@@ -138,9 +142,15 @@ export function createManagedSessionOperations(
 			epoch: authority.epoch,
 		};
 	};
-	const acquireWithin = async (authority: ManagedTurnAuthority, deadline: ManagedOperationDeadline) => {
+	const acquireWithin = async (
+		authority: ManagedTurnAuthority,
+		deadline: ManagedOperationDeadline,
+		beforeDispatch?: () => void,
+	) => {
 		const key = tenant(authority);
+		beforeDispatch?.();
 		await deadline.wait(runtime.reconcile(deadline.remaining()));
+		beforeDispatch?.();
 		return await deadline.wait(runtime.acquireAttachment(key, deadline.remaining()));
 	};
 	const acquire = async (authority: ManagedTurnAuthority) => {
@@ -165,15 +175,19 @@ export function createManagedSessionOperations(
 		options?.signal?.addEventListener("abort", onAbort, { once: true });
 		try {
 			const key = tenant(authority);
+			options?.beforeDispatch?.();
 			await deadline.wait(runtime.reconcile(deadline.remaining()));
+			options?.beforeDispatch?.();
 			const attachment = await deadline.wait(runtime.acquireAttachment(key, deadline.remaining()));
 			throwIfAborted(options?.signal);
+			options?.beforeDispatch?.();
 			return await deadline.wait(
 				runtime.request(attachment, frame, {
 					timeoutMs: deadline.remaining(),
 					beforeDispatch: () => {
 						deadline.remaining();
 						throwIfAborted(options?.signal);
+						options?.beforeDispatch?.();
 					},
 					onDispatch: options?.onDispatch,
 				}),
@@ -367,9 +381,11 @@ export function createManagedSessionOperations(
 		name: string,
 		input: Readonly<Record<string, unknown>>,
 		deadline: ManagedOperationDeadline,
+		beforeDispatch?: () => void,
 	) => {
 		return collectManagedQueryPages(name, deadline, async cursor => {
-			const attachment = await acquireWithin(authority, deadline);
+			const attachment = await acquireWithin(authority, deadline, beforeDispatch);
+			beforeDispatch?.();
 			return deadline.wait(
 				runtime.request(
 					attachment,
@@ -378,6 +394,7 @@ export function createManagedSessionOperations(
 						timeoutMs: deadline.remaining(),
 						beforeDispatch: () => {
 							deadline.remaining();
+							beforeDispatch?.();
 						},
 					},
 				),
@@ -438,10 +455,11 @@ export function createManagedSessionOperations(
 		};
 		input.signal?.addEventListener("abort", cancelAfterDispatch, { once: true });
 		try {
-			const attachment = await acquireWithin(authority, deadline);
+			const attachment = await acquireWithin(authority, deadline, input.beforeDispatch);
 			const assertCurrent = () => {
 				throwIfAborted(input.signal);
 				deadline.remaining();
+				input.beforeDispatch?.();
 				if (runtime.state !== "running" || !attachment.isCurrent())
 					throw new ManagedTurnUncertainError("Managed turn lost its current runtime attachment.");
 			};
@@ -455,7 +473,7 @@ export function createManagedSessionOperations(
 			}, ATTACHMENT_CHECK_MS);
 			attachmentCheck.unref?.();
 			const baseline = new Set(
-				(await queryPages(authority, "workflow.gates.list", {}, deadline)).map(durableGateId),
+				(await queryPages(authority, "workflow.gates.list", {}, deadline, input.beforeDispatch)).map(durableGateId),
 			);
 			assertCurrent();
 			let correlation: ReturnType<typeof decodeAcknowledgedCorrelation> | undefined;
@@ -488,7 +506,7 @@ export function createManagedSessionOperations(
 					checkedActions.add(actionId);
 					const accepted = correlation;
 					// Do not block ordered frame delivery on a query: a terminal may arrive while it is pending.
-					void queryPages(authority, "workflow.gates.list", {}, deadline)
+					void queryPages(authority, "workflow.gates.list", {}, deadline, input.beforeDispatch)
 						.then(gates => {
 							if (closed || terminal !== undefined) return;
 							const gate = resolveDurableGate(gates, baseline, event.payload!, accepted, authority);
@@ -581,15 +599,16 @@ export function createManagedSessionOperations(
 		getModels: (authority, timeoutMs) => query(authority, "models.list/current", {}, timeoutMs),
 		getProviders: (authority, timeoutMs) => query(authority, "providers.list/active", {}, timeoutMs),
 		getBranchCandidates: (authority, timeoutMs) => query(authority, "session.branch_candidates", {}, timeoutMs),
-		setModel: (authority, selection, timeoutMs) =>
+		setModel: (authority, selection, timeoutMs, beforeDispatch) =>
 			request({
 				authority,
 				operation: "model.set",
 				input: { id: `${selection.provider}/${selection.modelId}`, thinkingLevel: selection.thinkingLevel },
 				timeoutMs,
+				beforeDispatch,
 			}),
-		setThinking: (authority, thinkingLevel, timeoutMs) =>
-			request({ authority, operation: "thinking.set", input: { level: thinkingLevel }, timeoutMs }),
+		setThinking: (authority, thinkingLevel, timeoutMs, beforeDispatch) =>
+			request({ authority, operation: "thinking.set", input: { level: thinkingLevel }, timeoutMs, beforeDispatch }),
 		prompt: input => runTurn("turn.prompt", input),
 		followUp: input => runTurn("turn.follow_up", input),
 		abortAndPrompt: input => runTurn("turn.abort_and_prompt", input),

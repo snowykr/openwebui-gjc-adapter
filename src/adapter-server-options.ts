@@ -282,6 +282,7 @@ export async function buildResolvedAdapterServerOptions(
 		const baseRoutingRunner = createGjcRoutingLiveGatewayRunner({
 			turnRunner,
 			mappings,
+			turnTimeoutMs: config.turnTimeoutMs,
 			ownerUserId: owner.ownerUserId,
 			modelReaderFactory,
 			...(outbox === undefined ? {} : { outbox }),

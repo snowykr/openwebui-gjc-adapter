@@ -113,6 +113,10 @@ export interface GjcStartNewSessionInput {
 
 export interface GjcContinueSessionInput extends GjcSessionAddress, GjcLifecycleScoped {
 	readonly userMessageId: string;
+	/** Remaining budget when continuation is part of a larger managed operation. */
+	readonly timeoutMs?: number;
+	/** Additional caller fence at dispatch; runtime authorization remains mandatory. */
+	readonly beforeDispatch?: () => void;
 	readonly parentId?: string;
 	readonly text: string;
 	readonly sessionFile?: string;

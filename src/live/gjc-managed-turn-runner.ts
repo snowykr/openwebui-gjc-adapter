@@ -109,6 +109,9 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime, turnTimeo
 							await operations.prompt({
 								...turnInput({ ...input, authority }, "turn.prompt"),
 								timeoutMs: deadline.remaining(),
+								beforeDispatch: () => {
+									deadline.remaining();
+								},
 							}),
 							modelSelection,
 						),
@@ -303,6 +306,9 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime, turnTimeo
 									"turn.prompt",
 								),
 								timeoutMs: deadline.remaining(),
+								beforeDispatch: () => {
+									deadline.remaining();
+								},
 							}),
 							modelSelection,
 						),
@@ -551,9 +557,15 @@ async function applyManagedModelSelection(
 	selection: NormalizedModelSelection | undefined,
 	deadline?: ManagedOperationDeadline,
 	signal?: AbortSignal,
+	beforeDispatch?: () => void,
 ): Promise<NormalizedModelSelection | undefined> {
 	throwIfAborted(signal);
 	deadline?.remaining();
+	const assertDispatch = () => {
+		deadline?.remaining();
+		throwIfAborted(signal);
+		beforeDispatch?.();
+	};
 	if (selection === undefined) return undefined;
 	const requested = normalizeModelSelection(selection);
 	if (requested === undefined)
@@ -561,7 +573,7 @@ async function applyManagedModelSelection(
 
 	let modelResult: Readonly<Record<string, unknown>>;
 	try {
-		modelResult = await operations.setModel(authority, requested, deadline?.remaining());
+		modelResult = await operations.setModel(authority, requested, deadline?.remaining(), assertDispatch);
 	} catch (error) {
 		throw managedSelectionMutationError("model_set_failed", "model.set", error);
 	}
@@ -572,7 +584,12 @@ async function applyManagedModelSelection(
 	let thinkingResult: Readonly<Record<string, unknown>>;
 	try {
 		throwIfAborted(signal);
-		thinkingResult = await operations.setThinking(authority, requested.thinkingLevel, deadline?.remaining());
+		thinkingResult = await operations.setThinking(
+			authority,
+			requested.thinkingLevel,
+			deadline?.remaining(),
+			assertDispatch,
+		);
 	} catch (error) {
 		throw managedSelectionMutationError("thinking_set_failed", "thinking.set", error);
 	}
@@ -595,16 +612,28 @@ async function continueManagedTurn(
 	timeoutMs: number | undefined,
 ): Promise<GjcTurnResult> {
 	throwIfAborted(input.signal);
-	const deadline = new ManagedOperationDeadline(timeoutMs, "turn.follow_up");
+	const deadline = new ManagedOperationDeadline(input.timeoutMs ?? timeoutMs, "turn.follow_up");
+	const assertDispatch = () => {
+		deadline.remaining();
+		input.beforeDispatch?.();
+	};
 	const onAbort = () => deadline.fail(new GjcTurnCancelledError());
 	input.signal?.addEventListener("abort", onAbort, { once: true });
 	try {
 		const selection = await deadline.wait(
-			applyManagedModelSelection(operations, input.authority, input.modelSelection, deadline, input.signal),
+			applyManagedModelSelection(
+				operations,
+				input.authority,
+				input.modelSelection,
+				deadline,
+				input.signal,
+				assertDispatch,
+			),
 		);
 		const result = await operations.followUp({
 			...turnInput(input, "turn.follow_up"),
 			timeoutMs: deadline.remaining(),
+			beforeDispatch: assertDispatch,
 		});
 		deadline.remaining();
 		return withManagedProof(withManagedModelSelection(result, selection), input.authority);

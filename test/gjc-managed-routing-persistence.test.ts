@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -459,6 +459,135 @@ describe("managed routing persistence", () => {
 				"immutable result binding",
 			);
 			expect(forks).toHaveLength(2);
+		} finally {
+			f.close();
+		}
+	});
+
+	test.each(["fork", "transaction", "state", "prompt", "publication"] as const)(
+		"branch %s timeout retains acknowledged uncertainty without late publication",
+		async phase => {
+			const f = fixture();
+			let release!: () => void;
+			const gate = new Promise<void>(resolve => {
+				release = resolve;
+			});
+			let reachedPhase = false;
+			const waitAtPhase = async () => {
+				reachedPhase = true;
+				await gate;
+			};
+			try {
+				await routeGjcTurn(f.input());
+				const originalMapping = f.store.getScoped(f.scope);
+				let forks = 0;
+				const runner = Object.assign(f.runner, {
+					async forkManagedSuccessor(input: ManagedSuccessorInput) {
+						await input.onInvoking?.();
+						forks += 1;
+						const managedAuthority = { ...input.target, sessionId: "branch-target", generation: 2 };
+						await input.onAcknowledged?.(managedAuthority);
+						if (phase === "fork") await waitAtPhase();
+						const successor = { tenant: managedAuthority, generation: 2, isCurrent: () => true };
+						await input.publish(successor);
+						return { successor, managedAuthority, operationHash: input.source.requestKey };
+					},
+				});
+				const transaction = runner.withLifecyclePublication.bind(runner);
+				runner.withLifecyclePublication = async (address, effect) => {
+					if (phase === "transaction") await waitAtPhase();
+					return transaction(address, async lifecycle => {
+						const publish = lifecycle.publishManaged.bind(lifecycle);
+						lifecycle.publishManaged = async (proof, write) => {
+							if (phase === "publication") await waitAtPhase();
+							return publish(proof, write);
+						};
+						return effect(lifecycle);
+					});
+				};
+				const state = runner.getState.bind(runner);
+				runner.getState = async input => {
+					const result = await state(input);
+					if (phase === "state") await waitAtPhase();
+					return result;
+				};
+				const prompt = runner.continueSession.bind(runner);
+				runner.continueSession = async input => {
+					const result = await prompt(input);
+					if (phase === "prompt") await waitAtPhase();
+					return result;
+				};
+				const gateway = () =>
+					createGjcRoutingLiveGatewayRunner({ turnRunner: runner, mappings: f.store, turnTimeoutMs: 2_000 });
+				await expect(gateway().run(branchTurn())).rejects.toMatchObject({ code: "timeout" });
+				expect(reachedPhase).toBe(true);
+				const bytes = readFileSync(f.file);
+				const stateCount = runner.states.length;
+				const promptCount = runner.continues.length;
+				release();
+				await new Promise(resolve => setTimeout(resolve, 0));
+				expect(runner.states).toHaveLength(stateCount);
+				expect(runner.continues).toHaveLength(promptCount);
+				expect(readFileSync(f.file).equals(bytes)).toBe(true);
+				f.reopen();
+				const receipt = f.store.operationScoped(f.scope, "branch-1")!;
+				expect(receipt.state).toBe("uncertain");
+				expect(receipt.acknowledgedSuccessor?.sessionId).toBe("branch-target");
+				expect(receipt.lifecycle?.state).toBe(phase === "fork" ? "uncertain" : "active_generation_proven");
+				expect(receipt.result).toBeUndefined();
+				expect(f.store.getScoped(f.scope)).toEqual(originalMapping);
+				await expect(gateway().run(branchTurn())).rejects.toThrow("requires reconciliation");
+				expect(forks).toBe(1);
+			} finally {
+				release();
+				f.close();
+			}
+		},
+	);
+
+	test("branch fork, state and prompt consume the same configured budget", async () => {
+		const f = fixture();
+		try {
+			await routeGjcTurn(f.input());
+			let now = Date.now();
+			const clock = spyOn(Date, "now").mockImplementation(() => now);
+			let forkTimeout: number | undefined;
+			const runner = Object.assign(f.runner, {
+				async forkManagedSuccessor(input: ManagedSuccessorInput) {
+					forkTimeout = input.timeoutMs;
+					await input.onInvoking?.();
+					now += 400;
+					const managedAuthority = { ...input.target, sessionId: "branch-target", generation: 2 };
+					await input.onAcknowledged?.(managedAuthority);
+					const successor = { tenant: managedAuthority, generation: 2, isCurrent: () => true };
+					await input.publish(successor);
+					return { successor, managedAuthority, operationHash: input.source.requestKey };
+				},
+			});
+			const state = runner.getState.bind(runner);
+			runner.getState = async input => {
+				now += 300;
+				return state(input);
+			};
+			const prompt = runner.continueSession.bind(runner);
+			runner.continueSession = async input => {
+				now += 400;
+				return prompt(input);
+			};
+			try {
+				await expect(
+					createGjcRoutingLiveGatewayRunner({ turnRunner: runner, mappings: f.store, turnTimeoutMs: 1_000 }).run(
+						branchTurn(),
+					),
+				).rejects.toMatchObject({ code: "timeout" });
+				expect(forkTimeout).toBe(1_000);
+				expect(runner.continues[0]?.timeoutMs).toBe(300);
+				expect(() => runner.continues[0]?.beforeDispatch?.()).toThrow("timed out");
+				expect(f.store.operationScoped(f.scope, "branch-1")?.state).toBe("uncertain");
+				expect(f.store.getScoped(f.scope)?.sessionId).toBe("session-1");
+			} finally {
+				clock.mockRestore();
+			}
 		} finally {
 			f.close();
 		}

@@ -5,6 +5,7 @@ import {
 	transitionManagedLifecycleEvidence,
 } from "../gjc/managed-lifecycle-evidence";
 import { canTransitionManagedLifecycleState } from "../gjc/managed-lifecycle-state";
+import { ManagedOperationDeadline } from "../gjc/managed-operation-deadline";
 import type { ManagedSdkAttachment } from "../gjc/managed-sdk-runtime";
 import { scopedSessionMappingStore } from "../gjc/scoped-session-mapping-store";
 import type { routeGjcTurn, SessionMapping, SessionMappingStore } from "../gjc/session-router";
@@ -28,6 +29,7 @@ export interface RoutingControlDependencies {
 	readonly mappings: SessionMappingStore;
 	readonly outbox?: OutboxStore;
 	readonly ownerUserId?: string;
+	readonly turnTimeoutMs?: number;
 }
 export async function runRoutingControl(
 	input: RoutingControlDependencies,
@@ -316,178 +318,219 @@ async function runManagedBranch(
 	if (predecessor === undefined) throw new Error("Managed branch requires persisted source authority.");
 	throwIfAborted(turn.signal);
 	if (flow === undefined) throw new Error("Managed branch requires the public successor flow.");
-	const source = {
-		...predecessor,
-		requestKey: lifecycleControlRequestKey(predecessor, "session.fork", turn.userMessageId, hash),
-	};
-	const mappings = input.mappings;
-	mappings.beginOperation(turn.chatId, {
-		id: turn.userMessageId,
-		kind: "branch",
-		ingressId: turn.userMessageId,
-		detail: hash,
-	});
-	const { sessionId: _sessionId, generation: _generation, ...target } = source;
-	let lifecycleEvidence = createManagedLifecycleEvidence({
-		operation: "session.fork",
-		preparedAuthority: lifecyclePreparedAuthority(target),
-		source: lifecycleExactAuthority(source),
-		target: { sourceSessionId: source.sessionId, cwd: source.canonicalWorkspace },
-		payloadHash: hash,
-	});
-	const recordLifecycle = (next: typeof lifecycleEvidence) => {
-		mappings.recordLifecycleEvidence(turn.chatId, turn.userMessageId, hash, next);
-		lifecycleEvidence = next;
-	};
-	recordLifecycle(lifecycleEvidence);
-	try {
-		const forked = await flow({
-			source,
-			target,
-			signal: turn.signal,
-			lifecycleOperation: { operationId: turn.userMessageId, requestKey: source.requestKey, payloadHash: hash },
-			onInvoking: () => {
-				assertCurrentBranchPredecessor(mappings, turn.chatId, existing, turn.userMessageId);
-				recordLifecycle(transitionManagedLifecycleEvidence(lifecycleEvidence, "invoking"));
-			},
-			onAcknowledged: authority => {
-				assertManagedAuthority(authority, {
-					...source,
-					sessionId: authority.sessionId,
-					generation: authority.generation,
-				});
-				if (
-					authority.sessionId === source.sessionId ||
-					!Number.isSafeInteger(authority.generation) ||
-					authority.generation <= 0
-				)
-					throw new Error("Managed branch acknowledgement requires a distinct exact successor.");
-				recordLifecycle(
-					transitionManagedLifecycleEvidence(lifecycleEvidence, "acknowledged_unproven", {
-						acknowledged: lifecycleExactAuthority(authority),
-					}),
-				);
-				mappings.recordAcknowledgedSuccessor(turn.chatId, turn.userMessageId, hash, {
-					sessionId: authority.sessionId,
-					managedAuthority: managedAuthorityCopy(authority),
-				});
-				assertCurrentBranchPredecessor(mappings, turn.chatId, existing, turn.userMessageId);
-			},
-			publish: successor => {
-				assertCurrentBranchPredecessor(mappings, turn.chatId, existing, turn.userMessageId);
-				recordLifecycle(
-					transitionManagedLifecycleEvidence(lifecycleEvidence, "active_generation_proven", {
-						proven: {
-							kind: "managed-generation",
-							sessionId: successor.tenant.sessionId,
-							generation: successor.generation,
-							leaseId: source.leaseId,
-							epoch: source.epoch,
-						},
-					}),
-				);
-			},
-		});
+	const deadline = new ManagedOperationDeadline(input.turnTimeoutMs, "branch");
+	const step = <T>(effect: () => Promise<T>): Promise<T> => {
+		deadline.remaining();
 		throwIfAborted(turn.signal);
-		assertCurrentBranchPredecessor(mappings, turn.chatId, existing, turn.userMessageId);
-		const authority = managedSuccessorAuthority(source, forked.successor);
-		const acknowledged = mappings.operation(turn.chatId, turn.userMessageId)?.acknowledgedSuccessor;
-		if (
-			acknowledged === undefined ||
-			!("managedAuthority" in acknowledged) ||
-			acknowledged.managedAuthority === undefined
-		)
-			throw new Error("Managed branch successor acknowledgement was not persisted.");
-		assertManagedAuthority(acknowledged.managedAuthority, authority);
-		assertManagedAuthority(forked.managedAuthority, authority);
-		const sessionRoot = turn.project.sessionRoot ?? `${turn.project.cwd}/.gjc/sessions`;
-		if (input.turnRunner.withLifecyclePublication === undefined)
-			throw new Error("Managed branch requires lifecycle publication.");
-		const address = {
-			cwd: turn.project.cwd,
-			sessionRoot,
-			projectId: existing.projectId,
-			chatId: existing.chatId,
-			sessionId: authority.sessionId,
+		return deadline.wait(effect());
+	};
+	try {
+		const source = {
+			...predecessor,
+			requestKey: lifecycleControlRequestKey(predecessor, "session.fork", turn.userMessageId, hash),
 		};
-		return await input.turnRunner.withLifecyclePublication(address, async lifecycle => {
-			throwIfAborted(turn.signal);
-			assertCurrentBranchPredecessor(mappings, turn.chatId, existing, turn.userMessageId);
-			const state = await input.turnRunner.getState({
-				...address,
-				lifecycle,
-				managedAuthority: authority,
-			});
-			const result = await input.turnRunner.continueSession({
-				...address,
-				lifecycle,
-				userMessageId: turn.userMessageId,
-				parentId: turn.userMessageParentId ?? undefined,
-				text: turn.prompt,
-				activeLeaf: state.activeLeaf,
-				rawFrameCursor: state.rawFrameCursor,
-				eventCursor: state.eventCursor,
-				operationId: turn.userMessageId,
-				managedAuthority: authority,
-				...(turn.signal === undefined ? {} : { signal: turn.signal }),
-				...(turn.ownerUserId === undefined ? {} : { principalId: turn.ownerUserId }),
-			});
-			throwIfAborted(turn.signal);
-			assertCurrentBranchPredecessor(mappings, turn.chatId, existing, turn.userMessageId);
-			if (result.managedAuthority === undefined || result.managedProof === undefined)
-				throw new Error("Managed branch successor did not return full generation authority.");
-			assertManagedAuthority(result.managedAuthority, authority);
-			const publishedAuthority = managedAuthorityCopy(authority);
-			assertManagedProof(result.managedProof, publishedAuthority);
-			if (publishedAuthority.sessionId !== authority.sessionId)
-				throw new Error("Managed branch successor authority changed after fork proof.");
-			if (lifecycle.publishManaged === undefined) throw new Error("Managed branch requires generation publication.");
-			const mapping = await lifecycle.publishManaged(result.managedProof, () => {
-				const published = mappings.completeOperationWithMapping(
-					turn.chatId,
-					turn.userMessageId,
-					hash,
-					{
-						principalId: publishedAuthority.principalId,
-						chatId: existing.chatId,
-						projectId: existing.projectId,
-						sessionId: publishedAuthority.sessionId,
-						rawFrameCursor: result.rawFrameCursor,
-						eventCursor: result.eventCursor,
-						operationId: turn.userMessageId,
-						assistantText: result.text,
-						events: result.events,
-						managedAuthority: publishedAuthority,
-						modelSelection: result.modelSelection ?? existing.modelSelection,
-					},
-					"control",
-				);
-				ensureProjectionRows(
-					input.outbox,
-					published,
-					publishedAuthority.principalId,
-					publishedAuthority.principalId,
-				);
-				return published;
-			});
-			const events = projectTurnEvents(result.events, undefined);
-			return withCanonicalModel(
-				{
-					content: result.text,
-					...(events.length === 0 ? {} : { events }),
-				},
-				mapping.modelSelection,
-			);
+		const mappings = input.mappings;
+		mappings.beginOperation(turn.chatId, {
+			id: turn.userMessageId,
+			kind: "branch",
+			ingressId: turn.userMessageId,
+			detail: hash,
 		});
-	} catch (error) {
+		const { sessionId: _sessionId, generation: _generation, ...target } = source;
+		let lifecycleEvidence = createManagedLifecycleEvidence({
+			operation: "session.fork",
+			preparedAuthority: lifecyclePreparedAuthority(target),
+			source: lifecycleExactAuthority(source),
+			target: { sourceSessionId: source.sessionId, cwd: source.canonicalWorkspace },
+			payloadHash: hash,
+		});
+		const recordLifecycle = (next: typeof lifecycleEvidence) => {
+			mappings.recordLifecycleEvidence(turn.chatId, turn.userMessageId, hash, next);
+			lifecycleEvidence = next;
+		};
+		recordLifecycle(lifecycleEvidence);
 		try {
-			if (canTransitionManagedLifecycleState(lifecycleEvidence.state, "uncertain"))
-				recordLifecycle(transitionManagedLifecycleEvidence(lifecycleEvidence, "uncertain"));
-			mappings.transitionOperation(turn.chatId, turn.userMessageId, "uncertain", hash);
-		} catch (persistenceError) {
-			throw new AggregateError([error, persistenceError], "Managed branch failure could not be recorded.");
+			const forked = await step(() =>
+				flow({
+					source,
+					target,
+					timeoutMs: deadline.remaining(),
+					signal: turn.signal,
+					lifecycleOperation: {
+						operationId: turn.userMessageId,
+						requestKey: source.requestKey,
+						payloadHash: hash,
+					},
+					onInvoking: () => {
+						deadline.remaining();
+						throwIfAborted(turn.signal);
+						assertCurrentBranchPredecessor(mappings, turn.chatId, existing, turn.userMessageId);
+						recordLifecycle(transitionManagedLifecycleEvidence(lifecycleEvidence, "invoking"));
+					},
+					onAcknowledged: authority => {
+						assertManagedAuthority(authority, {
+							...source,
+							sessionId: authority.sessionId,
+							generation: authority.generation,
+						});
+						if (
+							authority.sessionId === source.sessionId ||
+							!Number.isSafeInteger(authority.generation) ||
+							authority.generation <= 0
+						)
+							throw new Error("Managed branch acknowledgement requires a distinct exact successor.");
+						recordLifecycle(
+							transitionManagedLifecycleEvidence(lifecycleEvidence, "acknowledged_unproven", {
+								acknowledged: lifecycleExactAuthority(authority),
+							}),
+						);
+						mappings.recordAcknowledgedSuccessor(turn.chatId, turn.userMessageId, hash, {
+							sessionId: authority.sessionId,
+							managedAuthority: managedAuthorityCopy(authority),
+						});
+						deadline.remaining();
+						assertCurrentBranchPredecessor(mappings, turn.chatId, existing, turn.userMessageId);
+					},
+					publish: successor => {
+						deadline.remaining();
+						throwIfAborted(turn.signal);
+						assertCurrentBranchPredecessor(mappings, turn.chatId, existing, turn.userMessageId);
+						recordLifecycle(
+							transitionManagedLifecycleEvidence(lifecycleEvidence, "active_generation_proven", {
+								proven: {
+									kind: "managed-generation",
+									sessionId: successor.tenant.sessionId,
+									generation: successor.generation,
+									leaseId: source.leaseId,
+									epoch: source.epoch,
+								},
+							}),
+						);
+					},
+				}),
+			);
+			throwIfAborted(turn.signal);
+			assertCurrentBranchPredecessor(mappings, turn.chatId, existing, turn.userMessageId);
+			const authority = managedSuccessorAuthority(source, forked.successor);
+			const acknowledged = mappings.operation(turn.chatId, turn.userMessageId)?.acknowledgedSuccessor;
+			if (
+				acknowledged === undefined ||
+				!("managedAuthority" in acknowledged) ||
+				acknowledged.managedAuthority === undefined
+			)
+				throw new Error("Managed branch successor acknowledgement was not persisted.");
+			assertManagedAuthority(acknowledged.managedAuthority, authority);
+			assertManagedAuthority(forked.managedAuthority, authority);
+			const sessionRoot = turn.project.sessionRoot ?? `${turn.project.cwd}/.gjc/sessions`;
+			if (input.turnRunner.withLifecyclePublication === undefined)
+				throw new Error("Managed branch requires lifecycle publication.");
+			const address = {
+				cwd: turn.project.cwd,
+				sessionRoot,
+				projectId: existing.projectId,
+				chatId: existing.chatId,
+				sessionId: authority.sessionId,
+			};
+			return await step(() =>
+				input.turnRunner.withLifecyclePublication!(address, async lifecycle => {
+					deadline.remaining();
+					throwIfAborted(turn.signal);
+					assertCurrentBranchPredecessor(mappings, turn.chatId, existing, turn.userMessageId);
+					const state = await step(() =>
+						input.turnRunner.getState({
+							...address,
+							lifecycle,
+							managedAuthority: authority,
+						}),
+					);
+					const result = await step(() =>
+						input.turnRunner.continueSession({
+							...address,
+							lifecycle,
+							timeoutMs: deadline.remaining(),
+							beforeDispatch: () => {
+								deadline.remaining();
+								throwIfAborted(turn.signal);
+								assertCurrentBranchPredecessor(mappings, turn.chatId, existing, turn.userMessageId);
+							},
+							userMessageId: turn.userMessageId,
+							parentId: turn.userMessageParentId ?? undefined,
+							text: turn.prompt,
+							activeLeaf: state.activeLeaf,
+							rawFrameCursor: state.rawFrameCursor,
+							eventCursor: state.eventCursor,
+							operationId: turn.userMessageId,
+							managedAuthority: authority,
+							...(turn.signal === undefined ? {} : { signal: turn.signal }),
+							...(turn.ownerUserId === undefined ? {} : { principalId: turn.ownerUserId }),
+						}),
+					);
+					throwIfAborted(turn.signal);
+					assertCurrentBranchPredecessor(mappings, turn.chatId, existing, turn.userMessageId);
+					if (result.managedAuthority === undefined || result.managedProof === undefined)
+						throw new Error("Managed branch successor did not return full generation authority.");
+					assertManagedAuthority(result.managedAuthority, authority);
+					const publishedAuthority = managedAuthorityCopy(authority);
+					assertManagedProof(result.managedProof, publishedAuthority);
+					if (publishedAuthority.sessionId !== authority.sessionId)
+						throw new Error("Managed branch successor authority changed after fork proof.");
+					if (lifecycle.publishManaged === undefined)
+						throw new Error("Managed branch requires generation publication.");
+					const mapping = await step(() =>
+						lifecycle.publishManaged(result.managedProof!, () => {
+							deadline.remaining();
+							throwIfAborted(turn.signal);
+							assertCurrentBranchPredecessor(mappings, turn.chatId, existing, turn.userMessageId);
+							const published = mappings.completeOperationWithMapping(
+								turn.chatId,
+								turn.userMessageId,
+								hash,
+								{
+									principalId: publishedAuthority.principalId,
+									chatId: existing.chatId,
+									projectId: existing.projectId,
+									sessionId: publishedAuthority.sessionId,
+									rawFrameCursor: result.rawFrameCursor,
+									eventCursor: result.eventCursor,
+									operationId: turn.userMessageId,
+									assistantText: result.text,
+									events: result.events,
+									managedAuthority: publishedAuthority,
+									modelSelection: result.modelSelection ?? existing.modelSelection,
+								},
+								"control",
+							);
+							ensureProjectionRows(
+								input.outbox,
+								published,
+								publishedAuthority.principalId,
+								publishedAuthority.principalId,
+							);
+							return published;
+						}),
+					);
+					const events = projectTurnEvents(result.events, undefined);
+					return withCanonicalModel(
+						{
+							content: result.text,
+							...(events.length === 0 ? {} : { events }),
+						},
+						mapping.modelSelection,
+					);
+				}),
+			);
+		} catch (error) {
+			try {
+				if (canTransitionManagedLifecycleState(lifecycleEvidence.state, "uncertain"))
+					recordLifecycle(transitionManagedLifecycleEvidence(lifecycleEvidence, "uncertain"));
+				mappings.transitionOperation(turn.chatId, turn.userMessageId, "uncertain", hash);
+			} catch (persistenceError) {
+				throw new AggregateError([error, persistenceError], "Managed branch failure could not be recorded.");
+			}
+			throw error;
 		}
-		throw error;
+	} finally {
+		deadline.close();
 	}
 }
 

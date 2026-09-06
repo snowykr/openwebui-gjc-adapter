@@ -41,6 +41,7 @@ export interface CreateGjcRoutingLiveGatewayRunnerInput {
 	readonly mappings: SessionMappingStore;
 	readonly outbox?: OutboxStore;
 	readonly ownerUserId?: string;
+	readonly turnTimeoutMs?: number;
 	readonly requestedModelId?: (turn: LiveGatewayRunnerInput) => string;
 	readonly createNeutralModelReader?: (
 		turn: LiveGatewayRunnerInput,

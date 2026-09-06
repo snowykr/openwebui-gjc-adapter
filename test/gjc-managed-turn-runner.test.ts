@@ -228,6 +228,76 @@ describe("managed turn runner", () => {
 		expect(fake.closeCalls).toBe(0);
 	});
 
+	test.each(["model.set", "thinking.set", "turn.follow_up"] as const)(
+		"continuation preserves caller deadline at %s dispatch",
+		async operation => {
+			const fake = new RunnerRuntime();
+			const runner = createManagedGjcTurnRunner(fake.runtime, 5_000);
+			let admitted = true;
+			const failure = new Error("outer branch expired");
+			const request = fake.request.bind(fake);
+			fake.request = async (attachment, frame, options) => {
+				if (frame.operation === operation) admitted = false;
+				return request(attachment, frame, options);
+			};
+			await expect(
+				runner.continueSession({
+					...address(),
+					managedAuthority: authority,
+					modelSelection,
+					userMessageId: "outer-fence",
+					text: "must not dispatch after expiry",
+					operationId: "outer-fence",
+					rawFrameCursor: 0,
+					eventCursor: 0,
+					timeoutMs: 1_000,
+					beforeDispatch: () => {
+						if (!admitted) throw failure;
+					},
+				}),
+			).rejects.toThrow();
+			expect(fake.requests.some(frame => frame.operation === operation)).toBe(false);
+			expect(fake.requests.map(frame => frame.operation)).toEqual(
+				operation === "model.set"
+					? []
+					: operation === "thinking.set"
+						? ["model.set"]
+						: ["model.set", "thinking.set"],
+			);
+		},
+	);
+
+	test("continuation honors a smaller remaining caller budget than its configured default", async () => {
+		const fake = new RunnerRuntime();
+		const runner = createManagedGjcTurnRunner(fake.runtime, 5_000);
+		const gate = deferred<void>();
+		const request = fake.request.bind(fake);
+		fake.request = async (attachment, frame, options) => {
+			if (frame.operation === "model.set") await gate.promise;
+			return request(attachment, frame, options);
+		};
+		try {
+			await expect(
+				runner.continueSession({
+					...address(),
+					managedAuthority: authority,
+					modelSelection,
+					userMessageId: "remaining",
+					text: "must not dispatch",
+					operationId: "remaining",
+					rawFrameCursor: 0,
+					eventCursor: 0,
+					timeoutMs: 50,
+				}),
+			).rejects.toMatchObject({ code: "timeout" });
+			gate.resolve();
+			await new Promise(resolve => setTimeout(resolve, 0));
+			expect(fake.requests).toEqual([]);
+		} finally {
+			gate.resolve();
+		}
+	});
+
 	test("requires complete managed authority for lifecycle invocation", async () => {
 		const fake = new RunnerRuntime();
 		await expect(
