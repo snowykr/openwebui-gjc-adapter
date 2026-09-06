@@ -267,4 +267,144 @@ describe("session authority v3 full graph", () => {
 			expect(parseSessionAuthorityV3Document(JSON.stringify(document))).toBeUndefined();
 		}
 	});
+
+	test("rejects a foreign reservation-only authority and nested results or successors on reopen", () => {
+		const chatId = JSON.stringify(["tenant-a", "chat-a"]);
+		const bound = authority(chatId, "project-a", "reserved");
+		const root = mkdtempSync(join(tmpdir(), "gjc-v3-reservation-ownership-"));
+		const file = join(root, "authority.json");
+		const base = {
+			kind: SESSION_AUTHORITY_V3_KIND,
+			version: 3,
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+			mappings: [],
+			provisionalOperations: [
+				{
+					id: "reserve",
+					kind: "create",
+					state: "pending",
+					startedAt: timestamp,
+					chatId,
+					projectId: "project-a",
+					sessionId: "reserved",
+					managedAuthority: bound,
+				},
+			],
+		};
+		try {
+			writeFileSync(file, JSON.stringify(base));
+			const valid = new SessionV3FileBackedMappingStore(file);
+			expect(
+				valid.provisionalOperationScoped({ principalId: "tenant-a", chatId: "chat-a" }, "reserve")?.managedAuthority
+					?.principalId,
+			).toBe("tenant-a");
+			valid.close();
+			for (const scenario of [
+				"owner",
+				"successor-principal",
+				"successor-workspace",
+				"result-principal",
+				"result-workspace",
+			]) {
+				const value: Record<string, any> = structuredClone(base);
+				const operation = value.provisionalOperations[0];
+				if (scenario === "owner") operation.managedAuthority.principalId = "tenant-b";
+				else if (scenario.startsWith("successor"))
+					operation.acknowledgedSuccessor = {
+						sessionId: "next",
+						managedAuthority: {
+							...bound,
+							sessionId: "next",
+							...(scenario.endsWith("principal")
+								? { principalId: "tenant-b" }
+								: { canonicalWorkspace: "/foreign" }),
+						},
+					};
+				else {
+					operation.state = "complete";
+					operation.completedAt = timestamp;
+					operation.result = {
+						kind: "control",
+						assistantText: "",
+						managedAuthority: {
+							...bound,
+							...(scenario.endsWith("principal")
+								? { principalId: "tenant-b" }
+								: { canonicalWorkspace: "/foreign" }),
+						},
+						mapping: {
+							chatId,
+							projectId: "project-a",
+							sessionId: "reserved",
+							operationId: "reserve",
+							rawFrameCursor: 0,
+							eventCursor: 0,
+						},
+					};
+				}
+				writeFileSync(file, JSON.stringify(value));
+				expect(parseSessionAuthorityV3Document(JSON.stringify(value))).toBeUndefined();
+				expect(() => new SessionV3FileBackedMappingStore(file)).toThrow("not strict V3");
+			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("requires duplicate prior tombstone storage to match validated retained history", () => {
+		const value = clonedGolden();
+		value.mappings[0].reassignment.priorTombstone = structuredClone(
+			value.mappings[0].reassignment.sourceTombstone.prior,
+		);
+		expect(parseSessionAuthorityV3Document(JSON.stringify(value))).toBeDefined();
+		for (const mutate of [
+			(prior: Record<string, any>) => {
+				prior.managedAuthority.principalId = "foreign";
+			},
+			(prior: Record<string, any>) => {
+				prior.events = [{ type: "message", text: "forged history" }];
+			},
+			(prior: Record<string, any>) => {
+				prior.journal = [{ id: "forged", kind: "prompt", state: "pending", startedAt: timestamp }];
+			},
+		]) {
+			const corrupt = structuredClone(value);
+			mutate(corrupt.mappings[0].reassignment.priorTombstone);
+			expect(parseSessionAuthorityV3Document(JSON.stringify(corrupt))).toBeUndefined();
+		}
+	});
+
+	test("rejects a foreign successor workspace in a scoped reservation before persistence", () => {
+		const root = mkdtempSync(join(tmpdir(), "gjc-v3-provisional-successor-"));
+		const file = join(root, "authority.json");
+		const store = new SessionV3FileBackedMappingStore(file);
+		const scope = { principalId: "tenant-a", chatId: "chat-a" };
+		const bound = authority(scope.chatId, "project-a", "reserved");
+		try {
+			for (const canonicalWorkspace of ["/foreign", bound.canonicalWorkspace]) {
+				const operation = {
+					id: "reserve",
+					kind: "create" as const,
+					chatId: scope.chatId,
+					projectId: "project-a",
+					sessionId: "reserved",
+					managedAuthority: bound,
+					acknowledgedSuccessor: {
+						sessionId: "next",
+						managedAuthority: { ...bound, sessionId: "next", canonicalWorkspace },
+					},
+				};
+				if (canonicalWorkspace === "/foreign") {
+					expect(() => store.reserveProvisionalOperationScoped(scope, operation as never)).toThrow();
+					expect(store.provisionalOperationScoped(scope, operation.id)).toBeUndefined();
+				} else {
+					store.reserveProvisionalOperationScoped(scope, operation as never);
+					expect(parseSessionAuthorityV3Document(readFileSync(file, "utf8"))).toBeDefined();
+				}
+			}
+		} finally {
+			store.close();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
 });

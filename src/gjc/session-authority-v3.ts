@@ -259,6 +259,24 @@ export function isSessionAuthorityV3RelationallyValid(
 			})
 		)
 			return false;
+		const owner =
+			provisional.managedAuthority ??
+			(mapping?.projectId === provisional.projectId ? mapping.managedAuthority : undefined);
+		if (
+			(provisional.result !== undefined || provisional.acknowledgedSuccessor !== undefined) &&
+			(owner === undefined ||
+				!validateJournal(
+					{
+						chatId: provisional.chatId,
+						projectId: provisional.projectId,
+						sessionId: owner.sessionId,
+						managedAuthority: owner,
+					},
+					[provisional],
+					new Map(),
+				))
+		)
+			return false;
 		if (
 			mapping !== undefined &&
 			mapping.projectId !== provisional.projectId &&
@@ -512,6 +530,12 @@ function isReassignment(value: unknown, mapping: SessionAuthorityV3Mapping): val
 		return false;
 	if (value.state === "pending" && value.sourceTombstone !== undefined) return false;
 	if (value.state === "committed" && !isTombstone(value.sourceTombstone)) return false;
+	if (
+		isRecord(value.sourceTombstone) &&
+		value.priorTombstone !== undefined &&
+		!isDeepStrictEqual(value.priorTombstone, value.sourceTombstone.prior)
+	)
+		return false;
 	return (
 		(value.sourceTombstone === undefined ||
 			(isTombstone(value.sourceTombstone) &&
@@ -669,6 +693,7 @@ function validateAuthority(
 		]) &&
 		value.authorityEpoch === SESSION_AUTHORITY_V3_EPOCH &&
 		isNonEmptyString(value.principalId) &&
+		matchesCanonicalPrincipal(value.chatId, value.principalId) &&
 		value.projectId === identity.projectId &&
 		isNonEmptyString(value.canonicalWorkspace) &&
 		isAbsolute(value.canonicalWorkspace) &&
@@ -691,6 +716,23 @@ function isIdentity(value: Record<string, unknown>): boolean {
 		header.projectId === value.projectId &&
 		header.sessionId === value.sessionId
 	);
+}
+
+function matchesCanonicalPrincipal(chatId: unknown, principalId: string): boolean {
+	if (typeof chatId !== "string") return false;
+	try {
+		const scope: unknown = JSON.parse(chatId);
+		if (
+			!Array.isArray(scope) ||
+			scope.length !== 2 ||
+			!scope.every(value => typeof value === "string") ||
+			JSON.stringify(scope) !== chatId
+		)
+			return true;
+		return scope[0] === principalId;
+	} catch {
+		return true;
+	}
 }
 function isCursors(value: Record<string, unknown>): boolean {
 	return isNonnegativeSafeInteger(value.rawFrameCursor) && isNonnegativeSafeInteger(value.eventCursor);

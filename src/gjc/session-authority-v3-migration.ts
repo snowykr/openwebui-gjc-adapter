@@ -25,24 +25,6 @@ import {
 } from "./session-authority-v3";
 import type { ManagedTurnAuthority } from "./turn-runner";
 
-const LEGACY_FIELDS = new Set([
-	"attachment",
-	"descriptor",
-	"descriptorPath",
-	"descriptorStat",
-	"payloadDigest",
-	"expectedSessionId",
-	"expectedCwd",
-	"tmuxSocket",
-	"tmuxPane",
-	"tmuxPanePid",
-	"tmuxOwnershipTag",
-	"ownedAt",
-	"sessionFile",
-	"activeLeaf",
-	"recoveryAttachment",
-]);
-
 export interface SessionAuthorityV2Document {
 	readonly mappings: readonly SessionAuthorityRecord[];
 	readonly provisionalOperations?: readonly ProvisionalSessionOperation[];
@@ -209,7 +191,7 @@ function migrateMapping(
 		assistantText: mapping.assistantText,
 		events: mapping.events,
 		modelSelection: mapping.modelSelection,
-		observations: migrateObservations(mapping.observations),
+		observations: mapping.observations,
 		managedAuthority,
 		journal,
 		reassignment,
@@ -386,7 +368,7 @@ function migrateTombstone(
 		assistantText: tombstone.assistantText,
 		events: tombstone.events,
 		modelSelection: tombstone.modelSelection,
-		observations: migrateObservations(tombstone.observations),
+		observations: tombstone.observations,
 		managedAuthority,
 		journal,
 		retiredAt: tombstone.retiredAt,
@@ -470,11 +452,6 @@ function blocked(reasons: readonly string[]): SessionAuthorityV3MigrationBlocked
 }
 function sha256(bytes: Uint8Array): string {
 	return createHash("sha256").update(bytes).digest("hex");
-}
-
-function migrateObservations(value: SessionAuthorityRecord["observations"]): unknown {
-	if (value === undefined) return undefined;
-	return Object.fromEntries(Object.entries(value).filter(([key]) => !LEGACY_FIELDS.has(key)));
 }
 
 function strip(value: unknown): unknown {

@@ -45,7 +45,7 @@ function v2Graph(): SessionAuthorityV2Document {
 				eventCursor: 2,
 				operationId: "op-a",
 				assistantText: "answer",
-				observations: { preserved: true, descriptor: "removed" },
+				observations: { preserved: true },
 				attachment: { descriptor: "/legacy/session.json" },
 				journal: [
 					{
@@ -236,10 +236,25 @@ describe("SessionAuthority V2 to V3 graph migration", () => {
 		expect(duplicate).toEqual(expect.objectContaining({ status: "blocked" }));
 	});
 
-	test("removes every legacy attachment, descriptor, and tmux field while retaining observations", () => {
+	test("removes owned legacy authority fields while retaining observations", () => {
 		const migrated = migrateSessionAuthorityV2ToV3(v2Graph(), fullBindings());
 		if (migrated.status !== "ready") throw new Error(migrated.reasons.join("\n"));
 		expect(containsLegacyField(migrated.document)).toBe(false);
 		expect(migrated.document.mappings[0].observations).toEqual({ preserved: true });
+	});
+
+	test.each(["mapping", "tombstone"] as const)("blocks opaque legacy-named %s observations without loss", target => {
+		const source = structuredClone(v2Graph());
+		const owner = target === "mapping" ? source.mappings[0] : source.mappings[0].reassignment!.sourceTombstone!;
+		Object.assign(owner, {
+			observations: {
+				descriptor: { name: "customer-schema" },
+				attachment: { filename: "report.csv" },
+				preserved: true,
+			},
+		});
+		const before = structuredClone(source);
+		expect(migrateSessionAuthorityV2ToV3(source, fullBindings())).toMatchObject({ status: "blocked" });
+		expect(source).toEqual(before);
 	});
 });

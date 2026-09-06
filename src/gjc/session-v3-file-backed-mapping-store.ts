@@ -141,11 +141,8 @@ class V3FileSessionAuthority extends SessionAuthority {
 		result?: SessionOperationResult,
 	): SessionAuthorityRecord {
 		return this.mutate(() => {
-			const authority = this.get(chatId)?.managedAuthority;
 			const durableResult =
-				result === undefined || result.managedAuthority !== undefined || authority === undefined
-					? result
-					: { ...result, managedAuthority: authority };
+				result === undefined ? undefined : normalizeResultAuthority(result, this.get(chatId)?.managedAuthority);
 			return super.transitionOperation(chatId, operationId, state, detail, durableResult);
 		});
 	}
@@ -157,12 +154,13 @@ class V3FileSessionAuthority extends SessionAuthority {
 		result: SessionOperationResult,
 	): SessionAuthorityRecord {
 		return this.mutate(() => {
-			const durableResult =
-				result.managedAuthority === undefined && mapping.managedAuthority !== undefined
-					? { ...result, managedAuthority: mapping.managedAuthority }
-					: result;
+			const durableMapping = {
+				...mapping,
+				managedAuthority: authorityV3(mapping.managedAuthority, `mapping ${chatId}`),
+			};
+			const durableResult = normalizeResultAuthority(result, durableMapping.managedAuthority);
 			super.transitionOperation(chatId, operationId, "complete", detail, durableResult);
-			return super.upsert(mapping);
+			return super.upsert(durableMapping);
 		});
 	}
 	override beginOperation(
@@ -468,9 +466,24 @@ function normalizePublishedTombstone(tombstone: SessionAuthorityTombstone): Sess
 	};
 }
 
+function normalizeResultAuthority(
+	result: SessionOperationResult,
+	mappingAuthority: ManagedTurnAuthority | undefined,
+): SessionOperationResult {
+	return {
+		...result,
+		managedAuthority: authorityV3(
+			result.managedAuthority === undefined ? mappingAuthority : result.managedAuthority,
+			"operation result",
+		),
+	};
+}
+
 function authorityV3(value: unknown, context: string): ManagedTurnAuthorityV3 {
 	if (typeof value !== "object" || value === null) throw new Error(`V3 managed authority is required for ${context}.`);
-	const authority = value as Omit<ManagedTurnAuthorityV3, "authorityEpoch">;
+	const authority = value as ManagedTurnAuthority & { readonly authorityEpoch?: unknown };
+	if (authority.authorityEpoch !== undefined && authority.authorityEpoch !== SESSION_AUTHORITY_V3_EPOCH)
+		throw new Error(`Invalid V3 authority schema epoch for ${context}.`);
 	if (typeof authority.epoch !== "string" || authority.epoch.length === 0)
 		throw new Error(`Managed runtime epoch is required for ${context}.`);
 	return {

@@ -502,6 +502,122 @@ describe("SessionV3FileBackedMappingStore", () => {
 		}
 	});
 
+	test.each([
+		["prompt", "turn", "mapping"],
+		["close", "close", "mapping"],
+		["gate", "control", "mapping"],
+		["prompt", "turn", "transition"],
+		["close", "close", "transition"],
+		["gate", "control", "transition"],
+	] as const)("normalizes schema metadata for repeated %s %s completion via %s", (kind, resultKind, method) => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-v3-completion-schema-"));
+		const filePath = join(directory, "authority.json");
+		const scope = { principalId: "user-1", chatId: "chat-1" };
+		const operationId = `${kind}-1`;
+		const { authorityEpoch: _authorityEpoch, ...runtimeFields } = authority();
+		const runtimeAuthority = { ...runtimeFields, epoch: "runtime-9", requestKey: "request-runtime" };
+		const canonicalAuthority = { ...runtimeAuthority, authorityEpoch: SESSION_AUTHORITY_V3_EPOCH };
+		const result = { ...completionResult(operationId, resultKind), managedAuthority: runtimeAuthority };
+		const inputMapping = {
+			...managedMapping(),
+			operationId: kind === "close" ? "initial" : operationId,
+			assistantText: result.assistantText,
+			events: result.events,
+			managedAuthority: runtimeAuthority,
+		};
+		let store = new SessionV3FileBackedMappingStore(filePath);
+		const complete = (managedAuthority: typeof runtimeAuthority) => {
+			if (method === "mapping") {
+				store.completeOperationWithMappingScoped(
+					scope,
+					operationId,
+					"request-hash",
+					{ ...inputMapping, managedAuthority },
+					resultKind,
+					result.gate,
+				);
+			} else {
+				store.transitionOperationScoped(scope, operationId, "complete", "request-hash", {
+					...result,
+					managedAuthority,
+				});
+			}
+		};
+		try {
+			store.setScoped(scope, { ...managedMapping(), managedAuthority: runtimeAuthority });
+			store.beginOperationScoped(scope, { id: operationId, kind, detail: "request-hash" });
+			const pending = store.operationScoped(scope, operationId);
+			const pendingBytes = readFileSync(filePath, "utf8");
+			for (const authorityEpoch of ["managed/invalid", null, 3]) {
+				const invalid = { ...runtimeAuthority, authorityEpoch };
+				expect(() => complete(invalid)).toThrow("Invalid V3 authority schema epoch");
+				expect(store.operationScoped(scope, operationId)).toEqual(pending);
+				expect(readFileSync(filePath, "utf8")).toBe(pendingBytes);
+			}
+			complete(runtimeAuthority);
+			const original = store.operationScoped(scope, operationId);
+			if (original?.completedAt === undefined) throw new Error("expected immutable completion");
+			expect(original.result?.managedAuthority).toEqual(canonicalAuthority);
+			expect(original.result?.events).toEqual(result.events);
+			expect(original.result?.gate).toEqual(result.gate);
+			const originalMapping = store.getScoped(scope);
+			const bytes = readFileSync(filePath, "utf8");
+			for (const reopen of [false, true]) {
+				if (reopen) {
+					store.close();
+					store = new SessionV3FileBackedMappingStore(filePath);
+				}
+				setSystemTime(new Date(Date.parse(original.completedAt) + 1_000));
+				try {
+					for (const proof of [runtimeAuthority, canonicalAuthority, runtimeAuthority]) complete(proof);
+				} finally {
+					setSystemTime();
+				}
+				expect(store.operationScoped(scope, operationId)).toEqual(original);
+				expect(store.getScoped(scope)).toEqual(originalMapping);
+				expect(readFileSync(filePath, "utf8")).toBe(bytes);
+				for (const changed of [
+					{ principalId: "foreign" },
+					{ projectId: "other-project" },
+					{ chatId: "other-chat" },
+					{ sessionId: "other-session" },
+					{ canonicalWorkspace: "/workspace/other" },
+					{ generation: 2 },
+					{ leaseId: "other-lease" },
+					{ epoch: "runtime-10" },
+					{ requestKey: "other-request" },
+					{ authorityEpoch: "managed/invalid" },
+				]) {
+					expect(() => complete({ ...runtimeAuthority, ...changed })).toThrow();
+					expect(store.operationScoped(scope, operationId)).toEqual(original);
+					expect(store.getScoped(scope)).toEqual(originalMapping);
+					expect(readFileSync(filePath, "utf8")).toBe(bytes);
+				}
+				if (kind === "close") {
+					expect(replayCloseOperation(operationId, original.result, "initial")).toEqual({ status: "closed" });
+					expect(() =>
+						store.completeOperationWithMappingScoped(
+							scope,
+							operationId,
+							"request-hash",
+							{ ...inputMapping, operationId, managedAuthority: canonicalAuthority },
+							"close",
+						),
+					).toThrow("Completed session operations are immutable");
+					expect(store.operationScoped(scope, operationId)).toEqual(original);
+					expect(readFileSync(filePath, "utf8")).toBe(bytes);
+				}
+			}
+			store.close();
+			store = new SessionV3FileBackedMappingStore(filePath);
+			expect(store.operationScoped(scope, operationId)).toEqual(original);
+			expect(readFileSync(filePath, "utf8")).toBe(bytes);
+		} finally {
+			store.close();
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
 	test("rejects close generation rebinding through atomic mapping completion after reopen", () => {
 		const directory = mkdtempSync(join(tmpdir(), "gjc-v3-close-generation-"));
 		const filePath = join(directory, "authority.json");
