@@ -13,14 +13,14 @@
       "bun",
       "scripts/gjc-release-compat.ts",
       "--root",
-      "/tmp/gjc-sdk-0164-compat.WRUU4I",
+      "/tmp/gjc-sdk-0164-final.fdfyei",
       "--gjc",
       "/home/snowy/coding/openwebui-gjc-adapter/node_modules/.bin/gjc"
     ],
     "exitCode": 0
   },
-  "startedAt": "2026-09-06T10:09:27.087Z",
-  "finishedAt": "2026-09-06T10:09:42.737Z",
+  "startedAt": "2026-09-06T10:43:10.448Z",
+  "finishedAt": "2026-09-06T10:43:28.672Z",
   "observedCliVersion": "0.16.4",
   "operations": [
     "session.create",
@@ -69,13 +69,13 @@
   "close": {
     "sdkLogicalClose": {
       "phase": "sdkLogicalClose",
-      "targetSessionId": "32475258-757f-4d8a-b407-deecba6e3b62",
+      "targetSessionId": "248d19db-ef9f-4280-a58f-d30c21d6c2d4",
       "generation": 1,
       "acknowledgement": {
         "ok": true,
         "operation": "session.close",
         "result": {
-          "sessionId": "32475258-757f-4d8a-b407-deecba6e3b62",
+          "sessionId": "248d19db-ef9f-4280-a58f-d30c21d6c2d4",
           "note": "Endpoint close was unreachable; sent SIGTERM to the durably identified session process."
         }
       },
@@ -95,13 +95,13 @@
     "retired": [
       {
         "phase": "sdkLogicalClose",
-        "targetSessionId": "338416b6-2301-40c9-8194-e3f7b4714ad9",
+        "targetSessionId": "6833c186-8aeb-4f3e-886f-db46f2275cb9",
         "generation": 1,
         "acknowledgement": {
           "ok": true,
           "operation": "session.close",
           "result": {
-            "sessionId": "338416b6-2301-40c9-8194-e3f7b4714ad9",
+            "sessionId": "6833c186-8aeb-4f3e-886f-db46f2275cb9",
             "note": "Endpoint close was unreachable; sent SIGTERM to the durably identified session process."
           }
         },
@@ -117,13 +117,13 @@
       },
       {
         "phase": "sdkLogicalClose",
-        "targetSessionId": "25bc86ef-04f4-4108-9b00-7bd295e59376",
+        "targetSessionId": "53b4e8d6-e8cb-4326-bc55-4b2878611995",
         "generation": 1,
         "acknowledgement": {
           "ok": true,
           "operation": "session.close",
           "result": {
-            "sessionId": "25bc86ef-04f4-4108-9b00-7bd295e59376",
+            "sessionId": "53b4e8d6-e8cb-4326-bc55-4b2878611995",
             "note": "Endpoint close was unreachable; sent SIGTERM to the durably identified session process."
           }
         },
@@ -140,13 +140,13 @@
     ]
   },
   "sourceReport": {
-    "path": "/tmp/gjc-sdk-0164-compat.WRUU4I/operation-report.json",
-    "sha256": "7cba368ac8600ac08717d973afcedfeae98f7bbdb6d3107411c4f0899a53e898"
+    "path": "/tmp/gjc-sdk-0164-final.fdfyei/operation-report.json",
+    "sha256": "bce637f961d897e9534dec8287206b2ce3b0322003a2d26cb54261c10d460503"
   },
   "limitations": [
     "Hermetic local HTTP provider, not a live OpenWebUI browser run.",
     "Harness closes use session-ID-only targets inside an exclusively owned isolated workspace. Positive retirement receipts do not prove remotely generation-fenced close against replacement races. SDK 0.16.4 requires endpointGeneration plus endpointIncarnation for exact close, but its public Router/lifecycle binding surfaces do not expose the needed opaque incarnation; production exact remote close remains unavailable.",
     "SDK abort reported uncertain/worker_unsettled; this report proves replay/correlated terminal observation, not synchronous worker termination.",
-    "Legacy bridge removal and canonical V3 store correctness are separate incomplete work."
+    "Legacy bridge removal and aggregate cutover remain incomplete; this SDK report is not evidence of adapter migration completion."
   ]
 }
