@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { ManagedOperationDeadline } from "../gjc/managed-operation-deadline";
 import type { ManagedSdkAttachment, ManagedSdkRuntime, TenantSessionKey } from "../gjc/managed-sdk-runtime";
 import { GjcTurnCancelledError, type ManagedTurnAuthority } from "../gjc/turn-runner";
 
@@ -45,13 +46,21 @@ export class ManagedSuccessorUncertainError extends Error {
 	}
 }
 
-export function createManagedSuccessorFlow(runtime: ManagedSdkRuntime): ManagedSuccessorFlow {
+export function createManagedSuccessorFlow(
+	runtime: ManagedSdkRuntime,
+	defaultTimeoutMs = 30_000,
+): ManagedSuccessorFlow {
 	return {
 		async fork(input) {
 			assertSuccessorAuthority(input.source, input.target);
 			throwIfAborted(input.signal);
 			const source = tenant(input.source);
 			const operationHash = successorHash(source, input.target);
+			const deadline = new ManagedOperationDeadline(input.timeoutMs ?? defaultTimeoutMs, "session.fork");
+			const step = <T>(effect: () => Promise<T>): Promise<T> => {
+				deadline.remaining();
+				return deadline.wait(effect());
+			};
 			let invoked = false;
 			let acknowledged = false;
 			let returnedTarget: TenantSessionKey | undefined;
@@ -59,22 +68,29 @@ export function createManagedSuccessorFlow(runtime: ManagedSdkRuntime): ManagedS
 			let acknowledgementPending = false;
 			try {
 				// Reconciliation plus acquire re-proves source registration, currentness, and tenant fencing.
-				await runtime.reconcile();
-				assertExactAttachment(await runtime.acquireAttachment(source), source, "source");
+				await step(() => runtime.reconcile(deadline.remaining()));
+				assertExactAttachment(
+					await step(() => runtime.acquireAttachment(source, deadline.remaining())),
+					source,
+					"source",
+				);
 				throwIfAborted(input.signal);
-				await input.onInvoking?.();
+				await step(async () => input.onInvoking?.());
 				throwIfAborted(input.signal);
+				deadline.remaining();
 				invoked = true;
-				const outcome = await runtime.forkLifecycleSession(source, {
-					actor: { namespace: "openwebui-gjc-adapter", id: input.source.principalId },
-					capability: "session.fork",
-					requestKey: input.source.requestKey,
-					target: {
-						sourceSessionId: source.sessionId,
-						cwd: input.target.canonicalWorkspace,
-					},
-					timeoutMs: input.timeoutMs,
-				});
+				const outcome = await step(() =>
+					runtime.forkLifecycleSession(source, {
+						actor: { namespace: "openwebui-gjc-adapter", id: input.source.principalId },
+						capability: "session.fork",
+						requestKey: input.source.requestKey,
+						target: {
+							sourceSessionId: source.sessionId,
+							cwd: input.target.canonicalWorkspace,
+						},
+						timeoutMs: deadline.remaining(),
+					}),
+				);
 				if (!outcome.ok || outcome.operation !== "session.fork") throw new Error("Managed session.fork failed.");
 				acknowledged = true;
 				returnedTarget = tenantFromFork(input.target, outcome);
@@ -82,17 +98,20 @@ export function createManagedSuccessorFlow(runtime: ManagedSdkRuntime): ManagedS
 					throw new ManagedSuccessorUncertainError("Managed fork acknowledgement lacks a target identity.");
 				acknowledgedAuthority = managedSuccessorAuthority(input.source, returnedTarget);
 				acknowledgementPending = true;
-				await input.onAcknowledged?.({ ...acknowledgedAuthority });
+				await step(async () => input.onAcknowledged?.({ ...acknowledgedAuthority! }));
 				acknowledgementPending = false;
 				// An abort after lifecycle invocation is ambiguous even when the fork later acknowledges.
 				if (input.signal?.aborted) throw new GjcTurnCancelledError();
-				if (input.lifecycleOperation === undefined) await runtime.registerLifecycleTenant(returnedTarget);
+				if (input.lifecycleOperation === undefined)
+					await step(() => runtime.registerLifecycleTenant(returnedTarget!, deadline.remaining()));
 				const successor =
 					input.lifecycleOperation === undefined
-						? await proveTarget(runtime, returnedTarget)
-						: await runtime.proveLifecycleTenant(returnedTarget, input.lifecycleOperation);
+						? await proveTarget(runtime, returnedTarget, deadline)
+						: await step(() =>
+								runtime.proveLifecycleTenant(returnedTarget!, input.lifecycleOperation!, deadline.remaining()),
+							);
 				throwIfAborted(input.signal);
-				await input.publish(successor);
+				await step(async () => input.publish(successor));
 				return {
 					successor,
 					managedAuthority: acknowledgedAuthority,
@@ -111,7 +130,10 @@ export function createManagedSuccessorFlow(runtime: ManagedSdkRuntime): ManagedS
 					input,
 					error,
 					!acknowledged || error instanceof GjcTurnCancelledError,
+					deadline,
 				);
+			} finally {
+				deadline.close();
 			}
 		},
 	};
@@ -161,11 +183,15 @@ function assertSuccessorAuthority(
 	if (source.requestKey !== target.requestKey) throw new Error("Managed successor request authority changed.");
 }
 
-async function proveTarget(runtime: ManagedSdkRuntime, target: TenantSessionKey): Promise<ManagedSdkAttachment> {
-	await runtime.reconcile();
-	const attachment = await runtime.acquireAttachment(target);
+async function proveTarget(
+	runtime: ManagedSdkRuntime,
+	target: TenantSessionKey,
+	deadline: ManagedOperationDeadline,
+): Promise<ManagedSdkAttachment> {
+	await deadline.wait(runtime.reconcile(deadline.remaining()));
+	const attachment = await deadline.wait(runtime.acquireAttachment(target, deadline.remaining()));
 	assertExactAttachment(attachment, target, "target");
-	const status = await runtime.generationStatus(target);
+	const status = await deadline.wait(runtime.generationStatus(target, deadline.remaining()));
 	if (status.status !== "current") throw new Error("Managed successor target generation is not current.");
 	return attachment;
 }
@@ -212,6 +238,7 @@ async function cleanupOrThrow(
 	input: ManagedSuccessorInput,
 	cause: unknown,
 	invocationUncertain: boolean,
+	deadline: ManagedOperationDeadline,
 ): Promise<never> {
 	if (target?.sessionId === input.source.sessionId)
 		throw new ManagedSuccessorUncertainError(
@@ -223,18 +250,22 @@ async function cleanupOrThrow(
 			cause,
 		});
 	try {
-		const outcome = await runtime.closeLifecycleSession(target, {
-			actor: { namespace: "openwebui-gjc-adapter", id: input.source.principalId },
-			capability: "session.close",
-			requestKey: input.source.requestKey,
-			target: { sessionId: target.sessionId, endpointGeneration: target.generation },
-			timeoutMs: input.timeoutMs,
-		});
+		const timeoutMs = deadline.remaining();
+		const outcome = await deadline.wait(
+			runtime.closeLifecycleSession(target, {
+				actor: { namespace: "openwebui-gjc-adapter", id: input.source.principalId },
+				capability: "session.close",
+				requestKey: input.source.requestKey,
+				target: { sessionId: target.sessionId, endpointGeneration: target.generation },
+				timeoutMs,
+			}),
+		);
 		if (!outcome.ok || outcome.operation !== "session.close" || outcome.result.sessionId !== target.sessionId)
 			throw new Error("Managed successor cleanup lacks a matching successful close acknowledgement.");
-		await runtime.reconcile();
-		const status = await runtime.generationStatus(target);
+		await deadline.wait(runtime.reconcile(deadline.remaining()));
+		const status = await deadline.wait(runtime.generationStatus(target, deadline.remaining()));
 		if (status.status !== "retired") throw new Error("Failed managed successor cleanup is not retired.");
+		deadline.remaining();
 		runtime.unregisterTenant(target);
 	} catch (cleanup) {
 		throw new ManagedSuccessorUncertainError("Failed managed successor cleanup is uncertain.", {

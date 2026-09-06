@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import type { lifecycle, router } from "@gajae-code/coding-agent/sdk";
 import { type ManagedSdkAttachment, ManagedSdkRuntime, type TenantSessionKey } from "../src/gjc/managed-sdk-runtime";
 import type { ManagedTurnAuthority } from "../src/gjc/turn-runner";
@@ -48,6 +48,113 @@ const successorAuthority: ManagedTurnAuthority = {
 };
 
 describe("managed successor with an explicit runtime boundary fake", () => {
+	test.each([
+		"reconcile",
+		"acquire:source-session:4",
+		"invoking",
+		"fork",
+		"acknowledge",
+		"register",
+		"adopt",
+		"status:forked-session:9",
+		"publish",
+		"close",
+	] as const)("a hanging %s cannot renew the successor budget or start later effects", async phase => {
+		const fake = new FakeRuntime();
+		let release!: () => void;
+		const gate = new Promise<void>(resolve => {
+			release = resolve;
+		});
+		let entered!: () => void;
+		const admission = new Promise<void>(resolve => {
+			entered = resolve;
+		});
+		const wait = async (current: string) => {
+			if (current === phase) {
+				entered();
+				await gate;
+			}
+		};
+		fake.afterPhase = wait;
+		const pending = createManagedSuccessorFlow(fake.runtime, 100)
+			.fork({
+				source,
+				target,
+				...(phase === "adopt"
+					? {
+							lifecycleOperation: {
+								operationId: "branch",
+								requestKey: source.requestKey,
+								payloadHash: "a".repeat(64),
+							},
+						}
+					: {}),
+				onInvoking: () => wait("invoking"),
+				onAcknowledged: () => wait("acknowledge"),
+				publish: async () => {
+					if (phase === "close") throw new Error("publication failed");
+					await wait("publish");
+				},
+			})
+			.catch(error => error);
+		await admission;
+		const error = await pending;
+		expect(error).toBeInstanceOf(Error);
+		if (phase === "reconcile" || phase === "acquire:source-session:4" || phase === "invoking") {
+			expect(error.code).toBe("timeout");
+			expect(fake.forks).toHaveLength(0);
+		} else expect(error).toBeInstanceOf(ManagedSuccessorUncertainError);
+		expect(fake.closeTargets).toHaveLength(phase === "close" ? 1 : 0);
+		expect(fake.unregistered).toEqual([]);
+		const effects = [...fake.order];
+		release();
+		await new Promise(resolve => setTimeout(resolve, 0));
+		expect(fake.order).toEqual(effects);
+	});
+
+	test("source admission and target proof spend one budget before publication or cleanup", async () => {
+		const fake = new FakeRuntime();
+		let now = Date.now();
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		fake.afterPhase = async () => {
+			now += 200;
+		};
+		let published = false;
+		try {
+			const error = await createManagedSuccessorFlow(fake.runtime, 1_000)
+				.fork({
+					source,
+					target,
+					onAcknowledged: () => {
+						now += 200;
+					},
+					publish: () => {
+						published = true;
+					},
+				})
+				.catch(error => error);
+			expect(error).toBeInstanceOf(ManagedSuccessorUncertainError);
+			expect(error.acknowledgedAuthority).toEqual(successorAuthority);
+			expect(fake.forks[0]!.timeoutMs).toBe(600);
+			expect(published).toBe(false);
+			expect(fake.closeTargets).toEqual([]);
+			expect(fake.order).not.toContain("status:forked-session:9");
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
+	test.each([0, -1, 1.5, Infinity, 2_147_483_648])(
+		"invalid successor budget %s rejects before source admission",
+		async timeoutMs => {
+			const fake = new FakeRuntime();
+			await expect(
+				createManagedSuccessorFlow(fake.runtime).fork({ source, target, timeoutMs, publish: () => undefined }),
+			).rejects.toBeInstanceOf(TypeError);
+			expect(fake.order).toEqual([]);
+		},
+	);
+
 	test("forks with stable actor/request key/hash and publishes only after target proof", async () => {
 		const fake = new FakeRuntime();
 		const published: string[] = [];
@@ -91,8 +198,10 @@ describe("managed successor with an explicit runtime boundary fake", () => {
 				sourceSessionId: source.sessionId,
 				cwd: target.canonicalWorkspace,
 			},
-			timeoutMs: undefined,
+			timeoutMs: expect.any(Number),
 		});
+		expect(fake.forks[0]!.timeoutMs).toBeGreaterThan(0);
+		expect(fake.forks[0]!.timeoutMs).toBeLessThanOrEqual(30_000);
 	});
 
 	test("keeps repeated same-key request payloads identical without sending the local operation hash", async () => {
@@ -102,7 +211,13 @@ describe("managed successor with an explicit runtime boundary fake", () => {
 		const second = await flow.fork({ source, target, publish: () => undefined });
 		expect(first.operationHash).toBe(second.operationHash);
 		expect(fake.forks.map(request => request.requestKey)).toEqual([source.requestKey, source.requestKey]);
-		expect(fake.forks[1]).toEqual(fake.forks[0]);
+		const { timeoutMs: firstBudget, ...firstRequest } = fake.forks[0]!;
+		const { timeoutMs: secondBudget, ...secondRequest } = fake.forks[1]!;
+		expect(secondRequest).toEqual(firstRequest);
+		for (const budget of [firstBudget, secondBudget]) {
+			expect(budget).toBeGreaterThan(0);
+			expect(budget).toBeLessThanOrEqual(30_000);
+		}
 		expect(fake.forks[0]?.target).not.toHaveProperty("operationHash");
 		expect(fake.forks[0]?.target).not.toHaveProperty("sourceGeneration");
 	});
@@ -591,14 +706,17 @@ class FakeRuntime {
 	forkFailure: Error | undefined;
 	closeOutcome: CloseOutcome = { ok: true, operation: "session.close", result: { sessionId: successor.sessionId } };
 	sourceFence = true;
+	afterPhase: ((phase: string) => Promise<void>) | undefined;
 	get runtime(): ManagedSdkRuntime {
 		return this as unknown as ManagedSdkRuntime;
 	}
 	async reconcile() {
 		this.order.push("reconcile");
+		await this.afterPhase?.("reconcile");
 	}
 	async acquireAttachment(key: TenantSessionKey) {
 		this.order.push(`acquire:${key.sessionId}:${key.generation}`);
+		await this.afterPhase?.(`acquire:${key.sessionId}:${key.generation}`);
 		if (key.sessionId === source.sessionId && !this.sourceFence) throw new Error("source fence was lost");
 		const registered =
 			key.sessionId === source.sessionId ? sourceTenant : this.registered.get(`${key.sessionId}:${key.generation}`);
@@ -608,6 +726,7 @@ class FakeRuntime {
 	}
 	async generationStatus(key: { sessionId: string; generation: number }) {
 		this.order.push(`status:${key.sessionId}:${key.generation}`);
+		await this.afterPhase?.(`status:${key.sessionId}:${key.generation}`);
 		return { status: key.sessionId === source.sessionId ? "current" : this.targetStatus };
 	}
 	registerTenant(key: TenantSessionKey) {
@@ -623,6 +742,12 @@ class FakeRuntime {
 	}
 	async registerLifecycleTenant(key: TenantSessionKey) {
 		this.registerTenant(key);
+		await this.afterPhase?.("register");
+		return this.attachmentFor(key);
+	}
+	async proveLifecycleTenant(key: TenantSessionKey) {
+		this.registerTenant(key);
+		await this.afterPhase?.("adopt");
 		return this.attachmentFor(key);
 	}
 	private attachmentFor(key: TenantSessionKey): ManagedSdkAttachment {
@@ -649,6 +774,7 @@ class FakeRuntime {
 		expect(tenant).toEqual(sourceTenant);
 		this.order.push("fork");
 		this.forks.push(request);
+		await this.afterPhase?.("fork");
 		this.afterFork?.();
 		if (this.forkFailure !== undefined) throw this.forkFailure;
 		return {
@@ -666,6 +792,7 @@ class FakeRuntime {
 		this.order.push("close");
 		this.closeTargets.push(request.target);
 		if (this.targetStatus !== "unknown") this.targetStatus = "retired";
+		await this.afterPhase?.("close");
 		return this.closeOutcome;
 	}
 }

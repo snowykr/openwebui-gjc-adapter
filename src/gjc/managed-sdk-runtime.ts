@@ -489,23 +489,28 @@ export class ManagedSdkRuntime {
 	}
 
 	/** Reconciles a credential-free lifecycle identity before exposing its exact tenant authority. */
-	async registerLifecycleTenant(key: TenantSessionKey): Promise<ManagedSdkAttachment> {
+	async registerLifecycleTenant(key: TenantSessionKey, timeoutMs?: number): Promise<ManagedSdkAttachment> {
 		assertTenantKey(key);
-		this.registerTenant(key);
-		await this.reconcile();
-		const attachment = await this.acquireAttachment(key);
-		if (!attachment.isCurrent()) throw new Error("Lifecycle tenant attachment is no longer current.");
-		return attachment;
+		key = copyTenantKey(key);
+		return this.#track(timeoutMs, async budget => {
+			this.registerTenant(key);
+			await this.reconcile(budget.remaining());
+			const attachment = await this.acquireAttachment(key, budget.remaining());
+			budget.remaining();
+			if (!attachment.isCurrent()) throw new Error("Lifecycle tenant attachment is no longer current.");
+			return attachment;
+		});
 	}
 
 	/** Exact lifecycle proof is not active routing authority; the owner supplies durable purpose evidence. */
 	async proveLifecycleTenant(
 		key: TenantSessionKey,
 		operation: ManagedSdkLifecycleOperation,
+		timeoutMs?: number,
 	): Promise<ManagedSdkAttachment> {
 		const access: ManagedSdkAccess = Object.freeze({ ...lifecycleOperation(operation), kind: "adoption-proof" });
 		key = copyTenantKey(key);
-		return this.#track(undefined, async budget => {
+		return this.#track(timeoutMs, async budget => {
 			this.registerTenant(key);
 			const registration = this.#registrations.get(generationIdentity(key));
 			await this.#assertAuthorized(key, false, false, access);
@@ -622,9 +627,9 @@ export class ManagedSdkRuntime {
 	}
 
 	/** Serializes explicit reconciliation without exposing Router implementation state. */
-	reconcile(): Promise<void> {
+	reconcile(timeoutMs?: number): Promise<void> {
 		const previous = this.#reconcileTail;
-		const next = this.#track(undefined, async budget => {
+		const next = this.#track(timeoutMs, async budget => {
 			await previous;
 			budget.remaining();
 			this.#assertOwner();
@@ -634,12 +639,20 @@ export class ManagedSdkRuntime {
 		return next;
 	}
 
-	async acquireAttachment(key: TenantSessionKey): Promise<ManagedSdkAttachment> {
+	async acquireAttachment(key: TenantSessionKey, timeoutMs?: number): Promise<ManagedSdkAttachment> {
 		key = copyTenantKey(key);
-		await this.#assertAuthorized(key, this.#state === "starting" && this.#bootstrapAdmission);
-		const token = this.#attachmentToken(key);
-		this.#activeTokens.add(token);
-		return token;
+		const bootstrap = this.#state === "starting" && this.#bootstrapAdmission;
+		return this.#track(
+			timeoutMs,
+			async budget => {
+				await this.#assertAuthorized(key, bootstrap);
+				budget.remaining();
+				const token = this.#attachmentToken(key);
+				this.#activeTokens.add(token);
+				return token;
+			},
+			bootstrap,
+		);
 	}
 
 	#attachmentToken(key: TenantSessionKey): ManagedSdkAttachment {
@@ -703,25 +716,30 @@ export class ManagedSdkRuntime {
 		});
 	}
 
-	async generationStatus(key: TenantSessionKey): Promise<router.SessionGenerationStatus> {
-		return this.#generationStatus(key, ACTIVE_ACCESS);
+	async generationStatus(key: TenantSessionKey, timeoutMs?: number): Promise<router.SessionGenerationStatus> {
+		return this.#generationStatus(key, ACTIVE_ACCESS, timeoutMs);
 	}
 
 	async retirementGenerationStatus(
 		key: TenantSessionKey,
 		operation: ManagedSdkLifecycleOperation,
+		timeoutMs?: number,
 	): Promise<router.SessionGenerationStatus> {
 		const access: ManagedSdkAccess = Object.freeze({
 			...lifecycleOperation(operation),
 			kind: "retirement",
 			action: "generation-status",
 		});
-		return this.#generationStatus(key, access);
+		return this.#generationStatus(key, access, timeoutMs);
 	}
 
-	async #generationStatus(key: TenantSessionKey, access: ManagedSdkAccess): Promise<router.SessionGenerationStatus> {
+	async #generationStatus(
+		key: TenantSessionKey,
+		access: ManagedSdkAccess,
+		timeoutMs?: number,
+	): Promise<router.SessionGenerationStatus> {
 		key = copyTenantKey(key);
-		return this.#track(undefined, async budget => {
+		return this.#track(timeoutMs, async budget => {
 			const registration = this.#registrations.get(generationIdentity(key));
 			await this.#assertAuthorized(key, false, false, access);
 			budget.remaining();
@@ -948,10 +966,10 @@ export class ManagedSdkRuntime {
 		);
 	}
 
-	#track<T>(timeout: unknown, work: (budget: CallBudget) => Promise<T>): Promise<T> {
+	#track<T>(timeout: unknown, work: (budget: CallBudget) => Promise<T>, bootstrap = false): Promise<T> {
 		let timeoutMs: number;
 		try {
-			this.#assertOwner();
+			this.#assertOwner(bootstrap);
 			timeoutMs = finiteTimeout(timeout, DEFAULT_OPERATION_TIMEOUT_MS);
 		} catch (error) {
 			return Promise.reject(error);
@@ -988,7 +1006,7 @@ export class ManagedSdkRuntime {
 		const result = Promise.race([
 			Promise.resolve().then(() => {
 				budget.remaining();
-				this.#assertOwner();
+				this.#assertOwner(bootstrap);
 				return work(budget);
 			}),
 			interrupted,

@@ -26,6 +26,7 @@
 
 ### Fixed
 
+- Bounded successor source admission, lifecycle invocation, acknowledgement, target proof, publication callback, and cleanup under one deadline. Propagated remaining time into compound runtime reconciliation/acquisition/adoption/status calls and rejected late queued effects without renewal; successor request identity remains independent of incidental transport timeout.
 - Delivered public lifecycle mutation outcomes before renewed lease/registration checks can hide their acknowledgement. Active/adoption/retirement proof and post-read list disclosure retain independent authorization; a production revoked-lease create regression preserves acknowledged identity in an uncertain canonical provisional record across reopen without publishing or prompting.
 - Separated internal external-lifecycle deadlines from public SDK readiness configuration. Create/resume and catalog callers no longer send short or over-60-second operation budgets as `readinessTimeoutMs`; an explicitly supplied SDK readiness value remains unchanged and must satisfy the public 4,000–60,000 ms range.
 - Rejected proof-free post-invocation terminal classification and indirect uncertainty/cleanup restoration, including reuse of pre-cleanup acknowledgement. The normative lifecycle matrix is unchanged, but unsupported evidence-labelled recovery remains blocked. Bounded graceful drain and local Router stop under one monotonic shutdown deadline with pre-effect checks instead of renewing the timeout.

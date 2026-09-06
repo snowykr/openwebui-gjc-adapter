@@ -385,6 +385,61 @@ function invokeExternal(
 }
 
 describe("managed SDK runtime", () => {
+	test.each(["acquire", "register", "adopt", "status", "retirement-status"] as const)(
+		"expired %s admission cannot perform late compound proof effects",
+		async mode => {
+			const entered = deferred<void>();
+			const release = deferred<boolean>();
+			const f = fixture({
+				fence: () => {
+					entered.resolve();
+					return release.promise;
+				},
+			});
+			f.runtime.registerTenant(tenant);
+			await f.runtime.start();
+			const promise =
+				mode === "acquire"
+					? f.runtime.acquireAttachment(tenant, 25)
+					: mode === "register"
+						? f.runtime.registerLifecycleTenant(tenant, 25)
+						: mode === "adopt"
+							? f.runtime.proveLifecycleTenant(tenant, operationIdentity(), 25)
+							: mode === "status"
+								? f.runtime.generationStatus(tenant, 25)
+								: f.runtime.retirementGenerationStatus(tenant, operationIdentity(), 25);
+			const result = promise.catch(error => error);
+			await entered.promise;
+			expect(await result).toMatchObject({ code: "timeout" });
+			const effects = [...f.calls];
+			release.resolve(true);
+			await new Promise(resolve => setTimeout(resolve, 0));
+			expect(f.calls).toEqual(effects);
+			expect(f.statusCalls).toEqual([]);
+			await f.runtime.stop();
+		},
+	);
+
+	test("expired serialized reconciliation never invokes its queued public effect", async () => {
+		const entered = deferred<void>();
+		const release = deferred<void>();
+		const f = fixture({
+			reconcile: () => {
+				entered.resolve();
+				return release.promise;
+			},
+		});
+		await f.runtime.start();
+		const first = f.runtime.reconcile(1_000);
+		await entered.promise;
+		await expect(f.runtime.reconcile(25)).rejects.toMatchObject({ code: "timeout" });
+		release.resolve();
+		await first;
+		await new Promise(resolve => setTimeout(resolve, 0));
+		expect(f.calls.filter(call => call === "reconcile")).toHaveLength(1);
+		await f.runtime.stop();
+	});
+
 	test.each([
 		"prepared",
 		"external-create",

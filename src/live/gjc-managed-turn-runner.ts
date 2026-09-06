@@ -78,7 +78,7 @@ const managedLifecycleAuthorities = new WeakMap<object, ManagedTurnAuthority>();
 
 export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime, turnTimeoutMs?: number): ManagedGjcTurnRunner {
 	const operations = createManagedSessionOperations(runtime, turnTimeoutMs);
-	const forkManagedSuccessor = createManagedSuccessorFlow(runtime);
+	const forkManagedSuccessor = createManagedSuccessorFlow(runtime, turnTimeoutMs);
 	return {
 		operations,
 		forkManagedSuccessor: forkManagedSuccessor.fork,
