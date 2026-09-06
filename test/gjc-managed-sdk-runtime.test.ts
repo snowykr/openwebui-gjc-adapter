@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import type { lifecycle, router } from "@gajae-code/coding-agent/sdk";
 import {
 	createManagedLifecycleEvidence,
@@ -1609,6 +1609,77 @@ describe("managed SDK runtime", () => {
 		await expect(f.runtime.stop()).rejects.toMatchObject({ code: "drain_timeout" });
 		expect(f.runtime.state).toBe("failed");
 		expect(f.closeCalls).toEqual([]);
+	});
+
+	test("graceful drain and local Router stop consume one deadline", async () => {
+		const entered = deferred<void>();
+		const response = deferred<Record<string, unknown>>();
+		const stopped = deferred<void>();
+		const f = fixture({
+			drainTimeoutMs: 1000,
+			request: () => {
+				entered.resolve();
+				return response.promise;
+			},
+			stop: () => stopped.promise,
+		});
+		f.runtime.registerTenant(tenant);
+		await f.runtime.start();
+		const token = await f.runtime.acquireAttachment(tenant);
+		const call = f.runtime.request(token, {});
+		await entered.promise;
+		let now = performance.now();
+		const clock = spyOn(performance, "now").mockImplementation(() => now);
+		try {
+			const shutdown = f.runtime.stop();
+			expect(f.runtime.stop()).toBe(shutdown);
+			now += 400;
+			response.resolve({ ok: true });
+			await call;
+			for (let i = 0; i < 20 && !f.calls.includes("stop"); i += 1) await Promise.resolve();
+			expect(f.calls.filter(call => call === "stop")).toHaveLength(1);
+			now += 700;
+			stopped.resolve();
+			await expect(shutdown).rejects.toMatchObject({ code: "drain_timeout" });
+			expect(f.runtime.state).toBe("failed");
+			expect(f.closeCalls).toEqual([]);
+		} finally {
+			clock.mockRestore();
+			response.resolve({ ok: true });
+			stopped.resolve();
+		}
+	});
+
+	test("an exhausted shutdown budget cannot invoke the next local effect", async () => {
+		const entered = deferred<void>();
+		const response = deferred<Record<string, unknown>>();
+		const f = fixture({
+			drainTimeoutMs: 1000,
+			request: () => {
+				entered.resolve();
+				return response.promise;
+			},
+		});
+		f.runtime.registerTenant(tenant);
+		await f.runtime.start();
+		const token = await f.runtime.acquireAttachment(tenant);
+		const call = f.runtime.request(token, {});
+		await entered.promise;
+		let now = performance.now();
+		const clock = spyOn(performance, "now").mockImplementation(() => now);
+		try {
+			const shutdown = f.runtime.stop();
+			now += 1001;
+			response.resolve({ ok: true });
+			await call;
+			await expect(shutdown).rejects.toMatchObject({ code: "drain_timeout" });
+			expect(f.calls).not.toContain("stop");
+			expect(f.runtime.state).toBe("failed");
+			expect(token.isCurrent()).toBe(false);
+		} finally {
+			clock.mockRestore();
+			response.resolve({ ok: true });
+		}
 	});
 
 	test("never starts tracked work after stop wins the admission microtask", async () => {

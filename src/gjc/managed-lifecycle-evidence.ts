@@ -221,6 +221,23 @@ export function assertManagedLifecycleEvidenceUpdate(
 		return;
 	}
 	assertManagedLifecycleTransition(current.state, next.state);
+	if (next.state === "terminal_failure" && current.state !== "intent_prepared")
+		throw new Error(
+			"Post-invocation termination requires explicit public not-applied evidence, which this receipt cannot represent.",
+		);
+	if (
+		current.state === "uncertain" &&
+		["acknowledged_unproven", "active_generation_proven", "cleanup_pending"].includes(next.state)
+	)
+		throw new Error(
+			"Uncertain lifecycle recovery requires fresh public request-bound evidence, which this receipt cannot represent.",
+		);
+	if (current.state === "invoking" && next.state === "cleanup_pending")
+		throw new Error(
+			"Cleanup invocation recovery requires explicit public not-applied evidence, which this receipt cannot represent.",
+		);
+	if (current.state === "invoking" && current.acknowledged !== undefined && next.state === "acknowledged_unproven")
+		throw new Error("Cleanup invocation cannot reuse an earlier acknowledgement as fresh public outcome evidence.");
 	if (current.state === "closing" && next.state === "active_generation_proven")
 		throw new Error(
 			"Close restoration requires explicit public not-applied evidence, which this receipt cannot represent.",

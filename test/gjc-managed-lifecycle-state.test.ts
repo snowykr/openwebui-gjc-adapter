@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	assertManagedLifecycleEvidenceUpdate,
 	copyManagedLifecycleEvidence,
@@ -36,6 +39,7 @@ import {
 	type SessionAuthorityV3Operation,
 	type SessionAuthorityV3Result,
 } from "../src/gjc/session-authority-v3";
+import { SessionV3FileBackedMappingStore } from "../src/gjc/session-v3-file-backed-mapping-store";
 import type {
 	ManagedGenerationProof,
 	ManagedPreparedTurnAuthority,
@@ -916,6 +920,71 @@ describe("canonical managed lifecycle evidence", () => {
 		);
 		const cleanup = transitionManagedLifecycleEvidence(acknowledgedEvidence(), "cleanup_uncertain", {}, later);
 		expect(() => transitionManagedLifecycleEvidence(cleanup, "cleanup_pending", {}, later)).toThrow("not-applied");
+	});
+
+	test("post-invocation failure cannot become terminal without public nonapplication proof", () => {
+		const intent = createEvidence();
+		expect(transitionManagedLifecycleEvidence(intent, "terminal_failure", {}, later).state).toBe("terminal_failure");
+		const invoking = transitionManagedLifecycleEvidence(intent, "invoking", {}, later);
+		const uncertain = transitionManagedLifecycleEvidence(invoking, "uncertain", {}, later);
+		for (const evidence of [invoking, uncertain]) {
+			expect(() => transitionManagedLifecycleEvidence(evidence, "terminal_failure", {}, later)).toThrow(
+				"not-applied",
+			);
+			expect(() =>
+				assertManagedLifecycleEvidenceUpdate(evidence, { ...evidence, state: "terminal_failure" }),
+			).toThrow("not-applied");
+		}
+	});
+
+	test("cleanup uncertainty cannot regain retry eligibility through an acknowledged detour", () => {
+		const initial = transitionManagedLifecycleEvidence(acknowledgedEvidence(), "cleanup_pending", {}, later);
+		expect(initial.state).toBe("cleanup_pending");
+		const invoking = transitionManagedLifecycleEvidence(initial, "invoking", {}, later);
+		expect(() => transitionManagedLifecycleEvidence(invoking, "cleanup_pending", {}, later)).toThrow("not-applied");
+		expect(() => transitionManagedLifecycleEvidence(invoking, "acknowledged_unproven", {}, later)).toThrow(
+			"earlier acknowledgement",
+		);
+		const cleanup = transitionManagedLifecycleEvidence(initial, "cleanup_uncertain", {}, later);
+		const uncertain = transitionManagedLifecycleEvidence(cleanup, "uncertain", {}, later);
+		for (const state of ["cleanup_pending", "acknowledged_unproven"] as const)
+			expect(() => transitionManagedLifecycleEvidence(uncertain, state, {}, later)).toThrow("request-bound");
+		expect(uncertain.acknowledged).toEqual(initial.acknowledged);
+		expect(uncertain.requestKey).toBe(initial.requestKey);
+		expect(uncertain.requestHash).toBe(initial.requestHash);
+	});
+
+	test("normal V3 reopen cannot restore pre-close proof through uncertainty", () => {
+		const active = transitionManagedLifecycleEvidence(
+			acknowledgedEvidence(),
+			"active_generation_proven",
+			{ proven },
+			later,
+		);
+		const uncertain = transitionManagedLifecycleEvidence(
+			transitionManagedLifecycleEvidence(active, "closing", {}, later),
+			"uncertain",
+			{},
+			later,
+		);
+		const root = mkdtempSync(join(tmpdir(), "gjc-uncertain-no-restore-"));
+		const path = join(root, "authority.json");
+		try {
+			writeFileSync(path, encodeSessionAuthorityV3Document(documentWith(uncertain)));
+			const store = new SessionV3FileBackedMappingStore(path);
+			store.close();
+			const retained = parseSessionAuthorityV3Document(readFileSync(path))!.provisionalOperations[0]!.lifecycle!;
+			expect(retained).toEqual(uncertain);
+			expect(retained.proven).toEqual(active.proven);
+			for (const state of ["active_generation_proven", "acknowledged_unproven", "cleanup_pending"] as const) {
+				expect(() => transitionManagedLifecycleEvidence(retained, state, {}, later)).toThrow("request-bound");
+				expect(() => assertManagedLifecycleEvidenceUpdate(retained, { ...retained, state })).toThrow(
+					"request-bound",
+				);
+			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	test("rejects scoped chat, project and payload mismatch while allowing historical absence", () => {

@@ -552,10 +552,19 @@ export class ManagedSdkRuntime {
 		}
 		this.#state = "draining";
 		this.#bootstrapAdmission = false;
+		const expiresAt = performance.now() + this.#drainTimeoutMs;
+		const remaining = () => {
+			const budget = expiresAt - performance.now();
+			if (budget <= 0)
+				throw new ManagedSdkOperationError("drain_timeout", "Managed runtime shutdown deadline exceeded.");
+			return budget;
+		};
 		this.#stopPromise = (async () => {
 			let drainFailure: unknown;
 			try {
-				await boundedWait(this.#drain(), this.#drainTimeoutMs, "drain_timeout");
+				// Reserve half the same shutdown budget for local Router cleanup.
+				const drainBudget = Math.min(remaining(), this.#drainTimeoutMs / 2);
+				await boundedWait(this.#drain(), drainBudget, "drain_timeout");
 			} catch (error) {
 				drainFailure = error;
 				const interruption = new ManagedSdkOperationError(
@@ -567,7 +576,9 @@ export class ManagedSdkRuntime {
 			this.#state = "stopping";
 			this.#clearSubscriptions();
 			try {
-				await boundedWait(this.#router.stop(), this.#drainTimeoutMs, "drain_timeout");
+				const stopBudget = remaining();
+				await boundedWait(this.#router.stop(), stopBudget, "drain_timeout");
+				remaining();
 				this.#state = "stopped";
 			} catch (error) {
 				this.#state = "failed";

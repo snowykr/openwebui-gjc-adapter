@@ -451,13 +451,15 @@ describe("session authority V3 activation", () => {
 					const current = parseSessionAuthorityV3Document(await readFile(context.stagedPath))!.mappings[0]!
 						.journal[0]!.lifecycle!;
 					expect(current.state).toBe("uncertain");
-					const guessed = transitionManagedLifecycleEvidence(current, "acknowledged_unproven", {
+					const guessed: ManagedLifecycleEvidence = {
+						...current,
+						state: "acknowledged_unproven",
 						acknowledged: {
 							...intent.preparedAuthority,
 							sessionId: "session",
 							generation: 7,
 						},
-					});
+					};
 					await expect(
 						context.stage.advance("migration:resume:session", managedLifecycleEvidenceHash(current), guessed),
 					).rejects.toThrow("original-incarnation");

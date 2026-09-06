@@ -26,6 +26,7 @@
 
 ### Fixed
 
+- Rejected proof-free post-invocation terminal classification and indirect uncertainty/cleanup restoration, including reuse of pre-cleanup acknowledgement. The normative lifecycle matrix is unchanged, but unsupported evidence-labelled recovery remains blocked. Bounded graceful drain and local Router stop under one monotonic shutdown deadline with pre-effect checks instead of renewing the timeout.
 - Restored the original cutover schema epoch `gjc-public-sdk-v015-managed/1` across canonical V3 and its activation marker. The obsolete `managed/1` schema identity is rejected without a compatibility layer; independent persisted workspace/runtime lease epochs are unchanged.
 - Removed the obsolete flat authority codec, activation store/coordinator, bootstrap service, and server cleanup hook after transferring their valid behavioral obligations to canonical V3 tests. Added concurrent activation, startup/shutdown/release failure, source-file safety, graph-copy validation, and unrelated-file preservation regressions; unsafe numeric-generation recovery and post-replacement rollback are not retained as success contracts.
 - Bounded direct V3 startup and failure cleanup with one configured deadline, rejecting late proof publication. Retained private historical V3 stages across activation retries with a manifest-bound checkpoint; changed, missing, or corrupt staged journals cannot be silently regenerated. Added an isolated public saved-resume/client-restart probe while retaining the exact-selection and interrupted-recovery limitations.
