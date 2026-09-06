@@ -19,7 +19,11 @@ import {
 } from "./gjc/managed-sdk-runtime";
 import { AuthorityMutationLock } from "./gjc/session-authority-file";
 import type { HistoricalSessionBinding } from "./gjc/session-authority-types";
-import type { SessionAuthorityV3Operation } from "./gjc/session-authority-v3";
+import type {
+	SessionAuthorityV3Operation,
+	SessionAuthorityV3Reassignment,
+	SessionAuthorityV3Tombstone,
+} from "./gjc/session-authority-v3";
 import {
 	activateSessionAuthorityV3,
 	type SessionAuthorityV3ActivationResult,
@@ -202,12 +206,7 @@ export async function activateAdapterSessionAuthorityV3(
 				bootstrap: async current => {
 					context = current;
 					const graph = current.stage.read();
-					if (
-						graph.provisionalOperations.some(
-							operation => operation.historicalBinding !== undefined && operation.state !== "complete",
-						)
-					)
-						return;
+					if (graph.provisionalOperations.some(operation => operation.state !== "complete")) return;
 					const sessionIds = new Set<string>();
 					// Complete all local source/owner checks before constructing the public runtime.
 					for (const mapping of graph.mappings) {
@@ -220,7 +219,7 @@ export async function activateAdapterSessionAuthorityV3(
 						const scope = historicalScope(source);
 						if (
 							scope === undefined ||
-							mapping.reassignment !== undefined ||
+							hasUnresolvedReassignment(mapping.reassignment) ||
 							mapping.observations?.__gjcSessionMappingRetirement !== undefined
 						)
 							return;
@@ -447,6 +446,17 @@ export async function activateAdapterSessionAuthorityV3(
 	if (failures.length > 0) throw new AggregateError(failures, "Managed historical bootstrap failed.");
 	if (result === undefined) throw new Error("Managed historical bootstrap produced no result.");
 	return result;
+}
+
+function hasUnresolvedReassignment(reassignment: SessionAuthorityV3Reassignment | undefined): boolean {
+	if (reassignment === undefined) return false;
+	if (reassignment.state === "pending" || reassignment.completedAt === undefined) return true;
+	for (const root of [reassignment.sourceTombstone, reassignment.priorTombstone]) {
+		for (let node: SessionAuthorityV3Tombstone | undefined = root; node !== undefined; node = node.prior) {
+			if (node.journal.some(operation => operation.state !== "complete")) return true;
+		}
+	}
+	return false;
 }
 
 function historicalScope(source: HistoricalSessionBinding): { principalId: string; chatId: string } | undefined {

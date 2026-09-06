@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,7 +9,7 @@ import { lifecycle } from "@gajae-code/coding-agent/sdk";
 import { activateAdapterSessionAuthorityV3 } from "../src/adapter-managed-bootstrap";
 import { ManagedOperationDeadline } from "../src/gjc/managed-operation-deadline";
 import { ManagedSdkRuntime } from "../src/gjc/managed-sdk-runtime";
-import { parseSessionAuthorityV3Document } from "../src/gjc/session-authority-v3";
+import { parseSessionAuthorityV3Document, type SessionAuthorityV3Document } from "../src/gjc/session-authority-v3";
 import { RuntimeSingletonLock } from "../src/runtime-singleton-lock";
 import { WorkspaceLeaseManager, workspaceLeaseId } from "../src/security/workspace-lease";
 import { apiKey, providerResponse, writeLocalProviderConfig } from "./gjc-release-compat-fixtures";
@@ -325,6 +326,20 @@ async function bootstrapProbe(
 	const sourcePath = join(stateRoot, "authority.json");
 	const chatId = JSON.stringify([principalId, "saved-chat"]);
 	const stamp = new Date().toISOString();
+	const terminalHistory = process.argv.includes("--bootstrap-history");
+	const prior = {
+		version: 2,
+		chatId,
+		projectId: "older-project",
+		sessionId,
+		createdAt: stamp,
+		header: { chatId, projectId: "older-project", sessionId },
+		rawFrameCursor: 0,
+		eventCursor: 0,
+		operationId: "older-turn",
+		journal: [],
+		retiredAt: stamp,
+	};
 	const original = JSON.stringify({
 		kind: "openwebui-gjc-session-authority",
 		version: 2,
@@ -339,6 +354,25 @@ async function bootstrapProbe(
 				rawFrameCursor: 0,
 				eventCursor: 0,
 				operationId: "prior-answer",
+				...(terminalHistory
+					? {
+							reassignment: {
+								state: "committed",
+								sourceProjectId: "old-project",
+								targetProjectId: "probe-project",
+								startedAt: stamp,
+								completedAt: stamp,
+								sourceTombstone: {
+									...prior,
+									projectId: "old-project",
+									header: { ...prior.header, projectId: "old-project" },
+									operationId: "old-turn",
+									prior,
+								},
+								priorTombstone: prior,
+							},
+						}
+					: {}),
 				journal: [
 					{
 						id: "prior-answer",
@@ -373,6 +407,7 @@ async function bootstrapProbe(
 		leaseMs: 30_000,
 	});
 	let runtime: ManagedSdkRuntime | undefined;
+	let initialGraph: SessionAuthorityV3Document | undefined;
 	try {
 		const result = await activateAdapterSessionAuthorityV3({
 			locations: { agentDir, stateRoot },
@@ -403,6 +438,12 @@ async function bootstrapProbe(
 							},
 			},
 			createRuntime: (directory, deps) => {
+				const stagePath = join(
+					stateRoot,
+					`session-authority-v3-${createHash("sha256").update(sourcePath).digest("hex").slice(0, 16)}`,
+					"historical.v3.json",
+				);
+				initialGraph = parseSessionAuthorityV3Document(readFileSync(stagePath));
 				runtime = new ManagedSdkRuntime({
 					agentDir: directory,
 					deps: {
@@ -436,6 +477,8 @@ async function bootstrapProbe(
 			const record = document?.mappings[0];
 			if (
 				record?.managedAuthority?.sessionId !== sessionId ||
+				initialGraph === undefined ||
+				!isDeepStrictEqual(record.reassignment, initialGraph.mappings[0]?.reassignment) ||
 				record.journal[0]?.result?.assistantText !== "immutable prior answer" ||
 				record.journal[0].result.managedAuthority !== undefined ||
 				record.journal[0].result.historicalBinding === undefined ||
@@ -449,6 +492,7 @@ async function bootstrapProbe(
 					version: document!.version,
 					generation: record.managedAuthority.generation,
 					originalResultPreserved: true,
+					terminalReassignmentHistoryPreserved: terminalHistory,
 					bootstrapRuntimeStopped: true,
 					migrationOperationCount: record.journal.length - 1,
 				},

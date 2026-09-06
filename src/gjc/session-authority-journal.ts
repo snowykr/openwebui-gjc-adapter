@@ -602,13 +602,14 @@ export class SessionAuthorityJournal {
 		this.setRecord(chatId, next);
 		return copy(next);
 	}
-	reconcile(copyResults = true): readonly SessionAuthorityRecord[] {
+	reconcile(copyResults = true, observedAt?: number): readonly SessionAuthorityRecord[] {
 		return reconcileSessionAuthority(
 			this.records,
 			this.provisional,
 			this.#dirtyRecords,
 			this.#dirtyProvisional,
 			copyResults,
+			observedAt,
 		);
 	}
 	replace(records: Iterable<SessionAuthorityRecord>, provisional: Iterable<ProvisionalSessionOperation> = []): void {

@@ -7,7 +7,10 @@ import { join } from "node:path";
 import type { lifecycle, router } from "@gajae-code/coding-agent/sdk";
 import { type AdapterManagedBootstrapInput, activateAdapterSessionAuthorityV3 } from "../src/adapter-managed-bootstrap";
 import { ManagedSdkRuntime, type ManagedSdkRuntimeDeps } from "../src/gjc/managed-sdk-runtime";
-import { parseSessionAuthorityV3Document } from "../src/gjc/session-authority-v3";
+import type { SessionAuthorityTombstone } from "../src/gjc/session-authority-types";
+import { parseSessionAuthorityV3Document, type SessionAuthorityV3Document } from "../src/gjc/session-authority-v3";
+import type { SessionAuthorityV2Document } from "../src/gjc/session-authority-v3-migration";
+import { V3FileBackedSessionMappingStore } from "../src/gjc/session-v3-file-backed-mapping-store";
 import { RuntimeSingletonLock } from "../src/runtime-singleton-lock";
 
 async function fixture(
@@ -27,6 +30,7 @@ async function fixture(
 		onStop?: () => Promise<void>;
 		timeoutMs?: number;
 		staleAtCommit?: boolean;
+		transformSource?: (source: SessionAuthorityV2Document) => SessionAuthorityV2Document;
 	} = {},
 ) {
 	const root = await mkdtemp(join(tmpdir(), "adapter-bootstrap-owned-"));
@@ -35,9 +39,7 @@ async function fixture(
 	const sourcePath = join(root, "authority.json");
 	const chatId = JSON.stringify(["owner", "chat"]);
 	const stamp = "2026-01-01T00:00:00.000Z";
-	const original = JSON.stringify({
-		kind: "openwebui-gjc-session-authority",
-		version: 2,
+	const source: SessionAuthorityV2Document = {
 		mappings: options.empty
 			? []
 			: [
@@ -78,6 +80,11 @@ async function fixture(
 					},
 				],
 		provisionalOperations: [],
+	};
+	const original = JSON.stringify({
+		kind: "openwebui-gjc-session-authority",
+		version: 2,
+		...(options.transformSource?.(source) ?? source),
 	});
 	await writeFile(sourcePath, original);
 	const stagePath = join(
@@ -92,6 +99,7 @@ async function fixture(
 	let reconciles = 0;
 	let runtime!: ManagedSdkRuntime;
 	let deps!: ManagedSdkRuntimeDeps;
+	let initialGraph: SessionAuthorityV3Document | undefined;
 	const graph = () => parseSessionAuthorityV3Document(readFileSync(stagePath))!;
 	const evidence = () => graph().mappings[0]?.journal.at(-1)?.lifecycle;
 	const input: AdapterManagedBootstrapInput = {
@@ -130,6 +138,7 @@ async function fixture(
 		createRuntime: (agentDir, owned) => {
 			deps = owned;
 			calls.push("construct");
+			initialGraph = graph();
 			expect(graph().version).toBe(3);
 			expect(readFileSync(sourcePath, "utf8")).toBe(original);
 			const attachment = { sessionId: "session", generation: 7, isCurrent: () => !stale };
@@ -210,6 +219,7 @@ async function fixture(
 		stagePath,
 		calls,
 		graph,
+		initialGraph: () => initialGraph!,
 		evidence,
 		runtime: () => runtime,
 		deps: () => deps,
@@ -224,7 +234,212 @@ async function fixture(
 	};
 }
 
+function withReassignment(
+	source: SessionAuthorityV2Document,
+	state: "committed" | "rolled_back" | "pending",
+): SessionAuthorityV2Document {
+	const mapping = source.mappings[0]!;
+	const tombstone = (
+		projectId: string,
+		operationId: string,
+		prior?: SessionAuthorityTombstone,
+	): SessionAuthorityTombstone => ({
+		version: 2,
+		chatId: mapping.chatId,
+		projectId,
+		// Reused saved-session identity is history, not another live occurrence.
+		sessionId: mapping.sessionId,
+		createdAt: mapping.createdAt,
+		header: { chatId: mapping.chatId, projectId, sessionId: mapping.sessionId },
+		rawFrameCursor: 1,
+		eventCursor: 1,
+		operationId,
+		sessionFile: `/inert/${operationId}.jsonl`,
+		journal: [
+			{
+				id: operationId,
+				kind: "prompt",
+				state: "complete",
+				startedAt: mapping.createdAt,
+				completedAt: mapping.createdAt,
+				result: {
+					kind: "turn",
+					assistantText: operationId,
+					mapping: {
+						chatId: mapping.chatId,
+						projectId,
+						sessionId: mapping.sessionId,
+						operationId,
+						rawFrameCursor: 1,
+						eventCursor: 1,
+					},
+				},
+			},
+		],
+		retiredAt: mapping.createdAt,
+		...(prior === undefined ? {} : { prior }),
+	});
+	const prior = tombstone("older-project", "older-turn");
+	const old = tombstone("old-project", "old-turn", prior);
+	const operation = mapping.journal[0]!;
+	return {
+		...source,
+		mappings: [
+			{
+				...mapping,
+				reassignment: {
+					state,
+					sourceProjectId: state === "committed" ? "old-project" : mapping.projectId,
+					targetProjectId: state === "committed" ? mapping.projectId : "other-project",
+					startedAt: mapping.createdAt,
+					...(state === "pending" ? {} : { completedAt: mapping.createdAt }),
+					...(state === "committed"
+						? { sourceTombstone: old, priorTombstone: structuredClone(prior) }
+						: { priorTombstone: prior }),
+				},
+			},
+		],
+		provisionalOperations: [
+			{ ...operation, chatId: mapping.chatId, projectId: mapping.projectId, sessionId: mapping.sessionId },
+		],
+	};
+}
+
 describe("adapter managed bootstrap composition", () => {
+	test.each(["committed", "rolled_back", "pending"] as const)(
+		"promotes only the current occurrence with %s reassignment history and no unresolved target",
+		async state => {
+			const f = await fixture({ transformSource: source => withReassignment(source, state) });
+			try {
+				const result = await activateAdapterSessionAuthorityV3(f.input);
+				expect(result.status).toBe("activated");
+				if (result.status !== "activated") throw new Error("Expected activated store.");
+				const initial = f.initialGraph();
+				expect(initial.mappings[0]!.reassignment?.state).toBe(state === "pending" ? "rolled_back" : state);
+				const persisted = parseSessionAuthorityV3Document(await readFile(f.sourcePath))!;
+				expect(persisted.mappings[0]!.reassignment).toEqual(initial.mappings[0]!.reassignment);
+				expect(persisted.mappings[0]!.journal.slice(0, -1)).toEqual([...initial.mappings[0]!.journal]);
+				expect(persisted.provisionalOperations).toEqual(initial.provisionalOperations);
+				expect(persisted.mappings[0]!.managedAuthority?.generation).toBe(7);
+				expect(f.calls.filter(call => call === "resume")).toHaveLength(1);
+				result.store.close();
+				const reopened = new V3FileBackedSessionMappingStore(f.sourcePath);
+				try {
+					reopened.assertServingReady();
+					expect(reopened.getScoped({ principalId: "owner", chatId: "chat" })?.managedAuthority?.generation).toBe(
+						7,
+					);
+					expect(reopened.getScoped({ principalId: "foreign", chatId: "chat" })).toBeUndefined();
+					expect(
+						reopened.operationScoped({ principalId: "owner", chatId: "chat" }, "older-turn")?.result
+							?.historicalBinding,
+					).toBeDefined();
+					expect(
+						reopened.operationScoped({ principalId: "owner", chatId: "chat" }, "older-turn")?.result
+							?.managedAuthority,
+					).toBeUndefined();
+					expect(
+						reopened.operationScoped({ principalId: "foreign", chatId: "chat" }, "older-turn"),
+					).toBeUndefined();
+					expect(parseSessionAuthorityV3Document(await readFile(f.sourcePath))).toEqual(persisted);
+				} finally {
+					reopened.close();
+				}
+			} finally {
+				await f.cleanup();
+			}
+		},
+	);
+
+	test.each(["pending", "missing-completion", "uncertain-history", "unassigned-provisional"] as const)(
+		"blocks %s before SDK construction without discarding history",
+		async scenario => {
+			const f = await fixture({
+				transformSource: source => {
+					const graph = withReassignment(source, scenario === "pending" ? "pending" : "committed");
+					const mapping = graph.mappings[0]!;
+					const reassignment = mapping.reassignment!;
+					if (scenario === "pending") {
+						const target = { id: "destination", kind: "prompt" as const, detail: "destination-hash" };
+						return {
+							...graph,
+							mappings: [{ ...mapping, reassignment: { ...reassignment, target } }],
+							provisionalOperations: [
+								...graph.provisionalOperations!,
+								{
+									...target,
+									state: "pending",
+									startedAt: mapping.createdAt,
+									chatId: mapping.chatId,
+									projectId: reassignment.targetProjectId,
+								},
+							],
+						};
+					}
+					if (scenario === "missing-completion") {
+						const { completedAt: _completed, ...unresolved } = reassignment;
+						return { ...graph, mappings: [{ ...mapping, reassignment: unresolved }] };
+					}
+					if (scenario === "uncertain-history") {
+						const old = reassignment.sourceTombstone!;
+						return {
+							...graph,
+							mappings: [
+								{
+									...mapping,
+									reassignment: {
+										...reassignment,
+										sourceTombstone: {
+											...old,
+											journal: [
+												...old.journal,
+												{
+													id: "uncertain-effect",
+													kind: "branch",
+													state: "uncertain",
+													startedAt: mapping.createdAt,
+												},
+											],
+										},
+									},
+								},
+							],
+						};
+					}
+					return scenario === "unassigned-provisional"
+						? {
+								...graph,
+								provisionalOperations: [
+									...graph.provisionalOperations!,
+									{
+										id: "unassigned",
+										kind: "create",
+										state: "uncertain",
+										startedAt: mapping.createdAt,
+										chatId: "unassigned-chat",
+										projectId: "project",
+									},
+								],
+							}
+						: graph;
+				},
+			});
+			try {
+				const result = await activateAdapterSessionAuthorityV3(f.input);
+				expect(result.status).toBe("blocked");
+				expect(f.calls).toEqual([]);
+				expect(await readFile(f.sourcePath, "utf8")).toBe(f.original);
+				const retained = await readFile(f.stagePath);
+				expect(f.graph().mappings[0]!.historicalBinding).toBeDefined();
+				expect((await activateAdapterSessionAuthorityV3(f.input)).status).toBe("blocked");
+				expect((await readFile(f.stagePath)).equals(retained)).toBe(true);
+				expect(f.calls).toEqual([]);
+			} finally {
+				await f.cleanup();
+			}
+		},
+	);
+
 	test("lock release failure is observable without releasing an external replacement", async () => {
 		let lockPath = "";
 		const replacement = "external mutation owner\n";

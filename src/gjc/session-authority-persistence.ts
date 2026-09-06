@@ -107,6 +107,7 @@ export interface SessionAuthoritySnapshotReplay {
 	readonly sourcePath: string;
 	readonly baseDigest: string;
 	readonly baseMtimeMs: number;
+	readonly reconciliationTimeMs: number;
 	readonly walDigest: string | null;
 }
 
@@ -142,6 +143,8 @@ export class FileSessionAuthority extends SessionAuthority {
 				(resolve(snapshotReplay.sourcePath) === resolve(filePath) ||
 					!Number.isFinite(snapshotReplay.baseMtimeMs) ||
 					snapshotReplay.baseMtimeMs < 0 ||
+					!Number.isFinite(snapshotReplay.reconciliationTimeMs) ||
+					snapshotReplay.reconciliationTimeMs < snapshotReplay.baseMtimeMs ||
 					!existsSync(filePath) ||
 					(snapshotReplay.walDigest !== null) !== existsSync(this.walPath))
 			)
@@ -177,7 +180,9 @@ export class FileSessionAuthority extends SessionAuthority {
 				originalBaseBytes > AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES && !this.#normalized;
 			let bootRewrote = false;
 			if (needsRecovery) {
-				if (pendingOperations) super.reconcileRestart(false);
+				// Replaying one immutable snapshot must produce the same graph on
+				// every attempt, including locally rolled-back reassignment markers.
+				if (pendingOperations) super.reconcileRestart(false, snapshotReplay?.reconciliationTimeMs);
 				// Oversized recovery (normalized or legacy): write through the
 				// reference-based writer, never persist()'s entries() deep copy
 				// of every retained event payload. The decision considers the

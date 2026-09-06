@@ -9,6 +9,7 @@ export function reconcileSessionAuthority(
 	dirtyRecords?: Set<string>,
 	dirtyProvisional?: Set<string>,
 	copyResults = true,
+	observedAt = Date.now(),
 ): readonly SessionAuthorityRecord[] {
 	const reconciled: SessionAuthorityRecord[] = [];
 	for (const record of records.values()) {
@@ -29,7 +30,7 @@ export function reconcileSessionAuthority(
 				? {
 						...record.reassignment,
 						state: "rolled_back" as const,
-						completedAt: new Date().toISOString(),
+						completedAt: new Date(Math.max(observedAt, Date.parse(record.reassignment.startedAt))).toISOString(),
 					}
 				: record.reassignment;
 		const changed =

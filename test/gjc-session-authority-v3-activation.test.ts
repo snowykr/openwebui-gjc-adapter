@@ -1285,6 +1285,59 @@ describe("session authority V3 activation", () => {
 		}
 	});
 
+	test("replays a pending reassignment deterministically across retained-stage retries", async () => {
+		const f = await historicalFixture();
+		try {
+			const source = new FileSessionAuthority(f.canonicalPath);
+			source.beginProjectReassignment(f.chatId, "project", "destination", {
+				id: "destination-turn",
+				kind: "prompt",
+				detail: "destination-hash",
+			});
+			source.reserveProvisionalOperation({
+				id: "destination-turn",
+				kind: "prompt",
+				detail: "destination-hash",
+				chatId: f.chatId,
+				projectId: "destination",
+			});
+			const base = await readFile(f.canonicalPath);
+			const wal = await readFile(`${f.canonicalPath}.wal`);
+			const baseStat = await stat(f.canonicalPath);
+			const walStat = await stat(`${f.canonicalPath}.wal`);
+			let firstGraph: string | undefined;
+			let stagePath = "";
+			for (let attempt = 0; attempt < 2; attempt++) {
+				const result = await f.invoke({
+					canonicalPath: f.canonicalPath,
+					stagingRoot: join(f.root, "private"),
+					bootstrap: async context => {
+						stagePath = context.stagedPath;
+						const graph = context.stage.read();
+						const reassignment = graph.mappings[0]!.reassignment!;
+						expect(reassignment.state).toBe("rolled_back");
+						expect(reassignment.completedAt).toBe(
+							new Date(
+								Math.max(baseStat.mtimeMs, walStat.mtimeMs, Date.parse(reassignment.startedAt)),
+							).toISOString(),
+						);
+						expect(graph.provisionalOperations[0]!.state).toBe("uncertain");
+						if (firstGraph === undefined) firstGraph = JSON.stringify(graph);
+						else expect(JSON.stringify(graph)).toBe(firstGraph);
+					},
+				});
+				expect(result.status).toBe("blocked");
+			}
+			expect(stagePath).not.toBe("");
+			expect((await readFile(f.canonicalPath)).equals(base)).toBe(true);
+			expect((await readFile(`${f.canonicalPath}.wal`)).equals(wal)).toBe(true);
+			expect((await stat(f.canonicalPath)).ino).toBe(baseStat.ino);
+			expect((await stat(`${f.canonicalPath}.wal`)).ino).toBe(walStat.ino);
+		} finally {
+			await f.cleanup();
+		}
+	});
+
 	test.each(["digest", "alias"] as const)("snapshot replay rejects %s before mutable recovery", async failure => {
 		const f = await fixture();
 		const working = join(f.root, "working.json");
@@ -1298,6 +1351,7 @@ describe("session authority V3 activation", () => {
 						sourcePath: f.canonicalPath,
 						baseDigest: failure === "digest" ? "0".repeat(64) : digest(f.original),
 						baseMtimeMs: before.mtimeMs,
+						reconciliationTimeMs: before.mtimeMs,
 						walDigest: null,
 					}),
 			).toThrow(failure === "alias" ? "alias original source" : "immutable snapshot");

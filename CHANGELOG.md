@@ -26,6 +26,7 @@
 
 ### Fixed
 
+- Admitted completed reassignment histories during restricted scoped bootstrap without promoting tombstones or rewriting completed provisional receipts. Unresolved historical effects and unassigned provisionals still block before SDK construction. Made private snapshot replay's local reassignment rollback timestamp deterministic so unchanged base/WAL evidence can reopen its retained historical stage; added a terminal-history public bootstrap probe.
 - Preserved committed branch results when publication later throws or times out, matching other controls. Reopen replays the immutable result without reforking or falsely reporting a failed uncertainty transition.
 - Bounded create/resume and ordinary controls through transaction admission, effects, final proof, and publication. Preserved completed local results across later publication timeout, rejected late callback writes, and removed the gateway's redundant pre-dispatch/duplicate abort path in favor of the managed operation's dispatch-aware cancellation owner.
 - Bounded the enclosing branch through fork, transaction admission, state, continuation, and final mapping publication, passing remaining time to the successor and continuation. Preserved outer dispatch fences through model setters, prompt acquisition, and workflow queries; an inner timer cannot authorize a delayed request after its caller expires.

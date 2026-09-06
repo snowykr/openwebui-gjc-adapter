@@ -229,6 +229,7 @@ async function activateUnderDeadline(
 		sourcePath: canonicalPath,
 		baseDigest: snapshot.baseDigest,
 		baseMtimeMs: snapshot.baseIdentity.mtimeMs,
+		reconciliationTimeMs: Math.max(snapshot.baseIdentity.mtimeMs, snapshot.walIdentity?.mtimeMs ?? 0),
 		walDigest: snapshot.walPresent ? snapshot.walDigest : null,
 	});
 	fsyncRegular(privateV2, "private replayed V2 authority");
