@@ -252,6 +252,11 @@ export interface GjcTurnRunner {
 		onAcknowledgedSuccessor?: (successor: AcknowledgedSuccessor) => Promise<void> | void,
 		onDispatch?: () => void,
 		lifecycleOwner?: ManagedLifecycleControlOwner,
+		execution?: {
+			readonly timeoutMs: number;
+			/** Synchronous outer-owner fence, additional to runtime tenant authorization. */
+			readonly beforeDispatch: () => void;
+		},
 	): Promise<GjcControlResult>;
 }
 

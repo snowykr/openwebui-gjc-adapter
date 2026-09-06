@@ -176,75 +176,99 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime, turnTimeo
 				idempotencyKey: authority.requestKey,
 			});
 		},
-		async runControl(input, mapping, lifecycle, _onAcknowledgedSuccessor, onDispatch, lifecycleOwner) {
+		async runControl(input, mapping, lifecycle, _onAcknowledgedSuccessor, onDispatch, lifecycleOwner, execution) {
 			const control = input.control;
 			if (control === undefined) throw new Error("OpenWebUI control request was not supplied.");
 			throwIfAborted(input.signal);
-			const authority = managedControlAuthority(input, mapping);
-			bindManagedLifecycleAuthority(lifecycle, authority);
-			if (control.operation === "branch") {
-				throw new Error("Managed branch requires the gateway-owned forkManagedSuccessor flow.");
-			}
-			if (control.operation === "session.new" || control.operation === "session.resume") {
-				if (control.operation === "session.resume" && control.sessionId !== authority.sessionId)
-					throw new Error("Managed selected resume requires persisted exact target authority before invocation.");
-				const owner = requireLifecycleControlOwner(input, authority, lifecycleOwner);
-				const creating = control.operation === "session.new";
-				const lifecycleResult = await (creating ? operations.create : operations.resume)({
-					authority: creating ? owner.preparedAuthority : owner.source,
-					target: creating
-						? { path: authority.canonicalWorkspace }
-						: { sessionIdOrPrefix: authority.sessionId, path: authority.canonicalWorkspace },
-					signal: input.signal,
-					lifecycleOperation: owner.lifecycleOperation,
-					onInvoking: owner.onInvoking,
-					onAcknowledged: async acknowledged => {
-						if (creating && acknowledged.sessionId === authority.sessionId)
-							throw new Error("Managed session.new returned the source session.");
-						if (!creating) assertResumedExactAuthority({ tenant: acknowledged }, owner.source);
-						await owner.onAcknowledged(acknowledged);
-					},
-				});
+			const deadline = new ManagedOperationDeadline(execution?.timeoutMs ?? turnTimeoutMs, "control");
+			const beforeDispatch = () => {
+				deadline.remaining();
 				throwIfAborted(input.signal);
-				if (!creating) assertResumedExactAuthority(lifecycleResult, owner.source);
-				if (!lifecycleResult.attachment.isCurrent()) throw new Error("Managed lifecycle control proof is stale.");
-				const proven = {
-					...lifecycleResult.tenant,
-					requestKey: owner.lifecycleOperation.requestKey,
-					authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
-				};
-				assertResumedExactAuthority({ tenant: lifecycleResult.attachment.tenant }, proven);
-				if (lifecycleResult.attachment.generation !== proven.generation)
-					throw new Error("Managed lifecycle token generation changed.");
-				return {
-					sessionId: proven.sessionId,
-					result: withManagedProof(emptyControlResult(), proven),
-				};
-			}
-			if (control.operation === "abort_and_prompt" || control.operation === "follow_up") {
-				const run = control.operation === "follow_up" ? operations.followUp : operations.abortAndPrompt;
-				const result = await run({
+				execution?.beforeDispatch();
+			};
+			try {
+				beforeDispatch();
+				const authority = managedControlAuthority(input, mapping);
+				bindManagedLifecycleAuthority(lifecycle, authority);
+				if (control.operation === "branch") {
+					throw new Error("Managed branch requires the gateway-owned forkManagedSuccessor flow.");
+				}
+				if (control.operation === "session.new" || control.operation === "session.resume") {
+					if (control.operation === "session.resume" && control.sessionId !== authority.sessionId)
+						throw new Error(
+							"Managed selected resume requires persisted exact target authority before invocation.",
+						);
+					const owner = requireLifecycleControlOwner(input, authority, lifecycleOwner);
+					const creating = control.operation === "session.new";
+					const lifecycleResult = await (creating ? operations.create : operations.resume)({
+						authority: creating ? owner.preparedAuthority : owner.source,
+						target: creating
+							? { path: authority.canonicalWorkspace }
+							: { sessionIdOrPrefix: authority.sessionId, path: authority.canonicalWorkspace },
+						timeoutMs: deadline.remaining(),
+						signal: input.signal,
+						lifecycleOperation: owner.lifecycleOperation,
+						onInvoking: () => {
+							beforeDispatch();
+							return owner.onInvoking();
+						},
+						onAcknowledged: async acknowledged => {
+							if (creating && acknowledged.sessionId === authority.sessionId)
+								throw new Error("Managed session.new returned the source session.");
+							if (!creating) assertResumedExactAuthority({ tenant: acknowledged }, owner.source);
+							await owner.onAcknowledged(acknowledged);
+						},
+					});
+					beforeDispatch();
+					if (!creating) assertResumedExactAuthority(lifecycleResult, owner.source);
+					if (!lifecycleResult.attachment.isCurrent())
+						throw new Error("Managed lifecycle control proof is stale.");
+					const proven = {
+						...lifecycleResult.tenant,
+						requestKey: owner.lifecycleOperation.requestKey,
+						authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+					};
+					assertResumedExactAuthority({ tenant: lifecycleResult.attachment.tenant }, proven);
+					if (lifecycleResult.attachment.generation !== proven.generation)
+						throw new Error("Managed lifecycle token generation changed.");
+					return {
+						sessionId: proven.sessionId,
+						result: withManagedProof(emptyControlResult(), proven),
+					};
+				}
+				if (control.operation === "abort_and_prompt" || control.operation === "follow_up") {
+					const run = control.operation === "follow_up" ? operations.followUp : operations.abortAndPrompt;
+					const result = await run({
+						authority,
+						operation: control.operation === "follow_up" ? "turn.follow_up" : "turn.abort_and_prompt",
+						text: control.text ?? input.prompt,
+						idempotencyKey: authority.requestKey,
+						signal: input.signal,
+						timeoutMs: deadline.remaining(),
+						beforeDispatch,
+						onDispatch,
+					});
+					beforeDispatch();
+					return { result: withManagedProof(result, authority) };
+				}
+				const operation = managedControlOperation(control);
+				await operations.request({
 					authority,
-					operation: control.operation === "follow_up" ? "turn.follow_up" : "turn.abort_and_prompt",
-					text: control.text ?? input.prompt,
+					operation,
+					input: managedControlInput(control, input),
 					idempotencyKey: authority.requestKey,
 					signal: input.signal,
+					timeoutMs: deadline.remaining(),
+					beforeDispatch,
 					onDispatch,
 				});
-				throwIfAborted(input.signal);
-				return { result: withManagedProof(result, authority) };
+				beforeDispatch();
+				await operations.acquire(authority, deadline.remaining(), beforeDispatch);
+				beforeDispatch();
+				return { result: withManagedProof(emptyControlResult(), authority) };
+			} finally {
+				deadline.close();
 			}
-			const operation = managedControlOperation(control);
-			await operations.request({
-				authority,
-				operation,
-				input: managedControlInput(control, input),
-				idempotencyKey: authority.requestKey,
-				signal: input.signal,
-				onDispatch,
-			});
-			await operations.acquire(authority);
-			return { result: withManagedProof(emptyControlResult(), authority) };
 		},
 		async getState(input) {
 			const authority = managedAuthorityFor(input, "session.state");

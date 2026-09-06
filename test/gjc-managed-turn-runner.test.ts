@@ -298,6 +298,62 @@ describe("managed turn runner", () => {
 		}
 	});
 
+	test("control request and final acquisition share one remaining budget", async () => {
+		const fake = new RunnerRuntime();
+		const runner = createManagedGjcTurnRunner(fake.runtime, 5_000);
+		let now = Date.now();
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		const request = fake.request.bind(fake);
+		fake.request = async (attachment, frame, options) => {
+			const result = await request(attachment, frame, options);
+			now += 600;
+			return result;
+		};
+		try {
+			await runner.runControl!(
+				{ ...managedAbortAndPromptInput(), control: { operation: "steer" } },
+				managedControlMapping(),
+				{} as never,
+				undefined,
+				undefined,
+				undefined,
+				{ timeoutMs: 1_000, beforeDispatch: () => undefined },
+			);
+			expect(fake.reconcileTimeouts).toEqual([1_000, 400]);
+			expect(fake.acquisitionTimeouts).toEqual([1_000, 400]);
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
+	test("control caller fence can reject at dispatch despite a live inner timer", async () => {
+		const fake = new RunnerRuntime();
+		const runner = createManagedGjcTurnRunner(fake.runtime, 5_000);
+		let current = true;
+		const request = fake.request.bind(fake);
+		fake.request = async (attachment, frame, options) => {
+			current = false;
+			return request(attachment, frame, options);
+		};
+		await expect(
+			runner.runControl!(
+				{ ...managedAbortAndPromptInput(), control: { operation: "steer" } },
+				managedControlMapping(),
+				{} as never,
+				undefined,
+				undefined,
+				undefined,
+				{
+					timeoutMs: 1_000,
+					beforeDispatch: () => {
+						if (!current) throw new Error("control owner expired");
+					},
+				},
+			),
+		).rejects.toThrow("control owner expired");
+		expect(fake.requests).toEqual([]);
+	});
+
 	test("requires complete managed authority for lifecycle invocation", async () => {
 		const fake = new RunnerRuntime();
 		await expect(
@@ -1163,6 +1219,8 @@ class RunnerRuntime {
 	readonly externalLifecycle: Record<string, unknown>[] = [];
 	readonly forkRequests: Record<string, unknown>[] = [];
 	readonly registered: unknown[] = [];
+	readonly reconcileTimeouts: (number | undefined)[] = [];
+	readonly acquisitionTimeouts: (number | undefined)[] = [];
 	readonly subscriptionCountAtRequest: number[] = [];
 	status: "retired" | "current" | "replaced" = "current";
 	unsubscribed = 0;
@@ -1182,8 +1240,11 @@ class RunnerRuntime {
 	get runtime(): ManagedSdkRuntime {
 		return this as unknown as ManagedSdkRuntime;
 	}
-	async reconcile() {}
-	async acquireAttachment(key: unknown) {
+	async reconcile(timeoutMs?: number) {
+		this.reconcileTimeouts.push(timeoutMs);
+	}
+	async acquireAttachment(key: unknown, timeoutMs?: number) {
+		this.acquisitionTimeouts.push(timeoutMs);
 		return this.token(key as TenantSessionKey);
 	}
 	async registerLifecycleTenant(key: unknown, outcome: unknown) {

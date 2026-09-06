@@ -89,7 +89,11 @@ export interface ManagedSessionOperations {
 	close(input: ManagedLifecycleInput): Promise<unknown>;
 	delete(input: ManagedLifecycleInput): Promise<unknown>;
 	list(input: ManagedLifecycleInput): Promise<unknown>;
-	acquire(authority: ManagedTurnAuthority): Promise<ManagedSdkAttachment>;
+	acquire(
+		authority: ManagedTurnAuthority,
+		timeoutMs?: number,
+		beforeDispatch?: () => void,
+	): Promise<ManagedSdkAttachment>;
 	request(input: ManagedRequestInput): Promise<Readonly<Record<string, unknown>>>;
 	query(
 		authority: ManagedTurnAuthority,
@@ -153,10 +157,10 @@ export function createManagedSessionOperations(
 		beforeDispatch?.();
 		return await deadline.wait(runtime.acquireAttachment(key, deadline.remaining()));
 	};
-	const acquire = async (authority: ManagedTurnAuthority) => {
-		const deadline = new ManagedOperationDeadline(defaultTimeoutMs, "attachment acquisition");
+	const acquire = async (authority: ManagedTurnAuthority, timeoutMs?: number, beforeDispatch?: () => void) => {
+		const deadline = new ManagedOperationDeadline(timeoutMs ?? defaultTimeoutMs, "attachment acquisition");
 		try {
-			return await acquireWithin(authority, deadline);
+			return await acquireWithin(authority, deadline, beforeDispatch);
 		} finally {
 			deadline.close();
 		}

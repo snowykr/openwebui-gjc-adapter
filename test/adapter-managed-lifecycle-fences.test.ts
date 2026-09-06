@@ -21,7 +21,13 @@ import { createUserWorkspaceRegistry } from "../src/security/user-workspace";
 import { createWorkspaceLeaseManager, workspaceLeaseId } from "../src/security/workspace-lease";
 import { writeDirectV3Authority } from "./cli-fixtures";
 
-async function fixture(controls: { afterCreate?: () => Promise<void>; afterFork?: () => void } = {}) {
+async function fixture(
+	controls: {
+		afterCreate?: () => Promise<void>;
+		afterFork?: () => void;
+		afterRequestDispatch?: (frame: Record<string, unknown>) => void;
+	} = {},
+) {
 	const root = await mkdtemp(join(tmpdir(), "gjc-production-lifecycle-"));
 	const stateRoot = join(root, "state");
 	const sessionRoot = join(root, "sessions");
@@ -148,6 +154,7 @@ async function fixture(controls: { afterCreate?: () => Promise<void>; afterFork?
 									requestOptions.beforeDispatch?.({} as never);
 									requestOptions.onDispatch?.({} as never);
 									calls.push(String(frame.query ?? frame.operation));
+									controls.afterRequestDispatch?.(frame);
 									if (frame.type === "query_request")
 										return { type: "query_response", ok: true, page: { items: [], complete: true } };
 									await onFrame?.(attachment, {
@@ -336,6 +343,86 @@ test("production branch retains its exact receipt after the effect replaces its 
 		await f.close();
 	}
 });
+
+test.each(["preaborted", "dispatched"] as const)(
+	"production control %s cancellation has only one dispatch-aware owner",
+	async phase => {
+		const controls: { afterRequestDispatch?: (frame: Record<string, unknown>) => void } = {};
+		const f = await fixture(controls);
+		try {
+			const project = { ...f.project, cwd: f.workspace.root, sessionRoot: f.workspace.sessionRoot };
+			const runner = createManagedGjcTurnRunner(f.runtime, 2_000);
+			await routeGjcTurn({
+				project,
+				principalId: f.prepared.principalId,
+				chatId: f.prepared.chatId,
+				userMessageId: "ingress",
+				text: "hello",
+				preparedManagedAuthority: f.prepared,
+				mappings: f.mappings,
+				runner,
+			});
+			const baseline = [...f.calls];
+			const cancellation = new AbortController();
+			let abortObserved!: () => void;
+			const abort = new Promise<void>(resolve => {
+				abortObserved = resolve;
+			});
+			controls.afterRequestDispatch = frame => {
+				if (frame.operation === "turn.follow_up") cancellation.abort();
+				if (frame.operation === "turn.abort") abortObserved();
+			};
+			if (phase === "preaborted") cancellation.abort();
+			const outerCancel = spyOn(runner, "cancelTurn");
+			try {
+				const gateway = createGjcRoutingLiveGatewayRunner({
+					turnRunner: runner,
+					mappings: f.mappings,
+					turnTimeoutMs: 2_000,
+				});
+				await expect(
+					gateway.run({
+						project,
+						prompt: "follow up",
+						chatId: f.prepared.chatId,
+						messageId: "control",
+						userMessageId: "control",
+						userMessageParentId: "ingress",
+						continued: true,
+						ownerUserId: f.prepared.principalId,
+						control: { operation: "follow_up" },
+						signal: cancellation.signal,
+					}),
+				).rejects.toMatchObject({ code: "gjc_turn_cancelled" });
+				if (phase === "dispatched") {
+					let timer!: ReturnType<typeof setTimeout>;
+					try {
+						await Promise.race([
+							abort,
+							new Promise<never>((_, reject) => {
+								timer = setTimeout(() => reject(new Error("abort not observed")), 2_000);
+							}),
+						]);
+					} finally {
+						clearTimeout(timer);
+					}
+				}
+				expect(outerCancel).not.toHaveBeenCalled();
+				expect(f.calls.slice(baseline.length).filter(call => call === "turn.abort")).toHaveLength(
+					phase === "dispatched" ? 1 : 0,
+				);
+				expect(f.mappings.operationScoped(f.prepared, "control")?.state).toBe(
+					phase === "dispatched" ? "uncertain" : undefined,
+				);
+				if (phase === "preaborted") expect(f.calls).toEqual(baseline);
+			} finally {
+				outerCancel.mockRestore();
+			}
+		} finally {
+			await f.close();
+		}
+	},
+);
 
 test("production staged proof grants cannot authorize active requests or survive lease loss", async () => {
 	const f = await fixture();

@@ -48,105 +48,109 @@ export async function runRoutingControl(
 	if (!isManagedMapping(existing)) throw new Error("GJC controls require managed session authority.");
 	if (control.operation === "branch")
 		return runManagedBranch(scopedInput, turn, existing, hash, managedSuccessorFlow(controlled));
-	if (control.operation === "session.new" || control.operation === "session.resume")
-		return runManagedLifecycleControl(scopedInput, turn, existing, hash);
-	if (controlled.runControl === undefined) throw new OpenWebUIControlError(control.operation);
-	const runControl = controlled.runControl;
-	if (controlled.withLifecyclePublication === undefined)
-		throw new Error("GJC runner must provide lifecycle publication for controls.");
-	const sessionRoot = turn.project.sessionRoot ?? `${turn.project.cwd}/.gjc/sessions`;
-	const cancellation = {
-		projectId: existing.projectId,
-		chatId: existing.chatId,
-		sessionId: existing.sessionId,
-		operationId: turn.userMessageId,
-		...(principalId === undefined ? {} : { principalId }),
-		...(isManagedMapping(existing) ? { managedAuthority: existing.managedAuthority } : {}),
-	};
-	let cancellationRequested = false;
-	const onAbort = () => {
-		if (cancellationRequested) return;
-		cancellationRequested = true;
-		void Promise.resolve(controlled.cancelTurn?.(cancellation)).catch(() => undefined);
-	};
-	turn.signal?.addEventListener("abort", onAbort, { once: true });
-	if (turn.signal?.aborted) onAbort();
-	// The public SDK control runner reports the exact point at which a command
-	// is handed to the SDK. Lifecycle controls use their separate durable invoking
-	// boundary and do not reinterpret a lifecycle invocation as Router dispatch.
-	const dispatchIsTracked = true;
-	let predecessor: { readonly applied: GjcControlResult; readonly mapping?: SessionMapping };
+	throwIfAborted(turn.signal);
+	const deadline = new ManagedOperationDeadline(input.turnTimeoutMs, "control");
 	try {
-		throwIfAborted(turn.signal);
-		predecessor = await controlled.withLifecyclePublication(
-			{
-				cwd: turn.project.cwd,
-				sessionRoot,
-				projectId: existing.projectId,
-				chatId: existing.chatId,
-				sessionId: existing.sessionId,
-			},
-			async lifecycle => {
-				throwIfAborted(turn.signal);
-				let dispatchFired: boolean | undefined = dispatchIsTracked ? false : undefined;
-				mappings.beginOperation(turn.chatId, {
-					id: turn.userMessageId,
-					kind: controlOperationKind(control.operation),
-					ingressId: turn.userMessageId,
-					detail: hash,
-				});
-				try {
-					const applied = await runControl.call(controlled, turn, existing, lifecycle, undefined, () => {
-						dispatchFired = true;
-					});
-					throwIfAborted(turn.signal);
-					return {
-						applied,
-						mapping: await publishManagedControlMapping(
-							mappings,
-							lifecycle,
-							turn,
-							existing,
+		if (control.operation === "session.new" || control.operation === "session.resume")
+			return await runManagedLifecycleControl(scopedInput, turn, existing, hash, deadline);
+		if (controlled.runControl === undefined) throw new OpenWebUIControlError(control.operation);
+		const runControl = controlled.runControl;
+		if (controlled.withLifecyclePublication === undefined)
+			throw new Error("GJC runner must provide lifecycle publication for controls.");
+		const sessionRoot = turn.project.sessionRoot ?? `${turn.project.cwd}/.gjc/sessions`;
+		const prepared = {
+			id: turn.userMessageId,
+			kind: controlOperationKind(control.operation),
+			ingressId: turn.userMessageId,
+			detail: hash,
+		};
+		deadline.remaining();
+		mappings.beginOperation(turn.chatId, prepared);
+		let dispatchFired = false;
+		const current = () => {
+			deadline.remaining();
+			throwIfAborted(turn.signal);
+			assertCurrentBranchPredecessor(mappings, turn.chatId, existing, turn.userMessageId);
+		};
+		let predecessor: { readonly applied: GjcControlResult; readonly mapping: SessionMapping };
+		try {
+			current();
+			predecessor = await deadline.wait(
+				controlled.withLifecyclePublication(
+					{
+						cwd: turn.project.cwd,
+						sessionRoot,
+						projectId: existing.projectId,
+						chatId: existing.chatId,
+						sessionId: existing.sessionId,
+					},
+					async lifecycle => {
+						current();
+						const applied = await deadline.wait(
+							runControl.call(
+								controlled,
+								turn,
+								existing,
+								lifecycle,
+								undefined,
+								() => {
+									dispatchFired = true;
+								},
+								undefined,
+								{ timeoutMs: deadline.remaining(), beforeDispatch: current },
+							),
+						);
+						current();
+						return {
 							applied,
-							hash,
-							mapping => ensureProjectionRows(input.outbox, mapping, projectionOwnerUserId, principalId),
-						),
-					};
-				} catch (error) {
-					if (dispatchFired === false) {
-						mappings.discardPendingOperation(turn.chatId, {
-							id: turn.userMessageId,
-							ingressId: turn.userMessageId,
-							detail: hash,
-						});
-					} else {
-						mappings.transitionOperation(turn.chatId, turn.userMessageId, "uncertain", hash);
-					}
-					throw error;
+							mapping: await deadline.wait(
+								publishManagedControlMapping(
+									mappings,
+									lifecycle,
+									turn,
+									existing,
+									applied,
+									hash,
+									mapping => ensureProjectionRows(input.outbox, mapping, projectionOwnerUserId, principalId),
+									current,
+								),
+							),
+						};
+					},
+				),
+			);
+		} catch (error) {
+			try {
+				if (mappings.operation(turn.chatId, turn.userMessageId)?.state !== "complete") {
+					if (!dispatchFired) mappings.discardPendingOperation(turn.chatId, prepared);
+					else mappings.transitionOperation(turn.chatId, turn.userMessageId, "uncertain", hash);
 				}
+			} catch (persistenceError) {
+				throw new AggregateError([error, persistenceError], "Managed control failure could not be recorded.");
+			}
+			throw error;
+		}
+		const { applied, mapping } = predecessor;
+		const result = applied.result;
+		return withCanonicalModel(
+			{
+				content: result?.text ?? mapping.assistantText ?? "",
+				...(result === undefined || result.events.length === 0
+					? {}
+					: {
+							events: projectTurnEvents(
+								result.events,
+								mapping.modelSelection === undefined
+									? undefined
+									: formatCanonicalModelId(mapping.modelSelection),
+							),
+						}),
 			},
+			mapping.modelSelection,
 		);
 	} finally {
-		turn.signal?.removeEventListener("abort", onAbort);
-		controlled.clearTurnCancellation?.(cancellation);
+		deadline.close();
 	}
-	const { applied, mapping } = predecessor;
-	if (mapping === undefined) throw new Error("GJC control did not publish a mapping.");
-	const result = applied.result;
-	return withCanonicalModel(
-		{
-			content: result?.text ?? mapping.assistantText ?? "",
-			...(result === undefined || result.events.length === 0
-				? {}
-				: {
-						events: projectTurnEvents(
-							result.events,
-							mapping.modelSelection === undefined ? undefined : formatCanonicalModelId(mapping.modelSelection),
-						),
-					}),
-		},
-		mapping.modelSelection,
-	);
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
@@ -158,6 +162,7 @@ async function runManagedLifecycleControl(
 	turn: LiveGatewayRunnerInput,
 	existing: SessionMapping,
 	hash: string,
+	deadline: ManagedOperationDeadline,
 ): Promise<LiveGatewayRunnerResult & { readonly model?: string }> {
 	throwIfAborted(turn.signal);
 	const control = turn.control!;
@@ -196,6 +201,7 @@ async function runManagedLifecycleControl(
 		evidence = next;
 	};
 	const current = () => {
+		deadline.remaining();
 		if (finished) throw new Error("Managed lifecycle control ownership has ended.");
 		assertCurrentBranchPredecessor(mappings, turn.chatId, existing, turn.userMessageId);
 	};
@@ -239,8 +245,17 @@ async function runManagedLifecycleControl(
 	};
 	try {
 		record(evidence);
-		const applied = await runner.withLifecyclePublication(address, lifecycle =>
-			runner.runControl!(turn, existing, lifecycle, undefined, undefined, owner),
+		current();
+		const applied = await deadline.wait(
+			runner.withLifecyclePublication(address, lifecycle => {
+				current();
+				return deadline.wait(
+					runner.runControl!(turn, existing, lifecycle, undefined, undefined, owner, {
+						timeoutMs: deadline.remaining(),
+						beforeDispatch: current,
+					}),
+				);
+			}),
 		);
 		throwIfAborted(turn.signal);
 		current();
@@ -262,21 +277,33 @@ async function runManagedLifecycleControl(
 			throw new Error("Managed lifecycle control result identity changed.");
 		assertManagedProof(proof, authority);
 		record(transitionManagedLifecycleEvidence(evidence, "active_generation_proven", { proven: proof }));
-		const mapping = await runner.withLifecyclePublication(
-			{ ...address, sessionId: authority.sessionId },
-			async lifecycle => {
-				await runner.getState({
-					...address,
-					sessionId: authority.sessionId,
-					lifecycle,
-					managedAuthority: authority,
-				});
+		current();
+		const mapping = await deadline.wait(
+			runner.withLifecyclePublication({ ...address, sessionId: authority.sessionId }, async lifecycle => {
+				current();
+				await deadline.wait(
+					runner.getState({
+						...address,
+						sessionId: authority.sessionId,
+						lifecycle,
+						managedAuthority: authority,
+					}),
+				);
 				throwIfAborted(turn.signal);
 				current();
-				return publishManagedControlMapping(mappings, lifecycle, turn, existing, applied, hash, mapping =>
-					ensureProjectionRows(input.outbox, mapping, source.principalId, source.principalId),
+				return deadline.wait(
+					publishManagedControlMapping(
+						mappings,
+						lifecycle,
+						turn,
+						existing,
+						applied,
+						hash,
+						mapping => ensureProjectionRows(input.outbox, mapping, source.principalId, source.principalId),
+						current,
+					),
 				);
-			},
+			}),
 		);
 		return withCanonicalModel(
 			{
@@ -289,11 +316,13 @@ async function runManagedLifecycleControl(
 		);
 	} catch (error) {
 		try {
-			if (evidence.state === "intent_prepared") mappings.discardPendingOperation(turn.chatId, prepared);
-			else {
-				if (canTransitionManagedLifecycleState(evidence.state, "uncertain"))
-					record(transitionManagedLifecycleEvidence(evidence, "uncertain"));
-				mappings.transitionOperation(turn.chatId, turn.userMessageId, "uncertain", hash);
+			if (mappings.operation(turn.chatId, turn.userMessageId)?.state !== "complete") {
+				if (evidence.state === "intent_prepared") mappings.discardPendingOperation(turn.chatId, prepared);
+				else {
+					if (canTransitionManagedLifecycleState(evidence.state, "uncertain"))
+						record(transitionManagedLifecycleEvidence(evidence, "uncertain"));
+					mappings.transitionOperation(turn.chatId, turn.userMessageId, "uncertain", hash);
+				}
 			}
 		} catch (persistenceError) {
 			throw new AggregateError(
@@ -620,6 +649,7 @@ async function publishManagedControlMapping(
 	applied: GjcControlResult,
 	hash: string,
 	afterPublish: (mapping: SessionMapping) => void,
+	beforePublish: () => void,
 ): Promise<SessionMapping> {
 	const result = applied.result;
 	const authority = result?.managedAuthority ?? existing.managedAuthority;
@@ -655,7 +685,9 @@ async function publishManagedControlMapping(
 	}
 	const publishedAuthority = managedAuthorityCopy(authority);
 	assertManagedProof(proof, publishedAuthority);
+	beforePublish();
 	return lifecycle.publishManaged(proof, () => {
+		beforePublish();
 		const published = mappings.completeOperationWithMapping(
 			turn.chatId,
 			turn.userMessageId,

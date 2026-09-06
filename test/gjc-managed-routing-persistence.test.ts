@@ -64,6 +64,142 @@ function fixture() {
 }
 
 describe("managed routing persistence", () => {
+	for (const operation of ["steer", "session.new", "session.resume"] as const) {
+		test.each(["admission", "effect", "publication"] as const)(
+			`${operation} %s timeout cannot mutate from a late callback`,
+			async phase => {
+				const f = fixture();
+				let release!: () => void;
+				const gate = new Promise<void>(resolve => {
+					release = resolve;
+				});
+				let reached = false;
+				const wait = async () => {
+					reached = true;
+					await gate;
+				};
+				try {
+					await routeGjcTurn(f.input());
+					const original = f.store.getScoped(f.scope)!;
+					let effects = 0;
+					const runner = Object.assign(f.runner, {
+						runControl: (async (_turn, _mapping, _lifecycle, _successor, onDispatch, owner, execution) => {
+							execution!.beforeDispatch();
+							expect(execution!.timeoutMs).toBeGreaterThan(0);
+							expect(execution!.timeoutMs).toBeLessThanOrEqual(2_000);
+							if (owner !== undefined) await owner.onInvoking();
+							else onDispatch?.();
+							effects += 1;
+							const authority = owner === undefined ? original.managedAuthority! : controlAuthority(owner);
+							await owner?.onAcknowledged(authority);
+							if (phase === "effect") await wait();
+							return controlResult(authority);
+						}) satisfies NonNullable<GjcTurnRunner["runControl"]>,
+					});
+					const transaction = runner.withLifecyclePublication.bind(runner);
+					runner.withLifecyclePublication = async (address, effect) => {
+						if (phase === "admission") await wait();
+						return transaction(address, async lifecycle => {
+							if (operation === "steer")
+								await runner.getState({ ...address, lifecycle, managedAuthority: original.managedAuthority! });
+							const publish = lifecycle.publishManaged.bind(lifecycle);
+							lifecycle.publishManaged = async (proof, write) => {
+								if (phase === "publication") await wait();
+								return publish(proof, write);
+							};
+							return effect(lifecycle);
+						});
+					};
+					const turn =
+						operation === "steer"
+							? { ...branchTurn("control-steer"), control: { operation: "steer" as const } }
+							: lifecycleTurn(operation);
+					const gateway = () =>
+						createGjcRoutingLiveGatewayRunner({ turnRunner: runner, mappings: f.store, turnTimeoutMs: 2_000 });
+					await expect(gateway().run(turn)).rejects.toMatchObject({ code: "timeout" });
+					expect(reached).toBe(true);
+					const bytes = readFileSync(f.file);
+					release();
+					await new Promise(resolve => setTimeout(resolve, 0));
+					expect(readFileSync(f.file).equals(bytes)).toBe(true);
+					f.reopen();
+					const receipt = f.store.operationScoped(f.scope, turn.userMessageId);
+					if (phase === "admission") expect(receipt).toBeUndefined();
+					else {
+						expect(receipt?.state).toBe("uncertain");
+						expect(receipt?.result).toBeUndefined();
+						await expect(gateway().run(turn)).rejects.toThrow("requires reconciliation");
+					}
+					expect(f.store.getScoped(f.scope)).toEqual(original);
+					expect(effects).toBe(phase === "admission" ? 0 : 1);
+				} finally {
+					release();
+					f.close();
+				}
+			},
+		);
+	}
+
+	test.each(["steer", "session.new", "session.resume"] as const)(
+		"%s publication timeout after local commit preserves immutable replay",
+		async operation => {
+			const f = fixture();
+			let release!: () => void;
+			const gate = new Promise<void>(resolve => {
+				release = resolve;
+			});
+			try {
+				await routeGjcTurn(f.input());
+				const original = f.store.getScoped(f.scope)!;
+				let effects = 0;
+				const runner = Object.assign(f.runner, {
+					runControl: (async (_turn, _mapping, _lifecycle, _successor, dispatch, owner) => {
+						await owner?.onInvoking();
+						if (owner === undefined) dispatch?.();
+						effects += 1;
+						const authority = owner === undefined ? original.managedAuthority! : controlAuthority(owner);
+						await owner?.onAcknowledged(authority);
+						return controlResult(authority);
+					}) satisfies NonNullable<GjcTurnRunner["runControl"]>,
+				});
+				const transaction = runner.withLifecyclePublication.bind(runner);
+				runner.withLifecyclePublication = (address, effect) =>
+					transaction(address, async lifecycle => {
+						if (operation === "steer")
+							await runner.getState({ ...address, lifecycle, managedAuthority: original.managedAuthority! });
+						const publish = lifecycle.publishManaged.bind(lifecycle);
+						lifecycle.publishManaged = async (proof, write) => {
+							const result = await publish(proof, write);
+							await gate;
+							return result;
+						};
+						return effect(lifecycle);
+					});
+				const turn =
+					operation === "steer"
+						? { ...branchTurn("committed-steer"), control: { operation: "steer" as const } }
+						: lifecycleTurn(operation);
+				const gateway = () =>
+					createGjcRoutingLiveGatewayRunner({ turnRunner: runner, mappings: f.store, turnTimeoutMs: 2_000 });
+				await expect(gateway().run(turn)).rejects.toMatchObject({ code: "timeout" });
+				const receipt = f.store.operationScoped(f.scope, turn.userMessageId)!;
+				expect(receipt.state).toBe("complete");
+				expect(receipt.result).toBeDefined();
+				const bytes = readFileSync(f.file);
+				release();
+				await new Promise(resolve => setTimeout(resolve, 0));
+				expect(readFileSync(f.file).equals(bytes)).toBe(true);
+				f.reopen();
+				expect(f.store.operationScoped(f.scope, turn.userMessageId)).toEqual(receipt);
+				await expect(gateway().run(turn)).resolves.toBeDefined();
+				expect(effects).toBe(1);
+			} finally {
+				release();
+				f.close();
+			}
+		},
+	);
+
 	test.each(["session.new", "session.resume"] as const)(
 		"journals %s intent, invocation, acknowledgement and proof before publication across reopen",
 		async operation => {
