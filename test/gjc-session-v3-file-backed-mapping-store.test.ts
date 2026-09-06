@@ -934,7 +934,7 @@ describe("SessionV3FileBackedMappingStore", () => {
 				},
 			});
 			const firstBytes = readFileSync(filePath, "utf8");
-			expect(firstBytes).toContain('"authorityEpoch":"managed/1"');
+			expect(firstBytes).toContain('"authorityEpoch":"gjc-public-sdk-v015-managed/1"');
 			expect(firstBytes).not.toContain("descriptorPath");
 			expect(firstBytes).not.toContain("sessionFile");
 			store.close();

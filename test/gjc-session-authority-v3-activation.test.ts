@@ -13,7 +13,7 @@ import {
 import { probeSessionAuthorityEpoch } from "../src/gjc/session-authority-epoch";
 import { AuthorityMutationLock } from "../src/gjc/session-authority-file";
 import { FileSessionAuthority } from "../src/gjc/session-authority-persistence";
-import { parseSessionAuthorityV3Document } from "../src/gjc/session-authority-v3";
+import { parseSessionAuthorityV3Document, SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import {
 	activateSessionAuthorityV3,
 	type SessionAuthorityV3ActivationBoundary,
@@ -1314,7 +1314,10 @@ describe("session authority V3 activation", () => {
 			expect(result.status).toBe("activated");
 			if (result.status !== "activated") throw new Error("Activation was unexpectedly blocked.");
 			const marker = JSON.parse(await readFile(result.markerPath, "utf8")) as Record<string, unknown>;
-			expect(marker).toMatchObject({ activationV3Digest: result.activationV3Digest, authorityEpoch: "managed/1" });
+			expect(marker).toMatchObject({
+				activationV3Digest: result.activationV3Digest,
+				authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+			});
 			expect(marker.source).toMatchObject({ baseDigest: digest(f.original), walPresent: false });
 			expect(probeSessionAuthorityEpoch(f.canonicalPath)).toEqual({
 				status: "v3",

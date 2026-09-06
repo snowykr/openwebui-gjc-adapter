@@ -15,6 +15,7 @@ import {
 	renderResolvedExistingSystemdUnit,
 	renderResolvedSystemdComposeUnit,
 } from "../src/configure/systemd";
+import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import { buildResolvedInstalledAdapterServerOptions } from "../src/installed-adapter-server-options";
 
 const { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync } = fs;
@@ -80,7 +81,7 @@ function writeV3Activation(canonicalPath: string, digestOverride?: string): void
 		`${JSON.stringify({
 			kind: "openwebui-gjc-session-authority",
 			version: 3,
-			authorityEpoch: "managed/1",
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
 			mappings: [],
 			provisionalOperations: [],
 		})}\n`,
@@ -92,7 +93,7 @@ function writeV3Activation(canonicalPath: string, digestOverride?: string): void
 		`${JSON.stringify({
 			kind: "openwebui-gjc-session-authority-active",
 			version: 1,
-			authorityEpoch: "managed/1",
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
 			activationV3Digest,
 			source: {
 				baseDigest: "0".repeat(64),
@@ -135,8 +136,16 @@ describe("runtime location composition", () => {
 		}
 	});
 
-	test("rejects absent, V2, malformed, unmarked, and malformed-marker authorities before effects", async () => {
-		for (const kind of ["absent", "v2", "malformed", "unmarked", "malformed-marker"] as const) {
+	test("rejects absent, V2, malformed, unmarked, malformed-marker, and obsolete-epoch authorities before effects", async () => {
+		for (const kind of [
+			"absent",
+			"v2",
+			"malformed",
+			"unmarked",
+			"malformed-marker",
+			"obsolete-epoch",
+			"obsolete-marker",
+		] as const) {
 			const root = realpathSync(mkdtempSync(join(tmpdir(), `gjc-v3-runtime-blocked-${kind}-`)));
 			const calls: string[] = [];
 			const runtime = {
@@ -161,6 +170,12 @@ describe("runtime location composition", () => {
 					writeV3Activation(canonicalPath);
 					if (kind === "unmarked") rmSync(`${canonicalPath}.v3-active.json`);
 					if (kind === "malformed-marker") writeFileSync(`${canonicalPath}.v3-active.json`, "{\n");
+					if (kind === "obsolete-epoch" || kind === "obsolete-marker") {
+						const target = kind === "obsolete-epoch" ? canonicalPath : `${canonicalPath}.v3-active.json`;
+						const document = JSON.parse(readFileSync(target, "utf8"));
+						document.authorityEpoch = "managed/1";
+						writeFileSync(target, JSON.stringify(document));
+					}
 				}
 				await expect(
 					buildResolvedAdapterServerOptions(config, { managedSdkRuntime: runtime as never }),

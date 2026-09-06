@@ -280,6 +280,18 @@ function bootstrapGraph() {
 }
 
 describe("session authority v3 full graph", () => {
+	test("uses the original cutover epoch and rejects obsolete schema authority without rewriting runtime epochs", () => {
+		const value = golden();
+		expect(value.authorityEpoch).toBe("gjc-public-sdk-v015-managed/1");
+		const parsed = parseSessionAuthorityV3Document(JSON.stringify(value))!;
+		expect(parsed.mappings[0]!.managedAuthority?.epoch).toBe("runtime-1");
+		const obsolete = { ...value, authorityEpoch: "managed/1" };
+		expect(parseSessionAuthorityV3Document(JSON.stringify(obsolete))).toBeUndefined();
+		const nested = clonedGolden();
+		nested.mappings[0].managedAuthority.authorityEpoch = "managed/1";
+		expect(parseSessionAuthorityV3Document(JSON.stringify(nested))).toBeUndefined();
+	});
+
 	test("ordinary store reopen retains bootstrap request identity and historical results without serving", () => {
 		const root = mkdtempSync(join(tmpdir(), "gjc-v3-bootstrap-evidence-"));
 		const path = join(root, "authority.json");

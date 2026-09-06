@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { access } from "node:fs/promises";
 import * as path from "node:path";
 import { isManagedLifecycleEvidence } from "../src/gjc/managed-lifecycle-evidence";
+import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import { canonicalSessionMappingKey } from "../src/gjc/session-mapping-store";
 import { LOW_MODEL_ID, MEDIUM_MODEL_ID, OFF_MODEL_ID } from "./model-selection-fixtures";
 import { expectNoDeliveryMutation, expectSelectionError } from "./real-selection-expectations";
@@ -218,9 +219,9 @@ describe("real canonical model selection scenarios", () => {
 				sessionId,
 				generation: expect.any(Number),
 				leaseId: "selection-fixture-lease",
-				epoch: "managed/1",
+				epoch: SESSION_AUTHORITY_V3_EPOCH,
 				requestKey: "user-prompt-failed",
-				authorityEpoch: "managed/1",
+				authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
 			});
 			const logicalAuthority = {
 				principalId: "owner-selection",
@@ -228,7 +229,7 @@ describe("real canonical model selection scenarios", () => {
 				canonicalWorkspace: path.join(harness.root, ".gjc", "openwebui", "default-reader"),
 				chatId: "chat-prompt-failed",
 				leaseId: "selection-fixture-lease",
-				epoch: "managed/1",
+				epoch: SESSION_AUTHORITY_V3_EPOCH,
 				requestKey: "user-prompt-failed",
 			};
 			expect(operation.lifecycle).toMatchObject({

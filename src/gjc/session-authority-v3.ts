@@ -22,7 +22,7 @@ import { normalizeModelSelection } from "./session-operation-codec";
 import type { GjcTurnEvent, ManagedTurnAuthority } from "./turn-runner";
 
 export const SESSION_AUTHORITY_V3_VERSION = 3 as const;
-export const SESSION_AUTHORITY_V3_EPOCH = "managed/1" as const;
+export const SESSION_AUTHORITY_V3_EPOCH = "gjc-public-sdk-v015-managed/1" as const;
 export const SESSION_AUTHORITY_V3_KIND = "openwebui-gjc-session-authority" as const;
 export const MANAGED_TURN_AUTHORITY_V3_EPOCH = SESSION_AUTHORITY_V3_EPOCH;
 
