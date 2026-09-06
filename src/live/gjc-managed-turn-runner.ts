@@ -115,7 +115,7 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime, turnTimeo
 						authority,
 					);
 				} catch (error) {
-					await closeAfterPrePromptFailure(operations, authority, { path: input.cwd }, error);
+					await closeAfterPrePromptFailure(operations, authority, { path: input.cwd }, error, deadline);
 					throw error;
 				}
 			} finally {
@@ -286,8 +286,10 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime, turnTimeo
 					chatId: input.chatId,
 					sessionId: authority.sessionId,
 				};
-				const transaction = managedLifecycleTransaction(address, authority);
+				const transaction = managedLifecycleTransaction(address, authority, deadline);
+				let publicationStarted = false;
 				try {
+					deadline.remaining();
 					await deadline.wait(beforePrompt(address, managedProof(authority), transaction));
 					throwIfAborted(input.signal);
 					const modelSelection = await deadline.wait(
@@ -307,10 +309,22 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime, turnTimeo
 						authority,
 					);
 					deadline.remaining();
-					return await publish({ ...address, ...result }, transaction);
+					publicationStarted = true;
+					return await deadline.wait(publish({ ...address, ...result }, transaction));
 				} catch (error) {
-					await onFailure?.(transaction, error);
-					await closeAfterPrePromptFailure(operations, authority, { path: input.cwd }, error);
+					if (onFailure !== undefined) {
+						try {
+							deadline.remaining();
+							await deadline.wait(onFailure(transaction, error));
+						} catch (failureError) {
+							throw new AggregateError(
+								[error, failureError],
+								"Managed startup failure persistence is uncertain.",
+							);
+						}
+					}
+					if (!publicationStarted)
+						await closeAfterPrePromptFailure(operations, authority, { path: input.cwd }, error, deadline);
 					throw error;
 				}
 			} finally {
@@ -323,10 +337,12 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime, turnTimeo
 function managedLifecycleTransaction(
 	address: GjcLifecyclePublicationAddress,
 	authority?: ManagedTurnAuthority,
+	deadline?: ManagedOperationDeadline,
 ): GjcLifecycleTransaction {
 	const transaction: GjcLifecycleTransaction = {
 		address,
 		async publishManaged(proof, write) {
+			deadline?.remaining();
 			const bound = managedLifecycleAuthorities.get(transaction);
 			if (bound === undefined) throw new Error("Managed lifecycle publication requires complete bound authority.");
 			assertManagedLifecyclePublication(address, bound, proof);
@@ -641,12 +657,17 @@ async function closeAfterPrePromptFailure(
 	authority: ManagedTurnAuthority,
 	target: Readonly<Record<string, unknown>>,
 	original: unknown,
+	deadline: ManagedOperationDeadline,
 ): Promise<void> {
 	try {
-		await operations.close({
-			authority,
-			target: { ...target, sessionId: authority.sessionId, endpointGeneration: authority.generation },
-		});
+		const timeoutMs = deadline.remaining();
+		await deadline.wait(
+			operations.close({
+				authority,
+				target: { ...target, sessionId: authority.sessionId, endpointGeneration: authority.generation },
+				timeoutMs,
+			}),
+		);
 	} catch (closeError) {
 		throw new AggregateError([original, closeError], "Managed pre-prompt failure cleanup is uncertain.");
 	}

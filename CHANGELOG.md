@@ -26,6 +26,7 @@
 
 ### Fixed
 
+- Bounded managed startup binding/publication/failure callbacks and direct-create cleanup under the original creation/prompt deadline. Late lifecycle writes fail closed, cleanup cannot renew expired budgets, and publication failure no longer remotely closes a potentially committed session; original and failure-owner errors remain observable.
 - Applied one model-reader lifetime budget across factory admission, resolution, runtime acquisition, all catalog queries, and final disposal, with configured timeout propagation for existing and temporary readers. Removed detached cancellation cleanup and retained its errors; late results cannot start cleanup after expiration. Temporary durable lifecycle and exact-close authority remain unresolved.
 - Persisted validated branch acknowledgements before renewed predecessor-currentness checks. Same-tenant session/generation/lease/request-key replacement now retains the uncertain successor across canonical reopen without adoption, prompt, publication, or another fork; replacement before invocation still blocks dispatch.
 - Reused bounded complete-page collection for managed model/provider catalogs instead of returning only their first page. Added per-query lease/request/page/cleanup deadlines, stopped-reader result rejection, and stable failure replay for repeated stops; temporary provisioning's durable lifecycle and exact-close gaps remain unresolved.

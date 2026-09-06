@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import type { NormalizedModelSelection } from "../src/contracts";
 import type { ManagedSdkAttachment, ManagedSdkRuntime, TenantSessionKey } from "../src/gjc/managed-sdk-runtime";
 import type {
@@ -28,6 +28,206 @@ const modelSelection: NormalizedModelSelection = {
 };
 
 describe("managed turn runner", () => {
+	test.each(["beforePrompt", "publish", "failure", "close"] as const)(
+		"startup %s cannot outlive its shared deadline or dispatch later cleanup",
+		async phase => {
+			const fake = new RunnerRuntime();
+			const gate = deferred<void>();
+			const runner = createManagedGjcTurnRunner(fake.runtime, 50);
+			let writes = 0;
+			let failureCalls = 0;
+			let lateWrite: Promise<unknown> | undefined;
+			if (phase === "close") fake.closeGate = gate.promise;
+			const original = new Error("before prompt failed");
+			const pending = runner
+				.startManagedSession(
+					{
+						cwd: authority.canonicalWorkspace,
+						sessionRoot: "/sessions",
+						projectId: authority.projectId,
+						chatId: authority.chatId,
+						userMessageId: "bounded-start",
+						text: "hello",
+						preparedManagedAuthority: withoutIdentity(),
+					},
+					async (result, lifecycle) => {
+						if (phase === "publish") await gate.promise;
+						return lifecycle.publishManaged!(result.managedProof!, () => {
+							writes += 1;
+						});
+					},
+					async (_address, proof, lifecycle) => {
+						if (phase === "beforePrompt") {
+							await gate.promise;
+							lateWrite = lifecycle.publishManaged!(proof, () => {
+								writes += 1;
+							}).catch(error => error);
+							await lateWrite;
+						}
+						if (phase === "failure" || phase === "close") throw original;
+					},
+					async () => {
+						failureCalls += 1;
+						if (phase === "failure") await gate.promise;
+					},
+				)
+				.catch(error => error);
+			try {
+				const error = await pending;
+				expect(error).toBeInstanceOf(AggregateError);
+				if (phase === "failure" || phase === "close") expect(error.errors[0]).toBe(original);
+				else expect(error.errors[0].code).toBe("timeout");
+				const requestCount = fake.requests.length;
+				gate.resolve();
+				await new Promise(resolve => setTimeout(resolve, 0));
+				expect(fake.requests).toHaveLength(requestCount);
+				expect(fake.closeCalls).toBe(phase === "close" ? 1 : 0);
+				expect(failureCalls).toBe(phase === "failure" || phase === "close" ? 1 : 0);
+				expect(writes).toBe(0);
+				if (phase === "beforePrompt") expect(await lateWrite).toMatchObject({ code: "timeout" });
+			} finally {
+				gate.resolve();
+				await pending;
+			}
+		},
+	);
+
+	test("startup cleanup receives only the remaining model preparation budget", async () => {
+		const fake = new RunnerRuntime();
+		const runner = createManagedGjcTurnRunner(fake.runtime, 1_000);
+		let now = Date.now();
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		const original = new Error("preparation failed");
+		fake.status = "retired";
+		try {
+			await expect(
+				runner.startManagedSession(
+					{
+						cwd: authority.canonicalWorkspace,
+						sessionRoot: "/sessions",
+						projectId: authority.projectId,
+						chatId: authority.chatId,
+						userMessageId: "remaining-start",
+						text: "hello",
+						preparedManagedAuthority: withoutIdentity(),
+					},
+					async () => {
+						throw new Error("unexpected publication");
+					},
+					async () => {
+						now += 600;
+						throw original;
+					},
+					async () => {
+						now += 200;
+					},
+				),
+			).rejects.toBe(original);
+			expect(fake.closeTimeouts).toEqual([200]);
+			expect(fake.requests).toEqual([]);
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
+	test.each(["throw", "timeout"] as const)("publication %s cannot trigger remote session cleanup", async mode => {
+		const fake = new RunnerRuntime();
+		const runner = createManagedGjcTurnRunner(fake.runtime, 50);
+		const gate = deferred<void>();
+		let writes = 0;
+		try {
+			await expect(
+				runner.startManagedSession(
+					{
+						cwd: authority.canonicalWorkspace,
+						sessionRoot: "/sessions",
+						projectId: authority.projectId,
+						chatId: authority.chatId,
+						userMessageId: "publication-start",
+						text: "hello",
+						preparedManagedAuthority: withoutIdentity(),
+					},
+					async (result, lifecycle) => {
+						await lifecycle.publishManaged!(result.managedProof!, () => {
+							writes += 1;
+						});
+						if (mode === "timeout") await gate.promise;
+						throw new Error("failed after local commit");
+					},
+					async () => undefined,
+				),
+			).rejects.toThrow();
+			expect(writes).toBe(1);
+			expect(fake.closeCalls).toBe(0);
+		} finally {
+			gate.resolve();
+		}
+	});
+
+	test("direct create model timeout cannot start a fresh cleanup budget", async () => {
+		const fake = new RunnerRuntime();
+		const gate = deferred<void>();
+		const request = fake.request.bind(fake);
+		fake.request = async (attachment, frame, options) => {
+			if (frame.operation === "model.set") await gate.promise;
+			return request(attachment, frame, options);
+		};
+		const runner = createManagedGjcTurnRunner(fake.runtime, 50);
+		try {
+			const failure = await runner
+				.create({
+					cwd: authority.canonicalWorkspace,
+					sessionRoot: "/sessions",
+					projectId: authority.projectId,
+					chatId: authority.chatId,
+					userMessageId: "create-timeout",
+					text: "hello",
+					preparedManagedAuthority: withoutIdentity(),
+					modelSelection,
+				})
+				.catch(error => error);
+			expect(failure).toBeInstanceOf(AggregateError);
+			expect(failure.errors[0].code).toBe("timeout");
+			expect(failure.errors[1].code).toBe("timeout");
+			gate.resolve();
+			await new Promise(resolve => setTimeout(resolve, 0));
+			expect(fake.requests).toEqual([]);
+			expect(fake.closeCalls).toBe(0);
+		} finally {
+			gate.resolve();
+		}
+	});
+
+	test("startup retains the original failure when its durable failure owner rejects", async () => {
+		const fake = new RunnerRuntime();
+		const runner = createManagedGjcTurnRunner(fake.runtime);
+		const original = new Error("preparation failed");
+		const persistence = new Error("journal unavailable");
+		const failure = await runner
+			.startManagedSession(
+				{
+					cwd: authority.canonicalWorkspace,
+					sessionRoot: "/sessions",
+					projectId: authority.projectId,
+					chatId: authority.chatId,
+					userMessageId: "owner-failure",
+					text: "hello",
+					preparedManagedAuthority: withoutIdentity(),
+				},
+				async () => undefined,
+				async () => {
+					throw original;
+				},
+				async () => {
+					throw persistence;
+				},
+			)
+			.catch(error => error);
+		expect(failure).toBeInstanceOf(AggregateError);
+		expect(failure.errors).toEqual([original, persistence]);
+		expect(fake.closeCalls).toBe(0);
+	});
+
 	test("requires complete managed authority for lifecycle invocation", async () => {
 		const fake = new RunnerRuntime();
 		await expect(
@@ -897,6 +1097,8 @@ class RunnerRuntime {
 	status: "retired" | "current" | "replaced" = "current";
 	unsubscribed = 0;
 	closeCalls = 0;
+	readonly closeTimeouts: unknown[] = [];
+	closeGate: Promise<void> | undefined;
 	failPrompt = false;
 	failAbortAndPrompt = false;
 	delayTerminal = false;
@@ -1057,6 +1259,8 @@ class RunnerRuntime {
 	}
 	async closeLifecycleSession(_tenantOrRequest?: unknown, _maybeRequest?: Record<string, unknown>) {
 		this.closeCalls += 1;
+		this.closeTimeouts.push(_maybeRequest?.timeoutMs);
+		await this.closeGate;
 		return lifecycleSuccess();
 	}
 	async deleteLifecycleSession(_tenantOrRequest?: unknown, _maybeRequest?: Record<string, unknown>) {
