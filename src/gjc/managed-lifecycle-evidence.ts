@@ -1,13 +1,37 @@
 import { createHash } from "node:crypto";
-import { isAbsolute } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
 	assertManagedLifecycleTransition,
 	isManagedLifecycleState,
 	type ManagedLifecycleState,
 } from "./managed-lifecycle-state";
+import type { HistoricalSessionBinding } from "./session-authority-types";
 import { hasOnlyKeys, isNonEmptyString, isRecord, isTimestamp } from "./session-authority-validation-primitives";
 import type { ManagedGenerationProof, ManagedPreparedTurnAuthority, ManagedTurnAuthority } from "./turn-runner";
+
+/** Public saved-session selection receipt, not snapshot or process-incarnation authority. */
+export interface ManagedHistoricalSavedSession {
+	readonly id: string;
+	readonly path: string;
+	readonly identity: {
+		readonly dev: string;
+		readonly ino: string;
+		readonly size: number;
+		readonly mtimeMs: number;
+		readonly mtimeNs: string;
+		readonly sha256: string;
+		readonly nlink: string;
+		readonly ctimeNs: string;
+	};
+}
+
+export interface ManagedHistoricalLifecycleSource {
+	readonly kind: "bootstrap-history";
+	readonly manifestDigest: string;
+	readonly historicalBinding: HistoricalSessionBinding;
+	readonly savedSession: ManagedHistoricalSavedSession;
+}
 
 export interface ManagedLifecycleEvidence {
 	readonly operation: "session.create" | "session.resume" | "session.fork" | "session.close" | "session.delete";
@@ -17,6 +41,7 @@ export interface ManagedLifecycleEvidence {
 	readonly payloadHash: string;
 	readonly preparedAuthority: ManagedPreparedTurnAuthority;
 	readonly source?: ManagedTurnAuthority;
+	readonly historicalSource?: ManagedHistoricalLifecycleSource;
 	readonly sourceProofRef?: { readonly operationId: string; readonly evidenceHash: string };
 	readonly target: Readonly<Record<string, unknown>>;
 	readonly state: ManagedLifecycleState;
@@ -39,7 +64,7 @@ export interface ManagedLifecycleEvidence {
 
 type EvidenceInput = Pick<
 	ManagedLifecycleEvidence,
-	"operation" | "preparedAuthority" | "source" | "target" | "payloadHash"
+	"operation" | "preparedAuthority" | "source" | "historicalSource" | "target" | "payloadHash"
 >;
 type EvidencePatch = Partial<
 	Pick<ManagedLifecycleEvidence, "acknowledged" | "proven" | "retirement" | "closeAcknowledgement">
@@ -55,6 +80,7 @@ const preparedFields = [
 ] as const;
 const scopeFields = ["principalId", "projectId", "canonicalWorkspace", "chatId", "leaseId", "epoch"] as const;
 const proofFields = ["acknowledged", "proven", "retirement", "closeAcknowledgement"] as const;
+const savedTranscriptFields = ["dev", "ino", "size", "mtimeMs", "mtimeNs", "sha256"] as const;
 const identityFields = [
 	"operation",
 	"actor",
@@ -63,6 +89,7 @@ const identityFields = [
 	"payloadHash",
 	"preparedAuthority",
 	"source",
+	"historicalSource",
 	"sourceProofRef",
 	"target",
 ] as const;
@@ -101,6 +128,7 @@ export function createManagedLifecycleEvidence(
 		target: input.target,
 		payloadHash: input.payloadHash,
 		...(input.source === undefined ? {} : { source: input.source }),
+		...(input.historicalSource === undefined ? {} : { historicalSource: input.historicalSource }),
 		actor,
 		requestKey,
 		requestHash: requestHash({ operation: input.operation, actor, requestKey, target: input.target }),
@@ -242,7 +270,6 @@ function assertEvidence(value: unknown): asserts value is ManagedLifecycleEviden
 		value.requestKey !== value.preparedAuthority.requestKey
 	)
 		throw new Error("Invalid managed lifecycle evidence identity.");
-	canonicalJson(value.target, true);
 	if (
 		value.requestHash !==
 		requestHash({
@@ -255,6 +282,18 @@ function assertEvidence(value: unknown): asserts value is ManagedLifecycleEviden
 		throw new Error("Managed lifecycle request hash does not match its public request.");
 	const prepared = value.preparedAuthority;
 	const source = value.source;
+	const historicalSource = value.historicalSource;
+	if (historicalSource !== undefined) {
+		if (
+			value.operation !== "session.resume" ||
+			source !== undefined ||
+			value.sourceProofRef !== undefined ||
+			!isManagedHistoricalLifecycleSource(historicalSource, prepared)
+		)
+			throw new Error("Managed bootstrap resume requires an exclusive matching historical source.");
+		validateHistoricalTarget(value.target, prepared, historicalSource);
+		canonicalJson(value.target);
+	} else canonicalJson(value.target, true);
 	if (
 		value.sourceProofRef !== undefined &&
 		(!hasOnlyKeys(value.sourceProofRef, ["operationId", "evidenceHash"]) ||
@@ -265,18 +304,25 @@ function assertEvidence(value: unknown): asserts value is ManagedLifecycleEviden
 		throw new Error("Managed retirement source proof reference is invalid.");
 	if (source !== undefined && (!isAuthority(source) || !scopeFields.every(field => source[field] === prepared[field])))
 		throw new Error("Managed lifecycle source crosses its prepared tenant fence.");
-	if (value.operation !== "session.create" && source === undefined)
+	if (value.operation !== "session.create" && source === undefined && historicalSource === undefined)
 		throw new Error("Managed lifecycle requires an exact source authority.");
-	validateTarget(
-		value.operation as ManagedLifecycleEvidence["operation"],
-		value.target,
-		prepared,
-		source as ManagedTurnAuthority | undefined,
-	);
+	if (historicalSource === undefined)
+		validateTarget(
+			value.operation as ManagedLifecycleEvidence["operation"],
+			value.target,
+			prepared,
+			source as ManagedTurnAuthority | undefined,
+		);
 	const acknowledged = value.acknowledged;
 	if (acknowledged !== undefined) {
 		if (!isAuthority(acknowledged) || !preparedFields.every(field => acknowledged[field] === prepared[field]))
 			throw new Error("Managed lifecycle acknowledgement crosses its prepared authority.");
+		if (
+			historicalSource !== undefined &&
+			isManagedHistoricalLifecycleSource(historicalSource, prepared) &&
+			acknowledged.sessionId !== historicalSource.historicalBinding.sessionId
+		)
+			throw new Error("Managed bootstrap acknowledgement changed the full historical session identity.");
 		if (source !== undefined && isAuthority(source)) {
 			if (
 				(value.operation === "session.create" || value.operation === "session.fork") &&
@@ -351,6 +397,150 @@ function assertEvidence(value: unknown): asserts value is ManagedLifecycleEviden
 	if (value.retirement !== undefined && value.state !== "retired")
 		throw new Error("Retirement proof belongs only to retired lifecycle state.");
 	canonicalJson(value);
+}
+
+function isManagedHistoricalLifecycleSource(
+	value: unknown,
+	prepared: ManagedPreparedTurnAuthority,
+): value is ManagedHistoricalLifecycleSource {
+	if (
+		!hasOnlyKeys(value, ["kind", "manifestDigest", "historicalBinding", "savedSession"]) ||
+		value.kind !== "bootstrap-history" ||
+		!isHash(value.manifestDigest) ||
+		!isHistoricalSessionBinding(value.historicalBinding)
+	)
+		return false;
+	const historical = value.historicalBinding;
+	return (
+		isNonEmptyString(historical.sessionId) &&
+		historical.projectId === prepared.projectId &&
+		(historical.chatId === prepared.chatId ||
+			historical.chatId === JSON.stringify([prepared.principalId, prepared.chatId])) &&
+		(historical.principalId === undefined || historical.principalId === prepared.principalId) &&
+		(historical.canonicalWorkspace === undefined || historical.canonicalWorkspace === prepared.canonicalWorkspace) &&
+		isHistoricalSavedSession(value.savedSession, historical.sessionId, prepared.canonicalWorkspace)
+	);
+}
+
+function isHistoricalSavedSession(
+	value: unknown,
+	sessionId: string,
+	workspace: string,
+): value is ManagedHistoricalSavedSession {
+	if (
+		!hasOnlyKeys(value, ["id", "path", "identity"]) ||
+		value.id !== sessionId ||
+		!isNonEmptyString(value.path) ||
+		!isAbsolute(value.path) ||
+		resolve(value.path) !== value.path ||
+		/[\p{Cc}]/u.test(value.path) ||
+		resolve(workspace) !== workspace ||
+		/[\p{Cc}]/u.test(workspace)
+	)
+		return false;
+	const within = relative(workspace, value.path);
+	if (within === "" || within === ".." || within.startsWith(`..${sep}`) || isAbsolute(within)) return false;
+	const identity = value.identity;
+	return (
+		hasOnlyKeys(identity, [...savedTranscriptFields, "nlink", "ctimeNs"]) &&
+		[identity.dev, identity.ino, identity.mtimeNs, identity.nlink, identity.ctimeNs].every(isDecimalIdentity) &&
+		typeof identity.size === "number" &&
+		Number.isSafeInteger(identity.size) &&
+		identity.size >= 0 &&
+		typeof identity.mtimeMs === "number" &&
+		Number.isFinite(identity.mtimeMs) &&
+		identity.mtimeMs >= 0 &&
+		isHash(identity.sha256)
+	);
+}
+
+function isDecimalIdentity(value: unknown): value is string {
+	return typeof value === "string" && /^[0-9]+$/.test(value);
+}
+
+export function isHistoricalSessionBinding(
+	value: unknown,
+	identity?: { readonly chatId?: unknown; readonly projectId?: unknown; readonly sessionId?: unknown },
+): value is HistoricalSessionBinding {
+	if (
+		!hasOnlyKeys(value, [
+			"kind",
+			"chatId",
+			"projectId",
+			"sessionId",
+			"principalId",
+			"canonicalWorkspace",
+			"reason",
+			"provenance",
+		]) ||
+		value.kind !== "unbound-history" ||
+		!isNonEmptyString(value.chatId) ||
+		!isNonEmptyString(value.projectId) ||
+		(value.sessionId !== undefined && !isNonEmptyString(value.sessionId)) ||
+		(value.principalId !== undefined && !isNonEmptyString(value.principalId)) ||
+		(value.canonicalWorkspace !== undefined &&
+			(!isNonEmptyString(value.canonicalWorkspace) || !isAbsolute(value.canonicalWorkspace)))
+	)
+		return false;
+	if (
+		identity !== undefined &&
+		(value.chatId !== identity.chatId ||
+			value.projectId !== identity.projectId ||
+			value.sessionId !== identity.sessionId)
+	)
+		return false;
+	const principal = scopedHistoricalPrincipal(value.chatId);
+	if (principal !== undefined && value.principalId !== principal) return false;
+	if (
+		value.reason !==
+		(value.principalId === undefined || value.canonicalWorkspace === undefined
+			? "ownership-unresolved"
+			: "generation-unproven")
+	)
+		return false;
+	const provenance = value.provenance;
+	return (
+		hasOnlyKeys(provenance, ["source", "documentHash", "nodeRef", "nodeHash"]) &&
+		Object.keys(provenance).length === 4 &&
+		provenance.source === "v2" &&
+		isHash(provenance.documentHash) &&
+		isHash(provenance.nodeHash) &&
+		typeof provenance.nodeRef === "string" &&
+		/^\/(?:mappings|provisionalOperations)\/(?:0|[1-9][0-9]*)(?:\/(?:[^~/]|~[01])+)*$/.test(provenance.nodeRef)
+	);
+}
+
+function scopedHistoricalPrincipal(chatId: string): string | undefined {
+	try {
+		const scope: unknown = JSON.parse(chatId);
+		return Array.isArray(scope) &&
+			scope.length === 2 &&
+			scope.every(isNonEmptyString) &&
+			JSON.stringify(scope) === chatId
+			? scope[0]
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function validateHistoricalTarget(
+	target: Record<string, unknown>,
+	prepared: ManagedPreparedTurnAuthority,
+	source: ManagedHistoricalLifecycleSource,
+): void {
+	const identity = target.sessionIdentity;
+	if (
+		!hasOnlyKeys(target, ["sessionId", "cwd", "sessionPath", "sessionIdentity"]) ||
+		target.sessionId !== source.savedSession.id ||
+		target.cwd !== prepared.canonicalWorkspace ||
+		target.sessionPath !== source.savedSession.path ||
+		!hasOnlyKeys(identity, savedTranscriptFields) ||
+		!savedTranscriptFields.every(field => identity[field] === source.savedSession.identity[field])
+	)
+		throw new Error(
+			"Managed bootstrap target requires the exact public saved-session selection and transcript identity projection.",
+		);
 }
 
 function validateTarget(

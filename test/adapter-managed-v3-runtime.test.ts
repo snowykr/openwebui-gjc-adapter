@@ -72,6 +72,88 @@ function runtime(status: "current" | "replaced" | "unknown" = "current", current
 }
 
 describe("startActiveManagedRuntime", () => {
+	test.each(["start", "reconcile", "acquireAttachment", "generationStatus", "liveTenantFence"] as const)(
+		"one startup budget bounds hanging %s and prevents late proof publication",
+		async phase => {
+			const fake = runtime();
+			let release!: (value: unknown) => void;
+			const pending = new Promise(resolve => {
+				release = resolve;
+			});
+			if (phase !== "liveTenantFence")
+				Object.assign(fake.runtime, {
+					[phase]: () => {
+						fake.calls.push(`hanging:${phase}`);
+						return pending;
+					},
+				});
+			const options = {
+				mappings: store([mapping()]),
+				runtime: fake.runtime,
+				turnTimeoutMs: 80,
+				liveTenantFence: phase === "liveTenantFence" ? () => pending.then(() => true) : () => true,
+			};
+			await expect(startActiveManagedRuntime(options)).rejects.toMatchObject({ code: "timeout" });
+			expect(fake.calls.filter(call => call === "dispose")).toHaveLength(1);
+			const calls = [...fake.calls];
+			release({ status: "current", generation: 7, isCurrent: () => true });
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(fake.calls).toEqual(calls);
+			if (phase === "start") expect(fake.registrations).toEqual([]);
+		},
+	);
+
+	test("startup cleanup does not renew the expired operation budget", async () => {
+		const fake = runtime("unknown");
+		Object.assign(fake.runtime, {
+			dispose: () => {
+				fake.calls.push("dispose");
+				return new Promise(() => {});
+			},
+		});
+		let failure: unknown;
+		try {
+			await startActiveManagedRuntime({
+				mappings: store([mapping()]),
+				runtime: fake.runtime,
+				turnTimeoutMs: 60,
+				liveTenantFence: () => true,
+			});
+		} catch (error) {
+			failure = error;
+		}
+		if (!(failure instanceof AggregateError)) throw new Error("Missing startup and cleanup failure evidence.");
+		expect(failure.errors[0].message).toContain("requires recovery");
+		expect(failure.errors[1].code).toBe("timeout");
+		expect(fake.calls.filter(call => call === "dispose")).toHaveLength(1);
+	});
+
+	test("successive startup phases consume one budget rather than renewing it", async () => {
+		const fake = runtime();
+		const delay = (phase: string) => async () => {
+			fake.calls.push(phase);
+			await Bun.sleep(200);
+		};
+		Object.assign(fake.runtime, {
+			start: delay("start"),
+			reconcile: delay("reconcile"),
+			acquireAttachment: async () => {
+				await delay("acquire")();
+				return { generation: 7, isCurrent: () => true };
+			},
+		});
+		await expect(
+			startActiveManagedRuntime({
+				mappings: store([mapping()]),
+				runtime: fake.runtime,
+				turnTimeoutMs: 500,
+				liveTenantFence: () => true,
+			}),
+		).rejects.toMatchObject({ code: "timeout" });
+		expect(fake.calls).toEqual(["start", "register:chat-1", "reconcile", "acquire", "dispose"]);
+	});
+
 	test("rejects unresolved historical roots before public runtime effects", () => {
 		const fake = runtime();
 		const mappings = store([]);

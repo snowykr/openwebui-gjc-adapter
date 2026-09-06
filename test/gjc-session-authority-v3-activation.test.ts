@@ -52,6 +52,122 @@ async function fixture() {
 }
 
 describe("session authority V3 activation", () => {
+	test.each([false, true])("never regenerates a modified normal V3 stage after resolver failure=%s", async crash => {
+		const f = await fixture();
+		let stagePath = "";
+		let calls = 0;
+		try {
+			const options = {
+				canonicalPath: f.canonicalPath,
+				stagingRoot: join(f.root, "private"),
+				resolveBindings: (_graph: unknown, context: { stagedPath: string }) => {
+					calls += 1;
+					stagePath = context.stagedPath;
+					const staged = new V3FileBackedSessionMappingStore(stagePath);
+					staged.reserveProvisionalOperationScoped(
+						{ principalId: "owner", chatId: "chat" },
+						{
+							id: "migration-resume",
+							ingressId: "same-key",
+							kind: "resume",
+							chatId: "chat",
+							projectId: "project",
+							detail: "same-hash",
+						},
+					);
+					staged.close();
+					if (crash) throw new Error("after staged intent");
+					return [];
+				},
+			};
+			if (crash) await expect(f.invoke(options)).rejects.toThrow("after staged intent");
+			else expect((await f.invoke(options)).status).toBe("blocked");
+			expect(await readFile(f.canonicalPath)).toEqual(f.original);
+			const before = JSON.parse(await readFile(stagePath, "utf8")).provisionalOperations[0];
+			expect(before.state).toBe("pending");
+			expect((await f.invoke(options)).status).toBe("blocked");
+			expect(calls).toBe(1);
+			const after = JSON.parse(await readFile(stagePath, "utf8")).provisionalOperations[0];
+			expect(after.state).toBe("uncertain");
+			expect(after.id).toBe(before.id);
+			expect(after.ingressId).toBe(before.ingressId);
+			expect(after.detail).toBe(before.detail);
+			expect(after.startedAt).toBe(before.startedAt);
+			expect(await readFile(f.canonicalPath)).toEqual(f.original);
+			await expect(stat(`${f.canonicalPath}.v3-active.json`)).rejects.toThrow();
+		} finally {
+			await f.cleanup();
+		}
+	});
+
+	test.each(["missing", "corrupt", "checkpoint"] as const)(
+		"does not recreate a %s retained historical stage",
+		async damage => {
+			const f = await fixture();
+			let stagePath = "";
+			try {
+				await expect(
+					f.invoke({
+						canonicalPath: f.canonicalPath,
+						stagingRoot: join(f.root, "private"),
+						resolveBindings: (_graph, context) => {
+							stagePath = context.stagedPath;
+							throw new Error("before public effect");
+						},
+					}),
+				).rejects.toThrow("before public effect");
+				if (damage === "missing") await rm(stagePath);
+				else if (damage === "corrupt") await writeFile(stagePath, "invalid V3");
+				else await writeFile(join(stagePath, "..", "historical-stage.json"), "{}\n");
+				await expect(f.activate()).rejects.toThrow();
+				expect(await readFile(f.canonicalPath)).toEqual(f.original);
+				if (damage === "missing") await expect(stat(stagePath)).rejects.toThrow();
+				if (damage === "corrupt") expect(await readFile(stagePath, "utf8")).toBe("invalid V3");
+			} finally {
+				await f.cleanup();
+			}
+		},
+	);
+
+	test.each(["manifest", "checkpoint", "source"] as const)(
+		"resolver currentness rejects changed %s evidence",
+		async changed => {
+			const f = await fixture();
+			try {
+				await expect(
+					f.invoke({
+						canonicalPath: f.canonicalPath,
+						stagingRoot: join(f.root, "private"),
+						resolveBindings: async (_graph, context) => {
+							const path =
+								changed === "source"
+									? f.canonicalPath
+									: join(
+											context.stagedPath,
+											"..",
+											changed === "manifest" ? "source-manifest.json" : "historical-stage.json",
+										);
+							await writeFile(path, "{}\n");
+							await context.assertCurrent();
+							throw new Error("Changed bootstrap evidence was incorrectly authorized.");
+						},
+					}),
+				).rejects.toThrow(
+					changed === "manifest"
+						? "manifest changed"
+						: changed === "checkpoint"
+							? "checkpoint conflicts"
+							: "authority changed",
+				);
+				await expect(stat(`${f.canonicalPath}.v3-active.json`)).rejects.toThrow();
+				if (changed !== "source") expect(await readFile(f.canonicalPath)).toEqual(f.original);
+				else expect(await readFile(f.canonicalPath, "utf8")).toBe("{}\n");
+			} finally {
+				await f.cleanup();
+			}
+		},
+	);
+
 	test.each(["runtime", "mutation"] as const)("rejects released %s ownership before snapshot effects", async kind => {
 		const f = await fixture();
 		const mutationLock = AuthorityMutationLock.acquire(f.canonicalPath);

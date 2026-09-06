@@ -6,6 +6,8 @@ import {
 	createManagedLifecycleEvidence,
 	createManagedRetirementEvidence,
 	isManagedLifecycleEvidence,
+	type ManagedHistoricalLifecycleSource,
+	type ManagedHistoricalSavedSession,
 	type ManagedLifecycleEvidence,
 	managedLifecycleEvidenceHash,
 	transitionManagedLifecycleEvidence,
@@ -21,6 +23,7 @@ import {
 	parseManagedLifecycleState,
 } from "../src/gjc/managed-lifecycle-state";
 import { copyOperation, copyProvisionalOperation } from "../src/gjc/session-authority-copy";
+import type { HistoricalSessionBinding } from "../src/gjc/session-authority-types";
 import {
 	encodeSessionAuthorityV3Document,
 	isSessionAuthorityV3Document,
@@ -146,6 +149,54 @@ function acknowledgedEvidence() {
 		"acknowledged_unproven",
 		{ acknowledged },
 		later,
+	);
+}
+
+function bootstrapSource(): ManagedHistoricalLifecycleSource {
+	return {
+		kind: "bootstrap-history",
+		manifestDigest: "c".repeat(64),
+		historicalBinding: {
+			kind: "unbound-history",
+			chatId: JSON.stringify([prepared.principalId, prepared.chatId]),
+			projectId: prepared.projectId,
+			sessionId: "original-full-session-id",
+			principalId: prepared.principalId,
+			reason: "ownership-unresolved",
+			provenance: { source: "v2", documentHash: "d".repeat(64), nodeRef: "/mappings/0", nodeHash: "e".repeat(64) },
+		},
+		savedSession: {
+			id: "original-full-session-id",
+			path: "/workspace/project/.gjc/sessions/original.jsonl",
+			identity: {
+				dev: "66306",
+				ino: "1481656",
+				size: 3671,
+				mtimeMs: 1788717200450.25,
+				mtimeNs: "1788717200450003321",
+				sha256: "b".repeat(64),
+				nlink: "1",
+				ctimeNs: "1788717200450003321",
+			},
+		},
+	};
+}
+function bootstrapTarget(savedSession: ManagedHistoricalSavedSession): Readonly<Record<string, unknown>> {
+	const { nlink: _nlink, ctimeNs: _ctimeNs, ...sessionIdentity } = savedSession.identity;
+	return {
+		sessionId: savedSession.id,
+		cwd: prepared.canonicalWorkspace,
+		sessionPath: savedSession.path,
+		sessionIdentity,
+	};
+}
+function bootstrapEvidence(
+	historicalSource = bootstrapSource(),
+	target = bootstrapTarget(historicalSource.savedSession),
+) {
+	return createManagedLifecycleEvidence(
+		{ operation: "session.resume", historicalSource, preparedAuthority: prepared, target, payloadHash },
+		time,
 	);
 }
 function documentWith(evidence?: ManagedLifecycleEvidence): SessionAuthorityV3Document {
@@ -283,6 +334,371 @@ function referencedCloseDocument(): SessionAuthorityV3Document {
 }
 
 describe("canonical managed lifecycle evidence", () => {
+	test("bootstraps exact historical session identity without inventing a source generation", () => {
+		for (const size of [0, 3671, Number.MAX_SAFE_INTEGER]) {
+			const historicalSource = bootstrapSource();
+			const selected = {
+				...historicalSource,
+				savedSession: {
+					...historicalSource.savedSession,
+					identity: { ...historicalSource.savedSession.identity, size },
+				},
+			};
+			const intent = bootstrapEvidence(selected);
+			const original = structuredClone(selected);
+			const ack: ManagedTurnAuthority = {
+				...prepared,
+				sessionId: historicalSource.historicalBinding.sessionId!,
+				generation: 27,
+			};
+			const proof: ManagedGenerationProof = {
+				kind: "managed-generation",
+				sessionId: ack.sessionId,
+				generation: ack.generation,
+				leaseId: ack.leaseId,
+				epoch: ack.epoch,
+			};
+			const invoking = transitionManagedLifecycleEvidence(intent, "invoking", {}, time);
+			const acknowledged = transitionManagedLifecycleEvidence(
+				invoking,
+				"acknowledged_unproven",
+				{ acknowledged: ack },
+				later,
+			);
+			const active = transitionManagedLifecycleEvidence(
+				acknowledged,
+				"active_generation_proven",
+				{ proven: proof },
+				later,
+			);
+			expect(isManagedLifecycleEvidence(active)).toBe(true);
+			expect(active.source).toBeUndefined();
+			expect(active.historicalSource).toEqual(original);
+			expect(active.historicalSource!.historicalBinding).not.toHaveProperty("generation");
+			expect(active.historicalSource!.historicalBinding.canonicalWorkspace).toBeUndefined();
+			expect(active.acknowledged!.generation).toBe(27);
+			expect(selected).toEqual(original);
+		}
+	});
+
+	test("keeps the full bootstrap source immutable and includes it in evidence hashing but not public request hashing", () => {
+		const intent = bootstrapEvidence();
+		expect(transitionManagedLifecycleEvidence(intent, intent.state)).toEqual(intent);
+		expect(() => assertManagedLifecycleEvidenceUpdate(intent, structuredClone(intent))).not.toThrow();
+		const differentManifest = bootstrapEvidence({ ...bootstrapSource(), manifestDigest: "f".repeat(64) });
+		const changedOccurrence = bootstrapEvidence({
+			...bootstrapSource(),
+			historicalBinding: {
+				...bootstrapSource().historicalBinding,
+				provenance: { ...bootstrapSource().historicalBinding.provenance, nodeRef: "/mappings/1" },
+			},
+		});
+		for (const changed of [differentManifest, changedOccurrence]) {
+			expect(isManagedLifecycleEvidence(changed)).toBe(true);
+			expect(changed.requestHash).toBe(intent.requestHash);
+			expect(managedLifecycleEvidenceHash(changed)).not.toBe(managedLifecycleEvidenceHash(intent));
+			expect(() => assertManagedLifecycleEvidenceUpdate(intent, changed)).toThrow(
+				"Immutable managed lifecycle identity changed: historicalSource",
+			);
+		}
+		const copied = copyManagedLifecycleEvidence(intent);
+		const operation = copyOperation({
+			id: "bootstrap",
+			kind: "resume",
+			state: "pending",
+			startedAt: time,
+			lifecycle: intent,
+		});
+		expect(copied.historicalSource).not.toBe(intent.historicalSource);
+		expect(copied.historicalSource!.historicalBinding.provenance).not.toBe(
+			intent.historicalSource!.historicalBinding.provenance,
+		);
+		expect(operation.lifecycle!.historicalSource!.historicalBinding.provenance).not.toBe(
+			intent.historicalSource!.historicalBinding.provenance,
+		);
+		expect(copied.historicalSource!.savedSession.identity).not.toBe(intent.historicalSource!.savedSession.identity);
+		expect(operation.lifecycle!.historicalSource!.savedSession.identity).not.toBe(
+			intent.historicalSource!.savedSession.identity,
+		);
+		expect(copied).toEqual(intent);
+	});
+
+	test("rejects mixed sources, non-resume historical branches and malformed manifest or provenance", () => {
+		const intent = bootstrapEvidence();
+		for (const operation of ["session.create", "session.fork", "session.close", "session.delete"] as const)
+			expect(() =>
+				createManagedLifecycleEvidence(
+					{
+						operation,
+						preparedAuthority: prepared,
+						historicalSource: bootstrapSource(),
+						target: intent.target,
+						payloadHash,
+					},
+					time,
+				),
+			).toThrow();
+		for (const changed of [
+			{ ...intent, source },
+			{ ...intent, sourceProofRef: { operationId: "prior", evidenceHash: "b".repeat(64) } },
+			...["", "A".repeat(64), "0".repeat(63), `sha256:${"a".repeat(64)}`].map(manifestDigest => ({
+				...intent,
+				historicalSource: { ...bootstrapSource(), manifestDigest },
+			})),
+			{ ...intent, historicalSource: { ...bootstrapSource(), extra: true } },
+			{
+				...intent,
+				historicalSource: {
+					...bootstrapSource(),
+					historicalBinding: { ...bootstrapSource().historicalBinding, generation: 1 },
+				},
+			},
+			{
+				...intent,
+				historicalSource: {
+					...bootstrapSource(),
+					historicalBinding: {
+						...bootstrapSource().historicalBinding,
+						provenance: { ...bootstrapSource().historicalBinding.provenance, nodeRef: "not-a-pointer" },
+					},
+				},
+			},
+		])
+			expect(isManagedLifecycleEvidence(changed)).toBe(false);
+	});
+
+	test("binds optional original ownership and full session identity to the current prepared scope", () => {
+		const original = bootstrapSource();
+		const { sessionId: _sessionId, ...missingSession } = original.historicalBinding;
+		expect(() => bootstrapEvidence({ ...original, historicalBinding: missingSession })).toThrow();
+		for (const patch of [
+			{ principalId: "foreign" },
+			{ projectId: "foreign" },
+			{ chatId: "foreign" },
+			{ canonicalWorkspace: "/foreign", reason: "generation-unproven" },
+			{ sessionId: "" },
+		])
+			expect(
+				isManagedLifecycleEvidence({
+					...bootstrapEvidence(),
+					historicalSource: { ...original, historicalBinding: { ...original.historicalBinding, ...patch } },
+				}),
+			).toBe(false);
+		const { principalId: _principal, ...unowned } = original.historicalBinding;
+		const logical: HistoricalSessionBinding = { ...unowned, chatId: prepared.chatId };
+		expect(isManagedLifecycleEvidence(bootstrapEvidence({ ...original, historicalBinding: logical }))).toBe(true);
+		const known: HistoricalSessionBinding = {
+			...original.historicalBinding,
+			canonicalWorkspace: prepared.canonicalWorkspace,
+			reason: "generation-unproven",
+		};
+		expect(isManagedLifecycleEvidence(bootstrapEvidence({ ...original, historicalBinding: known }))).toBe(true);
+	});
+
+	test("limits bootstrap public resume target to exact saved selection without prefix or readiness fallback", () => {
+		const original = bootstrapSource();
+		const target = bootstrapTarget(original.savedSession);
+		const { nlink: _nlink, ctimeNs: _ctimeNs, ...sessionIdentity } = original.savedSession.identity;
+		for (const changed of [
+			{ ...target, sessionId: "original" },
+			{ ...target, cwd: "/foreign" },
+			{ ...target, sessionPath: "/workspace/project/.gjc/sessions/other.jsonl" },
+			{ sessionIdOrPrefix: original.savedSession.id, path: prepared.canonicalWorkspace },
+			{ sessionId: original.savedSession.id, cwd: prepared.canonicalWorkspace },
+			...[
+				"sessionIdOrPrefix",
+				"path",
+				"readinessTimeoutMs",
+				"body",
+				"modelPreset",
+				"source",
+				"endpointGeneration",
+				"descriptor",
+				"token",
+			].map(key => ({ ...target, [key]: "forbidden" })),
+			{ ...target, sessionIdentity: original.savedSession.identity },
+			{ ...target, sessionIdentity: { ...sessionIdentity, nlink: original.savedSession.identity.nlink } },
+			{ ...target, sessionIdentity: { ...sessionIdentity, ctimeNs: original.savedSession.identity.ctimeNs } },
+			{ ...target, sessionIdentity: { ...original.savedSession.identity, nlink: undefined, ctimeNs: undefined } },
+		])
+			expect(() => bootstrapEvidence(original, changed)).toThrow();
+	});
+
+	test("rejects unsafe saved paths and malformed public saved-session identity without filesystem access", () => {
+		const original = bootstrapSource();
+		const evidence = bootstrapEvidence(original);
+		const { savedSession: _saved, ...missingSaved } = original;
+		expect(isManagedLifecycleEvidence({ ...evidence, historicalSource: missingSaved })).toBe(false);
+		for (const field of Object.keys(original.savedSession.identity)) {
+			const identity = Object.fromEntries(
+				Object.entries(original.savedSession.identity).filter(([key]) => key !== field),
+			);
+			expect(
+				isManagedLifecycleEvidence({
+					...evidence,
+					historicalSource: { ...original, savedSession: { ...original.savedSession, identity } },
+				}),
+			).toBe(false);
+		}
+		for (const patch of [
+			{ id: "foreign-session" },
+			{ path: "/foreign/original.jsonl" },
+			{ path: "/workspace/project-sibling/original.jsonl" },
+			{ path: "/workspace/project/../project/original.jsonl" },
+			{ path: "/workspace/project/./original.jsonl" },
+			{ path: "/workspace/project//original.jsonl" },
+			{ path: "/workspace/project/original.jsonl/" },
+			{ path: "relative.jsonl" },
+			{ path: "/workspace/project" },
+			{ path: "/workspace/project/unsafe\u0000.jsonl" },
+			{ extra: "not-public" },
+		])
+			expect(
+				isManagedLifecycleEvidence({
+					...evidence,
+					historicalSource: { ...original, savedSession: { ...original.savedSession, ...patch } },
+				}),
+			).toBe(false);
+		for (const field of ["dev", "ino", "mtimeNs", "nlink", "ctimeNs"] as const)
+			for (const invalid of ["", "-1", "+1", "1.0", "1e3", " 1", "0x10", 1])
+				expect(
+					isManagedLifecycleEvidence({
+						...evidence,
+						historicalSource: {
+							...original,
+							savedSession: {
+								...original.savedSession,
+								identity: { ...original.savedSession.identity, [field]: invalid },
+							},
+						},
+					}),
+				).toBe(false);
+		for (const patch of [
+			{ size: -1 },
+			{ size: 1.5 },
+			{ size: Number.MAX_SAFE_INTEGER + 1 },
+			{ size: "1" },
+			{ mtimeMs: -1 },
+			{ mtimeMs: Number.POSITIVE_INFINITY },
+			{ mtimeMs: NaN },
+			{ mtimeMs: "1" },
+			{ sha256: "A".repeat(64) },
+			{ sha256: "b".repeat(63) },
+			{ extra: 1 },
+		])
+			expect(
+				isManagedLifecycleEvidence({
+					...evidence,
+					historicalSource: {
+						...original,
+						savedSession: { ...original.savedSession, identity: { ...original.savedSession.identity, ...patch } },
+					},
+				}),
+			).toBe(false);
+	});
+
+	test("requires the exact six-field identity projection and binds saved receipt changes under the same key", () => {
+		const original = bootstrapSource();
+		const intent = bootstrapEvidence(original);
+		const { nlink: _nlink, ctimeNs: _ctimeNs, ...projection } = original.savedSession.identity;
+		expect(intent.target.sessionIdentity).toEqual(projection);
+		for (const field of Object.keys(projection)) {
+			const sessionIdentity = Object.fromEntries(Object.entries(projection).filter(([key]) => key !== field));
+			expect(() => bootstrapEvidence(original, { ...intent.target, sessionIdentity })).toThrow();
+		}
+		for (const patch of [
+			{ dev: "7" },
+			{ ino: "8" },
+			{ size: 9 },
+			{ mtimeMs: 10 },
+			{ mtimeNs: "11" },
+			{ sha256: "a".repeat(64) },
+		]) {
+			expect(() =>
+				bootstrapEvidence(original, { ...intent.target, sessionIdentity: { ...projection, ...patch } }),
+			).toThrow();
+			const changed = bootstrapEvidence({
+				...original,
+				savedSession: { ...original.savedSession, identity: { ...original.savedSession.identity, ...patch } },
+			});
+			expect(isManagedLifecycleEvidence(changed)).toBe(true);
+			expect(changed.requestKey).toBe(intent.requestKey);
+			expect(changed.requestHash).not.toBe(intent.requestHash);
+			expect(() => assertManagedLifecycleEvidenceUpdate(intent, changed)).toThrow("Immutable");
+		}
+		for (const patch of [{ nlink: "2" }, { ctimeNs: "42" }]) {
+			const changed = bootstrapEvidence({
+				...original,
+				savedSession: { ...original.savedSession, identity: { ...original.savedSession.identity, ...patch } },
+			});
+			expect(changed.requestHash).toBe(intent.requestHash);
+			expect(managedLifecycleEvidenceHash(changed)).not.toBe(managedLifecycleEvidenceHash(intent));
+			expect(() => assertManagedLifecycleEvidenceUpdate(intent, changed)).toThrow("historicalSource");
+		}
+		const renamed = bootstrapEvidence({
+			...original,
+			savedSession: { ...original.savedSession, path: "/workspace/project/.gjc/sessions/renamed.jsonl" },
+		});
+		expect(() => assertManagedLifecycleEvidenceUpdate(intent, renamed)).toThrow("Immutable");
+	});
+
+	test("does not allow public saved-path fields on ordinary serving lifecycle targets", () => {
+		const historical = bootstrapEvidence();
+		expect(() =>
+			createManagedLifecycleEvidence(
+				{
+					operation: "session.resume",
+					preparedAuthority: prepared,
+					source: { ...source, sessionId: bootstrapSource().savedSession.id },
+					target: historical.target,
+					payloadHash,
+				},
+				time,
+			),
+		).toThrow();
+		expect(() =>
+			createManagedLifecycleEvidence(
+				{
+					operation: "session.create",
+					preparedAuthority: prepared,
+					target: { cwd: prepared.canonicalWorkspace, body: { sessionPath: bootstrapSource().savedSession.path } },
+					payloadHash,
+				},
+				time,
+			),
+		).toThrow();
+	});
+
+	test("rejects changed bootstrap acknowledgement identity or fence and never treats history as proof", () => {
+		const invoking = transitionManagedLifecycleEvidence(bootstrapEvidence(), "invoking", {}, time);
+		const ack = { ...prepared, sessionId: bootstrapSource().historicalBinding.sessionId!, generation: 3 };
+		for (const patch of [
+			{ sessionId: "other" },
+			{ generation: 0 },
+			{ generation: -1 },
+			{ generation: 1.5 },
+			{ generation: Number.MAX_SAFE_INTEGER + 1 },
+			{ principalId: "other" },
+			{ projectId: "other" },
+			{ chatId: "other" },
+			{ canonicalWorkspace: "/other" },
+			{ leaseId: "other" },
+			{ epoch: "other" },
+			{ requestKey: "other" },
+		])
+			expect(() =>
+				transitionManagedLifecycleEvidence(
+					invoking,
+					"acknowledged_unproven",
+					{ acknowledged: { ...ack, ...patch } },
+					later,
+				),
+			).toThrow();
+		expect(() => transitionManagedLifecycleEvidence(invoking, "active_generation_proven", {}, later)).toThrow();
+		const uncertain = transitionManagedLifecycleEvidence(invoking, "uncertain", {}, later);
+		expect(() => transitionManagedLifecycleEvidence(uncertain, "invoking", {}, later)).toThrow();
+	});
+
 	test("hashes canonical public request identity and preserves logical chat identity through the V3 codec", () => {
 		const intent = createEvidence();
 		const reordered = createManagedLifecycleEvidence(

@@ -2,10 +2,14 @@ import { isAbsolute } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { NormalizedModelSelection } from "../contracts";
 import {
+	isHistoricalSessionBinding,
 	isManagedLifecycleEvidence,
 	type ManagedLifecycleEvidence,
 	managedLifecycleEvidenceHash,
 } from "./managed-lifecycle-evidence";
+
+export { isHistoricalSessionBinding } from "./managed-lifecycle-evidence";
+
 import type { HistoricalSessionBinding } from "./session-authority-types";
 import {
 	isJsonValue,
@@ -399,6 +403,11 @@ function isMapping(value: unknown): value is SessionAuthorityV3Mapping {
 		value.journal.every(
 			operation =>
 				isOperation(operation) &&
+				!(
+					value.historicalBinding !== undefined &&
+					operation.lifecycle?.historicalSource !== undefined &&
+					operation.result !== undefined
+				) &&
 				validateLifecycleOwner(
 					operation.lifecycle,
 					value.chatId as string,
@@ -439,6 +448,11 @@ function isProvisional(value: unknown): value is SessionAuthorityV3ProvisionalOp
 		isNonEmptyString(value.chatId) &&
 		isNonEmptyString(value.projectId) &&
 		isOperation(value) &&
+		!(
+			value.historicalBinding !== undefined &&
+			value.lifecycle?.historicalSource !== undefined &&
+			value.result !== undefined
+		) &&
 		validProjection(value) &&
 		validateLifecycleOwner(value.lifecycle, value.chatId, value.projectId, bindingIdentity(value)) &&
 		validateBinding(value, { chatId: value.chatId, projectId: value.projectId, sessionId: value.sessionId }, true)
@@ -734,6 +748,11 @@ function isTombstone(value: unknown): value is SessionAuthorityV3Tombstone {
 		value.journal.every(
 			operation =>
 				isOperation(operation) &&
+				!(
+					value.historicalBinding !== undefined &&
+					operation.lifecycle?.historicalSource !== undefined &&
+					operation.result !== undefined
+				) &&
 				validateLifecycleOwner(
 					operation.lifecycle,
 					value.chatId as string,
@@ -748,7 +767,6 @@ function isTombstone(value: unknown): value is SessionAuthorityV3Tombstone {
 
 function validateLifecycleOwner(value: unknown, chatId: string, projectId: string, owner?: unknown): boolean {
 	if (value === undefined) return true;
-	if (isRecord(owner) && owner.kind === "unbound-history") return false;
 	if (!isManagedLifecycleEvidence(value)) return false;
 	const prepared = value.preparedAuthority;
 	if (
@@ -757,6 +775,9 @@ function validateLifecycleOwner(value: unknown, chatId: string, projectId: strin
 		(chatId !== prepared.chatId && chatId !== JSON.stringify([prepared.principalId, prepared.chatId]))
 	)
 		return false;
+	if (isRecord(owner) && owner.kind === "unbound-history")
+		return value.historicalSource !== undefined && isDeepStrictEqual(owner, value.historicalSource.historicalBinding);
+	if (value.historicalSource !== undefined && owner === undefined) return false;
 	if (
 		owner !== undefined &&
 		(!isRecord(owner) ||
@@ -832,6 +853,12 @@ function validateJournal(
 	const ownerBinding = owner.binding ?? bindingIdentity(owner);
 	for (const operation of journal) {
 		if (!validateLifecycleOwner(operation.lifecycle, owner.chatId, owner.projectId, ownerBinding)) return false;
+		if (
+			ownerBinding?.kind === "unbound-history" &&
+			operation.lifecycle?.historicalSource !== undefined &&
+			operation.result !== undefined
+		)
+			return false;
 		const successor = operation.acknowledgedSuccessor;
 		if (
 			successor !== undefined &&
@@ -968,73 +995,6 @@ function validateBinding(
 	return unassigned && identity.sessionId === undefined;
 }
 
-export function isHistoricalSessionBinding(
-	value: unknown,
-	identity?: { readonly chatId?: unknown; readonly projectId?: unknown; readonly sessionId?: unknown },
-): value is HistoricalSessionBinding {
-	if (
-		!isRecordShape(value, [
-			"kind",
-			"chatId",
-			"projectId",
-			"sessionId",
-			"principalId",
-			"canonicalWorkspace",
-			"reason",
-			"provenance",
-		]) ||
-		value.kind !== "unbound-history" ||
-		!isNonEmptyString(value.chatId) ||
-		!isNonEmptyString(value.projectId) ||
-		(value.sessionId !== undefined && !isNonEmptyString(value.sessionId)) ||
-		(value.principalId !== undefined && !isNonEmptyString(value.principalId)) ||
-		(value.canonicalWorkspace !== undefined &&
-			(!isNonEmptyString(value.canonicalWorkspace) || !isAbsolute(value.canonicalWorkspace)))
-	)
-		return false;
-	if (
-		identity !== undefined &&
-		(value.chatId !== identity.chatId ||
-			value.projectId !== identity.projectId ||
-			value.sessionId !== identity.sessionId)
-	)
-		return false;
-	const principal = scopedPrincipal(value.chatId);
-	if (principal !== undefined && value.principalId !== principal) return false;
-	if (
-		value.reason !==
-		(value.principalId === undefined || value.canonicalWorkspace === undefined
-			? "ownership-unresolved"
-			: "generation-unproven")
-	)
-		return false;
-	const provenance = value.provenance;
-	return (
-		exactKeys(provenance, ["source", "documentHash", "nodeRef", "nodeHash"]) &&
-		provenance.source === "v2" &&
-		isDigest(provenance.documentHash) &&
-		isDigest(provenance.nodeHash) &&
-		typeof provenance.nodeRef === "string" &&
-		/^\/(?:mappings|provisionalOperations)\/(?:0|[1-9][0-9]*)(?:\/(?:[^~/]|~[01])+)*$/.test(provenance.nodeRef)
-	);
-}
-
-function isDigest(value: unknown): boolean {
-	return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
-}
-function scopedPrincipal(chatId: string): string | undefined {
-	try {
-		const scope: unknown = JSON.parse(chatId);
-		return Array.isArray(scope) &&
-			scope.length === 2 &&
-			scope.every(isNonEmptyString) &&
-			JSON.stringify(scope) === chatId
-			? scope[0]
-			: undefined;
-	} catch {
-		return undefined;
-	}
-}
 function bindingIdentity(value: unknown): Record<string, unknown> | undefined {
 	if (!isRecord(value)) return undefined;
 	const binding = value.managedAuthority ?? value.historicalBinding;
@@ -1169,6 +1129,12 @@ function containsForbiddenLegacyField(value: unknown, path = ""): boolean {
 	if (Array.isArray(value))
 		return value.some((child, index) => containsForbiddenLegacyField(child, `${path}/${index}`));
 	if (!isRecord(value)) return false;
+	const savedResume =
+		/^(?:\/mappings\/\d+(?:\/reassignment\/(?:sourceTombstone|priorTombstone)(?:\/prior)*)?\/journal\/\d+|\/provisionalOperations\/\d+|\/journal\/\d+|\/reassignment\/(?:sourceTombstone|priorTombstone)(?:\/prior)*\/journal\/\d+)?\/lifecycle$/.test(
+			path,
+		) &&
+		isManagedLifecycleEvidence(value) &&
+		value.historicalSource !== undefined;
 	const projection =
 		/^(?:\/mappings\/\d+(?:\/reassignment\/(?:sourceTombstone|priorTombstone)(?:\/prior)*)?|\/provisionalOperations\/\d+)(?:\/journal\/\d+\/result\/mapping)?$/.test(
 			path,
@@ -1181,8 +1147,10 @@ function containsForbiddenLegacyField(value: unknown, path = ""): boolean {
 	return Object.entries(value).some(
 		([key, child]) =>
 			FORBIDDEN_FIELDS.has(key) ||
+			["sessionPath", "sessionIdentity", "savedSession"].includes(key) ||
 			((key === "sessionFile" || key === "activeLeaf") && !projection) ||
-			containsForbiddenLegacyField(child, `${path}/${key}`),
+			(!(savedResume && (key === "target" || key === "historicalSource")) &&
+				containsForbiddenLegacyField(child, `${path}/${key}`)),
 	);
 }
 function canonicalize(value: unknown): unknown {

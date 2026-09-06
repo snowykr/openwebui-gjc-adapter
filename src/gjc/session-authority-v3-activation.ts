@@ -205,14 +205,40 @@ async function activateUnderDeadline(
 	if (historical.status === "blocked")
 		return { status: "blocked", canonicalPath, markerPath, reasons: historical.reasons };
 	const historicalPath = join(root, "historical.v3.json");
-	writePrivate(root, "historical.v3.json", Buffer.from(historical.v3Bytes));
+	const initialHistoricalBytes = Buffer.from(historical.v3Bytes);
+	const manifestDigest = digest(
+		readRegular(join(root, "source-manifest.json"), 16 * 1024, "immutable source manifest"),
+	);
+	retainHistoricalStage(root, historicalPath, initialHistoricalBytes, manifestDigest);
+	const retainedHistoricalBytes = readRegular(historicalPath, MAX_AUTHORITY_BYTES, "retained historical V3 stage");
 	const historicalStore = new V3FileBackedSessionMappingStore(historicalPath);
 	historicalStore.close();
-	if (!readRegular(historicalPath, MAX_AUTHORITY_BYTES, "historical V3 stage").equals(Buffer.from(historical.v3Bytes)))
-		throw new Error("Ordinary historical V3 reopen changed staged authority bytes.");
 	fsyncDirectory(root);
 	options.afterBoundary?.("historical-stage");
 	await assertLocks();
+	const assertBootstrapCurrent = async () => {
+		await assertLocks();
+		const retainedManifest = readRegular(join(root, "source-manifest.json"), 16 * 1024, "immutable source manifest");
+		if (digest(retainedManifest) !== manifestDigest) throw new Error("Historical bootstrap source manifest changed.");
+		if (!canonicalSnapshotMatches(canonicalPath, snapshot))
+			throw new Error("Canonical V2 authority changed during binding resolution.");
+		retainHistoricalStage(root, historicalPath, initialHistoricalBytes, manifestDigest);
+	};
+	await assertBootstrapCurrent();
+	// A changed stage may contain prepared or acknowledged lifecycle work. Until
+	// its journal is reconciled, never replace it by converting the original V2
+	// graph again, even when an earlier resolver returned no bindings or threw.
+	if (
+		!retainedHistoricalBytes.equals(initialHistoricalBytes) ||
+		!readRegular(historicalPath, MAX_AUTHORITY_BYTES, "historical V3 stage").equals(initialHistoricalBytes)
+	)
+		return {
+			status: "blocked",
+			canonicalPath,
+			markerPath,
+			reasons: ["Retained historical stage requires journal reconciliation before binding resolution."],
+		};
+	const historicalIdentity = fileIdentity(historicalPath);
 	const bindings =
 		options.resolveBindings === undefined
 			? (options.bindings ?? [])
@@ -220,15 +246,23 @@ async function activateUnderDeadline(
 					Promise.resolve(
 						options.resolveBindings(decodedDocument, {
 							stagedPath: historicalPath,
-							manifestDigest: digest(
-								readRegular(join(root, "source-manifest.json"), 16 * 1024, "immutable source manifest"),
-							),
-							assertCurrent: assertLocks,
+							manifestDigest,
+							assertCurrent: assertBootstrapCurrent,
 							remaining: () => deadline.remaining(),
 						}),
 					),
 				);
 	await assertLocks();
+	if (
+		!matchesFileIdentity(historicalPath, historicalIdentity) ||
+		!readRegular(historicalPath, MAX_AUTHORITY_BYTES, "historical V3 stage").equals(initialHistoricalBytes)
+	)
+		return {
+			status: "blocked",
+			canonicalPath,
+			markerPath,
+			reasons: ["Binding resolution changed the historical stage; retained journal cannot be discarded."],
+		};
 	if (bindings === undefined)
 		return {
 			status: "blocked",
@@ -352,6 +386,35 @@ async function activateUnderDeadline(
 	fsyncDirectory(root);
 	options.afterBoundary?.("marker");
 	return activated(canonicalPath, markerPath, marker);
+}
+
+function retainHistoricalStage(root: string, stagePath: string, initialBytes: Buffer, manifestDigest: string): void {
+	const checkpointPath = join(root, "historical-stage.json");
+	const checkpoint = encode({
+		kind: "openwebui-gjc-v3-historical-stage",
+		version: 1,
+		manifestDigest,
+		initialGraphDigest: digest(initialBytes),
+	});
+	if (lstatSync(checkpointPath, { throwIfNoEntry: false }) !== undefined) {
+		if (!readRegular(checkpointPath, 16 * 1024, "historical stage checkpoint").equals(checkpoint))
+			throw new Error("Historical stage checkpoint conflicts with its immutable source manifest.");
+		// A committed checkpoint makes absence/corruption evidence of loss, not
+		// permission to recreate a stage and forget a possibly invoked operation.
+		if (
+			parseSessionAuthorityV3Document(
+				readRegular(stagePath, MAX_AUTHORITY_BYTES, "retained historical V3 stage"),
+			) === undefined
+		)
+			throw new Error("Retained historical stage is not a valid canonical V3 document.");
+		return;
+	}
+	// No callback can have run before the immutable checkpoint. A crash in the
+	// initial file/checkpoint window may reuse only the identical initial graph.
+	writeImmutable(stagePath, initialBytes);
+	fsyncDirectory(root);
+	writeImmutable(checkpointPath, checkpoint);
+	fsyncDirectory(root);
 }
 
 function recover(

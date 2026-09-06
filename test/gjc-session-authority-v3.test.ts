@@ -2,7 +2,12 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createManagedLifecycleEvidence } from "../src/gjc/managed-lifecycle-evidence";
+import {
+	createManagedLifecycleEvidence,
+	isManagedLifecycleEvidence,
+	type ManagedHistoricalSavedSession,
+	transitionManagedLifecycleEvidence,
+} from "../src/gjc/managed-lifecycle-evidence";
 import type { HistoricalSessionBinding } from "../src/gjc/session-authority-types";
 import {
 	encodeSessionAuthorityV3Document,
@@ -10,8 +15,15 @@ import {
 	parseSessionAuthorityV3Document,
 	SESSION_AUTHORITY_V3_EPOCH,
 	SESSION_AUTHORITY_V3_KIND,
+	type SessionAuthorityV3Document,
+	type SessionAuthorityV3Operation,
 } from "../src/gjc/session-authority-v3";
 import { SessionV3FileBackedMappingStore } from "../src/gjc/session-v3-file-backed-mapping-store";
+import type {
+	ManagedGenerationProof,
+	ManagedPreparedTurnAuthority,
+	ManagedTurnAuthority,
+} from "../src/gjc/turn-runner";
 
 const timestamp = "2026-08-24T00:00:00.000Z";
 
@@ -184,7 +196,370 @@ function historicalGolden(): unknown {
 	return convert(golden(), "");
 }
 
+function bootstrapGraph() {
+	const document = historicalGolden();
+	if (!isSessionAuthorityV3Document(document)) throw new Error("Historical fixture must be valid V3.");
+	const root = document.mappings[0]!;
+	if (root.historicalBinding === undefined) throw new Error("Expected unbound fixture.");
+	const { canonicalWorkspace: _workspace, ...originalBinding } = root.historicalBinding;
+	const historicalBinding: HistoricalSessionBinding = { ...originalBinding, reason: "ownership-unresolved" };
+	const prepared: ManagedPreparedTurnAuthority = {
+		principalId: "tenant-a",
+		projectId: root.projectId,
+		canonicalWorkspace: "/srv/projects/a",
+		chatId: root.chatId,
+		leaseId: "bootstrap-lease",
+		epoch: "bootstrap-epoch",
+		requestKey: "manifest-occurrence-key",
+	};
+	const savedSession: ManagedHistoricalSavedSession = {
+		id: root.sessionId,
+		path: "/srv/projects/a/.gjc/sessions/saved.jsonl",
+		identity: {
+			dev: "66306",
+			ino: "1481656",
+			size: 3671,
+			mtimeMs: 1788717200450,
+			mtimeNs: "1788717200450003321",
+			sha256: "b".repeat(64),
+			nlink: "1",
+			ctimeNs: "1788717200450003321",
+		},
+	};
+	const { nlink: _nlink, ctimeNs: _ctimeNs, ...sessionIdentity } = savedSession.identity;
+	const lifecycle = createManagedLifecycleEvidence(
+		{
+			operation: "session.resume",
+			preparedAuthority: prepared,
+			historicalSource: {
+				kind: "bootstrap-history",
+				manifestDigest: "c".repeat(64),
+				historicalBinding,
+				savedSession,
+			},
+			target: {
+				sessionId: root.sessionId,
+				cwd: prepared.canonicalWorkspace,
+				sessionPath: savedSession.path,
+				sessionIdentity,
+			},
+			payloadHash: "d".repeat(64),
+		},
+		timestamp,
+	);
+	const operation: SessionAuthorityV3Operation = {
+		id: "bootstrap-operation",
+		kind: "resume",
+		state: "pending",
+		startedAt: timestamp,
+		detail: lifecycle.payloadHash,
+		lifecycle,
+	};
+	const { managedAuthority: _managedAuthority, historicalBinding: _historicalBinding, ...rootFields } = root;
+	const mapping = { ...rootFields, historicalBinding, journal: [...root.journal, operation] };
+	const graph: SessionAuthorityV3Document = { ...document, mappings: [mapping] };
+	const acknowledged: ManagedTurnAuthority = { ...prepared, sessionId: root.sessionId, generation: 19 };
+	const proof: ManagedGenerationProof = {
+		kind: "managed-generation",
+		sessionId: acknowledged.sessionId,
+		generation: acknowledged.generation,
+		leaseId: acknowledged.leaseId,
+		epoch: acknowledged.epoch,
+	};
+	return {
+		document: graph,
+		mapping,
+		operation,
+		lifecycle,
+		prepared,
+		acknowledged,
+		proof,
+		historicalBinding,
+		priorJournal: structuredClone(root.journal),
+	};
+}
+
 describe("session authority v3 full graph", () => {
+	test("ordinary store reopen retains bootstrap request identity and historical results without serving", () => {
+		const root = mkdtempSync(join(tmpdir(), "gjc-v3-bootstrap-evidence-"));
+		const path = join(root, "authority.json");
+		try {
+			const fixture = bootstrapGraph();
+			const invoking = transitionManagedLifecycleEvidence(fixture.lifecycle, "invoking", {}, timestamp);
+			const ack = transitionManagedLifecycleEvidence(
+				invoking,
+				"acknowledged_unproven",
+				{ acknowledged: fixture.acknowledged },
+				timestamp,
+			);
+			const active = transitionManagedLifecycleEvidence(
+				ack,
+				"active_generation_proven",
+				{ proven: fixture.proof },
+				timestamp,
+			);
+			for (const lifecycle of [fixture.lifecycle, invoking, ack, active]) {
+				const document = {
+					...fixture.document,
+					mappings: [
+						{ ...fixture.mapping, journal: [...fixture.priorJournal, { ...fixture.operation, lifecycle }] },
+					],
+				};
+				writeFileSync(path, encodeSessionAuthorityV3Document(document));
+				const store = new SessionV3FileBackedMappingStore(path);
+				expect(store.get(fixture.mapping.chatId)).toBeUndefined();
+				expect(() => store.assertServingReady()).toThrow("unbound history");
+				store.close();
+				const recovered = parseSessionAuthorityV3Document(readFileSync(path, "utf8"))!;
+				const operation = recovered.mappings[0]!.journal.at(-1)!;
+				expect(operation.state).toBe("uncertain");
+				expect(operation.lifecycle?.requestKey).toBe(lifecycle.requestKey);
+				expect(operation.lifecycle?.requestHash).toBe(lifecycle.requestHash);
+				expect(operation.lifecycle?.historicalSource).toEqual(lifecycle.historicalSource);
+				expect(operation.lifecycle?.acknowledged).toEqual(lifecycle.acknowledged);
+				expect(operation.lifecycle?.proven).toEqual(lifecycle.proven);
+				expect(recovered.mappings[0]!.journal[0]).toEqual(fixture.priorJournal[0]);
+			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("round-trips pending bootstrap acknowledgement and proof without promoting historical graph authority", () => {
+		const fixture = bootstrapGraph();
+		const invoking = transitionManagedLifecycleEvidence(fixture.lifecycle, "invoking", {}, timestamp);
+		const ack = transitionManagedLifecycleEvidence(
+			invoking,
+			"acknowledged_unproven",
+			{ acknowledged: fixture.acknowledged },
+			timestamp,
+		);
+		const active = transitionManagedLifecycleEvidence(
+			ack,
+			"active_generation_proven",
+			{ proven: fixture.proof },
+			timestamp,
+		);
+		for (const lifecycle of [fixture.lifecycle, invoking, ack, active]) {
+			const document = {
+				...fixture.document,
+				mappings: [{ ...fixture.mapping, journal: [...fixture.priorJournal, { ...fixture.operation, lifecycle }] }],
+			};
+			expect(isManagedLifecycleEvidence(lifecycle)).toBe(true);
+			expect(isSessionAuthorityV3Document(document)).toBe(true);
+			const replayed = parseSessionAuthorityV3Document(encodeSessionAuthorityV3Document(document))!;
+			expect(structuredClone(replayed)).toEqual(structuredClone(document));
+			expect(replayed.mappings[0]!.managedAuthority).toBeUndefined();
+			expect(replayed.mappings[0]!.historicalBinding).toEqual(fixture.historicalBinding);
+			expect(replayed.mappings[0]!.journal.slice(0, -1)).toEqual([...fixture.priorJournal]);
+		}
+	});
+
+	test("permits bootstrap success result only after promotion while preserving original historical results", () => {
+		const fixture = bootstrapGraph();
+		const ack = transitionManagedLifecycleEvidence(
+			transitionManagedLifecycleEvidence(fixture.lifecycle, "invoking", {}, timestamp),
+			"acknowledged_unproven",
+			{ acknowledged: fixture.acknowledged },
+			timestamp,
+		);
+		const active = transitionManagedLifecycleEvidence(
+			ack,
+			"active_generation_proven",
+			{ proven: fixture.proof },
+			timestamp,
+		);
+		const managedAuthority = { ...fixture.acknowledged, authorityEpoch: SESSION_AUTHORITY_V3_EPOCH };
+		const completed: SessionAuthorityV3Operation = {
+			...fixture.operation,
+			state: "complete",
+			completedAt: timestamp,
+			lifecycle: active,
+			result: {
+				kind: "control",
+				assistantText: "resumed",
+				managedAuthority,
+				mapping: {
+					chatId: fixture.mapping.chatId,
+					projectId: fixture.mapping.projectId,
+					sessionId: fixture.mapping.sessionId,
+					operationId: fixture.operation.id,
+					rawFrameCursor: 4,
+					eventCursor: 2,
+				},
+			},
+		};
+		expect(
+			isSessionAuthorityV3Document({
+				...fixture.document,
+				mappings: [{ ...fixture.mapping, journal: [...fixture.priorJournal, completed] }],
+			}),
+		).toBe(false);
+		const { historicalBinding: _historical, ...fields } = fixture.mapping;
+		const promoted = { ...fields, managedAuthority, journal: [...fixture.priorJournal, completed] };
+		const document: SessionAuthorityV3Document = { ...fixture.document, mappings: [promoted] };
+		expect(isSessionAuthorityV3Document(document)).toBe(true);
+		const reopened = parseSessionAuthorityV3Document(encodeSessionAuthorityV3Document(document))!;
+		expect(structuredClone(reopened)).toEqual(structuredClone(document));
+		expect(reopened.mappings[0]!.journal[0]!.result!.managedAuthority).toBeUndefined();
+		expect(reopened.mappings[0]!.journal[0]!.result!.historicalBinding).toBeDefined();
+		expect(reopened.mappings[0]!.journal.at(-1)!.lifecycle!.historicalSource).toEqual(active.historicalSource);
+		for (const patch of [{ principalId: "foreign" }, { canonicalWorkspace: "/foreign" }])
+			expect(
+				isSessionAuthorityV3Document({
+					...document,
+					mappings: [{ ...promoted, managedAuthority: { ...managedAuthority, ...patch } }],
+				}),
+			).toBe(false);
+	});
+
+	test("rejects bootstrap evidence coupled to another historical occurrence or unresolved owner container", () => {
+		const fixture = bootstrapGraph();
+		for (const provenance of [
+			{ ...fixture.historicalBinding.provenance, nodeRef: "/mappings/1" },
+			{ ...fixture.historicalBinding.provenance, documentHash: "f".repeat(64) },
+			{ ...fixture.historicalBinding.provenance, nodeHash: "f".repeat(64) },
+		]) {
+			const lifecycle = createManagedLifecycleEvidence(
+				{
+					operation: "session.resume",
+					preparedAuthority: fixture.prepared,
+					historicalSource: {
+						...fixture.lifecycle.historicalSource!,
+						historicalBinding: { ...fixture.historicalBinding, provenance },
+					},
+					target: fixture.lifecycle.target,
+					payloadHash: fixture.lifecycle.payloadHash,
+				},
+				timestamp,
+			);
+			expect(isManagedLifecycleEvidence(lifecycle)).toBe(true);
+			expect(
+				isSessionAuthorityV3Document({
+					...fixture.document,
+					mappings: [
+						{ ...fixture.mapping, journal: [...fixture.priorJournal, { ...fixture.operation, lifecycle }] },
+					],
+				}),
+			).toBe(false);
+		}
+		const { principalId: _principal, ...unowned } = fixture.historicalBinding;
+		const historicalBinding: HistoricalSessionBinding = { ...unowned, reason: "ownership-unresolved" };
+		const lifecycle = createManagedLifecycleEvidence(
+			{
+				operation: "session.resume",
+				preparedAuthority: fixture.prepared,
+				historicalSource: { ...fixture.lifecycle.historicalSource!, historicalBinding },
+				target: fixture.lifecycle.target,
+				payloadHash: fixture.lifecycle.payloadHash,
+			},
+			timestamp,
+		);
+		const mapping = {
+			...fixture.mapping,
+			historicalBinding,
+			journal: [...fixture.priorJournal, { ...fixture.operation, lifecycle }],
+		};
+		expect(isSessionAuthorityV3Document({ ...fixture.document, mappings: [mapping] })).toBe(true);
+		const orphan = { ...fixture.operation, chatId: fixture.mapping.chatId, projectId: fixture.mapping.projectId };
+		expect(isSessionAuthorityV3Document({ ...fixture.document, mappings: [], provisionalOperations: [orphan] })).toBe(
+			false,
+		);
+	});
+
+	test("retains scoped historical provisional bootstrap evidence without canonicalizing its logical acknowledgement", () => {
+		const fixture = bootstrapGraph();
+		const chatId = JSON.stringify([fixture.prepared.principalId, fixture.prepared.chatId]);
+		const historicalBinding = {
+			...fixture.historicalBinding,
+			chatId,
+			provenance: { ...fixture.historicalBinding.provenance, nodeRef: "/provisionalOperations/0" },
+		};
+		const intent = createManagedLifecycleEvidence(
+			{
+				operation: "session.resume",
+				preparedAuthority: fixture.prepared,
+				historicalSource: { ...fixture.lifecycle.historicalSource!, historicalBinding },
+				target: fixture.lifecycle.target,
+				payloadHash: fixture.lifecycle.payloadHash,
+			},
+			timestamp,
+		);
+		const ack = transitionManagedLifecycleEvidence(
+			transitionManagedLifecycleEvidence(intent, "invoking", {}, timestamp),
+			"acknowledged_unproven",
+			{ acknowledged: fixture.acknowledged },
+			timestamp,
+		);
+		const active = transitionManagedLifecycleEvidence(
+			ack,
+			"active_generation_proven",
+			{ proven: fixture.proof },
+			timestamp,
+		);
+		for (const lifecycle of [intent, ack, active]) {
+			const document: SessionAuthorityV3Document = {
+				...fixture.document,
+				mappings: [],
+				provisionalOperations: [
+					{
+						...fixture.operation,
+						chatId,
+						projectId: fixture.mapping.projectId,
+						sessionId: fixture.mapping.sessionId,
+						historicalBinding,
+						lifecycle,
+					},
+				],
+			};
+			expect(isSessionAuthorityV3Document(document)).toBe(true);
+			const decoded = parseSessionAuthorityV3Document(encodeSessionAuthorityV3Document(document))!;
+			expect(structuredClone(decoded)).toEqual(structuredClone(document));
+			expect(decoded.provisionalOperations[0]!.lifecycle!.historicalSource!.historicalBinding.chatId).toBe(chatId);
+			if (lifecycle.acknowledged !== undefined)
+				expect(decoded.provisionalOperations[0]!.lifecycle!.acknowledged!.chatId).toBe(fixture.prepared.chatId);
+		}
+	});
+
+	test("allows public saved selection fields only in validated bootstrap lifecycle positions", () => {
+		const fixture = bootstrapGraph();
+		expect(isSessionAuthorityV3Document(fixture.document)).toBe(true);
+		for (const field of ["sessionPath", "sessionIdentity", "savedSession"]) {
+			const value =
+				field === "savedSession"
+					? fixture.lifecycle.historicalSource!.savedSession
+					: fixture.lifecycle.target[field];
+			expect(
+				isSessionAuthorityV3Document({
+					...fixture.document,
+					mappings: [{ ...fixture.mapping, observations: { [field]: value } }],
+				}),
+			).toBe(false);
+		}
+		expect(
+			isSessionAuthorityV3Document({
+				...fixture.document,
+				mappings: [{ ...fixture.mapping, observations: { lifecycle: fixture.lifecycle } }],
+			}),
+		).toBe(false);
+		const changed = {
+			...fixture.operation,
+			lifecycle: {
+				...fixture.lifecycle,
+				historicalSource: {
+					...fixture.lifecycle.historicalSource!,
+					savedSession: { ...fixture.lifecycle.historicalSource!.savedSession, path: "/foreign/saved.jsonl" },
+				},
+			},
+		};
+		expect(
+			isSessionAuthorityV3Document({
+				...fixture.document,
+				mappings: [{ ...fixture.mapping, journal: [...fixture.priorJournal, changed] }],
+			}),
+		).toBe(false);
+	});
+
 	test("round-trips generation-free ordinary history at every identity occurrence", () => {
 		const value = historicalGolden();
 		expect(isSessionAuthorityV3Document(value)).toBe(true);

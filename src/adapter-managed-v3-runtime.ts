@@ -1,4 +1,5 @@
 import { isAbsolute, resolve } from "node:path";
+import { ManagedOperationDeadline } from "./gjc/managed-operation-deadline";
 import type { ManagedSdkRuntime, TenantSessionKey } from "./gjc/managed-sdk-runtime";
 import { SESSION_AUTHORITY_V3_EPOCH } from "./gjc/session-authority-v3";
 import type { SessionMapping } from "./gjc/session-mapping-store";
@@ -55,11 +56,17 @@ export function startActiveManagedRuntime(options: StartActiveManagedRuntimeOpti
 }
 
 async function start(options: StartActiveManagedRuntimeOptions): Promise<ActiveManagedV3Runtime> {
+	const deadline = new ManagedOperationDeadline(options.turnTimeoutMs, "V3 runtime startup");
+	const step = <T>(action: () => Promise<T>): Promise<T> => {
+		deadline.remaining();
+		return deadline.wait(action());
+	};
 	try {
-		await options.runtime.start();
+		await step(() => options.runtime.start());
 		const identities = new Set<string>();
 		const generations = new Set<string>();
 		for (const mapping of options.mappings.mappingRecordsIterable()) {
+			deadline.remaining();
 			const tenant = tenantFor(mapping);
 			const identity = JSON.stringify([tenant.principalId, tenant.chatId]);
 			const generationIdentity = JSON.stringify([tenant.sessionId, tenant.generation]);
@@ -70,16 +77,17 @@ async function start(options: StartActiveManagedRuntimeOptions): Promise<ActiveM
 			options.runtime.registerTenant(tenant);
 			// ManagedSdkRuntime serializes this boundary. Reconcile before every
 			// attachment acquisition so a replaced or provisional generation cannot escape.
-			await options.runtime.reconcile();
-			const acquired = await options.runtime.acquireAttachment(tenant);
+			await step(() => options.runtime.reconcile());
+			const acquired = await step(() => options.runtime.acquireAttachment(tenant));
 			if (acquired.generation !== tenant.generation || !acquired.isCurrent())
 				throw new Error("Canonical V3 mapping attachment is stale.");
-			const generation = await options.runtime.generationStatus(tenant);
+			const generation = await step(() => options.runtime.generationStatus(tenant));
 			if (generation.status !== "current")
 				throw new Error("Canonical V3 mapping generation is replaced, provisional, or requires recovery.");
-			if (!(await options.liveTenantFence(tenant)))
+			if (!(await step(async () => await options.liveTenantFence(tenant))))
 				throw new Error("External live tenant lease/epoch fence was lost.");
 		}
+		deadline.remaining();
 		const tenantFence: ActiveManagedV3TenantFence = async key =>
 			isTenantKey(key) && (await options.liveTenantFence(key));
 		let disposePromise: Promise<void> | undefined;
@@ -94,11 +102,14 @@ async function start(options: StartActiveManagedRuntimeOptions): Promise<ActiveM
 		});
 	} catch (error) {
 		try {
-			await options.runtime.dispose();
+			await deadline.wait(options.runtime.dispose());
 		} catch (disposeError) {
+			if (disposeError === error) throw error;
 			throw new AggregateError([error, disposeError], "Managed V3 runtime startup and cleanup failed.");
 		}
 		throw error;
+	} finally {
+		deadline.close();
 	}
 }
 
