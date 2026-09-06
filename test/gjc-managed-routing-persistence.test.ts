@@ -435,6 +435,99 @@ describe("managed routing persistence", () => {
 		}
 	});
 
+	test.each(["sessionId", "generation", "leaseId", "requestKey"] as const)(
+		"retains the admitted fork receipt after predecessor %s changes without publishing it",
+		async field => {
+			const f = fixture();
+			try {
+				await routeGjcTurn(f.input());
+				const original = f.store.getScoped(f.scope)!;
+				const replacementAuthority = {
+					...original.managedAuthority!,
+					[field]: field === "generation" ? 3 : "replacement",
+				};
+				let forks = 0;
+				let adopted = false;
+				let acknowledged: ManagedTurnAuthority | undefined;
+				const runner = Object.assign(f.runner, {
+					async forkManagedSuccessor(input: ManagedSuccessorInput): Promise<never> {
+						await input.onInvoking?.();
+						forks += 1;
+						f.store.setScoped(f.scope, {
+							...original,
+							sessionId: replacementAuthority.sessionId,
+							managedAuthority: replacementAuthority,
+						});
+						acknowledged = { ...input.target, sessionId: "acknowledged-target", generation: 9 };
+						await input.onAcknowledged?.(acknowledged);
+						adopted = true;
+						throw new Error("replacement must deny adoption");
+					},
+				});
+				const gateway = () => createGjcRoutingLiveGatewayRunner({ turnRunner: runner, mappings: f.store });
+				await expect(gateway().run(branchTurn())).rejects.toThrow(
+					field === "sessionId" ? "branch_predecessor_replaced" : "authority changed",
+				);
+				const receipt = f.store.operationScoped(f.scope, "branch-1")!;
+				expect(receipt.state).toBe("uncertain");
+				expect(receipt.lifecycle?.state).toBe("uncertain");
+				expect(receipt.lifecycle?.acknowledged).toEqual(lifecycleExactAuthority(acknowledged!));
+				expect(receipt.acknowledgedSuccessor).toEqual({
+					sessionId: acknowledged!.sessionId,
+					managedAuthority: acknowledged!,
+				});
+				expect(receipt.lifecycle?.proven).toBeUndefined();
+				expect(receipt.result).toBeUndefined();
+				f.reopen();
+				expect(f.store.operationScoped(f.scope, "branch-1")).toEqual(receipt);
+				expect(f.store.getScoped(f.scope)?.managedAuthority).toEqual(replacementAuthority);
+				const bytes = readFileSync(f.file);
+				await expect(gateway().run(branchTurn())).rejects.toThrow("requires reconciliation");
+				await expect(gateway().run({ ...branchTurn(), prompt: "changed payload" })).rejects.toThrow();
+				expect(readFileSync(f.file).equals(bytes)).toBe(true);
+				expect(forks).toBe(1);
+				expect(adopted).toBe(false);
+				expect(runner.states).toHaveLength(0);
+				expect(runner.continues).toHaveLength(0);
+			} finally {
+				f.close();
+			}
+		},
+	);
+
+	test("rejects predecessor replacement before the fork invocation callback", async () => {
+		const f = fixture();
+		try {
+			await routeGjcTurn(f.input());
+			const original = f.store.getScoped(f.scope)!;
+			let forks = 0;
+			const runner = Object.assign(f.runner, {
+				async forkManagedSuccessor(input: ManagedSuccessorInput): Promise<never> {
+					f.store.setScoped(f.scope, {
+						...original,
+						sessionId: "replacement",
+						managedAuthority: { ...original.managedAuthority!, sessionId: "replacement" },
+					});
+					await input.onInvoking?.();
+					forks += 1;
+					throw new Error("replacement must deny dispatch");
+				},
+			});
+			const gateway = createGjcRoutingLiveGatewayRunner({ turnRunner: runner, mappings: f.store });
+			await expect(gateway.run(branchTurn())).rejects.toThrow("branch_predecessor_replaced");
+			f.reopen();
+			const receipt = f.store.operationScoped(f.scope, "branch-1")!;
+			expect(receipt.lifecycle?.state).toBe("intent_prepared");
+			expect(receipt.lifecycle?.acknowledged).toBeUndefined();
+			expect(receipt.acknowledgedSuccessor).toBeUndefined();
+			expect(forks).toBe(0);
+			expect(runner.states).toHaveLength(0);
+			expect(runner.continues).toHaveLength(0);
+		} finally {
+			f.close();
+		}
+	});
+
 	test("rejects pre-aborted branch before intent and lifecycle dispatch", async () => {
 		const f = fixture();
 		try {

@@ -346,9 +346,11 @@ async function runManagedBranch(
 			target,
 			signal: turn.signal,
 			lifecycleOperation: { operationId: turn.userMessageId, requestKey: source.requestKey, payloadHash: hash },
-			onInvoking: () => recordLifecycle(transitionManagedLifecycleEvidence(lifecycleEvidence, "invoking")),
-			onAcknowledged: authority => {
+			onInvoking: () => {
 				assertCurrentBranchPredecessor(mappings, turn.chatId, existing, turn.userMessageId);
+				recordLifecycle(transitionManagedLifecycleEvidence(lifecycleEvidence, "invoking"));
+			},
+			onAcknowledged: authority => {
 				assertManagedAuthority(authority, {
 					...source,
 					sessionId: authority.sessionId,
@@ -369,6 +371,7 @@ async function runManagedBranch(
 					sessionId: authority.sessionId,
 					managedAuthority: managedAuthorityCopy(authority),
 				});
+				assertCurrentBranchPredecessor(mappings, turn.chatId, existing, turn.userMessageId);
 			},
 			publish: successor => {
 				assertCurrentBranchPredecessor(mappings, turn.chatId, existing, turn.userMessageId);

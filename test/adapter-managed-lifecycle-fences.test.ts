@@ -15,12 +15,13 @@ import { V3FileBackedSessionMappingStore } from "../src/gjc/session-v3-file-back
 import * as managedIdle from "../src/live/gjc-managed-idle-reaper";
 import { createManagedV3GenerationStore } from "../src/live/gjc-managed-idle-reaper";
 import { createManagedGjcTurnRunner } from "../src/live/gjc-managed-turn-runner";
+import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-gateway";
 import { SqliteProjectRegistrationStore } from "../src/projects/registration-store";
 import { createUserWorkspaceRegistry } from "../src/security/user-workspace";
 import { createWorkspaceLeaseManager, workspaceLeaseId } from "../src/security/workspace-lease";
 import { writeDirectV3Authority } from "./cli-fixtures";
 
-async function fixture(controls: { afterCreate?: () => Promise<void> } = {}) {
+async function fixture(controls: { afterCreate?: () => Promise<void>; afterFork?: () => void } = {}) {
 	const root = await mkdtemp(join(tmpdir(), "gjc-production-lifecycle-"));
 	const stateRoot = join(root, "state");
 	const sessionRoot = join(root, "sessions");
@@ -98,6 +99,26 @@ async function fixture(controls: { afterCreate?: () => Promise<void> } = {}) {
 										ok: true,
 										operation: "session.create",
 										result: { sessionId: "assigned", endpointGeneration: 1 },
+									};
+								},
+								async fork(
+									request: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["fork"]>[0],
+								) {
+									const document = JSON.parse(await readFile(authorityPath, "utf8"));
+									expect(document.mappings[0].journal.at(-1).lifecycle.state).toBe("invoking");
+									expect(request.target.sourceSessionId).toBe("assigned");
+									expect(request.target.cwd).toBe(workspace.root);
+									calls.push("fork");
+									attachments.set("forked", {
+										sessionId: "forked",
+										generation: 2,
+										isCurrent: () => true,
+									} as router.SessionAttachment);
+									controls.afterFork?.();
+									return {
+										ok: true,
+										operation: "session.fork",
+										result: { sessionId: "forked", endpointGeneration: 2 },
 									};
 								},
 							}) as unknown as ReturnType<typeof lifecycle.createSessionLifecycleService>,
@@ -247,6 +268,70 @@ test("production create persists its exact acknowledgement even when the lease i
 		} finally {
 			reopened.close();
 		}
+	} finally {
+		await f.close();
+	}
+});
+
+test("production branch retains its exact receipt after the effect replaces its predecessor", async () => {
+	const controls: { afterFork?: () => void } = {};
+	const f = await fixture(controls);
+	try {
+		const project = { ...f.project, cwd: f.workspace.root, sessionRoot: f.workspace.sessionRoot };
+		const runner = createManagedGjcTurnRunner(f.runtime, 2_000);
+		await routeGjcTurn({
+			project,
+			principalId: f.prepared.principalId,
+			chatId: f.prepared.chatId,
+			userMessageId: "ingress",
+			text: "hello",
+			preparedManagedAuthority: f.prepared,
+			mappings: f.mappings,
+			runner,
+		});
+		const original = f.mappings.getScoped(f.prepared)!;
+		const baseline = [...f.calls];
+		controls.afterFork = () => {
+			f.mappings.setScoped(f.prepared, {
+				...original,
+				sessionId: "replacement",
+				managedAuthority: { ...original.managedAuthority!, sessionId: "replacement" },
+			});
+		};
+		const gateway = createGjcRoutingLiveGatewayRunner({ turnRunner: runner, mappings: f.mappings });
+		const turn = {
+			project,
+			prompt: "branch prompt",
+			chatId: f.prepared.chatId,
+			messageId: "branch",
+			userMessageId: "branch",
+			userMessageParentId: "ingress",
+			continued: true,
+			ownerUserId: f.prepared.principalId,
+			control: { operation: "branch" as const },
+		};
+		await expect(gateway.run(turn)).rejects.toThrow("acknowledgement persistence is uncertain");
+		const receipt = f.mappings.operationScoped(f.prepared, "branch")!;
+		expect(receipt.state).toBe("uncertain");
+		expect(receipt.lifecycle?.state).toBe("uncertain");
+		expect(receipt.lifecycle?.acknowledged?.sessionId).toBe("forked");
+		expect(receipt.lifecycle?.acknowledged?.generation).toBe(2);
+		expect(receipt.acknowledgedSuccessor?.sessionId).toBe("forked");
+		expect(receipt.lifecycle?.proven).toBeUndefined();
+		expect(receipt.result).toBeUndefined();
+		expect(f.mappings.getScoped(f.prepared)?.sessionId).toBe("replacement");
+		await expect(
+			f.runtime.acquireAttachment({ ...f.prepared, sessionId: "forked", generation: 2 }),
+		).rejects.toThrow();
+		const reopened = new V3FileBackedSessionMappingStore(join(f.root, "sessions", "openwebui-session-mappings.json"));
+		try {
+			expect(reopened.operationScoped(f.prepared, "branch")).toEqual(receipt);
+			const restart = createGjcRoutingLiveGatewayRunner({ turnRunner: runner, mappings: reopened });
+			await expect(restart.run(turn)).rejects.toThrow("requires reconciliation");
+		} finally {
+			reopened.close();
+		}
+		expect(f.calls).toEqual([...baseline, "fork"]);
 	} finally {
 		await f.close();
 	}
