@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	encodeSessionAuthorityV3Document,
 	isSessionAuthorityV3Document,
@@ -6,6 +9,7 @@ import {
 	SESSION_AUTHORITY_V3_EPOCH,
 	SESSION_AUTHORITY_V3_KIND,
 } from "../src/gjc/session-authority-v3";
+import { SessionV3FileBackedMappingStore } from "../src/gjc/session-v3-file-backed-mapping-store";
 
 const timestamp = "2026-08-24T00:00:00.000Z";
 
@@ -138,6 +142,31 @@ function clonedGolden(): Record<string, any> {
 }
 
 describe("session authority v3 full graph", () => {
+	test("opens the golden graph and preserves runtime epochs across mutation and reopen", () => {
+		const root = mkdtempSync(join(tmpdir(), "gjc-v3-golden-store-"));
+		const file = join(root, "authority.json");
+		writeFileSync(file, JSON.stringify(golden()));
+		let store: SessionV3FileBackedMappingStore | undefined;
+		try {
+			store = new SessionV3FileBackedMappingStore(file);
+			store.beginOperation("chat-a", { id: "next-prompt", kind: "prompt", detail: "hash" });
+			store.close();
+			store = new SessionV3FileBackedMappingStore(file);
+			expect(store.operation("chat-a", "next-prompt")?.state).toBe("uncertain");
+			const persisted = parseSessionAuthorityV3Document(readFileSync(file, "utf8"))!;
+			expect(persisted.mappings[0].managedAuthority.epoch).toBe("runtime-1");
+			expect(persisted.mappings[0].journal[0].result).toEqual(
+				parseSessionAuthorityV3Document(JSON.stringify(golden()))!.mappings[0].journal[0].result,
+			);
+			expect(persisted.mappings[0].journal[1].acknowledgedSuccessor?.managedAuthority.epoch).toBe("runtime-4");
+			expect(persisted.mappings[0].reassignment?.sourceTombstone?.prior?.managedAuthority.epoch).toBe("runtime-3");
+			expect(persisted.provisionalOperations[0].managedAuthority?.epoch).toBe("runtime-5");
+		} finally {
+			store?.close();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	test("round-trips the golden graph without dropping replay, gate, successor, provisional, or recursive tombstone evidence", () => {
 		const parsed = parseSessionAuthorityV3Document(JSON.stringify(golden()));
 		expect(parsed).toBeDefined();
@@ -198,6 +227,44 @@ describe("session authority v3 full graph", () => {
 			const value = clonedGolden();
 			mutate(value);
 			expect(parseSessionAuthorityV3Document(JSON.stringify(value))).toBeUndefined();
+		}
+	});
+
+	test("rejects a foreign principal throughout an owned managed graph", () => {
+		for (const mutate of [
+			(value: Record<string, any>) => {
+				value.mappings[0].journal[0].result.managedAuthority.principalId = "tenant-b";
+			},
+			(value: Record<string, any>) => {
+				value.mappings[0].journal[1].acknowledgedSuccessor.managedAuthority.principalId = "tenant-b";
+			},
+			(value: Record<string, any>) => {
+				value.mappings[0].reassignment.sourceTombstone.managedAuthority.principalId = "tenant-b";
+			},
+			(value: Record<string, any>) => {
+				value.mappings[0].reassignment.sourceTombstone.prior.managedAuthority.principalId = "tenant-b";
+			},
+			(value: Record<string, any>) => {
+				value.provisionalOperations = [
+					{
+						id: "foreign-reservation",
+						kind: "create",
+						state: "pending",
+						startedAt: timestamp,
+						chatId: "chat-a",
+						projectId: "project-a",
+						sessionId: "session-next",
+						managedAuthority: { ...authority("chat-a", "project-a", "session-next"), principalId: "tenant-b" },
+					},
+				];
+			},
+			(value: Record<string, any>) => {
+				value.mappings[0].observations.__gjcSessionMappingScope = { principalId: "tenant-b" };
+			},
+		]) {
+			const document = clonedGolden();
+			mutate(document);
+			expect(parseSessionAuthorityV3Document(JSON.stringify(document))).toBeUndefined();
 		}
 	});
 });

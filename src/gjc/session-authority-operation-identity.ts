@@ -10,7 +10,8 @@ export function assertReservableIdentity(
 	provisional: readonly ProvisionalSessionOperation[],
 ): void {
 	const ingressId = operation.ingressId ?? operation.id;
-	if (hasIdentityCollision(operation, journal) || hasIdentityCollision(operation, provisional))
+	const ownedProvisional = provisional.filter(candidate => candidate.chatId === operation.chatId);
+	if (hasIdentityCollision(operation, journal) || hasIdentityCollision(operation, ownedProvisional))
 		throw new Error(`Session ingress ${ingressId} conflicts with an existing operation.`);
 	if (hasIdentityOverlap(operation, journal))
 		throw new Error(`Session operation ${ingressId} requires reconciliation.`);
@@ -26,6 +27,7 @@ export function assertPublishableIdentity(
 	if (
 		reserved === undefined ||
 		reserved.state !== "pending" ||
+		reserved.chatId !== operation.chatId ||
 		!sameOperationIdentity(reserved, operation) ||
 		reserved.kind !== operation.kind ||
 		reserved.projectId !== operation.projectId ||
@@ -36,7 +38,7 @@ export function assertPublishableIdentity(
 		hasIdentityCollision(operation, journal) ||
 		hasIdentityCollision(
 			operation,
-			provisional.filter(candidate => candidate !== reserved),
+			provisional.filter(candidate => candidate.chatId === operation.chatId && candidate !== reserved),
 		)
 	)
 		throw new Error(`Session ingress ${ingressId} conflicts with an existing operation.`);
@@ -44,13 +46,15 @@ export function assertPublishableIdentity(
 }
 
 export function assertBeginableIdentity(
+	chatId: string,
 	operation: Omit<SessionOperation, "state" | "startedAt" | "completedAt">,
 	provisional: readonly ProvisionalSessionOperation[],
 ): void {
 	const ingressId = operation.ingressId ?? operation.id;
-	if (hasIdentityCollision(operation, provisional))
+	const ownedProvisional = provisional.filter(candidate => candidate.chatId === chatId);
+	if (hasIdentityCollision(operation, ownedProvisional))
 		throw new Error(`Session ingress ${ingressId} conflicts with an existing operation.`);
-	if (hasIdentityOverlap(operation, provisional))
+	if (hasIdentityOverlap(operation, ownedProvisional))
 		throw new Error(`Session operation ${ingressId} requires reconciliation.`);
 }
 

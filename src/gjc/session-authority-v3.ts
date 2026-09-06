@@ -1,4 +1,5 @@
 import { isAbsolute } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import type { NormalizedModelSelection } from "../contracts";
 import {
 	isJsonValue,
@@ -205,8 +206,19 @@ export function isSessionAuthorityV3RelationallyValid(
 ): boolean {
 	const mappings = new Map<string, SessionAuthorityV3Mapping>();
 	const identities = new Map<string, string>();
+	const provisionalIdentities = new Set<string>();
 	for (const mapping of document.mappings) {
 		if (mappings.has(mapping.chatId)) return false;
+		const scope = mapping.observations?.__gjcSessionMappingScope;
+		if (
+			scope !== undefined &&
+			(!isRecord(scope) ||
+				scope.principalId !== mapping.managedAuthority.principalId ||
+				(scope.chatId !== undefined &&
+					(typeof scope.chatId !== "string" ||
+						JSON.stringify([scope.principalId, scope.chatId]) !== mapping.chatId)))
+		)
+			return false;
 		mappings.set(mapping.chatId, mapping);
 		if (!validateJournal(mapping, mapping.journal, identities)) return false;
 		for (const root of tombstoneRoots(mapping.reassignment))
@@ -215,13 +227,29 @@ export function isSessionAuthorityV3RelationallyValid(
 				tombstone !== undefined;
 				tombstone = tombstone.prior
 			) {
-				if (tombstone.chatId !== mapping.chatId || !validateAuthority(tombstone.managedAuthority, tombstone))
+				if (
+					tombstone.chatId !== mapping.chatId ||
+					tombstone.managedAuthority.principalId !== mapping.managedAuthority.principalId ||
+					!validateAuthority(tombstone.managedAuthority, tombstone)
+				)
 					return false;
 				if (!validateJournal(tombstone, tombstone.journal, identities)) return false;
 			}
 	}
 	for (const provisional of document.provisionalOperations) {
 		const mapping = mappings.get(provisional.chatId);
+		for (const identifier of operationIdentifiers(provisional)) {
+			const key = `${provisional.chatId}\u0000${identifier}`;
+			if (provisionalIdentities.has(key)) return false;
+			provisionalIdentities.add(key);
+		}
+		const publicationReceipt = isCompletedPublicationReceipt(mapping, provisional);
+		if (
+			mapping !== undefined &&
+			provisional.managedAuthority !== undefined &&
+			provisional.managedAuthority.principalId !== mapping.managedAuthority.principalId
+		)
+			return false;
 		if (
 			provisional.sessionId !== undefined &&
 			!validateAuthority(provisional.managedAuthority, {
@@ -234,14 +262,11 @@ export function isSessionAuthorityV3RelationallyValid(
 		if (
 			mapping !== undefined &&
 			mapping.projectId !== provisional.projectId &&
-			!isPermittedReassignmentProvisional(mapping, provisional)
+			!isPermittedReassignmentProvisional(mapping, provisional) &&
+			!publicationReceipt
 		)
 			return false;
-		if (
-			!addOperationIdentity(identities, provisional.chatId, provisional) &&
-			!isCompletedPublicationReceipt(mapping, provisional)
-		)
-			return false;
+		if (!addOperationIdentity(identities, provisional.chatId, provisional) && !publicationReceipt) return false;
 	}
 	return true;
 }
@@ -536,12 +561,20 @@ function isTombstone(value: unknown): value is SessionAuthorityV3Tombstone {
 }
 
 function validateJournal(
-	owner: Pick<SessionAuthorityV3Mapping, "chatId" | "projectId" | "sessionId">,
+	owner: Pick<SessionAuthorityV3Mapping, "chatId" | "projectId" | "sessionId" | "managedAuthority">,
 	journal: readonly SessionAuthorityV3Operation[],
 	identities: Map<string, string>,
 ): boolean {
 	const local = new Set<string>();
 	for (const operation of journal) {
+		const successor = operation.acknowledgedSuccessor;
+		if (
+			successor !== undefined &&
+			(!validateAuthority(successor.managedAuthority, { ...owner, sessionId: successor.sessionId }) ||
+				successor.managedAuthority.principalId !== owner.managedAuthority.principalId ||
+				successor.managedAuthority.canonicalWorkspace !== owner.managedAuthority.canonicalWorkspace)
+		)
+			return false;
 		for (const identifier of operationIdentifiers(operation))
 			if (local.has(identifier)) return false;
 			else local.add(identifier);
@@ -549,9 +582,10 @@ function validateJournal(
 			operation.result !== undefined &&
 			(operation.result.mapping.chatId !== owner.chatId ||
 				operation.result.mapping.projectId !== owner.projectId ||
-				operation.result.mapping.sessionId !== owner.sessionId ||
 				operation.result.mapping.operationId !== operation.id ||
-				!validateAuthority(operation.result.managedAuthority, owner))
+				operation.result.managedAuthority.principalId !== owner.managedAuthority.principalId ||
+				operation.result.managedAuthority.canonicalWorkspace !== owner.managedAuthority.canonicalWorkspace ||
+				!validateAuthority(operation.result.managedAuthority, operation.result.mapping))
 		)
 			return false;
 		if (!addOperationIdentity(identities, owner.chatId, operation)) return false;
@@ -586,15 +620,34 @@ function isCompletedPublicationReceipt(
 	provisional: SessionAuthorityV3ProvisionalOperation,
 ): boolean {
 	if (mapping === undefined || provisional.state !== "complete") return false;
-	const operation = mapping.journal.find(candidate => operationIdentity(candidate) === operationIdentity(provisional));
-	return (
-		operation !== undefined &&
-		operation.state === "complete" &&
-		operation.kind === "prompt" &&
-		operation.detail === provisional.detail &&
-		operation.startedAt === provisional.startedAt &&
-		operation.completedAt === provisional.completedAt
-	);
+	const matches = (owner: SessionAuthorityV3Mapping | SessionAuthorityV3Tombstone): boolean => {
+		if (owner.chatId !== provisional.chatId || owner.projectId !== provisional.projectId) return false;
+		const operation = owner.journal.find(
+			candidate => operationIdentity(candidate) === operationIdentity(provisional),
+		);
+		return (
+			operation !== undefined &&
+			operation.state === "complete" &&
+			operation.kind === "prompt" &&
+			(provisional.kind === "prompt" || provisional.kind === "create") &&
+			operation.detail === provisional.detail &&
+			operation.startedAt === provisional.startedAt &&
+			operation.completedAt === provisional.completedAt &&
+			operation.result !== undefined &&
+			(provisional.sessionId === undefined ||
+				(provisional.sessionId === operation.result.mapping.sessionId &&
+					isDeepStrictEqual(provisional.managedAuthority, operation.result.managedAuthority)))
+		);
+	};
+	if (matches(mapping)) return true;
+	for (const root of tombstoneRoots(mapping.reassignment))
+		for (
+			let tombstone: SessionAuthorityV3Tombstone | undefined = root;
+			tombstone !== undefined;
+			tombstone = tombstone.prior
+		)
+			if (matches(tombstone)) return true;
+	return false;
 }
 
 function validateAuthority(

@@ -199,6 +199,7 @@ async function closeAndProveRetired(
 	let closeError: unknown;
 	try {
 		const outcome = await runtime.closeLifecycleSession({
+			tenant,
 			actor: { namespace: "openwebui-gjc-adapter", id: tenant.principalId },
 			capability: "session.close",
 			requestKey: `${tenant.sessionId}:${tenant.generation}:catalog-close`,

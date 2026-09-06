@@ -108,6 +108,8 @@ interface ManagedLifecycleCall<TRequest> {
 	readonly request: TRequest;
 }
 
+type ManagedLifecycleCloseRequest = Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["close"]>[0];
+
 /** A session/generation-scoped subscription that is bound only from a Router acknowledgement. */
 export interface ManagedSdkPendingFrameSubscription extends ManagedSdkFrameSubscription {
 	bind(correlation: ManagedSdkFrameCorrelation): void;
@@ -238,11 +240,14 @@ export class ManagedSdkRuntime {
 	closeLifecycleSession(
 		tenantOrRequest:
 			| TenantSessionKey
-			| Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["close"]>[0]
-			| ManagedLifecycleCall<Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["close"]>[0]>,
-		request?: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["close"]>[0],
+			| ManagedLifecycleCall<ManagedLifecycleCloseRequest>
+			| (ManagedLifecycleCloseRequest & { readonly tenant: TenantSessionKey }),
+		request?: ManagedLifecycleCloseRequest,
 	): ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["close"]> {
-		return this.#invokeLifecycle(tenantOrRequest, request, value => this.#lifecycle.close(value));
+		return this.#invokeLifecycle(tenantOrRequest, request, (value, tenant) => {
+			assertLifecycleCloseAuthority(tenant, value);
+			return this.#lifecycle.close(value);
+		});
 	}
 
 	deleteLifecycleSession(
@@ -478,14 +483,14 @@ export class ManagedSdkRuntime {
 	async #invokeLifecycle<TRequest, TResult>(
 		tenantOrRequest: TenantSessionKey | TRequest | ManagedLifecycleCall<TRequest>,
 		request: TRequest | undefined,
-		invoke: (request: TRequest) => Promise<TResult>,
+		invoke: (request: TRequest, tenant: TenantSessionKey) => Promise<TResult>,
 	): Promise<TResult> {
 		const call = lifecycleCall(tenantOrRequest, request);
 		if (call === undefined)
 			throw new Error("Complete managed tenant authority is required for lifecycle operations.");
 		await this.#assertAuthorized(call.tenant, false);
 		assertLifecycleRequestAuthority(call.tenant, call.request);
-		return await invoke(call.request);
+		return await invoke(call.request, call.tenant);
 	}
 
 	async #invokePreparedCreate(
@@ -692,6 +697,31 @@ function assertLifecycleRequestAuthority(tenant: TenantSessionKey, request: unkn
 		throw new Error("Lifecycle target does not match managed tenant authority.");
 	if (target.endpointGeneration !== undefined && target.endpointGeneration !== tenant.generation)
 		throw new Error("Lifecycle target generation does not match managed tenant authority.");
+}
+
+function assertLifecycleCloseAuthority(tenant: TenantSessionKey, request: ManagedLifecycleCloseRequest): void {
+	const target = request.target;
+	if (
+		!isRecord(target) ||
+		target.sessionId !== tenant.sessionId ||
+		!Number.isSafeInteger(target.endpointGeneration) ||
+		target.endpointGeneration !== tenant.generation ||
+		target.endpointGeneration <= 0
+	)
+		throw new ManagedSdkOperationError(
+			"invalid_close_authority",
+			"Managed close requires a target matching the registered session and exact positive endpointGeneration.",
+		);
+	// SDK 0.16.4 consumes this opaque pair, but its public binding/lifecycle results do not produce it.
+	if (
+		typeof target.endpointIncarnation !== "string" ||
+		target.endpointIncarnation.length !== 64 ||
+		!/^[0-9a-f]{64}$/.test(target.endpointIncarnation)
+	)
+		throw new ManagedSdkOperationError(
+			"exact_close_authority_unavailable",
+			"Managed exact-generation close is unavailable: target.endpointIncarnation must be an opaque lowercase 64-hex value paired with endpointGeneration. SDK 0.16.4 public binding/lifecycle results do not supply it; session-ID-only and generation-only close are prohibited.",
+		);
 }
 
 function tenantIdentity(key: TenantSessionKey): string {

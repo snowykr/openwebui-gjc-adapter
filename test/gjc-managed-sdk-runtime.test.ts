@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import type { router } from "@gajae-code/coding-agent/sdk";
+import type { lifecycle, router } from "@gajae-code/coding-agent/sdk";
 import { ManagedSdkRuntime, type TenantSessionKey } from "../src/gjc/managed-sdk-runtime";
+
+type CloseRequest = Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["close"]>[0];
 
 const tenant: TenantSessionKey = {
 	principalId: "principal-1",
@@ -23,7 +25,24 @@ function deferred<T>() {
 	return { promise, resolve, reject };
 }
 
-function fixture(options: { start?: () => Promise<void>; fence?: () => boolean; maxFrames?: number } = {}) {
+function closeRequest(): CloseRequest {
+	return {
+		actor: { id: tenant.principalId, namespace: "adapter" },
+		capability: "session.close",
+		requestKey: "close-1",
+		target: {
+			sessionId: tenant.sessionId,
+			endpointGeneration: tenant.generation,
+			// Synthetic authority for boundary tests, not obtainable from SDK 0.16.4 public results.
+			endpointIncarnation: "0123456789abcdef".repeat(4),
+		},
+		timeoutMs: 500,
+	};
+}
+
+function fixture(
+	options: { start?: () => Promise<void>; fence?: () => boolean | Promise<boolean>; maxFrames?: number } = {},
+) {
 	let onFrame:
 		| ((attachment: router.SessionAttachment, frame: router.SessionRouterFrame) => Promise<void> | void)
 		| undefined;
@@ -40,6 +59,13 @@ function fixture(options: { start?: () => Promise<void>; fence?: () => boolean; 
 		send: () => undefined,
 	} as router.SessionAttachment;
 	const calls: string[] = [];
+	const closeCalls: CloseRequest[] = [];
+	const lifecycleService: Pick<ReturnType<typeof lifecycle.createSessionLifecycleService>, "close"> = {
+		async close(request) {
+			closeCalls.push(request);
+			return { ok: true, operation: "session.close", result: { sessionId: request.target.sessionId } };
+		},
+	};
 	const sessionRouter = {
 		async start() {
 			calls.push("start");
@@ -80,7 +106,7 @@ function fixture(options: { start?: () => Promise<void>; fence?: () => boolean; 
 				onFrame = input.deps?.onFrame;
 				return sessionRouter;
 			},
-			createLifecycleService: () => ({}) as never,
+			createLifecycleService: () => lifecycleService as ReturnType<typeof lifecycle.createSessionLifecycleService>,
 			tenantFence: () => options.fence?.() ?? true,
 			...(options.maxFrames === undefined ? {} : { maxFramesPerSubscription: options.maxFrames }),
 		},
@@ -90,6 +116,7 @@ function fixture(options: { start?: () => Promise<void>; fence?: () => boolean; 
 		attachment,
 		foreignAttachment,
 		calls,
+		closeCalls,
 		emit: async (frame: router.SessionRouterFrame, sourceAttachment = attachment) =>
 			await onFrame?.(sourceAttachment, frame),
 	};
@@ -252,6 +279,203 @@ describe("managed SDK runtime", () => {
 		expect("lifecycleService" in current.runtime).toBeFalse();
 		await current.runtime.stop();
 	});
+
+	test("rejects tenantless close even with paired endpoint authority", async () => {
+		const current = fixture();
+		current.runtime.registerTenant(tenant);
+		await current.runtime.start();
+		try {
+			await expect(current.runtime.closeLifecycleSession(closeRequest() as never)).rejects.toThrow(
+				"Complete managed tenant authority",
+			);
+			await expect(current.runtime.closeLifecycleSession({ request: closeRequest() } as never)).rejects.toThrow(
+				"Complete managed tenant authority",
+			);
+			await expect(
+				current.runtime.closeLifecycleSession({
+					...closeRequest(),
+					tenant: { sessionId: tenant.sessionId },
+				} as never),
+			).rejects.toThrow("Complete managed tenant authority");
+			expect(current.closeCalls).toHaveLength(0);
+		} finally {
+			await current.runtime.dispose();
+		}
+	});
+
+	test("rejects close without registration or with foreign tenant, session, generation, or fence identity", async () => {
+		const current = fixture();
+		await current.runtime.start();
+		try {
+			await expect(current.runtime.closeLifecycleSession(tenant, closeRequest())).rejects.toThrow("not registered");
+			current.runtime.registerTenant(tenant);
+			for (const foreign of [
+				{ principalId: "foreign-principal" },
+				{ projectId: "foreign-project" },
+				{ canonicalWorkspace: "/foreign-workspace" },
+				{ chatId: "foreign-chat" },
+				{ sessionId: "foreign-session" },
+				{ generation: tenant.generation + 1 },
+				{ leaseId: "foreign-lease" },
+				{ epoch: "foreign-epoch" },
+			]) {
+				await expect(
+					current.runtime.closeLifecycleSession({ ...tenant, ...foreign }, closeRequest()),
+				).rejects.toThrow("not registered");
+			}
+			await expect(
+				current.runtime.closeLifecycleSession(tenant, {
+					...closeRequest(),
+					actor: { id: "foreign-principal", namespace: "adapter" },
+				}),
+			).rejects.toThrow("Lifecycle actor does not match");
+			expect(current.closeCalls).toHaveLength(0);
+		} finally {
+			await current.runtime.dispose();
+		}
+	});
+
+	test.each([
+		{ name: "absent target", target: undefined },
+		{ name: "empty target", target: {} },
+		{
+			name: "missing session",
+			target: {
+				endpointGeneration: tenant.generation,
+				endpointIncarnation: closeRequest().target.endpointIncarnation,
+			},
+		},
+		{ name: "foreign session", target: { ...closeRequest().target, sessionId: "foreign-session" } },
+		{ name: "session-ID-only", target: { sessionId: tenant.sessionId } },
+		{
+			name: "incarnation without generation",
+			target: { sessionId: tenant.sessionId, endpointIncarnation: closeRequest().target.endpointIncarnation },
+		},
+		...[0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, tenant.generation + 1, String(tenant.generation), null].map(
+			generation => ({
+				name: `invalid or foreign generation ${generation}`,
+				target: { ...closeRequest().target, endpointGeneration: generation },
+			}),
+		),
+	])("rejects close with $name before SDK mutation", async ({ target }) => {
+		const current = fixture();
+		current.runtime.registerTenant(tenant);
+		await current.runtime.start();
+		try {
+			await expect(
+				current.runtime.closeLifecycleSession(tenant, { ...closeRequest(), target } as never),
+			).rejects.toThrow(/target.*(generation|managed tenant authority)/i);
+			expect(current.closeCalls).toHaveLength(0);
+		} finally {
+			await current.runtime.dispose();
+		}
+	});
+
+	test.each([
+		undefined,
+		null,
+		"",
+		"a".repeat(63),
+		"a".repeat(65),
+		"A".repeat(64),
+		"g".repeat(64),
+		`${"a".repeat(64)}\n`,
+		123,
+	])(
+		"fails closed with an actionable unavailable diagnostic for absent or invalid incarnation %j",
+		async endpointIncarnation => {
+			const current = fixture();
+			current.runtime.registerTenant(tenant);
+			await current.runtime.start();
+			try {
+				await expect(
+					current.runtime.closeLifecycleSession(tenant, {
+						...closeRequest(),
+						target: { ...closeRequest().target, endpointIncarnation },
+					} as never),
+				).rejects.toMatchObject({
+					code: "exact_close_authority_unavailable",
+					message: expect.stringContaining("SDK 0.16.4 public binding/lifecycle results do not supply it"),
+				});
+				expect(current.closeCalls).toHaveLength(0);
+			} finally {
+				await current.runtime.dispose();
+			}
+		},
+	);
+
+	test.each(["explicit", "wrapped", "flat"] as const)(
+		"forwards a supplied opaque pair untouched with %s tenant admission",
+		async shape => {
+			let fenceChecks = 0;
+			const current = fixture({
+				fence: () => {
+					fenceChecks += 1;
+					return true;
+				},
+			});
+			current.runtime.registerTenant(tenant);
+			await current.runtime.start();
+			const request = closeRequest();
+			try {
+				const outcome =
+					shape === "explicit"
+						? await current.runtime.closeLifecycleSession(tenant, request)
+						: shape === "wrapped"
+							? await current.runtime.closeLifecycleSession({ tenant, request })
+							: await current.runtime.closeLifecycleSession({ tenant, ...request });
+				expect(outcome).toEqual({ ok: true, operation: "session.close", result: { sessionId: tenant.sessionId } });
+				expect(fenceChecks).toBe(1);
+				expect(current.closeCalls).toEqual([request]);
+				expect(current.closeCalls[0]?.target).toBe(request.target);
+				if (shape !== "flat") expect(current.closeCalls[0]).toBe(request);
+				expect(current.calls).toEqual(["start"]);
+			} finally {
+				await current.runtime.dispose();
+			}
+		},
+	);
+
+	test("does not dispatch paired close when the tenant fence is lost", async () => {
+		const current = fixture({ fence: () => false });
+		current.runtime.registerTenant(tenant);
+		await current.runtime.start();
+		try {
+			await expect(current.runtime.closeLifecycleSession(tenant, closeRequest())).rejects.toThrow("fence was lost");
+			expect(current.closeCalls).toHaveLength(0);
+		} finally {
+			await current.runtime.dispose();
+		}
+	});
+
+	test.each(["fence loss", "unregistration", "registration replacement"] as const)(
+		"rejects paired close after %s during authorization",
+		async change => {
+			const fenceEntered = deferred<void>();
+			const fenceResult = deferred<boolean>();
+			const current = fixture({
+				fence: async () => {
+					fenceEntered.resolve();
+					return await fenceResult.promise;
+				},
+			});
+			current.runtime.registerTenant(tenant);
+			await current.runtime.start();
+			try {
+				const closing = current.runtime.closeLifecycleSession(tenant, closeRequest());
+				await fenceEntered.promise;
+				expect(current.closeCalls).toHaveLength(0);
+				if (change !== "fence loss") current.runtime.unregisterTenant(tenant);
+				if (change === "registration replacement")
+					current.runtime.registerTenant({ ...tenant, leaseId: "replacement-lease" });
+				fenceResult.resolve(change !== "fence loss");
+				await expect(closing).rejects.toThrow(change === "fence loss" ? "fence was lost" : "registration changed");
+				expect(current.closeCalls).toHaveLength(0);
+			} finally {
+				await current.runtime.dispose();
+			}
+		},
+	);
 
 	test("exposes listener failures through subscription drain and diagnostics", async () => {
 		const current = fixture();

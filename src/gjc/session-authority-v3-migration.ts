@@ -209,7 +209,7 @@ function migrateMapping(
 		assistantText: mapping.assistantText,
 		events: mapping.events,
 		modelSelection: mapping.modelSelection,
-		observations: mapping.observations,
+		observations: migrateObservations(mapping.observations),
 		managedAuthority,
 		journal,
 		reassignment,
@@ -223,8 +223,13 @@ function migrateProvisional(
 	reasons: string[],
 ): SessionAuthorityV3ProvisionalOperation | undefined {
 	if (operation.sessionId === undefined) {
-		reasons.push(`${context} has no session identity.`);
-		return undefined;
+		const converted = migrateOperation(operation, context, authorityFor, reasons);
+		if (converted === undefined) return undefined;
+		return strip({
+			...converted,
+			chatId: operation.chatId,
+			projectId: operation.projectId,
+		}) as SessionAuthorityV3ProvisionalOperation;
 	}
 	const identity = checkedIdentity(
 		{ chatId: operation.chatId, projectId: operation.projectId, sessionId: operation.sessionId },
@@ -381,7 +386,7 @@ function migrateTombstone(
 		assistantText: tombstone.assistantText,
 		events: tombstone.events,
 		modelSelection: tombstone.modelSelection,
-		observations: tombstone.observations,
+		observations: migrateObservations(tombstone.observations),
 		managedAuthority,
 		journal,
 		retiredAt: tombstone.retiredAt,
@@ -467,12 +472,17 @@ function sha256(bytes: Uint8Array): string {
 	return createHash("sha256").update(bytes).digest("hex");
 }
 
+function migrateObservations(value: SessionAuthorityRecord["observations"]): unknown {
+	if (value === undefined) return undefined;
+	return Object.fromEntries(Object.entries(value).filter(([key]) => !LEGACY_FIELDS.has(key)));
+}
+
 function strip(value: unknown): unknown {
 	if (Array.isArray(value)) return value.map(strip);
 	if (value === null || typeof value !== "object") return value;
 	return Object.fromEntries(
 		Object.entries(value as Record<string, unknown>)
-			.filter(([key, item]) => item !== undefined && !LEGACY_FIELDS.has(key))
+			.filter(([, item]) => item !== undefined)
 			.map(([key, item]) => [key, strip(item)]),
 	);
 }

@@ -138,7 +138,7 @@ export async function snapshotPublicSessions(directory: string): Promise<Map<str
 		capability: "session.list",
 		target: { cwd: resolve(directory) },
 	});
-	if (!response.ok || !Array.isArray(response.result.sessions))
+	if (!response.ok || !("sessions" in response.result) || !Array.isArray(response.result.sessions))
 		throw new Error("public lifecycle session.list returned an incomplete response");
 	const sessions = new Map<string, PublicSessionIdentity>();
 	for (const item of response.result.sessions) {

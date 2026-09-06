@@ -201,12 +201,13 @@ async function cleanupOrThrow(
 		});
 	try {
 		await runtime.closeLifecycleSession({
+			tenant: target,
 			actor: { namespace: "openwebui-gjc-adapter", id: input.source.principalId },
 			capability: "session.close",
 			requestKey: input.source.requestKey,
 			target: { sessionId: target.sessionId, endpointGeneration: target.generation },
 			timeoutMs: input.timeoutMs,
-		} as never);
+		});
 		await runtime.reconcile();
 		const status = await runtime.generationStatus(target);
 		if (status.status === "retired") {

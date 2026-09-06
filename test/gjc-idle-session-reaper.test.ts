@@ -1741,27 +1741,16 @@ describe("managed V3 idle retirement", () => {
 		const authorityPath = join(root, "session-authority.json");
 		const initial = new V3FileBackedSessionMappingStore(authorityPath);
 		const scope = { principalId: mapping.principalId!, chatId: mapping.chatId };
-		initial.setScoped(scope, mapping);
-		initial.beginOperationScoped(scope, {
+		const operation = {
 			id: mapping.operationId,
-			kind: "prompt",
+			kind: "prompt" as const,
 			ingressId: mapping.operationId,
 			detail: mapping.operationId,
-		});
-		initial.transitionOperationScoped(scope, mapping.operationId, "complete", mapping.operationId, {
-			kind: "turn",
-			assistantText: "",
-			events: [],
-			managedAuthority: mapping.managedAuthority!,
-			mapping: {
-				chatId: mapping.chatId,
-				projectId: mapping.projectId,
-				sessionId: mapping.sessionId,
-				rawFrameCursor: mapping.rawFrameCursor,
-				eventCursor: mapping.eventCursor,
-				operationId: mapping.operationId,
-			},
-		});
+			chatId: mapping.chatId,
+			projectId: mapping.projectId,
+		};
+		initial.reserveProvisionalOperationScoped(scope, operation);
+		initial.publishProvisionalOperationScoped(scope, operation, mapping);
 		initial.close();
 		return {
 			mapping,

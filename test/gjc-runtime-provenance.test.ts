@@ -1,16 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { lifecycle, router } from "@gajae-code/coding-agent/sdk";
 
 const ROOT = join(import.meta.dir, "..");
-const GJC_VERSION = "0.15.0";
-const CODING_AGENT_DEV_COMMIT = "e3b3a76a590081ded16214a1188857524d40e701";
-const CODING_AGENT_ARTIFACT_NAME = `gajae-code-coding-agent-${CODING_AGENT_DEV_COMMIT}-8ba25005.tgz`;
-const CODING_AGENT_ARTIFACT_PATH = `vendor/${CODING_AGENT_ARTIFACT_NAME}`;
-const CODING_AGENT_ARTIFACT_URL = `https://raw.githubusercontent.com/snowykr/openwebui-gjc-adapter/c09e31dc85c514cffaf7e44827b47d311620c49f/${CODING_AGENT_ARTIFACT_PATH}`;
-const CODING_AGENT_ARTIFACT_SHA256 = "8ba25005471c66871842cddefcdb98c0118ab26c3890b58f1f93665da524f4cb";
-const BUN_IMAGE_DIGEST = "sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4";
+const GJC_VERSION = "0.16.4";
+const CODING_AGENT_INTEGRITY =
+	"sha512-cnqyYOEGygPp87gCEkqahNiRYoBhL4gxvQnWY16lDADThfNjhrl7VP+5f9cLakevI+pjRbTSdDBw/iZ3Nc6PCw==";
+const BUN_IMAGE_DIGEST = "sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6";
 const PYTHON_IMAGE_DIGEST = "sha256:8a7e7cc04fd3e2bd787f7f24e22d5d119aa590d429b50c95dfe12b3abe52f48b";
 
 function normalizeRelease(version: string, nativesVersion: string, tag = "") {
@@ -29,34 +26,31 @@ function releaseRoute(event: "repository_dispatch" | "schedule" | "workflow_disp
 }
 
 describe("GJC SDK runtime provenance", () => {
-	test("pins the published runtime pair and exact vendored coding-agent development artifact", async () => {
+	test("pins the registry SDK and verifies its installed public contract", async () => {
 		const manifest = await Bun.file(join(ROOT, "package.json")).json();
 		const dependencies = Reflect.get(manifest, "dependencies");
 
-		for (const packageName of ["@gajae-code/ai", "@gajae-code/natives"])
+		for (const packageName of ["@gajae-code/ai", "@gajae-code/natives", "@gajae-code/coding-agent"]) {
 			expect(Reflect.get(dependencies, packageName)).toBe(GJC_VERSION);
-		expect(Reflect.get(dependencies, "@gajae-code/coding-agent")).toBe(CODING_AGENT_ARTIFACT_URL);
-		const artifact = Bun.file(join(ROOT, CODING_AGENT_ARTIFACT_PATH));
-		expect(await artifact.exists()).toBe(true);
-		expect(CODING_AGENT_ARTIFACT_NAME).toBe(
-			"gajae-code-coding-agent-e3b3a76a590081ded16214a1188857524d40e701-8ba25005.tgz",
-		);
-		expect(CODING_AGENT_ARTIFACT_NAME).toContain(CODING_AGENT_DEV_COMMIT);
-		expect(
-			createHash("sha256")
-				.update(new Uint8Array(await artifact.arrayBuffer()))
-				.digest("hex"),
-		).toBe(CODING_AGENT_ARTIFACT_SHA256);
+			const installed = await Bun.file(join(ROOT, "node_modules", packageName, "package.json")).json();
+			expect(installed.version).toBe(GJC_VERSION);
+		}
+		const lockfile = await Bun.file(join(ROOT, "bun.lock")).text();
+		expect(lockfile).toContain(CODING_AGENT_INTEGRITY);
+		expect(lockfile).not.toContain("vendor/gajae-code-coding-agent-");
+		expect(typeof lifecycle.createSessionLifecycleService).toBe("function");
+		for (const method of ["request", "generationStatus", "attachment", "reconcile", "start", "stop"] as const)
+			expect(typeof router.SessionRouter.prototype[method]).toBe("function");
 		expect(Reflect.get(manifest, "patchedDependencies")).toBeUndefined();
 		expect(Reflect.get(manifest, "files")).not.toContain("patches");
 		expect(existsSync(join(ROOT, "patches"))).toBe(false);
 	});
 
-	test("installs and invokes the vendored CLI from the production dependency tree", async () => {
+	test("installs and invokes the released CLI from the production dependency tree", async () => {
 		const dockerfile = await Bun.file(join(ROOT, "Dockerfile.adapter")).text();
 
 		expect(dockerfile).toContain("COPY package.json bun.lock ./");
-		expect(dockerfile).not.toContain(`COPY ${CODING_AGENT_ARTIFACT_PATH} ${CODING_AGENT_ARTIFACT_PATH}`);
+		expect(dockerfile).not.toContain("COPY vendor");
 		expect(dockerfile).toContain("bun install --frozen-lockfile --production");
 		expect(dockerfile).toContain(
 			'gjc_version="$(bun --no-env-file --config=/dev/null ./node_modules/.bin/gjc --version)"',
@@ -80,10 +74,9 @@ describe("GJC SDK runtime provenance", () => {
 		const changelog = await Bun.file(join(ROOT, "CHANGELOG.md")).text();
 
 		for (const document of [readme, changelog]) {
-			expect(document).toContain(CODING_AGENT_ARTIFACT_URL);
-			expect(document).toContain(CODING_AGENT_DEV_COMMIT);
-			expect(document).toContain(CODING_AGENT_ARTIFACT_SHA256);
-			expect(document).toContain("not the registry 0.15.0 tarball");
+			expect(document).toContain(`@gajae-code/coding-agent\` ${GJC_VERSION}`);
+			expect(document).toContain("npm registry");
+			expect(document).toContain("generationStatus");
 			expect(document).toContain("Production");
 			expect(document).toContain("public managed SDK");
 			expect(document).toContain("atomic cutover");
@@ -93,7 +86,7 @@ describe("GJC SDK runtime provenance", () => {
 	test("keeps pinned base images and runs as a non-root adapter user", async () => {
 		const dockerfile = await Bun.file(join(ROOT, "Dockerfile.adapter")).text();
 
-		expect(dockerfile).toContain(`FROM oven/bun:1.3.14@${BUN_IMAGE_DIGEST} AS bun-runtime`);
+		expect(dockerfile).toContain(`FROM oven/bun:1.4.0@${BUN_IMAGE_DIGEST} AS bun-runtime`);
 		expect(dockerfile).toContain(`FROM python:3.12-slim-bookworm@${PYTHON_IMAGE_DIGEST}`);
 		expect(dockerfile).toContain("COPY --from=bun-runtime /usr/local/bin/bun /opt/bun/bin/bun");
 		expect(dockerfile).toContain(`LABEL org.opencontainers.image.version="${GJC_VERSION}"`);
@@ -143,10 +136,9 @@ describe("GJC SDK runtime provenance", () => {
 		expect(workflow).toContain(`version: \${{ inputs.version }}`);
 		expect(workflow).toContain(`natives_version: \${{ inputs.version }}`);
 		expect(workflow).toContain(`commit: \${{ inputs.commit || github.sha }}`);
-		expect(workflow).toContain("- lane: v0.11.1-pair");
-		expect(workflow).toContain("- lane: v0.11.2-pair");
-		expect(workflow).toContain("- lane: v0.11.4-pair");
-		expect(workflow).toContain("- lane: v0.11.4-pair\n            version: 0.11.4\n            tag: v0.11.4");
+		expect(workflow).toContain(
+			`- lane: v${GJC_VERSION}-pair\n            version: ${GJC_VERSION}\n            tag: v${GJC_VERSION}`,
+		);
 		expect(workflow).toContain(`natives_version: \${{ matrix.version }}`);
 		expect(workflow).not.toMatch(/^\s+if:.*\bmatrix\./m);
 

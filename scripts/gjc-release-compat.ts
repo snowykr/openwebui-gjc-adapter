@@ -12,19 +12,26 @@ import {
 	sessionIdFrom,
 	validateCurrentModel,
 } from "./gjc-release-compat-runtime";
-import { lifecycleSuccessor, type PublicSdkSession, startPublicSdk, stopPublicSdk } from "./gjc-release-compat-sdk";
+import {
+	connectFor,
+	lifecycleSuccessor,
+	type PublicSdkSession,
+	snapshotPublicSessions,
+	startPublicSdk,
+	stopPublicSdk,
+} from "./gjc-release-compat-sdk";
 
 const root = requiredArgument("--root");
 const cli = requiredArgument("--gjc");
 const workspace = join(root, "workspace");
-const agentDir = join(root, ".gjc", "agent");
+const agentDir = join(workspace, ".gjc", "agent");
 const stateRoot = join(workspace, ".gjc", "state");
 const observed: Record<string, unknown> = { schema: 1, startedAt: new Date().toISOString(), operations: [] };
 const provider = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: providerResponse });
 const providerUrl = `http://127.0.0.1:${provider.port}`;
 let client: PublicSdkSession | undefined;
-let publicCloseInvoked = false;
 let sdkLogicalClose: Record<string, unknown> | undefined;
+const failures: unknown[] = [];
 
 await mkdir(workspace, { recursive: true });
 await writeLocalProviderConfig(agentDir, providerUrl);
@@ -47,9 +54,10 @@ try {
 	let sessionId = successor.sessionId;
 	await observe("Q14", () => client!.query("session.metadata"));
 	await observe("Q12", () => client!.query("workflow.gates.list"));
-	const models = await observe("Q10", () => client!.query("models.list/current"));
-	const thinkingSupported = await validateCurrentModel(client, models, observe);
+	await observe("Q10", () => client!.query("models.list/current"));
 	await observe("model.set", () => client!.control("model.set", { id: "compat-local/hermetic-model" }));
+	const selectedModels = await observe("Q10.selected", () => client!.query("models.list/current"));
+	const thinkingSupported = await validateCurrentModel(client, selectedModels, observe);
 	observed.thinking = { supported: thinkingSupported, requested: "off" };
 	if (thinkingSupported) await observe("thinking.set", () => client!.control("thinking.set", { level: "off" }));
 	const terminalAbort = await promptAndAbortTerminal(
@@ -157,7 +165,6 @@ try {
 	sessionId = successor.sessionId;
 	const branchSessionId = sessionIdFrom(successor) ?? (await rediscoverSessionId(workspace, createdSessionId));
 	const branchClient = client;
-	publicCloseInvoked = true;
 	sdkLogicalClose = await closeWithPublicSdkProof(branchClient, workspace, branchSessionId, observe);
 	client = undefined;
 	observed.close = { sdkLogicalClose };
@@ -197,22 +204,51 @@ try {
 	observed.effects = { providerUrl, transcript: createdTranscript, branchEntryId: entryId, postResumePrompt: true };
 	await client.close();
 	client = undefined;
-	observed.cleanup = { publicRouterStopped: true };
-	observed.finishedAt = new Date().toISOString();
-	await writeReports(root, observed);
 } catch (error) {
 	observed.error = error instanceof Error ? { name: error.name, message: error.message } : String(error);
-	observed.cleanup = publicCloseInvoked
-		? { publicRouterStopped: true, postClose: sdkLogicalClose }
-		: { publicRouterStopped: true };
-	observed.finishedAt = new Date().toISOString();
-	await writeReports(root, observed);
-	throw error;
+	failures.push(error);
 } finally {
-	await client?.close();
-	await stopPublicSdk(workspace);
-	await provider.stop();
+	const cleanup: Record<string, unknown> = { publicRouterStopped: false, retired: [] };
+	observed.cleanup = cleanup;
+	try {
+		await client?.close();
+		// The harness owns this isolated workspace. Stop every remaining live
+		// generation through public lifecycle proof, never by process discovery.
+		for (const session of (await snapshotPublicSessions(workspace)).values()) {
+			if (session.generation === undefined) continue;
+			if (
+				sdkLogicalClose?.targetSessionId === session.sessionId &&
+				sdkLogicalClose.generation === session.generation
+			)
+				continue;
+			const attached = await connectFor(workspace, session.sessionId, session.generation);
+			const receipt = await closeWithPublicSdkProof(attached, workspace, session.sessionId, observe);
+			(cleanup.retired as Record<string, unknown>[]).push(receipt);
+		}
+	} catch (error) {
+		cleanup.error = error instanceof Error ? error.message : String(error);
+		failures.push(error);
+	} finally {
+		try {
+			await stopPublicSdk(workspace);
+			cleanup.publicRouterStopped = true;
+		} catch (error) {
+			cleanup.routerError = error instanceof Error ? error.message : String(error);
+			failures.push(error);
+		} finally {
+			try {
+				await provider.stop();
+			} catch (error) {
+				cleanup.providerError = error instanceof Error ? error.message : String(error);
+				failures.push(error);
+			} finally {
+				observed.finishedAt = new Date().toISOString();
+				await writeReports(root, observed);
+			}
+		}
+	}
 }
+if (failures.length > 0) throw new AggregateError(failures, "Public SDK compatibility or cleanup failed.");
 
 async function observe(name: string, action: () => Promise<unknown>): Promise<unknown> {
 	const value = await action();

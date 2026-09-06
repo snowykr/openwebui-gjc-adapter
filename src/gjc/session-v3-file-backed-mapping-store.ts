@@ -24,6 +24,7 @@ import {
 } from "./session-authority";
 import type { ManagedAcknowledgedSuccessor, ManagedSessionOperation } from "./session-authority-copy";
 import { AuthorityMutationLock } from "./session-authority-file";
+import { SessionAuthorityDurabilityError } from "./session-authority-persistence";
 import { type AcknowledgedSuccessor, SessionAuthorityLoadError } from "./session-authority-types";
 import {
 	encodeSessionAuthorityV3Document,
@@ -237,16 +238,45 @@ class V3FileSessionAuthority extends SessionAuthority {
 	private mutate<T>(action: () => T): T {
 		if (this.#closed) throw new Error("Session authority store is closed.");
 		const lock = AuthorityMutationLock.acquire(this.filePath);
+		let durableMutation = false;
+		let mutationError: unknown;
+		let failed = false;
+		let result!: T;
 		try {
 			// A second writer may have committed between calls; always reload under
 			// the shared file lock before deriving the next immutable V3 document.
 			if (existsSync(this.filePath)) this.load();
-			const result = action();
-			this.persist();
-			return result;
-		} finally {
-			lock.release();
+			const rollback = this.snapshotJournalForRollback();
+			try {
+				result = action();
+				if (this.hasDirtyJournal()) {
+					this.persist();
+					durableMutation = true;
+				}
+			} catch (error) {
+				if (error instanceof SessionAuthorityDurabilityError) {
+					durableMutation = true;
+					throw error;
+				}
+				this.replaceAllWithReferences([...rollback.records.values()], [...rollback.provisional.values()]);
+				this.clearDirtyJournal();
+				throw error;
+			}
+		} catch (error) {
+			failed = true;
+			mutationError = error;
 		}
+		try {
+			lock.release();
+		} catch (error) {
+			const cause = failed
+				? new AggregateError([mutationError, error], "authority mutation and lock release failed")
+				: error;
+			if (durableMutation) throw new SessionAuthorityDurabilityError(this.filePath, cause);
+			throw cause;
+		}
+		if (failed) throw mutationError;
+		return result;
 	}
 
 	private load(): void {
@@ -278,13 +308,17 @@ class V3FileSessionAuthority extends SessionAuthority {
 		mkdirSync(dirname(this.filePath), { recursive: true });
 		const temporary = `${this.filePath}.tmp-${process.pid}-${Date.now()}`;
 		let descriptor: number | undefined;
+		let renameAttempted = false;
+		let replaced = false;
 		try {
 			descriptor = openSync(temporary, "wx", 0o600);
 			writeFileSync(descriptor, bytes, "utf8");
 			fsyncSync(descriptor);
 			closeSync(descriptor);
 			descriptor = undefined;
+			renameAttempted = true;
 			renameSync(temporary, this.filePath);
+			replaced = true;
 			const directory = openSync(dirname(this.filePath), "r");
 			try {
 				fsyncSync(directory);
@@ -294,11 +328,29 @@ class V3FileSessionAuthority extends SessionAuthority {
 			this.clearDirtyJournal();
 			this.#generation += 1;
 		} catch (error) {
-			if (descriptor !== undefined) closeSync(descriptor);
+			// A failed rename whose source disappeared may already have replaced
+			// the document. Never report a clean rollback across that boundary.
+			const durabilityUncertain = replaced || (renameAttempted && !existsSync(temporary));
+			try {
+				if (descriptor !== undefined) closeSync(descriptor);
+			} catch {
+				/* preserve the original persistence failure */
+			}
 			try {
 				unlinkSync(temporary);
 			} catch {
 				/* uncommitted temporary absent */
+			}
+			if (durabilityUncertain) {
+				try {
+					this.load();
+				} catch (loadError) {
+					throw new SessionAuthorityDurabilityError(
+						this.filePath,
+						new AggregateError([error, loadError], "authority reload failed after the V3 replacement"),
+					);
+				}
+				throw new SessionAuthorityDurabilityError(this.filePath, error);
 			}
 			throw error;
 		}
@@ -419,8 +471,8 @@ function normalizePublishedTombstone(tombstone: SessionAuthorityTombstone): Sess
 function authorityV3(value: unknown, context: string): ManagedTurnAuthorityV3 {
 	if (typeof value !== "object" || value === null) throw new Error(`V3 managed authority is required for ${context}.`);
 	const authority = value as Omit<ManagedTurnAuthorityV3, "authorityEpoch">;
-	if (authority.epoch !== SESSION_AUTHORITY_V3_EPOCH)
-		throw new Error(`V3 managed authority epoch is required for ${context}.`);
+	if (typeof authority.epoch !== "string" || authority.epoch.length === 0)
+		throw new Error(`Managed runtime epoch is required for ${context}.`);
 	return {
 		principalId: authority.principalId,
 		projectId: authority.projectId,

@@ -1,0 +1,152 @@
+{
+  "schemaVersion": 1,
+  "kind": "public-sdk-api-package-test-report",
+  "package": {
+    "name": "@gajae-code/coding-agent",
+    "version": "0.16.4",
+    "registry": "https://registry.npmjs.org",
+    "tarballSha256": "aa11e208bfaf5e836542ed35c61bdbe189ede8b5ad7b672fce7b08c018199008",
+    "integrity": "sha512-cnqyYOEGygPp87gCEkqahNiRYoBhL4gxvQnWY16lDADThfNjhrl7VP+5f9cLakevI+pjRbTSdDBw/iZ3Nc6PCw=="
+  },
+  "invocation": {
+    "argv": [
+      "bun",
+      "scripts/gjc-release-compat.ts",
+      "--root",
+      "/tmp/gjc-sdk-0164-compat.WRUU4I",
+      "--gjc",
+      "/home/snowy/coding/openwebui-gjc-adapter/node_modules/.bin/gjc"
+    ],
+    "exitCode": 0
+  },
+  "startedAt": "2026-09-06T10:09:27.087Z",
+  "finishedAt": "2026-09-06T10:09:42.737Z",
+  "observedCliVersion": "0.16.4",
+  "operations": [
+    "session.create",
+    "session.create.session.metadata",
+    "session.create.reattached",
+    "Q14",
+    "Q12",
+    "Q10",
+    "model.set",
+    "Q10.selected",
+    "Q10.page.2",
+    "Q10.page.3",
+    "Q10.page.4",
+    "thinking.set",
+    "terminal-abort.turn.prompt",
+    "terminal-abort.turn.prompt.abort",
+    "terminal-abort.turn.prompt.abort.replay",
+    "terminal-abort.turn.prompt.terminal",
+    "initial-transcript.turn.prompt",
+    "initial-transcript.turn.prompt.terminal",
+    "session.create",
+    "session.create.session.metadata",
+    "session.create.reattached",
+    "created-transcript.turn.prompt",
+    "created-transcript.turn.prompt.terminal",
+    "session.resume",
+    "session.resume.session.metadata",
+    "session.resume.reattached",
+    "session.resume",
+    "session.resume.session.metadata",
+    "session.resume.reattached",
+    "Q16",
+    "session.fork",
+    "session.fork.session.metadata",
+    "session.fork.reattached",
+    "session.close",
+    "session.resume",
+    "session.resume.session.metadata",
+    "session.resume.reattached",
+    "resume.turn.prompt",
+    "resume.turn.prompt.terminal",
+    "Q17",
+    "session.close",
+    "session.close"
+  ],
+  "close": {
+    "sdkLogicalClose": {
+      "phase": "sdkLogicalClose",
+      "targetSessionId": "32475258-757f-4d8a-b407-deecba6e3b62",
+      "generation": 1,
+      "acknowledgement": {
+        "ok": true,
+        "operation": "session.close",
+        "result": {
+          "sessionId": "32475258-757f-4d8a-b407-deecba6e3b62",
+          "note": "Endpoint close was unreachable; sent SIGTERM to the durably identified session process."
+        }
+      },
+      "retirement": {
+        "status": "retired",
+        "evidence": {
+          "source": "session_index",
+          "observedIndexSeq": 7,
+          "evidenceIndexSeq": 7,
+          "event": "host_unregistered"
+        }
+      }
+    }
+  },
+  "cleanup": {
+    "publicRouterStopped": true,
+    "retired": [
+      {
+        "phase": "sdkLogicalClose",
+        "targetSessionId": "338416b6-2301-40c9-8194-e3f7b4714ad9",
+        "generation": 1,
+        "acknowledgement": {
+          "ok": true,
+          "operation": "session.close",
+          "result": {
+            "sessionId": "338416b6-2301-40c9-8194-e3f7b4714ad9",
+            "note": "Endpoint close was unreachable; sent SIGTERM to the durably identified session process."
+          }
+        },
+        "retirement": {
+          "status": "retired",
+          "evidence": {
+            "source": "session_index",
+            "observedIndexSeq": 8,
+            "evidenceIndexSeq": 8,
+            "event": "host_unregistered"
+          }
+        }
+      },
+      {
+        "phase": "sdkLogicalClose",
+        "targetSessionId": "25bc86ef-04f4-4108-9b00-7bd295e59376",
+        "generation": 1,
+        "acknowledgement": {
+          "ok": true,
+          "operation": "session.close",
+          "result": {
+            "sessionId": "25bc86ef-04f4-4108-9b00-7bd295e59376",
+            "note": "Endpoint close was unreachable; sent SIGTERM to the durably identified session process."
+          }
+        },
+        "retirement": {
+          "status": "retired",
+          "evidence": {
+            "source": "session_index",
+            "observedIndexSeq": 9,
+            "evidenceIndexSeq": 9,
+            "event": "host_unregistered"
+          }
+        }
+      }
+    ]
+  },
+  "sourceReport": {
+    "path": "/tmp/gjc-sdk-0164-compat.WRUU4I/operation-report.json",
+    "sha256": "7cba368ac8600ac08717d973afcedfeae98f7bbdb6d3107411c4f0899a53e898"
+  },
+  "limitations": [
+    "Hermetic local HTTP provider, not a live OpenWebUI browser run.",
+    "Harness closes use session-ID-only targets inside an exclusively owned isolated workspace. Positive retirement receipts do not prove remotely generation-fenced close against replacement races. SDK 0.16.4 requires endpointGeneration plus endpointIncarnation for exact close, but its public Router/lifecycle binding surfaces do not expose the needed opaque incarnation; production exact remote close remains unavailable.",
+    "SDK abort reported uncertain/worker_unsettled; this report proves replay/correlated terminal observation, not synchronous worker termination.",
+    "Legacy bridge removal and canonical V3 store correctness are separate incomplete work."
+  ]
+}

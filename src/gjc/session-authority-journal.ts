@@ -1,6 +1,8 @@
+import { isDeepStrictEqual } from "node:util";
 import {
 	copy,
 	copyAcknowledgedSuccessor,
+	copyEvents,
 	copyOperation,
 	copyOperationResult,
 	copyProvisionalOperation,
@@ -149,7 +151,6 @@ export class SessionAuthorityJournal {
 				this.setProvisional(key, {
 					...provisional,
 					state: "uncertain",
-					detail: "project reassignment rolled back; external effect evidence retained",
 				});
 		}
 		const next = {
@@ -367,8 +368,11 @@ export class SessionAuthorityJournal {
 		const key = provisionalKey(chatId, ingressId),
 			current = this.provisional.get(key);
 		if (current === undefined) throw new Error(`Unknown provisional session operation ${ingressId}.`);
-		if (current.state === "complete" && state !== "complete")
-			throw new Error("Completed session operations are immutable.");
+		if (current.state === "complete") {
+			if (state !== "complete" || (detail !== undefined && detail !== current.detail))
+				throw new Error("Completed session operations are immutable.");
+			return copyProvisionalOperation(current);
+		}
 		const next = {
 			...current,
 			state,
@@ -427,7 +431,7 @@ export class SessionAuthorityJournal {
 		}
 		if (record.reassignment?.state === "pending")
 			throw new Error(`Session authority for chat ${chatId} has a pending project reassignment.`);
-		assertBeginableIdentity(operation, [...this.provisional.values()]);
+		assertBeginableIdentity(chatId, operation, [...this.provisional.values()]);
 		const next = {
 			...record,
 			journal: [...record.journal, { ...operation, state: "pending" as const, startedAt: new Date().toISOString() }],
@@ -522,8 +526,15 @@ export class SessionAuthorityJournal {
 		if (current === undefined) throw new Error(`Unknown session operation ${operationId}.`);
 		if (requiresUncertainAcknowledgedSuccessorCompletionReconciliation(current, state, detail, result))
 			throw new Error(`Session operation ${operationId} requires reconciliation.`);
-		if (current.state === "complete" && state !== "complete")
-			throw new Error("Completed session operations are immutable.");
+		if (current.state === "complete") {
+			if (
+				state !== "complete" ||
+				(detail !== undefined && detail !== current.detail) ||
+				(result !== undefined && !isDeepStrictEqual(result, current.result))
+			)
+				throw new Error("Completed session operations are immutable.");
+			return copy(record);
+		}
 		if (state === "complete" && result === undefined && current.result === undefined)
 			throw new Error("Completed session operations require an immutable result binding.");
 		if (state !== "complete" && result !== undefined)
@@ -716,10 +727,11 @@ function assertTargetIdentity(target: SessionAuthorityTargetIdentity): void {
 }
 
 function toTombstone(record: SessionAuthorityRecord, retiredAt: string): SessionAuthorityTombstone {
-	const { reassignment: _reassignment, events: _events, ...source } = record;
+	const { reassignment: _reassignment, ...source } = record;
 	return {
 		...source,
 		header: { ...source.header },
+		...(source.events === undefined ? {} : { events: copyEvents(source.events) }),
 		...(source.modelSelection === undefined ? {} : { modelSelection: { ...source.modelSelection } }),
 		observations: source.observations === undefined ? undefined : structuredClone(source.observations),
 		...(source.attachment === undefined

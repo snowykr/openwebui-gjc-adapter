@@ -885,6 +885,10 @@ function managedAuthorityForScope(
 }
 
 function managedAuthorityToScope(authority: ManagedTurnAuthority, scope: CanonicalScope): ManagedTurnAuthority {
+	if (authority.principalId !== scope.principalId)
+		throw new Error("Managed session authority principal does not match the requested scope.");
+	if (authority.chatId !== scope.chatId && authority.chatId !== scope.key)
+		throw new Error("Managed session authority chat does not match the requested scope.");
 	return authority.chatId === scope.key ? authority : { ...authority, chatId: scope.key };
 }
 

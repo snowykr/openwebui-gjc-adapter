@@ -288,8 +288,9 @@ describe("GJC upstream dev generation-status contract map", () => {
 		expect(fixture.devArtifact.sha256).toMatch(/^[a-f0-9]{64}$/);
 		expect(fixture.devArtifact.shasum).toMatch(/^[a-f0-9]{40}$/);
 		expect(fixture.devArtifact.integrity).toMatch(/^sha512-[A-Za-z0-9+/]+={0,2}$/);
-		const packageJson = JSON.parse(readFileSync(packagePath, "utf8")) as { dependencies?: Record<string, string> };
-		expect(packageJson.dependencies?.[fixture.devArtifact.packageName]).toBe(fixture.devArtifact.slice1Dependency);
+		// This immutable evidence describes the historical dev artifact, not the current registry dependency.
+		const artifact = readFileSync(fileURLToPath(new URL(`../${fixture.devArtifact.path}`, import.meta.url)));
+		expect(createHash("sha256").update(artifact).digest("hex")).toBe(fixture.devArtifact.sha256);
 		expect(fixture.devConsumptionPlan.productionActivation).toContain(
 			"package.json must use the exact file dependency",
 		);

@@ -10,8 +10,10 @@ import type {
 	ProvisionalSessionOperation,
 	SessionAuthorityRecord,
 	SessionAuthorityTombstone,
+	SessionOperation,
 } from "./session-authority-types";
 import { SESSION_AUTHORITY_VERSION } from "./session-authority-types";
+import { SESSION_AUTHORITY_V3_EPOCH } from "./session-authority-v3";
 import {
 	hasOnlyKeys,
 	isJsonValue,
@@ -226,7 +228,7 @@ function hasConsistentOperationResults(mapping: SessionAuthorityRecord): boolean
 		if (
 			resultMapping.chatId !== mapping.chatId ||
 			resultMapping.projectId !== mapping.projectId ||
-			resultMapping.sessionId !== mapping.sessionId ||
+			!hasConsistentResultSession(mapping, operation) ||
 			resultMapping.operationId !== operation.id
 		)
 			return false;
@@ -239,6 +241,24 @@ function hasConsistentOperationResults(mapping: SessionAuthorityRecord): boolean
 		);
 	});
 }
+
+function hasConsistentResultSession(
+	owner: Pick<SessionAuthorityRecord, "chatId" | "projectId" | "sessionId" | "managedAuthority">,
+	operation: SessionOperation,
+): boolean {
+	const result = operation.result;
+	if (result === undefined) return true;
+	const authority = result.managedAuthority;
+	if (authority === undefined) return result.mapping.sessionId === owner.sessionId;
+	return (
+		operation.state === "complete" &&
+		owner.managedAuthority !== undefined &&
+		authority.principalId === owner.managedAuthority.principalId &&
+		authority.canonicalWorkspace === owner.managedAuthority.canonicalWorkspace &&
+		isManagedTurnAuthority(authority, result.mapping)
+	);
+}
+
 function isReassignment(value: unknown, record: Pick<SessionAuthorityRecord, "chatId" | "projectId">): boolean {
 	if (
 		!isRecord(value) ||
@@ -356,6 +376,7 @@ function isManagedTurnAuthority(
 	return (
 		isRecord(value) &&
 		hasOnlyKeys(value, [
+			"authorityEpoch",
 			"principalId",
 			"projectId",
 			"canonicalWorkspace",
@@ -366,6 +387,7 @@ function isManagedTurnAuthority(
 			"epoch",
 			"requestKey",
 		]) &&
+		(value.authorityEpoch === undefined || value.authorityEpoch === SESSION_AUTHORITY_V3_EPOCH) &&
 		isNonEmptyString(value.principalId) &&
 		value.projectId === identity.projectId &&
 		isNonEmptyString(value.canonicalWorkspace) &&
@@ -417,7 +439,7 @@ function hasConsistentTombstoneResults(tombstone: SessionAuthorityTombstone): bo
 		return (
 			resultMapping.chatId === tombstone.chatId &&
 			resultMapping.projectId === tombstone.projectId &&
-			resultMapping.sessionId === tombstone.sessionId &&
+			hasConsistentResultSession(tombstone, operation) &&
 			resultMapping.operationId === operation.id
 		);
 	});

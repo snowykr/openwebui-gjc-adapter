@@ -78,7 +78,7 @@ async function routeManagedSessionClose(input: RouteGjcSessionCloseInput): Promi
 	try {
 		if (!(await tenantFence(tenant)))
 			return managedCloseFailure(input, "Managed tenant authority fence was lost before close.");
-		const outcome = await runtime.closeLifecycleSession({
+		const outcome = await runtime.closeLifecycleSession(tenant, {
 			actor: { id: authority.principalId, namespace: "openwebui-gjc-adapter" },
 			capability: "session.close",
 			requestKey: input.ingressId,
@@ -93,7 +93,7 @@ async function routeManagedSessionClose(input: RouteGjcSessionCloseInput): Promi
 			);
 		await runtime.reconcile();
 		const status = await runtime.generationStatus(tenant);
-		if (status.status === "retired") {
+		if (outcome.ok && outcome.result.sessionId === tenant.sessionId && status.status === "retired") {
 			const mapping = input.mappings.completeOperationWithMapping(
 				input.mapping.chatId,
 				input.ingressId,

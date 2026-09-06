@@ -37,6 +37,7 @@ export async function closeManagedLifecycle(
 	try {
 		await managed.assertFence();
 		const outcome = await managed.runtime.closeLifecycleSession({
+			tenant: managed.tenant,
 			actor: { id: authority.principalId, namespace: authority.projectId },
 			capability: "session.close",
 			requestKey: authority.requestKey,

@@ -403,11 +403,23 @@ function createManagedSelectionRuntime(baseUrl: string): ManagedSdkRuntime {
 		closeLifecycleSession: (tenantOrRequest: unknown, request?: unknown) => Promise<unknown>;
 	};
 	runtimeWithFixtureOperations.createExternalLifecycleSession = async () => createSession();
-	const managedClose = runtimeWithFixtureOperations.closeLifecycleSession.bind(runtime);
-	runtimeWithFixtureOperations.closeLifecycleSession = async (tenantOrRequest, request) =>
-		request === undefined
-			? lifecycle.close(tenantOrRequest as Record<string, unknown>)
-			: managedClose(tenantOrRequest, request);
+	// Selection scenarios simulate lifecycle retirement, not SDK 0.16.4's unavailable
+	// public exact-close authority. Real runtime close rejection has separate tests.
+	runtimeWithFixtureOperations.closeLifecycleSession = async (tenantOrRequest, request) => {
+		const tenant = request === undefined && isRecord(tenantOrRequest) ? tenantOrRequest.tenant : tenantOrRequest;
+		const value = request ?? tenantOrRequest;
+		if (
+			!isRecord(tenant) ||
+			!isRecord(value) ||
+			!isRecord(value.target) ||
+			!isRecord(value.actor) ||
+			value.actor.id !== tenant.principalId ||
+			value.target.sessionId !== tenant.sessionId ||
+			value.target.endpointGeneration !== tenant.generation
+		)
+			throw new Error("Selection lifecycle fixture requires the exact tenant close target.");
+		return lifecycle.close(value);
+	};
 	return runtime;
 
 	async function queryCoordinator(

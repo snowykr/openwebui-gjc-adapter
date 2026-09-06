@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { GJC_THINKING_LEVELS, type NormalizedModelSelection } from "../contracts";
-import { copy } from "./session-authority-copy";
+import { copy, copyEvents } from "./session-authority-copy";
 import type {
 	SessionAttachmentProof,
 	SessionAuthorityInput,
@@ -73,10 +73,9 @@ export function legacyCloseIngressId(operationId: string, mapping: SessionOperat
 /**
  * Builds the immutable result binding for a completed session operation.
  *
- * Journal results no longer carry the per-turn event stream; the event stream
- * lives on the record mapping and in the session transcript (.jsonl). New
- * durable results bind an empty array so the session authority document never
- * duplicates (or accumulates) full event arrays on every completed operation.
+ * Replay evidence belongs to the operation, not just the replaceable current
+ * mapping. Copy event payloads so later turns and caller mutations cannot
+ * rewrite a completed operation's replay.
  */
 export function operationResult(
 	kind: "turn" | "control" | "close",
@@ -86,7 +85,7 @@ export function operationResult(
 	return {
 		kind,
 		assistantText: mapping.assistantText ?? "",
-		events: [],
+		events: copyEvents(mapping.events ?? []),
 		mapping: {
 			chatId: mapping.chatId,
 			projectId: mapping.projectId,

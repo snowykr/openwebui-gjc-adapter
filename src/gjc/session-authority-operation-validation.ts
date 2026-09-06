@@ -1,5 +1,6 @@
 import { isAbsolute } from "node:path";
 import type { NormalizedModelSelection } from "../contracts";
+import type { ManagedSessionOperation } from "./session-authority-copy";
 import type {
 	SessionAttachmentProof,
 	SessionOperation,
@@ -53,22 +54,44 @@ export function isOperation(value: unknown): value is SessionOperation {
 		: value.completedAt === undefined && value.result === undefined;
 }
 export function requiresUncertainAcknowledgedSuccessorCompletionReconciliation(
-	operation: SessionOperation,
+	operation: SessionOperation | ManagedSessionOperation,
 	state: SessionOperationState,
 	detail: string | undefined,
 	result: SessionOperationResult | undefined,
 ): boolean {
+	if (operation.state !== "uncertain" || state !== "complete") return false;
+	const successor = operation.acknowledgedSuccessor;
+	if (
+		(operation.kind !== "create" && operation.kind !== "branch") ||
+		successor === undefined ||
+		detail !== operation.detail ||
+		result?.kind !== "control" ||
+		result.mapping.operationId !== operation.id ||
+		result.mapping.sessionId !== successor.sessionId
+	)
+		return true;
+	if ("managedAuthority" in successor) {
+		const expected = successor.managedAuthority;
+		const actual = result.managedAuthority;
+		return (
+			actual === undefined ||
+			actual.generation !== expected.generation ||
+			![
+				"principalId",
+				"projectId",
+				"canonicalWorkspace",
+				"chatId",
+				"sessionId",
+				"leaseId",
+				"epoch",
+				"requestKey",
+			].every(key => Reflect.get(actual, key) === Reflect.get(expected, key))
+		);
+	}
 	return (
-		operation.state === "uncertain" &&
-		state === "complete" &&
-		(operation.kind !== "create" ||
-			operation.acknowledgedSuccessor === undefined ||
-			detail !== operation.detail ||
-			result?.kind !== "control" ||
-			result.mapping.operationId !== operation.id ||
-			result.mapping.sessionId !== operation.acknowledgedSuccessor.sessionId ||
-			result.mapping.sessionFile === undefined ||
-			JSON.stringify(result.mapping.attachment) !== JSON.stringify(operation.acknowledgedSuccessor.attachment))
+		operation.kind !== "create" ||
+		result.mapping.sessionFile === undefined ||
+		JSON.stringify(result.mapping.attachment) !== JSON.stringify(successor.attachment)
 	);
 }
 

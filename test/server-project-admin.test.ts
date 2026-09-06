@@ -611,7 +611,14 @@ function managedCloseRuntime(initialStatus: "current" | "retired" | "replaced" |
 				: "";
 		subject.requests.push(requestKey);
 		await close(tenantOrRequest, request);
-		return { ok: subject.outcome.ok, certainty: subject.outcome.certainty } as never;
+		return subject.outcome.ok
+			? ({ ok: true, operation: "session.close", result: { sessionId: Reflect.get(target, "sessionId") } } as never)
+			: ({
+					ok: false,
+					operation: "session.close",
+					certainty: subject.outcome.certainty,
+					error: { code: "unavailable", message: "fixture rejection" },
+				} as never);
 	};
 	return subject;
 }

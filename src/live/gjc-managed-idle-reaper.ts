@@ -55,6 +55,7 @@ export interface ManagedIdleLeaseManager {
 
 export interface ManagedIdleLifecycleRuntime {
 	closeLifecycleSession(request: {
+		readonly tenant: TenantSessionKey;
 		readonly actor: Readonly<{ id: string; namespace: string }>;
 		readonly capability: "session.close";
 		readonly requestKey: string;
@@ -181,6 +182,7 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 			let outcome: Readonly<{ ok: boolean; certainty?: string }>;
 			try {
 				outcome = await this.input.runtime.closeLifecycleSession({
+					tenant: key,
 					actor: { id: record.authority.principalId, namespace: "openwebui-gjc-adapter" },
 					capability: "session.close",
 					requestKey: intent.key,
