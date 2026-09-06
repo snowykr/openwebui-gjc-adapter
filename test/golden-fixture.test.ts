@@ -3,7 +3,9 @@ import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveBranchRegenerateAction } from "../src/branches/regenerate";
-import { FileBackedSessionMappingStore } from "../src/gjc/session-router";
+import { scopedSessionMappingStore } from "../src/gjc/scoped-session-mapping-store";
+import { SessionMappingStore } from "../src/gjc/session-router";
+import { SessionV3FileBackedMappingStore } from "../src/gjc/session-v3-file-backed-mapping-store";
 import { handleChatCompletions } from "../src/live/chat-completions";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
 import { buildModelList } from "../src/live/models";
@@ -25,9 +27,10 @@ import {
 } from "../src/projection/workflow-gates";
 import { registerProjectDirectory } from "../src/projects/registry";
 import { resolveAllowedRoots } from "../src/security/paths";
+import { WorkspaceLeaseManager } from "../src/security/workspace-lease";
 import { FileBackedOutboxStore } from "../src/state/outbox";
 import { reconcilePendingOperations } from "../src/state/reconciler";
-import { attachmentProof } from "./gjc-lifecycle-fixtures";
+import { managedPreparedAuthority } from "./gjc-lifecycle-fixtures";
 import {
 	createdAt,
 	deliveredEvents,
@@ -169,7 +172,17 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 		expect(outbox.get("op-crash")?.attempts).toBe(2);
 
 		const turnRunner = new GoldenTurnRunner(sessionFile);
-		const mappings = new FileBackedSessionMappingStore(join(root, "mappings.json"));
+		const mappings = new SessionV3FileBackedMappingStore(join(root, "mappings.json"));
+		const workspaceRegistry = {
+			open: async (userId: string) => ({
+				userId,
+				safeKey: "a".repeat(64),
+				root: cwd,
+				sessionRoot: join(cwd, ".gjc", "sessions"),
+			}),
+		};
+		const workspaceLeaseManager = new WorkspaceLeaseManager({ stateRoot: root });
+		const liveOwner = { ownerUserId: "admin-1", singleOwnerLocalMode: false };
 		const liveRunner = createGjcRoutingLiveGatewayRunner({
 			turnRunner,
 			mappings,
@@ -190,19 +203,39 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 			headers: liveHeaders("chat-live", "assistant-1", "user-1", null),
 			projects: [project],
 			projectContextRepository: repository,
-			owner: { ownerUserId, singleOwnerLocalMode: false },
+			owner: liveOwner,
+			workspaceRegistry,
+			workspaceLeaseManager,
 			runner: liveRunner,
 			eventSink(event) {
 				deliveredEvents.push(event);
 			},
 		});
 		expect(firstLive.ok).toBe(true);
+		expect(turnRunner.starts[0]).toMatchObject({
+			principalId: ownerUserId,
+			preparedManagedAuthority: {
+				principalId: ownerUserId,
+				projectId: "openwebui",
+				canonicalWorkspace: cwd,
+				chatId: "chat-live",
+				requestKey: "user-1",
+			},
+		});
+		expect(mappings.getScoped({ principalId: ownerUserId, chatId: "chat-live" })).toMatchObject({
+			assistantText: "started",
+			events: [{ type: "tool_execution_end", text: "Tool finished", id: "tool-1" }],
+			rawFrameCursor: 1,
+			eventCursor: 1,
+		});
 		const continued = await handleChatCompletions({
 			request: { model: "gjc", messages: [{ role: "user", content: "continue" }] },
 			headers: liveHeaders("chat-live", "assistant-2", "user-2", "user-1"),
 			projects: [project],
 			projectContextRepository: repository,
-			owner: { ownerUserId, singleOwnerLocalMode: false },
+			owner: liveOwner,
+			workspaceRegistry,
+			workspaceLeaseManager,
 			runner: liveRunner,
 			eventSink(event) {
 				deliveredEvents.push(event);
@@ -213,15 +246,27 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 		expect(turnRunner.states[0]).toMatchObject({
 			chatId: "chat-live",
 			sessionId: "session-live",
-			sessionFile,
+			managedAuthority: {
+				principalId: ownerUserId,
+				projectId: "openwebui",
+				canonicalWorkspace: cwd,
+				chatId: "chat-live",
+				sessionId: "session-live",
+				generation: 1,
+			},
 		});
 		expect(turnRunner.continues[0]).toMatchObject({
 			chatId: "chat-live",
 			sessionId: "session-live",
-			sessionFile,
-			activeLeaf: "assistant-1",
+			managedAuthority: turnRunner.states[0]?.managedAuthority,
 			rawFrameCursor: 1,
 			eventCursor: 1,
+		});
+		expect(mappings.getScoped({ principalId: ownerUserId, chatId: "chat-live" })).toMatchObject({
+			assistantText: "continued",
+			events: [{ type: "workflow_gate", text: "Approve continuation", id: "gate-live" }],
+			rawFrameCursor: 2,
+			eventCursor: 2,
 		});
 		expect(deliveredEvents.some(event => event.events.some(item => item.type === "status"))).toBe(true);
 
@@ -232,23 +277,42 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 				"X-OpenWebUI-Task": "title_generation",
 			},
 			projects: [project],
-			owner: { ownerUserId, singleOwnerLocalMode: false },
+			owner: liveOwner,
+			workspaceRegistry,
+			workspaceLeaseManager,
 			runner: liveRunner,
 			modelReaderFactory: selectionFixture.staticModelReaderFactory(),
 		});
 		expect(background.ok).toBe(true);
 		expect(turnRunner.starts).toHaveLength(1);
 
-		mappings.set({
+		const lineageMappings = scopedSessionMappingStore(new SessionMappingStore(), ownerUserId, "chat-live");
+		lineageMappings.set({
 			chatId: "chat-live",
 			projectId: project.id,
 			sessionId: "session-golden",
-			sessionFile,
-			activeLeaf: "u-leaf",
 			rawFrameCursor: 2,
 			eventCursor: 1,
 			operationId: "user-2",
-			attachment: attachmentProof({ cwd, sessionId: "session-golden" }),
+			managedAuthority: managedPreparedAuthority({
+				principalId: ownerUserId,
+				projectId: project.id,
+				canonicalWorkspace: cwd,
+				chatId: "chat-live",
+				sessionId: "session-golden",
+				requestKey: "user-2",
+			}),
+		});
+		expect(lineageMappings.get("chat-live")).toMatchObject({
+			principalId: ownerUserId,
+			managedAuthority: {
+				principalId: ownerUserId,
+				projectId: project.id,
+				canonicalWorkspace: cwd,
+				chatId: "chat-live",
+				sessionId: "session-golden",
+				generation: 1,
+			},
 		});
 		expect(
 			resolveBranchRegenerateAction({
@@ -256,7 +320,7 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 				project,
 				chatId: "chat-live",
 				messageId: importedLeafMessageId,
-				mappings,
+				mappings: lineageMappings,
 				messageMetadata: importedLeafMetadata,
 			}),
 		).toMatchObject({ action: "branch", gjcEntryId: "u-leaf" });
@@ -266,11 +330,12 @@ describe("GJC-primary OpenWebUI golden MVP fixture", () => {
 				project,
 				chatId: "chat-live",
 				messageId: "wrong-message",
-				mappings,
+				mappings: lineageMappings,
 				messageMetadata: importedLeafMetadata,
 			}),
 		).toMatchObject({ action: "uncertain" });
 
 		expect(await Bun.file(sessionFile).text()).toBe(originalJsonl);
+		mappings.close();
 	});
 });

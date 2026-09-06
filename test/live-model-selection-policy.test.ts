@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { SdkV3OperationError } from "../src/gjc/sdk-v3-protocol";
+import { ManagedSdkOperationError } from "../src/gjc/managed-sdk-runtime";
 import { GjcTurnCancelledError } from "../src/gjc/turn-runner";
 import type { ModelReaderFactory } from "../src/live/model-reader";
 import {
@@ -168,7 +168,7 @@ describe("createModelSelectionPolicy", () => {
 			},
 		];
 		const unavailableActiveProviderQuery = async (): Promise<never> => {
-			throw new SdkV3OperationError("operation_not_session_owned", "providers.list/active is not installed");
+			throw new ManagedSdkOperationError("operation_not_session_owned", "providers.list/active is not installed");
 		};
 		const policy = createModelSelectionPolicy(async () => ({
 			async getAvailableModels() {

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import * as path from "node:path";
+import type { ManagedSdkRuntimeDependency } from "../src/gjc/managed-sdk-dependency";
 import type {
 	ManagedSdkAttachment,
 	ManagedSdkFrameCorrelation,
@@ -21,10 +22,11 @@ import type {
 	GjcTurnEvent,
 	GjcTurnResult,
 	GjcTurnRunner,
+	ManagedGenerationProof,
 	ManagedPreparedTurnAuthority,
+	ManagedTurnAuthority,
 } from "../src/gjc/turn-runner";
-import type { ManagedSdkRuntimeDependency } from "../src/live/gjc-routing-lifecycle";
-import { attachmentProof, lifecycleFixture } from "./gjc-lifecycle-fixtures";
+import { lifecycleFixture, managedPreparedAuthority as managedSessionAuthority } from "./gjc-lifecycle-fixtures";
 
 export async function writeDirectV3Authority(sessionRoot: string): Promise<void> {
 	await mkdir(sessionRoot, { recursive: true });
@@ -394,15 +396,50 @@ export async function stopProcess(proc: Bun.Subprocess): Promise<void> {
 export class FakeGjcTurnRunner implements GjcTurnRunner {
 	readonly starts: GjcStartNewSessionInput[] = [];
 	events: GjcTurnResult["events"] = [{ type: "assistant", text: "assistant from gjc" }];
+	readonly #managedAuthorities = new WeakMap<object, ManagedTurnAuthority>();
 
-	async startNewSession<T>(
-		input: GjcStartNewSessionInput,
+	async startNewSession<T>(): Promise<T> {
+		throw new Error("CLI turn fixture requires managed session startup.");
+	}
+
+	async startManagedSession<T>(
+		input: GjcStartNewSessionInput & { readonly preparedManagedAuthority: ManagedPreparedTurnAuthority },
 		publish: (
 			result: GjcSessionAddress & GjcTurnResult,
 			lifecycle: ReturnType<typeof lifecycleFixture>,
 		) => Promise<T>,
+		beforePrompt: (
+			address: GjcSessionAddress,
+			proof: ManagedGenerationProof,
+			lifecycle: ReturnType<typeof lifecycleFixture>,
+		) => Promise<void>,
 	): Promise<T> {
+		const prepared = input.preparedManagedAuthority;
+		if (
+			prepared === undefined ||
+			prepared.principalId !== input.principalId ||
+			prepared.projectId !== input.projectId ||
+			prepared.canonicalWorkspace !== input.cwd ||
+			prepared.chatId !== input.chatId ||
+			prepared.requestKey !== input.userMessageId ||
+			![prepared.principalId, prepared.leaseId, prepared.epoch, prepared.requestKey].every(
+				value => typeof value === "string" && value.trim().length > 0,
+			)
+		)
+			throw new Error("CLI turn fixture requires exact prepared managed authority.");
 		this.starts.push(input);
+		const managedAuthority = managedSessionAuthority({
+			...prepared,
+			sessionId: "session-1",
+			generation: 1,
+		});
+		const managedProof: ManagedGenerationProof = {
+			kind: "managed-generation",
+			sessionId: managedAuthority.sessionId,
+			generation: managedAuthority.generation,
+			leaseId: managedAuthority.leaseId,
+			epoch: managedAuthority.epoch,
+		};
 		const result = {
 			cwd: input.cwd,
 			sessionRoot: input.sessionRoot,
@@ -415,13 +452,18 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 			activeLeaf: "leaf-1",
 			rawFrameCursor: 1,
 			eventCursor: 1,
+			managedAuthority,
+			managedProof,
 			...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
 		};
-		const lifecycle = lifecycleFixture(result);
-		return await publish({ ...result, attachment: attachmentProof(result) }, lifecycle);
+		const lifecycle = lifecycleFixture(result, managedAuthority);
+		await beforePrompt(result, managedProof, lifecycle);
+		return await publish(result, lifecycle);
 	}
 
 	async continueSession(input: GjcContinueSessionInput): Promise<GjcTurnResult> {
+		const managedState = this.bindManagedAuthority(input);
+		input.onDispatch?.();
 		return {
 			text: `continued: ${input.text}`,
 			events: [{ type: "assistant", text: `continued: ${input.text}` }],
@@ -430,7 +472,7 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 			rawFrameCursor: input.rawFrameCursor + 1,
 			eventCursor: input.eventCursor + 1,
 			...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
-			attachment: attachmentProof(input),
+			...managedState,
 		};
 	}
 
@@ -438,7 +480,13 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 		address: GjcSessionAddress,
 		effect: (lifecycle: ReturnType<typeof lifecycleFixture>) => Promise<T>,
 	): Promise<T> {
-		return await effect(lifecycleFixture(address));
+		const lifecycle = lifecycleFixture(address);
+		lifecycle.publishManaged = async (proof, write) => {
+			const authority = this.#managedAuthorities.get(lifecycle);
+			if (authority === undefined) throw new Error("CLI fixture lifecycle has no managed authority.");
+			return await lifecycleFixture(address, authority).publishManaged!(proof, write);
+		};
+		return await effect(lifecycle);
 	}
 	async withLifecycleClosePreflight<T>(
 		address: GjcSessionAddress,
@@ -448,12 +496,47 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 	}
 
 	async getState(input: GjcSessionStateInput): Promise<GjcSessionState> {
+		const managedState = this.bindManagedAuthority(input);
 		return {
 			sessionFile: input.sessionFile,
 			activeLeaf: "leaf-1",
 			rawFrameCursor: 1,
 			eventCursor: 1,
-			attachment: attachmentProof(input),
+			...managedState,
+		};
+	}
+
+	private bindManagedAuthority(input: GjcSessionStateInput) {
+		const authority = input.managedAuthority;
+		if (
+			authority === undefined ||
+			authority.projectId !== input.projectId ||
+			authority.canonicalWorkspace !== input.cwd ||
+			authority.chatId !== input.chatId ||
+			authority.sessionId !== input.sessionId ||
+			!Number.isSafeInteger(authority.generation) ||
+			authority.generation <= 0 ||
+			![authority.principalId, authority.leaseId, authority.epoch, authority.requestKey].every(
+				value => typeof value === "string" && value.trim().length > 0,
+			)
+		)
+			throw new Error("CLI turn fixture requires exact managed session authority.");
+		const bound = this.#managedAuthorities.get(input.lifecycle);
+		if (
+			bound !== undefined &&
+			(Object.keys(bound) as (keyof ManagedTurnAuthority)[]).some(key => bound[key] !== authority[key])
+		)
+			throw new Error("CLI fixture lifecycle managed authority changed.");
+		this.#managedAuthorities.set(input.lifecycle, { ...authority });
+		return {
+			managedAuthority: { ...authority },
+			managedProof: {
+				kind: "managed-generation" as const,
+				sessionId: authority.sessionId,
+				generation: authority.generation,
+				leaseId: authority.leaseId,
+				epoch: authority.epoch,
+			},
 		};
 	}
 }

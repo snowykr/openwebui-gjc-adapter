@@ -81,23 +81,17 @@ export function createGjcRoutingLiveGatewayRunner(
 			// Admission occurs before routing can resolve an existing chat mapping. A
 			// new-turn authority therefore accompanies continuations too; it is never
 			// valid for an existing mapping and must not shadow its persisted proof.
-			if (existing !== undefined && turn.preparedManagedAuthority !== undefined)
+			if (existing?.projectId === turn.project.id && turn.preparedManagedAuthority !== undefined)
 				turn = { ...turn, preparedManagedAuthority: undefined };
 			if (turn.preparedManagedAuthority !== undefined) {
-				if (existing !== undefined || turn.continued)
+				if (existing?.projectId === turn.project.id)
 					throw new Error("Prepared managed authority is valid only for a new managed turn.");
 				assertPreparedManagedAuthorityForGateway(turn, turn.preparedManagedAuthority);
 			}
 			// A persisted managed authority is all-or-nothing. Legacy mappings are deliberately
 			// separate; once a mapping declares managed routing, missing tenant facts fail closed.
-			const managedAuthority = existing === undefined ? undefined : managedAuthorityForGateway(turn, existing);
-			const modelReaderTurn =
-				managedAuthority === undefined
-					? turn
-					: {
-							...turn,
-							modelReaderContext: managedModelReaderContextForGateway(turn, managedAuthority),
-						};
+			const managedAuthority =
+				existing?.projectId !== turn.project.id ? undefined : managedAuthorityForGateway(turn, existing);
 			const priorProvisional = scopedMappings.provisionalOperation(turn.chatId, turn.userMessageId);
 			if (
 				priorProvisional !== undefined &&
@@ -173,8 +167,6 @@ export function createGjcRoutingLiveGatewayRunner(
 					projectId: boundMapping.projectId,
 					chatId: boundMapping.chatId,
 					sessionId: boundMapping.sessionId,
-					sessionFile: boundMapping.sessionFile,
-					recoveryAttachment: boundMapping.attachment,
 				};
 				if (turn.onLiveEvents === undefined) {
 					gateReplyResult = await input.turnRunner.withLifecyclePublication(gateAddress, lifecycle =>
@@ -262,6 +254,10 @@ export function createGjcRoutingLiveGatewayRunner(
 				}
 			}
 			if (gateReplyResult !== null) return withCanonicalModel(gateReplyResult, boundSelection);
+			const modelReaderTurn =
+				requestedModelId === undefined || managedAuthority === undefined
+					? turn
+					: { ...turn, modelReaderContext: managedModelReaderContextForGateway(turn, managedAuthority) };
 			const modelSelection =
 				requestedModelId === undefined
 					? undefined

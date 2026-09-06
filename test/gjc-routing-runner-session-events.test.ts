@@ -350,24 +350,28 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 	);
 	test("fails a streaming reassignment when rollback persistence fails", async () => {
 		class RollbackFailingMappings extends SessionMappingStore {
-			override rollbackProjectReassignment(): void {
+			override rollbackProjectReassignmentScoped(): void {
 				throw new Error("rollback persistence failed");
 			}
 		}
 
 		const mappings = new RollbackFailingMappings();
-		mappings.set({
-			chatId: "chat-stream-rollback",
-			projectId: project.id,
-			sessionId: "session-a",
-			sessionFile: "/workspace/project/.gjc/sessions/session-a.jsonl",
-			operationId: "operation-a",
-			rawFrameCursor: 1,
-			eventCursor: 1,
-		});
+		mappings.setScoped(
+			{ principalId: "owner-test", chatId: "chat-stream-rollback" },
+			{
+				chatId: "chat-stream-rollback",
+				projectId: project.id,
+				sessionId: "session-a",
+				managedAuthority: managedPreparedAuthority({ chatId: "chat-stream-rollback", sessionId: "session-a" }),
+				operationId: "operation-a",
+				rawFrameCursor: 1,
+				eventCursor: 1,
+			},
+		);
 		const turnRunner = new FakeGjcTurnRunner();
 		turnRunner.observedEvents = [{ type: "assistant", text: "starting" }];
 		turnRunner.completionError = new Error("destination failed");
+		observeManagedEventsBeforeCompletion(turnRunner);
 		const result = await createGjcRoutingLiveGatewayRunner({
 			turnRunner,
 			mappings,
@@ -379,6 +383,13 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 			messageId: "assistant-b",
 			userMessageId: "operation-b",
 			userMessageParentId: "operation-a",
+			ownerUserId: "owner-test",
+			preparedManagedAuthority: managedPreparedAuthority({
+				projectId: "project-b",
+				canonicalWorkspace: "/workspace/project-b",
+				chatId: "chat-stream-rollback",
+				requestKey: "operation-b",
+			}),
 			continued: true,
 			requestedModelId: "gjc",
 			onLiveEvents: () => undefined,

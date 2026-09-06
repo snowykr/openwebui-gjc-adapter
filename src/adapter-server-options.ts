@@ -24,7 +24,7 @@ import { readSessionAuthorityV3ActiveMarker } from "./gjc/session-authority-v3-a
 import { loadGjcSessionFile } from "./gjc/session-loader";
 import type { SessionMapping, SessionMappingStore } from "./gjc/session-router";
 import { V3FileBackedSessionMappingStore } from "./gjc/session-v3-file-backed-mapping-store";
-import type { GjcCloseReceipt, ManagedPreparedTurnAuthority, ManagedTurnAuthority } from "./gjc/turn-runner";
+import type { ManagedPreparedTurnAuthority, ManagedTurnAuthority } from "./gjc/turn-runner";
 import type { LiveGatewayEventSink, LiveGatewayMessageSink } from "./live/chat-completions";
 import { acquireWorkspaceAdmission } from "./live/chat-completions";
 import type { LiveGatewayFileContextResolver } from "./live/file-contexts";
@@ -84,10 +84,6 @@ export interface BuildAdapterServerOptionsDependencies {
 	readonly projectRegistrationStore?: SqliteProjectRegistrationStore;
 	readonly outbox?: OutboxStore;
 	readonly projectionOperationApplier?: ProjectionOperationApplier;
-	/** Must destroy only a pane whose ownership has been proven for this mapping. */
-	readonly fallbackCloseSession?: (mapping: SessionMapping, cause: unknown) => Promise<SessionCloseResult>;
-	/** Post-ack proof must observe endpoint disappearance and the persisted owned pane/process; it must never kill. */
-	readonly proveClosedSession?: (mapping: SessionMapping, receipt: GjcCloseReceipt) => Promise<SessionCloseResult>;
 	/** Retires every principal-owned session authority only after proven close. */
 	readonly authorityCoordinator?: WorkspaceCleanupAuthorityCoordinator;
 }

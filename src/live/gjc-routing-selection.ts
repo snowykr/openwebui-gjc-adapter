@@ -72,8 +72,6 @@ export async function replayWithLifecyclePublication<T>(
 			projectId: mapping.projectId,
 			chatId: mapping.chatId,
 			sessionId: mapping.sessionId,
-			sessionFile: mapping.sessionFile,
-			recoveryAttachment: mapping.attachment,
 		},
 		async () => effect(),
 	);

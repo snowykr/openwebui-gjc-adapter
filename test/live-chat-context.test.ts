@@ -16,7 +16,7 @@ import { buildOpenWebUIStatusEvent } from "../src/openwebui/events";
 import type { RegisteredProject } from "../src/projects/registry";
 import { WorkspaceLeaseManager } from "../src/security/workspace-lease";
 import { createAdapterRequestHandler } from "../src/server";
-import { attachmentProof, lifecycleFixture } from "./gjc-lifecycle-fixtures";
+import { lifecycleFixture, managedPreparedAuthority } from "./gjc-lifecycle-fixtures";
 import { staticModelReaderFactory } from "./model-selection-fixtures";
 
 const project: RegisteredProject = {
@@ -540,9 +540,30 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 			};
 		});
 		const turnRunner: GjcTurnRunner = {
-			async startNewSession(input, publish, beforePrompt) {
+			async startNewSession() {
+				throw new Error("Lease lifecycle fixture requires managed session startup.");
+			},
+			async startManagedSession(input, publish, beforePrompt) {
+				const prepared = input.preparedManagedAuthority;
+				if (
+					prepared === undefined ||
+					prepared.principalId !== input.principalId ||
+					prepared.projectId !== input.projectId ||
+					prepared.canonicalWorkspace !== input.cwd ||
+					prepared.chatId !== input.chatId ||
+					prepared.requestKey !== input.userMessageId ||
+					![prepared.principalId, prepared.leaseId, prepared.epoch, prepared.requestKey].every(
+						value => typeof value === "string" && value.trim().length > 0,
+					)
+				)
+					throw new Error("Lease lifecycle fixture requires exact prepared managed authority.");
 				runnerCalls += 1;
 				const first = runnerCalls === 1;
+				const managedAuthority = managedPreparedAuthority({
+					...prepared,
+					sessionId: `session-${runnerCalls}`,
+					generation: 1,
+				});
 				const address = {
 					cwd: input.cwd,
 					sessionRoot: input.sessionRoot,
@@ -557,29 +578,27 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 					eventCursor: 1,
 					...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
 				};
-				const attachment = {
-					...attachmentProof(address),
-					tmuxSocket: "/tmp/tmux.sock",
-					tmuxPane: "%1",
-					tmuxPanePid: 1,
-					tmuxOwnershipTag: "owner",
-					ownedAt: "2026-07-19T00:00:00.000Z",
+				const managedProof = {
+					kind: "managed-generation" as const,
+					sessionId: managedAuthority.sessionId,
+					generation: managedAuthority.generation,
+					leaseId: managedAuthority.leaseId,
+					epoch: managedAuthority.epoch,
 				};
-				const lifecycle = lifecycleFixture(address);
-				const attachedAddress = { ...address, attachment };
-				await beforePrompt(attachedAddress, attachment, lifecycle);
+				const lifecycle = lifecycleFixture(address, managedAuthority);
+				await beforePrompt(address, managedProof, lifecycle);
 				await input.observer?.({
 					type: "message_update",
 					payload: { assistantMessageEvent: { type: "text_delta", delta: "working" } },
 				});
 				if (first) await firstTurn;
-				return publish({ ...address, attachment }, lifecycle);
+				return publish({ ...address, managedAuthority, managedProof }, lifecycle);
 			},
 			async continueSession(_input) {
 				throw new Error("Unexpected mapped-session continuation in lease lifecycle test.");
 			},
-			async getState(_input) {
-				return { rawFrameCursor: 1, eventCursor: 1 };
+			async getState() {
+				throw new Error("Unexpected mapped-session state read in lease lifecycle test.");
 			},
 		};
 		const runner = createGjcRoutingLiveGatewayRunner({
@@ -598,6 +617,7 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 			"X-OpenWebUI-Chat-Id": "chat-routed-1",
 			"X-OpenWebUI-Message-Id": "assistant-routed-1",
 			"X-OpenWebUI-User-Message-Id": "user-routed-1",
+			"X-OpenWebUI-User-Message-Parent-Id": "",
 		};
 		try {
 			const firstResult = await handleChatCompletions({

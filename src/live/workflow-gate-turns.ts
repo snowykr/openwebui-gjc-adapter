@@ -1,9 +1,14 @@
+import { resolve } from "node:path";
 import { scopedSessionMappingStore } from "../gjc/scoped-session-mapping-store";
 import type { SessionOperationGateBinding } from "../gjc/session-authority-types";
-import { ensureSdkSessionFile } from "../gjc/session-file";
 import type { SessionMapping, SessionMappingStore } from "../gjc/session-router";
-import { validateSessionFile } from "../gjc/session-router";
-import { type GjcLifecycleTransaction, GjcTurnCancelledError, type GjcTurnEventObserver } from "../gjc/turn-runner";
+import {
+	type GjcLifecycleTransaction,
+	GjcTurnCancelledError,
+	type GjcTurnEventObserver,
+	type GjcTurnResult,
+	type ManagedTurnAuthority,
+} from "../gjc/turn-runner";
 import {
 	answerFromWorkflowGateReply,
 	type PendingWorkflowGate,
@@ -57,23 +62,19 @@ export function replayCompletedWorkflowGateReply(
 		const gate = pendingWorkflowGateFromEvent(event);
 		return gate !== null && workflowGateOperationHash(turn, gate) === priorOperation.detail;
 	});
-	// The completed operation's own result may still carry the gate event in
-	// legacy documents (before compaction strips result event arrays); recompute
-	// the request hash from it as well.
-	const matchesLegacyResult = (result.events ?? []).some(event => {
+	// V3 retains each completed operation's immutable events even after the
+	// current mapping advances. Verify the request against that history as well.
+	const matchesResultEvents = (result.events ?? []).some(event => {
 		if (event.type !== "workflow_gate") return false;
 		const gate = pendingWorkflowGateFromEvent(event);
 		return gate !== null && workflowGateOperationHash(turn, gate) === priorOperation.detail;
 	});
-	// New documents discard the gate event once the operation is superseded, but
-	// bind the compact answered-gate identity on the durable result, so the
-	// request hash can still be recomputed and compared against the stored
-	// detail. Without a matching binding the replay is a conflicting ingress
-	// even when the operation is no longer the record's current one.
+	// The compact answered-gate identity independently binds the ingress hash;
+	// it does not replace the immutable result events retained by V3.
 	const gateBinding = result.gate;
 	const matchesBinding =
 		gateBinding !== undefined && workflowGateOperationHash(turn, gateBinding) === priorOperation.detail;
-	if (!matchesIngress && !matchesLegacyResult && !matchesBinding)
+	if (!matchesIngress && !matchesResultEvents && !matchesBinding)
 		throw new Error(
 			`GJC workflow gate operation ${turn.userMessageId} completed without a valid immutable result binding.`,
 		);
@@ -108,6 +109,11 @@ export async function handleWorkflowGateReply(
 	if (mapping === undefined || mapping.projectId !== turn.project.id) return null;
 	const pendingGate = latestPendingWorkflowGate(mapping.events ?? []);
 	if (pendingGate === null) return null;
+	const managedAuthority = requireGateManagedAuthority(turn, mapping, principalId);
+	if (pendingGate.sessionId !== undefined && pendingGate.sessionId !== managedAuthority.sessionId)
+		throw new Error("Workflow gate correlation does not match the managed session authority.");
+	if (lifecycle.publishManaged === undefined)
+		throw new Error("Managed workflow gate response requires managed lifecycle publication.");
 
 	const answerResult = answerFromWorkflowGateReply(pendingGate, turn.prompt);
 	if (!answerResult.ok) {
@@ -169,16 +175,11 @@ export async function handleWorkflowGateReply(
 		chatId: mapping.chatId,
 		sessionId: mapping.sessionId,
 		operationId: turn.userMessageId,
-		...(principalId === undefined ? {} : { principalId }),
+		principalId: managedAuthority.principalId,
+		managedAuthority,
 	};
-	let cancellationRequested = false;
-	const onAbort = () => {
-		if (cancellationRequested) return;
-		cancellationRequested = true;
-		void Promise.resolve(input.turnRunner.cancelTurn?.(cancellation)).catch(() => undefined);
-	};
-	turn.signal?.addEventListener("abort", onAbort, { once: true });
-	if (turn.signal?.aborted) onAbort();
+	// The managed runner owns signal-driven terminal aborts. Sending cancelTurn
+	// here would abort before dispatch or duplicate its post-dispatch abort.
 	let operationBegun = false;
 	let dispatchFired = false;
 	try {
@@ -192,12 +193,6 @@ export async function handleWorkflowGateReply(
 		operationBegun = true;
 		throwIfAborted(turn.signal);
 		const sessionRoot = turn.project.sessionRoot ?? `${turn.project.cwd}/.gjc/sessions`;
-		const existingSessionFile = await ensureSdkSessionFile(
-			turn.project,
-			mapping.sessionFile,
-			sessionRoot,
-			mapping.sessionId,
-		);
 		const result = await input.turnRunner.respondWorkflowGate({
 			cwd: turn.project.cwd,
 			sessionRoot,
@@ -210,14 +205,11 @@ export async function handleWorkflowGateReply(
 			idempotencyKey: workflowGateResponseIdempotencyKey(turn.chatId, turn.userMessageId),
 			userMessageId: turn.userMessageId,
 			parentId: turn.userMessageParentId ?? undefined,
-			sessionFile: existingSessionFile,
-			recoveryAttachment: mapping.attachment,
-			activeLeaf: mapping.activeLeaf,
 			rawFrameCursor: mapping.rawFrameCursor,
 			eventCursor: mapping.eventCursor,
 			operationId: turn.userMessageId,
 			lifecycle,
-			...(mapping.managedAuthority === undefined ? {} : { managedAuthority: mapping.managedAuthority }),
+			managedAuthority,
 			...(observer === undefined ? {} : { observer }),
 			...(turn.signal === undefined ? {} : { signal: turn.signal }),
 			...(principalId === undefined ? {} : { principalId }),
@@ -237,19 +229,12 @@ export async function handleWorkflowGateReply(
 					}),
 		});
 		throwIfAborted(turn.signal);
-		if (
-			result.attachment === undefined &&
-			(result.managedAuthority === undefined || result.managedProof === undefined)
-		) {
-			throw new Error("Workflow gate response did not return a validated current GJC attachment.");
-		}
+		assertGateManagedResult(result, managedAuthority, turn.userMessageId);
 		const nextPendingGate = latestPendingWorkflowGate(result.events);
 		const responseText = nextPendingGate === null ? result.text : projectPendingWorkflowGateMessage(nextPendingGate);
-		// Bound the carried gate history: retain only the gate event just answered
-		// (needed to verify replays of THIS operation against its durable detail
-		// binding) plus any gates emitted by this reply; accepted gates from
-		// earlier chain steps are dropped, so a chain of N gates keeps O(1) gate
-		// payloads instead of N full schemas and options.
+		// Bound the current mapping's carried history to the gate just answered
+		// plus events emitted by this reply. V3 separately retains each completed
+		// operation's immutable events; advancing the record never deletes them.
 		const answeredGateEvent = (mapping.events ?? []).find(
 			event => event.type === "workflow_gate" && pendingWorkflowGateFromEvent(event)?.gateId === pendingGate.gateId,
 		);
@@ -259,17 +244,18 @@ export async function handleWorkflowGateReply(
 				: markWorkflowGateAccepted([answeredGateEvent], pendingGate.gateId).filter(
 						event => event.type === "workflow_gate",
 					);
-		const nextMapping = {
-			...mapping,
-			sessionFile: validateSessionFile(turn.project, result.sessionFile ?? existingSessionFile, sessionRoot),
-			activeLeaf: result.activeLeaf ?? mapping.activeLeaf,
+		const nextMapping: SessionMapping = {
+			principalId: managedAuthority.principalId,
+			projectId: mapping.projectId,
+			chatId: mapping.chatId,
+			sessionId: mapping.sessionId,
 			rawFrameCursor: result.rawFrameCursor,
 			eventCursor: result.eventCursor,
 			operationId: turn.userMessageId,
 			assistantText: responseText,
 			events: [...carriedGateEvents, ...result.events],
-			...(result.attachment === undefined ? {} : { attachment: result.attachment }),
-			...(result.managedAuthority === undefined ? {} : { managedAuthority: result.managedAuthority }),
+			managedAuthority: result.managedAuthority,
+			...(mapping.modelSelection === undefined ? {} : { modelSelection: mapping.modelSelection }),
 		};
 		// Compact answered-gate identity (no schema/options/context payload), so a
 		// replay can still recompute the durable request hash even after the gate
@@ -299,15 +285,7 @@ export async function handleWorkflowGateReply(
 			ensureProjectionRows(input.outbox, published, projectionOwnerUserId, principalId);
 			return published;
 		};
-		if (result.managedAuthority !== undefined && result.managedProof !== undefined) {
-			if (lifecycle.publishManaged === undefined)
-				throw new Error("Managed workflow gate response requires managed lifecycle publication.");
-			await lifecycle.publishManaged(result.managedProof, publish);
-		} else {
-			if (result.attachment === undefined)
-				throw new Error("Workflow gate response did not return a validated current GJC attachment.");
-			await lifecycle.publish(result.attachment, publish);
-		}
+		await lifecycle.publishManaged(result.managedProof, publish);
 		const projectedEvents = projectTurnEvents(
 			result.events,
 			mapping.modelSelection === undefined ? undefined : formatCanonicalModelId(mapping.modelSelection),
@@ -329,9 +307,73 @@ export async function handleWorkflowGateReply(
 		}
 		throw error;
 	} finally {
-		turn.signal?.removeEventListener("abort", onAbort);
 		input.turnRunner.clearTurnCancellation?.(cancellation);
 	}
+}
+
+function requireGateManagedAuthority(
+	turn: LiveGatewayRunnerInput,
+	mapping: SessionMapping,
+	principalId: string | undefined,
+): ManagedTurnAuthority {
+	const authority = mapping.managedAuthority;
+	if (
+		principalId === undefined ||
+		mapping.principalId !== principalId ||
+		mapping.chatId !== turn.chatId ||
+		authority === undefined ||
+		authority.principalId !== principalId ||
+		authority.projectId !== turn.project.id ||
+		authority.canonicalWorkspace !== resolve(turn.project.cwd) ||
+		authority.chatId !== mapping.chatId ||
+		authority.sessionId !== mapping.sessionId ||
+		![
+			authority.principalId,
+			authority.projectId,
+			authority.chatId,
+			authority.sessionId,
+			authority.leaseId,
+			authority.epoch,
+			authority.requestKey,
+		].every(value => typeof value === "string" && value.trim().length > 0) ||
+		!Number.isSafeInteger(authority.generation) ||
+		authority.generation <= 0
+	)
+		throw new Error("Managed workflow gate requires exact principal, workspace, and session authority.");
+	return Object.freeze({ ...authority });
+}
+
+function assertGateManagedResult(
+	result: GjcTurnResult,
+	expected: ManagedTurnAuthority,
+	ingressId: string,
+): asserts result is GjcTurnResult & {
+	readonly managedAuthority: ManagedTurnAuthority;
+	readonly managedProof: NonNullable<GjcTurnResult["managedProof"]>;
+} {
+	const authority = result.managedAuthority;
+	const proof = result.managedProof;
+	if (
+		authority === undefined ||
+		proof === undefined ||
+		authority.principalId !== expected.principalId ||
+		authority.projectId !== expected.projectId ||
+		authority.canonicalWorkspace !== expected.canonicalWorkspace ||
+		authority.chatId !== expected.chatId ||
+		authority.sessionId !== expected.sessionId ||
+		authority.generation !== expected.generation ||
+		authority.leaseId !== expected.leaseId ||
+		authority.epoch !== expected.epoch ||
+		typeof authority.requestKey !== "string" ||
+		authority.requestKey.trim().length === 0 ||
+		(authority.requestKey !== expected.requestKey && authority.requestKey !== ingressId) ||
+		proof.kind !== "managed-generation" ||
+		proof.sessionId !== authority.sessionId ||
+		proof.generation !== authority.generation ||
+		proof.leaseId !== authority.leaseId ||
+		proof.epoch !== authority.epoch
+	)
+		throw new Error("Workflow gate response did not return matching current managed authority and proof.");
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
