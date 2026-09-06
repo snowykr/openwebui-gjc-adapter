@@ -344,6 +344,13 @@ describe("CLI module boundaries", () => {
 		).toEqual([]);
 		for (const module of [`${legacy}-client-transport`, `${legacy}-client-runner`, `${legacy}-runner`, "sdk-v3-cli"])
 			expect(existsSync(join(ROOT, "src/gjc", `${module}.ts`))).toBe(false);
+		for (const module of [
+			"managed-bootstrap",
+			"managed-authority-activation",
+			"managed-authority-file-storage",
+			"managed-session-authority",
+		])
+			expect(existsSync(join(ROOT, "src/gjc", `${module}.ts`))).toBe(false);
 		const entrypoint = readFileSync(join(ROOT, "src/index.ts"), "utf8");
 		for (const module of ["session-frames", "turn-runner", "cli-lifecycle-backend", "tmux-ownership"])
 			expect(entrypoint).not.toContain(`./gjc/${module}`);

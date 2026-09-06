@@ -747,6 +747,42 @@ describe("session authority v3 full graph", () => {
 		expect(encodeSessionAuthorityV3Document(first)).toBe(encodeSessionAuthorityV3Document(second));
 	});
 
+	test("rejects malformed scalar authority, model selection, and nested credential data", () => {
+		for (const patch of [{ generation: 0 }, { generation: 1.5 }, { requestKey: "" }, { token: "secret" }]) {
+			const value = clonedGolden();
+			Object.assign(value.mappings[0].managedAuthority, patch);
+			expect(parseSessionAuthorityV3Document(JSON.stringify(value))).toBeUndefined();
+		}
+		for (const patch of [
+			{ modelSelection: { provider: "provider", modelId: "model", thinkingLevel: "invalid" } },
+			{ events: [{ type: "message", payload: { token: "secret" } }] },
+			{ operationId: "" },
+		]) {
+			const value = clonedGolden();
+			Object.assign(value.mappings[0], patch);
+			expect(parseSessionAuthorityV3Document(JSON.stringify(value))).toBeUndefined();
+		}
+	});
+
+	test("canonical decoding detaches model selection and nested event history", () => {
+		const source = {
+			...golden(),
+			mappings: [{ ...mapping(), modelSelection: { provider: "provider", modelId: "model", thinkingLevel: "low" } }],
+		};
+		const before = JSON.stringify(source);
+		const parsed = parseSessionAuthorityV3Document(before)!;
+		expect(parsed).toBeDefined();
+		expect(encodeSessionAuthorityV3Document(parsed)).toBe(
+			encodeSessionAuthorityV3Document(parseSessionAuthorityV3Document(before)!),
+		);
+		Reflect.set(parsed.mappings[0]!.modelSelection!, "modelId", "changed");
+		Reflect.set(parsed.mappings[0]!.journal[0]!.result!.events![0]!.payload!, "durable", false);
+		expect(JSON.stringify(source)).toBe(before);
+		expect(encodeSessionAuthorityV3Document(parsed)).not.toBe(
+			encodeSessionAuthorityV3Document(parseSessionAuthorityV3Document(before)!),
+		);
+	});
+
 	test("rejects malformed relational identities and tenant authority mismatches", () => {
 		const wrongResult = clonedGolden();
 		wrongResult.mappings[0].journal[0].result.mapping.operationId = "other";

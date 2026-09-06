@@ -1,7 +1,7 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { linkSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -175,6 +175,90 @@ async function fixture() {
 }
 
 describe("session authority V3 activation", () => {
+	test.each(["symlink", "directory"] as const)(
+		"rejects a %s canonical source without snapshot effects",
+		async kind => {
+			const f = await fixture();
+			const retained = `${f.canonicalPath}.retained`;
+			try {
+				await rename(f.canonicalPath, retained);
+				if (kind === "symlink") await symlink(retained, f.canonicalPath);
+				else await mkdir(f.canonicalPath);
+				await expect(f.activate()).rejects.toThrow();
+				expect((await readFile(retained)).equals(f.original)).toBe(true);
+				expect(await Bun.file(`${f.canonicalPath}.v3-active.json`).exists()).toBe(false);
+				const snapshot = join(
+					f.root,
+					"private",
+					`session-authority-v3-${digest(Buffer.from(f.canonicalPath)).slice(0, 16)}`,
+					"source.v2.json",
+				);
+				expect(await Bun.file(snapshot).exists()).toBe(false);
+			} finally {
+				await f.cleanup();
+			}
+		},
+	);
+
+	test("release rejects an externally replaced mutation lock and preserves its bytes", async () => {
+		const f = await fixture();
+		const lock = AuthorityMutationLock.acquire(f.canonicalPath);
+		const lockPath = `${f.canonicalPath}.lock`;
+		try {
+			lock.assertHeld(f.canonicalPath);
+			const bytes = await readFile(lockPath);
+			await rename(lockPath, `${lockPath}.retained`);
+			await writeFile(lockPath, bytes);
+			const replacement = await stat(lockPath);
+			expect(() => lock.assertHeld(f.canonicalPath)).toThrow("ownership was lost");
+			expect(() => lock.release()).toThrow("ownership changed before release");
+			expect((await readFile(lockPath)).equals(bytes)).toBe(true);
+			expect((await stat(lockPath)).ino).toBe(replacement.ino);
+		} finally {
+			await f.cleanup();
+		}
+	});
+
+	test.each(["manifest", "base", "marker"] as const)(
+		"activation and forward recovery leave unrelated user files untouched at %s",
+		async boundary => {
+			const f = await fixture();
+			const unrelated: Array<{ path: string; bytes: Buffer; ino: number }> = [];
+			try {
+				for (const [directory, name, content] of [
+					["transcripts", "session.jsonl", '{"text":"private transcript"}\n'],
+					["artifacts", "user-output.txt", "user artifact\n"],
+				]) {
+					await mkdir(join(f.root, directory!));
+					const path = join(f.root, directory!, name!);
+					const bytes = Buffer.from(content!);
+					await writeFile(path, bytes);
+					unrelated.push({ path, bytes, ino: (await stat(path)).ino });
+				}
+				await expect(
+					f.activate(current => {
+						if (current === boundary) throw new Error("interrupted activation");
+					}),
+				).rejects.toThrow("interrupted activation");
+				const afterCrash = await readFile(f.canonicalPath);
+				const afterCrashInode = (await stat(f.canonicalPath)).ino;
+				if (boundary === "manifest") expect(afterCrash.equals(f.original)).toBe(true);
+				else expect(parseSessionAuthorityV3Document(afterCrash)).toBeDefined();
+				expect((await f.activate()).status).toBe("activated");
+				if (boundary !== "manifest") {
+					expect((await readFile(f.canonicalPath)).equals(afterCrash)).toBe(true);
+					expect((await stat(f.canonicalPath)).ino).toBe(afterCrashInode);
+				}
+				for (const file of unrelated) {
+					expect((await readFile(file.path)).equals(file.bytes)).toBe(true);
+					expect((await stat(file.path)).ino).toBe(file.ino);
+				}
+			} finally {
+				await f.cleanup();
+			}
+		},
+	);
+
 	test.each(["committing", "base"] as const)(
 		"bootstrap crash at %s never trusts pre-swap historical proof",
 		async boundary => {

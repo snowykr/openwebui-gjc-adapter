@@ -11,7 +11,6 @@ import type {
 	ManagedSdkPendingFrameSubscription,
 	TenantSessionKey,
 } from "../src/gjc/managed-sdk-runtime";
-import { MANAGED_SESSION_AUTHORITY_EPOCH } from "../src/gjc/managed-session-authority";
 import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import type {
 	GjcContinueSessionInput,
@@ -375,7 +374,7 @@ export class FakeManagedSdkRuntime implements ManagedSdkRuntimeDependency {
 			sessionId,
 			generation,
 			leaseId: authority?.leaseId ?? "fixture-lease",
-			epoch: authority?.epoch ?? MANAGED_SESSION_AUTHORITY_EPOCH,
+			epoch: authority?.epoch ?? SESSION_AUTHORITY_V3_EPOCH,
 		};
 		this.#sessions.set(sessionIdentity(tenant), {
 			tenant: authority === undefined ? undefined : tenant,

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { lifecycle, router } from "@gajae-code/coding-agent/sdk";
@@ -21,6 +21,10 @@ async function fixture(
 		empty?: boolean;
 		stopGate?: Promise<void>;
 		resumeGate?: Promise<void>;
+		failStart?: boolean;
+		failStop?: boolean;
+		onResume?: () => void;
+		onStop?: () => Promise<void>;
 		timeoutMs?: number;
 		staleAtCommit?: boolean;
 	} = {},
@@ -132,10 +136,13 @@ async function fixture(
 			const sdkRouter = {
 				start: async () => {
 					calls.push("start");
+					if (options.failStart) throw new Error("router start failed");
 				},
 				stop: async () => {
 					calls.push("stop");
 					await options.stopGate;
+					if (options.failStop) throw new Error("router stop failed");
+					await options.onStop?.();
 				},
 				reconcile: async () => {
 					calls.push("reconcile");
@@ -179,6 +186,7 @@ async function fixture(
 					expect(readFileSync(sourcePath, "utf8")).toBe(original);
 					if (options.revokeAfterResume) live = false;
 					if (options.failResume) throw new Error("lost outcome");
+					options.onResume?.();
 					await options.resumeGate;
 					return {
 						ok: true,
@@ -206,14 +214,120 @@ async function fixture(
 		runtime: () => runtime,
 		deps: () => deps,
 		cleanup: async () => {
-			await runtime?.dispose();
-			await runtimeLock.release();
-			await rm(root, { recursive: true, force: true });
+			try {
+				await runtime?.dispose();
+			} finally {
+				await runtimeLock.release();
+				await rm(root, { recursive: true, force: true });
+			}
 		},
 	};
 }
 
 describe("adapter managed bootstrap composition", () => {
+	test("lock release failure is observable without releasing an external replacement", async () => {
+		let lockPath = "";
+		const replacement = "external mutation owner\n";
+		const f = await fixture({
+			onStop: async () => {
+				await rename(lockPath, `${lockPath}.retained`);
+				await writeFile(lockPath, replacement);
+			},
+		});
+		lockPath = `${f.sourcePath}.lock`;
+		try {
+			const error = await activateAdapterSessionAuthorityV3(f.input).catch(error => error);
+			expect(error).toBeInstanceOf(AggregateError);
+			expect((error as AggregateError).errors.map(error => error.message)).toEqual([
+				"Session authority mutation lease ownership changed before release.",
+			]);
+			expect(f.runtime().state).toBe("stopped");
+			expect(await readFile(lockPath, "utf8")).toBe(replacement);
+			expect(parseSessionAuthorityV3Document(await readFile(f.sourcePath))).toBeDefined();
+		} finally {
+			await f.cleanup();
+		}
+	});
+
+	test("Router start failure stops locally and releases mutation ownership without invoking resume", async () => {
+		const f = await fixture({ failStart: true });
+		try {
+			await expect(activateAdapterSessionAuthorityV3(f.input)).rejects.toThrow("bootstrap failed");
+			expect(f.calls).toEqual(["construct", "start", "stop"]);
+			expect(f.runtime().state).toBe("stopped");
+			expect(f.evidence()).toBeUndefined();
+			expect(await readFile(f.sourcePath, "utf8")).toBe(f.original);
+			expect(await Bun.file(`${f.sourcePath}.lock`).exists()).toBe(false);
+			expect(await Bun.file(`${f.sourcePath}.v3-active.json`).exists()).toBe(false);
+			await Promise.all([f.runtime().dispose(), f.runtime().dispose()]);
+			expect(f.calls.filter(call => call === "stop")).toHaveLength(1);
+		} finally {
+			await f.cleanup();
+		}
+	});
+
+	test("failed local shutdown retains mutation ownership and exposes both failures", async () => {
+		const f = await fixture({ failResume: true, failStop: true });
+		try {
+			const error = await activateAdapterSessionAuthorityV3(f.input).catch(error => error);
+			expect(error).toBeInstanceOf(AggregateError);
+			expect((error as AggregateError).errors.map(error => error.message)).toEqual([
+				"lost outcome",
+				"router stop failed",
+				"Bootstrap shutdown is unproven; mutation ownership remains held.",
+			]);
+			expect(f.runtime().state).toBe("failed");
+			expect(f.evidence()?.state).toBe("uncertain");
+			const ownedLock = await readFile(`${f.sourcePath}.lock`, "utf8");
+			await expect(activateAdapterSessionAuthorityV3(f.input)).rejects.toThrow("bootstrap failed");
+			expect(await readFile(`${f.sourcePath}.lock`, "utf8")).toBe(ownedLock);
+			expect(f.calls.filter(call => call === "construct")).toHaveLength(1);
+			expect(await readFile(f.sourcePath, "utf8")).toBe(f.original);
+		} finally {
+			await expect(f.cleanup()).rejects.toThrow("router stop failed");
+		}
+	});
+
+	test("concurrent activation cannot duplicate an in-flight resume or share bootstrap capabilities", async () => {
+		let entered!: () => void;
+		let release!: () => void;
+		const invoked = new Promise<void>(resolve => {
+			entered = resolve;
+		});
+		const f = await fixture({
+			onResume: () => entered(),
+			resumeGate: new Promise<void>(resolve => {
+				release = resolve;
+			}),
+		});
+		const first = activateAdapterSessionAuthorityV3(f.input);
+		try {
+			await Promise.race([
+				invoked,
+				first.then(() => {
+					throw new Error("Activation missed resume barrier.");
+				}),
+			]);
+			await expect(activateAdapterSessionAuthorityV3(f.input)).rejects.toThrow("bootstrap failed");
+			expect(f.calls.filter(call => call === "construct")).toHaveLength(1);
+			expect(f.calls.filter(call => call === "resume")).toHaveLength(1);
+			expect(f.evidence()?.state).toBe("invoking");
+			expect(await readFile(f.sourcePath, "utf8")).toBe(f.original);
+			release();
+			const result = await first;
+			expect(result.status).toBe("activated");
+			expect(Object.keys(result).sort()).toEqual(["activation", "status", "store"]);
+			if (result.status === "activated") result.store.close();
+			expect(await Bun.file(`${f.sourcePath}.lock`).exists()).toBe(false);
+			await Promise.all([f.runtime().dispose(), f.runtime().dispose()]);
+			expect(f.calls.filter(call => call === "stop")).toHaveLength(1);
+		} finally {
+			release();
+			await first.catch(() => undefined);
+			await f.cleanup();
+		}
+	});
+
 	test("an attachment invalidated during final lease checking cannot be committed", async () => {
 		const f = await fixture({ staleAtCommit: true });
 		try {
