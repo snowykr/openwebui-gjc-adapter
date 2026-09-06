@@ -1,3 +1,4 @@
+import { copyManagedLifecycleEvidence } from "./managed-lifecycle-evidence";
 import type {
 	AcknowledgedSuccessor,
 	ProvisionalSessionOperation,
@@ -103,6 +104,7 @@ export function copyOperation(operation: ManagedSessionOperation): ManagedSessio
 export function copyOperation(operation: SessionOperation | ManagedSessionOperation) {
 	return {
 		...operation,
+		...(operation.lifecycle === undefined ? {} : { lifecycle: copyManagedLifecycleEvidence(operation.lifecycle) }),
 		...(operation.result === undefined ? {} : { result: copyOperationResult(operation.result) }),
 		...(operation.acknowledgedSuccessor === undefined
 			? {}
@@ -113,6 +115,7 @@ export function copyOperation(operation: SessionOperation | ManagedSessionOperat
 export function copyProvisionalOperation(operation: ProvisionalSessionOperation): ProvisionalSessionOperation {
 	return {
 		...operation,
+		...copyOperation(operation),
 		...(operation.attachment === undefined
 			? {}
 			: {

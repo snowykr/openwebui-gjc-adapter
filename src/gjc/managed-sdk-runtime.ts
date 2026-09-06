@@ -37,6 +37,17 @@ export interface TenantSessionKey {
 	readonly epoch: string;
 }
 
+export interface ManagedSdkLifecycleOperation {
+	readonly operationId: string;
+	readonly requestKey: string;
+	readonly payloadHash: string;
+}
+
+export type ManagedSdkAccess =
+	| Readonly<{ kind: "active" }>
+	| (ManagedSdkLifecycleOperation & Readonly<{ kind: "adoption-proof" }>)
+	| (ManagedSdkLifecycleOperation & Readonly<{ kind: "retirement"; action: "close" | "generation-status" }>);
+
 export interface ManagedSdkAttachment {
 	readonly tenant: TenantSessionKey;
 	readonly generation: number;
@@ -71,7 +82,7 @@ export interface ManagedSdkRuntimeDeps {
 	readonly createRouter?: (options: router.SessionRouterOptions) => router.SessionRouter;
 	readonly createLifecycleService?: (agentDir: string) => ReturnType<typeof lifecycle.createSessionLifecycleService>;
 	/** Re-proves tenant registration and lease/epoch authority at each boundary. */
-	readonly tenantFence?: (key: TenantSessionKey) => boolean | Promise<boolean>;
+	readonly tenantFence?: (key: TenantSessionKey, access: ManagedSdkAccess) => boolean | Promise<boolean>;
 	readonly preparedTenantFence?: (authority: ManagedPreparedTurnAuthority) => boolean | Promise<boolean>;
 	readonly drainTimeoutMs?: number;
 	readonly maxFrameSubscriptions?: number;
@@ -111,7 +122,9 @@ interface ManagedLifecycleCall<TRequest> {
 	readonly request: TRequest;
 }
 
-type ManagedLifecycleCloseRequest = Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["close"]>[0];
+export type ManagedLifecycleCloseRequest = Parameters<
+	ReturnType<typeof lifecycle.createSessionLifecycleService>["close"]
+>[0];
 type LifecycleMethod = "create" | "createExternal" | "resume" | "resumeExternal" | "fork" | "close" | "list";
 interface PendingCall {
 	readonly settled: Promise<void>;
@@ -130,6 +143,7 @@ const DEFAULT_MAX_SUBSCRIPTIONS = 128;
 const DEFAULT_MAX_FRAMES_PER_SUBSCRIPTION = 64;
 const DEFAULT_MAX_FRAME_HISTORY = 256;
 const DEFAULT_OPERATION_TIMEOUT_MS = 30_000;
+const ACTIVE_ACCESS: ManagedSdkAccess = Object.freeze({ kind: "active" });
 
 /** Process-owned public-SDK runtime; raw Router capabilities never cross its authority boundary. */
 export class ManagedSdkRuntime {
@@ -144,6 +158,7 @@ export class ManagedSdkRuntime {
 		{ raw: router.SessionAttachment; registration: TenantSessionKey }
 	>();
 	readonly #attachmentTokens = new WeakMap<router.SessionAttachment, Map<string, ManagedSdkAttachment>>();
+	readonly #activeTokens = new WeakSet<ManagedSdkAttachment>();
 	readonly #maxSubscriptions: number;
 	readonly #maxFramesPerSubscription: number;
 	readonly #maxFrameHistory: number;
@@ -273,6 +288,27 @@ export class ManagedSdkRuntime {
 		});
 	}
 
+	async retireLifecycleSession(
+		key: TenantSessionKey,
+		request: ManagedLifecycleCloseRequest,
+		operation: ManagedSdkLifecycleOperation,
+	): ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["close"]> {
+		const identity = lifecycleOperation(operation);
+		if (request.requestKey !== identity.requestKey)
+			throw new TypeError("Retirement request key does not match its durable operation.");
+		const access: ManagedSdkAccess = Object.freeze({ ...identity, kind: "retirement", action: "close" });
+		return this.#invokeLifecycle(
+			"close",
+			key,
+			request,
+			(value, tenant) => {
+				assertLifecycleCloseAuthority(tenant, value);
+				return this.#lifecycle.close(value);
+			},
+			access,
+		);
+	}
+
 	deleteLifecycleSession(
 		tenantOrRequest:
 			| TenantSessionKey
@@ -325,6 +361,37 @@ export class ManagedSdkRuntime {
 		const attachment = await this.acquireAttachment(key);
 		if (!attachment.isCurrent()) throw new Error("Lifecycle tenant attachment is no longer current.");
 		return attachment;
+	}
+
+	/** Exact lifecycle proof is not active routing authority; the owner supplies durable purpose evidence. */
+	async proveLifecycleTenant(
+		key: TenantSessionKey,
+		operation: ManagedSdkLifecycleOperation,
+	): Promise<ManagedSdkAttachment> {
+		const access: ManagedSdkAccess = Object.freeze({ ...lifecycleOperation(operation), kind: "adoption-proof" });
+		key = copyTenantKey(key);
+		return this.#track(undefined, async budget => {
+			this.registerTenant(key);
+			const registration = this.#registrations.get(generationIdentity(key));
+			await this.#assertAuthorized(key, false, false, access);
+			budget.remaining();
+			const reconcile = this.#reconcileTail.then(async () => {
+				budget.remaining();
+				await this.#assertAuthorized(key, false, false, access);
+				budget.remaining();
+				if (this.#registrations.get(generationIdentity(key)) !== registration)
+					throw new Error("Tenant registration changed during lifecycle proof.");
+				await this.#router.reconcile();
+			});
+			this.#reconcileTail = reconcile.catch(() => undefined);
+			await reconcile;
+			budget.remaining();
+			await this.#assertAuthorized(key, false, false, access);
+			budget.remaining();
+			if (this.#registrations.get(generationIdentity(key)) !== registration)
+				throw new Error("Tenant registration changed during lifecycle proof.");
+			return this.#attachmentToken(key);
+		});
 	}
 
 	unregisterTenant(key: TenantSessionKey): void {
@@ -424,6 +491,12 @@ export class ManagedSdkRuntime {
 	async acquireAttachment(key: TenantSessionKey): Promise<ManagedSdkAttachment> {
 		key = copyTenantKey(key);
 		await this.#assertAuthorized(key, this.#state === "starting" && this.#bootstrapAdmission);
+		const token = this.#attachmentToken(key);
+		this.#activeTokens.add(token);
+		return token;
+	}
+
+	#attachmentToken(key: TenantSessionKey): ManagedSdkAttachment {
 		const attachment = this.#router.attachment(key.sessionId, key.generation);
 		if (
 			!attachment?.isCurrent() ||
@@ -438,7 +511,7 @@ export class ManagedSdkRuntime {
 		}
 		const identity = tenantIdentity(key);
 		const existing = tokens.get(identity);
-		if (existing !== undefined && existing.isCurrent()) return existing;
+		if (existing?.isCurrent()) return existing;
 		const token: ManagedSdkAttachment = Object.freeze({
 			tenant: copyTenantKey(key),
 			generation: key.generation,
@@ -485,13 +558,35 @@ export class ManagedSdkRuntime {
 	}
 
 	async generationStatus(key: TenantSessionKey): Promise<router.SessionGenerationStatus> {
+		return this.#generationStatus(key, ACTIVE_ACCESS);
+	}
+
+	async retirementGenerationStatus(
+		key: TenantSessionKey,
+		operation: ManagedSdkLifecycleOperation,
+	): Promise<router.SessionGenerationStatus> {
+		const access: ManagedSdkAccess = Object.freeze({
+			...lifecycleOperation(operation),
+			kind: "retirement",
+			action: "generation-status",
+		});
+		return this.#generationStatus(key, access);
+	}
+
+	async #generationStatus(key: TenantSessionKey, access: ManagedSdkAccess): Promise<router.SessionGenerationStatus> {
 		key = copyTenantKey(key);
 		return this.#track(undefined, async budget => {
-			await this.#assertAuthorized(key, false);
+			const registration = this.#registrations.get(generationIdentity(key));
+			await this.#assertAuthorized(key, false, false, access);
 			budget.remaining();
 			this.#assertOwner();
+			if (this.#registrations.get(generationIdentity(key)) !== registration)
+				throw new Error("Tenant registration changed before generation status.");
 			const result = await this.#router.generationStatus(key.sessionId, key.generation);
-			await this.#assertAuthorized(key, false, true);
+			await this.#assertAuthorized(key, false, true, access);
+			budget.remaining();
+			if (this.#registrations.get(generationIdentity(key)) !== registration)
+				throw new Error("Tenant registration changed during generation status.");
 			return result;
 		});
 	}
@@ -506,6 +601,7 @@ export class ManagedSdkRuntime {
 		if (!nonEmpty(operation) || !hasCorrelation(correlation))
 			throw new TypeError("Operation and correlation are required.");
 		this.#assertManagedAttachment(managed);
+		this.#assertActiveToken(managed);
 		if (this.#subscriptions.size >= this.#maxSubscriptions) {
 			this.#classify("overflow");
 			throw new Error("Managed SDK frame subscription capacity exceeded.");
@@ -545,6 +641,7 @@ export class ManagedSdkRuntime {
 		if (this.#state !== "running") throw new Error("Managed SDK runtime is not running.");
 		if (!nonEmpty(operation)) throw new TypeError("Operation is required.");
 		this.#assertManagedAttachment(managed);
+		this.#assertActiveToken(managed);
 		if (this.#subscriptions.size >= this.#maxSubscriptions) {
 			this.#classify("overflow");
 			throw new Error("Managed SDK frame subscription capacity exceeded.");
@@ -575,10 +672,7 @@ export class ManagedSdkRuntime {
 			if (subscription.correlation !== undefined)
 				throw new Error("Managed SDK frame subscription is already bound.");
 			subscription.correlation = { ...correlation };
-			for (const frame of subscription.buffered) {
-				if (matchesCorrelation(subscription.correlation, frame)) this.#deliver(subscription, frame);
-			}
-			subscription.buffered = [];
+			if (subscription.buffered.length > 0) this.#deliver(subscription);
 		};
 		return unsubscribe;
 	}
@@ -588,6 +682,7 @@ export class ManagedSdkRuntime {
 		tenantOrRequest: TenantSessionKey | TRequest | ManagedLifecycleCall<TRequest>,
 		request: TRequest | undefined,
 		invoke: (request: TRequest, tenant: TenantSessionKey) => Promise<TResult>,
+		access: ManagedSdkAccess = ACTIVE_ACCESS,
 	): Promise<TResult> {
 		const call = lifecycleCall(tenantOrRequest, request);
 		if (call === undefined)
@@ -598,13 +693,18 @@ export class ManagedSdkRuntime {
 			method === "createExternal" || method === "resumeExternal" ? "readinessTimeoutMs" : "timeoutMs";
 		const timeout = isRecord(value) ? value[timeoutField] : undefined;
 		return this.#track(timeout, async budget => {
-			await this.#assertAuthorized(key, false);
+			const registration = this.#registrations.get(generationIdentity(key));
+			await this.#assertAuthorized(key, false, false, access);
 			assertLifecycleRequestAuthority(method, key, value);
 			budget.remaining();
 			this.#assertOwner();
+			if (this.#registrations.get(generationIdentity(key)) !== registration)
+				throw new Error("Tenant registration changed before lifecycle invocation.");
 			const result = await invoke({ ...value, [timeoutField]: budget.remaining() }, key);
-			await this.#assertAuthorized(key, false, true);
+			await this.#assertAuthorized(key, false, true, access);
 			budget.remaining();
+			if (this.#registrations.get(generationIdentity(key)) !== registration)
+				throw new Error("Tenant registration changed during lifecycle invocation.");
 			return result;
 		});
 	}
@@ -640,13 +740,18 @@ export class ManagedSdkRuntime {
 		});
 	}
 
-	async #assertAuthorized(key: TenantSessionKey, bootstrap: boolean, admitted = false): Promise<void> {
+	async #assertAuthorized(
+		key: TenantSessionKey,
+		bootstrap: boolean,
+		admitted = false,
+		access: ManagedSdkAccess = ACTIVE_ACCESS,
+	): Promise<void> {
 		assertTenantKey(key);
 		this.#assertOwner(bootstrap, admitted);
 		const registration = this.#registrations.get(generationIdentity(key));
 		if (registration === undefined || !sameTenantKey(registration, key))
 			throw new Error("Tenant is not registered for this session authority.");
-		if (this.#tenantFence === undefined || !(await this.#tenantFence(copyTenantKey(key))))
+		if (this.#tenantFence === undefined || !(await this.#tenantFence(copyTenantKey(key), access)))
 			throw new Error("Tenant authority fence was lost or unavailable.");
 		this.#assertOwner(bootstrap, admitted);
 		if (this.#registrations.get(generationIdentity(key)) !== registration)
@@ -673,6 +778,10 @@ export class ManagedSdkRuntime {
 		if (!this.#tokens.has(managed)) throw new Error("Manager-issued attachment token is required.");
 		if (!this.#isCurrentToken(managed)) throw new Error("Current Router attachment is required.");
 		return this.#tokens.get(managed)!.raw;
+	}
+
+	#assertActiveToken(managed: ManagedSdkAttachment): void {
+		if (!this.#activeTokens.has(managed)) throw new Error("Active tenant acquisition is required for subscriptions.");
 	}
 
 	#isCurrentToken(token: ManagedSdkAttachment): boolean {
@@ -780,34 +889,44 @@ export class ManagedSdkRuntime {
 		this.#seenFrameIds.add(identity);
 		if (this.#seenFrameIds.size > this.#maxFrameHistory)
 			this.#seenFrameIds.delete(this.#seenFrameIds.values().next().value as string);
-		for (const subscription of authorized) {
-			if (subscription.correlation === undefined) {
-				if (subscription.buffered.length >= this.#maxFramesPerSubscription) this.#classify("overflow");
-				else subscription.buffered.push(frame);
-				continue;
-			}
-			this.#deliver(subscription, frame);
-		}
+		for (const subscription of authorized) this.#deliver(subscription, frame);
 	}
 
-	#deliver(subscription: FrameSubscription, frame: router.SessionRouterFrame): void {
-		if (subscription.queued >= this.#maxFramesPerSubscription) {
+	#deliver(subscription: FrameSubscription, frame?: router.SessionRouterFrame): void {
+		if (frame !== undefined && subscription.queued >= this.#maxFramesPerSubscription) {
 			this.#classify("overflow");
 			return;
 		}
 		subscription.queued += 1;
 		const deliver = async () => {
 			try {
-				if (subscription.active && !subscription.deliveryFailed && subscription.correlation !== undefined) {
+				if (subscription.active && !subscription.deliveryFailed) {
 					await this.#assertAuthorized(subscription.tenant, false, true);
 					this.#assertManagedAttachment(subscription.token);
+					this.#assertActiveToken(subscription.token);
 					if (!subscription.active) return;
-					await subscription.listener({
-						tenant: subscription.tenant,
-						operation: subscription.operation,
-						correlation: subscription.correlation,
-						frame,
-					});
+					if (subscription.correlation === undefined) {
+						if (frame === undefined) return;
+						if (subscription.buffered.length >= this.#maxFramesPerSubscription) this.#classify("overflow");
+						else subscription.buffered.push(frame);
+						return;
+					}
+					const frames = subscription.buffered;
+					subscription.buffered = [];
+					if (frame !== undefined) frames.push(frame);
+					for (const observed of frames) {
+						if (!matchesCorrelation(subscription.correlation, observed)) continue;
+						await this.#assertAuthorized(subscription.tenant, false, true);
+						this.#assertManagedAttachment(subscription.token);
+						this.#assertActiveToken(subscription.token);
+						if (!subscription.active) return;
+						await subscription.listener({
+							tenant: subscription.tenant,
+							operation: subscription.operation,
+							correlation: subscription.correlation,
+							frame: observed,
+						});
+					}
 				}
 			} catch (error) {
 				subscription.deliveryFailed = true;
@@ -850,6 +969,26 @@ function positiveLimit(value: number | undefined, fallback: number): number {
 	if (value === undefined) return fallback;
 	if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError("Frame capacity must be a positive integer.");
 	return value;
+}
+
+function lifecycleOperation(value: ManagedSdkLifecycleOperation): ManagedSdkLifecycleOperation {
+	if (
+		!isRecord(value) ||
+		!nonEmpty(value.operationId) ||
+		value.operationId.trim() !== value.operationId ||
+		!nonEmpty(value.requestKey) ||
+		value.requestKey.trim() !== value.requestKey ||
+		/[\x00-\x1f\x7f]/.test(value.operationId + value.requestKey) ||
+		typeof value.payloadHash !== "string" ||
+		value.payloadHash.length !== 64 ||
+		!/^[0-9a-f]{64}$/.test(value.payloadHash)
+	)
+		throw new TypeError("A complete durable lifecycle operation identity and SHA-256 payload hash are required.");
+	return Object.freeze({
+		operationId: value.operationId,
+		requestKey: value.requestKey,
+		payloadHash: value.payloadHash,
+	});
 }
 
 function finiteTimeout(value: unknown, fallback: number): number {

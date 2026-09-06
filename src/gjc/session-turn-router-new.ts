@@ -1,4 +1,11 @@
 import { resolve } from "node:path";
+import {
+	createManagedLifecycleEvidence,
+	lifecycleExactAuthority,
+	lifecyclePreparedAuthority,
+	transitionManagedLifecycleEvidence,
+} from "./managed-lifecycle-evidence";
+import { canTransitionManagedLifecycleState } from "./managed-lifecycle-state";
 import type { ProvisionalSessionOperation } from "./session-authority";
 import { SESSION_AUTHORITY_V3_EPOCH } from "./session-authority-v3";
 import { hashTurnIngress, normalizeModelSelection } from "./session-operation-codec";
@@ -29,17 +36,31 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 		);
 	}
 	const sessionRoot = getProjectSessionRoot(input.project);
+	let lifecycleEvidence = createManagedLifecycleEvidence({
+		operation: "session.create",
+		preparedAuthority: lifecyclePreparedAuthority(prepared),
+		target: { kind: "existing_path", path: input.project.cwd },
+		payloadHash: operation.detail!,
+	});
+	input.mappings.recordLifecycleEvidence(input.chatId, input.userMessageId, operation.detail!, lifecycleEvidence);
+	const recordLifecycle = (next: typeof lifecycleEvidence) => {
+		input.mappings.recordLifecycleEvidence(input.chatId, input.userMessageId, operation.detail!, next);
+		lifecycleEvidence = next;
+	};
 	let boundAuthority: ManagedTurnAuthority | undefined;
 	let authorityCompleted = false;
 	let promptMayHaveDispatched = false;
 	const markUncertain = () => {
-		if (!authorityCompleted)
+		if (!authorityCompleted) {
+			if (canTransitionManagedLifecycleState(lifecycleEvidence.state, "uncertain"))
+				recordLifecycle(transitionManagedLifecycleEvidence(lifecycleEvidence, "uncertain"));
 			input.mappings.transitionProvisionalOperation(
 				input.chatId,
 				input.userMessageId,
 				"uncertain",
 				operation.detail,
 			);
+		}
 	};
 	const publish = async (
 		result: GjcSessionAddress & GjcTurnResult,
@@ -98,6 +119,12 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 			...(input.signal === undefined ? {} : { signal: input.signal }),
 			principalId: prepared.principalId,
 			preparedManagedAuthority: { ...prepared },
+			lifecycleOperation: {
+				operationId: input.userMessageId,
+				requestKey: prepared.requestKey,
+				payloadHash: operation.detail!,
+			},
+			onLifecycleInvoking: () => recordLifecycle(transitionManagedLifecycleEvidence(lifecycleEvidence, "invoking")),
 			onLifecycleAcknowledged: async (acknowledged: ManagedTurnAuthority) => {
 				const authority = managedAuthorityFor(
 					prepared,
@@ -111,6 +138,11 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 					acknowledged.sessionId,
 				);
 				assertSameManagedAuthority(authority, acknowledged);
+				recordLifecycle(
+					transitionManagedLifecycleEvidence(lifecycleEvidence, "acknowledged_unproven", {
+						acknowledged: lifecycleExactAuthority(acknowledged),
+					}),
+				);
 				input.mappings.attachProvisionalOperation(input.chatId, input.userMessageId, {
 					sessionId: authority.sessionId,
 					managedAuthority: authority,
@@ -125,6 +157,11 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 				assertManagedAddress(address, prepared);
 				const authority = managedAuthorityFor(prepared, proof, address.sessionId);
 				if (boundAuthority !== undefined) assertSameManagedAuthority(authority, boundAuthority);
+				if (lifecycleEvidence.state !== "acknowledged_unproven")
+					throw new Error("Managed startup requires durable lifecycle acknowledgement before proof.");
+				recordLifecycle(
+					transitionManagedLifecycleEvidence(lifecycleEvidence, "active_generation_proven", { proven: proof }),
+				);
 				if (lifecycle.publishManaged === undefined)
 					throw new Error("Lifecycle transaction cannot bind managed generation authority.");
 				await lifecycle.publishManaged(proof, () => {

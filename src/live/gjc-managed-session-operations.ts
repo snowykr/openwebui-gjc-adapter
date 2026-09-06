@@ -35,6 +35,12 @@ export interface ManagedLifecycleInput {
 	readonly signal?: AbortSignal;
 	/** Durable owner acknowledgement, before registration, cancellation handling, or currentness proof. */
 	readonly onAcknowledged?: (authority: ManagedTurnAuthority) => void | Promise<void>;
+	readonly onInvoking?: () => void | Promise<void>;
+	readonly lifecycleOperation?: {
+		readonly operationId: string;
+		readonly requestKey: string;
+		readonly payloadHash: string;
+	};
 }
 
 /** A lifecycle acknowledgement whose identity has been adopted, fenced, and proven current. */
@@ -261,6 +267,7 @@ export function createManagedSessionOperations(
 						});
 				}
 			};
+			await deadline.wait(Promise.resolve(input.onInvoking?.()));
 			const outcome = externalOutcome(await deadline.wait<unknown>(invokeLifecycle()));
 			if (!isLifecycleSuccess(outcome)) {
 				if (operation === "close" || operation === "delete") {
@@ -293,7 +300,11 @@ export function createManagedSessionOperations(
 					return {
 						outcome,
 						tenant: lifecycleTenant,
-						attachment: await deadline.wait(runtime.registerLifecycleTenant(lifecycleTenant)),
+						attachment: await deadline.wait(
+							input.lifecycleOperation === undefined
+								? runtime.registerLifecycleTenant(lifecycleTenant)
+								: runtime.proveLifecycleTenant(lifecycleTenant, input.lifecycleOperation),
+						),
 					} satisfies ManagedLifecycleResult;
 				} catch (error) {
 					// A successful lifecycle acknowledgement without current attachment proof

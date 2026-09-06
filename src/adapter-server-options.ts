@@ -17,7 +17,12 @@ import { buildRuntimeHealthChecks, type RuntimeIsolationDiagnostic } from "./ada
 import { type AdapterConfig, loadAdapterConfig, type ResolvedAdapterConfig } from "./config";
 import { SESSION_AUTHORITY_MAPPING_FILE } from "./config-env";
 import type { ManagedSdkRuntimeDependency, ManagedSdkTenantFence } from "./gjc/managed-sdk-dependency";
-import { ManagedSdkRuntime, type TenantSessionKey } from "./gjc/managed-sdk-runtime";
+import {
+	type ManagedSdkAccess,
+	ManagedSdkRuntime,
+	type ManagedSdkRuntimeDeps,
+	type TenantSessionKey,
+} from "./gjc/managed-sdk-runtime";
 import { probeSessionAuthorityEpoch } from "./gjc/session-authority-epoch";
 import { SESSION_AUTHORITY_V3_EPOCH } from "./gjc/session-authority-v3";
 import { readSessionAuthorityV3ActiveMarker } from "./gjc/session-authority-v3-activation";
@@ -33,6 +38,7 @@ import {
 	createManagedV3GenerationStore,
 	DEFAULT_MANAGED_IDLE_TIMEOUT_MS,
 	type ManagedIdleReaper,
+	managedIdleClosePayloadHash,
 } from "./live/gjc-managed-idle-reaper";
 import { createManagedModelReaderFactory } from "./live/gjc-managed-model-reader";
 import { createGjcRoutingLiveGatewayRunner } from "./live/gjc-routing-runner";
@@ -73,8 +79,8 @@ const PROJECTION_OUTBOX_STORE_FILE = "openwebui-projection-outbox.json";
 export interface BuildAdapterServerOptionsDependencies {
 	/** Test seam for the one process-owned managed runtime. */
 	readonly managedSdkRuntime?: ManagedSdkRuntimeDependency;
-	/** Test seam; receives only the explicitly resolved managed agent directory. */
-	readonly createManagedSdkRuntime?: (agentDir: string) => ManagedSdkRuntimeDependency;
+	/** Test seam; retains the production purpose fences while replacing public SDK transports. */
+	readonly createManagedSdkRuntime?: (agentDir: string, deps: ManagedSdkRuntimeDeps) => ManagedSdkRuntimeDependency;
 	/** Exact managed tenant lease/epoch fence. */
 	readonly managedSdkTenantFence?: ManagedSdkTenantFence;
 	readonly eventSink?: LiveGatewayEventSink;
@@ -166,20 +172,71 @@ export async function buildResolvedAdapterServerOptions(
 			projectStore.listLinkedProjects().map(project => project.id),
 		);
 		const mappings = new V3FileBackedSessionMappingStore(mappingStorePath);
+		const retirementLeases = new Map<string, WorkspaceLease>();
+		const retirementFence = async (
+			key: TenantSessionKey,
+			access: Extract<ManagedSdkAccess, { kind: "retirement" }>,
+		) => {
+			const lease = retirementLeases.get(managedTenantIdentity(key));
+			if (lease === undefined) return false;
+			const operation = mappings.operationScoped(
+				{ principalId: key.principalId, chatId: key.chatId },
+				access.operationId,
+			);
+			if (
+				operation?.kind !== "close" ||
+				operation.state !== "pending" ||
+				operation.lifecycle?.state !== "closing" ||
+				operation.lifecycle.sourceProofRef === undefined ||
+				operation.lifecycle.requestKey !== access.requestKey ||
+				operation.detail !== access.payloadHash ||
+				operation.lifecycle.payloadHash !== access.payloadHash ||
+				operation.lifecycle.source === undefined ||
+				managedTenantIdentity(operation.lifecycle.source) !== managedTenantIdentity(key)
+			)
+				return false;
+			return assertRetirementOperationFence(
+				key,
+				lease,
+				mappings,
+				workspaceRegistry,
+				projectStore,
+				workspaceLeaseManager,
+			);
+		};
 		const liveTenantFence =
 			dependencies.managedSdkTenantFence ??
 			(key =>
 				assertActiveManagedV3TenantFence(key, mappings, workspaceRegistry, projectStore, workspaceLeaseManager));
+		const managedRuntimeDeps: ManagedSdkRuntimeDeps = {
+			tenantFence: async (key, access) => {
+				if (access.kind === "retirement") return retirementFence(key, access);
+				if (hasManagedRetirementBarrier(key, mappings)) return false;
+				if (access.kind === "active" && (await liveTenantFence(key))) return true;
+				return assertStagedManagedTenantFence(
+					key,
+					access,
+					mappings,
+					workspaceRegistry,
+					projectStore,
+					workspaceLeaseManager,
+				);
+			},
+			preparedTenantFence: authority =>
+				assertPreparedManagedTenantFence(
+					authority,
+					workspaceRegistry,
+					projectStore,
+					workspaceLeaseManager,
+					mappings,
+				),
+		};
 		const runtime =
 			dependencies.managedSdkRuntime ??
-			dependencies.createManagedSdkRuntime?.(config.runtimeLocations.agentDir) ??
+			dependencies.createManagedSdkRuntime?.(config.runtimeLocations.agentDir, managedRuntimeDeps) ??
 			new ManagedSdkRuntime({
 				agentDir: config.runtimeLocations.agentDir,
-				deps: {
-					tenantFence: liveTenantFence,
-					preparedTenantFence: authority =>
-						assertPreparedManagedTenantFence(authority, workspaceRegistry, projectStore, workspaceLeaseManager),
-				},
+				deps: managedRuntimeDeps,
 			});
 		managedSdkRuntime = runtime;
 		activeManagedV3Runtime = await startActiveManagedRuntime({
@@ -238,8 +295,33 @@ export async function buildResolvedAdapterServerOptions(
 			const v3Mappings = mappings;
 			if (v3Mappings === undefined) throw new Error("Managed V3 idle reaper requires a session mapping store.");
 			const managedRecords = createManagedV3GenerationStore(v3Mappings);
+			const retirementOperations = new Map<
+				string,
+				{ operationId: string; requestKey: string; payloadHash: string }
+			>();
 			managedIdleReaper = createManagedIdleReaper({
-				runtime: managedV3Runtime.runtime,
+				runtime: {
+					closeLifecycleSession: async request => {
+						const authority = mappings.getScoped({
+							principalId: request.tenant.principalId,
+							chatId: request.tenant.chatId,
+						})?.managedAuthority;
+						if (authority === undefined) throw new Error("Managed retirement lost canonical source authority.");
+						const operation = {
+							operationId: request.requestKey,
+							requestKey: request.requestKey,
+							payloadHash: managedIdleClosePayloadHash(authority, request.requestKey),
+						};
+						retirementOperations.set(managedTenantIdentity(request.tenant), operation);
+						return managedV3Runtime.runtime.retireLifecycleSession(request.tenant, request, operation);
+					},
+					reconcile: () => managedV3Runtime.runtime.reconcile(),
+					generationStatus: key => {
+						const operation = retirementOperations.get(managedTenantIdentity(key));
+						if (operation === undefined) throw new Error("Managed retirement lacks its operation authorization.");
+						return managedV3Runtime.runtime.retirementGenerationStatus(key, operation);
+					},
+				},
 				records: managedRecords,
 				admission: {
 					acquire: async key => {
@@ -282,13 +364,27 @@ export async function buildResolvedAdapterServerOptions(
 						} catch {
 							return undefined;
 						}
+						const identity = managedTenantIdentity(key);
+						retirementLeases.set(identity, lease);
 						return {
 							assertFence: async () => {
-								await workspaceLeaseManager.assertFence(lease);
-								if (!(await managedV3Runtime.tenantFence(key)))
+								if (
+									!(await assertRetirementOperationFence(
+										key,
+										lease,
+										mappings,
+										workspaceRegistry,
+										projectStore,
+										workspaceLeaseManager,
+									))
+								)
 									throw new Error("Managed V3 tenant authority fence was lost.");
 							},
-							release: () => lease.release(),
+							release: async () => {
+								retirementLeases.delete(identity);
+								retirementOperations.delete(identity);
+								await lease.release();
+							},
 						};
 					},
 				},
@@ -584,6 +680,12 @@ async function assertActiveManagedV3TenantFence(
 	workspaceLeaseManager: ReturnType<typeof createWorkspaceLeaseManager>,
 ): Promise<boolean> {
 	try {
+		if (
+			mappings === undefined ||
+			key.epoch !== SESSION_AUTHORITY_V3_EPOCH ||
+			hasManagedRetirementBarrier(key, mappings)
+		)
+			return false;
 		const lease = parseWorkspaceLeaseId(key.leaseId);
 		const workspace = await workspaceRegistry.resolveBySafeKey(lease.safeKey);
 		const project = projectStore?.getProject(key.projectId);
@@ -622,6 +724,7 @@ async function assertPreparedManagedTenantFence(
 	workspaceRegistry: ReturnType<typeof createUserWorkspaceRegistry>,
 	projectStore: SqliteProjectRegistrationStore | undefined,
 	workspaceLeaseManager: ReturnType<typeof createWorkspaceLeaseManager>,
+	mappings: SessionMappingStore,
 ): Promise<boolean> {
 	try {
 		const lease = parseWorkspaceLeaseId(authority.leaseId);
@@ -634,6 +737,133 @@ async function assertPreparedManagedTenantFence(
 			authority.epoch !== SESSION_AUTHORITY_V3_EPOCH ||
 			!authority.chatId ||
 			!authority.requestKey
+		)
+			return false;
+		const operations = mappings.lifecycleOperationsScoped({
+			principalId: authority.principalId,
+			chatId: authority.chatId,
+		});
+		if (
+			!operations.some(operation => {
+				const lifecycle = operation.lifecycle;
+				return (
+					lifecycle !== undefined &&
+					operation.state === "pending" &&
+					(lifecycle.state === "intent_prepared" || lifecycle.state === "invoking") &&
+					lifecycle.requestKey === authority.requestKey &&
+					lifecycle.payloadHash === operation.detail &&
+					Object.entries(lifecycle.preparedAuthority).every(
+						([field, value]) => Reflect.get(authority, field) === value,
+					)
+				);
+			})
+		)
+			return false;
+		await workspaceLeaseManager.assertFence(lease);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function assertStagedManagedTenantFence(
+	key: TenantSessionKey,
+	access: ManagedSdkAccess,
+	mappings: SessionMappingStore,
+	workspaceRegistry: ReturnType<typeof createUserWorkspaceRegistry>,
+	projectStore: SqliteProjectRegistrationStore | undefined,
+	workspaceLeaseManager: ReturnType<typeof createWorkspaceLeaseManager>,
+): Promise<boolean> {
+	if (access.kind === "retirement") return false;
+	try {
+		const scope = { principalId: key.principalId, chatId: key.chatId };
+		const operations = mappings.lifecycleOperationsScoped(scope);
+		const candidates = operations.filter(operation => {
+			const lifecycle = operation.lifecycle;
+			if (
+				operation.state !== "pending" ||
+				lifecycle === undefined ||
+				lifecycle.payloadHash !== operation.detail ||
+				lifecycle.acknowledged === undefined
+			)
+				return false;
+			if (
+				access.kind === "adoption-proof" &&
+				(operation.id !== access.operationId ||
+					lifecycle.requestKey !== access.requestKey ||
+					lifecycle.payloadHash !== access.payloadHash)
+			)
+				return false;
+			if (
+				access.kind === "active"
+					? lifecycle.state !== "active_generation_proven"
+					: lifecycle.state !== "acknowledged_unproven"
+			)
+				return false;
+			return Object.entries(key).every(([field, value]) => Reflect.get(lifecycle.acknowledged!, field) === value);
+		});
+		if (candidates.length !== 1) return false;
+		const lease = parseWorkspaceLeaseId(key.leaseId);
+		const workspace = await workspaceRegistry.resolveBySafeKey(lease.safeKey);
+		if (
+			workspace?.userId !== key.principalId ||
+			path.resolve(workspace.root) !== key.canonicalWorkspace ||
+			projectStore?.getProject(key.projectId)?.status !== "linked" ||
+			key.epoch !== SESSION_AUTHORITY_V3_EPOCH
+		)
+			return false;
+		await workspaceLeaseManager.assertFence(lease);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function managedTenantIdentity(key: TenantSessionKey): string {
+	return JSON.stringify([
+		key.principalId,
+		key.projectId,
+		key.canonicalWorkspace,
+		key.chatId,
+		key.sessionId,
+		key.generation,
+		key.leaseId,
+		key.epoch,
+	]);
+}
+
+function hasManagedRetirementBarrier(key: TenantSessionKey, mappings: SessionMappingStore): boolean {
+	return mappings.operationsScoped({ principalId: key.principalId, chatId: key.chatId }).some(operation => {
+		if (operation.kind !== "close") return false;
+		if (operation.state === "pending" || operation.state === "uncertain") return true;
+		const retired = operation.result?.managedAuthority;
+		return (
+			operation.state === "complete" &&
+			retired !== undefined &&
+			managedTenantIdentity(retired) === managedTenantIdentity(key)
+		);
+	});
+}
+
+async function assertRetirementOperationFence(
+	key: TenantSessionKey,
+	lease: WorkspaceLease,
+	mappings: SessionMappingStore,
+	workspaceRegistry: ReturnType<typeof createUserWorkspaceRegistry>,
+	projectStore: SqliteProjectRegistrationStore | undefined,
+	workspaceLeaseManager: ReturnType<typeof createWorkspaceLeaseManager>,
+): Promise<boolean> {
+	try {
+		const historic = parseWorkspaceLeaseId(key.leaseId);
+		if (lease.safeKey !== historic.safeKey || lease.operation !== "reaper") return false;
+		const workspace = await workspaceRegistry.resolveBySafeKey(lease.safeKey);
+		const authority = mappings.getScoped({ principalId: key.principalId, chatId: key.chatId })?.managedAuthority;
+		if (
+			workspace?.userId !== key.principalId ||
+			path.resolve(workspace.root) !== key.canonicalWorkspace ||
+			projectStore?.getProject(key.projectId)?.status !== "linked" ||
+			authority === undefined ||
+			managedTenantIdentity(authority) !== managedTenantIdentity(key)
 		)
 			return false;
 		await workspaceLeaseManager.assertFence(lease);

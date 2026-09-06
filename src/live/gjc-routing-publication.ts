@@ -27,7 +27,7 @@ export function controlOperationHash(turn: LiveGatewayRunnerInput): string {
 
 export function lifecycleControlRequestKey(
 	authority: ManagedTurnAuthority,
-	operation: "session.fork" | "session.create",
+	operation: "session.fork" | "session.create" | "session.resume",
 	ingressId: string,
 	payloadHash: string,
 ): string {

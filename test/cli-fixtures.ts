@@ -139,6 +139,9 @@ export class FakeManagedSdkRuntime implements ManagedSdkRuntimeDependency {
 		this.registerTenant(key);
 		return await this.acquireAttachment(key);
 	}
+	async proveLifecycleTenant(key: TenantSessionKey): Promise<ManagedSdkAttachment> {
+		return this.registerLifecycleTenant(key);
+	}
 
 	async acquireAttachment(key: TenantSessionKey): Promise<ManagedSdkAttachment> {
 		if (this.state !== "running") throw new Error("Fake managed runtime is not running.");

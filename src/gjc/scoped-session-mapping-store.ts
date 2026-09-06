@@ -67,6 +67,15 @@ export function scopedSessionMappingStore(
 			requireChat(actual);
 			mappings.beginOperationScoped(scope, operation);
 		},
+		recordLifecycleEvidence: (
+			actual: string,
+			operationId: string,
+			payloadHash: string,
+			evidence: Parameters<SessionMappingStore["recordLifecycleEvidence"]>[3],
+		) => {
+			requireChat(actual);
+			mappings.recordLifecycleEvidenceScoped(scope, operationId, payloadHash, evidence);
+		},
 		recordAcknowledgedSuccessor: (
 			actual: string,
 			operationId: string,

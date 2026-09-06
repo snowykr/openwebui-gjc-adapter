@@ -1,3 +1,4 @@
+import { type ManagedLifecycleEvidence, transitionManagedLifecycleEvidence } from "./managed-lifecycle-evidence";
 import { copy } from "./session-authority-copy";
 import type { ProvisionalSessionOperation, SessionAuthorityRecord } from "./session-authority-types";
 import { provisionalKey } from "./session-operation-codec";
@@ -13,7 +14,14 @@ export function reconcileSessionAuthority(
 	for (const record of records.values()) {
 		const journal = record.journal.map(operation =>
 			operation.state === "pending"
-				? { ...operation, state: "uncertain" as const, detail: operation.detail ?? "restart before completion" }
+				? {
+						...operation,
+						state: "uncertain" as const,
+						detail: operation.detail ?? "restart before completion",
+						...(operation.lifecycle === undefined
+							? {}
+							: { lifecycle: interruptedLifecycle(operation.lifecycle) }),
+					}
 				: operation,
 		);
 		const reassignment =
@@ -48,8 +56,19 @@ export function reconcileSessionAuthority(
 			...operation,
 			state: "uncertain",
 			detail: operation.detail ?? "restart before completion",
+			...(operation.lifecycle === undefined ? {} : { lifecycle: interruptedLifecycle(operation.lifecycle) }),
 		});
 		dirtyProvisional?.add(key);
 	}
 	return reconciled;
+}
+
+function interruptedLifecycle(evidence: ManagedLifecycleEvidence): ManagedLifecycleEvidence {
+	// A prompt interruption does not revoke an already proven generation. Prepared
+	// intent also proves no invocation began; neither requires an invented edge.
+	if (evidence.state === "invoking" || evidence.state === "acknowledged_unproven" || evidence.state === "closing")
+		return transitionManagedLifecycleEvidence(evidence, "uncertain", {}, evidence.recordedAt);
+	if (evidence.state === "cleanup_pending")
+		return transitionManagedLifecycleEvidence(evidence, "cleanup_uncertain", {}, evidence.recordedAt);
+	return evidence;
 }

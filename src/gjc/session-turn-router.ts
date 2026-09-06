@@ -139,6 +139,15 @@ export function scopedSessionMappingStore(
 			requireChat(actual);
 			return mappings.provisionalOperationScoped(scope, ingressId);
 		},
+		recordLifecycleEvidence: (
+			actual: string,
+			operationId: string,
+			payloadHash: string,
+			evidence: Parameters<SessionMappingStore["recordLifecycleEvidence"]>[3],
+		) => {
+			requireChat(actual);
+			mappings.recordLifecycleEvidenceScoped(scope, operationId, payloadHash, evidence);
+		},
 		reserveProvisionalOperation: (operation: Parameters<SessionMappingStore["reserveProvisionalOperation"]>[0]) =>
 			mappings.reserveProvisionalOperationScoped(scope, operation),
 		publishProvisionalOperation: (

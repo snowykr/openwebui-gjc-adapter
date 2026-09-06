@@ -57,6 +57,7 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 		onFailure?: (lifecycle: GjcLifecycleTransaction, error: unknown) => Promise<void>,
 	): Promise<T> {
 		throwIfAborted(input.signal);
+		await input.onLifecycleInvoking?.();
 		this.managedStarts.push(input);
 		const authority = {
 			...input.preparedManagedAuthority,
@@ -84,6 +85,7 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 		};
 		const lifecycle = this.managedLifecycle(result);
 		this.lifecycleAuthorities.set(lifecycle, authority);
+		await input.onLifecycleAcknowledged?.(authority);
 		await beforePrompt(result, result.managedProof, lifecycle);
 		throwIfAborted(input.signal);
 		try {

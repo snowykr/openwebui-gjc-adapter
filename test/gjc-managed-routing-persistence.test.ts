@@ -2,14 +2,21 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { lifecycleExactAuthority } from "../src/gjc/managed-lifecycle-evidence";
 import type { ManagedSdkAttachment } from "../src/gjc/managed-sdk-runtime";
 import { routeGjcTurn } from "../src/gjc/session-turn-router";
 import { SessionV3FileBackedMappingStore } from "../src/gjc/session-v3-file-backed-mapping-store";
-import { GjcTurnCancelledError, type ManagedTurnAuthority } from "../src/gjc/turn-runner";
+import {
+	GjcTurnCancelledError,
+	type GjcTurnRunner,
+	type ManagedLifecycleControlOwner,
+	type ManagedTurnAuthority,
+} from "../src/gjc/turn-runner";
 import type { LiveGatewayRunnerInput } from "../src/live/chat-completions";
 import { createManagedV3GenerationStore } from "../src/live/gjc-managed-idle-reaper";
 import type { ManagedSuccessorInput } from "../src/live/gjc-managed-successor";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-gateway";
+import { controlOperationHash, lifecycleControlRequestKey } from "../src/live/gjc-routing-publication";
 import { managedPreparedAuthority } from "./gjc-lifecycle-fixtures";
 import { FakeGjcTurnRunner, project } from "./gjc-routing-runner-fixtures";
 
@@ -57,6 +64,253 @@ function fixture() {
 }
 
 describe("managed routing persistence", () => {
+	test.each(["session.new", "session.resume"] as const)(
+		"journals %s intent, invocation, acknowledgement and proof before publication across reopen",
+		async operation => {
+			const f = fixture();
+			try {
+				await routeGjcTurn(f.input());
+				const before = f.store.getScoped(f.scope)!.managedAuthority!;
+				const turn = lifecycleTurn(operation);
+				const hash = controlOperationHash(turn);
+				const order: string[] = [];
+				let invocations = 0;
+				const runner = Object.assign(f.runner, {
+					runControl: (async (_turn, _mapping, _transaction, _successor, _dispatch, owner) => {
+						invocations += 1;
+						expect(owner).toBeDefined();
+						const state = () => JSON.parse(readFileSync(f.file, "utf8")).mappings[0].journal.at(-1);
+						expect(state()).toMatchObject({
+							kind: operation === "session.new" ? "create" : "resume",
+							lifecycle: { state: "intent_prepared" },
+						});
+						order.push("intent_prepared");
+						expect(owner!.lifecycleOperation).toEqual({
+							operationId: turn.userMessageId,
+							payloadHash: hash,
+							requestKey: lifecycleControlRequestKey(
+								before,
+								operation === "session.new" ? "session.create" : "session.resume",
+								turn.userMessageId,
+								hash,
+							),
+						});
+						await owner!.onInvoking();
+						expect(state().lifecycle.state).toBe("invoking");
+						order.push("invoking");
+						const authority = controlAuthority(owner!);
+						await owner!.onAcknowledged(authority);
+						expect(state().lifecycle).toMatchObject({
+							state: "acknowledged_unproven",
+							acknowledged: { ...lifecycleExactAuthority(authority), chatId: f.scope.chatId },
+						});
+						expect(state().lifecycle.proven).toBeUndefined();
+						order.push("acknowledged_unproven");
+						expect(f.store.getScoped(f.scope)?.managedAuthority).toEqual(before);
+						return controlResult(authority);
+					}) satisfies NonNullable<GjcTurnRunner["runControl"]>,
+				});
+				const getState = runner.getState.bind(runner);
+				runner.getState = async input => {
+					const durable = f.store.operationScoped(f.scope, turn.userMessageId)!;
+					expect(durable.lifecycle?.state).toBe("active_generation_proven");
+					expect(durable.lifecycle?.proven).toMatchObject({
+						sessionId: input.sessionId,
+						generation: input.managedAuthority!.generation,
+					});
+					expect(f.store.getScoped(f.scope)?.managedAuthority).toEqual(before);
+					order.push("active_generation_proven");
+					return getState(input);
+				};
+				const gateway = () => createGjcRoutingLiveGatewayRunner({ turnRunner: runner, mappings: f.store });
+				const result = await gateway().run(turn);
+				expect(order).toEqual(["intent_prepared", "invoking", "acknowledged_unproven", "active_generation_proven"]);
+				const stored = f.store.operationScoped(f.scope, turn.userMessageId)!;
+				expect(stored).toMatchObject({
+					kind: operation === "session.new" ? "create" : "resume",
+					state: "complete",
+					lifecycle: { state: "active_generation_proven", payloadHash: hash },
+				});
+				expect(stored.lifecycle?.source).toEqual({
+					...lifecycleExactAuthority(before),
+					requestKey: stored.lifecycle!.requestKey,
+				});
+				expect(f.store.getScoped(f.scope)?.managedAuthority?.requestKey).not.toBe(before.requestKey);
+				f.reopen();
+				expect(f.store.operationScoped(f.scope, turn.userMessageId)).toEqual(stored);
+				expect(await gateway().run(turn)).toEqual(result);
+				await expect(gateway().run({ ...turn, prompt: "different" })).rejects.toThrow();
+				expect(invocations).toBe(1);
+			} finally {
+				f.close();
+			}
+		},
+	);
+
+	test.each(["session.new", "session.resume"] as const)(
+		"retains acknowledged %s uncertainty and prevents redispatch after reopen",
+		async operation => {
+			const f = fixture();
+			try {
+				await routeGjcTurn(f.input());
+				const previous = f.store.getScoped(f.scope);
+				let calls = 0;
+				const failure = new Error("lost after acknowledged lifecycle");
+				const runner = Object.assign(f.runner, {
+					runControl: (async (_turn, _mapping, _transaction, _successor, _dispatch, owner) => {
+						calls += 1;
+						await owner!.onInvoking();
+						await owner!.onAcknowledged(controlAuthority(owner!));
+						throw failure;
+					}) satisfies NonNullable<GjcTurnRunner["runControl"]>,
+				});
+				const gateway = () => createGjcRoutingLiveGatewayRunner({ turnRunner: runner, mappings: f.store });
+				const turn = lifecycleTurn(operation);
+				await expect(gateway().run(turn)).rejects.toBe(failure);
+				f.reopen();
+				expect(f.store.operationScoped(f.scope, turn.userMessageId)).toMatchObject({
+					state: "uncertain",
+					lifecycle: {
+						state: "uncertain",
+						acknowledged: { sessionId: operation === "session.new" ? "control-successor" : previous!.sessionId },
+					},
+				});
+				expect(f.store.getScoped(f.scope)).toEqual(previous);
+				await expect(gateway().run(turn)).rejects.toThrow("requires reconciliation");
+				expect(calls).toBe(1);
+				expect(f.runner.states).toEqual([]);
+			} finally {
+				f.close();
+			}
+		},
+	);
+
+	test.each(["before", "invoking", "proven"] as const)(
+		"classifies control failure at %s without inventing lifecycle or active proof",
+		async stage => {
+			const f = fixture();
+			try {
+				await routeGjcTurn(f.input());
+				const turn = lifecycleTurn("session.new");
+				const failure = new Error(`${stage} failure`);
+				const runner = Object.assign(f.runner, {
+					runControl: (async (_turn, _mapping, _transaction, _successor, _dispatch, owner) => {
+						if (stage === "before") throw failure;
+						await owner!.onInvoking();
+						if (stage === "invoking") throw failure;
+						const authority = controlAuthority(owner!);
+						await owner!.onAcknowledged(authority);
+						return controlResult(authority);
+					}) satisfies NonNullable<GjcTurnRunner["runControl"]>,
+				});
+				if (stage === "proven")
+					runner.getState = async () => {
+						throw failure;
+					};
+				await expect(
+					createGjcRoutingLiveGatewayRunner({ turnRunner: runner, mappings: f.store }).run(turn),
+				).rejects.toBe(failure);
+				f.reopen();
+				const journal = f.store.operationScoped(f.scope, turn.userMessageId);
+				if (stage === "before") expect(journal).toBeUndefined();
+				else
+					expect(journal).toMatchObject({
+						state: "uncertain",
+						lifecycle: { state: stage === "proven" ? "active_generation_proven" : "uncertain" },
+					});
+				expect(f.store.getScoped(f.scope)?.sessionId).toBe("session-1");
+			} finally {
+				f.close();
+			}
+		},
+	);
+
+	test("does not republish source identity or a fabricated result proof for session.new", async () => {
+		for (const mode of ["source", "proof"] as const) {
+			const f = fixture();
+			try {
+				await routeGjcTurn(f.input());
+				const runner = Object.assign(f.runner, {
+					runControl: (async (_turn, _mapping, _transaction, _successor, _dispatch, owner) => {
+						await owner!.onInvoking();
+						const authority = mode === "source" ? owner!.source : controlAuthority(owner!);
+						await owner!.onAcknowledged(authority);
+						const result = controlResult(authority);
+						return {
+							...result,
+							result: { ...result.result, managedProof: { ...result.result.managedProof, generation: 999 } },
+						};
+					}) satisfies NonNullable<GjcTurnRunner["runControl"]>,
+				});
+				const turn = lifecycleTurn("session.new");
+				await expect(
+					createGjcRoutingLiveGatewayRunner({ turnRunner: runner, mappings: f.store }).run(turn),
+				).rejects.toThrow();
+				f.reopen();
+				expect(f.store.getScoped(f.scope)?.sessionId).toBe("session-1");
+				expect(f.store.operationScoped(f.scope, turn.userMessageId)?.lifecycle?.state).toBe("uncertain");
+				expect(f.runner.states).toEqual([]);
+			} finally {
+				f.close();
+			}
+		}
+	});
+
+	test.each(["session.new", "session.resume"] as const)(
+		"rejects preaborted %s without preparing or invoking",
+		async operation => {
+			const f = fixture();
+			try {
+				await routeGjcTurn(f.input());
+				let calls = 0;
+				const runner = Object.assign(f.runner, {
+					runControl: async () => {
+						calls += 1;
+						throw new Error("unexpected");
+					},
+				});
+				const abort = new AbortController();
+				abort.abort();
+				const turn = { ...lifecycleTurn(operation), signal: abort.signal };
+				await expect(
+					createGjcRoutingLiveGatewayRunner({ turnRunner: runner, mappings: f.store }).run(turn),
+				).rejects.toBeInstanceOf(GjcTurnCancelledError);
+				expect(f.store.operationScoped(f.scope, turn.userMessageId)).toBeUndefined();
+				expect(calls).toBe(0);
+			} finally {
+				f.close();
+			}
+		},
+	);
+	test("persists initial lifecycle identity and proof in the full canonical journal", async () => {
+		const f = fixture();
+		try {
+			await routeGjcTurn(f.input());
+			const operation = f.store.operationScoped(f.scope, "user-1")!;
+			expect(operation).toMatchObject({
+				kind: "create",
+				state: "complete",
+				lifecycle: {
+					operation: "session.create",
+					state: "active_generation_proven",
+					requestKey: "user-1",
+					preparedAuthority: { principalId: "owner-test", chatId: "chat-1" },
+					acknowledged: { sessionId: "session-1", generation: 1 },
+					proven: { kind: "managed-generation", sessionId: "session-1", generation: 1 },
+				},
+			});
+			expect(operation.lifecycle?.payloadHash).toBe(operation.detail);
+			f.reopen();
+			expect(f.store.operationScoped(f.scope, "user-1")).toEqual(operation);
+			const bytes = readFileSync(f.file, "utf8");
+			expect(() =>
+				f.store.recordLifecycleEvidenceScoped(f.scope, "user-1", operation.detail!, operation.lifecycle!),
+			).toThrow("immutable");
+			expect(readFileSync(f.file, "utf8")).toBe(bytes);
+		} finally {
+			f.close();
+		}
+	});
 	test("does not route a retired generation awaiting local cleanup after restart", async () => {
 		const f = fixture();
 		try {
@@ -65,7 +319,13 @@ describe("managed routing persistence", () => {
 			const record = (await records.active())[0]!;
 			const intent = { key: "retirement", authority: record.authority, requestedAt: Date.now() };
 			expect(await records.prepareClose(record, intent)).toBe(true);
-			await records.retire(record, intent);
+			await records.acknowledge(record, intent, record.authority.sessionId);
+			await records.retire(record, intent, {
+				source: "session_index",
+				observedIndexSeq: 2,
+				evidenceIndexSeq: 2,
+				event: "session_closed",
+			});
 			f.reopen();
 			const gateway = createGjcRoutingLiveGatewayRunner({ turnRunner: f.runner, mappings: f.store });
 			await expect(gateway.run(branchTurn())).rejects.toThrow("retirement requires reconciliation");
@@ -84,6 +344,7 @@ describe("managed routing persistence", () => {
 			const forks: ManagedSuccessorInput[] = [];
 			const runner = Object.assign(f.runner, {
 				async forkManagedSuccessor(input: ManagedSuccessorInput) {
+					await input.onInvoking?.();
 					forks.push(input);
 					const managedAuthority = {
 						...input.target,
@@ -105,6 +366,11 @@ describe("managed routing persistence", () => {
 				const persisted = JSON.parse(readFileSync(f.file, "utf8"));
 				const operation = persisted.mappings[0].journal.at(-1);
 				expect(operation.state).toBe("pending");
+				expect(operation.lifecycle).toMatchObject({
+					state: "active_generation_proven",
+					operation: "session.fork",
+					requestKey: input.managedAuthority?.requestKey,
+				});
 				expect(operation.acknowledgedSuccessor).toMatchObject({
 					sessionId: input.sessionId,
 					managedAuthority: { ...input.managedAuthority, chatId: persisted.mappings[0].chatId },
@@ -140,6 +406,7 @@ describe("managed routing persistence", () => {
 			let forks = 0;
 			const runner = Object.assign(f.runner, {
 				async forkManagedSuccessor(input: ManagedSuccessorInput): Promise<never> {
+					await input.onInvoking?.();
 					forks += 1;
 					await input.onAcknowledged?.({ ...input.target, sessionId: "acknowledged-target", generation: 9 });
 					throw new Error("interrupted after durable acknowledgement");
@@ -152,6 +419,7 @@ describe("managed routing persistence", () => {
 			expect(prior).toMatchObject({
 				state: "uncertain",
 				kind: "branch",
+				lifecycle: { state: "uncertain", acknowledged: { sessionId: "acknowledged-target", generation: 9 } },
 				acknowledgedSuccessor: { sessionId: "acknowledged-target", managedAuthority: { generation: 9 } },
 			});
 			expect(f.store.getScoped(f.scope)?.sessionId).toBe("session-1");
@@ -346,5 +614,39 @@ function branchTurn(id = "branch-1"): LiveGatewayRunnerInput {
 		continued: true,
 		ownerUserId: "owner-test",
 		control: { operation: "branch" },
+	};
+}
+
+function lifecycleTurn(operation: "session.new" | "session.resume"): LiveGatewayRunnerInput {
+	return {
+		...branchTurn(`control-${operation}`),
+		prompt: "",
+		control: operation === "session.new" ? { operation } : { operation, sessionId: "session-1" },
+	};
+}
+function controlAuthority(owner: ManagedLifecycleControlOwner): ManagedTurnAuthority {
+	return {
+		...owner.source,
+		sessionId: owner.operation === "session.create" ? "control-successor" : owner.source.sessionId,
+		generation: owner.operation === "session.create" ? 2 : owner.source.generation,
+	};
+}
+function controlResult(authority: ManagedTurnAuthority) {
+	return {
+		sessionId: authority.sessionId,
+		result: {
+			text: "",
+			events: [],
+			rawFrameCursor: 0,
+			eventCursor: 0,
+			managedAuthority: authority,
+			managedProof: {
+				kind: "managed-generation" as const,
+				sessionId: authority.sessionId,
+				generation: authority.generation,
+				leaseId: authority.leaseId,
+				epoch: authority.epoch,
+			},
+		},
 	};
 }

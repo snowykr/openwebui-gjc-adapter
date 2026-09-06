@@ -380,6 +380,9 @@ class FakeRuntime {
 		this.registered.push({ key, outcome });
 		return this.token(key as TenantSessionKey);
 	}
+	async proveLifecycleTenant(key: TenantSessionKey) {
+		return this.registerLifecycleTenant(key, undefined);
+	}
 	private token(key: TenantSessionKey): ManagedSdkAttachment {
 		const identity = JSON.stringify(key);
 		let token = this.tokens.get(identity);

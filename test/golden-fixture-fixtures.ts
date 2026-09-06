@@ -75,12 +75,14 @@ export class GoldenTurnRunner implements GjcTurnRunner {
 			)
 		)
 			throw new Error("Golden fixture requires exact prepared managed authority.");
+		await input.onLifecycleInvoking?.();
 		this.starts.push(input);
 		const managedAuthority = managedPreparedAuthority({
 			...prepared,
 			sessionId: "session-live",
 			generation: 1,
 		});
+		await input.onLifecycleAcknowledged?.(managedAuthority);
 		const managedProof: ManagedGenerationProof = {
 			kind: "managed-generation",
 			sessionId: managedAuthority.sessionId,

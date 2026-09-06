@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import type { ManagedTurnAuthority } from "../src/gjc/turn-runner";
 import {
 	type CreateManagedIdleReaperInput,
@@ -21,13 +22,22 @@ const authority = (principalId = "tenant-a", generation = 4): ManagedTurnAuthori
 	requestKey: "normal-turn-key",
 });
 
+// Synthetic public Router evidence for the isolated runtime boundary, not a production close producer.
+const retirementEvidence = {
+	source: "session_index",
+	observedIndexSeq: 3,
+	evidenceIndexSeq: 3,
+	event: "session_closed",
+} as const;
+
 class Store implements ManagedIdleGenerationStore {
 	records: ManagedIdleGenerationRecord[];
 	prepared: ManagedIdleCloseIntent[] = [];
 	retired: string[] = [];
 	evicted: string[] = [];
 	published: string[] = [];
-	restored: string[] = [];
+	acknowledged: Array<{ key: string; sessionId: string }> = [];
+	retirementEvidence: Readonly<Record<string, unknown>>[] = [];
 	uncertain: string[] = [];
 	prepare = true;
 
@@ -44,17 +54,25 @@ class Store implements ManagedIdleGenerationStore {
 	async pendingRetirement(record: ManagedIdleGenerationRecord) {
 		return this.prepared.find(intent => intent.authority === record.authority && this.retired.includes(intent.key));
 	}
-	async restoreActive(_record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent) {
-		this.restored.push(intent.key);
+	async acknowledge(_record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent, sessionId: string) {
+		this.acknowledged.push({ key: intent.key, sessionId });
 	}
-	async retire(record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent) {
+	async retire(
+		record: ManagedIdleGenerationRecord,
+		intent: ManagedIdleCloseIntent,
+		evidence: Readonly<Record<string, unknown>>,
+	) {
 		this.retired.push(intent.key);
+		this.retirementEvidence.push(evidence);
 		this.records = this.records.map(candidate =>
 			candidate === record ? { ...record, state: "closing" } : candidate,
 		);
 	}
-	async markUncertain(_record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent, reason: string) {
+	async markUncertain(record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent, reason: string) {
 		this.uncertain.push(`${intent.key}:${reason}`);
+		this.records = this.records.map(candidate =>
+			candidate === record ? { ...record, state: "uncertain" } : candidate,
+		);
 	}
 	async evict(record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent) {
 		this.evicted.push(intent.key);
@@ -104,7 +122,7 @@ function harness(
 				reconciles += 1;
 			},
 			async generationStatus() {
-				return { status };
+				return { status, ...(status === "retired" ? { evidence: retirementEvidence } : {}) };
 			},
 		},
 		...overrides,
@@ -267,21 +285,100 @@ describe("managed idle reaper", () => {
 	test("retires only eligible exact active generations before eviction and publication", async () => {
 		const subject = harness([active(), active("tenant-b", 95), { ...active("tenant-c"), state: "uncertain" }]);
 		await subject.reaper.runOnce();
-		expect(subject.closeKeys).toEqual([
-			"managed-idle-close:tenant-a\u0000project-a\u0000/work/tenant-a\u0000chat-a\u0000session-a\u00004\u0000lease-a\u0000epoch-a",
-		]);
+		const identity =
+			"tenant-a\u0000project-a\u0000/work/tenant-a\u0000chat-a\u0000session-a\u00004\u0000lease-a\u0000epoch-a";
+		expect(subject.closeKeys).toEqual([`managed-idle-close:${createHash("sha256").update(identity).digest("hex")}`]);
+		expect(subject.closeKeys[0]).toMatch(/^managed-idle-close:[a-f0-9]{64}$/);
+		expect(subject.closeKeys[0]).not.toContain("\u0000");
 		expect(subject.store.retired).toEqual(subject.closeKeys);
+		expect(subject.store.acknowledged).toEqual([{ key: subject.closeKeys[0], sessionId: "session-a" }]);
+		expect(subject.store.retirementEvidence).toEqual([retirementEvidence]);
 		expect(subject.store.evicted).toEqual(subject.closeKeys);
 		expect(subject.store.published).toEqual(subject.closeKeys);
 		expect(subject.counts()).toEqual({ admissions: 1, leases: 1, reconciles: 1 });
 	});
 
-	test("restores current only after an explicit retryable not-applied close", async () => {
+	test("retains retryable rejection as uncertain rather than treating its label as not-applied proof", async () => {
 		const subject = harness([active()], "current", { ok: false, certainty: "retryable" });
+		await expect(subject.reaper.runOnce()).rejects.toThrow("matching success and exact retirement");
+		expect(subject.store.uncertain).toHaveLength(1);
+		expect(subject.store.acknowledged).toEqual([]);
+		expect(subject.counts().reconciles).toBe(0);
 		await subject.reaper.runOnce();
-		expect(subject.store.restored).toEqual(subject.closeKeys);
-		expect(subject.store.uncertain).toEqual([]);
+		expect(subject.closeKeys).toHaveLength(1);
 		expect(subject.store.evicted).toEqual([]);
+		await subject.reaper.stop();
+	});
+
+	test("retired status without public evidence retains the acknowledgement but cannot retire", async () => {
+		const subject = harness([active()], "retired", undefined, {
+			runtime: {
+				closeLifecycleSession: async request => ({ ok: true, result: { sessionId: request.target.sessionId } }),
+				reconcile: async () => undefined,
+				generationStatus: async () => ({ status: "retired" }),
+			},
+		});
+		await expect(subject.reaper.runOnce()).rejects.toThrow("matching success and exact retirement");
+		expect(subject.store.acknowledged).toEqual([{ key: subject.store.prepared[0]!.key, sessionId: "session-a" }]);
+		expect(subject.store.uncertain).toHaveLength(1);
+		expect(subject.store.retired).toEqual([]);
+		expect(subject.store.evicted).toEqual([]);
+		await subject.reaper.stop();
+	});
+
+	test.each(["reconcile", "generationStatus"] as const)(
+		"acknowledges before %s and retains that receipt when observation fails",
+		async phase => {
+			const order: string[] = [];
+			const failure = new Error(`${phase} failed`);
+			const subject = harness([active()], "retired", undefined, {
+				runtime: {
+					closeLifecycleSession: async request => {
+						order.push("close");
+						return { ok: true, result: { sessionId: request.target.sessionId } };
+					},
+					reconcile: async () => {
+						order.push("reconcile");
+						if (phase === "reconcile") throw failure;
+					},
+					generationStatus: async () => {
+						order.push("generationStatus");
+						throw failure;
+					},
+				},
+			});
+			const acknowledge = subject.store.acknowledge.bind(subject.store);
+			subject.store.acknowledge = async (record, intent, sessionId) => {
+				await acknowledge(record, intent, sessionId);
+				order.push("acknowledge");
+			};
+			await expect(subject.reaper.runOnce()).rejects.toBe(failure);
+			expect(order).toEqual(
+				phase === "reconcile"
+					? ["close", "acknowledge", "reconcile"]
+					: ["close", "acknowledge", "reconcile", "generationStatus"],
+			);
+			expect(subject.store.acknowledged).toHaveLength(1);
+			expect(subject.store.uncertain).toHaveLength(1);
+			expect(subject.store.retired).toEqual([]);
+			await subject.reaper.runOnce();
+			expect(order.filter(event => event === "close")).toHaveLength(1);
+			await subject.reaper.stop();
+		},
+	);
+
+	test("acknowledgement persistence failure prevents reconciliation and retirement", async () => {
+		const failure = new Error("acknowledgement persistence failed");
+		const subject = harness([active()]);
+		subject.store.acknowledge = async () => {
+			throw failure;
+		};
+		await expect(subject.reaper.runOnce()).rejects.toBe(failure);
+		expect(subject.counts().reconciles).toBe(0);
+		expect(subject.store.uncertain).toHaveLength(1);
+		expect(subject.store.retired).toEqual([]);
+		expect(subject.store.evicted).toEqual([]);
+		await subject.reaper.stop();
 	});
 
 	test("retains replaced, unknown, and lifecycle errors as uncertain", async () => {
@@ -314,7 +411,7 @@ describe("managed idle reaper", () => {
 					return { ok: true, result: { sessionId: "session-a" } };
 				},
 				reconcile: async () => undefined,
-				generationStatus: async () => ({ status: "retired" }),
+				generationStatus: async () => ({ status: "retired", evidence: retirementEvidence }),
 			},
 		});
 		const first = reaper.runOnce();
@@ -346,7 +443,7 @@ describe("managed idle reaper", () => {
 			runtime: {
 				closeLifecycleSession: async () => ({ ok: true, result: { sessionId: "session-a" } }),
 				reconcile: async () => undefined,
-				generationStatus: async () => ({ status: "retired" }),
+				generationStatus: async () => ({ status: "retired", evidence: retirementEvidence }),
 			},
 		});
 		await blocked.runOnce();
@@ -364,7 +461,7 @@ describe("managed idle reaper", () => {
 					throw new Error("transport failed");
 				},
 				reconcile: async () => undefined,
-				generationStatus: async () => ({ status: "retired" }),
+				generationStatus: async () => ({ status: "retired", evidence: retirementEvidence }),
 			},
 		});
 		await expect(failing.runOnce()).rejects.toThrow("transport failed");
@@ -387,7 +484,7 @@ describe("managed idle reaper", () => {
 			expect(subject.store.retired).toHaveLength(1);
 			expect(subject.store.records[0]?.state).toBe("closing");
 			expect(subject.store.uncertain).toEqual([]);
-			expect(subject.store.restored).toEqual([]);
+			expect(subject.store.acknowledged).toHaveLength(1);
 			fail = false;
 			await subject.reaper.runOnce();
 			expect(subject.closeKeys).toHaveLength(1);
@@ -434,7 +531,7 @@ describe("managed idle reaper", () => {
 		expect(subject.store.retired).toHaveLength(1);
 		expect(subject.store.evicted).toEqual([]);
 		expect(subject.store.uncertain).toEqual([]);
-		expect(subject.store.restored).toEqual([]);
+		expect(subject.store.acknowledged).toHaveLength(1);
 		await subject.reaper.stop();
 	});
 
@@ -449,7 +546,7 @@ describe("managed idle reaper", () => {
 					throw original;
 				},
 				reconcile: async () => undefined,
-				generationStatus: async () => ({ status: "retired" }),
+				generationStatus: async () => ({ status: "retired", evidence: retirementEvidence }),
 			},
 			leases: {
 				acquire: async () => ({
@@ -546,7 +643,7 @@ describe("managed idle reaper", () => {
 					return { ok: true, result: { sessionId: request.target.sessionId } };
 				},
 				reconcile: async () => undefined,
-				generationStatus: async () => ({ status: "retired" }),
+				generationStatus: async () => ({ status: "retired", evidence: retirementEvidence }),
 			},
 		});
 		let finished = false;

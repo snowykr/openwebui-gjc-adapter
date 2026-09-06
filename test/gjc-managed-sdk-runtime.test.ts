@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import type { lifecycle, router } from "@gajae-code/coding-agent/sdk";
-import { ManagedSdkRuntime, type ManagedSdkRuntimeDeps, type TenantSessionKey } from "../src/gjc/managed-sdk-runtime";
+import {
+	type ManagedSdkAccess,
+	type ManagedSdkLifecycleOperation,
+	ManagedSdkRuntime,
+	type ManagedSdkRuntimeDeps,
+	type TenantSessionKey,
+} from "../src/gjc/managed-sdk-runtime";
 import type { ManagedPreparedTurnAuthority } from "../src/gjc/turn-runner";
 
 type LifecycleService = ReturnType<typeof lifecycle.createSessionLifecycleService>;
@@ -43,6 +49,10 @@ function closeRequest(): CloseRequest {
 		},
 		timeoutMs: 500,
 	};
+}
+
+function operationIdentity(): ManagedSdkLifecycleOperation {
+	return { operationId: "operation-1", requestKey: "close-1", payloadHash: "a".repeat(64) };
 }
 
 function preparedAuthority(): ManagedPreparedTurnAuthority {
@@ -91,13 +101,15 @@ function fixture(
 	options: {
 		start?: () => Promise<void>;
 		stop?: () => Promise<void>;
-		fence?: () => boolean | Promise<boolean>;
+		fence?: ManagedSdkRuntimeDeps["tenantFence"];
 		preparedFence?: ManagedSdkRuntimeDeps["preparedTenantFence"];
 		omitTenantFence?: boolean;
 		omitPreparedFence?: boolean;
 		request?: () => Promise<Record<string, unknown>>;
 		close?: LifecycleService["close"];
 		list?: LifecycleService["list"];
+		reconcile?: () => Promise<void>;
+		generationStatus?: router.SessionRouter["generationStatus"];
 		maxFrames?: number;
 		drainTimeoutMs?: number;
 	} = {},
@@ -122,6 +134,7 @@ function fixture(
 	const createCalls: CreateRequest[] = [];
 	const resumeCalls: ResumeRequest[] = [];
 	const listCalls: ListRequest[] = [];
+	const statusCalls: Array<{ sessionId: string; generation: number }> = [];
 	let currentAttachment = attachment;
 	const lifecycleService: Pick<LifecycleService, "close" | "createExternal" | "resumeExternal" | "list" | "delete"> = {
 		async close(request) {
@@ -165,6 +178,7 @@ function fixture(
 		},
 		async reconcile() {
 			calls.push("reconcile");
+			await options.reconcile?.();
 		},
 		attachment(sessionId: string, generation?: number) {
 			return sessionId === tenant.sessionId && generation === tenant.generation ? currentAttachment : null;
@@ -182,7 +196,9 @@ function fixture(
 			if (options.request !== undefined) return await options.request();
 			return { ok: true };
 		},
-		async generationStatus() {
+		async generationStatus(sessionId: string, generation: number) {
+			statusCalls.push({ sessionId, generation });
+			if (options.generationStatus !== undefined) return options.generationStatus(sessionId, generation);
 			return {
 				status: "retired",
 				evidence: { source: "session_index", observedIndexSeq: 1, evidenceIndexSeq: 1, event: "session_closed" },
@@ -197,7 +213,12 @@ function fixture(
 				return sessionRouter;
 			},
 			createLifecycleService: () => lifecycleService as ReturnType<typeof lifecycle.createSessionLifecycleService>,
-			...(options.omitTenantFence ? {} : { tenantFence: () => options.fence?.() ?? true }),
+			...(options.omitTenantFence
+				? {}
+				: {
+						tenantFence: (key: TenantSessionKey, access: ManagedSdkAccess) =>
+							options.fence?.(key, access) ?? true,
+					}),
 			...(options.omitPreparedFence ? {} : { preparedTenantFence: options.preparedFence ?? (() => true) }),
 			...(options.drainTimeoutMs === undefined ? {} : { drainTimeoutMs: options.drainTimeoutMs }),
 			...(options.maxFrames === undefined ? {} : { maxFramesPerSubscription: options.maxFrames }),
@@ -212,6 +233,7 @@ function fixture(
 		createCalls,
 		resumeCalls,
 		listCalls,
+		statusCalls,
 		replaceAttachment() {
 			currentAttachment = foreignAttachment;
 		},
@@ -221,6 +243,323 @@ function fixture(
 }
 
 describe("managed SDK runtime", () => {
+	test("purpose-only grants prove identity and retirement but never authorize active traffic", async () => {
+		const operation = operationIdentity();
+		const accesses: ManagedSdkAccess[] = [];
+		const f = fixture({
+			fence: (key, access) => {
+				accesses.push(access);
+				return (
+					JSON.stringify(key) === JSON.stringify(tenant) &&
+					access.kind !== "active" &&
+					access.operationId === operation.operationId &&
+					access.requestKey === operation.requestKey &&
+					access.payloadHash === operation.payloadHash
+				);
+			},
+		});
+		await f.runtime.start();
+		const token = await f.runtime.proveLifecycleTenant(tenant, operation);
+		expect(await f.runtime.proveLifecycleTenant(tenant, operation)).toBe(token);
+		expect(Object.keys(token).sort()).toEqual(["generation", "isCurrent", "tenant"]);
+		for (const frame of [
+			{ type: "control_request", operation: "turn.prompt" },
+			{ type: "query_request", query: "session.state" },
+		])
+			await expect(f.runtime.request(token, frame)).rejects.toThrow("fence was lost");
+		await expect(f.runtime.acquireAttachment(tenant)).rejects.toThrow("fence was lost");
+		await expect(f.runtime.closeLifecycleSession(tenant, closeRequest())).rejects.toThrow("fence was lost");
+		await expect(f.runtime.generationStatus(tenant)).rejects.toThrow("fence was lost");
+		expect(() => f.runtime.subscribeFrames(token, "turn", { commandId: "queued-command" }, () => {})).toThrow(
+			"Active tenant acquisition",
+		);
+		expect(() => f.runtime.prepareFrameSubscription(token, "turn", () => {})).toThrow("Active tenant acquisition");
+		const request = {
+			...closeRequest(),
+			target: { sessionId: tenant.sessionId, endpointGeneration: tenant.generation },
+		};
+		await expect(f.runtime.retireLifecycleSession(tenant, request, operation)).rejects.toMatchObject({
+			code: "exact_close_authority_unavailable",
+		});
+		expect(f.closeCalls).toEqual([]);
+		expect(f.statusCalls).toEqual([]);
+		expect(f.calls).not.toContain("request");
+		await expect(f.runtime.retirementGenerationStatus(tenant, operation)).resolves.toMatchObject({
+			status: "retired",
+		});
+		expect(f.statusCalls).toEqual([{ sessionId: tenant.sessionId, generation: tenant.generation }]);
+		expect(accesses).toContainEqual({ ...operation, kind: "adoption-proof" });
+		expect(accesses).toContainEqual({ ...operation, kind: "retirement", action: "close" });
+		expect(accesses).toContainEqual({ ...operation, kind: "retirement", action: "generation-status" });
+		expect(accesses.every(Object.isFrozen)).toBe(true);
+		await f.runtime.stop();
+	});
+
+	test("promotes the same proof token only after active acquisition and rechecks revocation before buffered delivery", async () => {
+		let active = false;
+		const accesses: ManagedSdkAccess[] = [];
+		const f = fixture({
+			fence: (_key, access) => {
+				accesses.push(access);
+				return access.kind === "active" ? active : true;
+			},
+		});
+		await f.runtime.start();
+		const token = await f.runtime.proveLifecycleTenant(tenant, operationIdentity());
+		expect(() => f.runtime.prepareFrameSubscription(token, "turn", () => {})).toThrow();
+		active = true;
+		expect(await f.runtime.acquireAttachment(tenant)).toBe(token);
+		await expect(f.runtime.request(token, { type: "query_request", query: "session.state" })).resolves.toEqual({
+			ok: true,
+		});
+		const received: number[] = [];
+		const subscription = f.runtime.prepareFrameSubscription(token, "turn", observed => {
+			received.push(observed.frame.seq!);
+		});
+		active = false;
+		accesses.length = 0;
+		await f.emit(observedFrame(1));
+		await expect(subscription.drain()).rejects.toThrow("fence was lost");
+		subscription.bind({ commandId: "queued-command" });
+		await expect(subscription.drain()).rejects.toThrow("fence was lost");
+		expect(received).toEqual([]);
+		expect(accesses).toEqual([{ kind: "active" }]);
+		subscription();
+		await f.runtime.stop();
+	});
+
+	test("flushes earlier authorized pre-ack frames before a later queued frame at binding", async () => {
+		const f = fixture();
+		f.runtime.registerTenant(tenant);
+		await f.runtime.start();
+		const received: number[] = [];
+		const token = await f.runtime.acquireAttachment(tenant);
+		const subscription = f.runtime.prepareFrameSubscription(token, "turn", observed => {
+			received.push(observed.frame.seq!);
+		});
+		await f.emit(observedFrame(1));
+		await subscription.drain();
+		expect(received).toEqual([]);
+		await f.emit(observedFrame(2));
+		subscription.bind({ commandId: "queued-command" });
+		await subscription.drain();
+		expect(received).toEqual([1, 2]);
+		subscription();
+		await f.runtime.stop();
+	});
+
+	test("rechecks active authority between buffered listener deliveries", async () => {
+		let allowed = true;
+		const f = fixture({ fence: (_key, access) => access.kind === "active" && allowed });
+		f.runtime.registerTenant(tenant);
+		await f.runtime.start();
+		const received: number[] = [];
+		const subscription = f.runtime.prepareFrameSubscription(
+			await f.runtime.acquireAttachment(tenant),
+			"turn",
+			observed => {
+				received.push(observed.frame.seq!);
+				allowed = false;
+			},
+		);
+		await f.emit(observedFrame(1));
+		await subscription.drain();
+		await f.emit(observedFrame(2));
+		await subscription.drain();
+		subscription.bind({ commandId: "queued-command" });
+		await expect(subscription.drain()).rejects.toThrow("fence was lost");
+		expect(received).toEqual([1]);
+		subscription();
+		await f.runtime.stop();
+	});
+
+	test("validates durable operation identities and retirement request-key binding before effects", async () => {
+		let authorized = 0;
+		const f = fixture({
+			fence: () => {
+				authorized += 1;
+				return true;
+			},
+		});
+		await f.runtime.start();
+		f.runtime.registerTenant(tenant);
+		for (const change of [
+			{ operationId: "" },
+			{ operationId: " x" },
+			{ requestKey: "" },
+			{ requestKey: "bad\nkey" },
+			{ payloadHash: "a".repeat(63) },
+			{ payloadHash: "A".repeat(64) },
+			{ payloadHash: `sha256:${"a".repeat(64)}` },
+			{ payloadHash: `${"a".repeat(64)}\n` },
+		]) {
+			const operation = { ...operationIdentity(), ...change };
+			await expect(f.runtime.proveLifecycleTenant(tenant, operation)).rejects.toBeInstanceOf(TypeError);
+			await expect(f.runtime.retireLifecycleSession(tenant, closeRequest(), operation)).rejects.toBeInstanceOf(
+				TypeError,
+			);
+			await expect(f.runtime.retirementGenerationStatus(tenant, operation)).rejects.toBeInstanceOf(TypeError);
+		}
+		await expect(
+			f.runtime.retireLifecycleSession(tenant, closeRequest(), { ...operationIdentity(), requestKey: "other" }),
+		).rejects.toThrow("request key");
+		expect(authorized).toBe(0);
+		expect(f.calls).toEqual(["start"]);
+		expect(f.closeCalls).toEqual([]);
+		expect(f.statusCalls).toEqual([]);
+		await f.runtime.stop();
+	});
+
+	test.each(["adoption", "retirement", "status"] as const)(
+		"rechecks %s purpose revocation after an awaited boundary",
+		async mode => {
+			let allowed = true;
+			const revoke = async () => {
+				allowed = false;
+			};
+			const f = fixture({
+				fence: (_key, access) => access.kind !== "active" && allowed,
+				reconcile: mode === "adoption" ? revoke : undefined,
+				close: async request => {
+					await revoke();
+					return { ok: true, operation: "session.close", result: { sessionId: request.target.sessionId } };
+				},
+				generationStatus: async () => {
+					await revoke();
+					return { status: "unknown", reason: "session_not_observed" };
+				},
+			});
+			await f.runtime.start();
+			f.runtime.registerTenant(tenant);
+			const result =
+				mode === "adoption"
+					? f.runtime.proveLifecycleTenant(tenant, operationIdentity())
+					: mode === "retirement"
+						? f.runtime.retireLifecycleSession(tenant, closeRequest(), operationIdentity())
+						: f.runtime.retirementGenerationStatus(tenant, operationIdentity());
+			await expect(result).rejects.toThrow("fence was lost");
+			expect(f.closeCalls).toHaveLength(mode === "retirement" ? 1 : 0);
+			await expect(f.runtime.acquireAttachment(tenant)).rejects.toThrow("fence was lost");
+			await f.runtime.stop();
+		},
+	);
+
+	test("rechecks adoption authorization before a serialized reconcile effect", async () => {
+		const entered = deferred<void>();
+		const release = deferred<void>();
+		const admitted = deferred<void>();
+		let allowed = true;
+		const f = fixture({
+			fence: (_key, access) => {
+				admitted.resolve();
+				return access.kind === "adoption-proof" && allowed;
+			},
+			reconcile: async () => {
+				entered.resolve();
+				await release.promise;
+			},
+		});
+		await f.runtime.start();
+		const prior = f.runtime.reconcile();
+		await entered.promise;
+		const proving = f.runtime.proveLifecycleTenant(tenant, operationIdentity()).catch(error => error);
+		await admitted.promise;
+		allowed = false;
+		release.resolve();
+		await prior;
+		expect(await proving).toBeInstanceOf(Error);
+		expect(f.calls.filter(call => call === "reconcile")).toHaveLength(1);
+		await f.runtime.stop();
+	});
+
+	test.each(["adoption", "retirement", "status"] as const)(
+		"rejects %s when registration is replaced during purpose authorization",
+		async mode => {
+			const entered = deferred<void>();
+			const release = deferred<boolean>();
+			const f = fixture({
+				fence: () => {
+					entered.resolve();
+					return release.promise;
+				},
+			});
+			await f.runtime.start();
+			f.runtime.registerTenant(tenant);
+			const pending = (
+				mode === "adoption"
+					? f.runtime.proveLifecycleTenant(tenant, operationIdentity())
+					: mode === "retirement"
+						? f.runtime.retireLifecycleSession(tenant, closeRequest(), operationIdentity())
+						: f.runtime.retirementGenerationStatus(tenant, operationIdentity())
+			).catch(error => error);
+			await entered.promise;
+			f.runtime.unregisterTenant(tenant);
+			f.runtime.registerTenant({ ...tenant, leaseId: "replacement" });
+			release.resolve(true);
+			expect(await pending).toBeInstanceOf(Error);
+			expect(f.closeCalls).toEqual([]);
+			expect(f.statusCalls).toEqual([]);
+			expect(f.calls).toEqual(["start"]);
+			await f.runtime.stop();
+		},
+	);
+
+	test("a close-only grant does not authorize generation status or caller-supplied active-purpose overrides", async () => {
+		const seen: ManagedSdkAccess[] = [];
+		const f = fixture({
+			fence: (_key, access) => {
+				seen.push(access);
+				return access.kind === "retirement" && access.action === "close";
+			},
+		});
+		await f.runtime.start();
+		f.runtime.registerTenant(tenant);
+		await expect(f.runtime.retirementGenerationStatus(tenant, operationIdentity())).rejects.toThrow("fence was lost");
+		const attempted = { ...closeRequest(), access: { ...operationIdentity(), kind: "retirement", action: "close" } };
+		await expect(f.runtime.closeLifecycleSession(tenant, attempted)).rejects.toThrow("fence was lost");
+		expect(seen).toEqual([
+			{ ...operationIdentity(), kind: "retirement", action: "generation-status" },
+			{ kind: "active" },
+		]);
+		expect(f.closeCalls).toEqual([]);
+		expect(f.statusCalls).toEqual([]);
+		await f.runtime.stop();
+	});
+
+	test("adoption proof cannot retain active subscription eligibility across registration replacement", async () => {
+		let active = true;
+		const f = fixture({ fence: (_key, access) => (access.kind === "active" ? active : true) });
+		await f.runtime.start();
+		f.runtime.registerTenant(tenant);
+		const original = await f.runtime.acquireAttachment(tenant);
+		f.runtime.unregisterTenant(tenant);
+		active = false;
+		const proof = await f.runtime.proveLifecycleTenant(tenant, operationIdentity());
+		expect(proof).not.toBe(original);
+		expect(original.isCurrent()).toBe(false);
+		expect(() => f.runtime.prepareFrameSubscription(proof, "turn", () => {})).toThrow("Active tenant acquisition");
+		await f.runtime.stop();
+	});
+
+	test("bounded stop invalidates queued proof authorization before a late reconcile", async () => {
+		const entered = deferred<void>();
+		const release = deferred<boolean>();
+		const f = fixture({
+			drainTimeoutMs: 15,
+			fence: () => {
+				entered.resolve();
+				return release.promise;
+			},
+		});
+		await f.runtime.start();
+		const proof = f.runtime.proveLifecycleTenant(tenant, operationIdentity()).catch(error => error);
+		await entered.promise;
+		await expect(f.runtime.stop()).rejects.toMatchObject({ code: "drain_timeout" });
+		expect(await proof).toMatchObject({ code: "runtime_interrupted" });
+		release.resolve(true);
+		await new Promise(resolve => setTimeout(resolve, 0));
+		expect(f.calls).toEqual(["start", "stop"]);
+	});
 	test("issues stable manager-only capabilities and revokes tokens after replacement or registration loss", async () => {
 		const f = fixture();
 		f.runtime.registerTenant(tenant);
@@ -264,6 +603,11 @@ describe("managed SDK runtime", () => {
 		await expect(f.runtime.acquireAttachment(tenant)).rejects.toThrow("fence was lost");
 		await expect(f.runtime.closeLifecycleSession(tenant, closeRequest())).rejects.toThrow("fence was lost");
 		await expect(f.runtime.listLifecycleSessions(tenant, listRequest())).rejects.toThrow("fence was lost");
+		await expect(f.runtime.proveLifecycleTenant(tenant, operationIdentity())).rejects.toThrow("fence was lost");
+		await expect(f.runtime.retireLifecycleSession(tenant, closeRequest(), operationIdentity())).rejects.toThrow(
+			"fence was lost",
+		);
+		await expect(f.runtime.retirementGenerationStatus(tenant, operationIdentity())).rejects.toThrow("fence was lost");
 		await expect(
 			f.runtime.createPreparedExternalLifecycleSession(preparedAuthority(), createRequest()),
 		).rejects.toThrow("fence was lost");
@@ -716,9 +1060,11 @@ describe("managed SDK runtime", () => {
 		await current.runtime.start();
 		const managed = await current.runtime.acquireAttachment(tenant);
 		const received: string[] = [];
+		const listenerEntered = deferred<void>();
 		const releaseListener = deferred<void>();
 		const unsubscribe = current.runtime.subscribeFrames(managed, "turn", { commandId: "command-1" }, async frame => {
 			received.push(String(frame.frame.seq));
+			listenerEntered.resolve();
 			await releaseListener.promise;
 		});
 		const matching = {
@@ -730,7 +1076,7 @@ describe("managed SDK runtime", () => {
 			seq: 1,
 		};
 		await current.emit(matching);
-		await Promise.resolve();
+		await listenerEntered.promise;
 		await current.emit(matching);
 		await current.emit({ ...matching, sessionId: "foreign", seq: 2 });
 		await current.emit({ ...matching, seq: 3 });

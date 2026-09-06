@@ -3,6 +3,7 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { NormalizedModelSelection } from "../src/contracts";
+import { isManagedLifecycleEvidence } from "../src/gjc/managed-lifecycle-evidence";
 import type { ManagedSdkRuntime } from "../src/gjc/managed-sdk-runtime";
 import { scopedSessionMappingStore } from "../src/gjc/scoped-session-mapping-store";
 import { canonicalSessionMappingKey, SessionAuthorityLoadError } from "../src/gjc/session-authority";
@@ -1012,14 +1013,16 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 							lifecycle: GjcLifecycleTransaction,
 						) => Promise<void>,
 					): Promise<T> {
-						if (failure === "setter") throw new Error(`${failure} failed`);
 						return await super.startManagedSession(
 							input,
 							async (result, lifecycle) => {
 								if (failure === "prompt") throw new Error(`${failure} failed`);
 								return await publish(result, lifecycle);
 							},
-							beforePrompt,
+							async (address, proof, lifecycle) => {
+								if (failure === "setter") throw new Error(`${failure} failed`);
+								await beforePrompt(address, proof, lifecycle);
+							},
 						);
 					}
 				}
@@ -1051,6 +1054,7 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 				const failedChatKey = canonicalSessionMappingKey(ownerUserId, "failed-chat");
 				expect(document.mappings.some(mapping => mapping.chatId === failedChatKey)).toBeFalse();
 				expect(document.provisionalOperations).toHaveLength(1);
+				expect(isManagedLifecycleEvidence(document.provisionalOperations[0]!.lifecycle)).toBe(true);
 				expect(document.provisionalOperations[0]).toMatchObject({
 					id: "user-2",
 					ingressId: "user-2",
@@ -1067,17 +1071,52 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 						"id",
 						"ingressId",
 						"kind",
+						"lifecycle",
+						"managedAuthority",
 						"projectId",
+						"sessionId",
 						"startedAt",
 						"state",
-						...(failure === "prompt" ? ["managedAuthority", "sessionId"] : []),
 					].sort(),
 				);
+				expect(document.provisionalOperations[0]).toMatchObject({
+					sessionId: "session-1",
+					managedAuthority: managedPreparedAuthority({ chatId: failedChatKey, requestKey: "user-2" }),
+				});
+				const failedOperation = document.provisionalOperations[0]!;
+				const preparedAuthority = {
+					principalId: ownerUserId,
+					projectId: "project",
+					canonicalWorkspace: project.cwd,
+					chatId: "failed-chat",
+					leaseId: "lease-1",
+					epoch: "epoch-1",
+					requestKey: "user-2",
+				};
+				expect(failedOperation.lifecycle).toMatchObject({
+					operation: "session.create",
+					actor: { id: ownerUserId, namespace: "openwebui-gjc-adapter" },
+					state: failure === "prompt" ? "active_generation_proven" : "uncertain",
+					requestKey: "user-2",
+					requestHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+					payloadHash: failedOperation.detail,
+					preparedAuthority,
+					target: { kind: "existing_path", path: project.cwd },
+					acknowledged: { ...preparedAuthority, sessionId: "session-1", generation: 1 },
+				});
 				if (failure === "prompt")
-					expect(document.provisionalOperations[0]).toMatchObject({
-						sessionId: "session-1",
-						managedAuthority: managedPreparedAuthority({ chatId: failedChatKey, requestKey: "user-2" }),
+					expect(failedOperation.lifecycle).toMatchObject({
+						proven: {
+							kind: "managed-generation",
+							sessionId: "session-1",
+							generation: 1,
+							leaseId: "lease-1",
+							epoch: "epoch-1",
+						},
 					});
+				else expect(failedOperation.lifecycle).not.toHaveProperty("proven");
+				expect(failedOperation.lifecycle).not.toHaveProperty("retirement");
+				expect(turnRunner.managedStarts).toHaveLength(1);
 				expect(JSON.stringify(document)).not.toMatch(/descriptor|sessionFile|attachment/);
 				expect(JSON.stringify(document.provisionalOperations[0])).not.toMatch(/assistant|hello/);
 				expect(outbox.listPending()).toHaveLength(0);

@@ -62,6 +62,20 @@ export interface ManagedLifecycleControlInput {
 	readonly authority: ManagedTurnAuthority;
 	readonly operation: "session.create" | "session.resume" | "session.close" | "session.delete";
 }
+
+/** Durable owner hooks for a single canonical create/resume control operation. */
+export interface ManagedLifecycleControlOwner {
+	readonly operation: "session.create" | "session.resume";
+	readonly source: ManagedTurnAuthority;
+	readonly preparedAuthority: ManagedPreparedTurnAuthority;
+	readonly lifecycleOperation: {
+		readonly operationId: string;
+		readonly requestKey: string;
+		readonly payloadHash: string;
+	};
+	onInvoking(): void | Promise<void>;
+	onAcknowledged(authority: ManagedTurnAuthority): void | Promise<void>;
+}
 export interface ManagedCloseInput {
 	readonly authority: ManagedTurnAuthority;
 }
@@ -89,6 +103,12 @@ export interface GjcStartNewSessionInput {
 	readonly preparedManagedAuthority?: ManagedPreparedTurnAuthority;
 	/** Persists assigned lifecycle identity before attachment proof or prompt effects. */
 	readonly onLifecycleAcknowledged?: (authority: ManagedTurnAuthority) => void | Promise<void>;
+	readonly onLifecycleInvoking?: () => void | Promise<void>;
+	readonly lifecycleOperation?: {
+		readonly operationId: string;
+		readonly requestKey: string;
+		readonly payloadHash: string;
+	};
 }
 
 export interface GjcContinueSessionInput extends GjcSessionAddress, GjcLifecycleScoped {
@@ -227,6 +247,7 @@ export interface GjcTurnRunner {
 		lifecycle: GjcLifecycleTransaction,
 		onAcknowledgedSuccessor?: (successor: AcknowledgedSuccessor) => Promise<void> | void,
 		onDispatch?: () => void,
+		lifecycleOwner?: ManagedLifecycleControlOwner,
 	): Promise<GjcControlResult>;
 }
 

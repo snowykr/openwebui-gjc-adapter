@@ -21,7 +21,6 @@ export type OpenWebUIControl =
 	| {
 			readonly operation: "session.resume";
 			readonly sessionId: string;
-			readonly sessionFile: string;
 	  }
 	| { readonly operation: "unsupported"; readonly surface: string };
 

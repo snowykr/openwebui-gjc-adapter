@@ -26,6 +26,7 @@
 
 ### Fixed
 
+- Persisted create, resume, and fork lifecycle phases in canonical V3 operations without replacing routing history. Restricted adoption proofs and retirement operations to separate manager-owned purposes; added real production-fence tests with durable workspace leases. Idle close now retains successful acknowledgement before observation and commits retirement evidence with its immutable result atomically; retryable failures and changed turn IDs cannot authorize a re-close. The public exact-close producer and staged-bootstrap/recovery gaps remain unresolved.
 - Separated public SDK control acknowledgement from semantic completion: managed turns await correlated terminal final text or a unique durable gate, with one finite deadline, observer failure propagation, and exactly-once dispatched cancellation. Added an executed public-SDK managed-routing/replay probe.
 - Rejected failed turns before exposing a successful stream and required the referenced session final before accepting completion.
 - Preserved terminal-event chronology, streamed lifecycle delivery, text-shaped GJC deltas, and text-only turn recovery.

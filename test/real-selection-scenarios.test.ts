@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { access } from "node:fs/promises";
 import * as path from "node:path";
+import { isManagedLifecycleEvidence } from "../src/gjc/managed-lifecycle-evidence";
 import { canonicalSessionMappingKey } from "../src/gjc/session-mapping-store";
 import { LOW_MODEL_ID, MEDIUM_MODEL_ID, OFF_MODEL_ID } from "./model-selection-fixtures";
 import { expectNoDeliveryMutation, expectSelectionError } from "./real-selection-expectations";
@@ -183,6 +184,7 @@ describe("real canonical model selection scenarios", () => {
 			);
 			expect(provisional).toHaveLength(1);
 			const operation = provisional[0] as Record<string, unknown>;
+			expect(isManagedLifecycleEvidence(operation.lifecycle)).toBe(true);
 			const sessionId = operation.sessionId as string;
 			const managedAuthority = operation.managedAuthority as Record<string, unknown>;
 			expect(operation).toMatchObject({
@@ -201,6 +203,7 @@ describe("real canonical model selection scenarios", () => {
 				"id",
 				"ingressId",
 				"kind",
+				"lifecycle",
 				"managedAuthority",
 				"projectId",
 				"sessionId",
@@ -219,6 +222,34 @@ describe("real canonical model selection scenarios", () => {
 				requestKey: "user-prompt-failed",
 				authorityEpoch: "managed/1",
 			});
+			const logicalAuthority = {
+				principalId: "owner-selection",
+				projectId: "openwebui",
+				canonicalWorkspace: path.join(harness.root, ".gjc", "openwebui", "default-reader"),
+				chatId: "chat-prompt-failed",
+				leaseId: "selection-fixture-lease",
+				epoch: "managed/1",
+				requestKey: "user-prompt-failed",
+			};
+			expect(operation.lifecycle).toMatchObject({
+				operation: "session.create",
+				actor: { id: logicalAuthority.principalId, namespace: "openwebui-gjc-adapter" },
+				state: "active_generation_proven",
+				requestKey: logicalAuthority.requestKey,
+				requestHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+				payloadHash: operation.detail,
+				preparedAuthority: logicalAuthority,
+				target: { kind: "existing_path", path: logicalAuthority.canonicalWorkspace },
+				acknowledged: { ...logicalAuthority, sessionId, generation: managedAuthority.generation },
+				proven: {
+					kind: "managed-generation",
+					sessionId,
+					generation: managedAuthority.generation,
+					leaseId: logicalAuthority.leaseId,
+					epoch: logicalAuthority.epoch,
+				},
+			});
+			expect(operation.lifecycle).not.toHaveProperty("retirement");
 			expect(JSON.stringify(operation)).not.toMatch(/assistant|PASS|private|TOKEN|\\u0000/);
 			const afterFailure = await harness.effects();
 			expect(afterFailure.coordinator.setterAttempts).toBe(beforeFailure.coordinator.setterAttempts + 2);

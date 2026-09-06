@@ -8,6 +8,12 @@ export interface ManagedSuccessorInput {
 	readonly target: Omit<ManagedTurnAuthority, "sessionId" | "generation">;
 	readonly timeoutMs?: number;
 	readonly signal?: AbortSignal;
+	readonly onInvoking?: () => Promise<void> | void;
+	readonly lifecycleOperation?: {
+		readonly operationId: string;
+		readonly requestKey: string;
+		readonly payloadHash: string;
+	};
 	/** Persists the assigned target before cancellation, registration, or attachment proof. */
 	readonly onAcknowledged?: (authority: ManagedTurnAuthority) => Promise<void> | void;
 	/** Called only after the exact target generation is reconciled, fenced, and current. */
@@ -56,6 +62,8 @@ export function createManagedSuccessorFlow(runtime: ManagedSdkRuntime): ManagedS
 				await runtime.reconcile();
 				assertExactAttachment(await runtime.acquireAttachment(source), source, "source");
 				throwIfAborted(input.signal);
+				await input.onInvoking?.();
+				throwIfAborted(input.signal);
 				invoked = true;
 				const outcome = await runtime.forkLifecycleSession(source, {
 					actor: { namespace: "openwebui-gjc-adapter", id: input.source.principalId },
@@ -78,8 +86,11 @@ export function createManagedSuccessorFlow(runtime: ManagedSdkRuntime): ManagedS
 				acknowledgementPending = false;
 				// An abort after lifecycle invocation is ambiguous even when the fork later acknowledges.
 				if (input.signal?.aborted) throw new GjcTurnCancelledError();
-				await runtime.registerLifecycleTenant(returnedTarget);
-				const successor = await proveTarget(runtime, returnedTarget);
+				if (input.lifecycleOperation === undefined) await runtime.registerLifecycleTenant(returnedTarget);
+				const successor =
+					input.lifecycleOperation === undefined
+						? await proveTarget(runtime, returnedTarget)
+						: await runtime.proveLifecycleTenant(returnedTarget, input.lifecycleOperation);
 				throwIfAborted(input.signal);
 				await input.publish(successor);
 				return {

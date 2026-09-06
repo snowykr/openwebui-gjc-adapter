@@ -1,3 +1,14 @@
+import { isDeepStrictEqual } from "node:util";
+import {
+	assertManagedLifecycleEvidenceUpdate,
+	copyManagedLifecycleEvidence,
+	createManagedRetirementEvidence,
+	isManagedLifecycleEvidence,
+	lifecycleExactAuthority,
+	lifecyclePreparedAuthority,
+	type ManagedLifecycleEvidence,
+	transitionManagedLifecycleEvidence,
+} from "./managed-lifecycle-evidence";
 import {
 	canonicalSessionMappingKey,
 	type ProvisionalSessionOperation,
@@ -553,6 +564,281 @@ export class SessionMappingStore {
 		const canonicalScope = canonicalScopeFor(scope);
 		assertScopedKeyAvailable(this.authority, canonicalScope);
 		this.authority.transitionProvisionalOperation(canonicalScope.key, ingressId, state, detail);
+	}
+	recordLifecycleEvidence(
+		chatId: string,
+		operationId: string,
+		payloadHash: string,
+		evidence: ManagedLifecycleEvidence,
+	): void {
+		assertLegacyKeyAvailable(this.authority, chatId);
+		this.writeLifecycleEvidence(chatId, operationId, payloadHash, evidence);
+	}
+	reserveManagedRetirementScoped(
+		scope: SessionMappingScope,
+		source: ManagedTurnAuthority,
+		input: { readonly operationId: string; readonly requestKey: string; readonly payloadHash: string },
+	): SessionOperation {
+		const canonical = canonicalScopeFor(scope);
+		if (
+			source.principalId !== scope.principalId ||
+			source.chatId !== scope.chatId ||
+			!input.operationId ||
+			!input.requestKey
+		)
+			throw new Error("Managed retirement does not match the requested tenant scope.");
+		let reserved!: SessionOperation;
+		this.mutateAuthorityState((records, provisional) => {
+			const record = records.find(candidate => candidate.chatId === canonical.key);
+			const authority = managedAuthorityForScope(record?.managedAuthority, canonical);
+			if (
+				record === undefined ||
+				isRetiredRecord(record) ||
+				!isScopedRecordFor(record, canonical) ||
+				authority === undefined ||
+				!isDeepStrictEqual(lifecycleExactAuthority(authority), lifecycleExactAuthority(source))
+			)
+				throw new Error("Managed retirement source changed before reservation.");
+			const existing = record.journal.find(
+				operation => operation.id === input.operationId || operation.ingressId === input.operationId,
+			);
+			if (existing !== undefined) {
+				if (
+					existing.kind !== "close" ||
+					existing.state !== "pending" ||
+					existing.detail !== input.payloadHash ||
+					existing.lifecycle?.requestKey !== input.requestKey ||
+					!isDeepStrictEqual(existing.lifecycle.source, lifecycleExactAuthority(source))
+				)
+					throw new Error("Managed retirement request conflicts with its durable reservation.");
+				reserved = operationForScope(existing, canonical);
+				return { records, provisional };
+			}
+			if (
+				record.journal.some(
+					operation =>
+						operation.state === "pending" ||
+						operation.state === "uncertain" ||
+						(operation.kind === "close" && operation.state === "complete"),
+				) ||
+				provisional.some(operation => operation.chatId === canonical.key && operation.state !== "complete")
+			)
+				throw new Error("Managed retirement conflicts with unfinished work.");
+			const sourceOperation = [...record.journal]
+				.reverse()
+				.find(
+					operation =>
+						operation.state === "complete" &&
+						operation.lifecycle?.state === "active_generation_proven" &&
+						operation.lifecycle.acknowledged !== undefined &&
+						[
+							"principalId",
+							"projectId",
+							"canonicalWorkspace",
+							"chatId",
+							"sessionId",
+							"generation",
+							"leaseId",
+							"epoch",
+						].every(
+							field => Reflect.get(operation.lifecycle!.acknowledged!, field) === Reflect.get(source, field),
+						),
+				);
+			if (sourceOperation?.lifecycle === undefined)
+				throw new Error("Managed retirement requires persisted active-generation lifecycle evidence.");
+			const startedAt = new Date().toISOString();
+			const lifecycle = createManagedRetirementEvidence(
+				{
+					operation: "session.close",
+					preparedAuthority: { ...lifecyclePreparedAuthority(source), requestKey: input.requestKey },
+					source: lifecycleExactAuthority(source),
+					sourceOperationId: sourceOperation.id,
+					sourceEvidence: sourceOperation.lifecycle,
+					payloadHash: input.payloadHash,
+					target: { sessionId: source.sessionId, endpointGeneration: source.generation },
+				},
+				startedAt,
+			);
+			reserved = {
+				id: input.operationId,
+				ingressId: input.operationId,
+				kind: "close",
+				state: "pending",
+				startedAt,
+				detail: input.payloadHash,
+				lifecycle,
+			};
+			return {
+				records: records.map(candidate =>
+					candidate === record ? { ...record, journal: [...record.journal, reserved] } : candidate,
+				),
+				provisional,
+			};
+		});
+		return reserved;
+	}
+	completeManagedRetirementScoped(
+		scope: SessionMappingScope,
+		source: ManagedTurnAuthority,
+		operationId: string,
+		evidence: Readonly<Record<string, unknown>>,
+	): void {
+		const canonical = canonicalScopeFor(scope);
+		this.mutateAuthorityState((records, provisional) => {
+			const record = records.find(candidate => candidate.chatId === canonical.key);
+			const authority = managedAuthorityForScope(record?.managedAuthority, canonical);
+			if (
+				record === undefined ||
+				isRetiredRecord(record) ||
+				authority === undefined ||
+				!isDeepStrictEqual(lifecycleExactAuthority(authority), lifecycleExactAuthority(source))
+			)
+				throw new Error("Managed retirement source changed before completion.");
+			const operation = record.journal.find(candidate => candidate.id === operationId);
+			const lifecycle = operation?.lifecycle;
+			if (
+				operation?.kind !== "close" ||
+				(operation.state !== "pending" && operation.state !== "uncertain") ||
+				lifecycle?.sourceProofRef === undefined ||
+				lifecycle.closeAcknowledgement === undefined ||
+				!isDeepStrictEqual(lifecycle.source, lifecycleExactAuthority(source))
+			)
+				throw new Error("Managed retirement requires durable successful close acknowledgement.");
+			const completedAt = new Date().toISOString();
+			const retired = transitionManagedLifecycleEvidence(
+				lifecycle,
+				"retired",
+				{
+					retirement: {
+						sessionId: source.sessionId,
+						generation: source.generation,
+						acknowledgedSessionId: lifecycle.closeAcknowledgement.sessionId,
+						observedAt: completedAt,
+						evidence,
+					},
+				},
+				completedAt,
+			);
+			const result: SessionOperationResult = {
+				kind: "close",
+				assistantText: "",
+				events: [],
+				managedAuthority: record.managedAuthority,
+				mapping: {
+					chatId: canonical.key,
+					projectId: record.projectId,
+					sessionId: record.sessionId,
+					rawFrameCursor: record.rawFrameCursor,
+					eventCursor: record.eventCursor,
+					operationId,
+				},
+				correlation: { closeStatus: "closed", mappingOperationId: record.operationId },
+			};
+			const completed: SessionOperation = {
+				...operation,
+				state: "complete",
+				completedAt,
+				lifecycle: retired,
+				result,
+			};
+			return {
+				records: records.map(candidate =>
+					candidate === record
+						? {
+								...record,
+								journal: record.journal.map(entry => (entry === operation ? completed : entry)),
+							}
+						: candidate,
+				),
+				provisional,
+			};
+		});
+	}
+	lifecycleOperationsScoped(scope: SessionMappingScope): readonly SessionOperation[] {
+		const canonical = canonicalScopeFor(scope);
+		assertScopedKeyAvailable(this.authority, canonical);
+		const operations = [
+			...this.operationsScoped(scope),
+			...this.authority
+				.provisionalEntries()
+				.filter(operation => operation.chatId === canonical.key)
+				.map(operation => provisionalOperationForScope(operation, canonical)),
+		];
+		return operations.filter(
+			operation =>
+				operation.lifecycle !== undefined &&
+				operation.lifecycle.preparedAuthority.principalId === scope.principalId &&
+				operation.lifecycle.preparedAuthority.chatId === scope.chatId,
+		);
+	}
+	recordLifecycleEvidenceScoped(
+		scope: SessionMappingScope,
+		operationId: string,
+		payloadHash: string,
+		evidence: ManagedLifecycleEvidence,
+	): void {
+		const canonical = canonicalScopeFor(scope);
+		assertScopedKeyAvailable(this.authority, canonical);
+		if (
+			evidence.preparedAuthority.principalId !== scope.principalId ||
+			evidence.preparedAuthority.chatId !== scope.chatId
+		)
+			throw new Error("Managed lifecycle evidence does not match the requested tenant scope.");
+		this.writeLifecycleEvidence(canonical.key, operationId, payloadHash, evidence);
+	}
+	private writeLifecycleEvidence(
+		chatId: string,
+		operationId: string,
+		payloadHash: string,
+		evidence: ManagedLifecycleEvidence,
+	): void {
+		if (!isManagedLifecycleEvidence(evidence) || evidence.payloadHash !== payloadHash)
+			throw new Error("Invalid managed lifecycle evidence or payload hash.");
+		this.mutateAuthorityState((records, provisional) => {
+			if (evidence.sourceProofRef !== undefined) {
+				const record = records.find(candidate => candidate.chatId === chatId);
+				const source = evidence.source;
+				const authority = record?.managedAuthority;
+				if (
+					source === undefined ||
+					authority === undefined ||
+					record === undefined ||
+					isRetiredRecord(record) ||
+					!isDeepStrictEqual(lifecycleExactAuthority({ ...authority, chatId: source.chatId }), source)
+				)
+					throw new Error("Managed retirement source changed before evidence persistence.");
+			}
+			let found = false;
+			const update = <T extends SessionOperation>(operation: T): T => {
+				if (operation.id !== operationId && operation.ingressId !== operationId) return operation;
+				if (
+					found ||
+					operation.state === "complete" ||
+					operation.state === "conflict" ||
+					operation.detail !== payloadHash
+				)
+					throw new Error("Managed lifecycle operation has an immutable or conflicting result binding.");
+				if (operation.lifecycle === undefined) {
+					if (evidence.state !== "intent_prepared")
+						throw new Error("Managed lifecycle must begin with prepared intent.");
+				} else assertManagedLifecycleEvidenceUpdate(operation.lifecycle, evidence);
+				found = true;
+				return { ...operation, lifecycle: copyManagedLifecycleEvidence(evidence) };
+			};
+			const nextRecords = records.map(record =>
+				record.chatId !== chatId
+					? record
+					: {
+							...record,
+							journal: record.journal.map(update),
+						},
+			);
+			const nextProvisional = provisional.map(operation =>
+				operation.chatId === chatId ? update(operation) : operation,
+			);
+			if (!found) throw new Error("Managed lifecycle operation must be durably reserved before evidence.");
+			return { records: nextRecords, provisional: nextProvisional };
+		});
 	}
 	protected mutateAuthorityState(mutation: AuthorityStateMutation): void {
 		const next = mutation(this.authority.entries(), this.authority.provisionalEntries());

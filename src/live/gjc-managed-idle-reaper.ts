@@ -1,6 +1,8 @@
+import { createHash } from "node:crypto";
 import { isAbsolute, resolve } from "node:path";
+import { transitionManagedLifecycleEvidence } from "../gjc/managed-lifecycle-evidence";
 import type { TenantSessionKey } from "../gjc/managed-sdk-runtime";
-import type { SessionOperation, SessionOperationResult } from "../gjc/session-authority";
+import type { SessionOperation } from "../gjc/session-authority";
 import { SESSION_AUTHORITY_V3_EPOCH } from "../gjc/session-authority-v3";
 import type { SessionMapping, SessionMappingStore } from "../gjc/session-router";
 import type { ManagedTurnAuthority } from "../gjc/turn-runner";
@@ -35,8 +37,16 @@ export interface ManagedIdleGenerationStore {
 	): Promise<boolean | ManagedIdleCloseIntent>;
 	/** Revalidates a durable successful retirement against the current full mapping authority. */
 	pendingRetirement(record: ManagedIdleGenerationRecord): Promise<ManagedIdleCloseIntent | undefined>;
-	restoreActive(record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent): Promise<void>;
-	retire(record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent): Promise<void>;
+	acknowledge(
+		record: ManagedIdleGenerationRecord,
+		intent: ManagedIdleCloseIntent,
+		acknowledgedSessionId: string,
+	): Promise<void>;
+	retire(
+		record: ManagedIdleGenerationRecord,
+		intent: ManagedIdleCloseIntent,
+		evidence: Readonly<Record<string, unknown>>,
+	): Promise<void>;
 	markUncertain(record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent, reason: string): Promise<void>;
 	evict(record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent): Promise<void>;
 	/** Runs after durable retirement and before eviction; must be idempotent by intent.key. */
@@ -66,7 +76,17 @@ export interface ManagedIdleLifecycleRuntime {
 		readonly timeoutMs?: number;
 	}): Promise<Readonly<{ ok: boolean; certainty?: string; result?: Readonly<{ sessionId: string }> }>>;
 	reconcile(): Promise<void>;
-	generationStatus(key: TenantSessionKey): Promise<Readonly<{ status: string }>>;
+	generationStatus(key: TenantSessionKey): Promise<
+		Readonly<{
+			status: string;
+			evidence?: {
+				readonly source: string;
+				readonly observedIndexSeq: number;
+				readonly evidenceIndexSeq?: number;
+				readonly event?: string;
+			};
+		}>
+	>;
 }
 
 export interface CreateManagedIdleReaperInput {
@@ -228,7 +248,7 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 			try {
 				await lease.assertFence();
 				if (this.#stopped) {
-					await this.input.records.restoreActive(record, intent);
+					await this.input.records.markUncertain(record, intent, "Stopped after durable close reservation.");
 					return;
 				}
 				outcome = await this.input.runtime.closeLifecycleSession({
@@ -239,19 +259,18 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 					target: { sessionId: record.authority.sessionId, endpointGeneration: record.authority.generation },
 					timeoutMs: this.input.closeTimeoutMs,
 				});
+				if (!outcome.ok || outcome.result?.sessionId !== key.sessionId)
+					throw new Error("Managed close lacks matching success and exact retirement.");
+				await this.input.records.acknowledge(record, intent, outcome.result.sessionId);
 				await lease.assertFence();
 				await this.input.runtime.reconcile();
 				await lease.assertFence();
 				const status = await this.input.runtime.generationStatus(key);
 				await lease.assertFence();
-				if (outcome.ok && outcome.result?.sessionId === key.sessionId && status.status === "retired") {
-					await this.input.records.retire(record, intent);
+				if (status.status === "retired" && status.evidence !== undefined) {
+					await this.input.records.retire(record, intent, { ...status.evidence });
 					retired = true;
 					await this.finishRetirement(record, intent, lease);
-					return;
-				}
-				if (status.status === "current" && !outcome.ok && outcome.certainty === "retryable") {
-					await this.input.records.restoreActive(record, intent);
 					return;
 				}
 				throw new Error(
@@ -343,14 +362,11 @@ class ManagedV3GenerationStore implements ManagedIdleGenerationStore {
 		const operations = this.mappings.operationsScoped(scope);
 		if (generationState(mapping, operations) !== "active" || latestActivityAt(operations) !== record.lastActivityAt)
 			return false;
-		const closeOperations = operations.filter(operation => operation.kind === "close");
-		const prior = closeOperations[closeOperations.length - 1];
-		const key = nextManagedCloseIngress(intent.key, mapping.operationId, closeOperations, prior);
-		this.mappings.beginOperationScoped(scope, {
-			id: key,
-			kind: "close",
-			ingressId: key,
-			detail: key,
+		const key = intent.key;
+		this.mappings.reserveManagedRetirementScoped(scope, record.authority, {
+			operationId: key,
+			requestKey: key,
+			payloadHash: managedIdleClosePayloadHash(record.authority, key),
 		});
 		return key === intent.key ? true : { ...intent, key };
 	}
@@ -370,40 +386,47 @@ class ManagedV3GenerationStore implements ManagedIdleGenerationStore {
 		return { key: operation.id, authority: record.authority, requestedAt: Date.parse(operation.startedAt) };
 	}
 
-	async restoreActive(_record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent): Promise<void> {
-		const scope = scopeFor(intent.authority);
+	async acknowledge(
+		record: ManagedIdleGenerationRecord,
+		intent: ManagedIdleCloseIntent,
+		acknowledgedSessionId: string,
+	): Promise<void> {
+		const scope = scopeFor(record.authority);
 		const mapping = this.mappings.getScoped(scope);
-		if (mapping === undefined || !sameManagedAuthority(mapping, intent.authority)) return;
-		if (this.mappings.operationScoped(scope, intent.key) === undefined) return;
-		this.mappings.transitionOperationScoped(
+		const operation = this.mappings.operationScoped(scope, intent.key);
+		if (
+			mapping === undefined ||
+			!sameManagedAuthority(mapping, record.authority) ||
+			acknowledgedSessionId !== record.authority.sessionId ||
+			operation?.lifecycle === undefined
+		)
+			throw new Error("Managed close acknowledgement does not match its canonical reservation.");
+		const observedAt = new Date().toISOString();
+		this.mappings.recordLifecycleEvidenceScoped(
 			scope,
 			intent.key,
-			"conflict",
-			"Managed session close remains current and is retryable.",
+			operation.detail!,
+			transitionManagedLifecycleEvidence(
+				operation.lifecycle,
+				"closing",
+				{
+					closeAcknowledgement: {
+						sessionId: acknowledgedSessionId,
+						generation: record.authority.generation,
+						observedAt,
+					},
+				},
+				observedAt,
+			),
 		);
 	}
 
-	async retire(record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent): Promise<void> {
-		const scope = scopeFor(record.authority);
-		const mapping = this.mappings.getScoped(scope);
-		if (mapping === undefined || !sameManagedAuthority(mapping, record.authority))
-			throw new Error("Managed V3 mapping changed before durable retirement.");
-		const result: SessionOperationResult = {
-			kind: "close",
-			assistantText: "",
-			events: [],
-			managedAuthority: record.authority,
-			mapping: {
-				chatId: mapping.chatId,
-				projectId: mapping.projectId,
-				sessionId: mapping.sessionId,
-				rawFrameCursor: mapping.rawFrameCursor,
-				eventCursor: mapping.eventCursor,
-				operationId: intent.key,
-			},
-			correlation: { closeStatus: "closed", mappingOperationId: mapping.operationId },
-		};
-		this.mappings.transitionOperationScoped(scope, intent.key, "complete", intent.key, result);
+	async retire(
+		record: ManagedIdleGenerationRecord,
+		intent: ManagedIdleCloseIntent,
+		evidence: Readonly<Record<string, unknown>>,
+	): Promise<void> {
+		this.mappings.completeManagedRetirementScoped(scopeFor(record.authority), record.authority, intent.key, evidence);
 	}
 
 	async markUncertain(
@@ -414,8 +437,18 @@ class ManagedV3GenerationStore implements ManagedIdleGenerationStore {
 		const scope = scopeFor(intent.authority);
 		const mapping = this.mappings.getScoped(scope);
 		if (mapping === undefined || !sameManagedAuthority(mapping, intent.authority)) return;
-		if (this.mappings.operationScoped(scope, intent.key) === undefined) return;
-		this.mappings.transitionOperationScoped(scope, intent.key, "uncertain", reason);
+		const operation = this.mappings.operationScoped(scope, intent.key);
+		if (operation === undefined) return;
+		if (operation.lifecycle?.state === "closing")
+			this.mappings.recordLifecycleEvidenceScoped(
+				scope,
+				intent.key,
+				operation.detail!,
+				transitionManagedLifecycleEvidence(operation.lifecycle, "uncertain"),
+			);
+		// The payload binding is immutable; error text is caller-visible, not a new hash.
+		void reason;
+		this.mappings.transitionOperationScoped(scope, intent.key, "uncertain", operation.detail);
 	}
 
 	async evict(record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent): Promise<void> {
@@ -492,22 +525,16 @@ function generationState(mapping: SessionMapping, operations: readonly SessionOp
 	if (operations.some(operation => operation.state === "pending")) return "inflight";
 	const current = operations.find(operation => operation.id === mapping.operationId);
 	if (current === undefined || current.state !== "complete") return "uncertain";
-	const authority = mapping.managedAuthority!;
-	const base = closeKey(authority);
 	for (const operation of operations) {
 		if (operation.kind !== "close") {
 			if (operation.state === "uncertain" || operation.state === "conflict") return "uncertain";
 			continue;
 		}
-		const idleClose =
-			operation.id === base ||
-			operation.id.startsWith(`${base}:retry:`) ||
-			operation.id.startsWith(`${base}:rearmed:`);
 		if (operation.state !== "complete") {
-			// Only an explicitly not-applied idle close is safe to retry. Manual or
-			// uncertain closes must be reconciled by their owner, including after restart.
-			if (operation.state !== "conflict" || !idleClose) return "uncertain";
+			// A retryable label or conflict journal state is not public not-applied proof.
+			return "uncertain";
 		}
+		if (completedRetirement(mapping, [operation]) === undefined) return "uncertain";
 	}
 	return completedRetirement(mapping, operations) === undefined ? "active" : "closing";
 }
@@ -542,22 +569,6 @@ function completedRetirement(
 	return undefined;
 }
 
-function nextManagedCloseIngress(
-	base: string,
-	mappingOperationId: string,
-	operations: readonly SessionOperation[],
-	prior: SessionOperation | undefined,
-): string {
-	if (prior === undefined) return base;
-	const retryCount = operations.filter(operation => operation.id.startsWith(`${base}:retry:`)).length + 1;
-	const priorMappingOperationId = prior.result?.correlation?.mappingOperationId;
-	if (prior.state === "complete" && priorMappingOperationId !== mappingOperationId) {
-		const rearmCount = operations.filter(operation => operation.id.startsWith(`${base}:rearmed:`)).length + 1;
-		return `${base}:rearmed:${mappingOperationId}:${rearmCount}`;
-	}
-	return `${base}:retry:${retryCount}`;
-}
-
 function tenantKey(authority: ManagedTurnAuthority): TenantSessionKey {
 	return {
 		principalId: authority.principalId,
@@ -585,7 +596,22 @@ function recordIdentity(authority: ManagedTurnAuthority): string {
 }
 
 function closeKey(authority: ManagedTurnAuthority): string {
-	return `managed-idle-close:${recordIdentity(authority)}`;
+	return `managed-idle-close:${createHash("sha256").update(recordIdentity(authority)).digest("hex")}`;
+}
+
+export function managedIdleClosePayloadHash(authority: ManagedTurnAuthority, requestKey: string): string {
+	return createHash("sha256")
+		.update(
+			JSON.stringify([
+				"session.close",
+				recordIdentity(authority),
+				authority.requestKey,
+				requestKey,
+				authority.sessionId,
+				authority.generation,
+			]),
+		)
+		.digest("hex");
 }
 
 function errorMessage(error: unknown): string {

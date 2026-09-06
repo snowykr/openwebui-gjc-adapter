@@ -39,12 +39,14 @@ class FakeGjcTurnRunner implements GjcTurnRunner {
 			lifecycle: ReturnType<typeof lifecycleFixture>,
 		) => Promise<void>,
 	): Promise<T> {
+		await input.onLifecycleInvoking?.();
 		const authority = {
 			...input.preparedManagedAuthority,
 			sessionId: "session-1",
 			generation: 1,
 			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
 		} as ManagedTurnAuthority & { readonly authorityEpoch: typeof SESSION_AUTHORITY_V3_EPOCH };
+		await input.onLifecycleAcknowledged?.(authority);
 		const result = {
 			cwd: input.cwd,
 			sessionRoot: input.sessionRoot,

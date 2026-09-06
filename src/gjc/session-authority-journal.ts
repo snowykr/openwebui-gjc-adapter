@@ -331,13 +331,14 @@ export class SessionAuthorityJournal {
 		const completedAt = new Date().toISOString();
 		const journalOperation: SessionOperation = {
 			id: operation.id,
-			kind: "prompt",
+			kind: reserved.lifecycle === undefined ? "prompt" : "create",
 			state: "complete",
 			ingressId: operation.ingressId,
 			detail: operation.detail,
 			startedAt: reserved.startedAt,
 			completedAt,
 			result: operationResult("turn", mapping),
+			...(reserved.lifecycle === undefined ? {} : { lifecycle: structuredClone(reserved.lifecycle) }),
 		};
 		if (reassignment?.state === "pending" && mapping.projectId === reassignment.targetProjectId) {
 			const target = createAuthorityIdentity({ ...mapping, journal: [journalOperation] });
@@ -482,7 +483,8 @@ export class SessionAuthorityJournal {
 			current.ingressId !== operation.ingressId ||
 			current.detail !== operation.detail ||
 			current.state !== "pending" ||
-			current.acknowledgedSuccessor !== undefined
+			current.acknowledgedSuccessor !== undefined ||
+			(current.lifecycle !== undefined && current.lifecycle.state !== "intent_prepared")
 		)
 			throw new Error(`Session operation ${operation.id} requires reconciliation.`);
 		const journal = record.journal.filter((_, candidateIndex) => candidateIndex !== index);
@@ -501,7 +503,8 @@ export class SessionAuthorityJournal {
 			operation.detail === undefined ||
 			current.detail !== operation.detail ||
 			current.state !== "pending" ||
-			current.acknowledgedSuccessor !== undefined
+			current.acknowledgedSuccessor !== undefined ||
+			(current.lifecycle !== undefined && current.lifecycle.state !== "intent_prepared")
 		)
 			throw new Error(`Session operation ${operation.id} requires reconciliation.`);
 		const key = provisionalKey(current.chatId, current.ingressId ?? current.id);

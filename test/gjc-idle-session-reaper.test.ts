@@ -1,9 +1,16 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildAdapterServerOptions } from "../src/adapter-server-options";
-import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
+import {
+	createManagedLifecycleEvidence,
+	lifecycleExactAuthority,
+	lifecyclePreparedAuthority,
+	transitionManagedLifecycleEvidence,
+} from "../src/gjc/managed-lifecycle-evidence";
+import { parseSessionAuthorityV3Document, SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import type { SessionMapping, SessionMappingStore } from "../src/gjc/session-router";
 import { V3FileBackedSessionMappingStore } from "../src/gjc/session-v3-file-backed-mapping-store";
 import type { ManagedTurnAuthority } from "../src/gjc/turn-runner";
@@ -23,6 +30,14 @@ const project = {
 	allowedRoot: "/workspace",
 	createdAt: new Date("2026-01-01T00:00:00.000Z"),
 };
+
+// Synthetic public Router observation; this fixture does not supply production exact-close authority.
+const retirementEvidence = {
+	source: "session_index",
+	observedIndexSeq: 3,
+	evidenceIndexSeq: 3,
+	event: "session_closed",
+} as const;
 
 function managedRuntimeFixture() {
 	let state: "new" | "running" | "stopped" = "new";
@@ -237,18 +252,44 @@ describe("managed V3 idle retirement", () => {
 		const authorityPath = join(root, "session-authority.json");
 		const initial = new V3FileBackedSessionMappingStore(authorityPath);
 		const scope = { principalId: mapping.principalId!, chatId: mapping.chatId };
+		const authority = mapping.managedAuthority!;
+		const payloadHash = "a".repeat(64);
 		const operation = {
 			id: mapping.operationId,
-			kind: "prompt" as const,
+			kind: "create" as const,
 			ingressId: mapping.operationId,
-			detail: mapping.operationId,
+			detail: payloadHash,
 			chatId: mapping.chatId,
 			projectId: mapping.projectId,
 		};
 		initial.reserveProvisionalOperationScoped(scope, operation);
+		let lifecycle = createManagedLifecycleEvidence({
+			operation: "session.create",
+			preparedAuthority: lifecyclePreparedAuthority(authority),
+			target: { path: authority.canonicalWorkspace, kind: "existing_path" },
+			payloadHash,
+		});
+		initial.recordLifecycleEvidenceScoped(scope, operation.id, payloadHash, lifecycle);
+		lifecycle = transitionManagedLifecycleEvidence(lifecycle, "invoking");
+		initial.recordLifecycleEvidenceScoped(scope, operation.id, payloadHash, lifecycle);
+		lifecycle = transitionManagedLifecycleEvidence(lifecycle, "acknowledged_unproven", {
+			acknowledged: lifecycleExactAuthority(authority),
+		});
+		initial.recordLifecycleEvidenceScoped(scope, operation.id, payloadHash, lifecycle);
+		lifecycle = transitionManagedLifecycleEvidence(lifecycle, "active_generation_proven", {
+			proven: {
+				kind: "managed-generation",
+				sessionId: authority.sessionId,
+				generation: authority.generation,
+				leaseId: authority.leaseId,
+				epoch: authority.epoch,
+			},
+		});
+		initial.recordLifecycleEvidenceScoped(scope, operation.id, payloadHash, lifecycle);
 		initial.publishProvisionalOperationScoped(scope, operation, mapping);
 		initial.close();
 		return {
+			authorityPath,
 			mapping,
 			mappings: new V3FileBackedSessionMappingStore(authorityPath),
 			reopen: () => new V3FileBackedSessionMappingStore(authorityPath),
@@ -303,7 +344,7 @@ describe("managed V3 idle retirement", () => {
 			},
 			generationStatus: async () => {
 				lifecycleCalls.push("status");
-				return { status: "retired" };
+				return { status: "retired", evidence: retirementEvidence };
 			},
 		});
 
@@ -330,16 +371,29 @@ describe("managed V3 idle retirement", () => {
 		});
 		expect(scopedMapping).toBeDefined();
 		expect(scopedMapping!.managedAuthority).toEqual(record!.authority);
-		const prepared = await records.prepareClose(record!, {
+		const intent = {
 			key: "managed-close-prepare",
 			authority: record!.authority,
 			requestedAt: Date.now(),
-		});
+		};
+		const prepared = await records.prepareClose(record!, intent);
 		expect(prepared).toBe(true);
-		fixture.mappings.retireScoped({
-			principalId: record!.authority.principalId,
-			chatId: record!.authority.chatId,
+		expect(fixture.mappings.operationScoped(record!.authority, intent.key)?.lifecycle).toMatchObject({
+			state: "closing",
+			sourceProofRef: { operationId: fixture.mapping.operationId },
 		});
+		const beforeAcknowledgement = await readFile(fixture.authorityPath, "utf8");
+		await expect(records.retire(record!, intent, retirementEvidence)).rejects.toThrow(
+			"durable successful close acknowledgement",
+		);
+		expect(await readFile(fixture.authorityPath, "utf8")).toBe(beforeAcknowledgement);
+		await records.acknowledge(record!, intent, record!.authority.sessionId);
+		await records.retire(record!, intent, retirementEvidence);
+		expect(fixture.mappings.operationScoped(record!.authority, intent.key)).toMatchObject({
+			state: "complete",
+			lifecycle: { state: "retired", retirement: { evidence: retirementEvidence } },
+		});
+		await records.evict(record!, intent);
 		expect(
 			fixture.mappings.getScoped({ principalId: record!.authority.principalId, chatId: record!.authority.chatId }),
 		).toBeUndefined();
@@ -347,24 +401,22 @@ describe("managed V3 idle retirement", () => {
 		await fixture.cleanup();
 	});
 
-	test("restarts a retryable close with a deterministic ingress and then retires", async () => {
+	test("retryable rejection remains uncertain under the same exact key after actual reopen without redispatch", async () => {
 		const fixture = await createV3Fixture();
 		let { mappings } = fixture;
 		const scope = { principalId: fixture.mapping.principalId!, chatId: fixture.mapping.chatId };
 		let now = Date.now() + 100_000;
-		let attempt = 0;
 		const ingressIds: string[] = [];
 		const authorities: unknown[] = [];
 		const runtime = runtimeFor(
 			async request => {
-				attempt += 1;
 				ingressIds.push(request.requestKey);
 				authorities.push({ tenant: request.tenant, target: request.target });
-				return attempt === 1
-					? { ok: false, certainty: "retryable" }
-					: { ok: true, result: { sessionId: request.target.sessionId } };
+				return { ok: false, certainty: "retryable" };
 			},
-			async () => ({ status: attempt === 1 ? "current" : "retired" }),
+			async () => {
+				throw new Error("A rejected close must not query retirement.");
+			},
 		);
 		const first = reaperFor(
 			mappings,
@@ -372,10 +424,13 @@ describe("managed V3 idle retirement", () => {
 			async () => undefined,
 			() => now,
 		);
-		await first.runOnce();
+		await expect(first.runOnce()).rejects.toThrow("matching success and exact retirement");
 		await first.stop();
 		const prior = mappings.operationScoped(scope, ingressIds[0]!);
-		expect(prior?.state).toBe("conflict");
+		expect(prior).toMatchObject({ state: "uncertain", lifecycle: { state: "uncertain" } });
+		expect(prior?.lifecycle?.requestKey).toBe(ingressIds[0]);
+		expect(prior?.lifecycle?.closeAcknowledgement).toBeUndefined();
+		expect(prior?.lifecycle?.source).toEqual(lifecycleExactAuthority(fixture.mapping.managedAuthority!));
 		mappings.close();
 		mappings = fixture.reopen();
 		expect(mappings.operationScoped(scope, ingressIds[0]!)).toEqual(prior);
@@ -388,44 +443,86 @@ describe("managed V3 idle retirement", () => {
 		);
 		await restarted.runOnce();
 
-		expect(ingressIds).toHaveLength(2);
-		expect(ingressIds[1]).toBe(`${ingressIds[0]}:retry:1`);
-		expect(authorities[1]).toEqual(authorities[0]);
-		expect(mappings.entries()).toHaveLength(0);
+		expect(ingressIds).toHaveLength(1);
+		const { requestKey: _requestKey, ...tenant } = lifecycleExactAuthority(fixture.mapping.managedAuthority!);
+		expect(authorities).toEqual([
+			{ tenant, target: { sessionId: tenant.sessionId, endpointGeneration: tenant.generation } },
+		]);
+		expect(mappings.operationScoped(scope, ingressIds[0]!)).toEqual(prior);
+		expect(mappings.operationsScoped(scope).filter(operation => operation.kind === "close")).toEqual([prior!]);
+		expect(mappings.getScoped(scope)?.managedAuthority).toEqual(fixture.mapping.managedAuthority);
 		await restarted.stop();
 		mappings.close();
 		await fixture.cleanup();
 	});
 
-	test("rearms a previously completed close after the mapping operation advances", async () => {
+	test("a persisted idle-close conflict cannot authorize a retry after reopen", async () => {
+		const fixture = await createV3Fixture();
+		let mappings = fixture.mappings;
+		const records = createManagedV3GenerationStore(mappings);
+		const record = (await records.active())[0]!;
+		const authority = record.authority;
+		const identity = [
+			authority.principalId,
+			authority.projectId,
+			authority.canonicalWorkspace,
+			authority.chatId,
+			authority.sessionId,
+			authority.generation,
+			authority.leaseId,
+			authority.epoch,
+		].join("\u0000");
+		const key = `managed-idle-close:${createHash("sha256").update(identity).digest("hex")}`;
+		const intent = { key, authority, requestedAt: Date.now() };
+		try {
+			expect(await records.prepareClose(record, intent)).toBe(true);
+			const reserved = mappings.operationScoped(authority, key)!;
+			mappings.transitionOperationScoped(authority, key, "conflict", reserved.detail);
+			mappings.close();
+			mappings = fixture.reopen();
+			const before = await readFile(fixture.authorityPath, "utf8");
+			const forbidden = async (): Promise<never> => {
+				throw new Error("Conflict is not not-applied proof.");
+			};
+			const restarted = reaperFor(mappings, {
+				closeLifecycleSession: forbidden,
+				reconcile: forbidden,
+				generationStatus: forbidden,
+			});
+			await restarted.runOnce();
+			await restarted.stop();
+			expect((await createManagedV3GenerationStore(mappings).active())[0]?.state).toBe("uncertain");
+			expect(mappings.operationScoped(authority, key)?.state).toBe("conflict");
+			expect(await readFile(fixture.authorityPath, "utf8")).toBe(before);
+		} finally {
+			mappings.close();
+			await fixture.cleanup();
+		}
+	});
+
+	test("a new mapping operation ID cannot rearm a retired exact generation after reopen", async () => {
 		const fixture = await createV3Fixture();
 		let { mappings } = fixture;
 		const { mapping: original } = fixture;
 		const scope = { principalId: original.principalId!, chatId: original.chatId };
-		mappings.beginOperationScoped(scope, {
-			id: "managed-close",
-			kind: "close",
-			ingressId: "managed-close",
-			detail: "managed-close",
-		});
-		mappings.transitionOperationScoped(scope, "managed-close", "complete", "managed-close", {
-			kind: "close",
-			assistantText: "",
-			events: [],
-			managedAuthority: original.managedAuthority!,
-			mapping: {
-				chatId: original.chatId,
-				projectId: original.projectId,
-				sessionId: original.sessionId,
-				rawFrameCursor: original.rawFrameCursor,
-				eventCursor: original.eventCursor,
-				operationId: "managed-close",
-			},
-			correlation: { closeStatus: "closed", mappingOperationId: original.operationId },
-		});
-		mappings.upsertScoped(scope, { ...original, operationId: "turn-2" });
+		const records = createManagedV3GenerationStore(mappings);
+		const record = (await records.active())[0]!;
+		const intent = { key: "managed-close", authority: record.authority, requestedAt: Date.now() };
+		expect(await records.prepareClose(record, intent)).toBe(true);
+		await records.acknowledge(record, intent, record.authority.sessionId);
+		await records.retire(record, intent, retirementEvidence);
+		mappings.beginOperationScoped(scope, { id: "turn-2", kind: "prompt", ingressId: "turn-2", detail: "turn-2" });
+		mappings.completeOperationWithMappingScoped(
+			scope,
+			"turn-2",
+			"turn-2",
+			{ ...original, operationId: "turn-2" },
+			"turn",
+		);
 		mappings.close();
 		mappings = fixture.reopen();
+		const before = JSON.stringify(mappings.operationsScoped(scope));
+		const beforeBytes = await readFile(fixture.authorityPath, "utf8");
 		const ingressIds: string[] = [];
 		const reaper = reaperFor(
 			mappings,
@@ -434,26 +531,148 @@ describe("managed V3 idle retirement", () => {
 					ingressIds.push(request.requestKey);
 					return { ok: true, result: { sessionId: request.target.sessionId } };
 				},
-				async () => ({ status: "retired" }),
+				async () => ({ status: "retired", evidence: retirementEvidence }),
 			),
 		);
 		await reaper.runOnce();
+		const reopenedRecords = createManagedV3GenerationStore(mappings);
+		const reopenedRecord = (await reopenedRecords.active())[0]!;
+		expect(reopenedRecord.state).toBe("uncertain");
+		expect(
+			await reopenedRecords.prepareClose(reopenedRecord, {
+				key: "new-close-key",
+				authority: reopenedRecord.authority,
+				requestedAt: Date.now(),
+			}),
+		).toBe(false);
 
-		expect(ingressIds[0]).toContain(":rearmed:turn-2:1");
-		expect(mappings.entries()).toHaveLength(0);
+		expect(ingressIds).toEqual([]);
+		expect(JSON.stringify(mappings.operationsScoped(scope))).toBe(before);
+		expect(await readFile(fixture.authorityPath, "utf8")).toBe(beforeBytes);
+		expect(mappings.getScoped(scope)?.managedAuthority).toEqual(original.managedAuthority);
+		expect(mappings.operationScoped(scope, intent.key)?.lifecycle?.state).toBe("retired");
 		await reaper.stop();
 		mappings.close();
 		await fixture.cleanup();
 	});
 
-	test("restart preserves manual pending or uncertain close and interrupted turn exclusion", async () => {
+	test.each([
+		{ name: "missing", evidence: undefined },
+		{ name: "missing evidence sequence", evidence: { source: "session_index", observedIndexSeq: 3 } },
+		{ name: "non-index", evidence: { ...retirementEvidence, source: "endpoint" } },
+		{ name: "nonpositive sequence", evidence: { ...retirementEvidence, evidenceIndexSeq: 0 } },
+		{ name: "unobserved sequence", evidence: { ...retirementEvidence, evidenceIndexSeq: 4 } },
+		{ name: "non-retirement event", evidence: { ...retirementEvidence, event: "session_opened" } },
+	])("rejects $name positive retirement evidence and retains acknowledgement across reopen", async ({ evidence }) => {
+		const fixture = await createV3Fixture();
+		let mappings = fixture.mappings;
+		const scope = { principalId: fixture.mapping.principalId!, chatId: fixture.mapping.chatId };
+		const closeKeys: string[] = [];
+		const runtime = runtimeFor(
+			async request => {
+				closeKeys.push(request.requestKey);
+				return { ok: true, result: { sessionId: request.target.sessionId } };
+			},
+			async () => ({ status: "retired", ...(evidence === undefined ? {} : { evidence }) }),
+		);
+		const first = reaperFor(mappings, runtime);
+		try {
+			await expect(first.runOnce()).rejects.toThrow("retirement");
+			await first.stop();
+			const receipt = mappings.operationScoped(scope, closeKeys[0]!)!;
+			expect(receipt).toMatchObject({
+				state: "uncertain",
+				lifecycle: {
+					state: "uncertain",
+					closeAcknowledgement: { sessionId: fixture.mapping.sessionId, generation: 1 },
+				},
+			});
+			expect(receipt.lifecycle?.retirement).toBeUndefined();
+			expect(receipt.result).toBeUndefined();
+			expect(mappings.getScoped(scope)?.managedAuthority).toEqual(fixture.mapping.managedAuthority);
+			mappings.close();
+			mappings = fixture.reopen();
+			expect(mappings.operationScoped(scope, closeKeys[0]!)).toEqual(receipt);
+			const restarted = reaperFor(mappings, runtime);
+			await restarted.runOnce();
+			await restarted.stop();
+			expect(closeKeys).toHaveLength(1);
+			expect(mappings.operationsScoped(scope).filter(operation => operation.kind === "close")).toEqual([receipt]);
+		} finally {
+			mappings.close();
+			await fixture.cleanup();
+		}
+	});
+
+	test("persists matching acknowledgement before status failure and reopens without remote redispatch", async () => {
+		const fixture = await createV3Fixture();
+		let mappings = fixture.mappings;
+		const scope = { principalId: fixture.mapping.principalId!, chatId: fixture.mapping.chatId };
+		const failure = new Error("status unavailable");
+		const closeKeys: string[] = [];
+		const observations: string[] = [];
+		const runtime: ManagedIdleLifecycleRuntime = {
+			closeLifecycleSession: async request => {
+				closeKeys.push(request.requestKey);
+				return { ok: true, result: { sessionId: request.target.sessionId } };
+			},
+			reconcile: async () => {
+				const persisted = parseSessionAuthorityV3Document(await readFile(fixture.authorityPath, "utf8"));
+				const receipt = persisted?.mappings[0]?.journal.find(operation => operation.id === closeKeys[0]);
+				expect(receipt?.lifecycle?.closeAcknowledgement).toMatchObject({
+					sessionId: fixture.mapping.sessionId,
+					generation: 1,
+				});
+				observations.push("durable acknowledgement");
+			},
+			generationStatus: async () => {
+				observations.push("status failure");
+				throw failure;
+			},
+		};
+		const first = reaperFor(mappings, runtime);
+		try {
+			await expect(first.runOnce()).rejects.toBe(failure);
+			await first.stop();
+			expect(observations).toEqual(["durable acknowledgement", "status failure"]);
+			const receipt = mappings.operationScoped(scope, closeKeys[0]!)!;
+			expect(receipt).toMatchObject({
+				state: "uncertain",
+				lifecycle: {
+					state: "uncertain",
+					closeAcknowledgement: { sessionId: fixture.mapping.sessionId, generation: 1 },
+				},
+			});
+			expect(receipt.lifecycle?.retirement).toBeUndefined();
+			mappings.close();
+			mappings = fixture.reopen();
+			expect(mappings.operationScoped(scope, closeKeys[0]!)).toEqual(receipt);
+			const forbidden = async (): Promise<never> => {
+				throw new Error("Uncertain close requires external reconciliation.");
+			};
+			const restarted = reaperFor(mappings, {
+				closeLifecycleSession: forbidden,
+				reconcile: forbidden,
+				generationStatus: forbidden,
+			});
+			await restarted.runOnce();
+			await restarted.stop();
+			expect(closeKeys).toHaveLength(1);
+			expect(mappings.getScoped(scope)?.managedAuthority).toEqual(fixture.mapping.managedAuthority);
+		} finally {
+			mappings.close();
+			await fixture.cleanup();
+		}
+	});
+
+	test("restart preserves pending, uncertain, and conflict close or interrupted turn exclusion", async () => {
 		for (const kind of ["close", "prompt"] as const) {
-			for (const state of ["pending", "uncertain"] as const) {
+			for (const state of ["pending", "uncertain", "conflict"] as const) {
 				const fixture = await createV3Fixture();
 				let mappings = fixture.mappings;
 				const scope = { principalId: fixture.mapping.principalId!, chatId: fixture.mapping.chatId };
 				mappings.beginOperationScoped(scope, { id: "interrupted", kind, ingressId: "interrupted", detail: "hash" });
-				if (state === "uncertain") mappings.transitionOperationScoped(scope, "interrupted", state, "hash");
+				if (state !== "pending") mappings.transitionOperationScoped(scope, "interrupted", state, "hash");
 				mappings.close();
 				mappings = fixture.reopen();
 				let closes = 0;
@@ -464,12 +683,14 @@ describe("managed V3 idle retirement", () => {
 							closes += 1;
 							return { ok: true, result: { sessionId: request.target.sessionId } };
 						},
-						async () => ({ status: "retired" }),
+						async () => ({ status: "retired", evidence: retirementEvidence }),
 					),
 				);
 				await reaper.runOnce();
 				expect(closes).toBe(0);
-				expect(mappings.operationScoped(scope, "interrupted")?.state).toBe("uncertain");
+				expect(mappings.operationScoped(scope, "interrupted")?.state).toBe(
+					state === "pending" ? "uncertain" : state,
+				);
 				expect(mappings.getScoped(scope)).toBeDefined();
 				await reaper.stop();
 				mappings.close();
@@ -490,6 +711,7 @@ describe("managed V3 idle retirement", () => {
 			{ generation: 2 },
 			{ leaseId: "foreign" },
 			{ epoch: "foreign" },
+			{ requestKey: "foreign" },
 		]) {
 			const foreign = { ...record, authority: { ...record.authority, ...change } };
 			await expect(
@@ -522,7 +744,7 @@ describe("managed V3 idle retirement", () => {
 				closes += 1;
 				return { ok: true, result: { sessionId: request.target.sessionId } };
 			},
-			async () => ({ status: "retired" }),
+			async () => ({ status: "retired", evidence: retirementEvidence }),
 		);
 		const first = reaperFor(fixture.mappings, runtime);
 		await first.runOnce();
@@ -550,7 +772,7 @@ describe("managed V3 idle retirement", () => {
 					closes += 1;
 					return { ok: true, result: { sessionId: request.target.sessionId } };
 				},
-				async () => ({ status: "retired" }),
+				async () => ({ status: "retired", evidence: retirementEvidence }),
 			);
 			const records = createManagedV3GenerationStore(mappings);
 			const published = new Set<string>();
@@ -622,7 +844,8 @@ describe("managed V3 idle retirement", () => {
 		const intent = { key: "exact-retirement", authority: record.authority, requestedAt: Date.now() };
 		try {
 			await records.prepareClose(record, intent);
-			await records.retire(record, intent);
+			await records.acknowledge(record, intent, record.authority.sessionId);
+			await records.retire(record, intent, retirementEvidence);
 			for (const change of [
 				{ principalId: "foreign" },
 				{ projectId: "foreign" },
@@ -653,7 +876,7 @@ describe("managed V3 idle retirement", () => {
 			mappings,
 			runtimeFor(
 				async request => ({ ok: true, result: { sessionId: request.target.sessionId } }),
-				async () => ({ status: "retired" }),
+				async () => ({ status: "retired", evidence: retirementEvidence }),
 			),
 			async () => {
 				fenceChecks += 1;

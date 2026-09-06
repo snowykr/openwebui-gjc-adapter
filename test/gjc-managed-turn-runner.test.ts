@@ -1,9 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import type { NormalizedModelSelection } from "../src/contracts";
 import type { ManagedSdkAttachment, ManagedSdkRuntime, TenantSessionKey } from "../src/gjc/managed-sdk-runtime";
-import type { ManagedPreparedTurnAuthority, ManagedTurnAuthority } from "../src/gjc/turn-runner";
+import type {
+	ManagedLifecycleControlOwner,
+	ManagedPreparedTurnAuthority,
+	ManagedTurnAuthority,
+} from "../src/gjc/turn-runner";
 import type { LiveGatewayRunnerInput } from "../src/live/chat-completions";
 import { createManagedGjcTurnRunner } from "../src/live/gjc-managed-turn-runner";
+import { controlOperationHash, lifecycleControlRequestKey } from "../src/live/gjc-routing-publication";
 
 const authority: ManagedTurnAuthority = {
 	principalId: "principal-1",
@@ -520,13 +525,21 @@ describe("managed turn runner", () => {
 			{ ...managedAbortAndPromptInput(), control: { operation: "session.new" } },
 			managedControlMapping(),
 			{} as never,
-			successor => {
-				acknowledged = true;
-				expect(successor).toMatchObject({
-					sessionId: "new-session",
-					managedAuthority: { generation: 12, principalId: authority.principalId },
-				});
-			},
+			undefined,
+			undefined,
+			controlOwner(
+				{ ...managedAbortAndPromptInput(), control: { operation: "session.new" } },
+				{
+					onAcknowledged: successor => {
+						acknowledged = true;
+						expect(successor).toMatchObject({
+							sessionId: "new-session",
+							generation: 12,
+							principalId: authority.principalId,
+						});
+					},
+				},
+			),
 		);
 		expect(result.result?.managedAuthority?.sessionId).toBe("new-session");
 		expect(result.result?.managedAuthority?.requestKey).not.toBe(authority.requestKey);
@@ -546,7 +559,7 @@ describe("managed turn runner", () => {
 			runner.runControl!(
 				{
 					...managedAbortAndPromptInput(),
-					control: { operation: "session.resume", sessionId: "foreign", sessionFile: "/foreign/session" },
+					control: { operation: "session.resume", sessionId: "foreign" },
 				},
 				managedControlMapping(),
 				{} as never,
@@ -608,60 +621,9 @@ describe("managed turn runner", () => {
 		);
 	});
 
-	test("routes managed branch through public lifecycle and returns exact successor authority", async () => {
+	test("rejects unowned direct branch dispatch without invoking the public fork", async () => {
 		const fake = new RunnerRuntime();
 		fake.forkResult = { sessionId: "successor-session", endpointGeneration: 8 };
-		const runner = createManagedGjcTurnRunner(fake.runtime);
-		const result = await runner.runControl!(
-			{
-				project: { cwd: authority.canonicalWorkspace } as never,
-				prompt: "branch prompt",
-				chatId: authority.chatId,
-				messageId: "message-branch",
-				userMessageId: "message-branch",
-				userMessageParentId: null,
-				continued: true,
-				ownerUserId: authority.principalId,
-				control: { operation: "branch" },
-			} as never,
-			{
-				principalId: authority.principalId,
-				chatId: authority.chatId,
-				projectId: authority.projectId,
-				sessionId: authority.sessionId,
-				rawFrameCursor: 0,
-				eventCursor: 0,
-				operationId: "operation-branch",
-				managedAuthority: authority,
-			},
-			{} as never,
-		);
-		expect(result?.sessionId).toBe("successor-session");
-		expect(result?.result?.managedAuthority).toMatchObject({
-			...authority,
-			sessionId: "successor-session",
-			generation: 8,
-		});
-		expect(result?.result?.managedProof).toEqual({
-			kind: "managed-generation",
-			sessionId: "successor-session",
-			generation: 8,
-			leaseId: authority.leaseId,
-			epoch: authority.epoch,
-		});
-		expect(result?.result).not.toHaveProperty("attachment");
-		expect(JSON.stringify(result)).not.toMatch(/descriptor|sessionFile|tmux|token|credential/i);
-		expect(fake.requests).toHaveLength(0);
-		expect(fake.forkRequests).toHaveLength(1);
-		expect(fake.forkRequests[0]).toMatchObject({
-			capability: "session.fork",
-			requestKey: authority.requestKey,
-			target: { sourceSessionId: authority.sessionId },
-		});
-	});
-
-	test("rejects a lifecycle fork that returns the source identity without closing the source", async () => {
-		const fake = new RunnerRuntime();
 		const runner = createManagedGjcTurnRunner(fake.runtime);
 		await expect(
 			runner.runControl!(
@@ -669,8 +631,8 @@ describe("managed turn runner", () => {
 					project: { cwd: authority.canonicalWorkspace } as never,
 					prompt: "branch prompt",
 					chatId: authority.chatId,
-					messageId: "message-branch-source",
-					userMessageId: "message-branch-source",
+					messageId: "message-branch",
+					userMessageId: "message-branch",
 					userMessageParentId: null,
 					continued: true,
 					ownerUserId: authority.principalId,
@@ -683,15 +645,191 @@ describe("managed turn runner", () => {
 					sessionId: authority.sessionId,
 					rawFrameCursor: 0,
 					eventCursor: 0,
-					operationId: "operation-branch-source",
+					operationId: "operation-branch",
 					managedAuthority: authority,
 				},
 				{} as never,
 			),
+		).rejects.toThrow("gateway-owned forkManagedSuccessor");
+		expect(fake.requests).toHaveLength(0);
+		expect(fake.forkRequests).toHaveLength(0);
+	});
+
+	test("owned successor flow rejects the source identity without closing the source", async () => {
+		const fake = new RunnerRuntime();
+		const runner = createManagedGjcTurnRunner(fake.runtime);
+		await expect(
+			runner.forkManagedSuccessor({
+				source: authority,
+				target: withoutIdentity(),
+				publish: () => {
+					throw new Error("Source must not publish.");
+				},
+			}),
 		).rejects.toBeInstanceOf(Error);
+		expect(fake.forkRequests).toHaveLength(1);
 		expect(fake.closeCalls).toBe(0);
 	});
+
+	test.each(["session.new", "session.resume"] as const)(
+		"requires exact owner hooks and acknowledgement before %s proof acquisition",
+		async operation => {
+			const fake = new RunnerRuntime();
+			const input: LiveGatewayRunnerInput = {
+				...managedAbortAndPromptInput(),
+				control: operation === "session.new" ? { operation } : { operation, sessionId: authority.sessionId },
+			};
+			const expected = {
+				sessionId: operation === "session.new" ? "new-session" : authority.sessionId,
+				endpointGeneration: operation === "session.new" ? 12 : authority.generation,
+			};
+			const order: string[] = [];
+			fake.createPreparedExternalLifecycleSession = async (_key, request) => {
+				order.push("sdk");
+				fake.externalLifecycle.push(request);
+				return { ok: true, result: expected };
+			};
+			fake.resumeExternalLifecycleSession = async (_key, request) => {
+				order.push("sdk");
+				fake.externalLifecycle.push(request!);
+				return { kind: "result", outcome: { ok: true, result: expected } };
+			};
+			const owner = controlOwner(input, {
+				onInvoking: () => {
+					order.push("invoking");
+				},
+				onAcknowledged: acknowledged => {
+					order.push("acknowledged");
+					expect(acknowledged.sessionId).toBe(expected.sessionId);
+				},
+			});
+			fake.proveLifecycleTenant = async (key, operation) => {
+				order.push("proof");
+				expect(order).toEqual(["invoking", "sdk", "acknowledged", "proof"]);
+				expect(operation).toEqual(owner.lifecycleOperation);
+				return fake.registerLifecycleTenant(key, undefined);
+			};
+			const runner = createManagedGjcTurnRunner(fake.runtime);
+			await expect(runner.runControl!(input, managedControlMapping(), {} as never)).rejects.toThrow(
+				"durable operation ownership",
+			);
+			for (const changed of [{ operationId: "foreign" }, { requestKey: "foreign" }, { payloadHash: "a".repeat(64) }])
+				await expect(
+					runner.runControl!(input, managedControlMapping(), {} as never, undefined, undefined, {
+						...owner,
+						lifecycleOperation: { ...owner.lifecycleOperation, ...changed },
+					}),
+				).rejects.toThrow("durable operation ownership");
+			expect(order).toEqual([]);
+			const result = await runner.runControl!(
+				input,
+				managedControlMapping(),
+				{} as never,
+				undefined,
+				undefined,
+				owner,
+			);
+			expect(result.result?.managedAuthority).toMatchObject({
+				...owner.source,
+				sessionId: expected.sessionId,
+				generation: expected.endpointGeneration,
+			});
+			expect(result.result?.managedProof).toEqual({
+				kind: "managed-generation",
+				sessionId: expected.sessionId,
+				generation: expected.endpointGeneration,
+				leaseId: authority.leaseId,
+				epoch: authority.epoch,
+			});
+			expect(fake.externalLifecycle[0]).toMatchObject({
+				requestKey: owner.lifecycleOperation.requestKey,
+				capability: owner.operation,
+			});
+			expect(fake.requests).toEqual([]);
+		},
+	);
+
+	test.each(["session.new", "session.resume"] as const)(
+		"preserves %s acknowledgement persistence failure before registration or proof",
+		async operation => {
+			const fake = new RunnerRuntime();
+			fake.createPreparedExternalLifecycleSession = async () => ({
+				ok: true,
+				result: { sessionId: "new-session", endpointGeneration: 12 },
+			});
+			const input: LiveGatewayRunnerInput = {
+				...managedAbortAndPromptInput(),
+				control: operation === "session.new" ? { operation } : { operation, sessionId: authority.sessionId },
+			};
+			const failure = new Error("acknowledgement persistence failed");
+			await expect(
+				createManagedGjcTurnRunner(fake.runtime).runControl!(
+					input,
+					managedControlMapping(),
+					{} as never,
+					undefined,
+					undefined,
+					controlOwner(input, {
+						onAcknowledged: () => {
+							throw failure;
+						},
+					}),
+				),
+			).rejects.toBe(failure);
+			expect(fake.registered).toEqual([]);
+			expect(fake.closeCalls).toBe(0);
+			expect(fake.requests).toEqual([]);
+		},
+	);
+
+	test.each(["session.new", "session.resume"] as const)(
+		"rejects pre-aborted %s before invoking its owner or SDK",
+		async operation => {
+			const fake = new RunnerRuntime();
+			const abort = new AbortController();
+			abort.abort();
+			const input: LiveGatewayRunnerInput = {
+				...managedAbortAndPromptInput(abort.signal),
+				control: operation === "session.new" ? { operation } : { operation, sessionId: authority.sessionId },
+			};
+			let invoking = 0;
+			await expect(
+				createManagedGjcTurnRunner(fake.runtime).runControl!(
+					input,
+					managedControlMapping(),
+					{} as never,
+					undefined,
+					undefined,
+					controlOwner(input, {
+						onInvoking: () => {
+							invoking += 1;
+						},
+					}),
+				),
+			).rejects.toMatchObject({ code: "gjc_turn_cancelled" });
+			expect(invoking).toBe(0);
+			expect(fake.externalLifecycle).toEqual([]);
+		},
+	);
 });
+
+function controlOwner(
+	input: LiveGatewayRunnerInput,
+	hooks: Partial<Pick<ManagedLifecycleControlOwner, "onInvoking" | "onAcknowledged">> = {},
+): ManagedLifecycleControlOwner {
+	const operation = input.control?.operation === "session.new" ? "session.create" : "session.resume";
+	const payloadHash = controlOperationHash(input);
+	const requestKey = lifecycleControlRequestKey(authority, operation, input.userMessageId, payloadHash);
+	return {
+		operation,
+		source: { ...authority, requestKey },
+		preparedAuthority: { ...withoutIdentity(), requestKey },
+		lifecycleOperation: { operationId: input.userMessageId, requestKey, payloadHash },
+		onInvoking: () => undefined,
+		onAcknowledged: () => undefined,
+		...hooks,
+	};
+}
 
 function withoutIdentity(): ManagedPreparedTurnAuthority {
 	const { sessionId: _sessionId, generation: _generation, ...value } = authority;
@@ -779,6 +917,9 @@ class RunnerRuntime {
 	async registerLifecycleTenant(key: unknown, outcome: unknown) {
 		this.registered.push({ key, outcome });
 		return this.token(key as TenantSessionKey);
+	}
+	async proveLifecycleTenant(key: TenantSessionKey, _operation: ManagedLifecycleControlOwner["lifecycleOperation"]) {
+		return this.registerLifecycleTenant(key, undefined);
 	}
 	private token(key: TenantSessionKey): ManagedSdkAttachment {
 		const identity = JSON.stringify(key);

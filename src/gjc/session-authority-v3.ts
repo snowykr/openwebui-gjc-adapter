@@ -2,6 +2,11 @@ import { isAbsolute } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { NormalizedModelSelection } from "../contracts";
 import {
+	isManagedLifecycleEvidence,
+	type ManagedLifecycleEvidence,
+	managedLifecycleEvidenceHash,
+} from "./managed-lifecycle-evidence";
+import {
 	isJsonValue,
 	isNonEmptyString,
 	isNonnegativeSafeInteger,
@@ -65,6 +70,7 @@ export interface SessionAuthorityV3Operation {
 	readonly detail?: string;
 	readonly result?: SessionAuthorityV3Result;
 	readonly acknowledgedSuccessor?: SessionAuthorityV3AcknowledgedSuccessor;
+	readonly lifecycle?: ManagedLifecycleEvidence;
 }
 
 export interface SessionAuthorityV3Tombstone {
@@ -238,6 +244,17 @@ export function isSessionAuthorityV3RelationallyValid(
 	}
 	for (const provisional of document.provisionalOperations) {
 		const mapping = mappings.get(provisional.chatId);
+		if (!validateLifecycleSourceReference(provisional, mapping?.journal ?? [])) return false;
+		if (
+			!validateLifecycleOwner(
+				provisional.lifecycle,
+				provisional.chatId,
+				provisional.projectId,
+				provisional.managedAuthority ??
+					(mapping?.projectId === provisional.projectId ? mapping.managedAuthority : undefined),
+			)
+		)
+			return false;
 		for (const identifier of operationIdentifiers(provisional)) {
 			const key = `${provisional.chatId}\u0000${identifier}`;
 			if (provisionalIdentities.has(key)) return false;
@@ -348,7 +365,17 @@ function isMapping(value: unknown): value is SessionAuthorityV3Mapping {
 			value as Readonly<{ chatId: unknown; projectId: unknown; sessionId: unknown }>,
 		) &&
 		Array.isArray(value.journal) &&
-		value.journal.every(isOperation) &&
+		value.journal.every(
+			operation =>
+				isOperation(operation) &&
+				validateLifecycleOwner(
+					operation.lifecycle,
+					value.chatId as string,
+					value.projectId as string,
+					value.managedAuthority,
+				) &&
+				validateLifecycleSourceReference(operation, value.journal as SessionAuthorityV3Operation[]),
+		) &&
 		(value.reassignment === undefined ||
 			isReassignment(value.reassignment, value as unknown as SessionAuthorityV3Mapping))
 	);
@@ -366,6 +393,7 @@ function isProvisional(value: unknown): value is SessionAuthorityV3ProvisionalOp
 			"detail",
 			"result",
 			"acknowledgedSuccessor",
+			"lifecycle",
 			"chatId",
 			"projectId",
 			"sessionId",
@@ -377,6 +405,7 @@ function isProvisional(value: unknown): value is SessionAuthorityV3ProvisionalOp
 		isNonEmptyString(value.chatId) &&
 		isNonEmptyString(value.projectId) &&
 		isOperation(value) &&
+		validateLifecycleOwner(value.lifecycle, value.chatId, value.projectId, value.managedAuthority) &&
 		((value.sessionId === undefined && value.managedAuthority === undefined) ||
 			(isNonEmptyString(value.sessionId) &&
 				validateAuthority(
@@ -398,6 +427,7 @@ function isOperation(value: unknown): value is SessionAuthorityV3Operation {
 			"detail",
 			"result",
 			"acknowledgedSuccessor",
+			"lifecycle",
 			"chatId",
 			"projectId",
 			"sessionId",
@@ -416,15 +446,98 @@ function isOperation(value: unknown): value is SessionAuthorityV3Operation {
 		return false;
 	if (value.ingressId !== undefined && !isNonEmptyString(value.ingressId)) return false;
 	if (value.detail !== undefined && typeof value.detail !== "string") return false;
+	if (
+		value.lifecycle !== undefined &&
+		(!isManagedLifecycleEvidence(value.lifecycle) ||
+			Date.parse(value.lifecycle.recordedAt) < Date.parse(value.startedAt) ||
+			value.lifecycle.payloadHash !== value.detail)
+	)
+		return false;
 	if (value.state === "complete") {
 		if (!isTimestamp(value.completedAt) || Date.parse(value.completedAt) < Date.parse(value.startedAt)) return false;
 		if (value.result !== undefined && !isResult(value.result)) return false;
 	} else if (value.completedAt !== undefined || value.result !== undefined) return false;
-	return (
-		value.acknowledgedSuccessor === undefined ||
-		((value.kind === "create" || value.kind === "branch") &&
+	if (
+		value.acknowledgedSuccessor !== undefined &&
+		!(
+			(value.kind === "create" || value.kind === "branch") &&
 			(value.state === "pending" || value.state === "uncertain") &&
-			isSuccessor(value.acknowledgedSuccessor))
+			isSuccessor(value.acknowledgedSuccessor)
+		)
+	)
+		return false;
+	return validateOperationLifecycle(value as unknown as SessionAuthorityV3Operation);
+}
+
+function validateOperationLifecycle(operation: SessionAuthorityV3Operation): boolean {
+	const lifecycle = operation.lifecycle;
+	if (lifecycle === undefined) return true;
+	const kind = {
+		"session.create": "create",
+		"session.resume": "resume",
+		"session.fork": "branch",
+		"session.close": "close",
+	} as const;
+	// No canonical routing journal kind represents public delete yet.
+	if (lifecycle.operation === "session.delete" || operation.kind !== kind[lifecycle.operation]) return false;
+	const successor = operation.acknowledgedSuccessor;
+	if (
+		successor !== undefined &&
+		(lifecycle.acknowledged === undefined ||
+			successor.sessionId !== lifecycle.acknowledged.sessionId ||
+			!matchesLifecycleAuthority(successor.managedAuthority, lifecycle.acknowledged))
+	)
+		return false;
+	if (operation.state !== "complete") return true;
+	if (Date.parse(lifecycle.recordedAt) > Date.parse(operation.completedAt!)) return false;
+	if (lifecycle.state === "terminal_failure") return operation.result === undefined;
+	if (lifecycle.state !== "active_generation_proven" && lifecycle.state !== "retired") return false;
+	const result = operation.result;
+	if (result === undefined) return true;
+	if (lifecycle.operation === "session.close") {
+		const source = lifecycle.source;
+		const retirement = lifecycle.retirement;
+		return (
+			result.kind === "close" &&
+			lifecycle.state === "retired" &&
+			source !== undefined &&
+			retirement !== undefined &&
+			matchesLifecycleAuthority(result.managedAuthority, source) &&
+			result.mapping.sessionId === source.sessionId &&
+			retirement.sessionId === source.sessionId &&
+			retirement.generation === source.generation &&
+			retirement.acknowledgedSessionId === source.sessionId
+		);
+	}
+	const acknowledged = lifecycle.acknowledged;
+	const proven = lifecycle.proven;
+	return (
+		result.kind !== "close" &&
+		lifecycle.state === "active_generation_proven" &&
+		acknowledged !== undefined &&
+		proven !== undefined &&
+		matchesLifecycleAuthority(result.managedAuthority, acknowledged) &&
+		result.mapping.sessionId === acknowledged.sessionId &&
+		proven.sessionId === result.managedAuthority.sessionId &&
+		proven.generation === result.managedAuthority.generation &&
+		proven.leaseId === result.managedAuthority.leaseId &&
+		proven.epoch === result.managedAuthority.epoch
+	);
+}
+
+function matchesLifecycleAuthority(actual: ManagedTurnAuthorityV3, expected: ManagedTurnAuthority): boolean {
+	return (
+		[
+			"principalId",
+			"projectId",
+			"canonicalWorkspace",
+			"sessionId",
+			"generation",
+			"leaseId",
+			"epoch",
+			"requestKey",
+		].every(field => actual[field as keyof ManagedTurnAuthority] === expected[field as keyof ManagedTurnAuthority]) &&
+		(actual.chatId === expected.chatId || actual.chatId === JSON.stringify([expected.principalId, expected.chatId]))
 	);
 }
 
@@ -579,9 +692,88 @@ function isTombstone(value: unknown): value is SessionAuthorityV3Tombstone {
 			value as Readonly<{ chatId: unknown; projectId: unknown; sessionId: unknown }>,
 		) &&
 		Array.isArray(value.journal) &&
-		value.journal.every(isOperation) &&
+		value.journal.every(
+			operation =>
+				isOperation(operation) &&
+				validateLifecycleOwner(
+					operation.lifecycle,
+					value.chatId as string,
+					value.projectId as string,
+					value.managedAuthority,
+				) &&
+				validateLifecycleSourceReference(operation, value.journal as SessionAuthorityV3Operation[]),
+		) &&
 		(value.prior === undefined || isTombstone(value.prior))
 	);
+}
+
+function validateLifecycleOwner(value: unknown, chatId: string, projectId: string, owner?: unknown): boolean {
+	if (value === undefined) return true;
+	if (!isManagedLifecycleEvidence(value)) return false;
+	const prepared = value.preparedAuthority;
+	if (
+		!matchesCanonicalPrincipal(chatId, prepared.principalId) ||
+		prepared.projectId !== projectId ||
+		(chatId !== prepared.chatId && chatId !== JSON.stringify([prepared.principalId, prepared.chatId]))
+	)
+		return false;
+	if (
+		owner !== undefined &&
+		(!isRecord(owner) ||
+			owner.principalId !== prepared.principalId ||
+			owner.projectId !== prepared.projectId ||
+			owner.canonicalWorkspace !== prepared.canonicalWorkspace)
+	)
+		return false;
+	return [value.source, value.acknowledged].every(
+		authority =>
+			authority === undefined ||
+			(authority.principalId === prepared.principalId &&
+				authority.projectId === projectId &&
+				authority.canonicalWorkspace === prepared.canonicalWorkspace &&
+				authority.chatId === prepared.chatId),
+	);
+}
+
+function validateLifecycleSourceReference(
+	operation: SessionAuthorityV3Operation,
+	journal: readonly SessionAuthorityV3Operation[],
+): boolean {
+	const lifecycle = operation.lifecycle;
+	const reference = lifecycle?.sourceProofRef;
+	if (reference === undefined) return true;
+	const source = lifecycle?.source;
+	if (source === undefined || reference.operationId === operation.id) return false;
+	const candidates = journal.filter(candidate => isRecord(candidate) && candidate.id === reference.operationId);
+	if (candidates.length !== 1) return false;
+	const prior = candidates[0]!;
+	if (
+		!isOperation(prior) ||
+		prior.state !== "complete" ||
+		prior.completedAt === undefined ||
+		Date.parse(prior.completedAt) > Date.parse(operation.startedAt)
+	)
+		return false;
+	const evidence = prior.lifecycle;
+	if (
+		evidence?.state !== "active_generation_proven" ||
+		evidence.acknowledged === undefined ||
+		evidence.proven === undefined ||
+		managedLifecycleEvidenceHash(evidence) !== reference.evidenceHash
+	)
+		return false;
+	return (
+		[
+			"principalId",
+			"projectId",
+			"canonicalWorkspace",
+			"chatId",
+			"sessionId",
+			"generation",
+			"leaseId",
+			"epoch",
+		] as const
+	).every(field => evidence.acknowledged![field] === source[field]);
 }
 
 function validateJournal(
@@ -591,6 +783,8 @@ function validateJournal(
 ): boolean {
 	const local = new Set<string>();
 	for (const operation of journal) {
+		if (!validateLifecycleOwner(operation.lifecycle, owner.chatId, owner.projectId, owner.managedAuthority))
+			return false;
 		const successor = operation.acknowledgedSuccessor;
 		if (
 			successor !== undefined &&
@@ -652,8 +846,10 @@ function isCompletedPublicationReceipt(
 		return (
 			operation !== undefined &&
 			operation.state === "complete" &&
-			operation.kind === "prompt" &&
+			(operation.kind === "prompt" ||
+				(operation.kind === "create" && operation.lifecycle?.operation === "session.create")) &&
 			(provisional.kind === "prompt" || provisional.kind === "create") &&
+			isDeepStrictEqual(operation.lifecycle, provisional.lifecycle) &&
 			operation.detail === provisional.detail &&
 			operation.startedAt === provisional.startedAt &&
 			operation.completedAt === provisional.completedAt &&

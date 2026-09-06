@@ -48,6 +48,8 @@ Use OpenWebUI 0.10.0 or newer so chat/message/task placeholders are available. P
 
 SDK 0.16.4 does not expose the opaque incarnation needed for a replacement-safe remote close through its public Router/lifecycle binding surfaces. A generation alone is rejected by the SDK; closing by session ID and checking retirement afterward can close a replacement. The adapter therefore fails closed on remote close without complete exact authority. The isolated compatibility harness proves positive retirement only, not replacement-race-safe production close.
 
+Canonical V3 operations retain lifecycle intent, acknowledgement, and exact-generation proof alongside the full routing journal. Adoption-only proof cannot authorize prompts, queries, or subscriptions; active work requires durable generation proof and a live tenant lease. Idle retirement uses a fresh reaper lease against the unchanged historical generation, persists a successful matching close acknowledgement before observation, and commits positive retirement with its journal result atomically. A retryable label, lost attachment, or changed turn ID does not reactivate that generation. Interrupted operations retain their request identity and remain blocked for reconciliation; this does not yet provide the original staged-bootstrap or automatic same-key recovery contract.
+
 ## CLI first-install configuration
 
 Choose the route before running a command:

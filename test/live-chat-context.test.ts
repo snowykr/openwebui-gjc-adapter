@@ -554,6 +554,7 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 					)
 				)
 					throw new Error("Lease lifecycle fixture requires exact prepared managed authority.");
+				await input.onLifecycleInvoking?.();
 				runnerCalls += 1;
 				const first = runnerCalls === 1;
 				const managedAuthority = managedPreparedAuthority({
@@ -561,6 +562,7 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 					sessionId: `session-${runnerCalls}`,
 					generation: 1,
 				});
+				await input.onLifecycleAcknowledged?.(managedAuthority);
 				const address = {
 					cwd: input.cwd,
 					sessionRoot: input.sessionRoot,
