@@ -40,6 +40,188 @@ const userContext = {
 };
 
 describe("managed model reader", () => {
+	test.each(["context", "resolver", "reconcile", "acquire"] as const)(
+		"bounds existing-reader %s admission without later work after release",
+		async phase => {
+			const fake = new FakeRuntime();
+			const effects: string[] = [];
+			let release!: () => void;
+			const gate = new Promise<void>(resolve => {
+				release = resolve;
+			});
+			const effect = async (name: string) => {
+				effects.push(name);
+				if (name === phase) await gate;
+			};
+			const reconcile = spyOn(fake, "reconcile").mockImplementation(async () => effect("reconcile"));
+			const acquire = spyOn(fake, "acquireAttachment").mockImplementation(async () => {
+				await effect("acquire");
+				return { tenant, generation: tenant.generation, isCurrent: () => true };
+			});
+			try {
+				await expect(
+					createManagedModelReaderFactory({
+						runtime: fake.runtime,
+						timeoutMs: 50,
+						resolveAttachment: async () => {
+							await effect("resolver");
+							return { tenant };
+						},
+					})({ ...userContext, lease: { assertFence: () => effect("context") } }),
+				).rejects.toThrow();
+				const beforeRelease = [...effects];
+				release();
+				await new Promise(resolve => setTimeout(resolve, 0));
+				expect(effects).toEqual(beforeRelease);
+				expect(effects.at(-1)).toBe(phase);
+				expect(fake.requests).toEqual([]);
+				expect(fake.created).toBeUndefined();
+			} finally {
+				release();
+				reconcile.mockRestore();
+				acquire.mockRestore();
+			}
+		},
+	);
+
+	test.each(["existing", "temporary"] as const)(
+		"%s acquisition, multiple queries and stop consume one lifetime budget",
+		async kind => {
+			const fake = new FakeRuntime();
+			let now = Date.now();
+			const clock = spyOn(Date, "now").mockImplementation(() => now);
+			let spent = false;
+			const spendAdmission = async () => {
+				if (!spent) {
+					now += 400;
+					spent = true;
+				}
+			};
+			fake.queryHandler = async frame => {
+				now += 300;
+				return { type: "query_response", ok: true, page: { items: [frame.query], complete: true } };
+			};
+			try {
+				const reader = await createManagedModelReaderFactory({
+					runtime: fake.runtime,
+					timeoutMs: 1_000,
+					...(kind === "existing"
+						? {
+								resolveAttachment: async () => {
+									await spendAdmission();
+									return { tenant };
+								},
+							}
+						: { temporary: { ...temporary, assertFence: spendAdmission } }),
+				})();
+				expect(await reader.getAvailableModels()).toEqual(["models.list/current"]);
+				const error = await reader.getActiveProviders().catch(error => error);
+				expect(kind === "temporary" ? error.errors[0].code : error.code).toBe("timeout");
+				expect(fake.requestTimeouts).toEqual([600, 300]);
+				await expect(reader.stop()).rejects.toMatchObject({ code: "timeout" });
+				expect(fake.closed).toBeUndefined();
+				if (kind === "temporary") {
+					expect(fake.createTimeoutMs).toBe(600);
+					expect(fake.registrationTimeouts).toEqual([600]);
+				} else expect(fake.reconcileTimeouts).toEqual([600]);
+				expect(fake.acquisitionTimeouts).toEqual([600]);
+			} finally {
+				clock.mockRestore();
+			}
+		},
+	);
+
+	test.each(["create", "register", "close"] as const)(
+		"temporary %s timeout starts no later effect or renewed cleanup",
+		async phase => {
+			const fake = new FakeRuntime();
+			let release!: () => void;
+			const gate = new Promise<void>(resolve => {
+				release = resolve;
+			});
+			if (phase === "create") fake.createGate = gate;
+			if (phase === "close") fake.closeGate = gate;
+			const register =
+				phase === "register"
+					? spyOn(fake, "registerLifecycleTenant").mockImplementation(async key => {
+							await gate;
+							return { tenant: key, generation: key.generation, isCurrent: () => true };
+						})
+					: undefined;
+			try {
+				const creation = createManagedModelReaderFactory({ runtime: fake.runtime, timeoutMs: 50, temporary })();
+				if (phase === "close") {
+					const reader = await creation;
+					const failure = await Promise.resolve(reader.stop()).catch(error => error);
+					expect(failure).toBeInstanceOf(AggregateError);
+					await expect(reader.stop()).rejects.toBe(failure);
+				} else await expect(creation).rejects.toThrow();
+				release();
+				await new Promise(resolve => setTimeout(resolve, 0));
+				expect(fake.createCalls).toBe(1);
+				expect(fake.requests).toEqual([]);
+				expect(fake.statusKeys).toEqual([]);
+				expect(fake.unregistered).toEqual([]);
+				if (phase !== "close") expect(fake.closed).toBeUndefined();
+			} finally {
+				release();
+				register?.mockRestore();
+			}
+		},
+	);
+
+	test("expired temporary fence cannot start its second lease check", async () => {
+		const fake = new FakeRuntime();
+		let now = Date.now();
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		let contextChecks = 0;
+		try {
+			await expect(
+				createManagedModelReaderFactory({
+					runtime: fake.runtime,
+					timeoutMs: 100,
+					temporary: {
+						...temporary,
+						assertFence: async () => {
+							now += 100;
+						},
+					},
+				})({
+					...userContext,
+					lease: {
+						assertFence: async () => {
+							contextChecks += 1;
+						},
+					},
+				}),
+			).rejects.toMatchObject({ code: "timeout" });
+			expect(contextChecks).toBe(1);
+			expect(fake.createCalls).toBe(0);
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
+	test.each([0, -1, 1.5, Infinity, 2_147_483_648])(
+		"rejects invalid catalog lifetime %s before admission",
+		async timeoutMs => {
+			const fake = new FakeRuntime();
+			let resolved = false;
+			await expect(
+				createManagedModelReaderFactory({
+					runtime: fake.runtime,
+					timeoutMs,
+					resolveAttachment: async () => {
+						resolved = true;
+						return { tenant };
+					},
+				})(),
+			).rejects.toThrow("positive finite timer-safe integer");
+			expect(resolved).toBe(false);
+			expect(fake.reconciles).toBe(0);
+		},
+	);
+
 	test("collects complete model and provider pages with exact cursors", async () => {
 		const fake = new FakeRuntime();
 		fake.queryHandler = async frame => ({
@@ -107,12 +289,13 @@ describe("managed model reader", () => {
 
 	test("catalog pages and cleanup cannot renew an expired query budget", async () => {
 		const fake = new FakeRuntime();
-		const reader = await createManagedModelReaderFactory({
-			runtime: fake.runtime,
-			temporary: { ...temporary, timeoutMs: 1_000 },
-		})();
 		let now = Date.now();
 		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		const reader = await createManagedModelReaderFactory({
+			runtime: fake.runtime,
+			timeoutMs: 1_000,
+			temporary,
+		})();
 		fake.queryHandler = async () => {
 			now += 600;
 			return {
@@ -143,9 +326,9 @@ describe("managed model reader", () => {
 		});
 		const reader = await createManagedModelReaderFactory({
 			runtime: fake.runtime,
+			timeoutMs: 50,
 			temporary: {
 				...temporary,
-				timeoutMs: 50,
 				assertFence: async () => {
 					if (blocked) await gate;
 				},
@@ -184,7 +367,7 @@ describe("managed model reader", () => {
 		await admission;
 		await reader.stop();
 		resolve({ type: "query_response", ok: true, page: { items: ["not-visible"], complete: true } });
-		expect(await pending).toBeInstanceOf(ManagedModelReaderUnavailableError);
+		expect(await pending).toMatchObject({ code: "operation_closed" });
 		await expect(reader.getActiveProviders()).rejects.toThrow("stopped");
 		expect(fake.requests).toHaveLength(1);
 	});
@@ -214,7 +397,8 @@ describe("managed model reader", () => {
 		const fake = new FakeRuntime();
 		const reader = await createManagedModelReaderFactory({
 			runtime: fake.runtime,
-			temporary: { ...temporary, timeoutMs: 250 },
+			timeoutMs: 250,
+			temporary,
 		})();
 		await reader.stop();
 
@@ -224,7 +408,8 @@ describe("managed model reader", () => {
 		});
 		expect(fake.created).not.toHaveProperty("timeoutMs");
 		expect(fake.created).not.toHaveProperty("readinessTimeoutMs");
-		expect(fake.createTimeoutMs).toBe(250);
+		expect(fake.createTimeoutMs).toBeGreaterThan(0);
+		expect(fake.createTimeoutMs).toBeLessThanOrEqual(250);
 		expect(fake.preparedCreates).toEqual([
 			expect.objectContaining({
 				principalId: temporary.principalId,
@@ -311,6 +496,54 @@ describe("managed model reader", () => {
 		await expect(late).rejects.toBeInstanceOf(GjcTurnCancelledError);
 		await fake.closeObserved;
 		expect(fake.closed).toBeDefined();
+	});
+
+	test("cancellation waits for admitted creation and preserves cleanup failure", async () => {
+		const fake = new FakeRuntime();
+		let releaseCreation!: () => void;
+		let releaseClose!: () => void;
+		fake.createGate = new Promise<void>(resolve => {
+			releaseCreation = resolve;
+		});
+		fake.closeGate = new Promise<void>(resolve => {
+			releaseClose = resolve;
+		});
+		fake.closeOutcome = {
+			ok: false,
+			operation: "session.close",
+			certainty: "uncertain",
+			error: { code: "failed", message: "denied" },
+		};
+		const controller = new AbortController();
+		let settled = false;
+		const pending = createManagedModelReaderFactory({ runtime: fake.runtime, timeoutMs: 1_000, temporary })(
+			undefined,
+			controller.signal,
+		)
+			.catch(error => error)
+			.finally(() => {
+				settled = true;
+			});
+		try {
+			for (let attempt = 0; attempt < 20 && fake.createCalls < 1; attempt++) await Bun.sleep(1);
+			expect(fake.createCalls).toBe(1);
+			controller.abort();
+			releaseCreation();
+			await fake.closeObserved;
+			expect(settled).toBe(false);
+			releaseClose();
+			const error = await pending;
+			expect(error).toBeInstanceOf(AggregateError);
+			expect(error.errors[0]).toBeInstanceOf(GjcTurnCancelledError);
+			expect(error.errors[1]).toBeInstanceOf(ManagedModelReaderUnavailableError);
+			expect(fake.registered).toEqual([]);
+			expect(fake.unregistered).toEqual([]);
+			expect(fake.requests).toEqual([]);
+		} finally {
+			releaseCreation();
+			releaseClose();
+			await pending;
+		}
 	});
 
 	test("cleans up after query failure and rejects replaced or unknown retirement proof", async () => {
@@ -406,15 +639,21 @@ class FakeRuntime {
 	queryFailure: Error | undefined;
 	queryHandler: ((frame: Record<string, unknown>) => Promise<Record<string, unknown>>) | undefined;
 	readonly requestTimeouts: (number | undefined)[] = [];
+	readonly reconcileTimeouts: (number | undefined)[] = [];
+	readonly acquisitionTimeouts: (number | undefined)[] = [];
+	readonly registrationTimeouts: (number | undefined)[] = [];
 	createGate: Promise<void> | undefined;
+	closeGate: Promise<void> | undefined;
 
 	get runtime(): ManagedSdkRuntime {
 		return this as unknown as ManagedSdkRuntime;
 	}
-	async reconcile() {
+	async reconcile(timeoutMs?: number) {
+		this.reconcileTimeouts.push(timeoutMs);
 		this.reconciles += 1;
 	}
-	async acquireAttachment(key: TenantSessionKey) {
+	async acquireAttachment(key: TenantSessionKey, timeoutMs?: number) {
+		this.acquisitionTimeouts.push(timeoutMs);
 		const identity = tenantIdentity(key);
 		if (this.rejectTenant || !this.#tenants.has(identity) || this.#retired.has(identity))
 			throw new Error("tenant mismatch");
@@ -492,11 +731,12 @@ class FakeRuntime {
 		await this.createGate;
 		return { ok: true, result: { sessionId: "catalog-session", endpointGeneration: 11 } };
 	}
-	async registerLifecycleTenant(key: TenantSessionKey) {
+	async registerLifecycleTenant(key: TenantSessionKey, timeoutMs?: number) {
+		this.registrationTimeouts.push(timeoutMs);
 		if (this.rejectTenant) throw new Error("tenant mismatch");
 		this.registered.push(key);
 		this.#tenants.add(tenantIdentity(key));
-		return this.acquireAttachment(key);
+		return this.acquireAttachment(key, timeoutMs);
 	}
 	async closeLifecycleSession(
 		request: NonNullable<Parameters<ManagedSdkRuntime["closeLifecycleSession"]>[1]> & {
@@ -515,6 +755,7 @@ class FakeRuntime {
 			throw new Error("Fixture close requires exact catalog tenant and generation authority.");
 		this.closed = request;
 		this.closeResolve();
+		await this.closeGate;
 		return (
 			this.closeOutcome ?? { ok: true, operation: "session.close", result: { sessionId: request.target.sessionId } }
 		);

@@ -632,6 +632,7 @@ function createManagedReaderFactory(runtime: ManagedSdkRuntime, timeoutMs: numbe
 		if (isManagedTurnAuthority(authority)) {
 			return createManagedModelReaderFactory({
 				runtime,
+				timeoutMs,
 				resolveAttachment: async () => ({
 					tenant: {
 						principalId: authority.principalId,
@@ -650,10 +651,10 @@ function createManagedReaderFactory(runtime: ManagedSdkRuntime, timeoutMs: numbe
 			throw new Error("Managed temporary model catalog access requires a workspace lease fence.");
 		return createManagedModelReaderFactory({
 			runtime,
+			timeoutMs,
 			temporary: {
 				...authority,
 				assertFence: () => context.lease!.assertFence(),
-				timeoutMs,
 			},
 		})(context, signal);
 	};
