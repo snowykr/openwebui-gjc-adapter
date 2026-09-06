@@ -8,6 +8,8 @@ export interface ManagedSuccessorInput {
 	readonly target: Omit<ManagedTurnAuthority, "sessionId" | "generation">;
 	readonly timeoutMs?: number;
 	readonly signal?: AbortSignal;
+	/** Persists the assigned target before cancellation, registration, or attachment proof. */
+	readonly onAcknowledged?: (authority: ManagedTurnAuthority) => Promise<void> | void;
 	/** Called only after the exact target generation is reconciled, fenced, and current. */
 	readonly publish: (successor: ManagedSdkAttachment) => Promise<void> | void;
 }
@@ -28,9 +30,12 @@ export interface ManagedSuccessorFlow {
 }
 
 export class ManagedSuccessorUncertainError extends Error {
-	constructor(message: string, options?: ErrorOptions) {
+	readonly acknowledgedAuthority: ManagedTurnAuthority | undefined;
+	constructor(message: string, options?: ErrorOptions & { readonly acknowledgedAuthority?: ManagedTurnAuthority }) {
 		super(message, options);
 		this.name = "ManagedSuccessorUncertainError";
+		this.acknowledgedAuthority =
+			options?.acknowledgedAuthority === undefined ? undefined : { ...options.acknowledgedAuthority };
 	}
 }
 
@@ -44,44 +49,51 @@ export function createManagedSuccessorFlow(runtime: ManagedSdkRuntime): ManagedS
 			let invoked = false;
 			let acknowledged = false;
 			let returnedTarget: TenantSessionKey | undefined;
+			let acknowledgedAuthority: ManagedTurnAuthority | undefined;
+			let acknowledgementPending = false;
 			try {
 				// Reconciliation plus acquire re-proves source registration, currentness, and tenant fencing.
 				await runtime.reconcile();
 				assertExactAttachment(await runtime.acquireAttachment(source), source, "source");
 				throwIfAborted(input.signal);
 				invoked = true;
-				const outcome = unwrapOutcome(
-					await runtime.forkLifecycleSession({
-						actor: { namespace: "openwebui-gjc-adapter", id: input.source.principalId },
-						capability: "session.fork",
-						requestKey: input.source.requestKey,
-						target: {
-							sourceSessionId: source.sessionId,
-							sourceGeneration: source.generation,
-							operationHash,
-						},
-						timeoutMs: input.timeoutMs,
-					} as never),
-				);
-				if (!isSuccess(outcome)) throw new Error("Managed session.fork failed.");
+				const outcome = await runtime.forkLifecycleSession(source, {
+					actor: { namespace: "openwebui-gjc-adapter", id: input.source.principalId },
+					capability: "session.fork",
+					requestKey: input.source.requestKey,
+					target: {
+						sourceSessionId: source.sessionId,
+						cwd: input.target.canonicalWorkspace,
+					},
+					timeoutMs: input.timeoutMs,
+				});
+				if (!outcome.ok || outcome.operation !== "session.fork") throw new Error("Managed session.fork failed.");
 				acknowledged = true;
 				returnedTarget = tenantFromFork(input.target, outcome);
 				if (returnedTarget === undefined)
 					throw new ManagedSuccessorUncertainError("Managed fork acknowledgement lacks a target identity.");
+				acknowledgedAuthority = managedSuccessorAuthority(input.source, returnedTarget);
+				acknowledgementPending = true;
+				await input.onAcknowledged?.({ ...acknowledgedAuthority });
+				acknowledgementPending = false;
 				// An abort after lifecycle invocation is ambiguous even when the fork later acknowledges.
 				if (input.signal?.aborted) throw new GjcTurnCancelledError();
 				await runtime.registerLifecycleTenant(returnedTarget);
 				const successor = await proveTarget(runtime, returnedTarget);
-				const managedAuthority = managedSuccessorAuthority(input.source, returnedTarget);
 				throwIfAborted(input.signal);
 				await input.publish(successor);
 				return {
 					successor,
-					managedAuthority,
+					managedAuthority: acknowledgedAuthority,
 					operationHash,
 				};
 			} catch (error) {
 				if (!invoked) throw error;
+				if (acknowledgementPending)
+					throw new ManagedSuccessorUncertainError("Managed successor acknowledgement persistence is uncertain.", {
+						cause: error,
+						acknowledgedAuthority,
+					});
 				return await cleanupOrThrow(
 					runtime,
 					returnedTarget,
@@ -164,7 +176,7 @@ function assertExactAttachment(
 		attachment.tenant.epoch !== target.epoch
 	)
 		throw new Error(`Managed successor ${role} attachment is not the exact target generation.`);
-	if (!attachment.attachment.isCurrent()) throw new Error(`Managed successor ${role} attachment is not current.`);
+	if (!attachment.isCurrent()) throw new Error(`Managed successor ${role} attachment is not current.`);
 }
 
 function managedSuccessorAuthority(source: ManagedTurnAuthority, target: TenantSessionKey): ManagedTurnAuthority {
@@ -200,42 +212,31 @@ async function cleanupOrThrow(
 			cause,
 		});
 	try {
-		await runtime.closeLifecycleSession({
-			tenant: target,
+		const outcome = await runtime.closeLifecycleSession(target, {
 			actor: { namespace: "openwebui-gjc-adapter", id: input.source.principalId },
 			capability: "session.close",
 			requestKey: input.source.requestKey,
 			target: { sessionId: target.sessionId, endpointGeneration: target.generation },
 			timeoutMs: input.timeoutMs,
 		});
+		if (!outcome.ok || outcome.operation !== "session.close" || outcome.result.sessionId !== target.sessionId)
+			throw new Error("Managed successor cleanup lacks a matching successful close acknowledgement.");
 		await runtime.reconcile();
 		const status = await runtime.generationStatus(target);
-		if (status.status === "retired") {
-			runtime.unregisterTenant(target);
-			if (invocationUncertain)
-				throw new ManagedSuccessorUncertainError(
-					"Managed successor invocation outcome is uncertain after cleanup.",
-					{
-						cause,
-					},
-				);
-			throw cause;
-		}
-		throw new ManagedSuccessorUncertainError("Failed managed successor cleanup is not retired.", { cause });
+		if (status.status !== "retired") throw new Error("Failed managed successor cleanup is not retired.");
+		runtime.unregisterTenant(target);
 	} catch (cleanup) {
-		if (cleanup === cause) throw cleanup;
 		throw new ManagedSuccessorUncertainError("Failed managed successor cleanup is uncertain.", {
 			cause: new AggregateError([cause, cleanup]),
+			acknowledgedAuthority: managedSuccessorAuthority(input.source, target),
 		});
 	}
-}
-
-function unwrapOutcome(value: unknown): unknown {
-	return isRecord(value) && value.kind === "result" && "outcome" in value ? value.outcome : value;
-}
-
-function isSuccess(value: unknown): boolean {
-	return isRecord(value) && value.ok === true;
+	if (invocationUncertain)
+		throw new ManagedSuccessorUncertainError("Managed successor invocation outcome is uncertain after cleanup.", {
+			cause,
+			acknowledgedAuthority: managedSuccessorAuthority(input.source, target),
+		});
+	throw cause;
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {

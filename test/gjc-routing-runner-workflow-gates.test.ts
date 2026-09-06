@@ -178,12 +178,12 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 		let abortCalls = 0;
 		let subscriptionsClosed = 0;
 		const requests: Record<string, unknown>[] = [];
-		const currentAttachment = { isCurrent: () => true };
+		const currentAttachment = { tenant: authority, generation: authority.generation, isCurrent: () => true };
 		const runtime = {
 			state: "running",
 			async reconcile() {},
-			async acquireAttachment(tenant: unknown) {
-				return { tenant, generation: authority.generation, attachment: currentAttachment };
+			async acquireAttachment() {
+				return currentAttachment;
 			},
 			prepareFrameSubscription(
 				_attachment: unknown,

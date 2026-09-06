@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { ManagedTurnAuthority } from "../gjc/turn-runner";
 import type { LiveGatewayRunnerInput } from "./chat-completions";
 
 export function controlOperationKind(
@@ -19,6 +20,31 @@ export function controlOperationHash(turn: LiveGatewayRunnerInput): string {
 				parentId: turn.userMessageParentId,
 				prompt: turn.prompt,
 				control: turn.control,
+			}),
+		)
+		.digest("hex");
+}
+
+export function lifecycleControlRequestKey(
+	authority: ManagedTurnAuthority,
+	operation: "session.fork" | "session.create",
+	ingressId: string,
+	payloadHash: string,
+): string {
+	return createHash("sha256")
+		.update(
+			JSON.stringify({
+				operation,
+				principalId: authority.principalId,
+				projectId: authority.projectId,
+				canonicalWorkspace: authority.canonicalWorkspace,
+				chatId: authority.chatId,
+				sessionId: authority.sessionId,
+				generation: authority.generation,
+				leaseId: authority.leaseId,
+				epoch: authority.epoch,
+				ingressId,
+				payloadHash,
 			}),
 		)
 		.digest("hex");

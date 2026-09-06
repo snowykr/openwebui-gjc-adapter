@@ -71,7 +71,7 @@ async function start(options: StartActiveManagedRuntimeOptions): Promise<ActiveM
 			// attachment acquisition so a replaced or provisional generation cannot escape.
 			await options.runtime.reconcile();
 			const acquired = await options.runtime.acquireAttachment(tenant);
-			if (acquired.generation !== tenant.generation || !acquired.attachment.isCurrent())
+			if (acquired.generation !== tenant.generation || !acquired.isCurrent())
 				throw new Error("Canonical V3 mapping attachment is stale.");
 			const generation = await options.runtime.generationStatus(tenant);
 			if (generation.status !== "current")

@@ -26,10 +26,12 @@ import {
 	createManagedSessionOperations,
 	type ManagedGateInput,
 	type ManagedLifecycleInput,
+	ManagedOperationDeadline,
 	type ManagedSessionOperations,
 	type ManagedTurnInput,
 } from "./gjc-managed-session-operations";
 import { createManagedSuccessorFlow, type ManagedSuccessorFlow } from "./gjc-managed-successor";
+import { controlOperationHash, lifecycleControlRequestKey } from "./gjc-routing-publication";
 
 export type ManagedRunnerStartInput = GjcStartNewSessionInput & {
 	readonly preparedManagedAuthority: ManagedPreparedTurnAuthority;
@@ -81,44 +83,51 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime, turnTimeo
 		forkManagedSuccessor: forkManagedSuccessor.fork,
 		async create(input) {
 			throwIfAborted(input.signal);
-			const lifecycle = await operations.create({
-				authority: input.preparedManagedAuthority,
-				target: { path: input.cwd },
-			});
-			const authority: ManagedTurnAuthority = {
-				...input.preparedManagedAuthority,
-				sessionId: lifecycle.tenant.sessionId,
-				generation: lifecycle.tenant.generation,
-			};
+			const deadline = new ManagedOperationDeadline(turnTimeoutMs, "session.create/prompt");
 			try {
-				const modelSelection = await applyManagedModelSelection(operations, authority, input.modelSelection);
-				return withManagedProof(
-					withManagedModelSelection(
-						await operations.prompt(turnInput({ ...input, authority }, "turn.prompt")),
-						modelSelection,
-					),
-					authority,
-				);
-			} catch (error) {
-				await closeAfterPrePromptFailure(operations, authority, { path: input.cwd }, error);
-				throw error;
+				const lifecycle = await operations.create({
+					authority: input.preparedManagedAuthority,
+					target: { path: input.cwd },
+					timeoutMs: deadline.remaining(),
+					signal: input.signal,
+					onAcknowledged: input.onLifecycleAcknowledged,
+				});
+				const authority: ManagedTurnAuthority = {
+					...input.preparedManagedAuthority,
+					sessionId: lifecycle.tenant.sessionId,
+					generation: lifecycle.tenant.generation,
+				};
+				try {
+					const modelSelection = await deadline.wait(
+						applyManagedModelSelection(operations, authority, input.modelSelection, deadline, input.signal),
+					);
+					return withManagedProof(
+						withManagedModelSelection(
+							await operations.prompt({
+								...turnInput({ ...input, authority }, "turn.prompt"),
+								timeoutMs: deadline.remaining(),
+							}),
+							modelSelection,
+						),
+						authority,
+					);
+				} catch (error) {
+					await closeAfterPrePromptFailure(operations, authority, { path: input.cwd }, error);
+					throw error;
+				}
+			} finally {
+				deadline.close();
 			}
 		},
 		resume: input => operations.resume(input),
 		continue: async input => {
 			bindManagedLifecycleAuthority(input.lifecycle, input.authority);
-			const modelSelection = await applyManagedModelSelection(operations, input.authority, input.modelSelection);
-			const result = await operations.followUp(turnInput(input, "turn.follow_up"));
-			await operations.acquire(input.authority);
-			return withManagedProof(withManagedModelSelection(result, modelSelection), input.authority);
+			return continueManagedTurn(operations, input, turnTimeoutMs);
 		},
 		continueSession: async input => {
 			const authority = managedAuthorityFor(input, "turn.follow_up");
 			bindManagedLifecycleAuthority(input.lifecycle, authority);
-			const modelSelection = await applyManagedModelSelection(operations, authority, input.modelSelection);
-			const result = await operations.followUp(turnInput({ ...input, authority }, "turn.follow_up"));
-			await operations.acquire(authority);
-			return withManagedProof(withManagedModelSelection(result, modelSelection), authority);
+			return continueManagedTurn(operations, { ...input, authority }, turnTimeoutMs);
 		},
 		async control(input) {
 			if ("gateId" in input) {
@@ -161,9 +170,10 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime, turnTimeo
 				idempotencyKey: authority.requestKey,
 			});
 		},
-		async runControl(input, mapping, lifecycle, _onAcknowledgedSuccessor, onDispatch) {
+		async runControl(input, mapping, lifecycle, onAcknowledgedSuccessor, onDispatch) {
 			const control = input.control;
 			if (control === undefined) throw new Error("OpenWebUI control request was not supplied.");
+			throwIfAborted(input.signal);
 			const authority = managedControlAuthority(input, mapping);
 			bindManagedLifecycleAuthority(lifecycle, authority);
 			if (control.operation === "branch") {
@@ -180,34 +190,62 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime, turnTimeo
 					result: withManagedProof(emptyControlResult(), successor.managedAuthority),
 				};
 			}
-			if (control.operation === "session.new" || control.operation === "session.resume") {
-				const lifecycleResult =
-					control.operation === "session.new"
-						? await operations.create({ authority, target: { path: authority.canonicalWorkspace } })
-						: await operations.resume({
-								authority,
-								target: {
-									sessionIdOrPrefix: control.sessionId ?? authority.sessionId,
-									path: authority.canonicalWorkspace,
-								},
-							});
+			if (control.operation === "session.new") {
+				if (onAcknowledgedSuccessor === undefined)
+					throw new Error("Managed session.new requires durable acknowledgement ownership.");
+				const { sessionId: _sessionId, generation: _generation, ...prepared } = authority;
+				const requestKey = lifecycleControlRequestKey(
+					authority,
+					"session.create",
+					input.userMessageId,
+					controlOperationHash(input),
+				);
+				onDispatch?.();
+				const created = await operations.create({
+					authority: { ...prepared, requestKey },
+					target: { path: authority.canonicalWorkspace },
+					signal: input.signal,
+					onAcknowledged: acknowledged => {
+						if (acknowledged.sessionId === authority.sessionId)
+							throw new Error("Managed session.new returned the source session.");
+						return onAcknowledgedSuccessor({ sessionId: acknowledged.sessionId, managedAuthority: acknowledged });
+					},
+				});
+				throwIfAborted(input.signal);
+				const successorAuthority = { ...created.tenant, requestKey, authorityEpoch: SESSION_AUTHORITY_V3_EPOCH };
+				return {
+					sessionId: successorAuthority.sessionId,
+					result: withManagedProof(emptyControlResult(), successorAuthority),
+				};
+			}
+			if (control.operation === "session.resume") {
+				if (control.sessionId !== authority.sessionId)
+					throw new Error("Managed selected resume requires persisted exact target authority before invocation.");
+				onDispatch?.();
+				const lifecycleResult = await operations.resume({
+					authority,
+					target: {
+						sessionIdOrPrefix: control.sessionId,
+						path: authority.canonicalWorkspace,
+					},
+					signal: input.signal,
+				});
 				assertResumedExactAuthority(lifecycleResult, authority);
 				return {
 					sessionId: authority.sessionId,
 					result: withManagedProof(emptyControlResult(), authority),
 				};
 			}
-			if (control.operation === "abort_and_prompt") {
-				const result = await operations.abortAndPrompt({
+			if (control.operation === "abort_and_prompt" || control.operation === "follow_up") {
+				const run = control.operation === "follow_up" ? operations.followUp : operations.abortAndPrompt;
+				const result = await run({
 					authority,
-					operation: "turn.abort_and_prompt",
+					operation: control.operation === "follow_up" ? "turn.follow_up" : "turn.abort_and_prompt",
 					text: control.text ?? input.prompt,
 					idempotencyKey: authority.requestKey,
 					signal: input.signal,
 					onDispatch,
 				});
-				throwIfAborted(input.signal);
-				await operations.acquire(authority);
 				throwIfAborted(input.signal);
 				return { result: withManagedProof(result, authority) };
 			}
@@ -241,44 +279,58 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime, turnTimeo
 		},
 		withLifecyclePublication: async (address, effect) => effect(managedLifecycleTransaction(address)),
 		async startManagedSession(input, publish, beforePrompt, onFailure) {
-			const lifecycleResult = await operations.create({
-				authority: input.preparedManagedAuthority,
-				target: { path: input.cwd },
-			});
-			const authority: ManagedTurnAuthority = {
-				...input.preparedManagedAuthority,
-				sessionId: lifecycleResult.tenant.sessionId,
-				generation: lifecycleResult.tenant.generation,
-				authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
-			} as ManagedTurnAuthority & { readonly authorityEpoch: typeof SESSION_AUTHORITY_V3_EPOCH };
-			const address = {
-				cwd: input.cwd,
-				sessionRoot: input.sessionRoot,
-				projectId: input.projectId,
-				chatId: input.chatId,
-				sessionId: authority.sessionId,
-			};
-			const transaction = managedLifecycleTransaction(address, authority);
+			throwIfAborted(input.signal);
+			const deadline = new ManagedOperationDeadline(turnTimeoutMs, "session.create/prompt");
 			try {
-				await beforePrompt(address, managedProof(authority), transaction);
-				const modelSelection = await applyManagedModelSelection(operations, authority, input.modelSelection);
-				const result = withManagedProof(
-					withManagedModelSelection(
-						await operations.prompt(
-							turnInput(
-								{ ...input, preparedManagedAuthority: input.preparedManagedAuthority, authority },
-								"turn.prompt",
-							),
+				const lifecycleResult = await operations.create({
+					authority: input.preparedManagedAuthority,
+					target: { path: input.cwd },
+					timeoutMs: deadline.remaining(),
+					signal: input.signal,
+					onAcknowledged: input.onLifecycleAcknowledged,
+				});
+				const authority: ManagedTurnAuthority = {
+					...input.preparedManagedAuthority,
+					sessionId: lifecycleResult.tenant.sessionId,
+					generation: lifecycleResult.tenant.generation,
+					authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+				} as ManagedTurnAuthority & { readonly authorityEpoch: typeof SESSION_AUTHORITY_V3_EPOCH };
+				const address = {
+					cwd: input.cwd,
+					sessionRoot: input.sessionRoot,
+					projectId: input.projectId,
+					chatId: input.chatId,
+					sessionId: authority.sessionId,
+				};
+				const transaction = managedLifecycleTransaction(address, authority);
+				try {
+					await deadline.wait(beforePrompt(address, managedProof(authority), transaction));
+					throwIfAborted(input.signal);
+					const modelSelection = await deadline.wait(
+						applyManagedModelSelection(operations, authority, input.modelSelection, deadline, input.signal),
+					);
+					const result = withManagedProof(
+						withManagedModelSelection(
+							await operations.prompt({
+								...turnInput(
+									{ ...input, preparedManagedAuthority: input.preparedManagedAuthority, authority },
+									"turn.prompt",
+								),
+								timeoutMs: deadline.remaining(),
+							}),
+							modelSelection,
 						),
-						modelSelection,
-					),
-					authority,
-				);
-				return await publish({ ...address, ...result }, transaction);
-			} catch (error) {
-				await onFailure?.(transaction, error);
-				await closeAfterPrePromptFailure(operations, authority, { path: input.cwd }, error);
-				throw error;
+						authority,
+					);
+					deadline.remaining();
+					return await publish({ ...address, ...result }, transaction);
+				} catch (error) {
+					await onFailure?.(transaction, error);
+					await closeAfterPrePromptFailure(operations, authority, { path: input.cwd }, error);
+					throw error;
+				}
+			} finally {
+				deadline.close();
 			}
 		},
 	};
@@ -459,7 +511,11 @@ async function applyManagedModelSelection(
 	operations: ManagedSessionOperations,
 	authority: ManagedTurnAuthority,
 	selection: NormalizedModelSelection | undefined,
+	deadline?: ManagedOperationDeadline,
+	signal?: AbortSignal,
 ): Promise<NormalizedModelSelection | undefined> {
+	throwIfAborted(signal);
+	deadline?.remaining();
 	if (selection === undefined) return undefined;
 	const requested = normalizeModelSelection(selection);
 	if (requested === undefined)
@@ -467,7 +523,7 @@ async function applyManagedModelSelection(
 
 	let modelResult: Readonly<Record<string, unknown>>;
 	try {
-		modelResult = await operations.setModel(authority, requested);
+		modelResult = await operations.setModel(authority, requested, deadline?.remaining());
 	} catch (error) {
 		throw managedSelectionMutationError("model_set_failed", "model.set", error);
 	}
@@ -477,7 +533,8 @@ async function applyManagedModelSelection(
 
 	let thinkingResult: Readonly<Record<string, unknown>>;
 	try {
-		thinkingResult = await operations.setThinking(authority, requested.thinkingLevel);
+		throwIfAborted(signal);
+		thinkingResult = await operations.setThinking(authority, requested.thinkingLevel, deadline?.remaining());
 	} catch (error) {
 		throw managedSelectionMutationError("thinking_set_failed", "thinking.set", error);
 	}
@@ -494,6 +551,31 @@ async function applyManagedModelSelection(
 	return requested;
 }
 
+async function continueManagedTurn(
+	operations: ManagedSessionOperations,
+	input: ManagedRunnerContinueInput,
+	timeoutMs: number | undefined,
+): Promise<GjcTurnResult> {
+	throwIfAborted(input.signal);
+	const deadline = new ManagedOperationDeadline(timeoutMs, "turn.follow_up");
+	const onAbort = () => deadline.fail(new GjcTurnCancelledError());
+	input.signal?.addEventListener("abort", onAbort, { once: true });
+	try {
+		const selection = await deadline.wait(
+			applyManagedModelSelection(operations, input.authority, input.modelSelection, deadline, input.signal),
+		);
+		const result = await operations.followUp({
+			...turnInput(input, "turn.follow_up"),
+			timeoutMs: deadline.remaining(),
+		});
+		deadline.remaining();
+		return withManagedProof(withManagedModelSelection(result, selection), input.authority);
+	} finally {
+		input.signal?.removeEventListener("abort", onAbort);
+		deadline.close();
+	}
+}
+
 function managedSelectionMutationError(
 	code: "model_set_failed" | "thinking_set_failed",
 	operation: string,
@@ -502,7 +584,7 @@ function managedSelectionMutationError(
 	if (error instanceof GjcTurnCancelledError) return error;
 	if (
 		error instanceof ManagedSdkOperationError &&
-		["model_set_failed", "thinking_set_failed", "invalid_result"].includes(error.code)
+		["model_set_failed", "thinking_set_failed", "invalid_result", "timeout", "operation_closed"].includes(error.code)
 	)
 		return error;
 	const message = error instanceof Error ? error.message : String(error);

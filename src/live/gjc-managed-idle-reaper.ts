@@ -33,10 +33,13 @@ export interface ManagedIdleGenerationStore {
 		record: ManagedIdleGenerationRecord,
 		intent: ManagedIdleCloseIntent,
 	): Promise<boolean | ManagedIdleCloseIntent>;
+	/** Revalidates a durable successful retirement against the current full mapping authority. */
+	pendingRetirement(record: ManagedIdleGenerationRecord): Promise<ManagedIdleCloseIntent | undefined>;
 	restoreActive(record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent): Promise<void>;
 	retire(record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent): Promise<void>;
 	markUncertain(record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent, reason: string): Promise<void>;
 	evict(record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent): Promise<void>;
+	/** Runs after durable retirement and before eviction; must be idempotent by intent.key. */
 	publishRetired?(record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent): Promise<void>;
 }
 
@@ -80,7 +83,14 @@ export interface CreateManagedIdleReaperInput {
 	readonly clearInterval?: (timer: ReturnType<typeof setInterval>) => void;
 }
 
+export interface ManagedIdlePollFailure {
+	readonly error: unknown;
+	readonly at: number;
+}
+
 export interface ManagedIdleReaper {
+	/** Polling has no awaiting caller; retain its latest failure and also reject stop with it. */
+	readonly lastPollFailure: ManagedIdlePollFailure | undefined;
 	runOnce(): Promise<void>;
 	stop(): Promise<void>;
 }
@@ -106,8 +116,10 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 	readonly #timeoutMs: number;
 	readonly #now: () => number;
 	readonly #inFlight = new Map<string, Promise<void>>();
+	readonly #scans = new Set<Promise<void>>();
 	readonly #clearInterval: (timer: ReturnType<typeof setInterval>) => void;
 	#poller: ReturnType<typeof setInterval> | undefined;
+	#lastPollFailure: ManagedIdlePollFailure | undefined;
 	#stopped = false;
 	#draining: Promise<void> | undefined;
 
@@ -122,19 +134,41 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 				throw new TypeError("pollIntervalMs must be a positive safe integer.");
 			const setInterval = input.setInterval ?? ((handler, timeoutMs) => globalThis.setInterval(handler, timeoutMs));
 			this.#poller = setInterval(() => {
-				void this.runOnce().catch(() => undefined);
+				void this.runOnce().catch(error => {
+					this.#lastPollFailure = Object.freeze({ error, at: this.#now() });
+				});
 			}, input.pollIntervalMs);
 			(this.#poller as unknown as { unref?: () => void }).unref?.();
 		}
 	}
 
-	async runOnce(): Promise<void> {
+	get lastPollFailure(): ManagedIdlePollFailure | undefined {
+		return this.#lastPollFailure;
+	}
+
+	runOnce(): Promise<void> {
+		if (this.#stopped) return Promise.resolve();
+		const scan = Promise.resolve()
+			.then(() => this.scan())
+			.finally(() => this.#scans.delete(scan));
+		this.#scans.add(scan);
+		return scan;
+	}
+
+	private async scan(): Promise<void> {
 		if (this.#stopped) return;
 		const records = await this.input.records.active();
-		await Promise.all(
+		const results = await Promise.allSettled(
 			records.map(async record => {
-				if (this.#stopped || record.state !== "active" || record.lastActivityAt + this.#timeoutMs > this.#now())
+				if (
+					this.#stopped ||
+					(record.state !== "closing" &&
+						(record.state !== "active" || record.lastActivityAt + this.#timeoutMs > this.#now()))
+				)
 					return;
+				if (record.state === "closing" && (await this.input.records.pendingRetirement(record)) === undefined)
+					return;
+				if (this.#stopped) return;
 				const key = recordIdentity(record.authority);
 				if (this.#inFlight.has(key)) return;
 				const work = this.reap(record);
@@ -146,6 +180,7 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 				}
 			}),
 		);
+		throwFailures(results.flatMap(result => (result.status === "rejected" ? [result.reason] : [])));
 	}
 
 	async stop(): Promise<void> {
@@ -156,7 +191,10 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 		}
 		if (this.#draining === undefined) {
 			this.#draining = (async () => {
-				while (this.#inFlight.size > 0) await Promise.allSettled([...this.#inFlight.values()]);
+				const results = await Promise.allSettled([...this.#scans]);
+				const errors = results.flatMap(result => (result.status === "rejected" ? [result.reason] : []));
+				if (this.#lastPollFailure !== undefined) errors.push(this.#lastPollFailure.error);
+				throwFailures([...new Set(errors)]);
 			})();
 		}
 		await this.#draining;
@@ -168,12 +206,20 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 		let lease: ManagedIdleLease | undefined;
 		let intent: ManagedIdleCloseIntent | undefined;
 		let retired = false;
+		const errors: unknown[] = [];
 		try {
 			releaseAdmission = await this.input.admission.acquire(key);
 			if (releaseAdmission === undefined || this.#stopped) return;
 			lease = await this.input.leases.acquire(key);
 			if (lease === undefined || this.#stopped) return;
 			await lease.assertFence();
+			if (record.state === "closing") {
+				intent = await this.input.records.pendingRetirement(record);
+				if (intent === undefined) return;
+				retired = true;
+				await this.finishRetirement(record, intent, lease);
+				return;
+			}
 			const proposed = { key: closeKey(record.authority), authority: record.authority, requestedAt: this.#now() };
 			const prepared = await this.input.records.prepareClose(record, proposed);
 			if (prepared === false) return;
@@ -201,26 +247,63 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 				if (outcome.ok && outcome.result?.sessionId === key.sessionId && status.status === "retired") {
 					await this.input.records.retire(record, intent);
 					retired = true;
-					await lease.assertFence();
-					await this.input.records.evict(record, intent);
-					await this.input.records.publishRetired?.(record, intent);
+					await this.finishRetirement(record, intent, lease);
 					return;
 				}
 				if (status.status === "current" && !outcome.ok && outcome.certainty === "retryable") {
 					await this.input.records.restoreActive(record, intent);
 					return;
 				}
-				await this.input.records.markUncertain(record, intent, `Exact generation status is ${status.status}.`);
+				throw new Error(
+					`Managed close lacks matching success and exact retirement; generation status is ${status.status}.`,
+				);
 			} catch (error) {
-				if (intent !== undefined && !retired)
-					await this.input.records.markUncertain(record, intent, errorMessage(error));
+				errors.push(error);
+				if (!retired) {
+					try {
+						await this.input.records.markUncertain(record, intent, errorMessage(error));
+					} catch (persistenceError) {
+						errors.push(persistenceError);
+					}
+				}
 			}
+		} catch (error) {
+			errors.push(error);
 		} finally {
 			try {
 				await lease?.release();
-			} catch {}
-			releaseAdmission?.();
+			} catch (releaseError) {
+				errors.push(releaseError);
+			}
+			try {
+				releaseAdmission?.();
+			} catch (releaseError) {
+				errors.push(releaseError);
+			}
+			throwFailures(errors);
 		}
+	}
+
+	private async finishRetirement(
+		record: ManagedIdleGenerationRecord,
+		intent: ManagedIdleCloseIntent,
+		lease: ManagedIdleLease,
+	): Promise<void> {
+		const revalidate = async () => {
+			await lease.assertFence();
+			const pending = await this.input.records.pendingRetirement(record);
+			if (
+				pending === undefined ||
+				pending.key !== intent.key ||
+				recordIdentity(pending.authority) !== recordIdentity(record.authority) ||
+				pending.authority.requestKey !== record.authority.requestKey
+			)
+				throw new Error("Managed retirement receipt changed before local cleanup.");
+		};
+		await revalidate();
+		await this.input.records.publishRetired?.(record, intent);
+		await revalidate();
+		await this.input.records.evict(record, intent);
 	}
 }
 
@@ -272,6 +355,21 @@ class ManagedV3GenerationStore implements ManagedIdleGenerationStore {
 		return key === intent.key ? true : { ...intent, key };
 	}
 
+	async pendingRetirement(record: ManagedIdleGenerationRecord): Promise<ManagedIdleCloseIntent | undefined> {
+		return this.retirementIntent(record);
+	}
+
+	private retirementIntent(record: ManagedIdleGenerationRecord): ManagedIdleCloseIntent | undefined {
+		const scope = scopeFor(record.authority);
+		const mapping = this.mappings.getScoped(scope);
+		if (mapping === undefined || !sameManagedAuthority(mapping, record.authority)) return undefined;
+		const operations = this.mappings.operationsScoped(scope);
+		if (generationState(mapping, operations) !== "closing") return undefined;
+		const operation = completedRetirement(mapping, operations);
+		if (operation === undefined) return undefined;
+		return { key: operation.id, authority: record.authority, requestedAt: Date.parse(operation.startedAt) };
+	}
+
 	async restoreActive(_record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent): Promise<void> {
 		const scope = scopeFor(intent.authority);
 		const mapping = this.mappings.getScoped(scope);
@@ -320,11 +418,11 @@ class ManagedV3GenerationStore implements ManagedIdleGenerationStore {
 		this.mappings.transitionOperationScoped(scope, intent.key, "uncertain", reason);
 	}
 
-	async evict(record: ManagedIdleGenerationRecord, _intent: ManagedIdleCloseIntent): Promise<void> {
+	async evict(record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent): Promise<void> {
 		const scope = scopeFor(record.authority);
-		const mapping = this.mappings.getScoped(scope);
-		if (mapping === undefined || !sameManagedAuthority(mapping, record.authority))
-			throw new Error("Managed V3 mapping changed before durable eviction.");
+		const pending = this.retirementIntent(record);
+		if (pending === undefined || pending.key !== intent.key)
+			throw new Error("Managed V3 retirement receipt changed before durable eviction.");
 		this.mappings.retireScoped(scope);
 	}
 }
@@ -396,8 +494,7 @@ function generationState(mapping: SessionMapping, operations: readonly SessionOp
 	if (current === undefined || current.state !== "complete") return "uncertain";
 	const authority = mapping.managedAuthority!;
 	const base = closeKey(authority);
-	for (let index = 0; index < operations.length; index += 1) {
-		const operation = operations[index]!;
+	for (const operation of operations) {
 		if (operation.kind !== "close") {
 			if (operation.state === "uncertain" || operation.state === "conflict") return "uncertain";
 			continue;
@@ -410,8 +507,19 @@ function generationState(mapping: SessionMapping, operations: readonly SessionOp
 			// Only an explicitly not-applied idle close is safe to retry. Manual or
 			// uncertain closes must be reconciled by their owner, including after restart.
 			if (operation.state !== "conflict" || !idleClose) return "uncertain";
-			continue;
 		}
+	}
+	return completedRetirement(mapping, operations) === undefined ? "active" : "closing";
+}
+
+function completedRetirement(
+	mapping: SessionMapping,
+	operations: readonly SessionOperation[],
+): SessionOperation | undefined {
+	const authority = mapping.managedAuthority!;
+	for (let index = 0; index < operations.length; index += 1) {
+		const operation = operations[index]!;
+		if (operation.kind !== "close" || operation.state !== "complete") continue;
 		const result = operation.result;
 		if (
 			result?.kind !== "close" ||
@@ -429,9 +537,9 @@ function generationState(mapping: SessionMapping, operations: readonly SessionOp
 			const activityAt = Date.parse(activity.completedAt ?? activity.startedAt);
 			return activityAt > closedAt || (activityAt === closedAt && activityIndex > index);
 		});
-		if (!laterActivity) return "closing";
+		if (!laterActivity) return operation;
 	}
-	return "active";
+	return undefined;
 }
 
 function nextManagedCloseIngress(
@@ -482,4 +590,9 @@ function closeKey(authority: ManagedTurnAuthority): string {
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : "Managed idle retirement is uncertain.";
+}
+
+function throwFailures(errors: readonly unknown[]): void {
+	if (errors.length === 1) throw errors[0];
+	if (errors.length > 1) throw new AggregateError(errors, "Managed idle retirement failed.");
 }

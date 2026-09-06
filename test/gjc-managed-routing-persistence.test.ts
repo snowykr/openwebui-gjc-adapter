@@ -2,9 +2,14 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ManagedSdkAttachment } from "../src/gjc/managed-sdk-runtime";
 import { routeGjcTurn } from "../src/gjc/session-turn-router";
 import { SessionV3FileBackedMappingStore } from "../src/gjc/session-v3-file-backed-mapping-store";
 import { GjcTurnCancelledError, type ManagedTurnAuthority } from "../src/gjc/turn-runner";
+import type { LiveGatewayRunnerInput } from "../src/live/chat-completions";
+import { createManagedV3GenerationStore } from "../src/live/gjc-managed-idle-reaper";
+import type { ManagedSuccessorInput } from "../src/live/gjc-managed-successor";
+import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-gateway";
 import { managedPreparedAuthority } from "./gjc-lifecycle-fixtures";
 import { FakeGjcTurnRunner, project } from "./gjc-routing-runner-fixtures";
 
@@ -52,6 +57,140 @@ function fixture() {
 }
 
 describe("managed routing persistence", () => {
+	test("does not route a retired generation awaiting local cleanup after restart", async () => {
+		const f = fixture();
+		try {
+			await routeGjcTurn(f.input());
+			const records = createManagedV3GenerationStore(f.store);
+			const record = (await records.active())[0]!;
+			const intent = { key: "retirement", authority: record.authority, requestedAt: Date.now() };
+			expect(await records.prepareClose(record, intent)).toBe(true);
+			await records.retire(record, intent);
+			f.reopen();
+			const gateway = createGjcRoutingLiveGatewayRunner({ turnRunner: f.runner, mappings: f.store });
+			await expect(gateway.run(branchTurn())).rejects.toThrow("retirement requires reconciliation");
+			expect(f.runner.states).toHaveLength(0);
+			expect(f.runner.continues).toHaveLength(0);
+			expect(f.store.getScoped(f.scope)?.sessionId).toBe("session-1");
+		} finally {
+			f.close();
+		}
+	});
+	test("binds distinct branch ingresses and durably acknowledges before successor work", async () => {
+		const f = fixture();
+		try {
+			await routeGjcTurn(f.input());
+			f.runner.events = [{ type: "agent_end", payload: { finalText: "branch prompt complete" } }];
+			const forks: ManagedSuccessorInput[] = [];
+			const runner = Object.assign(f.runner, {
+				async forkManagedSuccessor(input: ManagedSuccessorInput) {
+					forks.push(input);
+					const managedAuthority = {
+						...input.target,
+						sessionId: `branch-${forks.length}`,
+						generation: forks.length + 1,
+					};
+					await input.onAcknowledged?.(managedAuthority);
+					const successor: ManagedSdkAttachment = {
+						tenant: managedAuthority,
+						generation: managedAuthority.generation,
+						isCurrent: () => true,
+					};
+					await input.publish(successor);
+					return { successor, managedAuthority, operationHash: input.source.requestKey };
+				},
+			});
+			const originalGetState = runner.getState.bind(runner);
+			runner.getState = async input => {
+				const persisted = JSON.parse(readFileSync(f.file, "utf8"));
+				const operation = persisted.mappings[0].journal.at(-1);
+				expect(operation.state).toBe("pending");
+				expect(operation.acknowledgedSuccessor).toMatchObject({
+					sessionId: input.sessionId,
+					managedAuthority: { ...input.managedAuthority, chatId: persisted.mappings[0].chatId },
+				});
+				expect(f.store.getScoped(f.scope)?.sessionId).not.toBe(input.sessionId);
+				return originalGetState(input);
+			};
+			const gateway = () => createGjcRoutingLiveGatewayRunner({ turnRunner: runner, mappings: f.store });
+			const first = await gateway().run(branchTurn());
+			f.reopen();
+			expect(await gateway().run(branchTurn())).toEqual(first);
+			expect(forks).toHaveLength(1);
+			await gateway().run(branchTurn("branch-2"));
+			expect(forks).toHaveLength(2);
+			expect(forks[0]!.source.requestKey).not.toBe("user-1");
+			expect(forks[0]!.source.requestKey).not.toBe(forks[1]!.source.requestKey);
+			expect(forks[1]!.target.requestKey).toBe(forks[1]!.source.requestKey);
+			f.reopen();
+			expect(await gateway().run(branchTurn())).toEqual(first);
+			await expect(gateway().run({ ...branchTurn(), prompt: "changed branch payload" })).rejects.toThrow(
+				"immutable result binding",
+			);
+			expect(forks).toHaveLength(2);
+		} finally {
+			f.close();
+		}
+	});
+
+	test("reopens acknowledged branch failure without repeating fork or prompt", async () => {
+		const f = fixture();
+		try {
+			await routeGjcTurn(f.input());
+			let forks = 0;
+			const runner = Object.assign(f.runner, {
+				async forkManagedSuccessor(input: ManagedSuccessorInput): Promise<never> {
+					forks += 1;
+					await input.onAcknowledged?.({ ...input.target, sessionId: "acknowledged-target", generation: 9 });
+					throw new Error("interrupted after durable acknowledgement");
+				},
+			});
+			const gateway = () => createGjcRoutingLiveGatewayRunner({ turnRunner: runner, mappings: f.store });
+			await expect(gateway().run(branchTurn())).rejects.toThrow("interrupted after durable acknowledgement");
+			f.reopen();
+			const prior = f.store.operationScoped(f.scope, "branch-1");
+			expect(prior).toMatchObject({
+				state: "uncertain",
+				kind: "branch",
+				acknowledgedSuccessor: { sessionId: "acknowledged-target", managedAuthority: { generation: 9 } },
+			});
+			expect(f.store.getScoped(f.scope)?.sessionId).toBe("session-1");
+			const bytes = readFileSync(f.file, "utf8");
+			await expect(gateway().run(branchTurn())).rejects.toThrow("requires reconciliation");
+			await expect(gateway().run({ ...branchTurn(), prompt: "changed payload" })).rejects.toThrow();
+			expect(readFileSync(f.file, "utf8")).toBe(bytes);
+			expect(forks).toBe(1);
+			expect(runner.states).toHaveLength(0);
+			expect(runner.continues).toHaveLength(0);
+		} finally {
+			f.close();
+		}
+	});
+
+	test("rejects pre-aborted branch before intent and lifecycle dispatch", async () => {
+		const f = fixture();
+		try {
+			await routeGjcTurn(f.input());
+			let forks = 0;
+			const runner = Object.assign(f.runner, {
+				async forkManagedSuccessor(): Promise<never> {
+					forks += 1;
+					throw new Error("unexpected fork");
+				},
+			});
+			const controller = new AbortController();
+			controller.abort();
+			const gateway = createGjcRoutingLiveGatewayRunner({ turnRunner: runner, mappings: f.store });
+			await expect(gateway.run({ ...branchTurn(), signal: controller.signal })).rejects.toBeInstanceOf(
+				GjcTurnCancelledError,
+			);
+			expect(forks).toBe(0);
+			expect(f.store.operationScoped(f.scope, "branch-1")).toBeUndefined();
+		} finally {
+			f.close();
+		}
+	});
+
 	test("binds before publishing and replays immutable events across restart and later turns", async () => {
 		const f = fixture();
 		try {
@@ -195,3 +334,17 @@ describe("managed routing persistence", () => {
 		}
 	});
 });
+
+function branchTurn(id = "branch-1"): LiveGatewayRunnerInput {
+	return {
+		project,
+		prompt: "branch prompt",
+		chatId: "chat-1",
+		messageId: id,
+		userMessageId: id,
+		userMessageParentId: "user-1",
+		continued: true,
+		ownerUserId: "owner-test",
+		control: { operation: "branch" },
+	};
+}

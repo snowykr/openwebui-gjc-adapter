@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { createHash, randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import type { router } from "@gajae-code/coding-agent/sdk";
 import { buildAdapterServerOptionsFromEnv } from "../../src/adapter-server-options";
@@ -387,6 +387,38 @@ function createManagedSelectionRuntime(baseUrl: string): ManagedSdkRuntime {
 	const runtime = new ManagedSdkRuntime({
 		agentDir: join(process.env.HOME ?? process.cwd(), "managed-router-agent"),
 		deps: {
+			tenantFence: key => {
+				if (
+					!key.principalId ||
+					!key.projectId ||
+					!key.chatId ||
+					resolve(key.canonicalWorkspace) !== key.canonicalWorkspace ||
+					!key.leaseId ||
+					key.epoch !== SESSION_AUTHORITY_V3_EPOCH
+				)
+					return false;
+				if (sessions.has(`${key.sessionId}\u0000${key.generation}`)) return true;
+				const document = JSON.parse(readFileSync(join(sessionRoot, "openwebui-session-mappings.json"), "utf8"));
+				return document.mappings.some((mapping: { managedAuthority?: Record<string, unknown> }) => {
+					const authority = mapping.managedAuthority;
+					return (
+						authority !== undefined &&
+						Object.entries(key).every(([field, value]) =>
+							field === "chatId"
+								? authority.chatId === JSON.stringify([key.principalId, value])
+								: authority[field] === value,
+						)
+					);
+				});
+			},
+			preparedTenantFence: key =>
+				key.principalId.length > 0 &&
+				key.projectId.length > 0 &&
+				key.chatId.length > 0 &&
+				resolve(key.canonicalWorkspace) === key.canonicalWorkspace &&
+				key.leaseId.length > 0 &&
+				key.epoch === SESSION_AUTHORITY_V3_EPOCH &&
+				key.requestKey.length > 0,
 			createRouter: input => {
 				onFrame = input.deps?.onFrame;
 				return selectionRouter;
@@ -394,15 +426,9 @@ function createManagedSelectionRuntime(baseUrl: string): ManagedSdkRuntime {
 			createLifecycleService: () => lifecycle as never,
 		},
 	});
-	// The managed model reader's temporary catalog authority is an adapter-owned
-	// service request rather than a tenant-bound lifecycle call. Keep the actual
-	// ManagedSdkRuntime/Router for every serving operation, with this fixture-only
-	// public operation backed by the same lifecycle fixture.
 	const runtimeWithFixtureOperations = runtime as unknown as {
-		createExternalLifecycleSession: (request: unknown) => Promise<unknown>;
 		closeLifecycleSession: (tenantOrRequest: unknown, request?: unknown) => Promise<unknown>;
 	};
-	runtimeWithFixtureOperations.createExternalLifecycleSession = async () => createSession();
 	// Selection scenarios simulate lifecycle retirement, not SDK 0.16.4's unavailable
 	// public exact-close authority. Real runtime close rejection has separate tests.
 	runtimeWithFixtureOperations.closeLifecycleSession = async (tenantOrRequest, request) => {

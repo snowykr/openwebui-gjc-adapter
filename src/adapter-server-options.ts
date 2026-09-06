@@ -166,19 +166,27 @@ export async function buildResolvedAdapterServerOptions(
 			projectStore.listLinkedProjects().map(project => project.id),
 		);
 		const mappings = new V3FileBackedSessionMappingStore(mappingStorePath);
+		const liveTenantFence =
+			dependencies.managedSdkTenantFence ??
+			(key =>
+				assertActiveManagedV3TenantFence(key, mappings, workspaceRegistry, projectStore, workspaceLeaseManager));
 		const runtime =
 			dependencies.managedSdkRuntime ??
 			dependencies.createManagedSdkRuntime?.(config.runtimeLocations.agentDir) ??
-			new ManagedSdkRuntime({ agentDir: config.runtimeLocations.agentDir });
+			new ManagedSdkRuntime({
+				agentDir: config.runtimeLocations.agentDir,
+				deps: {
+					tenantFence: liveTenantFence,
+					preparedTenantFence: authority =>
+						assertPreparedManagedTenantFence(authority, workspaceRegistry, projectStore, workspaceLeaseManager),
+				},
+			});
 		managedSdkRuntime = runtime;
 		activeManagedV3Runtime = await startActiveManagedRuntime({
 			mappings,
 			runtime: runtime as ManagedSdkRuntime,
 			turnTimeoutMs: config.turnTimeoutMs,
-			liveTenantFence:
-				dependencies.managedSdkTenantFence ??
-				(key =>
-					assertActiveManagedV3TenantFence(key, mappings, workspaceRegistry, projectStore, workspaceLeaseManager)),
+			liveTenantFence,
 		});
 		managedSdkRuntime = activeManagedV3Runtime.runtime;
 		managedSdkTenantFence = activeManagedV3Runtime.tenantFence;
@@ -423,6 +431,17 @@ export async function buildResolvedAdapterServerOptions(
 						return managedSdkRuntimeHealth.reason ?? `Managed SDK runtime is ${managedSdkRuntimeHealth.phase}.`;
 					},
 				},
+				{
+					name: "managed-idle-reaper",
+					get status() {
+						return managedIdleReaper?.lastPollFailure === undefined ? "ok" : "degraded";
+					},
+					get detail() {
+						return managedIdleReaper?.lastPollFailure === undefined
+							? "Managed idle reaper has no recorded polling failure."
+							: "Managed idle retirement requires reconciliation after polling failure.";
+					},
+				},
 			],
 			managedSdkRuntime: {
 				runtime: managedSdkRuntime,
@@ -473,9 +492,13 @@ export async function buildResolvedAdapterServerOptions(
 		let startupError: unknown = error;
 		try {
 			await managedIdleReaper?.stop();
-			await routingRunner?.stop?.();
 		} catch (stopError) {
 			startupError = new AggregateError([startupError, stopError], "Adapter initialization cleanup failed");
+		}
+		try {
+			await routingRunner?.stop?.();
+		} catch (stopError) {
+			startupError = appendStartupCleanupError(startupError, stopError);
 		}
 		try {
 			await disposeManagedSdkRuntime();
@@ -585,6 +608,32 @@ async function assertActiveManagedV3TenantFence(
 					authority.generation !== key.generation ||
 					authority.leaseId !== key.leaseId ||
 					authority.epoch !== key.epoch))
+		)
+			return false;
+		await workspaceLeaseManager.assertFence(lease);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function assertPreparedManagedTenantFence(
+	authority: ManagedPreparedTurnAuthority,
+	workspaceRegistry: ReturnType<typeof createUserWorkspaceRegistry>,
+	projectStore: SqliteProjectRegistrationStore | undefined,
+	workspaceLeaseManager: ReturnType<typeof createWorkspaceLeaseManager>,
+): Promise<boolean> {
+	try {
+		const lease = parseWorkspaceLeaseId(authority.leaseId);
+		const workspace = await workspaceRegistry.resolveBySafeKey(lease.safeKey);
+		const project = projectStore?.getProject(authority.projectId);
+		if (
+			workspace?.userId !== authority.principalId ||
+			path.resolve(workspace.root) !== authority.canonicalWorkspace ||
+			project?.status !== "linked" ||
+			authority.epoch !== SESSION_AUTHORITY_V3_EPOCH ||
+			!authority.chatId ||
+			!authority.requestKey
 		)
 			return false;
 		await workspaceLeaseManager.assertFence(lease);

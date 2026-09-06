@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setImmediate } from "node:timers/promises";
+import { isDeepStrictEqual } from "node:util";
 import { lifecycle } from "@gajae-code/coding-agent/sdk";
 import { type ManagedSdkAttachment, ManagedSdkRuntime } from "../src/gjc/managed-sdk-runtime";
 import { routeGjcTurn } from "../src/gjc/session-turn-router";
@@ -40,11 +41,19 @@ process.env.GJC_CODING_AGENT_DIR = agentDir;
 process.env.GJC_COMPAT_LOCAL_API_KEY = apiKey;
 const service = lifecycle.createSessionLifecycleService(agentDir);
 const responses: Record<string, unknown>[] = [];
+let lifecycleCreates = 0;
 let promptAccepted!: () => void;
 const promptAcknowledged = new Promise<void>(resolve => {
 	promptAccepted = resolve;
 });
 class ProbeRuntime extends ManagedSdkRuntime {
+	override async createPreparedExternalLifecycleSession(
+		authority: Parameters<ManagedSdkRuntime["createPreparedExternalLifecycleSession"]>[0],
+		request: Parameters<ManagedSdkRuntime["createPreparedExternalLifecycleSession"]>[1],
+	) {
+		lifecycleCreates += 1;
+		return super.createPreparedExternalLifecycleSession(authority, request);
+	}
 	override async request(
 		attachment: ManagedSdkAttachment,
 		frame: Record<string, unknown>,
@@ -56,8 +65,28 @@ class ProbeRuntime extends ManagedSdkRuntime {
 		return response;
 	}
 }
-const runtime = new ProbeRuntime({ agentDir, deps: { createLifecycleService: () => service } });
-const mappings = new SessionV3FileBackedMappingStore(join(root, "authority.json"));
+const runtime = new ProbeRuntime({
+	agentDir,
+	deps: {
+		createLifecycleService: () => service,
+		tenantFence: key =>
+			key.principalId === "managed-compat" &&
+			key.projectId === "managed-compat-project" &&
+			key.chatId === "managed-compat-chat" &&
+			key.canonicalWorkspace === workspace &&
+			key.leaseId === "isolated-lease" &&
+			key.epoch === "isolated-epoch",
+		preparedTenantFence: key =>
+			key.principalId === "managed-compat" &&
+			key.projectId === "managed-compat-project" &&
+			key.chatId === "managed-compat-chat" &&
+			key.canonicalWorkspace === workspace &&
+			key.leaseId === "isolated-lease" &&
+			key.epoch === "isolated-epoch" &&
+			key.requestKey === "managed-compat-ingress",
+	},
+});
+let mappings = new SessionV3FileBackedMappingStore(join(root, "authority.json"));
 const runner = createManagedGjcTurnRunner(runtime);
 const scope = { principalId: "managed-compat", chatId: "managed-compat-chat" };
 const project = {
@@ -142,6 +171,9 @@ try {
 		generation: result.mapping.managedAuthority?.generation,
 	};
 	const before = responses.length;
+	const createsBeforeReplay = lifecycleCreates;
+	mappings.close();
+	mappings = new SessionV3FileBackedMappingStore(join(root, "authority.json"));
 	const replay = await routeGjcTurn({
 		project,
 		...scope,
@@ -152,9 +184,17 @@ try {
 		managedAuthority: result.mapping.managedAuthority,
 		modelSelection: { provider: "compat-local", modelId: "hermetic-model", thinkingLevel: "off" },
 	});
-	if (replay.assistantText !== result.assistantText || responses.length !== before)
+	if (
+		replay.assistantText !== result.assistantText ||
+		!isDeepStrictEqual(replay.events, result.events) ||
+		responses.length !== before ||
+		lifecycleCreates !== createsBeforeReplay
+	)
 		throw new Error("Replay changed the result or reissued SDK requests.");
 	report.replayedWithoutDispatch = true;
+	report.replayedAfterStoreReopen = true;
+	report.replayedImmutableEvents = true;
+	report.lifecycleCreates = lifecycleCreates;
 } catch (error) {
 	errors.push(error);
 } finally {
@@ -206,7 +246,8 @@ async function cleanupIsolatedSession(authority: Parameters<ManagedSdkRuntime["g
 		requestKey: "isolated-cleanup",
 		target: { sessionId: authority.sessionId },
 	});
-	if (!acknowledgement.ok) throw new Error("Isolated public cleanup failed.");
+	if (!acknowledgement.ok || acknowledgement.result.sessionId !== authority.sessionId)
+		throw new Error("Isolated public cleanup failed or acknowledged a different session.");
 	await runtime.reconcile();
 	const retirement = await runtime.generationStatus(authority);
 	if (retirement.status !== "retired") throw new Error("Isolated cleanup retirement is unproven.");

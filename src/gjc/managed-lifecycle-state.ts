@@ -24,7 +24,13 @@ export const MANAGED_LIFECYCLE_TRANSITIONS: Readonly<Record<ManagedLifecycleStat
 	Object.freeze({
 		intent_prepared: ["invoking", "terminal_failure"],
 		invoking: ["acknowledged_unproven", "terminal_failure", "uncertain", "cleanup_pending"],
-		acknowledged_unproven: ["active_generation_proven", "cleanup_pending", "uncertain", "retired"],
+		acknowledged_unproven: [
+			"active_generation_proven",
+			"cleanup_pending",
+			"uncertain",
+			"retired",
+			"cleanup_uncertain",
+		],
 		active_generation_proven: ["closing"],
 		closing: ["active_generation_proven", "retired", "uncertain"],
 		retired: [],

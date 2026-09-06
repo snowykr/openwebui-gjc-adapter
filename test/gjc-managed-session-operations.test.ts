@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { ManagedSdkRuntime } from "../src/gjc/managed-sdk-runtime";
+import type { ManagedSdkAttachment, ManagedSdkRuntime, TenantSessionKey } from "../src/gjc/managed-sdk-runtime";
 import type { ManagedTurnAuthority } from "../src/gjc/turn-runner";
 import { createManagedSessionOperations, ManagedTurnUncertainError } from "../src/live/gjc-managed-session-operations";
 
@@ -51,7 +51,61 @@ describe("managed session operations", () => {
 		]);
 		expect(fake.requests[2]?.cursor).toBeUndefined();
 		expect(fake.requests[3]?.cursor).toBe("next");
-		expect(JSON.stringify(fake)).not.toMatch(/token|credential|password/i);
+		expect(JSON.stringify(fake)).not.toMatch(/credential|password|endpointIncarnation/i);
+	});
+
+	test("passes typed readiness budget and persists identity before registration", async () => {
+		const fake = new FakeRuntime();
+		const operations = createManagedSessionOperations(fake.runtime, 500);
+		const order: string[] = [];
+		const register = fake.registerLifecycleTenant.bind(fake);
+		fake.registerLifecycleTenant = async (key, outcome) => {
+			order.push("register");
+			return register(key, outcome);
+		};
+		await operations.create({
+			authority: withoutIdentity(),
+			target: { path: authority.canonicalWorkspace },
+			onAcknowledged: proof => {
+				order.push("acknowledge");
+				expect(proof).toMatchObject(authority);
+			},
+		});
+		expect(order).toEqual(["acknowledge", "register"]);
+		expect(fake.externalLifecycle[0]?.request).not.toHaveProperty("timeoutMs");
+		expect(fake.externalLifecycle[0]?.request.readinessTimeoutMs).toBeGreaterThan(0);
+		expect(fake.externalLifecycle[0]?.request.readinessTimeoutMs).toBeLessThanOrEqual(500);
+	});
+
+	test("retains failed durable acknowledgement without registration or cleanup effects", async () => {
+		const fake = new FakeRuntime();
+		const failure = new Error("ack fsync failed");
+		await expect(
+			createManagedSessionOperations(fake.runtime).create({
+				authority: withoutIdentity(),
+				target: { path: authority.canonicalWorkspace },
+				onAcknowledged: () => {
+					throw failure;
+				},
+			}),
+		).rejects.toBe(failure);
+		expect(fake.registered).toHaveLength(0);
+		expect(fake.lifecycle).toHaveLength(0);
+	});
+
+	test("times out lifecycle invocation and never registers a late result", async () => {
+		const fake = new FakeRuntime();
+		const gate = deferred<ReturnType<typeof lifecycleSuccess>>();
+		fake.createPreparedExternalLifecycleSession = async () => gate.promise;
+		await expect(
+			createManagedSessionOperations(fake.runtime, 25).create({
+				authority: withoutIdentity(),
+				target: { path: authority.canonicalWorkspace },
+			}),
+		).rejects.toMatchObject({ code: "timeout" });
+		gate.resolve(lifecycleSuccess());
+		await new Promise(resolve => setTimeout(resolve, 0));
+		expect(fake.registered).toHaveLength(0);
 	});
 
 	test("requires retired exact generation for close or delete and fences unproven retirement", async () => {
@@ -184,19 +238,61 @@ describe("managed session operations", () => {
 		const releaseSecond = deferred<Record<string, unknown>>();
 		fake.queryHandler = async (_frame, page) => {
 			if (page === 1) {
-				await new Promise(resolve => setTimeout(resolve, 30));
+				await new Promise(resolve => setTimeout(resolve, 50));
 				return queryResponse(["one"], "next");
 			}
 			return releaseSecond.promise;
 		};
 		await expect(
-			createManagedSessionOperations(fake.runtime).query(authority, "models.list/current", {}, 100),
+			createManagedSessionOperations(fake.runtime).query(authority, "models.list/current", {}, 500),
 		).rejects.toMatchObject({ code: "timeout" });
 		expect(fake.requests).toHaveLength(2);
 		expect(fake.requestTimeouts[1]!).toBeLessThan(fake.requestTimeouts[0]! - 10);
 		releaseSecond.resolve(queryResponse(["two"], "must-not-fetch"));
 		await new Promise(resolve => setTimeout(resolve, 0));
 		expect(fake.requests).toHaveLength(2);
+	});
+
+	test("bounds generic request acquisition and prevents dispatch after expiration", async () => {
+		const fake = new FakeRuntime();
+		const release = deferred<void>();
+		const acquire = fake.acquireAttachment.bind(fake);
+		fake.acquireAttachment = async key => {
+			await release.promise;
+			return acquire(key);
+		};
+		const operations = createManagedSessionOperations(fake.runtime, 25);
+		await expect(
+			operations.request({ authority, operation: "turn.steer", input: { text: "bounded" } }),
+		).rejects.toMatchObject({ code: "timeout" });
+		expect(fake.requests).toHaveLength(0);
+		release.resolve();
+		await new Promise(resolve => setTimeout(resolve, 0));
+		expect(fake.requests).toHaveLength(0);
+	});
+
+	test("cancels hanging generic acquisition without late dispatch", async () => {
+		const fake = new FakeRuntime();
+		const entered = deferred<void>();
+		const release = deferred<void>();
+		const acquire = fake.acquireAttachment.bind(fake);
+		fake.acquireAttachment = async key => {
+			entered.resolve();
+			await release.promise;
+			return acquire(key);
+		};
+		const controller = new AbortController();
+		const request = createManagedSessionOperations(fake.runtime, 1_000).request({
+			authority,
+			operation: "turn.steer",
+			signal: controller.signal,
+		});
+		await entered.promise;
+		controller.abort();
+		await expect(request).rejects.toMatchObject({ code: "gjc_turn_cancelled" });
+		release.resolve();
+		await new Promise(resolve => setTimeout(resolve, 0));
+		expect(fake.requests).toHaveLength(0);
 	});
 
 	test("rejects invalid query and turn timeouts before any Router dispatch", async () => {
@@ -247,6 +343,7 @@ function withoutIdentity(): Omit<ManagedTurnAuthority, "sessionId" | "generation
 class FakeRuntime {
 	readonly state = "running";
 	readonly attachment = { isCurrent: () => true };
+	readonly tokens = new Map<string, ManagedSdkAttachment>();
 	readonly externalLifecycle: { operation: string; request: Record<string, unknown> }[] = [];
 	readonly lifecycle: { operation: string; request: Record<string, unknown> }[] = [];
 	readonly requests: Record<string, unknown>[] = [];
@@ -277,11 +374,20 @@ class FakeRuntime {
 			tenant.epoch !== authority.epoch
 		)
 			throw new Error("Exact tenant mismatch");
-		return { tenant: key, generation: authority.generation, attachment: this.attachment };
+		return this.token(tenant);
 	}
 	async registerLifecycleTenant(key: unknown, outcome: unknown) {
 		this.registered.push({ key, outcome });
-		return { tenant: key, generation: authority.generation, attachment: this.attachment };
+		return this.token(key as TenantSessionKey);
+	}
+	private token(key: TenantSessionKey): ManagedSdkAttachment {
+		const identity = JSON.stringify(key);
+		let token = this.tokens.get(identity);
+		if (token === undefined) {
+			token = { tenant: key, generation: key.generation, isCurrent: this.attachment.isCurrent };
+			this.tokens.set(identity, token);
+		}
+		return token;
 	}
 	async createPreparedExternalLifecycleSession(_authority: unknown, request: Record<string, unknown>) {
 		this.externalLifecycle.push({ operation: "create", request });

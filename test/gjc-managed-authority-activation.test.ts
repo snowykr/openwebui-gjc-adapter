@@ -7,7 +7,7 @@ import {
 	type ManagedAuthorityPreparedRebindIntent,
 	managedAuthorityManifestDigest,
 } from "../src/gjc/managed-authority-activation";
-import type { TenantSessionKey } from "../src/gjc/managed-sdk-runtime";
+import type { ManagedSdkAttachment, TenantSessionKey } from "../src/gjc/managed-sdk-runtime";
 import { MANAGED_SESSION_AUTHORITY_EPOCH } from "../src/gjc/managed-session-authority";
 
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
@@ -40,6 +40,9 @@ function fixture(
 	} = {},
 ) {
 	const calls: string[] = [];
+	const tenants = new Map<string, TenantSessionKey>();
+	const attachments = new Map<string, ManagedSdkAttachment>();
+	let running = false;
 	let journal: ManagedAuthorityActivationJournal | undefined;
 	const checkpoint = {
 		authorityEpoch: MANAGED_SESSION_AUTHORITY_EPOCH,
@@ -95,14 +98,36 @@ function fixture(
 		},
 		runtime: {
 			state: "new",
-			start: async () => await effect("router"),
+			start: async () => {
+				await effect("router");
+				running = true;
+			},
 			reconcile: async () => await effect("reconcile"),
-			registerTenant: (key: TenantSessionKey) => calls.push(`register:${key.generation}`),
-			acquireAttachment: async (key: TenantSessionKey) => ({
-				tenant: key,
-				generation: key.generation,
-				attachment: { isCurrent: () => true },
-			}),
+			registerTenant: (key: TenantSessionKey) => {
+				calls.push(`register:${key.generation}`);
+				const prior = tenants.get(`${key.sessionId}:${key.generation}`);
+				if (prior !== undefined && tenantIdentity(prior) !== tenantIdentity(key))
+					attachments.delete(tenantIdentity(prior));
+				tenants.set(`${key.sessionId}:${key.generation}`, Object.freeze({ ...key }));
+			},
+			acquireAttachment: async (key: TenantSessionKey) => {
+				const identity = tenantIdentity(key);
+				const tenant = Object.freeze({ ...key });
+				const current = () =>
+					running && tenantIdentity(tenants.get(`${tenant.sessionId}:${tenant.generation}`)) === identity;
+				if (!current()) throw new Error("Activation fixture tenant is not current.");
+				let token = attachments.get(identity);
+				if (token === undefined) {
+					const issued: ManagedSdkAttachment = Object.freeze({
+						tenant,
+						generation: tenant.generation,
+						isCurrent: () => attachments.get(identity) === issued && current(),
+					});
+					token = issued;
+					attachments.set(identity, token);
+				}
+				return token;
+			},
 		} as never,
 		lifecycle: {
 			resume: async value => {
@@ -227,4 +252,43 @@ describe("managed authority activation", () => {
 		});
 		expect(retired.calls).not.toContain("resume");
 	});
+	test("keeps activation fixture tokens stable and invalidates replaced lease authority", async () => {
+		const active = fixture();
+		await new ManagedAuthorityActivationCoordinator(active.activation).activate();
+		const prepared = intent();
+		const key: TenantSessionKey = {
+			principalId: prepared.principalId,
+			projectId: prepared.projectId,
+			canonicalWorkspace: prepared.canonicalWorkspace,
+			chatId: prepared.chatId,
+			sessionId: prepared.sessionId,
+			generation: 7,
+			leaseId: prepared.leaseId,
+			epoch: prepared.epoch,
+		};
+		const token = await active.activation.runtime.acquireAttachment(key);
+		expect(await active.activation.runtime.acquireAttachment({ ...key })).toBe(token);
+		expect(token).not.toHaveProperty("attachment");
+		expect(token).not.toHaveProperty("send");
+		active.activation.runtime.registerTenant({ ...key, leaseId: "changed" });
+		expect(token.isCurrent()).toBe(false);
+		await expect(active.activation.runtime.acquireAttachment(key)).rejects.toThrow("not current");
+	});
 });
+
+function tenantIdentity(key: TenantSessionKey | undefined): string {
+	return JSON.stringify(
+		key === undefined
+			? null
+			: [
+					key.principalId,
+					key.projectId,
+					key.canonicalWorkspace,
+					key.chatId,
+					key.sessionId,
+					key.generation,
+					key.leaseId,
+					key.epoch,
+				],
+	);
+}

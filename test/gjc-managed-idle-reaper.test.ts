@@ -41,17 +41,24 @@ class Store implements ManagedIdleGenerationStore {
 		this.prepared.push(intent);
 		return this.prepare;
 	}
+	async pendingRetirement(record: ManagedIdleGenerationRecord) {
+		return this.prepared.find(intent => intent.authority === record.authority && this.retired.includes(intent.key));
+	}
 	async restoreActive(_record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent) {
 		this.restored.push(intent.key);
 	}
-	async retire(_record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent) {
+	async retire(record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent) {
 		this.retired.push(intent.key);
+		this.records = this.records.map(candidate =>
+			candidate === record ? { ...record, state: "closing" } : candidate,
+		);
 	}
 	async markUncertain(_record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent, reason: string) {
 		this.uncertain.push(`${intent.key}:${reason}`);
 	}
-	async evict(_record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent) {
+	async evict(record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent) {
 		this.evicted.push(intent.key);
+		this.records = this.records.filter(candidate => candidate.authority !== record.authority);
 	}
 	async publishRetired(_record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent) {
 		this.published.push(intent.key);
@@ -165,7 +172,7 @@ describe("managed idle reaper", () => {
 			{ ok: true, result: { sessionId: "replacement" } },
 		]) {
 			const subject = harness([active()], "retired", outcome);
-			await subject.reaper.runOnce();
+			await expect(subject.reaper.runOnce()).rejects.toThrow("matching success and exact retirement");
 			expect(subject.store.uncertain).toHaveLength(1);
 			expect(subject.store.retired).toEqual([]);
 			expect(subject.store.evicted).toEqual([]);
@@ -251,7 +258,7 @@ describe("managed idle reaper", () => {
 				}),
 			},
 		});
-		await subject.reaper.runOnce();
+		await expect(subject.reaper.runOnce()).rejects.toThrow("lease lost");
 		expect(subject.closeKeys).toEqual([]);
 		expect(subject.store.uncertain[0]).toContain("lease lost");
 		expect(subject.store.evicted).toEqual([]);
@@ -280,7 +287,7 @@ describe("managed idle reaper", () => {
 	test("retains replaced, unknown, and lifecycle errors as uncertain", async () => {
 		for (const status of ["replaced", "unknown"]) {
 			const subject = harness([active()], status);
-			await subject.reaper.runOnce();
+			await expect(subject.reaper.runOnce()).rejects.toThrow(`generation status is ${status}`);
 			expect(subject.store.uncertain).toHaveLength(1);
 			expect(subject.store.evicted).toEqual([]);
 		}
@@ -360,8 +367,210 @@ describe("managed idle reaper", () => {
 				generationStatus: async () => ({ status: "retired" }),
 			},
 		});
-		await failing.runOnce();
+		await expect(failing.runOnce()).rejects.toThrow("transport failed");
 		expect(failingStore.uncertain).toHaveLength(1);
 		expect(failingStore.evicted).toEqual([]);
 	});
+
+	test.each(["evict", "publishRetired"] as const)(
+		"retries failed %s without re-closing or weakening retirement",
+		async phase => {
+			const subject = harness([active()]);
+			const failure = new Error(`${phase} failed`);
+			const original = subject.store[phase].bind(subject.store);
+			let fail = true;
+			subject.store[phase] = async (record, intent) => {
+				if (fail) throw failure;
+				await original(record, intent);
+			};
+			await expect(subject.reaper.runOnce()).rejects.toBe(failure);
+			expect(subject.store.retired).toHaveLength(1);
+			expect(subject.store.records[0]?.state).toBe("closing");
+			expect(subject.store.uncertain).toEqual([]);
+			expect(subject.store.restored).toEqual([]);
+			fail = false;
+			await subject.reaper.runOnce();
+			expect(subject.closeKeys).toHaveLength(1);
+			expect(subject.store.retired).toHaveLength(1);
+			expect(subject.store.evicted).toEqual(subject.store.retired);
+			expect(subject.store.records).toEqual([]);
+			await subject.reaper.stop();
+		},
+	);
+
+	test("preserves release failure after successful retirement and releases admission", async () => {
+		const failure = new Error("lease release failed");
+		let released = 0;
+		const subject = harness([active()], "retired", undefined, {
+			admission: {
+				acquire: async () => () => {
+					released += 1;
+				},
+			},
+			leases: {
+				acquire: async () => ({
+					assertFence: async () => undefined,
+					release: async () => {
+						throw failure;
+					},
+				}),
+			},
+		});
+		await expect(subject.reaper.runOnce()).rejects.toBe(failure);
+		expect(released).toBe(1);
+		expect(subject.store.evicted).toHaveLength(1);
+		expect(subject.store.uncertain).toEqual([]);
+		await subject.reaper.runOnce();
+		expect(subject.closeKeys).toHaveLength(1);
+		await subject.reaper.stop();
+	});
+
+	test("revalidates the retirement receipt after publication and never evicts a changed authority", async () => {
+		const subject = harness([active()]);
+		subject.store.publishRetired = async () => {
+			subject.store.pendingRetirement = async () => undefined;
+		};
+		await expect(subject.reaper.runOnce()).rejects.toThrow("receipt changed");
+		expect(subject.store.retired).toHaveLength(1);
+		expect(subject.store.evicted).toEqual([]);
+		expect(subject.store.uncertain).toEqual([]);
+		expect(subject.store.restored).toEqual([]);
+		await subject.reaper.stop();
+	});
+
+	test("aggregates original lifecycle, persistence and guard release errors without replacing them", async () => {
+		const original = new Error("close failed");
+		const persistence = new Error("uncertainty persistence failed");
+		const lease = new Error("lease release failed");
+		const admission = new Error("admission release failed");
+		const subject = harness([active()], "retired", undefined, {
+			runtime: {
+				closeLifecycleSession: async () => {
+					throw original;
+				},
+				reconcile: async () => undefined,
+				generationStatus: async () => ({ status: "retired" }),
+			},
+			leases: {
+				acquire: async () => ({
+					assertFence: async () => undefined,
+					release: async () => {
+						throw lease;
+					},
+				}),
+			},
+			admission: {
+				acquire: async () => () => {
+					throw admission;
+				},
+			},
+		});
+		subject.store.markUncertain = async () => {
+			throw persistence;
+		};
+		await expect(subject.reaper.runOnce()).rejects.toMatchObject({
+			errors: [original, persistence, lease, admission],
+		});
+		expect(subject.store.retired).toEqual([]);
+		await subject.reaper.stop();
+	});
+
+	test("retains polling active() failure in the typed channel and rejects stop with the original", async () => {
+		let poll!: () => void;
+		const failure = new Error("scan failed");
+		const entered = deferred<void>();
+		const subject = harness([], "retired", undefined, {
+			pollIntervalMs: 10,
+			setInterval: handler => {
+				poll = handler;
+				return { unref() {} } as unknown as ReturnType<typeof setInterval>;
+			},
+			clearInterval: () => undefined,
+		});
+		subject.store.active = async () => {
+			entered.resolve();
+			throw failure;
+		};
+		poll();
+		await entered.promise;
+		await expect(subject.reaper.stop()).rejects.toBe(failure);
+		expect(subject.reaper.lastPollFailure).toEqual({ error: failure, at: 100 });
+	});
+
+	test("stop drains concurrent scans waiting on active() and rejects a late scan failure", async () => {
+		const first = deferred<ManagedIdleGenerationRecord[]>();
+		const second = deferred<ManagedIdleGenerationRecord[]>();
+		const entered = deferred<void>();
+		const subject = harness([]);
+		let scans = 0;
+		subject.store.active = async () => {
+			scans += 1;
+			if (scans === 2) entered.resolve();
+			return scans === 1 ? first.promise : second.promise;
+		};
+		const scan1 = subject.reaper.runOnce();
+		const scan2 = subject.reaper.runOnce();
+		await entered.promise;
+		let stopped = false;
+		const failure = new Error("late scan failure");
+		const stopping = subject.reaper.stop().finally(() => {
+			stopped = true;
+		});
+		void scan2.catch(() => undefined);
+		void stopping.catch(() => undefined);
+		first.resolve([active()]);
+		await scan1;
+		expect(stopped).toBe(false);
+		second.reject(failure);
+		await expect(scan2).rejects.toBe(failure);
+		await expect(stopping).rejects.toBe(failure);
+		expect(subject.counts().admissions).toBe(0);
+		expect(subject.closeKeys).toEqual([]);
+	});
+
+	test("a scan drains another generation's pending close before surfacing an admission failure", async () => {
+		const gate = deferred<void>();
+		const started = deferred<void>();
+		const failure = new Error("tenant admission failed");
+		const subject = harness([active("tenant-a"), active("tenant-b")], "retired", undefined, {
+			admission: {
+				acquire: async key => {
+					if (key.principalId === "tenant-a") throw failure;
+					return () => undefined;
+				},
+			},
+			runtime: {
+				closeLifecycleSession: async request => {
+					started.resolve();
+					await gate.promise;
+					return { ok: true, result: { sessionId: request.target.sessionId } };
+				},
+				reconcile: async () => undefined,
+				generationStatus: async () => ({ status: "retired" }),
+			},
+		});
+		let finished = false;
+		const scan = subject.reaper.runOnce().finally(() => {
+			finished = true;
+		});
+		void scan.catch(() => undefined);
+		await started.promise;
+		expect(finished).toBe(false);
+		const stopping = subject.reaper.stop();
+		void stopping.catch(() => undefined);
+		gate.resolve();
+		await expect(scan).rejects.toBe(failure);
+		await expect(stopping).rejects.toBe(failure);
+		expect(subject.store.evicted).toHaveLength(1);
+	});
 });
+
+function deferred<T>() {
+	let resolve!: (value: T | PromiseLike<T>) => void;
+	let reject!: (reason: unknown) => void;
+	const promise = new Promise<T>((accept, fail) => {
+		resolve = accept;
+		reject = fail;
+	});
+	return { promise, resolve, reject };
+}

@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import type { NormalizedModelSelection } from "../src/contracts";
-import type { ManagedSdkRuntime } from "../src/gjc/managed-sdk-runtime";
+import type { ManagedSdkAttachment, ManagedSdkRuntime, TenantSessionKey } from "../src/gjc/managed-sdk-runtime";
 import type { ManagedPreparedTurnAuthority, ManagedTurnAuthority } from "../src/gjc/turn-runner";
+import type { LiveGatewayRunnerInput } from "../src/live/chat-completions";
 import { createManagedGjcTurnRunner } from "../src/live/gjc-managed-turn-runner";
 
 const authority: ManagedTurnAuthority = {
@@ -146,7 +147,7 @@ describe("managed turn runner", () => {
 		expect(fake.registered).toHaveLength(1);
 		expect(fake.subscriptionCountAtRequest).toEqual([1]);
 		expect(fake.unsubscribed).toBe(1);
-		expect(JSON.stringify(fake)).not.toMatch(/token|credential|password/i);
+		expect(JSON.stringify(fake)).not.toMatch(/credential|password|endpointIncarnation/i);
 	});
 
 	test("continues, answers an explicitly correlated gate, and sends public terminal cancellation", async () => {
@@ -431,6 +432,157 @@ describe("managed turn runner", () => {
 		expect(fake.unsubscribed).toBe(1);
 	});
 
+	test("follow_up control waits for correlated terminal and retains text and events", async () => {
+		const fake = new RunnerRuntime();
+		fake.delayTerminal = true;
+		const runner = createManagedGjcTurnRunner(fake.runtime, 1_000);
+		const control = {
+			...managedAbortAndPromptInput(),
+			control: { operation: "follow_up" as const, text: "follow-up text" },
+		};
+		const turn = runner.runControl!(control, managedControlMapping(), {} as never);
+		let settled = false;
+		void turn.then(() => {
+			settled = true;
+		});
+		await new Promise(resolve => setTimeout(resolve, 10));
+		expect(fake.requests.at(-1)).toMatchObject({ operation: "turn.follow_up", input: { text: "follow-up text" } });
+		expect(settled).toBe(false);
+		await fake.subscriptions[0]!.listener(
+			routerFrame({ type: "agent_end", id: "b", finalText: "follow-up completed" }, 2),
+		);
+		await expect(turn).resolves.toMatchObject({
+			result: { text: "follow-up completed", events: [{ type: "message_update" }, { type: "agent_end" }] },
+		});
+	});
+
+	test("follow_up control propagates semantic failure after acknowledgement", async () => {
+		const fake = new RunnerRuntime();
+		fake.delayTerminal = true;
+		const runner = createManagedGjcTurnRunner(fake.runtime, 1_000);
+		const turn = runner.runControl!(
+			{ ...managedAbortAndPromptInput(), control: { operation: "follow_up" } },
+			managedControlMapping(),
+			{} as never,
+		);
+		await new Promise(resolve => setTimeout(resolve, 10));
+		await fake.subscriptions[0]!.listener(
+			routerFrame({ type: "agent_failed", error: { message: "follow-up failed" } }, 2),
+		).catch(() => undefined);
+		await expect(turn).rejects.toMatchObject({ code: "prompt_failed", message: "follow-up failed" });
+	});
+
+	test("pre-aborted managed start performs no lifecycle or publication effect", async () => {
+		const fake = new RunnerRuntime();
+		const runner = createManagedGjcTurnRunner(fake.runtime);
+		const controller = new AbortController();
+		controller.abort();
+		let publications = 0;
+		await expect(
+			runner.startManagedSession(
+				{
+					cwd: authority.canonicalWorkspace,
+					sessionRoot: "/sessions",
+					projectId: authority.projectId,
+					chatId: authority.chatId,
+					userMessageId: "cancelled",
+					text: "no create",
+					preparedManagedAuthority: withoutIdentity(),
+					signal: controller.signal,
+				},
+				async () => {
+					publications += 1;
+				},
+				async () => {
+					publications += 1;
+				},
+			),
+		).rejects.toMatchObject({ code: "gjc_turn_cancelled" });
+		expect(fake.externalLifecycle).toHaveLength(0);
+		expect(fake.requests).toHaveLength(0);
+		expect(publications).toBe(0);
+	});
+
+	test("session.new acknowledges assigned successor before currentness proof", async () => {
+		const fake = new RunnerRuntime();
+		fake.createPreparedExternalLifecycleSession = async (_prepared, request) => {
+			fake.externalLifecycle.push(request);
+			return { ok: true, result: { sessionId: "new-session", endpointGeneration: 12 } };
+		};
+		const runner = createManagedGjcTurnRunner(fake.runtime);
+		let acknowledged = false;
+		const register = fake.registerLifecycleTenant.bind(fake);
+		fake.registerLifecycleTenant = async (key, outcome) => {
+			expect(acknowledged).toBe(true);
+			return register(key, outcome);
+		};
+		const result = await runner.runControl!(
+			{ ...managedAbortAndPromptInput(), control: { operation: "session.new" } },
+			managedControlMapping(),
+			{} as never,
+			successor => {
+				acknowledged = true;
+				expect(successor).toMatchObject({
+					sessionId: "new-session",
+					managedAuthority: { generation: 12, principalId: authority.principalId },
+				});
+			},
+		);
+		expect(result.result?.managedAuthority?.sessionId).toBe("new-session");
+		expect(result.result?.managedAuthority?.requestKey).not.toBe(authority.requestKey);
+		expect(fake.requests).toHaveLength(0);
+	});
+
+	test("rejects foreign selected resume before lifecycle invocation", async () => {
+		const fake = new RunnerRuntime();
+		let resumes = 0;
+		const resume = fake.resumeExternalLifecycleSession.bind(fake);
+		fake.resumeExternalLifecycleSession = async (key, request) => {
+			resumes += 1;
+			return resume(key, request);
+		};
+		const runner = createManagedGjcTurnRunner(fake.runtime);
+		await expect(
+			runner.runControl!(
+				{
+					...managedAbortAndPromptInput(),
+					control: { operation: "session.resume", sessionId: "foreign", sessionFile: "/foreign/session" },
+				},
+				managedControlMapping(),
+				{} as never,
+			),
+		).rejects.toThrow("persisted exact target authority");
+		expect(resumes).toBe(0);
+		expect(fake.requests).toHaveLength(0);
+	});
+
+	test("uses configured continuation budget across setters and prevents late prompt dispatch", async () => {
+		const fake = new RunnerRuntime();
+		const release = deferred<void>();
+		const original = fake.request.bind(fake);
+		fake.request = async (attachment, frame, options) => {
+			if (frame.operation === "model.set") await release.promise;
+			return original(attachment, frame, options);
+		};
+		const runner = createManagedGjcTurnRunner(fake.runtime, 25);
+		await expect(
+			runner.continue({
+				...address(),
+				authority,
+				modelSelection,
+				userMessageId: "bounded",
+				text: "never dispatched",
+				operationId: "bounded",
+				rawFrameCursor: 0,
+				eventCursor: 0,
+			}),
+		).rejects.toMatchObject({ code: "timeout" });
+		expect(fake.requests).toHaveLength(0);
+		release.resolve();
+		await new Promise(resolve => setTimeout(resolve, 0));
+		expect(fake.requests).toHaveLength(0);
+	});
+
 	test("requires exact retirement for close and performs pre-prompt cleanup once after failure", async () => {
 		const fake = new RunnerRuntime();
 		const runner = createManagedGjcTurnRunner(fake.runtime);
@@ -569,9 +721,15 @@ function managedControlMapping() {
 	} as never;
 }
 
-function managedAbortAndPromptInput(signal?: AbortSignal) {
+function managedAbortAndPromptInput(signal?: AbortSignal): LiveGatewayRunnerInput {
 	return {
-		project: { cwd: authority.canonicalWorkspace } as never,
+		project: {
+			id: authority.projectId,
+			name: "Project",
+			cwd: authority.canonicalWorkspace,
+			allowedRoot: "/workspace",
+			createdAt: new Date("2026-07-08T00:00:00.000Z"),
+		},
 		prompt: "fallback prompt",
 		chatId: authority.chatId,
 		messageId: "message-abort-and-prompt",
@@ -581,12 +739,13 @@ function managedAbortAndPromptInput(signal?: AbortSignal) {
 		ownerUserId: authority.principalId,
 		control: { operation: "abort_and_prompt", text: "replacement prompt" },
 		...(signal === undefined ? {} : { signal }),
-	} as never;
+	};
 }
 
 class RunnerRuntime {
 	readonly state = "running";
 	readonly attachment = { isCurrent: () => true };
+	readonly tokens = new Map<string, ManagedSdkAttachment>();
 	readonly requests: Record<string, unknown>[] = [];
 	readonly subscriptions: { correlation: Record<string, unknown>; listener: (frame: unknown) => Promise<void> }[] = [];
 	readonly subscriptionHistory: {
@@ -615,11 +774,20 @@ class RunnerRuntime {
 	}
 	async reconcile() {}
 	async acquireAttachment(key: unknown) {
-		return { tenant: key, generation: (key as { generation: number }).generation, attachment: this.attachment };
+		return this.token(key as TenantSessionKey);
 	}
 	async registerLifecycleTenant(key: unknown, outcome: unknown) {
 		this.registered.push({ key, outcome });
-		return { tenant: key, generation: (key as { generation: number }).generation, attachment: this.attachment };
+		return this.token(key as TenantSessionKey);
+	}
+	private token(key: TenantSessionKey): ManagedSdkAttachment {
+		const identity = JSON.stringify(key);
+		let token = this.tokens.get(identity);
+		if (token === undefined) {
+			token = { tenant: key, generation: key.generation, isCurrent: this.attachment.isCurrent };
+			this.tokens.set(identity, token);
+		}
+		return token;
 	}
 	async createExternalLifecycleSession(_tenant: unknown, request?: Record<string, unknown>) {
 		if (request === undefined) throw new Error("Complete managed tenant authority is required.");
@@ -744,7 +912,7 @@ class RunnerRuntime {
 	async forkLifecycleSession(_tenantOrRequest: unknown, maybeRequest?: Record<string, unknown>) {
 		const request = maybeRequest ?? (_tenantOrRequest as Record<string, unknown>);
 		this.forkRequests.push(request);
-		return { ok: true as const, result: this.forkResult };
+		return { ok: true as const, operation: "session.fork", result: this.forkResult };
 	}
 	async closeLifecycleSession(_tenantOrRequest?: unknown, _maybeRequest?: Record<string, unknown>) {
 		this.closeCalls += 1;

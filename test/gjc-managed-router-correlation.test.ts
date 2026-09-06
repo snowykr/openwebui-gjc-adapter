@@ -133,6 +133,7 @@ async function fixture() {
 		deps: {
 			createRouter: harness.createRouter,
 			createLifecycleService: () => ({}) as never,
+			tenantFence: key => Object.entries(tenant).every(([field, value]) => Reflect.get(key, field) === value),
 		},
 	});
 	runtime.registerTenant(tenant);
@@ -440,9 +441,35 @@ describe("managed Router acknowledgement correlation", () => {
 		ambiguous.harness.promptResponse.resolve(acknowledgement());
 		await ambiguous.harness.emit(eventFrame(1, { type: "action_needed", kind: "ask", id: "ask" }));
 		await ambiguous.harness.gateQueryStarted.promise;
-		ambiguous.harness.gateResponse.resolve([{ gate_id: "one" }, { gate_id: "two" }]);
+		ambiguous.harness.gateResponse.resolve([
+			{ gate_id: "one", ...hostCorrelation, sessionId: authority.sessionId },
+			{ gate_id: "two", ...hostCorrelation, sessionId: authority.sessionId },
+		]);
 		await expect(rejected).rejects.toMatchObject({ code: "invalid_result" });
 		await ambiguous.runtime.dispose();
+	});
+
+	test("never assigns current correlation to a lone unrelated newly listed gate", async () => {
+		const current = await fixture();
+		const turn = current.operations.prompt({ authority, operation: "turn.prompt", text: "ask", timeoutMs: 1_000 });
+		await current.harness.promptStarted.promise;
+		current.harness.promptResponse.resolve(acknowledgement());
+		await current.harness.emit(eventFrame(1, { type: "action_needed", kind: "ask", id: "unbound-ask" }));
+		await current.harness.gateQueryStarted.promise;
+		current.harness.gateResponse.resolve([
+			{ gate_id: "unrelated-new-gate", status: "pending", schema: { type: "string" } },
+		]);
+		let settled = false;
+		void turn.then(() => {
+			settled = true;
+		});
+		await new Promise(resolve => setTimeout(resolve, 10));
+		expect(settled).toBe(false);
+		await current.harness.emit(terminalFrame(2, "actual terminal"));
+		const result = await turn;
+		expect(result.text).toBe("actual terminal");
+		expect(result.events.some(event => event.type === "workflow_gate")).toBe(false);
+		await current.runtime.dispose();
 	});
 
 	test("times out an acknowledged turn without public terminal evidence and closes observation", async () => {

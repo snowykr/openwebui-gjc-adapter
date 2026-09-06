@@ -57,7 +57,7 @@ function runtime(status: "current" | "replaced" | "unknown" = "current", current
 		},
 		async acquireAttachment(key: TenantSessionKey) {
 			calls.push(`acquire:${key.chatId}`);
-			return { tenant: key, generation: key.generation, attachment };
+			return { tenant: key, generation: key.generation, isCurrent: attachment.isCurrent };
 		},
 		async generationStatus() {
 			calls.push("status");

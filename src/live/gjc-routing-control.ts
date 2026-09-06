@@ -11,7 +11,7 @@ import type { OutboxStore } from "../state/outbox";
 import type { LiveGatewayRunnerInput, LiveGatewayRunnerResult } from "./chat-completions";
 import { OpenWebUIControlError } from "./chat-completions-types";
 import type { ManagedSuccessorFlow } from "./gjc-managed-successor";
-import { controlOperationHash, controlOperationKind } from "./gjc-routing-publication";
+import { controlOperationHash, controlOperationKind, lifecycleControlRequestKey } from "./gjc-routing-publication";
 import { withCanonicalModel } from "./gjc-routing-selection";
 import { formatCanonicalModelId } from "./models";
 import { ensureProjectionRows, projectTurnEvents } from "./workflow-gate-turns";
@@ -100,6 +100,37 @@ export async function runRoutingControl(
 						},
 					);
 					throwIfAborted(turn.signal);
+					if (control.operation === "session.new") {
+						const authority = applied.result?.managedAuthority;
+						const acknowledged = mappings.operation(turn.chatId, turn.userMessageId)?.acknowledgedSuccessor;
+						if (authority === undefined || acknowledged === undefined || !("managedAuthority" in acknowledged))
+							throw new Error("Managed session.new requires durable successor acknowledgement.");
+						assertManagedAuthority(authority, acknowledged.managedAuthority);
+						const address = {
+							cwd: turn.project.cwd,
+							sessionRoot,
+							projectId: existing.projectId,
+							chatId: existing.chatId,
+							sessionId: authority.sessionId,
+						};
+						const mapping = await controlled.withLifecyclePublication!(address, async successorLifecycle => {
+							await controlled.getState({
+								...address,
+								managedAuthority: authority,
+								lifecycle: successorLifecycle,
+							});
+							return publishManagedControlMapping(
+								mappings,
+								successorLifecycle,
+								turn,
+								existing,
+								applied,
+								hash,
+								mapping => ensureProjectionRows(input.outbox, mapping, projectionOwnerUserId, principalId),
+							);
+						});
+						return { applied, mapping };
+					}
 					return {
 						applied,
 						mapping: await publishManagedControlMapping(
@@ -160,8 +191,14 @@ async function runManagedBranch(
 	hash: string,
 	flow: ManagedSuccessorFlow["fork"] | undefined,
 ): Promise<LiveGatewayRunnerResult & { readonly model?: string }> {
-	const source = existing.managedAuthority;
-	if (source === undefined) throw new Error("Managed branch requires persisted source authority.");
+	const predecessor = existing.managedAuthority;
+	if (predecessor === undefined) throw new Error("Managed branch requires persisted source authority.");
+	throwIfAborted(turn.signal);
+	if (flow === undefined) throw new Error("Managed branch requires the public successor flow.");
+	const source = {
+		...predecessor,
+		requestKey: lifecycleControlRequestKey(predecessor, "session.fork", turn.userMessageId, hash),
+	};
 	const mappings = input.mappings;
 	mappings.beginOperation(turn.chatId, {
 		id: turn.userMessageId,
@@ -170,17 +207,39 @@ async function runManagedBranch(
 		detail: hash,
 	});
 	try {
-		if (flow === undefined) throw new Error("Managed branch requires the public successor flow.");
 		const { sessionId: _sessionId, generation: _generation, ...target } = source;
 		const forked = await flow({
 			source,
 			target,
 			signal: turn.signal,
-			publish: () => undefined,
+			onAcknowledged: authority => {
+				assertCurrentBranchPredecessor(mappings, turn.chatId, existing, turn.userMessageId);
+				assertManagedAuthority(authority, {
+					...source,
+					sessionId: authority.sessionId,
+					generation: authority.generation,
+				});
+				if (
+					authority.sessionId === source.sessionId ||
+					!Number.isSafeInteger(authority.generation) ||
+					authority.generation <= 0
+				)
+					throw new Error("Managed branch acknowledgement requires a distinct exact successor.");
+				mappings.recordAcknowledgedSuccessor(turn.chatId, turn.userMessageId, hash, {
+					sessionId: authority.sessionId,
+					managedAuthority: managedAuthorityCopy(authority),
+				});
+			},
+			publish: () => assertCurrentBranchPredecessor(mappings, turn.chatId, existing, turn.userMessageId),
 		});
 		throwIfAborted(turn.signal);
 		assertCurrentBranchPredecessor(mappings, turn.chatId, existing, turn.userMessageId);
 		const authority = managedSuccessorAuthority(source, forked.successor);
+		const acknowledged = mappings.operation(turn.chatId, turn.userMessageId)?.acknowledgedSuccessor;
+		if (acknowledged === undefined || !("managedAuthority" in acknowledged))
+			throw new Error("Managed branch successor acknowledgement was not persisted.");
+		assertManagedAuthority(acknowledged.managedAuthority, authority);
+		assertManagedAuthority(forked.managedAuthority, authority);
 		const sessionRoot = turn.project.sessionRoot ?? `${turn.project.cwd}/.gjc/sessions`;
 		if (input.turnRunner.withLifecyclePublication === undefined)
 			throw new Error("Managed branch requires lifecycle publication.");
@@ -251,16 +310,21 @@ async function runManagedBranch(
 				);
 				return published;
 			});
+			const events = projectTurnEvents(result.events, undefined);
 			return withCanonicalModel(
 				{
 					content: result.text,
-					...(result.events.length === 0 ? {} : { events: projectTurnEvents(result.events, undefined) }),
+					...(events.length === 0 ? {} : { events }),
 				},
 				mapping.modelSelection,
 			);
 		});
 	} catch (error) {
-		mappings.transitionOperation(turn.chatId, turn.userMessageId, "uncertain", hash);
+		try {
+			mappings.transitionOperation(turn.chatId, turn.userMessageId, "uncertain", hash);
+		} catch (persistenceError) {
+			throw new AggregateError([error, persistenceError], "Managed branch failure could not be recorded.");
+		}
 		throw error;
 	}
 }
@@ -357,7 +421,23 @@ async function publishManagedControlMapping(
 	const proof = result?.managedProof;
 	if (authority === undefined || proof === undefined || lifecycle.publishManaged === undefined)
 		throw new Error("GJC managed control did not return a generation proof.");
-	if (existing.managedAuthority !== undefined) assertManagedAuthority(authority, existing.managedAuthority);
+	if (existing.managedAuthority !== undefined) {
+		if (turn.control?.operation === "session.new") {
+			assertManagedAuthority(authority, {
+				...existing.managedAuthority,
+				sessionId: authority.sessionId,
+				generation: authority.generation,
+				requestKey: lifecycleControlRequestKey(
+					existing.managedAuthority,
+					"session.create",
+					turn.userMessageId,
+					hash,
+				),
+			});
+			if (authority.sessionId === existing.sessionId)
+				throw new Error("Managed session.new must assign a different session identity.");
+		} else assertManagedAuthority(authority, existing.managedAuthority);
+	}
 	const publishedAuthority = managedAuthorityCopy(authority);
 	assertManagedProof(proof, publishedAuthority);
 	return lifecycle.publishManaged(proof, () => {
@@ -412,4 +492,7 @@ function assertCurrentBranchPredecessor(
 		operation?.state !== "pending"
 	)
 		throw new OpenWebUIControlError("branch_predecessor_replaced");
+	if (current.managedAuthority === undefined || predecessor.managedAuthority === undefined)
+		throw new OpenWebUIControlError("branch_predecessor_replaced");
+	assertManagedAuthority(current.managedAuthority, predecessor.managedAuthority);
 }

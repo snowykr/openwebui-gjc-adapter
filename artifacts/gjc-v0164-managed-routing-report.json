@@ -1,19 +1,20 @@
 {
   "kind": "managed-routing-api-package-test-report",
-  "sdkVersion": "0.16.4",
-  "invocation": "bun scripts/gjc-managed-runtime-compat.ts",
-  "sourceReport": "<TEMP>/gjc-managed-route-compat-gX91xv/report.json",
-  "sourceReportSha256": "02cfabd85f49f8bfa619808fa2a9063dfb2e364658c5f27b3c7dced47abdfe4e",
-  "startedAt": "2026-09-06T12:34:59.303Z",
-  "finishedAt": "2026-09-06T12:35:04.870Z",
+  "startedAt": "2026-09-06T13:43:47.069Z",
+  "limitations": [
+    "Hermetic provider and exclusively owned probe workspace; no browser.",
+    "Session-only isolated cleanup does not prove production replacement-race-safe close; SDK issue #5345 remains open.",
+    "This probe verifies managed prompt completion and immutable replay after store reopen, not every workflow-gate or cancellation path.",
+    "Explicit hermetic tenant allowlist; not production operation-lease or restricted activation proof."
+  ],
   "withheldBeforeProviderResponse": true,
   "acknowledgement": {
     "type": "control_response",
-    "id": "da1ad183-2801-420d-8804-1d148c652e50",
+    "id": "b22b40ba-9b5d-4fab-b201-cb5160abbe8c",
     "ok": true,
     "result": {
-      "commandId": "ceebe5c1-a81d-4a95-9645-2e36bc9ee003",
-      "turnId": "8fd93cd2-7fa2-4ba7-9037-b6cdf5ef8821",
+      "commandId": "df9e6a24-7210-4d9b-a9e7-3c5084ddc69b",
+      "turnId": "b40d7d33-8086-412e-b900-a3fb524a1096",
       "accepted": true
     }
   },
@@ -26,12 +27,15 @@
     "generation": 1
   },
   "replayedWithoutDispatch": true,
+  "replayedAfterStoreReopen": true,
+  "replayedImmutableEvents": true,
+  "lifecycleCreates": 1,
   "cleanup": {
     "acknowledgement": {
       "ok": true,
       "operation": "session.close",
       "result": {
-        "sessionId": "71a6fae4-7d8f-4180-874c-bd197d0cad8e",
+        "sessionId": "b2c271be-02e6-44f9-8097-098ceb2b918f",
         "note": "Endpoint close was unreachable; sent SIGTERM to the durably identified session process."
       }
     },
@@ -46,18 +50,13 @@
     }
   },
   "routerStopped": true,
-  "errors": [],
-  "limitations": [
-    "Hermetic provider and exclusively owned probe workspace; no browser.",
-    "Session-only isolated cleanup does not prove production replacement-race-safe close; SDK issue #5345 remains open.",
-    "This probe verifies managed prompt completion and durable replay, not every workflow-gate or cancellation path."
-  ],
+  "finishedAt": "2026-09-06T13:43:52.054Z",
   "responses": [
     {
       "operation": "model.set",
       "response": {
         "type": "control_response",
-        "id": "2d89a22a-62ed-4ea7-9654-c926870224ed",
+        "id": "553e2672-8823-4efa-bec8-90d9d08f3f33",
         "ok": true,
         "result": {
           "provider": "compat-local",
@@ -70,7 +69,7 @@
       "operation": "thinking.set",
       "response": {
         "type": "control_response",
-        "id": "a72436d5-c228-44f4-b5f6-bce9ecb6c38c",
+        "id": "98f4fc39-6dac-489c-8660-e5b9fe619be2",
         "ok": true,
         "result": {
           "changed": true
@@ -81,7 +80,7 @@
       "operation": "workflow.gates.list",
       "response": {
         "type": "query_response",
-        "id": "d68006b4-14e4-4055-9c34-943ec865efd5",
+        "id": "3595d4c2-1894-48ea-90a6-0deb9905e704",
         "ok": true,
         "page": {
           "items": [],
@@ -94,14 +93,19 @@
       "operation": "turn.prompt",
       "response": {
         "type": "control_response",
-        "id": "da1ad183-2801-420d-8804-1d148c652e50",
+        "id": "b22b40ba-9b5d-4fab-b201-cb5160abbe8c",
         "ok": true,
         "result": {
-          "commandId": "ceebe5c1-a81d-4a95-9645-2e36bc9ee003",
-          "turnId": "8fd93cd2-7fa2-4ba7-9037-b6cdf5ef8821",
+          "commandId": "df9e6a24-7210-4d9b-a9e7-3c5084ddc69b",
+          "turnId": "b40d7d33-8086-412e-b900-a3fb524a1096",
           "accepted": true
         }
       }
     }
-  ]
+  ],
+  "errors": [],
+  "sdkVersion": "0.16.4",
+  "invocation": "bun scripts/gjc-managed-runtime-compat.ts",
+  "sourceReport": "<TEMP>/gjc-managed-route-compat-22lwCO/report.json",
+  "sourceReportSha256": "6d963de06a31999869d801dd8d25ad64d7d47c0b9ecd49a54edd1a9941b6016f"
 }

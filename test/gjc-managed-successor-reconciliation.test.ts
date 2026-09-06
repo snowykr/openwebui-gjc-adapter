@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AcknowledgedSuccessor } from "../src/gjc/session-authority-types";
 import { SessionV3FileBackedMappingStore } from "../src/gjc/session-v3-file-backed-mapping-store";
 
 const scope = { principalId: "owner", chatId: "chat" };
@@ -76,10 +75,14 @@ describe("managed successor restart reconciliation", () => {
 				store.recordAcknowledgedSuccessorScoped(scope, "successor", "hash", {
 					sessionId: "target",
 					managedAuthority: authority("target", 2),
-				} as unknown as AcknowledgedSuccessor);
+				});
 				store.close();
 				store = new SessionV3FileBackedMappingStore(file);
 				expect(store.operationScoped(scope, "successor")?.state).toBe("uncertain");
+				expect(store.operationScoped(scope, "successor")?.acknowledgedSuccessor).toMatchObject({
+					sessionId: "target",
+					managedAuthority: authority("target", 2),
+				});
 				const before = readFileSync(file, "utf8");
 				const target = mapping("target", 2, "successor");
 				for (const substitution of [

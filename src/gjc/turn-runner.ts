@@ -87,6 +87,8 @@ export interface GjcStartNewSessionInput {
 	readonly signal?: AbortSignal;
 	readonly principalId?: string;
 	readonly preparedManagedAuthority?: ManagedPreparedTurnAuthority;
+	/** Persists assigned lifecycle identity before attachment proof or prompt effects. */
+	readonly onLifecycleAcknowledged?: (authority: ManagedTurnAuthority) => void | Promise<void>;
 }
 
 export interface GjcContinueSessionInput extends GjcSessionAddress, GjcLifecycleScoped {

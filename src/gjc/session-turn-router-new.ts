@@ -98,6 +98,24 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 			...(input.signal === undefined ? {} : { signal: input.signal }),
 			principalId: prepared.principalId,
 			preparedManagedAuthority: { ...prepared },
+			onLifecycleAcknowledged: async (acknowledged: ManagedTurnAuthority) => {
+				const authority = managedAuthorityFor(
+					prepared,
+					{
+						kind: "managed-generation",
+						sessionId: acknowledged.sessionId,
+						generation: acknowledged.generation,
+						leaseId: acknowledged.leaseId,
+						epoch: acknowledged.epoch,
+					},
+					acknowledged.sessionId,
+				);
+				assertSameManagedAuthority(authority, acknowledged);
+				input.mappings.attachProvisionalOperation(input.chatId, input.userMessageId, {
+					sessionId: authority.sessionId,
+					managedAuthority: authority,
+				});
+			},
 		} as const;
 		return await input.runner.startManagedSession(
 			startInput,

@@ -7,6 +7,7 @@ import {
 	type ManagedSdkRuntime,
 	type TenantSessionKey,
 } from "../gjc/managed-sdk-runtime";
+import { SESSION_AUTHORITY_V3_EPOCH } from "../gjc/session-authority-v3";
 import {
 	GjcTurnCancelledError,
 	type GjcTurnEvent,
@@ -31,6 +32,9 @@ export interface ManagedLifecycleInput {
 		Partial<Pick<ManagedTurnAuthority, "sessionId" | "generation">>;
 	readonly target: Readonly<Record<string, unknown>>;
 	readonly timeoutMs?: number;
+	readonly signal?: AbortSignal;
+	/** Durable owner acknowledgement, before registration, cancellation handling, or currentness proof. */
+	readonly onAcknowledged?: (authority: ManagedTurnAuthority) => void | Promise<void>;
 }
 
 /** A lifecycle acknowledgement whose identity has been adopted, fenced, and proven current. */
@@ -139,93 +143,180 @@ export function createManagedSessionOperations(
 		options?: ManagedRequestInput,
 	) => {
 		throwIfAborted(options?.signal);
-		const attachment = await acquire(authority);
-		throwIfAborted(options?.signal);
-		return await runtime.request(attachment, frame, {
-			timeoutMs: options?.timeoutMs,
-			beforeDispatch: () => throwIfAborted(options?.signal),
-			onDispatch: options?.onDispatch,
-		});
+		const deadline = new ManagedOperationDeadline(
+			options?.timeoutMs ?? defaultTimeoutMs,
+			options?.operation ?? "request",
+		);
+		const onAbort = () => deadline.fail(new GjcTurnCancelledError());
+		options?.signal?.addEventListener("abort", onAbort, { once: true });
+		try {
+			const key = tenant(authority);
+			await deadline.wait(runtime.reconcile());
+			const attachment = await deadline.wait(runtime.acquireAttachment(key));
+			throwIfAborted(options?.signal);
+			return await deadline.wait(
+				runtime.request(attachment, frame, {
+					timeoutMs: deadline.remaining(),
+					beforeDispatch: () => {
+						deadline.remaining();
+						throwIfAborted(options?.signal);
+					},
+					onDispatch: options?.onDispatch,
+				}),
+			);
+		} finally {
+			options?.signal?.removeEventListener("abort", onAbort);
+			deadline.close();
+		}
 	};
 	const lifecycle = async (
 		operation: "create" | "resume" | "fork" | "close" | "delete" | "list",
 		input: ManagedLifecycleInput,
 	): Promise<unknown> => {
-		const authority = input.authority;
-		const key = hasExactGeneration(authority) ? tenant(authority as ManagedTurnAuthority) : undefined;
-		const actor = { namespace: "openwebui-gjc-adapter", id: authority.principalId };
-		const requestKey = authority.requestKey;
-		const target = lifecycleTarget(operation, input.target);
-		const request =
-			operation === "list"
-				? { actor, capability: "session.list" as const, target, timeoutMs: input.timeoutMs }
-				: { actor, capability: `session.${operation}`, requestKey, target, timeoutMs: input.timeoutMs };
-		let outcome: unknown;
+		throwIfAborted(input.signal);
+		const deadline = new ManagedOperationDeadline(input.timeoutMs ?? defaultTimeoutMs, `session.${operation}`);
 		try {
-			outcome = await (operation === "create"
-				? runtime.createPreparedExternalLifecycleSession(authority, request as never)
-				: operation === "resume"
-					? runtime.resumeExternalLifecycleSession(requireExactTenant(key), request as never)
-					: operation === "fork"
-						? runtime.forkLifecycleSession(requireExactTenant(key), request as never)
-						: operation === "close"
-							? runtime.closeLifecycleSession(requireExactTenant(key), request as never)
-							: operation === "delete"
-								? runtime.deleteLifecycleSession(requireExactTenant(key), request as never)
-								: runtime.listLifecycleSessions(requireExactTenant(key), request as never));
-		} catch (error) {
-			if ((operation === "close" || operation === "delete") && key !== undefined)
-				await requireRetired(runtime, key, error);
-			throw error;
-		}
-		outcome = externalOutcome(outcome);
-		if (!isLifecycleSuccess(outcome)) {
-			if (operation === "close" || operation === "delete") {
-				throw new ManagedTurnUncertainError(
-					`Managed session.${operation} lacks a successful lifecycle acknowledgement.`,
-				);
-			}
-			if (isUncertainLifecycleOutcome(outcome))
-				throw new ManagedTurnUncertainError(`Managed session.${operation} outcome is uncertain.`);
-			throw new Error(lifecycleMessage(outcome, `Managed session.${operation} failed.`));
-		}
-		if (operation === "close" || operation === "delete") {
-			if (key === undefined)
-				throw new ManagedTurnUncertainError("Managed retirement lacks an exact generation authority.");
-			if (!isRecord(outcome) || !isRecord(outcome.result) || outcome.result.sessionId !== key.sessionId)
-				throw new ManagedTurnUncertainError(
-					`Managed session.${operation} acknowledgement does not match the exact session.`,
-				);
-			await requireRetired(runtime, key);
-		} else if (operation !== "list") {
-			const lifecycleTenant = tenantFromLifecycle(authority, outcome, operation, target);
-			if (lifecycleTenant === undefined)
-				throw new Error("Managed lifecycle acknowledgement lacks the expected session id and positive generation.");
-			try {
-				return {
-					outcome,
-					tenant: lifecycleTenant,
-					attachment: await runtime.registerLifecycleTenant(lifecycleTenant),
-				} satisfies ManagedLifecycleResult;
-			} catch (error) {
-				// A successful lifecycle acknowledgement without current attachment proof
-				// cannot be reinterpreted as failure. Retire this exact generation first.
-				try {
-					await lifecycle("close", {
-						authority: { ...lifecycleTenant, requestKey: authority.requestKey },
-						target: { sessionId: lifecycleTenant.sessionId, endpointGeneration: lifecycleTenant.generation },
-						timeoutMs: input.timeoutMs,
-					});
-					runtime.unregisterTenant(lifecycleTenant);
-				} catch (cleanup) {
-					throw new AggregateError([error, cleanup], "Managed lifecycle success has uncertain cleanup.");
+			const authority = input.authority;
+			const key = hasExactGeneration(authority) ? tenant(authority as ManagedTurnAuthority) : undefined;
+			const actor = { namespace: "openwebui-gjc-adapter", id: authority.principalId };
+			const requestKey = authority.requestKey;
+			const target = lifecycleTarget(operation, input.target);
+			const invokeLifecycle = () => {
+				throwIfAborted(input.signal);
+				const timeoutMs = deadline.remaining();
+				switch (operation) {
+					case "create":
+						return runtime.createPreparedExternalLifecycleSession(authority, {
+							actor,
+							capability: "session.create",
+							requestKey,
+							target: { kind: "existing_path", path: requiredTargetString(target, "path") },
+							readinessTimeoutMs: timeoutMs,
+						});
+					case "resume":
+						return runtime.resumeExternalLifecycleSession(requireExactTenant(key), {
+							actor,
+							capability: "session.resume",
+							requestKey,
+							target: {
+								sessionIdOrPrefix: requiredTargetString(target, "sessionIdOrPrefix"),
+								path:
+									target.path === undefined
+										? authority.canonicalWorkspace
+										: requiredTargetString(target, "path"),
+							},
+							readinessTimeoutMs: timeoutMs,
+						});
+					case "fork":
+						return runtime.forkLifecycleSession(requireExactTenant(key), {
+							actor,
+							capability: "session.fork",
+							requestKey,
+							target: {
+								sourceSessionId: requiredTargetString(target, "sourceSessionId"),
+								cwd: requiredTargetString(target, "cwd"),
+							},
+							timeoutMs,
+						});
+					case "close":
+						return runtime.closeLifecycleSession(requireExactTenant(key), {
+							actor,
+							capability: "session.close",
+							requestKey,
+							target: {
+								sessionId: requiredTargetString(target, "sessionId"),
+								endpointGeneration:
+									target.endpointGeneration === undefined ? key!.generation : requiredTargetGeneration(target),
+								...(target.endpointIncarnation === undefined
+									? {}
+									: { endpointIncarnation: requiredTargetString(target, "endpointIncarnation") }),
+							},
+							timeoutMs,
+						});
+					case "delete":
+						return runtime.deleteLifecycleSession(requireExactTenant(key), {
+							actor,
+							capability: "session.delete",
+							requestKey,
+							target: {
+								sessionId: requiredTargetString(target, "sessionId"),
+								cwd: authority.canonicalWorkspace,
+							},
+							timeoutMs,
+						});
+					case "list":
+						if (Object.keys(target).some(field => field !== "cwd"))
+							throw new Error("Managed lifecycle list rejects unreviewed scope options.");
+						return runtime.listLifecycleSessions(requireExactTenant(key), {
+							actor,
+							capability: "session.list",
+							target: {
+								cwd:
+									target.cwd === undefined
+										? authority.canonicalWorkspace
+										: requiredTargetString(target, "cwd"),
+								resolveSessionId: key!.sessionId,
+							},
+							timeoutMs,
+						});
 				}
-				throw new ManagedTurnUncertainError("Managed lifecycle success lacks current exact-generation proof.", {
-					cause: error,
-				});
+			};
+			const outcome = externalOutcome(await deadline.wait<unknown>(invokeLifecycle()));
+			if (!isLifecycleSuccess(outcome)) {
+				if (operation === "close" || operation === "delete") {
+					throw new ManagedTurnUncertainError(
+						`Managed session.${operation} lacks a successful lifecycle acknowledgement.`,
+					);
+				}
+				if (isUncertainLifecycleOutcome(outcome))
+					throw new ManagedTurnUncertainError(`Managed session.${operation} outcome is uncertain.`);
+				throw new Error(lifecycleMessage(outcome, `Managed session.${operation} failed.`));
 			}
+			if (operation === "close" || operation === "delete") {
+				if (key === undefined)
+					throw new ManagedTurnUncertainError("Managed retirement lacks an exact generation authority.");
+				if (!isRecord(outcome) || !isRecord(outcome.result) || outcome.result.sessionId !== key.sessionId)
+					throw new ManagedTurnUncertainError(
+						`Managed session.${operation} acknowledgement does not match the exact session.`,
+					);
+				await deadline.wait(requireRetired(runtime, key));
+			} else if (operation !== "list") {
+				const lifecycleTenant = tenantFromLifecycle(authority, outcome, operation, target);
+				if (lifecycleTenant === undefined)
+					throw new Error(
+						"Managed lifecycle acknowledgement lacks the expected session id and positive generation.",
+					);
+				const acknowledged = { ...lifecycleTenant, requestKey, authorityEpoch: SESSION_AUTHORITY_V3_EPOCH };
+				await deadline.wait(Promise.resolve(input.onAcknowledged?.(acknowledged)));
+				try {
+					throwIfAborted(input.signal);
+					return {
+						outcome,
+						tenant: lifecycleTenant,
+						attachment: await deadline.wait(runtime.registerLifecycleTenant(lifecycleTenant)),
+					} satisfies ManagedLifecycleResult;
+				} catch (error) {
+					// A successful lifecycle acknowledgement without current attachment proof
+					// cannot be reinterpreted as failure. Retire this exact generation first.
+					try {
+						await lifecycle("close", {
+							authority: { ...lifecycleTenant, requestKey: authority.requestKey },
+							target: { sessionId: lifecycleTenant.sessionId, endpointGeneration: lifecycleTenant.generation },
+							timeoutMs: deadline.remaining(),
+						});
+						runtime.unregisterTenant(lifecycleTenant);
+					} catch (cleanup) {
+						throw new AggregateError([error, cleanup], "Managed lifecycle success has uncertain cleanup.");
+					}
+					throw new ManagedTurnUncertainError("Managed lifecycle success lacks current exact-generation proof.", {
+						cause: error,
+					});
+				}
+			}
+			return outcome;
+		} finally {
+			deadline.close();
 		}
-		return outcome;
 	};
 	const request = async (input: ManagedRequestInput) => {
 		if (!input.operation) throw new TypeError("Managed operation is required.");
@@ -337,7 +428,7 @@ export function createManagedSessionOperations(
 			const assertCurrent = () => {
 				throwIfAborted(input.signal);
 				deadline.remaining();
-				if (runtime.state !== "running" || !attachment.attachment.isCurrent())
+				if (runtime.state !== "running" || !attachment.isCurrent())
 					throw new ManagedTurnUncertainError("Managed turn lost its current runtime attachment.");
 			};
 			assertCurrent();
@@ -444,7 +535,7 @@ export function createManagedSessionOperations(
 			}
 			const current = await deadline.wait(runtime.acquireAttachment(tenant(authority)));
 			assertCurrent();
-			if (current.attachment !== attachment.attachment)
+			if (current !== attachment)
 				throw new ManagedTurnUncertainError("Managed turn attachment changed before completion.");
 			return {
 				text: terminal === undefined ? accumulatedText(events) : (terminal.payload!.finalText as string),
@@ -600,6 +691,20 @@ function lifecycleTarget(
 	return { ...target };
 }
 
+function requiredTargetString(target: Readonly<Record<string, unknown>>, field: string): string {
+	const value = target[field];
+	if (typeof value !== "string" || value.length === 0)
+		throw new TypeError(`Managed lifecycle target ${field} must be a non-empty string.`);
+	return value;
+}
+
+function requiredTargetGeneration(target: Readonly<Record<string, unknown>>): number {
+	const value = target.endpointGeneration;
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0)
+		throw new TypeError("Managed lifecycle target generation must be a positive safe integer.");
+	return value;
+}
+
 function tenantFromLifecycle(
 	authority: ManagedLifecycleInput["authority"],
 	outcome: unknown,
@@ -747,12 +852,10 @@ function resolveDurableGate(
 		const nested = value.correlation;
 		if (nested !== undefined && !isRecord(nested)) return false;
 		const records = isRecord(nested) ? [value, nested] : [value];
-		let explicit = false;
 		let complete = false;
 		for (const record of records) {
 			for (const key of ["sessionId", "commandId", "turnId"] as const) {
 				if (record[key] === undefined) continue;
-				explicit = true;
 				if (record[key] !== expected[key]) return false;
 			}
 			if (
@@ -762,7 +865,7 @@ function resolveDurableGate(
 			)
 				complete = true;
 		}
-		return complete || (!explicit && !baseline.has(id));
+		return complete || (action.workflowGateId === id && !baseline.has(id));
 	});
 	if (matches.length > 1)
 		throw new ManagedSdkOperationError(
@@ -780,7 +883,7 @@ function nonEmptyString(value: unknown): value is string {
 }
 
 /** One finite budget, including attachment acquisition, every page, observers and publication fencing. */
-class ManagedOperationDeadline {
+export class ManagedOperationDeadline {
 	readonly expiresAt: number;
 	readonly #failure: Promise<never>;
 	readonly #timer: ReturnType<typeof setTimeout>;

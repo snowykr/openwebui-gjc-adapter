@@ -5,6 +5,7 @@ import type {
 	ManagedAuthorityPreparedRebindIntent,
 } from "../src/gjc/managed-authority-activation";
 import { type ManagedBootstrapOptions, ManagedBootstrapService } from "../src/gjc/managed-bootstrap";
+import type { ManagedSdkAttachment, TenantSessionKey } from "../src/gjc/managed-sdk-runtime";
 import {
 	type LegacyManagedSessionAuthorityEvidence,
 	MANAGED_SESSION_AUTHORITY_EPOCH,
@@ -81,19 +82,41 @@ class FakeRuntime {
 	reconciles = 0;
 	failStart = false;
 	readonly registered: unknown[] = [];
+	readonly #tenants = new Map<string, TenantSessionKey>();
+	readonly #attachments = new Map<string, ManagedSdkAttachment>();
 	async start() {
 		this.starts += 1;
 		if (this.failStart) throw new Error("router start failed");
 		this.state = "running";
 	}
-	registerTenant(key: unknown) {
+	registerTenant(key: TenantSessionKey) {
 		this.registered.push(key);
+		const prior = this.#tenants.get(`${key.sessionId}:${key.generation}`);
+		if (prior !== undefined && tenantIdentity(prior) !== tenantIdentity(key))
+			this.#attachments.delete(tenantIdentity(prior));
+		this.#tenants.set(`${key.sessionId}:${key.generation}`, Object.freeze({ ...key }));
 	}
 	async reconcile() {
 		this.reconciles += 1;
 	}
-	async acquireAttachment(tenant: { readonly generation: number }) {
-		return { tenant, generation: tenant.generation, attachment: { isCurrent: () => true } };
+	async acquireAttachment(key: TenantSessionKey): Promise<ManagedSdkAttachment> {
+		const identity = tenantIdentity(key);
+		const tenant = Object.freeze({ ...key });
+		const current = () =>
+			this.state === "running" &&
+			tenantIdentity(this.#tenants.get(`${tenant.sessionId}:${tenant.generation}`)) === identity;
+		if (!current()) throw new Error("Bootstrap fixture tenant is not current.");
+		let token = this.#attachments.get(identity);
+		if (token === undefined) {
+			const issued: ManagedSdkAttachment = Object.freeze({
+				tenant,
+				generation: tenant.generation,
+				isCurrent: () => this.#attachments.get(identity) === issued && current(),
+			});
+			token = issued;
+			this.#attachments.set(identity, token);
+		}
+		return token;
 	}
 	async dispose() {
 		this.disposes += 1;
@@ -264,4 +287,36 @@ describe("managed bootstrap", () => {
 		expect(active.releases()).toBe(1);
 		expect(Object.keys(active.storage)).not.toContain("userArtifacts");
 	});
+	test("keeps bootstrap fixture tokens stable and invalidates changed leases and disposed sessions", async () => {
+		const active = fixture();
+		await active.service.start();
+		const tenant = active.runtime.registered[0] as TenantSessionKey;
+		const token = await active.runtime.acquireAttachment(tenant);
+		expect(await active.runtime.acquireAttachment({ ...tenant })).toBe(token);
+		expect(token).not.toHaveProperty("attachment");
+		expect(token).not.toHaveProperty("send");
+		active.runtime.registerTenant({ ...tenant, leaseId: "changed" });
+		expect(token.isCurrent()).toBe(false);
+		await expect(active.runtime.acquireAttachment(tenant)).rejects.toThrow("not current");
+		const replacement = await active.runtime.acquireAttachment({ ...tenant, leaseId: "changed" });
+		await active.service.dispose();
+		expect(replacement.isCurrent()).toBe(false);
+	});
 });
+
+function tenantIdentity(key: TenantSessionKey | undefined): string {
+	return JSON.stringify(
+		key === undefined
+			? null
+			: [
+					key.principalId,
+					key.projectId,
+					key.canonicalWorkspace,
+					key.chatId,
+					key.sessionId,
+					key.generation,
+					key.leaseId,
+					key.epoch,
+				],
+	);
+}

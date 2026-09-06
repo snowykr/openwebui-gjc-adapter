@@ -1,8 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import type { lifecycle, router } from "@gajae-code/coding-agent/sdk";
-import { ManagedSdkRuntime, type TenantSessionKey } from "../src/gjc/managed-sdk-runtime";
+import { ManagedSdkRuntime, type ManagedSdkRuntimeDeps, type TenantSessionKey } from "../src/gjc/managed-sdk-runtime";
+import type { ManagedPreparedTurnAuthority } from "../src/gjc/turn-runner";
 
-type CloseRequest = Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["close"]>[0];
+type LifecycleService = ReturnType<typeof lifecycle.createSessionLifecycleService>;
+type CloseRequest = Parameters<LifecycleService["close"]>[0];
+type CreateRequest = Parameters<LifecycleService["createExternal"]>[0];
+type ResumeRequest = Parameters<LifecycleService["resumeExternal"]>[0];
+type ListRequest = Parameters<LifecycleService["list"]>[0];
 
 const tenant: TenantSessionKey = {
 	principalId: "principal-1",
@@ -27,7 +32,7 @@ function deferred<T>() {
 
 function closeRequest(): CloseRequest {
 	return {
-		actor: { id: tenant.principalId, namespace: "adapter" },
+		actor: { id: tenant.principalId, namespace: "openwebui-gjc-adapter" },
 		capability: "session.close",
 		requestKey: "close-1",
 		target: {
@@ -40,8 +45,62 @@ function closeRequest(): CloseRequest {
 	};
 }
 
+function preparedAuthority(): ManagedPreparedTurnAuthority {
+	return {
+		principalId: tenant.principalId,
+		projectId: tenant.projectId,
+		canonicalWorkspace: tenant.canonicalWorkspace,
+		chatId: tenant.chatId,
+		leaseId: tenant.leaseId,
+		epoch: tenant.epoch,
+		requestKey: "create-1",
+	};
+}
+
+function createRequest(): CreateRequest {
+	return {
+		actor: { id: tenant.principalId, namespace: "openwebui-gjc-adapter" },
+		capability: "session.create",
+		requestKey: "create-1",
+		target: { kind: "existing_path", path: tenant.canonicalWorkspace },
+		readinessTimeoutMs: 500,
+	};
+}
+
+function listRequest(): ListRequest {
+	return {
+		actor: closeRequest().actor,
+		capability: "session.list",
+		target: { cwd: tenant.canonicalWorkspace, resolveSessionId: tenant.sessionId },
+		timeoutMs: 500,
+	};
+}
+
+function observedFrame(seq: number): router.SessionRouterFrame {
+	return {
+		body: {},
+		name: "event",
+		sessionId: tenant.sessionId,
+		generation: tenant.generation,
+		commandId: "queued-command",
+		seq,
+	};
+}
+
 function fixture(
-	options: { start?: () => Promise<void>; fence?: () => boolean | Promise<boolean>; maxFrames?: number } = {},
+	options: {
+		start?: () => Promise<void>;
+		stop?: () => Promise<void>;
+		fence?: () => boolean | Promise<boolean>;
+		preparedFence?: ManagedSdkRuntimeDeps["preparedTenantFence"];
+		omitTenantFence?: boolean;
+		omitPreparedFence?: boolean;
+		request?: () => Promise<Record<string, unknown>>;
+		close?: LifecycleService["close"];
+		list?: LifecycleService["list"];
+		maxFrames?: number;
+		drainTimeoutMs?: number;
+	} = {},
 ) {
 	let onFrame:
 		| ((attachment: router.SessionAttachment, frame: router.SessionRouterFrame) => Promise<void> | void)
@@ -60,10 +119,39 @@ function fixture(
 	} as router.SessionAttachment;
 	const calls: string[] = [];
 	const closeCalls: CloseRequest[] = [];
-	const lifecycleService: Pick<ReturnType<typeof lifecycle.createSessionLifecycleService>, "close"> = {
+	const createCalls: CreateRequest[] = [];
+	const resumeCalls: ResumeRequest[] = [];
+	const listCalls: ListRequest[] = [];
+	let currentAttachment = attachment;
+	const lifecycleService: Pick<LifecycleService, "close" | "createExternal" | "resumeExternal" | "list" | "delete"> = {
 		async close(request) {
 			closeCalls.push(request);
+			if (options.close !== undefined) return await options.close(request);
 			return { ok: true, operation: "session.close", result: { sessionId: request.target.sessionId } };
+		},
+		async createExternal(request) {
+			createCalls.push(request);
+			return { ok: true, operation: "session.create", result: { sessionId: "created", endpointGeneration: 1 } };
+		},
+		async resumeExternal(request) {
+			resumeCalls.push(request);
+			return {
+				kind: "result",
+				outcome: {
+					ok: true,
+					operation: "session.resume",
+					result: { sessionId: tenant.sessionId, endpointGeneration: tenant.generation },
+				},
+			};
+		},
+		async list(request) {
+			listCalls.push(request);
+			if (options.list !== undefined) return await options.list(request);
+			return { ok: true, operation: "session.list", result: { indexSeq: 1, sessions: [], warnings: [] } };
+		},
+		async delete() {
+			calls.push("delete");
+			throw new Error("Delete must never dispatch.");
 		},
 	};
 	const sessionRouter = {
@@ -73,12 +161,13 @@ function fixture(
 		},
 		async stop() {
 			calls.push("stop");
+			await options.stop?.();
 		},
 		async reconcile() {
 			calls.push("reconcile");
 		},
 		attachment(sessionId: string, generation?: number) {
-			return sessionId === tenant.sessionId && generation === tenant.generation ? attachment : null;
+			return sessionId === tenant.sessionId && generation === tenant.generation ? currentAttachment : null;
 		},
 		async request(
 			_sessionId: string,
@@ -90,6 +179,7 @@ function fixture(
 			requestOptions?.beforeDispatch?.({} as never);
 			calls.push("request");
 			requestOptions?.onDispatch?.({} as never);
+			if (options.request !== undefined) return await options.request();
 			return { ok: true };
 		},
 		async generationStatus() {
@@ -107,7 +197,9 @@ function fixture(
 				return sessionRouter;
 			},
 			createLifecycleService: () => lifecycleService as ReturnType<typeof lifecycle.createSessionLifecycleService>,
-			tenantFence: () => options.fence?.() ?? true,
+			...(options.omitTenantFence ? {} : { tenantFence: () => options.fence?.() ?? true }),
+			...(options.omitPreparedFence ? {} : { preparedTenantFence: options.preparedFence ?? (() => true) }),
+			...(options.drainTimeoutMs === undefined ? {} : { drainTimeoutMs: options.drainTimeoutMs }),
 			...(options.maxFrames === undefined ? {} : { maxFramesPerSubscription: options.maxFrames }),
 		},
 	});
@@ -117,12 +209,410 @@ function fixture(
 		foreignAttachment,
 		calls,
 		closeCalls,
+		createCalls,
+		resumeCalls,
+		listCalls,
+		replaceAttachment() {
+			currentAttachment = foreignAttachment;
+		},
 		emit: async (frame: router.SessionRouterFrame, sourceAttachment = attachment) =>
 			await onFrame?.(sourceAttachment, frame),
 	};
 }
 
 describe("managed SDK runtime", () => {
+	test("issues stable manager-only capabilities and revokes tokens after replacement or registration loss", async () => {
+		const f = fixture();
+		f.runtime.registerTenant(tenant);
+		await f.runtime.start();
+		const token = await f.runtime.acquireAttachment(tenant);
+		expect(Object.keys(token).sort()).toEqual(["generation", "isCurrent", "tenant"]);
+		expect(token).not.toHaveProperty("attachment");
+		expect(token).not.toHaveProperty("send");
+		expect(await f.runtime.acquireAttachment(tenant)).toBe(token);
+		const reordered = {
+			generation: tenant.generation,
+			sessionId: tenant.sessionId,
+			epoch: tenant.epoch,
+			leaseId: tenant.leaseId,
+			chatId: tenant.chatId,
+			canonicalWorkspace: tenant.canonicalWorkspace,
+			projectId: tenant.projectId,
+			principalId: tenant.principalId,
+		};
+		expect(await f.runtime.acquireAttachment(reordered)).toBe(token);
+		await expect(f.runtime.request({ ...token }, {})).rejects.toThrow("Manager-issued");
+		f.replaceAttachment();
+		expect(token.isCurrent()).toBe(false);
+		const replacement = await f.runtime.acquireAttachment(tenant);
+		expect(replacement).not.toBe(token);
+		f.runtime.unregisterTenant(tenant);
+		f.runtime.registerTenant(tenant);
+		expect(replacement.isCurrent()).toBe(false);
+		await f.runtime.stop();
+	});
+
+	test.each(["missing", "denied"] as const)("fails closed with %s prepared and registered fences", async mode => {
+		const f = fixture({
+			omitTenantFence: mode === "missing",
+			omitPreparedFence: mode === "missing",
+			fence: () => false,
+			preparedFence: () => false,
+		});
+		f.runtime.registerTenant(tenant);
+		await f.runtime.start();
+		await expect(f.runtime.acquireAttachment(tenant)).rejects.toThrow("fence was lost");
+		await expect(f.runtime.closeLifecycleSession(tenant, closeRequest())).rejects.toThrow("fence was lost");
+		await expect(f.runtime.listLifecycleSessions(tenant, listRequest())).rejects.toThrow("fence was lost");
+		await expect(
+			f.runtime.createPreparedExternalLifecycleSession(preparedAuthority(), createRequest()),
+		).rejects.toThrow("fence was lost");
+		expect(f.createCalls).toEqual([]);
+		expect(f.closeCalls).toEqual([]);
+		expect(f.listCalls).toEqual([]);
+		await f.runtime.stop();
+	});
+
+	test("validates prepared actor, key and workspace without inventing a session identity", async () => {
+		const seen: ManagedPreparedTurnAuthority[] = [];
+		const f = fixture({
+			preparedFence: authority => {
+				seen.push(authority);
+				return true;
+			},
+		});
+		await f.runtime.start();
+		for (const changed of [
+			{ actor: { ...createRequest().actor, id: "foreign" } },
+			{ actor: { ...createRequest().actor, namespace: "foreign" } },
+			{ requestKey: "foreign" },
+			{ target: { kind: "existing_path" as const, path: "/foreign" } },
+		])
+			await expect(
+				f.runtime.createPreparedExternalLifecycleSession(preparedAuthority(), { ...createRequest(), ...changed }),
+			).rejects.toThrow();
+		await expect(
+			f.runtime.createPreparedExternalLifecycleSession(
+				{ ...preparedAuthority(), sessionId: "invented" } as never,
+				createRequest(),
+			),
+		).rejects.toThrow();
+		expect(f.createCalls).toEqual([]);
+		await f.runtime.createPreparedExternalLifecycleSession(preparedAuthority(), createRequest());
+		expect(seen).toEqual([preparedAuthority(), preparedAuthority()]);
+		expect(f.createCalls[0]!.readinessTimeoutMs!).toBeLessThanOrEqual(500);
+		await f.runtime.stop();
+	});
+
+	test.each(["prepared", "registered"] as const)(
+		"never dispatches after a late %s authorization deadline",
+		async kind => {
+			const fence = deferred<boolean>();
+			const entered = deferred<void>();
+			const wait = () => {
+				entered.resolve();
+				return fence.promise;
+			};
+			const f = fixture({ fence: wait, preparedFence: wait });
+			f.runtime.registerTenant(tenant);
+			await f.runtime.start();
+			const call =
+				kind === "prepared"
+					? f.runtime.createPreparedExternalLifecycleSession(preparedAuthority(), {
+							...createRequest(),
+							readinessTimeoutMs: 15,
+						})
+					: f.runtime.closeLifecycleSession(tenant, { ...closeRequest(), timeoutMs: 15 });
+			await entered.promise;
+			await expect(call).rejects.toMatchObject({ code: "timeout" });
+			fence.resolve(true);
+			await new Promise(resolve => setTimeout(resolve, 0));
+			expect(f.createCalls).toEqual([]);
+			expect(f.closeCalls).toEqual([]);
+			await f.runtime.stop();
+		},
+	);
+
+	test("rejects a prepared lease lost during asynchronous admission", async () => {
+		const fence = deferred<boolean>();
+		const f = fixture({ preparedFence: () => fence.promise });
+		await f.runtime.start();
+		const creating = f.runtime.createPreparedExternalLifecycleSession(preparedAuthority(), createRequest());
+		fence.resolve(false);
+		await expect(creating).rejects.toThrow("fence was lost");
+		expect(f.createCalls).toEqual([]);
+		await f.runtime.stop();
+	});
+
+	test("binds external resume to the complete session id and workspace and rejects broad list targets", async () => {
+		const f = fixture();
+		f.runtime.registerTenant(tenant);
+		await f.runtime.start();
+		const resume: ResumeRequest = {
+			actor: closeRequest().actor,
+			capability: "session.resume",
+			requestKey: "resume",
+			target: { sessionIdOrPrefix: tenant.sessionId, path: tenant.canonicalWorkspace },
+			readinessTimeoutMs: 500,
+		};
+		for (const target of [
+			{ ...resume.target, sessionIdOrPrefix: "session" },
+			{ ...resume.target, path: "/foreign" },
+		])
+			await expect(f.runtime.resumeExternalLifecycleSession(tenant, { ...resume, target })).rejects.toThrow();
+		for (const target of [
+			undefined,
+			{ cwd: tenant.canonicalWorkspace },
+			{ ...listRequest().target, scope: { kind: "all" } },
+			{ ...listRequest().target, resolveSessionId: "foreign" },
+		])
+			await expect(f.runtime.listLifecycleSessions(tenant, { ...listRequest(), target } as never)).rejects.toThrow();
+		expect(f.resumeCalls).toEqual([]);
+		expect(f.listCalls).toEqual([]);
+		await f.runtime.resumeExternalLifecycleSession(tenant, resume);
+		expect(f.resumeCalls[0]?.target).toEqual(resume.target);
+		await f.runtime.stop();
+	});
+
+	test("filters declared list authority without leaking global evidence", async () => {
+		const exact = {
+			sessionId: tenant.sessionId,
+			endpointGeneration: tenant.generation,
+			cwd: tenant.canonicalWorkspace,
+		};
+		const f = fixture({
+			list: async () => ({
+				ok: true,
+				operation: "session.list",
+				result: {
+					indexSeq: 3,
+					sessions: [
+						exact,
+						{ ...exact, sessionId: "foreign" },
+						{ ...exact, endpointGeneration: 8 },
+						{ ...exact, cwd: "/foreign" },
+					],
+					warnings: ["foreign workspace secret"],
+				},
+			}),
+		});
+		f.runtime.registerTenant(tenant);
+		await f.runtime.start();
+		const result = await f.runtime.listLifecycleSessions(tenant, {
+			...listRequest(),
+			target: { ...listRequest().target, cursor: "opaque" },
+		});
+		expect(result).toEqual({
+			ok: true,
+			operation: "session.list",
+			result: { indexSeq: 3, sessions: [exact], warnings: [] },
+		});
+		await f.runtime.stop();
+	});
+
+	test("rejects unfilterable list output and always blocks public delete before effect", async () => {
+		const f = fixture({
+			list: async () => ({ ok: true, operation: "session.list", result: { items: ["foreign"] } }) as never,
+		});
+		f.runtime.registerTenant(tenant);
+		await f.runtime.start();
+		await expect(f.runtime.listLifecycleSessions(tenant, listRequest())).rejects.toMatchObject({
+			code: "invalid_result",
+		});
+		await expect(
+			f.runtime.deleteLifecycleSession(tenant, {
+				actor: closeRequest().actor,
+				capability: "session.delete",
+				requestKey: "delete",
+				target: { sessionId: tenant.sessionId },
+			}),
+		).rejects.toMatchObject({ code: "exact_delete_authority_unavailable" });
+		expect(f.calls).not.toContain("delete");
+		await f.runtime.stop();
+	});
+
+	test.each(["replacement", "lease", "unregister"] as const)(
+		"drops queued frames after %s and records failed observation",
+		async change => {
+			let allowed = true;
+			const f = fixture({ fence: () => allowed });
+			f.runtime.registerTenant(tenant);
+			await f.runtime.start();
+			const first = deferred<void>();
+			const release = deferred<void>();
+			const received: number[] = [];
+			const subscription = f.runtime.subscribeFrames(
+				await f.runtime.acquireAttachment(tenant),
+				"turn",
+				{ commandId: "queued-command" },
+				async value => {
+					received.push(value.frame.seq!);
+					first.resolve();
+					await release.promise;
+				},
+			);
+			await f.emit(observedFrame(1));
+			await first.promise;
+			await f.emit(observedFrame(2));
+			if (change === "replacement") f.replaceAttachment();
+			else if (change === "lease") allowed = false;
+			else f.runtime.unregisterTenant(tenant);
+			release.resolve();
+			await expect(subscription.drain()).rejects.toThrow();
+			expect(received).toEqual([1]);
+			expect(f.runtime.frameDiagnostics().listenerError).toBe(1);
+			subscription();
+			await f.runtime.stop();
+		},
+	);
+
+	test.each(["request", "lifecycle", "authorization"] as const)(
+		"bounds shutdown for a hanging %s without later dispatch",
+		async kind => {
+			const entered = deferred<void>();
+			const result = deferred<Record<string, unknown>>();
+			const fence = deferred<boolean>();
+			let blockFence = false;
+			const f = fixture({
+				drainTimeoutMs: 15,
+				fence: () => {
+					if (!blockFence) return true;
+					entered.resolve();
+					return fence.promise;
+				},
+				request: () => {
+					entered.resolve();
+					return result.promise;
+				},
+				close: async () => {
+					entered.resolve();
+					await result.promise;
+					return { ok: true, operation: "session.close", result: { sessionId: tenant.sessionId } };
+				},
+			});
+			f.runtime.registerTenant(tenant);
+			await f.runtime.start();
+			const token = await f.runtime.acquireAttachment(tenant);
+			blockFence = kind === "authorization";
+			const pending = (
+				kind === "request"
+					? f.runtime.request(token, {}, { timeoutMs: 500 })
+					: f.runtime.closeLifecycleSession(tenant, closeRequest())
+			).catch(error => error);
+			await entered.promise;
+			const stopped = f.runtime.stop();
+			await expect(stopped).rejects.toMatchObject({ code: "drain_timeout" });
+			expect(await pending).toMatchObject({ code: "runtime_interrupted" });
+			expect(f.calls.filter(call => call === "stop")).toHaveLength(1);
+			fence.resolve(true);
+			result.resolve({ ok: true });
+			await new Promise(resolve => setTimeout(resolve, 0));
+			if (kind === "authorization") expect(f.closeCalls).toEqual([]);
+			expect(token.isCurrent()).toBe(false);
+		},
+	);
+
+	test("bounds a hanging Router stop and never remotely closes sessions", async () => {
+		const f = fixture({ drainTimeoutMs: 15, stop: () => new Promise(() => {}) });
+		await f.runtime.start();
+		await expect(f.runtime.stop()).rejects.toMatchObject({ code: "drain_timeout" });
+		expect(f.runtime.state).toBe("failed");
+		expect(f.closeCalls).toEqual([]);
+	});
+
+	test("never starts tracked work after stop wins the admission microtask", async () => {
+		const f = fixture();
+		f.runtime.registerTenant(tenant);
+		await f.runtime.start();
+		const call = f.runtime.closeLifecycleSession(tenant, closeRequest()).catch(error => error);
+		await f.runtime.stop();
+		expect(await call).toMatchObject({ code: "runtime_interrupted" });
+		expect(f.closeCalls).toEqual([]);
+	});
+
+	test("settles an already dispatched request during drain while rejecting new work", async () => {
+		const entered = deferred<void>();
+		const response = deferred<Record<string, unknown>>();
+		const f = fixture({
+			request: () => {
+				entered.resolve();
+				return response.promise;
+			},
+		});
+		f.runtime.registerTenant(tenant);
+		await f.runtime.start();
+		const token = await f.runtime.acquireAttachment(tenant);
+		const accepted = f.runtime.request(token, {});
+		await entered.promise;
+		const stopping = f.runtime.stop();
+		await expect(f.runtime.request(token, {})).rejects.toMatchObject({ code: "runtime_interrupted" });
+		response.resolve({ ok: true });
+		await expect(accepted).resolves.toEqual({ ok: true });
+		await stopping;
+		expect(f.calls.filter(call => call === "request")).toHaveLength(1);
+	});
+
+	test("invalidates a prepared authorization still pending when drain expires", async () => {
+		const entered = deferred<void>();
+		const fence = deferred<boolean>();
+		const f = fixture({
+			drainTimeoutMs: 15,
+			preparedFence: () => {
+				entered.resolve();
+				return fence.promise;
+			},
+		});
+		await f.runtime.start();
+		const call = f.runtime
+			.createPreparedExternalLifecycleSession(preparedAuthority(), createRequest())
+			.catch(error => error);
+		await entered.promise;
+		await expect(f.runtime.stop()).rejects.toMatchObject({ code: "drain_timeout" });
+		expect(await call).toMatchObject({ code: "runtime_interrupted" });
+		fence.resolve(true);
+		await new Promise(resolve => setTimeout(resolve, 0));
+		expect(f.createCalls).toEqual([]);
+	});
+
+	test("bounds stop while Router start or a queued delivery fence never finishes", async () => {
+		const starting = fixture({ drainTimeoutMs: 15, start: () => new Promise(() => {}) });
+		void starting.runtime.start();
+		await expect(starting.runtime.stop()).rejects.toMatchObject({ code: "drain_timeout" });
+		expect(starting.calls).toEqual(["start", "stop"]);
+		let blocked = false;
+		const fence = deferred<boolean>();
+		const f = fixture({ drainTimeoutMs: 15, fence: () => (blocked ? fence.promise : true) });
+		f.runtime.registerTenant(tenant);
+		await f.runtime.start();
+		let delivered = false;
+		const token = await f.runtime.acquireAttachment(tenant);
+		const subscription = f.runtime.subscribeFrames(token, "turn", { commandId: "queued-command" }, () => {
+			delivered = true;
+		});
+		blocked = true;
+		await f.emit(observedFrame(1));
+		await expect(f.runtime.stop()).rejects.toMatchObject({ code: "drain_timeout" });
+		fence.resolve(true);
+		await expect(subscription.drain()).rejects.toThrow();
+		expect(delivered).toBe(false);
+	});
+
+	test("does not return lifecycle success as proof after the live tenant fence is lost", async () => {
+		let allowed = true;
+		const f = fixture({
+			fence: () => allowed,
+			close: async request => {
+				allowed = false;
+				return { ok: true, operation: "session.close", result: { sessionId: request.target.sessionId } };
+			},
+		});
+		f.runtime.registerTenant(tenant);
+		await f.runtime.start();
+		await expect(f.runtime.closeLifecycleSession(tenant, closeRequest())).rejects.toThrow("fence was lost");
+		expect(f.closeCalls).toHaveLength(1);
+		await f.runtime.stop();
+	});
+
 	test("shares start/stop races, admits bootstrap only while starting, and records start failure", async () => {
 		const startGate = deferred<void>();
 		const active = fixture({ start: async () => await startGate.promise });
@@ -425,10 +915,13 @@ describe("managed SDK runtime", () => {
 							? await current.runtime.closeLifecycleSession({ tenant, request })
 							: await current.runtime.closeLifecycleSession({ tenant, ...request });
 				expect(outcome).toEqual({ ok: true, operation: "session.close", result: { sessionId: tenant.sessionId } });
-				expect(fenceChecks).toBe(1);
-				expect(current.closeCalls).toEqual([request]);
-				expect(current.closeCalls[0]?.target).toBe(request.target);
-				if (shape !== "flat") expect(current.closeCalls[0]).toBe(request);
+				expect(fenceChecks).toBe(2);
+				expect(current.closeCalls).toHaveLength(1);
+				expect(current.closeCalls[0]?.target).toEqual(request.target);
+				expect(current.closeCalls[0]?.requestKey).toBe(request.requestKey);
+				expect(current.closeCalls[0]?.timeoutMs).toBeGreaterThan(0);
+				expect(current.closeCalls[0]!.timeoutMs!).toBeLessThanOrEqual(request.timeoutMs!);
+				expect(request.timeoutMs).toBe(500);
 				expect(current.calls).toEqual(["start"]);
 			} finally {
 				await current.runtime.dispose();

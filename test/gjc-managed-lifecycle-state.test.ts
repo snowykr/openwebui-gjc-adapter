@@ -13,7 +13,7 @@ import {
 const EXPECTED_TRANSITIONS = {
 	intent_prepared: ["invoking", "terminal_failure"],
 	invoking: ["acknowledged_unproven", "terminal_failure", "uncertain", "cleanup_pending"],
-	acknowledged_unproven: ["active_generation_proven", "cleanup_pending", "uncertain", "retired"],
+	acknowledged_unproven: ["active_generation_proven", "cleanup_pending", "uncertain", "retired", "cleanup_uncertain"],
 	active_generation_proven: ["closing"],
 	closing: ["active_generation_proven", "retired", "uncertain"],
 	retired: [],
@@ -31,6 +31,16 @@ const EXPECTED_TRANSITIONS = {
 } as const;
 
 describe("managed lifecycle state", () => {
+	test("retains ambiguous temporary cleanup after acknowledgement without restoring routing", () => {
+		expect(() => assertManagedLifecycleTransition("acknowledged_unproven", "cleanup_uncertain")).not.toThrow();
+		expect(decodeManagedLifecycleState(encodeManagedLifecycleState("cleanup_uncertain"))).toBe("cleanup_uncertain");
+		expect(() => assertManagedLifecycleTransition("cleanup_uncertain", "active_generation_proven")).toThrow(
+			ManagedLifecycleStateError,
+		);
+		expect(() => assertManagedLifecycleTransition("retired", "cleanup_uncertain")).toThrow(
+			ManagedLifecycleStateError,
+		);
+	});
 	test("accepts every and only normative lifecycle edge", () => {
 		expect(MANAGED_LIFECYCLE_TRANSITIONS).toEqual(EXPECTED_TRANSITIONS);
 		for (const from of MANAGED_LIFECYCLE_STATES) {

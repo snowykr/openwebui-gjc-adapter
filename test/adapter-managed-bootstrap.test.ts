@@ -46,7 +46,7 @@ describe("adapter managed bootstrap composition", () => {
 			dispose: async () => {},
 			reconcile: async () => {},
 			registerTenant: () => {},
-			acquireAttachment: async () => ({ attachment: { isCurrent: () => true } }),
+			acquireAttachment: async () => ({ isCurrent: () => true }),
 			generationStatus: async () => ({ status: "current" }),
 		} as never;
 		const result = await activateAdapterSessionAuthorityV3({

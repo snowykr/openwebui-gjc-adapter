@@ -54,10 +54,9 @@ export type EndpointSessionAttachmentProof = Omit<
 	"tmuxSocket" | "tmuxPane" | "tmuxPanePid" | "tmuxOwnershipTag" | "ownedAt"
 >;
 
-export interface AcknowledgedSuccessor {
-	readonly sessionId: string;
-	readonly attachment: EndpointSessionAttachmentProof;
-}
+export type AcknowledgedSuccessor =
+	| { readonly sessionId: string; readonly attachment: EndpointSessionAttachmentProof }
+	| { readonly sessionId: string; readonly managedAuthority: ManagedTurnAuthority };
 
 export interface SessionOperationGateBinding {
 	readonly gateId: string;

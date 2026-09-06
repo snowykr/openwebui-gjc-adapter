@@ -10,6 +10,7 @@ import type { ManagedTurnAuthority } from "../src/gjc/turn-runner";
 import {
 	createManagedIdleReaper,
 	createManagedV3GenerationStore,
+	type ManagedIdleGenerationStore,
 	type ManagedIdleLifecycleRuntime,
 } from "../src/live/gjc-managed-idle-reaper";
 import type { OpenWebUIProjectionRepository } from "../src/openwebui/client";
@@ -59,12 +60,7 @@ function managedRuntimeFixture() {
 			return {
 				tenant,
 				generation: tenant.generation,
-				attachment: {
-					sessionId: tenant.sessionId,
-					generation: tenant.generation,
-					isCurrent: () => true,
-					send: () => undefined,
-				},
+				isCurrent: () => state === "running" && registrations.has(key),
 			};
 		},
 		async generationStatus() {
@@ -276,9 +272,10 @@ describe("managed V3 idle retirement", () => {
 		runtime: ManagedIdleLifecycleRuntime,
 		assertFence: () => Promise<void> = async () => undefined,
 		now: () => number = () => Date.now() + 100_000,
+		records: ManagedIdleGenerationStore = createManagedV3GenerationStore(mappings),
 	) {
 		return createManagedIdleReaper({
-			records: createManagedV3GenerationStore(mappings),
+			records,
 			runtime,
 			idleTimeoutMs: 1,
 			now,
@@ -540,6 +537,114 @@ describe("managed V3 idle retirement", () => {
 		reopened.close();
 		await fixture.cleanup();
 	});
+	test.each(["eviction", "publication"] as const)(
+		"recovers failed %s after persisted retirement and actual reopen without remote re-close",
+		async phase => {
+			const fixture = await createV3Fixture();
+			let mappings = fixture.mappings;
+			const scope = { principalId: fixture.mapping.principalId!, chatId: fixture.mapping.chatId };
+			const failure = new Error(`${phase} failed`);
+			let closes = 0;
+			const runtime = runtimeFor(
+				async request => {
+					closes += 1;
+					return { ok: true, result: { sessionId: request.target.sessionId } };
+				},
+				async () => ({ status: "retired" }),
+			);
+			const records = createManagedV3GenerationStore(mappings);
+			const published = new Set<string>();
+			const publicationAttempts: string[] = [];
+			records.publishRetired = async (_record, intent) => {
+				publicationAttempts.push(intent.key);
+				published.add(intent.key);
+				// The external effect may succeed before its acknowledgement fails.
+				if (phase === "publication") throw failure;
+			};
+			if (phase === "eviction")
+				records.evict = async () => {
+					throw failure;
+				};
+			const first = reaperFor(mappings, runtime, undefined, undefined, records);
+			try {
+				await expect(first.runOnce()).rejects.toBe(failure);
+				await first.stop();
+				const record = (await records.active())[0]!;
+				expect(record.state).toBe("closing");
+				const intent = (await records.pendingRetirement(record))!;
+				const receipt = mappings.operationScoped(scope, intent.key);
+				expect(receipt).toMatchObject({ state: "complete", result: { correlation: { closeStatus: "closed" } } });
+				expect(mappings.getScoped(scope)).toBeDefined();
+				mappings.close();
+				mappings = fixture.reopen();
+				expect(mappings.operationScoped(scope, intent.key)).toEqual(receipt);
+				const reopenedRecords = createManagedV3GenerationStore(mappings);
+				const reopenedRecord = (await reopenedRecords.active())[0]!;
+				expect(reopenedRecord.state).toBe("closing");
+				expect(await reopenedRecords.pendingRetirement(reopenedRecord)).toEqual(intent);
+				reopenedRecords.publishRetired = async (_record, recovered) => {
+					publicationAttempts.push(recovered.key);
+					published.add(recovered.key);
+				};
+				const forbidden = async (): Promise<never> => {
+					throw new Error("Recovery must not invoke the remote runtime.");
+				};
+				const recovered = reaperFor(
+					mappings,
+					{
+						closeLifecycleSession: forbidden,
+						reconcile: forbidden,
+						generationStatus: forbidden,
+					},
+					undefined,
+					undefined,
+					reopenedRecords,
+				);
+				await recovered.runOnce();
+				await recovered.stop();
+				expect(closes).toBe(1);
+				expect(publicationAttempts).toEqual([intent.key, intent.key]);
+				expect([...published]).toEqual([intent.key]);
+				expect(mappings.entries()).toEqual([]);
+				mappings.close();
+				mappings = fixture.reopen();
+				expect(mappings.entries()).toEqual([]);
+			} finally {
+				mappings.close();
+				await fixture.cleanup();
+			}
+		},
+	);
+	test("local retirement recovery refuses changed authority and a substituted completed receipt", async () => {
+		const fixture = await createV3Fixture();
+		const records = createManagedV3GenerationStore(fixture.mappings);
+		const record = (await records.active())[0]!;
+		const intent = { key: "exact-retirement", authority: record.authority, requestedAt: Date.now() };
+		try {
+			await records.prepareClose(record, intent);
+			await records.retire(record, intent);
+			for (const change of [
+				{ principalId: "foreign" },
+				{ projectId: "foreign" },
+				{ canonicalWorkspace: "/foreign" },
+				{ chatId: "foreign" },
+				{ sessionId: "foreign" },
+				{ generation: 2 },
+				{ leaseId: "foreign" },
+				{ epoch: "foreign" },
+				{ requestKey: "foreign" },
+			]) {
+				const foreign = { ...record, authority: { ...record.authority, ...change } };
+				expect(await records.pendingRetirement(foreign)).toBeUndefined();
+				await expect(records.evict(foreign, intent)).rejects.toThrow("receipt changed");
+			}
+			await expect(records.evict(record, { ...intent, key: "other" })).rejects.toThrow("receipt changed");
+			expect((await records.active())[0]?.state).toBe("closing");
+		} finally {
+			fixture.mappings.close();
+			await fixture.cleanup();
+		}
+	});
 	test("does not evict after the live tenant fence fails", async () => {
 		const fixture = await createV3Fixture();
 		const { mappings, mapping } = fixture;
@@ -556,7 +661,7 @@ describe("managed V3 idle retirement", () => {
 			},
 		);
 
-		await reaper.runOnce();
+		await expect(reaper.runOnce()).rejects.toThrow("fence lost");
 
 		expect(fenceChecks).toBeGreaterThanOrEqual(3);
 		expect(mappings.getScoped({ principalId: mapping.principalId!, chatId: mapping.chatId })).toBeDefined();

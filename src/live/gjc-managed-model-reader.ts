@@ -76,7 +76,7 @@ async function createTemporaryReader(
 	assertPrincipal(context, input.principalId);
 	await assertTemporaryFence(input, context, signal);
 	const actor = { namespace: "openwebui-gjc-adapter", id: input.principalId };
-	const creation = runtime.createExternalLifecycleSession({
+	const creation = runtime.createPreparedExternalLifecycleSession(input, {
 		actor,
 		capability: "session.create",
 		requestKey: input.requestKey,
@@ -206,7 +206,7 @@ async function closeAndProveRetired(
 			target: { sessionId: tenant.sessionId, endpointGeneration: tenant.generation },
 			timeoutMs,
 		});
-		if (!isSuccess(outcome))
+		if (!isSuccess(outcome) || !isRecord(outcome.result) || outcome.result.sessionId !== tenant.sessionId)
 			closeError = new ManagedModelReaderUnavailableError("Managed catalog session close was not acknowledged.");
 	} catch (error) {
 		closeError = error;
@@ -216,7 +216,7 @@ async function closeAndProveRetired(
 		const status = await runtime.generationStatus(tenant);
 		if (status.status !== "retired")
 			throw new ManagedModelReaderUnavailableError("Exact managed catalog generation retirement is not proven.");
-		runtime.unregisterTenant(tenant);
+		if (closeError === undefined) runtime.unregisterTenant(tenant);
 	} catch (proofError) {
 		throw closeError === undefined
 			? proofError

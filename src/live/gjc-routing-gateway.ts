@@ -128,6 +128,23 @@ export function createGjcRoutingLiveGatewayRunner(
 			};
 			const replayedOperation = await replayRoutingOperation(input, turn);
 			if (replayedOperation !== null) return replayedOperation;
+			if (
+				existing !== undefined &&
+				scopedMappings
+					.operations(turn.chatId)
+					.some(
+						operation =>
+							operation.kind === "close" &&
+							(operation.state === "pending" ||
+								operation.state === "uncertain" ||
+								(operation.state === "complete" &&
+									operation.result?.kind === "close" &&
+									operation.result.correlation?.closeStatus === "closed" &&
+									operation.result.mapping.sessionId === existing.sessionId &&
+									operation.result.managedAuthority?.generation === existing.managedAuthority?.generation)),
+					)
+			)
+				throw new Error("Managed session retirement requires reconciliation before new routing.");
 
 			const requestedModelId = turn.requestedModelId ?? input.requestedModelId?.(turn);
 			if (

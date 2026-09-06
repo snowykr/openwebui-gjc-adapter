@@ -239,7 +239,7 @@ export class ManagedAuthorityActivationCoordinator {
 			});
 			await this.#assertFence(lock, tenant);
 			const attachment = await this.#boundaryResult(lock, () => this.#options.runtime.acquireAttachment(tenant));
-			if (attachment.generation !== tenant.generation || !attachment.attachment.isCurrent())
+			if (attachment.generation !== tenant.generation || !attachment.isCurrent())
 				throw new Error("Exact current Router attachment proof is required.");
 			await this.#assertFence(lock, tenant);
 			const record = toRecord(item.intent, outcome);
@@ -338,7 +338,7 @@ export class ManagedAuthorityActivationCoordinator {
 		});
 		await this.#assertFence(lock, tenant);
 		const attachment = await this.#boundaryResult(lock, () => this.#options.runtime.acquireAttachment(tenant));
-		if (attachment.generation !== tenant.generation || !attachment.attachment.isCurrent())
+		if (attachment.generation !== tenant.generation || !attachment.isCurrent())
 			throw new Error("Recovered exact current Router attachment proof is required.");
 		await this.#assertFence(lock, tenant);
 		return existing ?? toRecord(intent, outcome);
@@ -375,7 +375,7 @@ export class ManagedAuthorityActivationCoordinator {
 			});
 			await this.#assertFence(lock, tenant);
 			const attachment = await this.#boundaryResult(lock, () => this.#options.runtime.acquireAttachment(tenant));
-			if (attachment.generation !== tenant.generation || !attachment.attachment.isCurrent())
+			if (attachment.generation !== tenant.generation || !attachment.isCurrent())
 				return blocked("Durable generation record lacks current Router attachment proof.");
 		}
 		await this.#save(lock, { ...journal, phase: "active", canonicalReplaced: true, activeMarker: true });

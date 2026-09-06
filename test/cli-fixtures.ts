@@ -104,7 +104,7 @@ export class FakeManagedSdkRuntime implements ManagedSdkRuntimeDependency {
 	#nextSession = 1;
 	#nextTurn = 1;
 	readonly #sessions = new Map<string, FakeManagedSession>();
-	readonly #attachments = new Map<string, ManagedSdkAttachment["attachment"]>();
+	readonly #attachments = new Map<string, ManagedSdkAttachment>();
 	readonly #subscriptions = new Set<FakeManagedFrameSubscription>();
 
 	async start(): Promise<void> {
@@ -129,7 +129,10 @@ export class FakeManagedSdkRuntime implements ManagedSdkRuntimeDependency {
 
 	unregisterTenant(key: TenantSessionKey): void {
 		const index = this.tenants.findIndex(candidate => sameTenant(candidate, key));
-		if (index >= 0) this.tenants.splice(index, 1);
+		if (index >= 0) {
+			this.tenants.splice(index, 1);
+			this.#attachments.delete(sessionIdentity(key));
+		}
 	}
 
 	async registerLifecycleTenant(key: TenantSessionKey): Promise<ManagedSdkAttachment> {
@@ -149,12 +152,20 @@ export class FakeManagedSdkRuntime implements ManagedSdkRuntimeDependency {
 		else if (!sameTenant(session.tenant, key)) throw new Error("Fake managed tenant authority changed.");
 		let attachment = this.#attachments.get(identity);
 		if (attachment === undefined) {
-			attachment = {
-				isCurrent: () => this.#sessions.get(identity)?.status === "current",
-			} as ManagedSdkAttachment["attachment"];
+			const tenant = Object.freeze({ ...key });
+			const token: ManagedSdkAttachment = Object.freeze({
+				tenant,
+				generation: tenant.generation,
+				isCurrent: () =>
+					this.state === "running" &&
+					this.#attachments.get(identity) === token &&
+					this.tenants.some(candidate => sameTenant(candidate, tenant)) &&
+					this.#sessions.get(identity)?.status === "current",
+			});
+			attachment = token;
 			this.#attachments.set(identity, attachment);
 		}
-		return { tenant: { ...key }, generation: key.generation, attachment };
+		return attachment;
 	}
 
 	async generationStatus(key: TenantSessionKey): Promise<any> {
@@ -169,7 +180,7 @@ export class FakeManagedSdkRuntime implements ManagedSdkRuntimeDependency {
 		this.assertManagedAttachment(managed);
 		if (this.state !== "running" || operation.trim().length === 0)
 			throw new Error("Fake managed subscription requires a running runtime and operation.");
-		const attachment = { ...managed, tenant: { ...managed.tenant } };
+		const attachment = managed;
 		let active = true;
 		let correlation: ManagedSdkFrameCorrelation | undefined;
 		let tail = Promise.resolve();
@@ -343,7 +354,7 @@ export class FakeManagedSdkRuntime implements ManagedSdkRuntimeDependency {
 			const session = this.#sessions.get(`${sessionId}:${generation}`);
 			if (session !== undefined) session.status = "retired";
 		}
-		return { ok: true, result: { closed: true } };
+		return { ok: true, operation: "session.close", result: { sessionId } };
 	}
 
 	async deleteLifecycleSession(_tenantOrRequest: any, request?: any): Promise<any> {
@@ -375,7 +386,7 @@ export class FakeManagedSdkRuntime implements ManagedSdkRuntimeDependency {
 		if (!this.tenants.some(candidate => sameTenant(candidate, managed.tenant)))
 			throw new Error("Fake managed tenant is not registered.");
 		const identity = sessionIdentity(managed.tenant);
-		if (this.#attachments.get(identity) !== managed.attachment || !managed.attachment.isCurrent())
+		if (this.#attachments.get(identity) !== managed || !managed.isCurrent())
 			throw new Error("Fake managed attachment is not current.");
 	}
 

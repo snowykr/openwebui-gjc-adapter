@@ -48,13 +48,11 @@ function managedRuntimeFixture() {
 		async acquireAttachment(tenant: Record<string, unknown>) {
 			const key = tenantKey(tenant);
 			if (!registrations.has(key)) throw new Error("Managed fixture tenant is not registered.");
-			const attachment = {
-				sessionId: tenant.sessionId,
+			return {
+				tenant,
 				generation: tenant.generation,
-				isCurrent: () => true,
-				send: () => undefined,
+				isCurrent: () => state === "running" && registrations.has(key),
 			};
-			return { tenant, generation: tenant.generation, attachment };
 		},
 		async generationStatus() {
 			return { status: "current" as const };

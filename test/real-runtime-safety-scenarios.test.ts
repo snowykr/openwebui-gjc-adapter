@@ -49,12 +49,7 @@ function managedRuntimeFixture() {
 			return {
 				tenant,
 				generation: tenant.generation,
-				attachment: {
-					sessionId: tenant.sessionId,
-					generation: tenant.generation,
-					isCurrent: () => true,
-					send: () => undefined,
-				},
+				isCurrent: () => state === "running" && registrations.has(key),
 			};
 		},
 		async generationStatus() {
