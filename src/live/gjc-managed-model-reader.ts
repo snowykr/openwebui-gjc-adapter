@@ -1,7 +1,8 @@
 import { resolve } from "node:path";
+import { ManagedOperationDeadline } from "../gjc/managed-operation-deadline";
 import type { ManagedSdkAttachment, ManagedSdkRuntime, TenantSessionKey } from "../gjc/managed-sdk-runtime";
 import { GjcTurnCancelledError } from "../gjc/turn-runner";
-import { decodeRouterPage } from "./gjc-managed-session-operations";
+import { collectManagedQueryPages } from "./gjc-managed-session-operations";
 import type { ModelReader, ModelReaderContext, ModelReaderFactory } from "./model-reader";
 
 export interface ManagedModelReaderAttachment {
@@ -136,6 +137,7 @@ async function acquire(
 
 class ManagedModelReader implements ModelReader {
 	#stopped = false;
+	#stopPromise: Promise<void> | undefined;
 
 	constructor(
 		private readonly runtime: ManagedSdkRuntime,
@@ -159,37 +161,70 @@ class ManagedModelReader implements ModelReader {
 	}
 
 	async stop(): Promise<void> {
-		if (this.#stopped) return;
+		if (this.#stopPromise !== undefined) return this.#stopPromise;
+		const deadline = new ManagedOperationDeadline(this.temporary?.timeoutMs, "catalog stop");
+		try {
+			await this.stopWithin(deadline);
+		} finally {
+			deadline.close();
+		}
+	}
+
+	private stopWithin(deadline: ManagedOperationDeadline): Promise<void> {
+		if (this.#stopPromise !== undefined) return this.#stopPromise;
 		this.#stopped = true;
-		await this.fence();
-		if (this.temporary !== undefined)
-			await closeAndProveRetired(this.runtime, this.temporary.tenant, this.temporary.timeoutMs);
+		this.#stopPromise = (async () => {
+			deadline.remaining();
+			await deadline.wait(this.fence());
+			if (this.temporary !== undefined)
+				await closeAndProveRetired(this.runtime, this.temporary.tenant, this.temporary.timeoutMs, deadline);
+		})();
+		return this.#stopPromise;
 	}
 
 	private async query(
 		name: "models.list/current" | "providers.list/active" | "session.state",
 	): Promise<readonly unknown[]> {
 		throwIfAborted(this.signal);
-		await this.fence();
-		try {
-			const frame = await this.runtime.request(
-				this.attachment,
-				{ type: "query_request", query: name, input: {} },
-				{ beforeDispatch: () => throwIfAborted(this.signal) },
-			);
+		if (this.#stopped) throw new ManagedModelReaderUnavailableError("Managed catalog reader is stopped.");
+		const deadline = new ManagedOperationDeadline(this.temporary?.timeoutMs, name);
+		const onAbort = () => deadline.fail(new GjcTurnCancelledError());
+		this.signal?.addEventListener("abort", onAbort, { once: true });
+		const assertCurrent = () => {
+			deadline.remaining();
 			throwIfAborted(this.signal);
-			await this.fence();
-			return decodeRouterPage(frame, name).items;
+			if (this.#stopped || !this.attachment.isCurrent())
+				throw new ManagedModelReaderUnavailableError("Managed catalog reader lost its current attachment.");
+		};
+		try {
+			return await collectManagedQueryPages(name, deadline, async cursor => {
+				assertCurrent();
+				await deadline.wait(this.fence());
+				assertCurrent();
+				const frame = await deadline.wait(
+					this.runtime.request(
+						this.attachment,
+						{ type: "query_request", query: name, input: {}, ...(cursor === undefined ? {} : { cursor }) },
+						{ timeoutMs: deadline.remaining(), beforeDispatch: assertCurrent },
+					),
+				);
+				assertCurrent();
+				await deadline.wait(this.fence());
+				assertCurrent();
+				return frame;
+			});
 		} catch (error) {
 			if (this.temporary !== undefined) {
 				try {
-					await this.stop();
+					await this.stopWithin(deadline);
 				} catch (cleanup) {
-					if (error instanceof GjcTurnCancelledError) throw error;
 					throw new AggregateError([error, cleanup], "Managed catalog query and cleanup failed.");
 				}
 			}
 			throw error;
+		} finally {
+			this.signal?.removeEventListener("abort", onAbort);
+			deadline.close();
 		}
 	}
 }
@@ -198,34 +233,43 @@ async function closeAndProveRetired(
 	runtime: ManagedSdkRuntime,
 	tenant: TenantSessionKey,
 	timeoutMs?: number,
+	sharedDeadline?: ManagedOperationDeadline,
 ): Promise<void> {
-	let closeError: unknown;
+	const deadline = sharedDeadline ?? new ManagedOperationDeadline(timeoutMs, "catalog retirement");
 	try {
-		const outcome = await runtime.closeLifecycleSession({
-			tenant,
-			actor: { namespace: "openwebui-gjc-adapter", id: tenant.principalId },
-			capability: "session.close",
-			requestKey: `${tenant.sessionId}:${tenant.generation}:catalog-close`,
-			target: { sessionId: tenant.sessionId, endpointGeneration: tenant.generation },
-			timeoutMs,
-		});
-		if (!isSuccess(outcome) || !isRecord(outcome.result) || outcome.result.sessionId !== tenant.sessionId)
-			closeError = new ManagedModelReaderUnavailableError("Managed catalog session close was not acknowledged.");
-	} catch (error) {
-		closeError = error;
+		let closeError: unknown;
+		try {
+			const remaining = deadline.remaining();
+			const outcome = await deadline.wait(
+				runtime.closeLifecycleSession({
+					tenant,
+					actor: { namespace: "openwebui-gjc-adapter", id: tenant.principalId },
+					capability: "session.close",
+					requestKey: `${tenant.sessionId}:${tenant.generation}:catalog-close`,
+					target: { sessionId: tenant.sessionId, endpointGeneration: tenant.generation },
+					timeoutMs: remaining,
+				}),
+			);
+			if (!isSuccess(outcome) || !isRecord(outcome.result) || outcome.result.sessionId !== tenant.sessionId)
+				closeError = new ManagedModelReaderUnavailableError("Managed catalog session close was not acknowledged.");
+		} catch (error) {
+			closeError = error;
+		}
+		try {
+			await deadline.wait(runtime.reconcile(deadline.remaining()));
+			const status = await deadline.wait(runtime.generationStatus(tenant, deadline.remaining()));
+			if (status.status !== "retired")
+				throw new ManagedModelReaderUnavailableError("Exact managed catalog generation retirement is not proven.");
+			if (closeError === undefined) runtime.unregisterTenant(tenant);
+		} catch (proofError) {
+			throw closeError === undefined
+				? proofError
+				: new AggregateError([closeError, proofError], "Managed catalog close has uncertain retirement.");
+		}
+		if (closeError !== undefined) throw closeError;
+	} finally {
+		if (sharedDeadline === undefined) deadline.close();
 	}
-	try {
-		await runtime.reconcile();
-		const status = await runtime.generationStatus(tenant);
-		if (status.status !== "retired")
-			throw new ManagedModelReaderUnavailableError("Exact managed catalog generation retirement is not proven.");
-		if (closeError === undefined) runtime.unregisterTenant(tenant);
-	} catch (proofError) {
-		throw closeError === undefined
-			? proofError
-			: new AggregateError([closeError, proofError], "Managed catalog close has uncertain retirement.");
-	}
-	if (closeError !== undefined) throw closeError;
 }
 
 function tenantFromCreate(input: ManagedTemporaryModelReaderInput, value: unknown): TenantSessionKey | undefined {

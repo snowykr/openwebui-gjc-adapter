@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import type { ManagedSdkAttachment, ManagedSdkRuntime, TenantSessionKey } from "../src/gjc/managed-sdk-runtime";
 import { GjcTurnCancelledError } from "../src/gjc/turn-runner";
 import {
@@ -40,6 +40,155 @@ const userContext = {
 };
 
 describe("managed model reader", () => {
+	test("collects complete model and provider pages with exact cursors", async () => {
+		const fake = new FakeRuntime();
+		fake.queryHandler = async frame => ({
+			type: "query_response",
+			ok: true,
+			page: {
+				items: [`${frame.query}:${frame.cursor ?? "first"}`],
+				complete: frame.cursor !== undefined,
+				...(frame.cursor === undefined ? { continuationCursor: "second" } : {}),
+			},
+		});
+		const reader = await createManagedModelReaderFactory({
+			runtime: fake.runtime,
+			resolveAttachment: async () => ({ tenant }),
+		})(userContext);
+		try {
+			expect(await reader.getAvailableModels()).toEqual(["models.list/current:first", "models.list/current:second"]);
+			expect(await reader.getActiveProviders()).toEqual([
+				"providers.list/active:first",
+				"providers.list/active:second",
+			]);
+			expect(fake.requests.map(frame => frame.cursor)).toEqual([undefined, "second", undefined, "second"]);
+		} finally {
+			await reader.stop();
+		}
+	});
+
+	test.each(["missing-cursor", "repeat-cursor", "page-bound", "item-bound"] as const)(
+		"rejects %s instead of returning an incomplete catalog",
+		async mode => {
+			const fake = new FakeRuntime();
+			fake.queryHandler = async () => ({
+				type: "query_response",
+				ok: true,
+				page: {
+					items: mode === "item-bound" ? Array.from({ length: 100_001 }, () => "item") : [],
+					complete: mode === "item-bound",
+					...(mode === "repeat-cursor"
+						? { continuationCursor: "same" }
+						: mode === "page-bound"
+							? { continuationCursor: String(fake.requests.length) }
+							: {}),
+				},
+			});
+			const reader = await createManagedModelReaderFactory({
+				runtime: fake.runtime,
+				resolveAttachment: async () => ({ tenant }),
+			})(userContext);
+			try {
+				await expect(reader.getAvailableModels()).rejects.toThrow(
+					mode === "missing-cursor"
+						? "incomplete"
+						: mode === "repeat-cursor"
+							? "repeated"
+							: mode === "page-bound"
+								? "page bound"
+								: "item bound",
+				);
+				expect(fake.requests.length).toBe(mode === "page-bound" ? 256 : mode === "repeat-cursor" ? 2 : 1);
+			} finally {
+				await reader.stop();
+			}
+		},
+	);
+
+	test("catalog pages and cleanup cannot renew an expired query budget", async () => {
+		const fake = new FakeRuntime();
+		const reader = await createManagedModelReaderFactory({
+			runtime: fake.runtime,
+			temporary: { ...temporary, timeoutMs: 1_000 },
+		})();
+		let now = Date.now();
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		fake.queryHandler = async () => {
+			now += 600;
+			return {
+				type: "query_response",
+				ok: true,
+				page: { items: [], complete: false, continuationCursor: String(fake.requests.length) },
+			};
+		};
+		try {
+			const failure = await reader.getAvailableModels().catch(error => error);
+			expect(failure).toBeInstanceOf(AggregateError);
+			expect(failure.errors[0].code).toBe("timeout");
+			expect(fake.requestTimeouts).toEqual([1_000, 400]);
+			expect(fake.closed).toBeUndefined();
+			await expect(reader.stop()).rejects.toMatchObject({ code: "timeout" });
+			await expect(reader.stop()).rejects.toMatchObject({ code: "timeout" });
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
+	test("a hanging catalog lease check cannot dispatch a late query or renewed cleanup", async () => {
+		const fake = new FakeRuntime();
+		let blocked = false;
+		let release!: () => void;
+		const gate = new Promise<void>(resolve => {
+			release = resolve;
+		});
+		const reader = await createManagedModelReaderFactory({
+			runtime: fake.runtime,
+			temporary: {
+				...temporary,
+				timeoutMs: 50,
+				assertFence: async () => {
+					if (blocked) await gate;
+				},
+			},
+		})();
+		blocked = true;
+		const error = await reader.getAvailableModels().catch(error => error);
+		expect(error).toBeInstanceOf(AggregateError);
+		expect(error.errors[0].code).toBe("timeout");
+		release();
+		await new Promise(resolve => setTimeout(resolve, 0));
+		expect(fake.requests).toEqual([]);
+		expect(fake.closed).toBeUndefined();
+		await expect(reader.stop()).rejects.toMatchObject({ code: "timeout" });
+	});
+
+	test("stopped reader rejects new and already-admitted queries without another request", async () => {
+		const fake = new FakeRuntime();
+		let resolve!: (value: Record<string, unknown>) => void;
+		const gate = new Promise<Record<string, unknown>>(done => {
+			resolve = done;
+		});
+		let entered!: () => void;
+		const admission = new Promise<void>(done => {
+			entered = done;
+		});
+		fake.queryHandler = async () => {
+			entered();
+			return gate;
+		};
+		const reader = await createManagedModelReaderFactory({
+			runtime: fake.runtime,
+			resolveAttachment: async () => ({ tenant }),
+		})(userContext);
+		const pending = reader.getAvailableModels().catch(error => error);
+		await admission;
+		await reader.stop();
+		resolve({ type: "query_response", ok: true, page: { items: ["not-visible"], complete: true } });
+		expect(await pending).toBeInstanceOf(ManagedModelReaderUnavailableError);
+		await expect(reader.getActiveProviders()).rejects.toThrow("stopped");
+		expect(fake.requests).toHaveLength(1);
+	});
+
 	test("queries models, providers, and state through one exact existing Router attachment", async () => {
 		const fake = new FakeRuntime();
 		const reader = await createManagedModelReaderFactory({
@@ -130,6 +279,7 @@ describe("managed model reader", () => {
 						}
 					: { ok: true, operation: "session.close", result: { sessionId: "foreign-session" } };
 			const reader = await createManagedModelReaderFactory({ runtime: fake.runtime, temporary })();
+			await expect(reader.stop()).rejects.toBeInstanceOf(ManagedModelReaderUnavailableError);
 			await expect(reader.stop()).rejects.toBeInstanceOf(ManagedModelReaderUnavailableError);
 			expect(fake.statusKeys).toEqual([{ ...tenant, sessionId: "catalog-session", generation: 11 }]);
 			expect(fake.unregistered).toEqual([]);
@@ -254,6 +404,8 @@ class FakeRuntime {
 	status: "retired" | "replaced" | "unknown" = "retired";
 	rejectTenant = false;
 	queryFailure: Error | undefined;
+	queryHandler: ((frame: Record<string, unknown>) => Promise<Record<string, unknown>>) | undefined;
+	readonly requestTimeouts: (number | undefined)[] = [];
 	createGate: Promise<void> | undefined;
 
 	get runtime(): ManagedSdkRuntime {
@@ -283,11 +435,18 @@ class FakeRuntime {
 		}
 		return token;
 	}
-	async request(attachment: ManagedSdkAttachment, frame: Record<string, unknown>) {
+	async request(
+		attachment: ManagedSdkAttachment,
+		frame: Record<string, unknown>,
+		options?: { timeoutMs?: number; beforeDispatch?: () => void },
+	) {
+		options?.beforeDispatch?.();
 		if (this.#attachments.get(tenantIdentity(attachment.tenant)) !== attachment || !attachment.isCurrent())
 			throw new Error("tenant mismatch");
 		this.requests.push(frame);
+		this.requestTimeouts.push(options?.timeoutMs);
 		if (this.queryFailure !== undefined) throw this.queryFailure;
+		if (this.queryHandler !== undefined) return this.queryHandler(frame);
 		if (frame.query === "models.list/current")
 			return {
 				type: "query_response",

@@ -368,13 +368,9 @@ export function createManagedSessionOperations(
 		input: Readonly<Record<string, unknown>>,
 		deadline: ManagedOperationDeadline,
 	) => {
-		if (!name) throw new TypeError("Managed query is required.");
-		const items: unknown[] = [];
-		const cursors = new Set<string>();
-		let cursor: string | undefined;
-		for (let page = 0; page < MAX_QUERY_PAGES; page += 1) {
+		return collectManagedQueryPages(name, deadline, async cursor => {
 			const attachment = await acquireWithin(authority, deadline);
-			const result = await deadline.wait(
+			return deadline.wait(
 				runtime.request(
 					attachment,
 					{ type: "query_request", query: name, input: { ...input }, ...(cursor === undefined ? {} : { cursor }) },
@@ -386,19 +382,7 @@ export function createManagedSessionOperations(
 					},
 				),
 			);
-			const parsed = decodeRouterPage(result, name);
-			if (items.length + parsed.items.length > MAX_QUERY_ITEMS)
-				throw new Error(`Managed ${name} query exceeded item bound.`);
-			items.push(...parsed.items);
-			if (parsed.complete) return items;
-			if (parsed.continuationCursor === undefined)
-				throw new Error(`Managed ${name} query is incomplete without a continuation cursor.`);
-			if (cursors.has(parsed.continuationCursor))
-				throw new Error(`Managed ${name} query repeated a continuation cursor.`);
-			cursors.add(parsed.continuationCursor);
-			cursor = parsed.continuationCursor;
-		}
-		throw new Error(`Managed ${name} query exceeded page bound.`);
+		});
 	};
 	const query = async (
 		authority: ManagedTurnAuthority,
@@ -670,6 +654,32 @@ async function requireRetired(
 	if (status.status !== "retired")
 		throw new ManagedTurnUncertainError("Exact managed generation retirement is not proven.");
 }
+export async function collectManagedQueryPages(
+	name: string,
+	deadline: ManagedOperationDeadline,
+	readPage: (cursor: string | undefined) => Promise<unknown>,
+): Promise<readonly unknown[]> {
+	if (!name) throw new TypeError("Managed query is required.");
+	const items: unknown[] = [];
+	const cursors = new Set<string>();
+	let cursor: string | undefined;
+	for (let page = 0; page < MAX_QUERY_PAGES; page += 1) {
+		deadline.remaining();
+		const parsed = decodeRouterPage(await deadline.wait(readPage(cursor)), name);
+		if (items.length + parsed.items.length > MAX_QUERY_ITEMS)
+			throw new Error(`Managed ${name} query exceeded item bound.`);
+		items.push(...parsed.items);
+		if (parsed.complete) return items;
+		if (parsed.continuationCursor === undefined)
+			throw new Error(`Managed ${name} query is incomplete without a continuation cursor.`);
+		if (cursors.has(parsed.continuationCursor))
+			throw new Error(`Managed ${name} query repeated a continuation cursor.`);
+		cursors.add(parsed.continuationCursor);
+		cursor = parsed.continuationCursor;
+	}
+	throw new Error(`Managed ${name} query exceeded page bound.`);
+}
+
 export function decodeRouterPage(frame: unknown, query: string): ManagedRouterPage {
 	if (!isRecord(frame) || frame.type !== "query_response")
 		throw new Error(`Managed ${query} query response has an invalid envelope.`);

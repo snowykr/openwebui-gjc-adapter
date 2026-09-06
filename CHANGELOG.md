@@ -26,6 +26,7 @@
 
 ### Fixed
 
+- Reused bounded complete-page collection for managed model/provider catalogs instead of returning only their first page. Added per-query lease/request/page/cleanup deadlines, stopped-reader result rejection, and stable failure replay for repeated stops; temporary provisioning's durable lifecycle and exact-close gaps remain unresolved.
 - Propagated live query/request/prompt/retirement deadlines through compound runtime acquisition and proof calls, with pre-effect checks and a bounded standalone acquisition. Removed the expired-cancellation one-millisecond abort renewal and corrected runtime fake lifecycle argument shapes.
 - Bounded successor source admission, lifecycle invocation, acknowledgement, target proof, publication callback, and cleanup under one deadline. Propagated remaining time into compound runtime reconciliation/acquisition/adoption/status calls and rejected late queued effects without renewal; successor request identity remains independent of incidental transport timeout.
 - Delivered public lifecycle mutation outcomes before renewed lease/registration checks can hide their acknowledgement. Active/adoption/retirement proof and post-read list disclosure retain independent authorization; a production revoked-lease create regression preserves acknowledged identity in an uncertain canonical provisional record across reopen without publishing or prompting.
