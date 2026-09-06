@@ -185,6 +185,71 @@ describe("managed routing persistence", () => {
 		},
 	);
 
+	for (const operation of ["session.new", "session.resume"] as const) {
+		test.each(["sessionId", "generation", "leaseId", "requestKey"] as const)(
+			`${operation} retains its admitted receipt after predecessor %s replacement`,
+			async field => {
+				const f = fixture();
+				try {
+					await routeGjcTurn(f.input());
+					const original = f.store.getScoped(f.scope)!;
+					const replacementAuthority = {
+						...original.managedAuthority!,
+						[field]: field === "generation" ? 3 : "replacement",
+					};
+					let calls = 0;
+					let adopted = false;
+					let acknowledged: ManagedTurnAuthority | undefined;
+					const runner = Object.assign(f.runner, {
+						runControl: (async (_turn, _mapping, _transaction, _successor, _dispatch, owner) => {
+							await owner!.onInvoking();
+							calls += 1;
+							f.store.setScoped(f.scope, {
+								...original,
+								sessionId: replacementAuthority.sessionId,
+								managedAuthority: replacementAuthority,
+							});
+							acknowledged = controlAuthority(owner!);
+							await owner!.onAcknowledged(acknowledged);
+							adopted = true;
+							return controlResult(acknowledged);
+						}) satisfies NonNullable<GjcTurnRunner["runControl"]>,
+					});
+					const turn = lifecycleTurn(operation);
+					const gateway = () => createGjcRoutingLiveGatewayRunner({ turnRunner: runner, mappings: f.store });
+					await expect(gateway().run(turn)).rejects.toThrow(
+						field === "sessionId" ? "branch_predecessor_replaced" : "authority changed",
+					);
+					const receipt = f.store.operationScoped(f.scope, turn.userMessageId)!;
+					expect(receipt.lifecycle?.acknowledged).toEqual(lifecycleExactAuthority(acknowledged!));
+					expect(receipt.lifecycle?.state).toBe("uncertain");
+					expect(receipt.state).toBe("uncertain");
+					expect(receipt.lifecycle?.proven).toBeUndefined();
+					expect(receipt.result).toBeUndefined();
+					if (operation === "session.new")
+						expect(receipt.acknowledgedSuccessor).toEqual({
+							sessionId: acknowledged!.sessionId,
+							managedAuthority: acknowledged!,
+						});
+					else expect(receipt.acknowledgedSuccessor).toBeUndefined();
+					f.reopen();
+					expect(f.store.operationScoped(f.scope, turn.userMessageId)).toEqual(receipt);
+					expect(f.store.getScoped(f.scope)?.managedAuthority).toEqual(replacementAuthority);
+					const bytes = readFileSync(f.file);
+					await expect(gateway().run(turn)).rejects.toThrow("requires reconciliation");
+					await expect(gateway().run({ ...turn, prompt: "changed payload" })).rejects.toThrow();
+					expect(readFileSync(f.file).equals(bytes)).toBe(true);
+					expect(calls).toBe(1);
+					expect(adopted).toBe(false);
+					expect(runner.states).toEqual([]);
+					expect(runner.continues).toEqual([]);
+				} finally {
+					f.close();
+				}
+			},
+		);
+	}
+
 	test.each(["before", "invoking", "proven"] as const)(
 		"classifies control failure at %s without inventing lifecycle or active proof",
 		async stage => {

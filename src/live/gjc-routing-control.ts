@@ -208,7 +208,6 @@ async function runManagedLifecycleControl(
 			record(transitionManagedLifecycleEvidence(evidence, "invoking"));
 		},
 		onAcknowledged: authority => {
-			current();
 			assertManagedAuthority(authority, {
 				...source,
 				sessionId: creating ? authority.sessionId : source.sessionId,
@@ -226,6 +225,7 @@ async function runManagedLifecycleControl(
 					sessionId: authority.sessionId,
 					managedAuthority: managedAuthorityCopy(authority),
 				});
+			current();
 		},
 	};
 	const address = {
