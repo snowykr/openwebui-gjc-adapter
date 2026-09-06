@@ -192,27 +192,33 @@ export function createManagedSessionOperations(
 				const timeoutMs = deadline.remaining();
 				switch (operation) {
 					case "create":
-						return runtime.createPreparedExternalLifecycleSession(authority, {
-							actor,
-							capability: "session.create",
-							requestKey,
-							target: { kind: "existing_path", path: requiredTargetString(target, "path") },
-							readinessTimeoutMs: timeoutMs,
-						});
-					case "resume":
-						return runtime.resumeExternalLifecycleSession(requireExactTenant(key), {
-							actor,
-							capability: "session.resume",
-							requestKey,
-							target: {
-								sessionIdOrPrefix: requiredTargetString(target, "sessionIdOrPrefix"),
-								path:
-									target.path === undefined
-										? authority.canonicalWorkspace
-										: requiredTargetString(target, "path"),
+						return runtime.createPreparedExternalLifecycleSession(
+							authority,
+							{
+								actor,
+								capability: "session.create",
+								requestKey,
+								target: { kind: "existing_path", path: requiredTargetString(target, "path") },
 							},
-							readinessTimeoutMs: timeoutMs,
-						});
+							timeoutMs,
+						);
+					case "resume":
+						return runtime.resumeExternalLifecycleSession(
+							requireExactTenant(key),
+							{
+								actor,
+								capability: "session.resume",
+								requestKey,
+								target: {
+									sessionIdOrPrefix: requiredTargetString(target, "sessionIdOrPrefix"),
+									path:
+										target.path === undefined
+											? authority.canonicalWorkspace
+											: requiredTargetString(target, "path"),
+								},
+							},
+							timeoutMs,
+						);
 					case "fork":
 						return runtime.forkLifecycleSession(requireExactTenant(key), {
 							actor,

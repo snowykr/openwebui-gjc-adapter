@@ -50,9 +50,10 @@ class ProbeRuntime extends ManagedSdkRuntime {
 	override async createPreparedExternalLifecycleSession(
 		authority: Parameters<ManagedSdkRuntime["createPreparedExternalLifecycleSession"]>[0],
 		request: Parameters<ManagedSdkRuntime["createPreparedExternalLifecycleSession"]>[1],
+		timeoutMs?: number,
 	) {
 		lifecycleCreates += 1;
-		return super.createPreparedExternalLifecycleSession(authority, request);
+		return super.createPreparedExternalLifecycleSession(authority, request, timeoutMs);
 	}
 	override async request(
 		attachment: ManagedSdkAttachment,

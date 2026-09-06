@@ -54,7 +54,7 @@ describe("managed session operations", () => {
 		expect(JSON.stringify(fake)).not.toMatch(/credential|password|endpointIncarnation/i);
 	});
 
-	test("passes typed readiness budget and persists identity before registration", async () => {
+	test("keeps logical timeout out of SDK readiness and persists identity before registration", async () => {
 		const fake = new FakeRuntime();
 		const operations = createManagedSessionOperations(fake.runtime, 500);
 		const order: string[] = [];
@@ -73,8 +73,9 @@ describe("managed session operations", () => {
 		});
 		expect(order).toEqual(["acknowledge", "register"]);
 		expect(fake.externalLifecycle[0]?.request).not.toHaveProperty("timeoutMs");
-		expect(fake.externalLifecycle[0]?.request.readinessTimeoutMs).toBeGreaterThan(0);
-		expect(fake.externalLifecycle[0]?.request.readinessTimeoutMs).toBeLessThanOrEqual(500);
+		expect(fake.externalLifecycle[0]?.request).not.toHaveProperty("readinessTimeoutMs");
+		expect(fake.externalTimeouts[0]).toBeGreaterThan(0);
+		expect(fake.externalTimeouts[0]).toBeLessThanOrEqual(500);
 	});
 
 	test("retains failed durable acknowledgement without registration or cleanup effects", async () => {
@@ -92,6 +93,25 @@ describe("managed session operations", () => {
 		expect(fake.registered).toHaveLength(0);
 		expect(fake.lifecycle).toHaveLength(0);
 	});
+
+	test.each([25, 180_000])(
+		"external create and resume keep a %ims logical deadline out of readiness",
+		async timeoutMs => {
+			const fake = new FakeRuntime();
+			const operations = createManagedSessionOperations(fake.runtime, timeoutMs);
+			await operations.create({ authority: withoutIdentity(), target: { path: authority.canonicalWorkspace } });
+			await operations.resume({ authority, target: { sessionIdOrPrefix: authority.sessionId } });
+			expect(fake.externalLifecycle.map(call => call.operation)).toEqual(["create", "resume"]);
+			for (const call of fake.externalLifecycle) {
+				expect(call.request).not.toHaveProperty("readinessTimeoutMs");
+				expect(call.request).not.toHaveProperty("timeoutMs");
+			}
+			for (const budget of fake.externalTimeouts) {
+				expect(budget).toBeGreaterThan(0);
+				expect(budget).toBeLessThanOrEqual(timeoutMs);
+			}
+		},
+	);
 
 	test("times out lifecycle invocation and never registers a late result", async () => {
 		const fake = new FakeRuntime();
@@ -345,6 +365,7 @@ class FakeRuntime {
 	readonly attachment = { isCurrent: () => true };
 	readonly tokens = new Map<string, ManagedSdkAttachment>();
 	readonly externalLifecycle: { operation: string; request: Record<string, unknown> }[] = [];
+	readonly externalTimeouts: (number | undefined)[] = [];
 	readonly lifecycle: { operation: string; request: Record<string, unknown> }[] = [];
 	readonly requests: Record<string, unknown>[] = [];
 	readonly registered: unknown[] = [];
@@ -392,11 +413,17 @@ class FakeRuntime {
 		}
 		return token;
 	}
-	async createPreparedExternalLifecycleSession(_authority: unknown, request: Record<string, unknown>) {
+	async createPreparedExternalLifecycleSession(
+		_authority: unknown,
+		request: Record<string, unknown>,
+		timeoutMs?: number,
+	) {
+		this.externalTimeouts.push(timeoutMs);
 		this.externalLifecycle.push({ operation: "create", request });
 		return lifecycleSuccess();
 	}
-	async resumeExternalLifecycleSession(_tenant: unknown, request: Record<string, unknown>) {
+	async resumeExternalLifecycleSession(_tenant: unknown, request: Record<string, unknown>, timeoutMs?: number) {
+		this.externalTimeouts.push(timeoutMs);
 		this.externalLifecycle.push({ operation: "resume", request });
 		return { kind: "result", outcome: lifecycleSuccess() };
 	}

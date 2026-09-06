@@ -72,9 +72,10 @@ describe("managed model reader", () => {
 		expect(fake.created).toMatchObject({
 			capability: "session.create",
 			target: { kind: "existing_path", path: temporary.canonicalWorkspace },
-			readinessTimeoutMs: 250,
 		});
 		expect(fake.created).not.toHaveProperty("timeoutMs");
+		expect(fake.created).not.toHaveProperty("readinessTimeoutMs");
+		expect(fake.createTimeoutMs).toBe(250);
 		expect(fake.preparedCreates).toEqual([
 			expect.objectContaining({
 				principalId: temporary.principalId,
@@ -245,6 +246,7 @@ class FakeRuntime {
 	readonly statusKeys: TenantSessionKey[] = [];
 	readonly preparedCreates: Parameters<ManagedSdkRuntime["createPreparedExternalLifecycleSession"]>[0][] = [];
 	created: Record<string, unknown> | undefined;
+	createTimeoutMs: number | undefined;
 	createCalls = 0;
 	closed: Record<string, unknown> | undefined;
 	closeOutcome: Awaited<ReturnType<ManagedSdkRuntime["closeLifecycleSession"]>> | undefined;
@@ -307,6 +309,7 @@ class FakeRuntime {
 	async createPreparedExternalLifecycleSession(
 		authority: Parameters<ManagedSdkRuntime["createPreparedExternalLifecycleSession"]>[0],
 		request: Parameters<ManagedSdkRuntime["createPreparedExternalLifecycleSession"]>[1],
+		timeoutMs?: number,
 	) {
 		if (
 			this.rejectTenant ||
@@ -326,6 +329,7 @@ class FakeRuntime {
 		this.preparedCreates.push(authority);
 		this.createCalls += 1;
 		this.created = request;
+		this.createTimeoutMs = timeoutMs;
 		await this.createGate;
 		return { ok: true, result: { sessionId: "catalog-session", endpointGeneration: 11 } };
 	}

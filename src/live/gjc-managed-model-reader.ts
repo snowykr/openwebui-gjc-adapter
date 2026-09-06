@@ -76,13 +76,16 @@ async function createTemporaryReader(
 	assertPrincipal(context, input.principalId);
 	await assertTemporaryFence(input, context, signal);
 	const actor = { namespace: "openwebui-gjc-adapter", id: input.principalId };
-	const creation = runtime.createPreparedExternalLifecycleSession(input, {
-		actor,
-		capability: "session.create",
-		requestKey: input.requestKey,
-		target: { kind: "existing_path", path: input.canonicalWorkspace },
-		readinessTimeoutMs: input.timeoutMs,
-	});
+	const creation = runtime.createPreparedExternalLifecycleSession(
+		input,
+		{
+			actor,
+			capability: "session.create",
+			requestKey: input.requestKey,
+			target: { kind: "existing_path", path: input.canonicalWorkspace },
+		},
+		input.timeoutMs,
+	);
 	void creation.then(
 		result => {
 			if (!signal?.aborted) return;

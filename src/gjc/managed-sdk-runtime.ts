@@ -350,17 +350,24 @@ export class ManagedSdkRuntime {
 					Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["createExternal"]>[0]
 			  >,
 		request?: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["createExternal"]>[0],
+		timeoutMs?: number,
 	): ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["createExternal"]> {
-		return this.#invokeLifecycle("createExternal", tenantOrRequest, request, value =>
-			this.#lifecycle.createExternal(value),
+		return this.#invokeLifecycle(
+			"createExternal",
+			tenantOrRequest,
+			request,
+			value => this.#lifecycle.createExternal(value),
+			ACTIVE_ACCESS,
+			timeoutMs,
 		);
 	}
 
 	createPreparedExternalLifecycleSession(
 		authority: ManagedPreparedTurnAuthority,
 		request: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["createExternal"]>[0],
+		timeoutMs?: number,
 	): ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["createExternal"]> {
-		return this.#invokePreparedCreate(authority, request);
+		return this.#invokePreparedCreate(authority, request, timeoutMs);
 	}
 
 	resumeExternalLifecycleSession(
@@ -371,9 +378,15 @@ export class ManagedSdkRuntime {
 					Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["resumeExternal"]>[0]
 			  >,
 		request?: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["resumeExternal"]>[0],
+		timeoutMs?: number,
 	): ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["resumeExternal"]> {
-		return this.#invokeLifecycle("resumeExternal", tenantOrRequest, request, value =>
-			this.#lifecycle.resumeExternal(value),
+		return this.#invokeLifecycle(
+			"resumeExternal",
+			tenantOrRequest,
+			request,
+			value => this.#lifecycle.resumeExternal(value),
+			ACTIVE_ACCESS,
+			timeoutMs,
 		);
 	}
 
@@ -816,15 +829,16 @@ export class ManagedSdkRuntime {
 		request: TRequest | undefined,
 		invoke: (request: TRequest, tenant: TenantSessionKey) => Promise<TResult>,
 		access: ManagedSdkAccess = ACTIVE_ACCESS,
+		timeoutMs?: number,
 	): Promise<TResult> {
 		const call = lifecycleCall(tenantOrRequest, request);
 		if (call === undefined)
 			throw new Error("Complete managed tenant authority is required for lifecycle operations.");
 		const key = copyTenantKey(call.tenant);
 		const value = structuredClone(call.request);
-		const timeoutField =
-			method === "createExternal" || method === "resumeExternal" ? "readinessTimeoutMs" : "timeoutMs";
-		const timeout = isRecord(value) ? value[timeoutField] : undefined;
+		const external = method === "createExternal" || method === "resumeExternal";
+		if (external) assertExternalLifecycleReadiness(value);
+		const timeout = external ? timeoutMs : isRecord(value) ? value.timeoutMs : undefined;
 		return this.#track(timeout, async budget => {
 			const registration = this.#registrations.get(generationIdentity(key));
 			await this.#assertAuthorized(key, false, false, access);
@@ -833,7 +847,7 @@ export class ManagedSdkRuntime {
 			this.#assertOwner();
 			if (this.#registrations.get(generationIdentity(key)) !== registration)
 				throw new Error("Tenant registration changed before lifecycle invocation.");
-			const result = await invoke({ ...value, [timeoutField]: budget.remaining() }, key);
+			const result = await invoke(external ? value : { ...value, timeoutMs: budget.remaining() }, key);
 			await this.#assertAuthorized(key, false, true, access);
 			budget.remaining();
 			if (this.#registrations.get(generationIdentity(key)) !== registration)
@@ -845,10 +859,12 @@ export class ManagedSdkRuntime {
 	async #invokePreparedCreate(
 		authority: ManagedPreparedTurnAuthority,
 		request: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["createExternal"]>[0],
+		timeoutMs?: number,
 	): Promise<Awaited<ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["createExternal"]>>> {
 		assertPreparedAuthority(authority);
 		const prepared = Object.freeze({ ...authority });
 		const value = structuredClone(request);
+		assertExternalLifecycleReadiness(value);
 		if (value.actor.id !== prepared.principalId || value.actor.namespace !== "openwebui-gjc-adapter")
 			throw new Error("Lifecycle actor does not match prepared managed authority.");
 		if (value.capability !== "session.create" || value.requestKey !== prepared.requestKey)
@@ -860,12 +876,12 @@ export class ManagedSdkRuntime {
 		)
 			throw new Error("Lifecycle create target does not match prepared managed authority.");
 		const fence = this.#preparedTenantFence;
-		return this.#track(value.readinessTimeoutMs, async budget => {
+		return this.#track(timeoutMs, async budget => {
 			if (fence === undefined || !(await fence(prepared)))
 				throw new Error("Prepared tenant authority fence was lost or unavailable.");
 			budget.remaining();
 			this.#assertOwner();
-			const result = await this.#lifecycle.createExternal({ ...value, readinessTimeoutMs: budget.remaining() });
+			const result = await this.#lifecycle.createExternal(value);
 			if (!(await fence(prepared))) throw new Error("Prepared tenant authority fence was lost.");
 			budget.remaining();
 			this.#assertOwner(false, true);
@@ -1131,6 +1147,23 @@ function finiteTimeout(value: unknown, fallback: number): number {
 	return value;
 }
 
+function assertReadinessTimeout(value: unknown): void {
+	if (
+		value !== undefined &&
+		(typeof value !== "number" || !Number.isInteger(value) || value < 4_000 || value > 60_000)
+	)
+		throw new TypeError("Lifecycle readinessTimeoutMs must be an integer between 4000 and 60000.");
+}
+
+function assertExternalLifecycleReadiness(request: unknown): void {
+	if (!isRecord(request)) throw new TypeError("External lifecycle request is required.");
+	if ("timeoutMs" in request)
+		throw new TypeError(
+			"External lifecycle timeoutMs must be supplied as the internal operation budget, not in the public request.",
+		);
+	assertReadinessTimeout(request.readinessTimeoutMs);
+}
+
 async function boundedWait<T>(promise: Promise<T>, timeoutMs: number, code: string): Promise<T> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
@@ -1282,6 +1315,8 @@ function assertLifecycleRequestAuthority(method: LifecycleMethod, tenant: Tenant
 	};
 	if (Object.keys(target).some(key => !fields[method].includes(key)))
 		throw new Error("Lifecycle target contains unsupported authority or broad scope.");
+	if (method === "create" || method === "resume" || method === "fork")
+		assertReadinessTimeout(target.readinessTimeoutMs);
 	const sessionField =
 		method === "resumeExternal"
 			? "sessionIdOrPrefix"

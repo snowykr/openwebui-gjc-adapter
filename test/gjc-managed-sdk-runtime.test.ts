@@ -153,7 +153,7 @@ function createRequest(): CreateRequest {
 		capability: "session.create",
 		requestKey: "create-1",
 		target: { kind: "existing_path", path: tenant.canonicalWorkspace },
-		readinessTimeoutMs: 500,
+		readinessTimeoutMs: 4_000,
 	};
 }
 
@@ -215,6 +215,8 @@ function fixture(
 	const calls: string[] = [];
 	const closeCalls: CloseRequest[] = [];
 	const createCalls: CreateRequest[] = [];
+	const internalCreateCalls: Array<Parameters<LifecycleService["create"]>[0]> = [];
+	const forkCalls: Array<Parameters<LifecycleService["fork"]>[0]> = [];
 	const resumeCalls: ResumeRequest[] = [];
 	const listCalls: ListRequest[] = [];
 	const historicalResumeCalls: HistoricalResumeRequest[] = [];
@@ -222,7 +224,7 @@ function fixture(
 	let currentAttachment = attachment;
 	const lifecycleService: Pick<
 		LifecycleService,
-		"close" | "createExternal" | "resumeExternal" | "resume" | "list" | "delete"
+		"close" | "create" | "fork" | "createExternal" | "resumeExternal" | "resume" | "list" | "delete"
 	> = {
 		async close(request) {
 			closeCalls.push(request);
@@ -232,6 +234,14 @@ function fixture(
 		async createExternal(request) {
 			createCalls.push(request);
 			return { ok: true, operation: "session.create", result: { sessionId: "created", endpointGeneration: 1 } };
+		},
+		async create(request) {
+			internalCreateCalls.push(request);
+			return { ok: true, operation: "session.create", result: { sessionId: "created", endpointGeneration: 1 } };
+		},
+		async fork(request) {
+			forkCalls.push(request);
+			return { ok: true, operation: "session.fork", result: { sessionId: "forked", endpointGeneration: 1 } };
 		},
 		async resumeExternal(request) {
 			resumeCalls.push(request);
@@ -329,6 +339,8 @@ function fixture(
 		calls,
 		closeCalls,
 		createCalls,
+		internalCreateCalls,
+		forkCalls,
 		resumeCalls,
 		listCalls,
 		historicalResumeCalls,
@@ -341,7 +353,268 @@ function fixture(
 	};
 }
 
+function invokeExternal(
+	runtime: ManagedSdkRuntime,
+	method: "prepared" | "create" | "resume",
+	readiness: { readonly readinessTimeoutMs?: number } = {},
+	timeoutMs?: number,
+) {
+	if (method === "resume")
+		return runtime.resumeExternalLifecycleSession(
+			tenant,
+			{
+				actor: closeRequest().actor,
+				capability: "session.resume",
+				requestKey: "resume-1",
+				target: { sessionIdOrPrefix: tenant.sessionId, path: tenant.canonicalWorkspace },
+				...readiness,
+			},
+			timeoutMs,
+		);
+	const { readinessTimeoutMs: _readiness, ...request } = createRequest();
+	return method === "prepared"
+		? runtime.createPreparedExternalLifecycleSession(preparedAuthority(), { ...request, ...readiness }, timeoutMs)
+		: runtime.createExternalLifecycleSession(tenant, { ...request, ...readiness }, timeoutMs);
+}
+
 describe("managed SDK runtime", () => {
+	test.each(["prepared", "create", "resume"] as const)(
+		"%s external lifecycle separates small logical budgets from unchanged readiness configuration",
+		async method => {
+			const f = fixture();
+			f.runtime.registerTenant(tenant);
+			await f.runtime.start();
+			for (const timeout of [15, 500]) {
+				for (const readiness of [{}, { readinessTimeoutMs: 4_000 }, { readinessTimeoutMs: 60_000 }]) {
+					await invokeExternal(f.runtime, method, readiness, timeout);
+					const request = [...f.createCalls, ...f.resumeCalls].at(-1)!;
+					expect(request).not.toHaveProperty("timeoutMs");
+					if ("readinessTimeoutMs" in readiness)
+						expect(request.readinessTimeoutMs).toBe(readiness.readinessTimeoutMs);
+					else expect(request).not.toHaveProperty("readinessTimeoutMs");
+				}
+			}
+			expect(f.createCalls.length + f.resumeCalls.length).toBe(6);
+			await f.runtime.stop();
+		},
+	);
+
+	test.each(["prepared", "create", "resume"] as const)(
+		"%s external lifecycle rejects invalid readiness and undeclared public timeout without invocation",
+		async method => {
+			const f = fixture();
+			f.runtime.registerTenant(tenant);
+			await f.runtime.start();
+			for (const invalid of [3_999, 60_001, 4_000.5, 500, 15, 0, -1, Infinity, NaN, null, "4000"]) {
+				const readiness = {};
+				Reflect.set(readiness, "readinessTimeoutMs", invalid);
+				await expect(invokeExternal(f.runtime, method, readiness, 500)).rejects.toThrow("readinessTimeoutMs");
+			}
+			for (const timeoutMs of [15, undefined]) {
+				const readiness = { timeoutMs };
+				await expect(
+					invokeExternal(f.runtime, method, { ...readiness, readinessTimeoutMs: 4_000 }, 500),
+				).rejects.toThrow("internal operation budget");
+			}
+			expect(f.createCalls).toEqual([]);
+			expect(f.resumeCalls).toEqual([]);
+			await f.runtime.stop();
+		},
+	);
+
+	test.each(["prepared", "create", "resume"] as const)(
+		"%s external lifecycle uses the unchanged 30s default budget, not configured readiness",
+		async method => {
+			for (const elapsed of [4_500, 30_001]) {
+				const entered = deferred<void>();
+				const release = deferred<boolean>();
+				const wait = () => {
+					entered.resolve();
+					return release.promise;
+				};
+				const f = fixture({ fence: wait, preparedFence: wait });
+				f.runtime.registerTenant(tenant);
+				await f.runtime.start();
+				let now = performance.now();
+				const clock = spyOn(performance, "now").mockImplementation(() => now);
+				try {
+					const call = invokeExternal(f.runtime, method, { readinessTimeoutMs: 4_000 });
+					const result = call.catch(error => error);
+					await entered.promise;
+					now += elapsed;
+					release.resolve(true);
+					const outcome = await result;
+					if (elapsed === 30_001) {
+						expect(outcome).toMatchObject({ code: "timeout" });
+						expect(f.createCalls.length + f.resumeCalls.length).toBe(0);
+					} else {
+						expect(outcome).not.toBeInstanceOf(Error);
+						expect([...f.createCalls, ...f.resumeCalls][0]?.readinessTimeoutMs).toBe(4_000);
+					}
+				} finally {
+					clock.mockRestore();
+					await f.runtime.stop();
+				}
+			}
+		},
+	);
+
+	test.each(["prepared", "create", "resume"] as const)(
+		"%s external logical deadline rejects late authorization without public effects",
+		async method => {
+			const entered = deferred<void>();
+			const release = deferred<boolean>();
+			const wait = () => {
+				entered.resolve();
+				return release.promise;
+			};
+			const f = fixture({ fence: wait, preparedFence: wait });
+			f.runtime.registerTenant(tenant);
+			await f.runtime.start();
+			const result = invokeExternal(f.runtime, method, { readinessTimeoutMs: 60_000 }, 15).catch(error => error);
+			await entered.promise;
+			expect(await result).toMatchObject({ code: "timeout" });
+			release.resolve(true);
+			await new Promise(resolve => setTimeout(resolve, 0));
+			expect(f.createCalls).toEqual([]);
+			expect(f.resumeCalls).toEqual([]);
+			await f.runtime.stop();
+		},
+	);
+
+	test.each(["prepared", "create", "resume"] as const)(
+		"%s external readiness is snapshotted rather than decremented after awaited admission",
+		async method => {
+			const entered = deferred<void>();
+			const release = deferred<boolean>();
+			const wait = () => {
+				entered.resolve();
+				return release.promise;
+			};
+			const f = fixture({ fence: wait, preparedFence: wait });
+			f.runtime.registerTenant(tenant);
+			await f.runtime.start();
+			const readiness = { readinessTimeoutMs: 4_000 };
+			let now = performance.now();
+			const clock = spyOn(performance, "now").mockImplementation(() => now);
+			try {
+				const call = invokeExternal(f.runtime, method, readiness, 500);
+				await entered.promise;
+				readiness.readinessTimeoutMs = 60_001;
+				now += 200;
+				release.resolve(true);
+				await call;
+				const request = [...f.createCalls, ...f.resumeCalls][0]!;
+				expect(request.readinessTimeoutMs).toBe(4_000);
+				expect(request).not.toHaveProperty("timeoutMs");
+			} finally {
+				clock.mockRestore();
+				await f.runtime.stop();
+			}
+		},
+	);
+
+	test.each(["prepared", "create", "resume"] as const)(
+		"%s external logical budget validation is independent of valid readiness",
+		async method => {
+			const f = fixture();
+			f.runtime.registerTenant(tenant);
+			await f.runtime.start();
+			for (const timeout of [0, -1, 1.5, Infinity, NaN, 2_147_483_648])
+				await expect(invokeExternal(f.runtime, method, { readinessTimeoutMs: 4_000 }, timeout)).rejects.toThrow(
+					"Managed timeout",
+				);
+			expect(f.createCalls).toEqual([]);
+			expect(f.resumeCalls).toEqual([]);
+			await f.runtime.stop();
+		},
+	);
+
+	test.each(["create", "resume"] as const)(
+		"%s wrapped external request preserves readiness and accepts a separate third budget",
+		async method => {
+			const f = fixture();
+			f.runtime.registerTenant(tenant);
+			await f.runtime.start();
+			if (method === "create")
+				await f.runtime.createExternalLifecycleSession({ tenant, request: createRequest() }, undefined, 500);
+			else
+				await f.runtime.resumeExternalLifecycleSession(
+					{
+						tenant,
+						request: {
+							actor: closeRequest().actor,
+							capability: "session.resume",
+							requestKey: "resume-1",
+							target: { sessionIdOrPrefix: tenant.sessionId, path: tenant.canonicalWorkspace },
+							readinessTimeoutMs: 60_000,
+						},
+					},
+					undefined,
+					500,
+				);
+			const request = [...f.createCalls, ...f.resumeCalls][0]!;
+			expect(request.readinessTimeoutMs).toBe(method === "create" ? 4_000 : 60_000);
+			expect(request).not.toHaveProperty("timeoutMs");
+			await f.runtime.stop();
+		},
+	);
+
+	test.each(["create", "resume", "fork"] as const)(
+		"nonexternal %s validates configured target readiness while shrinking public timeout",
+		async method => {
+			const entered = deferred<void>();
+			const release = deferred<boolean>();
+			const f = fixture({
+				fence: () => {
+					entered.resolve();
+					return release.promise;
+				},
+			});
+			f.runtime.registerTenant(tenant);
+			await f.runtime.start();
+			const invoke = (readinessTimeoutMs: number) => {
+				const common = { actor: closeRequest().actor, requestKey: "lifecycle-1", timeoutMs: 500 };
+				if (method === "create")
+					return f.runtime.createLifecycleSession(tenant, {
+						...common,
+						capability: "session.create",
+						target: { cwd: tenant.canonicalWorkspace, readinessTimeoutMs },
+					});
+				if (method === "fork")
+					return f.runtime.forkLifecycleSession(tenant, {
+						...common,
+						capability: "session.fork",
+						target: { cwd: tenant.canonicalWorkspace, sourceSessionId: tenant.sessionId, readinessTimeoutMs },
+					});
+				return f.runtime.resumeLifecycleSession(tenant, {
+					...common,
+					capability: "session.resume",
+					target: { cwd: tenant.canonicalWorkspace, sessionId: tenant.sessionId, readinessTimeoutMs },
+				});
+			};
+			let now = performance.now();
+			const clock = spyOn(performance, "now").mockImplementation(() => now);
+			try {
+				const call = invoke(4_000);
+				await entered.promise;
+				now += 200;
+				release.resolve(true);
+				await call;
+				const requests = [...f.internalCreateCalls, ...f.historicalResumeCalls, ...f.forkCalls];
+				expect(requests).toHaveLength(1);
+				expect(requests[0]?.timeoutMs).toBe(300);
+				expect(requests[0]?.target.readinessTimeoutMs).toBe(4_000);
+				for (const invalid of [3_999, 60_001, 4_000.5])
+					await expect(invoke(invalid)).rejects.toThrow("readinessTimeoutMs");
+				expect(f.internalCreateCalls.length + f.historicalResumeCalls.length + f.forkCalls.length).toBe(1);
+			} finally {
+				clock.mockRestore();
+				await f.runtime.stop();
+			}
+		},
+	);
+
 	test("selects only the exact public saved receipt and resumes without creating routing authority", async () => {
 		const selection = historicalSelection();
 		const evidence = historicalEvidence();
@@ -1391,7 +1664,7 @@ describe("managed SDK runtime", () => {
 		expect(f.createCalls).toEqual([]);
 		await f.runtime.createPreparedExternalLifecycleSession(preparedAuthority(), createRequest());
 		expect(seen).toEqual([preparedAuthority(), preparedAuthority()]);
-		expect(f.createCalls[0]!.readinessTimeoutMs!).toBeLessThanOrEqual(500);
+		expect(f.createCalls[0]!.readinessTimeoutMs).toBe(4_000);
 		await f.runtime.stop();
 	});
 
@@ -1409,10 +1682,7 @@ describe("managed SDK runtime", () => {
 			await f.runtime.start();
 			const call =
 				kind === "prepared"
-					? f.runtime.createPreparedExternalLifecycleSession(preparedAuthority(), {
-							...createRequest(),
-							readinessTimeoutMs: 15,
-						})
+					? f.runtime.createPreparedExternalLifecycleSession(preparedAuthority(), createRequest(), 15)
 					: f.runtime.closeLifecycleSession(tenant, { ...closeRequest(), timeoutMs: 15 });
 			await entered.promise;
 			await expect(call).rejects.toMatchObject({ code: "timeout" });
@@ -1444,7 +1714,7 @@ describe("managed SDK runtime", () => {
 			capability: "session.resume",
 			requestKey: "resume",
 			target: { sessionIdOrPrefix: tenant.sessionId, path: tenant.canonicalWorkspace },
-			readinessTimeoutMs: 500,
+			readinessTimeoutMs: 4_000,
 		};
 		for (const target of [
 			{ ...resume.target, sessionIdOrPrefix: "session" },

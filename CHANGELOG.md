@@ -26,6 +26,7 @@
 
 ### Fixed
 
+- Separated internal external-lifecycle deadlines from public SDK readiness configuration. Create/resume and catalog callers no longer send short or over-60-second operation budgets as `readinessTimeoutMs`; an explicitly supplied SDK readiness value remains unchanged and must satisfy the public 4,000–60,000 ms range.
 - Rejected proof-free post-invocation terminal classification and indirect uncertainty/cleanup restoration, including reuse of pre-cleanup acknowledgement. The normative lifecycle matrix is unchanged, but unsupported evidence-labelled recovery remains blocked. Bounded graceful drain and local Router stop under one monotonic shutdown deadline with pre-effect checks instead of renewing the timeout.
 - Restored the original cutover schema epoch `gjc-public-sdk-v015-managed/1` across canonical V3 and its activation marker. The obsolete `managed/1` schema identity is rejected without a compatibility layer; independent persisted workspace/runtime lease epochs are unchanged.
 - Removed the obsolete flat authority codec, activation store/coordinator, bootstrap service, and server cleanup hook after transferring their valid behavioral obligations to canonical V3 tests. Added concurrent activation, startup/shutdown/release failure, source-file safety, graph-copy validation, and unrelated-file preservation regressions; unsafe numeric-generation recovery and post-replacement rollback are not retained as success contracts.
