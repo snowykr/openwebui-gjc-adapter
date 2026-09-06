@@ -884,8 +884,8 @@ function assertPrincipalId(principalId: string): void {
 function compositeScopeFromRecord(record: SessionAuthorityRecord): SessionMappingScope | undefined {
 	const observation = record.observations?.[SCOPED_MAPPING_OBSERVATION];
 	if (observation === undefined) {
-		const history = record.historicalBinding;
-		if (history?.principalId === undefined) return undefined;
+		const principalId = record.historicalBinding?.principalId ?? record.managedAuthority?.principalId;
+		if (principalId === undefined) return undefined;
 		let key: unknown;
 		try {
 			key = JSON.parse(record.chatId);
@@ -895,12 +895,12 @@ function compositeScopeFromRecord(record: SessionAuthorityRecord): SessionMappin
 		if (
 			!Array.isArray(key) ||
 			key.length !== 2 ||
-			key[0] !== history.principalId ||
+			key[0] !== principalId ||
 			typeof key[1] !== "string" ||
-			canonicalSessionMappingKey(history.principalId, key[1]) !== record.chatId
+			canonicalSessionMappingKey(principalId, key[1]) !== record.chatId
 		)
 			return undefined;
-		return { principalId: history.principalId, chatId: key[1] };
+		return { principalId, chatId: key[1] };
 	}
 	if (typeof observation !== "object" || observation === null || Array.isArray(observation))
 		throw new Error("Session mapping contains invalid scope metadata.");
@@ -1269,7 +1269,7 @@ function mappingFromRecordShallow(record: SessionAuthorityRecord): SessionMappin
 
 function storedScopeFromRecord(record: SessionAuthorityRecord): SessionMappingScope | undefined {
 	const observation = record.observations?.[SCOPED_MAPPING_OBSERVATION];
-	if (observation === undefined) return undefined;
+	if (observation === undefined) return compositeScopeFromRecord(record);
 	if (typeof observation !== "object" || observation === null || Array.isArray(observation))
 		throw new Error("Session mapping contains invalid scope metadata.");
 	const principalId = (observation as StoredMappingScope).principalId;

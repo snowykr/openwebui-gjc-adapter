@@ -1,10 +1,16 @@
 #!/usr/bin/env bun
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { lifecycle } from "@gajae-code/coding-agent/sdk";
+import { activateAdapterSessionAuthorityV3 } from "../src/adapter-managed-bootstrap";
 import { ManagedOperationDeadline } from "../src/gjc/managed-operation-deadline";
+import { ManagedSdkRuntime } from "../src/gjc/managed-sdk-runtime";
+import { parseSessionAuthorityV3Document } from "../src/gjc/session-authority-v3";
+import { RuntimeSingletonLock } from "../src/runtime-singleton-lock";
+import { WorkspaceLeaseManager, workspaceLeaseId } from "../src/security/workspace-lease";
 import { apiKey, providerResponse, writeLocalProviderConfig } from "./gjc-release-compat-fixtures";
 import { promptAndAwaitTerminal } from "./gjc-release-compat-runtime";
 import { connectFor, publicLifecycle, startPublicSdk, stopPublicSdk } from "./gjc-release-compat-sdk";
@@ -99,158 +105,177 @@ async function probe(): Promise<void> {
 			promptAndAwaitTerminal(client, identity.sessionId, "save", "Respond with compatibility-ok.", observe),
 		);
 		await close("close-original");
-		// Distinct API contract probes, not a production fallback chain. The bare
-		// service target cannot resume saved sessions without transcript authority.
-		const bare = await observe("resume.saved-full-id", () =>
-			publicLifecycle(workspace).resume({
-				actor,
-				capability: "session.resume",
-				requestKey: "bare-saved-resume",
-				target: { sessionId: identity!.sessionId, cwd: workspace },
-				timeoutMs: 15_000,
-			}),
-		);
-		if (!isRecord(bare) || bare.ok !== false || !isRecord(bare.error) || bare.error.code !== "invalid_input")
-			throw new Error("Bare saved resume contract changed; review the observed outcome.");
-		report.bareSavedResumeUnsupported = true;
-		const foreignWorkspace = join(root, "foreign-workspace");
-		await mkdir(foreignWorkspace);
-		const foreign = await observe("resume.foreign-workspace", () =>
-			publicLifecycle(workspace).resumeExternal({
-				actor,
-				capability: "session.resume",
-				requestKey: "foreign-workspace-denial",
-				target: { sessionIdOrPrefix: identity!.sessionId, path: foreignWorkspace },
-			}),
-		);
-		if (!isRecord(foreign) || foreign.kind !== "not_found")
-			throw new Error("Foreign workspace selected the saved session.");
-		let request: ResumeRequest;
-		if (process.argv.includes("--exact")) {
-			const selected = await observe("list.exact-saved-id", () =>
-				publicLifecycle(workspace).list({
+		if (process.argv.includes("--bootstrap")) {
+			report.selection = "manifest-bound-adapter-bootstrap";
+			await bootstrapProbe(
+				root,
+				workspace,
+				agentDir,
+				identity.sessionId,
+				actor.id,
+				budget,
+				observations,
+				acknowledged => {
+					identity = acknowledged;
+					live = true;
+				},
+			);
+			report.scopedHistoricalBootstrapVerified = true;
+			await close("close-bootstrapped-session");
+		} else {
+			// Distinct API contract probes, not a production fallback chain. The bare
+			// service target cannot resume saved sessions without transcript authority.
+			const bare = await observe("resume.saved-full-id", () =>
+				publicLifecycle(workspace).resume({
 					actor,
-					capability: "session.list",
-					target: { cwd: workspace, resolveSessionId: identity!.sessionId },
-					timeoutMs: budget.remaining(),
+					capability: "session.resume",
+					requestKey: "bare-saved-resume",
+					target: { sessionId: identity!.sessionId, cwd: workspace },
+					timeoutMs: 15_000,
 				}),
 			);
-			const saved = selectedSavedSession(selected, identity.sessionId);
-			request = {
-				kind: "exact",
-				request: {
+			if (!isRecord(bare) || bare.ok !== false || !isRecord(bare.error) || bare.error.code !== "invalid_input")
+				throw new Error("Bare saved resume contract changed; review the observed outcome.");
+			report.bareSavedResumeUnsupported = true;
+			const foreignWorkspace = join(root, "foreign-workspace");
+			await mkdir(foreignWorkspace);
+			const foreign = await observe("resume.foreign-workspace", () =>
+				publicLifecycle(workspace).resumeExternal({
 					actor,
 					capability: "session.resume",
-					requestKey: "manifest-occurrence-resume",
-					target: {
-						sessionId: identity.sessionId,
-						cwd: workspace,
-						sessionPath: saved.path,
-						sessionIdentity: saved.identity,
-					},
-					timeoutMs: 15_000,
-				},
-			};
-		} else
-			request = {
-				kind: "external",
-				request: {
-					actor,
-					capability: "session.resume",
-					requestKey: "manifest-occurrence-resume",
-					target: { sessionIdOrPrefix: identity.sessionId, path: workspace },
-					readinessTimeoutMs: 15_000,
-				},
-			};
-		report.request = request;
-		const resumed = await observe(`resume.${request.kind}-saved-full-id`, () =>
-			invokeResume(publicLifecycle(workspace), request),
-		);
-		const resumedIdentity = exactIdentity(externalOutcome(resumed), "session.resume", identity.sessionId);
-		identity = resumedIdentity;
-		live = true;
-		const attached = await budget.wait(connectFor(workspace, identity.sessionId, identity.generation));
-		const metadata = await observe("resumed.metadata", () => attached.query("session.metadata"));
-		if (
-			!isRecord(metadata) ||
-			metadata.type !== "query_response" ||
-			metadata.ok !== true ||
-			!isRecord(metadata.page) ||
-			metadata.page.complete !== true ||
-			!Array.isArray(metadata.page.items) ||
-			metadata.page.items.length !== 1 ||
-			!isRecord(metadata.page.items[0]) ||
-			metadata.page.items[0].sessionId !== identity.sessionId ||
-			metadata.page.items[0].cwd !== workspace
-		)
-			throw new Error("Resumed public metadata crossed its exact session/workspace fence.");
-		const recreated = await observe("resume.new-service", () =>
-			invokeResume(lifecycle.createSessionLifecycleService(agentDir), request),
-		);
-		if (!isDeepStrictEqual(resumed, recreated)) throw new Error("Same-key new-service result changed.");
-		const restarted = await observe("resume.new-client-process", () => replayInChild(agentDir, request, budget));
-		if (!isDeepStrictEqual(resumed, restarted)) throw new Error("Same-key new-process result changed.");
-		report.clientRestartSameKeyOutcomeEqual = true;
-		await close("close-resumed");
-		const afterRetirement = await observe("resume.same-key-after-retirement", () =>
-			replayInChild(agentDir, request, budget),
-		);
-		const retiredOutcome = externalOutcome(afterRetirement);
-		if (isRecord(retiredOutcome) && retiredOutcome.ok === true) {
-			const replayIdentity = exactIdentity(retiredOutcome, "session.resume", identity.sessionId);
-			if (!isDeepStrictEqual(afterRetirement, resumed)) {
-				identity = replayIdentity;
-				live = true;
-				throw new Error("Same-key replay after retirement changed its successful lifecycle identity.");
-			}
-		} else if (
-			!isRecord(retiredOutcome) ||
-			retiredOutcome.operation !== "session.resume" ||
-			retiredOutcome.certainty !== "terminal" ||
-			!isRecord(retiredOutcome.error) ||
-			retiredOutcome.error.code !== "resource_gone"
-		) {
-			throw new Error("Retired replay returned neither its cached identity nor explicit resource_gone.");
-		}
-		const status = await observe("cached-generation-status", () => attached.generationStatus());
-		if (!isRecord(status) || status.status !== "retired")
-			throw new Error("Cached replay reactivated a retired generation.");
-		report.retiredReplayDoesNotReinvokeSession = true;
-		if (process.argv.includes("--replacement")) {
-			// This mode reproduces an upstream contract gap. Passing this probe is
-			// evidence of the unsafe behavior, never a production recovery gate.
-			if (request.kind !== "exact") throw new Error("Replacement probe requires --exact.");
-			const replacement: ResumeRequest = {
-				kind: "exact",
-				request: {
-					...request.request,
-					requestKey: "independent-replacement-resume",
-					target: {
-						...request.request.target,
-						sessionIdentity: {
-							...request.request.target.sessionIdentity!,
-							sha256: "0".repeat(64),
-						},
-					},
-				},
-			};
-			const newOutcome = await observe("resume.mismatching-public-snapshot", () =>
-				invokeResume(publicLifecycle(workspace), replacement),
+					requestKey: "foreign-workspace-denial",
+					target: { sessionIdOrPrefix: identity!.sessionId, path: foreignWorkspace },
+				}),
 			);
-			const nextIdentity = exactIdentity(externalOutcome(newOutcome), "session.resume", identity.sessionId);
-			report.suppliedSnapshotHashEnforced = false;
-			report.numericGenerationReused = nextIdentity.generation === identity.generation;
-			identity = nextIdentity;
+			if (!isRecord(foreign) || foreign.kind !== "not_found")
+				throw new Error("Foreign workspace selected the saved session.");
+			let request: ResumeRequest;
+			if (process.argv.includes("--exact")) {
+				const selected = await observe("list.exact-saved-id", () =>
+					publicLifecycle(workspace).list({
+						actor,
+						capability: "session.list",
+						target: { cwd: workspace, resolveSessionId: identity!.sessionId },
+						timeoutMs: budget.remaining(),
+					}),
+				);
+				const saved = selectedSavedSession(selected, identity.sessionId);
+				request = {
+					kind: "exact",
+					request: {
+						actor,
+						capability: "session.resume",
+						requestKey: "manifest-occurrence-resume",
+						target: {
+							sessionId: identity.sessionId,
+							cwd: workspace,
+							sessionPath: saved.path,
+							sessionIdentity: saved.identity,
+						},
+						timeoutMs: 15_000,
+					},
+				};
+			} else
+				request = {
+					kind: "external",
+					request: {
+						actor,
+						capability: "session.resume",
+						requestKey: "manifest-occurrence-resume",
+						target: { sessionIdOrPrefix: identity.sessionId, path: workspace },
+						readinessTimeoutMs: 15_000,
+					},
+				};
+			report.request = request;
+			const resumed = await observe(`resume.${request.kind}-saved-full-id`, () =>
+				invokeResume(publicLifecycle(workspace), request),
+			);
+			const resumedIdentity = exactIdentity(externalOutcome(resumed), "session.resume", identity.sessionId);
+			identity = resumedIdentity;
 			live = true;
-			await budget.wait(connectFor(workspace, identity.sessionId, identity.generation));
-			const oldKey = await observe("resume.old-key-after-independent-replacement", () =>
+			const attached = await budget.wait(connectFor(workspace, identity.sessionId, identity.generation));
+			const metadata = await observe("resumed.metadata", () => attached.query("session.metadata"));
+			if (
+				!isRecord(metadata) ||
+				metadata.type !== "query_response" ||
+				metadata.ok !== true ||
+				!isRecord(metadata.page) ||
+				metadata.page.complete !== true ||
+				!Array.isArray(metadata.page.items) ||
+				metadata.page.items.length !== 1 ||
+				!isRecord(metadata.page.items[0]) ||
+				metadata.page.items[0].sessionId !== identity.sessionId ||
+				metadata.page.items[0].cwd !== workspace
+			)
+				throw new Error("Resumed public metadata crossed its exact session/workspace fence.");
+			const recreated = await observe("resume.new-service", () =>
+				invokeResume(lifecycle.createSessionLifecycleService(agentDir), request),
+			);
+			if (!isDeepStrictEqual(resumed, recreated)) throw new Error("Same-key new-service result changed.");
+			const restarted = await observe("resume.new-client-process", () => replayInChild(agentDir, request, budget));
+			if (!isDeepStrictEqual(resumed, restarted)) throw new Error("Same-key new-process result changed.");
+			report.clientRestartSameKeyOutcomeEqual = true;
+			await close("close-resumed");
+			const afterRetirement = await observe("resume.same-key-after-retirement", () =>
 				replayInChild(agentDir, request, budget),
 			);
-			exactIdentity(externalOutcome(oldKey), "session.resume", identity.sessionId);
-			report.oldKeyNowAcknowledgesReplacement = true;
-			report.originalIncarnationRecoveryProven = false;
-			report.verdict = "blocked: snapshot precondition and original-incarnation replay are not enforced";
-			await close("close-independent-replacement");
+			const retiredOutcome = externalOutcome(afterRetirement);
+			if (isRecord(retiredOutcome) && retiredOutcome.ok === true) {
+				const replayIdentity = exactIdentity(retiredOutcome, "session.resume", identity.sessionId);
+				if (!isDeepStrictEqual(afterRetirement, resumed)) {
+					identity = replayIdentity;
+					live = true;
+					throw new Error("Same-key replay after retirement changed its successful lifecycle identity.");
+				}
+			} else if (
+				!isRecord(retiredOutcome) ||
+				retiredOutcome.operation !== "session.resume" ||
+				retiredOutcome.certainty !== "terminal" ||
+				!isRecord(retiredOutcome.error) ||
+				retiredOutcome.error.code !== "resource_gone"
+			) {
+				throw new Error("Retired replay returned neither its cached identity nor explicit resource_gone.");
+			}
+			const status = await observe("cached-generation-status", () => attached.generationStatus());
+			if (!isRecord(status) || status.status !== "retired")
+				throw new Error("Cached replay reactivated a retired generation.");
+			report.retiredReplayDoesNotReinvokeSession = true;
+			if (process.argv.includes("--replacement")) {
+				// This mode reproduces an upstream contract gap. Passing this probe is
+				// evidence of the unsafe behavior, never a production recovery gate.
+				if (request.kind !== "exact") throw new Error("Replacement probe requires --exact.");
+				const replacement: ResumeRequest = {
+					kind: "exact",
+					request: {
+						...request.request,
+						requestKey: "independent-replacement-resume",
+						target: {
+							...request.request.target,
+							sessionIdentity: {
+								...request.request.target.sessionIdentity!,
+								sha256: "0".repeat(64),
+							},
+						},
+					},
+				};
+				const newOutcome = await observe("resume.mismatching-public-snapshot", () =>
+					invokeResume(publicLifecycle(workspace), replacement),
+				);
+				const nextIdentity = exactIdentity(externalOutcome(newOutcome), "session.resume", identity.sessionId);
+				report.suppliedSnapshotHashEnforced = false;
+				report.numericGenerationReused = nextIdentity.generation === identity.generation;
+				identity = nextIdentity;
+				live = true;
+				await budget.wait(connectFor(workspace, identity.sessionId, identity.generation));
+				const oldKey = await observe("resume.old-key-after-independent-replacement", () =>
+					replayInChild(agentDir, request, budget),
+				);
+				exactIdentity(externalOutcome(oldKey), "session.resume", identity.sessionId);
+				report.oldKeyNowAcknowledgesReplacement = true;
+				report.originalIncarnationRecoveryProven = false;
+				report.verdict = "blocked: snapshot precondition and original-incarnation replay are not enforced";
+				await close("close-independent-replacement");
+			}
 		}
 	} catch (error) {
 		errors.push(error);
@@ -283,6 +308,158 @@ async function probe(): Promise<void> {
 		console.log(JSON.stringify({ report: join(root, "report.json"), ok: errors.length === 0 }));
 	}
 	if (errors.length > 0) throw new AggregateError(errors, "Public saved resume compatibility failed.");
+}
+
+async function bootstrapProbe(
+	root: string,
+	workspace: string,
+	agentDir: string,
+	sessionId: string,
+	principalId: string,
+	budget: ManagedOperationDeadline,
+	observations: { name: string; value: unknown }[],
+	acknowledge: (identity: { sessionId: string; generation: number }) => void,
+): Promise<void> {
+	const stateRoot = join(root, "adapter-state");
+	await mkdir(stateRoot);
+	const sourcePath = join(stateRoot, "authority.json");
+	const chatId = JSON.stringify([principalId, "saved-chat"]);
+	const stamp = new Date().toISOString();
+	const original = JSON.stringify({
+		kind: "openwebui-gjc-session-authority",
+		version: 2,
+		mappings: [
+			{
+				version: 2,
+				chatId,
+				projectId: "probe-project",
+				sessionId,
+				createdAt: stamp,
+				header: { chatId, projectId: "probe-project", sessionId },
+				rawFrameCursor: 0,
+				eventCursor: 0,
+				operationId: "prior-answer",
+				journal: [
+					{
+						id: "prior-answer",
+						kind: "prompt",
+						state: "complete",
+						startedAt: stamp,
+						completedAt: stamp,
+						result: {
+							kind: "turn",
+							assistantText: "immutable prior answer",
+							mapping: {
+								chatId,
+								projectId: "probe-project",
+								sessionId,
+								rawFrameCursor: 0,
+								eventCursor: 0,
+								operationId: "prior-answer",
+							},
+						},
+					},
+				],
+			},
+		],
+		provisionalOperations: [],
+	});
+	await writeFile(sourcePath, original);
+	const lock = await RuntimeSingletonLock.acquire(stateRoot);
+	const lease = await new WorkspaceLeaseManager({ stateRoot }).acquire({
+		safeKey: createHash("sha256").update(principalId).digest("hex"),
+		holderId: "public-bootstrap-probe",
+		operation: "migration",
+		leaseMs: 30_000,
+	});
+	let runtime: ManagedSdkRuntime | undefined;
+	try {
+		const result = await activateAdapterSessionAuthorityV3({
+			locations: { agentDir, stateRoot },
+			sourcePath,
+			runtimeLock: lock,
+			configuredOwnerUserId: principalId,
+			timeoutMs: Math.min(25_000, budget.remaining()),
+			authority: {
+				resolve: async (owner, projectId) =>
+					owner !== principalId || projectId !== "probe-project"
+						? undefined
+						: {
+								project: {
+									id: projectId,
+									name: "probe",
+									cwd: workspace,
+									allowedRoot: workspace,
+									createdAt: new Date(stamp),
+								},
+								canonicalWorkspace: workspace,
+								leaseId: workspaceLeaseId(lease.reference),
+								epoch: "exclusive-probe-epoch",
+								assertFence: async () => {
+									budget.remaining();
+									await lease.assertFence();
+								},
+								assertCurrent: () => lease.assertFenceSync(),
+							},
+			},
+			createRuntime: (directory, deps) => {
+				runtime = new ManagedSdkRuntime({
+					agentDir: directory,
+					deps: {
+						...deps,
+						createLifecycleService: value => {
+							const service = lifecycle.createSessionLifecycleService(value);
+							const resume = service.resume.bind(service);
+							service.resume = async request => {
+								if ((await readFile(sourcePath, "utf8")) !== original)
+									throw new Error("Canonical source changed before public resume.");
+								const outcome = await resume(request);
+								observations.push({ name: "bootstrap.public-resume", value: outcome });
+								if (
+									outcome.ok &&
+									outcome.result.sessionId === sessionId &&
+									Number.isSafeInteger(outcome.result.endpointGeneration)
+								)
+									acknowledge({ sessionId, generation: outcome.result.endpointGeneration! });
+								return outcome;
+							};
+							return service;
+						},
+					},
+				});
+				return runtime;
+			},
+		});
+		if (result.status !== "activated") throw new Error("Scoped public historical bootstrap did not activate.");
+		try {
+			const document = parseSessionAuthorityV3Document(await readFile(sourcePath));
+			const record = document?.mappings[0];
+			if (
+				record?.managedAuthority?.sessionId !== sessionId ||
+				record.journal[0]?.result?.assistantText !== "immutable prior answer" ||
+				record.journal[0].result.managedAuthority !== undefined ||
+				record.journal[0].result.historicalBinding === undefined ||
+				record.journal.at(-1)?.lifecycle?.state !== "active_generation_proven" ||
+				runtime?.state !== "stopped"
+			)
+				throw new Error("Bootstrap failed history, proof, or runtime isolation invariants.");
+			observations.push({
+				name: "bootstrap.canonical-v3",
+				value: {
+					version: document!.version,
+					generation: record.managedAuthority.generation,
+					originalResultPreserved: true,
+					bootstrapRuntimeStopped: true,
+					migrationOperationCount: record.journal.length - 1,
+				},
+			});
+		} finally {
+			result.store.close();
+		}
+	} finally {
+		await lease.release();
+		await lock.release();
+	}
 }
 
 async function replayInChild(

@@ -4,18 +4,129 @@ import { linkSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+	createManagedLifecycleEvidence,
+	type ManagedLifecycleEvidence,
+	managedLifecycleEvidenceHash,
+	transitionManagedLifecycleEvidence,
+} from "../src/gjc/managed-lifecycle-evidence";
 import { probeSessionAuthorityEpoch } from "../src/gjc/session-authority-epoch";
 import { AuthorityMutationLock } from "../src/gjc/session-authority-file";
 import { FileSessionAuthority } from "../src/gjc/session-authority-persistence";
+import { parseSessionAuthorityV3Document } from "../src/gjc/session-authority-v3";
 import {
 	activateSessionAuthorityV3,
 	type SessionAuthorityV3ActivationBoundary,
 	type SessionAuthorityV3ActivationOptions,
+	type SessionAuthorityV3BootstrapAccess,
+	type SessionAuthorityV3BootstrapContext,
 } from "../src/gjc/session-authority-v3-activation";
 import { V3FileBackedSessionMappingStore } from "../src/gjc/session-v3-file-backed-mapping-store";
 import { RuntimeSingletonLock } from "../src/runtime-singleton-lock";
 
 const digest = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+
+async function historicalFixture() {
+	const f = await fixture();
+	const chatId = JSON.stringify(["owner", "chat"]);
+	const original = Buffer.from(
+		`${JSON.stringify({
+			kind: "openwebui-gjc-session-authority",
+			version: 2,
+			mappings: [
+				{
+					version: 2,
+					chatId,
+					projectId: "project",
+					sessionId: "session",
+					createdAt: "2026-01-01T00:00:00.000Z",
+					header: { chatId, projectId: "project", sessionId: "session" },
+					rawFrameCursor: 1,
+					eventCursor: 2,
+					operationId: "historical-turn",
+					assistantText: "immutable old answer",
+					events: [{ type: "message", id: "old", payload: { text: "original" } }],
+					journal: [],
+				},
+			],
+			provisionalOperations: [],
+		})}\n`,
+	);
+	await writeFile(f.canonicalPath, original);
+	return { ...f, original, chatId };
+}
+
+function bootstrapEvidence(context: SessionAuthorityV3BootstrapContext): ManagedLifecycleEvidence {
+	const record = parseSessionAuthorityV3Document(readFileSync(context.stagedPath))!.mappings[0]!;
+	return createManagedLifecycleEvidence({
+		operation: "session.resume",
+		payloadHash: "a".repeat(64),
+		preparedAuthority: {
+			principalId: "owner",
+			projectId: "project",
+			canonicalWorkspace: "/workspace",
+			chatId: "chat",
+			leaseId: "lease",
+			epoch: "epoch",
+			requestKey: "stable-manifest-key",
+		},
+		historicalSource: {
+			kind: "bootstrap-history",
+			manifestDigest: context.manifestDigest,
+			historicalBinding: record.historicalBinding!,
+			savedSession: {
+				id: "session",
+				path: "/workspace/session.jsonl",
+				identity: {
+					dev: "1",
+					ino: "2",
+					size: 123,
+					mtimeMs: 1,
+					mtimeNs: "1000000",
+					sha256: "b".repeat(64),
+					nlink: "1",
+					ctimeNs: "1000000",
+				},
+			},
+		},
+		target: {
+			sessionId: "session",
+			cwd: "/workspace",
+			sessionPath: "/workspace/session.jsonl",
+			sessionIdentity: {
+				dev: "1",
+				ino: "2",
+				size: 123,
+				mtimeMs: 1,
+				mtimeNs: "1000000",
+				sha256: "b".repeat(64),
+			},
+		},
+	});
+}
+
+async function advanceBootstrap(context: SessionAuthorityV3BootstrapContext, intent: ManagedLifecycleEvidence) {
+	const id = "migration:resume:session";
+	let previous = intent;
+	for (const next of [transitionManagedLifecycleEvidence(intent, "invoking")]) {
+		await context.stage.advance(id, managedLifecycleEvidenceHash(previous), next);
+		previous = next;
+	}
+	const acknowledged = { ...intent.preparedAuthority, sessionId: "session", generation: 7 };
+	const ack = transitionManagedLifecycleEvidence(previous, "acknowledged_unproven", { acknowledged });
+	await context.stage.advance(id, managedLifecycleEvidenceHash(previous), ack);
+	const active = transitionManagedLifecycleEvidence(ack, "active_generation_proven", {
+		proven: {
+			kind: "managed-generation",
+			sessionId: "session",
+			generation: 7,
+			leaseId: "lease",
+			epoch: "epoch",
+		},
+	});
+	await context.stage.advance(id, managedLifecycleEvidenceHash(ack), active);
+	return active;
+}
 
 async function fixture() {
 	const root = await mkdtemp(join(tmpdir(), "gjc-v3-activation-"));
@@ -26,7 +137,19 @@ async function fixture() {
 	const invoke = async (options: Omit<SessionAuthorityV3ActivationOptions, "runtimeLock" | "mutationLock">) => {
 		const mutationLock = AuthorityMutationLock.acquire(canonicalPath);
 		try {
-			return await activateSessionAuthorityV3({ ...options, runtimeLock, mutationLock });
+			return await activateSessionAuthorityV3({
+				beforeBootstrapCommit: async () => () => {},
+				bootstrapTenantFence: evidence =>
+					evidence.preparedAuthority.principalId === "owner" &&
+					evidence.preparedAuthority.projectId === "project" &&
+					evidence.preparedAuthority.canonicalWorkspace === "/workspace" &&
+					evidence.preparedAuthority.chatId === "chat" &&
+					evidence.preparedAuthority.leaseId === "lease" &&
+					evidence.preparedAuthority.epoch === "epoch",
+				...options,
+				runtimeLock,
+				mutationLock,
+			});
 		} finally {
 			mutationLock.release();
 		}
@@ -52,6 +175,400 @@ async function fixture() {
 }
 
 describe("session authority V3 activation", () => {
+	test.each(["committing", "base"] as const)(
+		"bootstrap crash at %s never trusts pre-swap historical proof",
+		async boundary => {
+			const f = await historicalFixture();
+			let effects = 0;
+			const bootstrap = async (context: SessionAuthorityV3BootstrapContext) => {
+				const intent = bootstrapEvidence(context);
+				await context.stage.begin("migration:resume:session", intent);
+				effects += 1;
+				const active = await advanceBootstrap(context, intent);
+				await context.stage.promote("migration:resume:session", managedLifecycleEvidenceHash(active), active);
+			};
+			try {
+				await expect(
+					f.invoke({
+						canonicalPath: f.canonicalPath,
+						stagingRoot: join(f.root, "private"),
+						bootstrap,
+						afterBoundary: value => {
+							if (value === boundary) throw new Error("commit interrupted");
+						},
+					}),
+				).rejects.toThrow("commit interrupted");
+				const retry = await f.invoke({
+					canonicalPath: f.canonicalPath,
+					stagingRoot: join(f.root, "private"),
+					bootstrap,
+				});
+				expect(retry.status).toBe(boundary === "base" ? "activated" : "blocked");
+				expect(effects).toBe(1);
+				if (boundary === "committing") {
+					expect(await readFile(f.canonicalPath)).toEqual(f.original);
+					await expect(stat(`${f.canonicalPath}.v3-active.json`)).rejects.toThrow();
+				}
+			} finally {
+				await f.cleanup();
+			}
+		},
+	);
+
+	test("final bootstrap token check follows the last awaited lock check", async () => {
+		const f = await historicalFixture();
+		let valid = true;
+		try {
+			await expect(
+				f.invoke({
+					canonicalPath: f.canonicalPath,
+					stagingRoot: join(f.root, "private"),
+					beforeBootstrapCommit: async () => () => {
+						if (!valid) throw new Error("final token stale");
+					},
+					afterBoundary: boundary => {
+						if (boundary === "committing") valid = false;
+					},
+					bootstrap: async context => {
+						const intent = bootstrapEvidence(context);
+						await context.stage.begin("migration:resume:session", intent);
+						const active = await advanceBootstrap(context, intent);
+						await context.stage.promote("migration:resume:session", managedLifecycleEvidenceHash(active), active);
+					},
+				}),
+			).rejects.toThrow("final token stale");
+			expect(await readFile(f.canonicalPath)).toEqual(f.original);
+		} finally {
+			await f.cleanup();
+		}
+	});
+
+	test("missing commit verifier is rejected before bootstrap effects", async () => {
+		const f = await fixture();
+		let invoked = false;
+		try {
+			await expect(
+				f.invoke({
+					canonicalPath: f.canonicalPath,
+					stagingRoot: join(f.root, "private"),
+					beforeBootstrapCommit: undefined,
+					bootstrap: async () => {
+						invoked = true;
+					},
+				}),
+			).rejects.toThrow("commit revalidation");
+			expect(invoked).toBe(false);
+		} finally {
+			await f.cleanup();
+		}
+	});
+
+	test("commits the same staged migration journal and revokes its mutable capability", async () => {
+		const f = await historicalFixture();
+		let context!: SessionAuthorityV3BootstrapContext;
+		let active!: ManagedLifecycleEvidence;
+		try {
+			const result = await f.invoke({
+				canonicalPath: f.canonicalPath,
+				stagingRoot: join(f.root, "private"),
+				bootstrap: async current => {
+					context = current;
+					const intent = bootstrapEvidence(current);
+					await current.stage.begin("migration:resume:session", intent);
+					await expect(
+						current.stage.promote("migration:resume:session", managedLifecycleEvidenceHash(intent), intent),
+					).rejects.toThrow("persisted exact generation proof");
+					active = await advanceBootstrap(current, intent);
+					await expect(current.stage.advance("migration:resume:session", "0".repeat(64), active)).rejects.toThrow(
+						"evidence changed",
+					);
+					await current.stage.promote("migration:resume:session", managedLifecycleEvidenceHash(active), active);
+					await current.stage.promote("migration:resume:session", managedLifecycleEvidenceHash(active), active);
+					expect(await readFile(f.canonicalPath)).toEqual(f.original);
+				},
+			});
+			expect(result.status).toBe("activated");
+			const document = parseSessionAuthorityV3Document(await readFile(f.canonicalPath))!;
+			expect(document.mappings[0]!.operationId).toBe("historical-turn");
+			expect(document.mappings[0]!.assistantText).toBe("immutable old answer");
+			expect(document.mappings[0]!.managedAuthority?.generation).toBe(7);
+			expect(document.mappings[0]!.journal[0]!.state).toBe("complete");
+			expect(document.mappings[0]!.journal[0]!.lifecycle).toEqual(active);
+			await expect(
+				context.stage.promote("migration:resume:session", managedLifecycleEvidenceHash(active), active),
+			).rejects.toThrow("ownership is unavailable");
+			const store = new V3FileBackedSessionMappingStore(f.canonicalPath);
+			expect(() => store.bootstrapStage({} as SessionAuthorityV3BootstrapAccess)).toThrow(
+				"ownership is unavailable",
+			);
+			expect(store.getScoped({ principalId: "owner", chatId: "chat" })?.sessionId).toBe("session");
+			store.close();
+		} finally {
+			await f.cleanup();
+		}
+	});
+
+	test("restart retains prepared bootstrap identity and blocks fresh-key replacement", async () => {
+		const f = await historicalFixture();
+		let intent!: ManagedLifecycleEvidence;
+		try {
+			await expect(
+				f.invoke({
+					canonicalPath: f.canonicalPath,
+					stagingRoot: join(f.root, "private"),
+					bootstrap: async context => {
+						intent = bootstrapEvidence(context);
+						await context.stage.begin("migration:resume:session", intent);
+						throw new Error("crash after intent");
+					},
+				}),
+			).rejects.toThrow("crash after intent");
+			const result = await f.invoke({
+				canonicalPath: f.canonicalPath,
+				stagingRoot: join(f.root, "private"),
+				bootstrap: async context => {
+					const operation = await context.stage.begin("migration:resume:session", intent);
+					expect(operation.state).toBe("uncertain");
+					await expect(context.stage.begin("migration:resume:different", intent)).rejects.toThrow("new key");
+					const active = await advanceBootstrap(context, intent);
+					await context.stage.promote("migration:resume:session", managedLifecycleEvidenceHash(active), active);
+				},
+			});
+			expect(result.status).toBe("activated");
+		} finally {
+			await f.cleanup();
+		}
+	});
+
+	test("restart cannot convert an unacknowledged invocation into same-key success", async () => {
+		const f = await historicalFixture();
+		let intent!: ManagedLifecycleEvidence;
+		try {
+			await expect(
+				f.invoke({
+					canonicalPath: f.canonicalPath,
+					stagingRoot: join(f.root, "private"),
+					bootstrap: async context => {
+						intent = bootstrapEvidence(context);
+						await context.stage.begin("migration:resume:session", intent);
+						await context.stage.advance(
+							"migration:resume:session",
+							managedLifecycleEvidenceHash(intent),
+							transitionManagedLifecycleEvidence(intent, "invoking"),
+						);
+						throw new Error("lost acknowledgement");
+					},
+				}),
+			).rejects.toThrow("lost acknowledgement");
+			const result = await f.invoke({
+				canonicalPath: f.canonicalPath,
+				stagingRoot: join(f.root, "private"),
+				bootstrap: async context => {
+					const current = parseSessionAuthorityV3Document(await readFile(context.stagedPath))!.mappings[0]!
+						.journal[0]!.lifecycle!;
+					expect(current.state).toBe("uncertain");
+					const guessed = transitionManagedLifecycleEvidence(current, "acknowledged_unproven", {
+						acknowledged: {
+							...intent.preparedAuthority,
+							sessionId: "session",
+							generation: 7,
+						},
+					});
+					await expect(
+						context.stage.advance("migration:resume:session", managedLifecycleEvidenceHash(current), guessed),
+					).rejects.toThrow("original-incarnation");
+				},
+			});
+			expect(result.status).toBe("blocked");
+			expect(await readFile(f.canonicalPath)).toEqual(f.original);
+		} finally {
+			await f.cleanup();
+		}
+	});
+
+	test("retained promoted stage completes only local activation after a callback crash", async () => {
+		const f = await historicalFixture();
+		let active!: ManagedLifecycleEvidence;
+		try {
+			await expect(
+				f.invoke({
+					canonicalPath: f.canonicalPath,
+					stagingRoot: join(f.root, "private"),
+					bootstrap: async context => {
+						const intent = bootstrapEvidence(context);
+						await context.stage.begin("migration:resume:session", intent);
+						active = await advanceBootstrap(context, intent);
+						await context.stage.promote("migration:resume:session", managedLifecycleEvidenceHash(active), active);
+						throw new Error("after promotion");
+					},
+				}),
+			).rejects.toThrow("after promotion");
+			const result = await f.invoke({
+				canonicalPath: f.canonicalPath,
+				stagingRoot: join(f.root, "private"),
+				bootstrap: async context => {
+					await context.stage.promote("migration:resume:session", managedLifecycleEvidenceHash(active), active);
+				},
+			});
+			expect(result.status).toBe("activated");
+			expect(parseSessionAuthorityV3Document(await readFile(f.canonicalPath))!.mappings[0]!.journal).toHaveLength(1);
+		} finally {
+			await f.cleanup();
+		}
+	});
+
+	test("bootstrap callback cannot discard historical text while publishing proof", async () => {
+		const f = await historicalFixture();
+		try {
+			await expect(
+				f.invoke({
+					canonicalPath: f.canonicalPath,
+					stagingRoot: join(f.root, "private"),
+					bootstrap: async context => {
+						const intent = bootstrapEvidence(context);
+						await context.stage.begin("migration:resume:session", intent);
+						const active = await advanceBootstrap(context, intent);
+						await context.stage.promote("migration:resume:session", managedLifecycleEvidenceHash(active), active);
+						const value = JSON.parse(await readFile(context.stagedPath, "utf8"));
+						value.mappings[0].assistantText = "rewritten";
+						await writeFile(context.stagedPath, JSON.stringify(value));
+					},
+				}),
+			).rejects.toThrow("immutable source history");
+			expect(await readFile(f.canonicalPath)).toEqual(f.original);
+		} finally {
+			await f.cleanup();
+		}
+	});
+
+	test("a timed-out bootstrap lease check cannot write when its grant arrives late", async () => {
+		const f = await historicalFixture();
+		let release!: (valid: boolean) => void;
+		const pending = new Promise<boolean>(resolve => {
+			release = resolve;
+		});
+		let entered!: () => void;
+		const reached = new Promise<void>(resolve => {
+			entered = resolve;
+		});
+		let path = "";
+		try {
+			const activation = f.invoke({
+				canonicalPath: f.canonicalPath,
+				stagingRoot: join(f.root, "private"),
+				timeoutMs: 2_000,
+				bootstrapTenantFence: () => {
+					entered();
+					return pending;
+				},
+				bootstrap: async context => {
+					path = context.stagedPath;
+					await context.stage.begin("migration:resume:session", bootstrapEvidence(context));
+				},
+			});
+			const rejected = expect(activation).rejects.toMatchObject({ code: "timeout" });
+			await Promise.race([reached, activation]);
+			await rejected;
+			const before = await readFile(path);
+			release(true);
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(await readFile(path)).toEqual(before);
+			expect(await readFile(f.canonicalPath)).toEqual(f.original);
+		} finally {
+			release?.(false);
+			await f.cleanup();
+		}
+	});
+
+	test.each(["lease", "manifest", "occurrence"] as const)(
+		"denies bootstrap writes with foreign %s proof",
+		async mismatch => {
+			const f = await historicalFixture();
+			try {
+				const result = await f.invoke({
+					canonicalPath: f.canonicalPath,
+					stagingRoot: join(f.root, "private"),
+					bootstrap: async context => {
+						const intent = bootstrapEvidence(context);
+						const changed = {
+							...intent,
+							...(mismatch === "lease"
+								? { preparedAuthority: { ...intent.preparedAuthority, leaseId: "foreign" } }
+								: {
+										historicalSource: {
+											...intent.historicalSource!,
+											...(mismatch === "manifest"
+												? { manifestDigest: "f".repeat(64) }
+												: {
+														historicalBinding: {
+															...intent.historicalSource!.historicalBinding,
+															provenance: {
+																...intent.historicalSource!.historicalBinding.provenance,
+																nodeRef: "/mappings/99",
+															},
+														},
+													}),
+										},
+									}),
+						};
+						const before = await readFile(context.stagedPath);
+						await expect(context.stage.begin("migration:resume:session", changed)).rejects.toThrow();
+						expect(await readFile(context.stagedPath)).toEqual(before);
+					},
+				});
+				expect(result.status).toBe("blocked");
+			} finally {
+				await f.cleanup();
+			}
+		},
+	);
+
+	test("a revoked tenant fence retains invocation acknowledgement but cannot publish proof", async () => {
+		const f = await historicalFixture();
+		let live = true;
+		try {
+			const result = await f.invoke({
+				canonicalPath: f.canonicalPath,
+				stagingRoot: join(f.root, "private"),
+				bootstrapTenantFence: () => live,
+				bootstrap: async context => {
+					const intent = bootstrapEvidence(context);
+					await context.stage.begin("migration:resume:session", intent);
+					const invoking = transitionManagedLifecycleEvidence(intent, "invoking");
+					await context.stage.advance("migration:resume:session", managedLifecycleEvidenceHash(intent), invoking);
+					live = false;
+					const ack = transitionManagedLifecycleEvidence(invoking, "acknowledged_unproven", {
+						acknowledged: {
+							...intent.preparedAuthority,
+							sessionId: "session",
+							generation: 7,
+						},
+					});
+					await context.stage.advance("migration:resume:session", managedLifecycleEvidenceHash(invoking), ack);
+					const persisted = parseSessionAuthorityV3Document(await readFile(context.stagedPath))!.mappings[0]!
+						.journal[0]!.lifecycle!;
+					expect(persisted).toEqual(ack);
+					const proof = transitionManagedLifecycleEvidence(ack, "active_generation_proven", {
+						proven: {
+							kind: "managed-generation",
+							sessionId: "session",
+							generation: 7,
+							leaseId: "lease",
+							epoch: "epoch",
+						},
+					});
+					await expect(
+						context.stage.advance("migration:resume:session", managedLifecycleEvidenceHash(ack), proof),
+					).rejects.toThrow("tenant fence was lost");
+				},
+			});
+			expect(result.status).toBe("blocked");
+		} finally {
+			await f.cleanup();
+		}
+	});
+
 	test.each([false, true])("never regenerates a modified normal V3 stage after resolver failure=%s", async crash => {
 		const f = await fixture();
 		let stagePath = "";

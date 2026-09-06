@@ -1,7 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import type { lifecycle, router } from "@gajae-code/coding-agent/sdk";
 import {
+	createManagedLifecycleEvidence,
+	type ManagedHistoricalSavedSession,
+	transitionManagedLifecycleEvidence,
+} from "../src/gjc/managed-lifecycle-evidence";
+import {
 	type ManagedSdkAccess,
+	type ManagedSdkHistoricalSelection,
 	type ManagedSdkLifecycleOperation,
 	ManagedSdkRuntime,
 	type ManagedSdkRuntimeDeps,
@@ -14,6 +20,80 @@ type CloseRequest = Parameters<LifecycleService["close"]>[0];
 type CreateRequest = Parameters<LifecycleService["createExternal"]>[0];
 type ResumeRequest = Parameters<LifecycleService["resumeExternal"]>[0];
 type ListRequest = Parameters<LifecycleService["list"]>[0];
+type HistoricalResumeRequest = Parameters<LifecycleService["resume"]>[0];
+
+function historicalSelection(): ManagedSdkHistoricalSelection {
+	return {
+		manifestDigest: "b".repeat(64),
+		preparedAuthority: { ...preparedAuthority(), requestKey: "migration:resume:key-1" },
+		historicalBinding: {
+			kind: "unbound-history",
+			principalId: tenant.principalId,
+			projectId: tenant.projectId,
+			canonicalWorkspace: tenant.canonicalWorkspace,
+			chatId: tenant.chatId,
+			sessionId: tenant.sessionId,
+			reason: "generation-unproven",
+			provenance: { source: "v2", documentHash: "c".repeat(64), nodeRef: "/mappings/0", nodeHash: "d".repeat(64) },
+		},
+	};
+}
+
+function savedSession(): ManagedHistoricalSavedSession {
+	return {
+		id: tenant.sessionId,
+		path: "/workspace/project-1/.gjc/sessions/saved.jsonl",
+		identity: {
+			dev: "1",
+			ino: "42",
+			size: 123,
+			mtimeMs: 1234,
+			mtimeNs: "1234000000",
+			sha256: "a".repeat(64),
+			nlink: "1",
+			ctimeNs: "1234000000",
+		},
+	};
+}
+
+function historicalEvidence() {
+	const selection = historicalSelection();
+	const saved = savedSession();
+	const { nlink: _nlink, ctimeNs: _ctimeNs, ...sessionIdentity } = saved.identity;
+	return transitionManagedLifecycleEvidence(
+		createManagedLifecycleEvidence({
+			operation: "session.resume",
+			preparedAuthority: selection.preparedAuthority,
+			payloadHash: "e".repeat(64),
+			historicalSource: {
+				kind: "bootstrap-history",
+				manifestDigest: selection.manifestDigest,
+				historicalBinding: selection.historicalBinding,
+				savedSession: saved,
+			},
+			target: {
+				sessionId: saved.id,
+				cwd: selection.preparedAuthority.canonicalWorkspace,
+				sessionPath: saved.path,
+				sessionIdentity,
+			},
+		}),
+		"invoking",
+	);
+}
+
+function historicalList(saved = savedSession()): Awaited<ReturnType<LifecycleService["list"]>> {
+	return {
+		ok: true,
+		operation: "session.list",
+		result: {
+			indexSeq: 1,
+			sessions: [{ sessionId: "unrelated-session", cwd: "/foreign" }],
+			warnings: ["private warning"],
+			savedSession: saved,
+		},
+	};
+}
 
 const tenant: TenantSessionKey = {
 	principalId: "principal-1",
@@ -103,11 +183,14 @@ function fixture(
 		stop?: () => Promise<void>;
 		fence?: ManagedSdkRuntimeDeps["tenantFence"];
 		preparedFence?: ManagedSdkRuntimeDeps["preparedTenantFence"];
+		historicalSelectionFence?: ManagedSdkRuntimeDeps["historicalSelectionFence"];
+		historicalResumeFence?: ManagedSdkRuntimeDeps["historicalResumeFence"];
 		omitTenantFence?: boolean;
 		omitPreparedFence?: boolean;
 		request?: () => Promise<Record<string, unknown>>;
 		close?: LifecycleService["close"];
 		list?: LifecycleService["list"];
+		historicalResume?: LifecycleService["resume"];
 		reconcile?: () => Promise<void>;
 		generationStatus?: router.SessionRouter["generationStatus"];
 		maxFrames?: number;
@@ -134,9 +217,13 @@ function fixture(
 	const createCalls: CreateRequest[] = [];
 	const resumeCalls: ResumeRequest[] = [];
 	const listCalls: ListRequest[] = [];
+	const historicalResumeCalls: HistoricalResumeRequest[] = [];
 	const statusCalls: Array<{ sessionId: string; generation: number }> = [];
 	let currentAttachment = attachment;
-	const lifecycleService: Pick<LifecycleService, "close" | "createExternal" | "resumeExternal" | "list" | "delete"> = {
+	const lifecycleService: Pick<
+		LifecycleService,
+		"close" | "createExternal" | "resumeExternal" | "resume" | "list" | "delete"
+	> = {
 		async close(request) {
 			closeCalls.push(request);
 			if (options.close !== undefined) return await options.close(request);
@@ -161,6 +248,15 @@ function fixture(
 			listCalls.push(request);
 			if (options.list !== undefined) return await options.list(request);
 			return { ok: true, operation: "session.list", result: { indexSeq: 1, sessions: [], warnings: [] } };
+		},
+		async resume(request) {
+			historicalResumeCalls.push(request);
+			if (options.historicalResume !== undefined) return options.historicalResume(request);
+			return {
+				ok: true,
+				operation: "session.resume",
+				result: { sessionId: request.target.sessionId, endpointGeneration: 1 },
+			};
 		},
 		async delete() {
 			calls.push("delete");
@@ -220,6 +316,8 @@ function fixture(
 							options.fence?.(key, access) ?? true,
 					}),
 			...(options.omitPreparedFence ? {} : { preparedTenantFence: options.preparedFence ?? (() => true) }),
+			historicalSelectionFence: options.historicalSelectionFence,
+			historicalResumeFence: options.historicalResumeFence,
 			...(options.drainTimeoutMs === undefined ? {} : { drainTimeoutMs: options.drainTimeoutMs }),
 			...(options.maxFrames === undefined ? {} : { maxFramesPerSubscription: options.maxFrames }),
 		},
@@ -233,6 +331,7 @@ function fixture(
 		createCalls,
 		resumeCalls,
 		listCalls,
+		historicalResumeCalls,
 		statusCalls,
 		replaceAttachment() {
 			currentAttachment = foreignAttachment;
@@ -243,6 +342,654 @@ function fixture(
 }
 
 describe("managed SDK runtime", () => {
+	test("selects only the exact public saved receipt and resumes without creating routing authority", async () => {
+		const selection = historicalSelection();
+		const evidence = historicalEvidence();
+		const listed = savedSession();
+		let selectionFences = 0;
+		let resumeFences = 0;
+		let ordinaryFences = 0;
+		const f = fixture({
+			fence: () => {
+				ordinaryFences += 1;
+				return false;
+			},
+			preparedFence: () => {
+				ordinaryFences += 1;
+				return false;
+			},
+			historicalSelectionFence: value => {
+				expect(value).toEqual(selection);
+				expect(Object.isFrozen(value.historicalBinding.provenance)).toBe(true);
+				selectionFences += 1;
+				return true;
+			},
+			historicalResumeFence: (id, value) => {
+				expect(id).toBe("migration:resume:attempt-1");
+				expect(value).toEqual(evidence);
+				expect(Object.isFrozen(value.target.sessionIdentity)).toBe(true);
+				resumeFences += 1;
+				return true;
+			},
+			list: async () => historicalList(listed),
+		});
+		await f.runtime.start();
+		const receipt = await f.runtime.selectHistoricalSession(selection, 500);
+		expect(receipt).toEqual(listed);
+		expect(receipt).not.toBe(listed);
+		expect(receipt.identity).not.toBe(listed.identity);
+		expect(Object.keys(receipt).sort()).toEqual(["id", "identity", "path"]);
+		expect(f.listCalls).toHaveLength(1);
+		const { timeoutMs: listTimeout, ...listRequest } = f.listCalls[0]!;
+		expect(listTimeout).toBeGreaterThan(0);
+		expect(listTimeout!).toBeLessThanOrEqual(500);
+		expect(listRequest).toEqual({
+			actor: evidence.actor,
+			capability: "session.list",
+			target: { cwd: tenant.canonicalWorkspace, resolveSessionId: tenant.sessionId },
+		});
+		expect(selectionFences).toBe(2);
+		const outcome = await f.runtime.resumeHistoricalSession("migration:resume:attempt-1", evidence, 500);
+		expect(outcome).toEqual({
+			ok: true,
+			operation: "session.resume",
+			result: { sessionId: tenant.sessionId, endpointGeneration: 1 },
+		});
+		const { timeoutMs: resumeTimeout, ...resumeRequest } = f.historicalResumeCalls[0]!;
+		expect(resumeTimeout).toBeGreaterThan(0);
+		expect(resumeTimeout!).toBeLessThanOrEqual(500);
+		expect({ ...resumeRequest, target: { ...resumeRequest.target } } as Record<string, unknown>).toEqual({
+			actor: evidence.actor,
+			capability: "session.resume",
+			requestKey: evidence.requestKey,
+			target: evidence.target,
+		});
+		expect(resumeRequest.target.sessionIdentity).not.toHaveProperty("nlink");
+		expect(resumeRequest.target.sessionIdentity).not.toHaveProperty("ctimeNs");
+		expect(resumeFences).toBe(1);
+		expect(ordinaryFences).toBe(0);
+		expect(selection.historicalBinding).not.toHaveProperty("generation");
+		expect(evidence.preparedAuthority).not.toHaveProperty("generation");
+		expect(f.calls).toEqual(["start"]);
+		expect(f.resumeCalls).toEqual([]);
+		expect(f.createCalls).toEqual([]);
+		expect(f.statusCalls).toEqual([]);
+		await expect(f.runtime.acquireAttachment(tenant)).rejects.toThrow("not registered");
+		const forged = { tenant, generation: tenant.generation, isCurrent: () => true };
+		await expect(f.runtime.request(forged, { type: "query_request", query: "session.state" })).rejects.toThrow(
+			"not registered",
+		);
+		expect(() => f.runtime.subscribeFrames(forged, "turn", { commandId: "command" }, () => {})).toThrow(
+			"Registered current tenant",
+		);
+		await f.emit(observedFrame(1));
+		expect(f.runtime.frameDiagnostics().foreign).toBe(1);
+		await f.runtime.stop();
+	});
+
+	test.each(["missing", "denied"] as const)(
+		"historical operations deny %s dedicated fences even with active and prepared authorization",
+		async mode => {
+			const f = fixture({
+				historicalSelectionFence: mode === "missing" ? undefined : () => false,
+				historicalResumeFence: mode === "missing" ? undefined : () => false,
+			});
+			f.runtime.registerTenant(tenant);
+			await f.runtime.start();
+			await expect(f.runtime.selectHistoricalSession(historicalSelection())).rejects.toThrow(
+				"selection authority fence",
+			);
+			await expect(
+				f.runtime.resumeHistoricalSession("migration:resume:attempt-1", historicalEvidence()),
+			).rejects.toThrow("resume authority fence");
+			expect(f.listCalls).toEqual([]);
+			expect(f.historicalResumeCalls).toEqual([]);
+			expect(f.calls).toEqual(["start"]);
+			await f.runtime.stop();
+		},
+	);
+
+	test("historical selection rejects malformed and cross-tenant sources before listing", async () => {
+		let fenced = 0;
+		const f = fixture({
+			historicalSelectionFence: () => {
+				fenced += 1;
+				return true;
+			},
+		});
+		await f.runtime.start();
+		const mutations: Array<(value: ManagedSdkHistoricalSelection) => void> = [
+			value => {
+				Reflect.deleteProperty(value, "manifestDigest");
+			},
+			value => {
+				Reflect.set(value, "manifestDigest", "x".repeat(64));
+			},
+			value => {
+				Reflect.set(value, "manifestDigest", "a".repeat(63));
+			},
+			value => {
+				Reflect.set(value, "raw", {});
+			},
+			value => {
+				Reflect.deleteProperty(value, "historicalBinding");
+			},
+			value => {
+				Reflect.set(value.historicalBinding, "sessionId", "");
+			},
+			value => {
+				Reflect.deleteProperty(value.historicalBinding, "sessionId");
+			},
+			value => {
+				Reflect.set(value.historicalBinding, "sessionId", "session-1\n");
+			},
+			value => {
+				Reflect.set(value.historicalBinding, "generation", 1);
+			},
+			value => {
+				Reflect.set(value.historicalBinding, "sessionFile", "/adapter/path");
+			},
+			value => {
+				Reflect.set(value.historicalBinding, "projectId", "foreign");
+			},
+			value => {
+				Reflect.set(value.historicalBinding, "chatId", "foreign");
+			},
+			value => {
+				Reflect.set(value.historicalBinding, "principalId", "foreign");
+			},
+			value => {
+				Reflect.set(value.historicalBinding, "canonicalWorkspace", "/foreign");
+			},
+			value => {
+				Reflect.set(value.historicalBinding.provenance, "nodeRef", "/invalid/0");
+			},
+			value => {
+				Reflect.set(value.historicalBinding.provenance, "documentHash", "not-a-hash");
+			},
+			value => {
+				Reflect.deleteProperty(value.preparedAuthority, "leaseId");
+			},
+			value => {
+				Reflect.set(value.preparedAuthority, "epoch", "");
+			},
+			value => {
+				Reflect.set(value.preparedAuthority, "requestKey", " ");
+			},
+			value => {
+				Reflect.set(value.preparedAuthority, "generation", 1);
+			},
+			value => {
+				Reflect.set(value.preparedAuthority, "canonicalWorkspace", "relative");
+			},
+			value => {
+				Reflect.set(value.preparedAuthority, "canonicalWorkspace", "/workspace/../project-1");
+			},
+		];
+		for (const mutate of mutations) {
+			const selection = historicalSelection();
+			mutate(selection);
+			await expect(f.runtime.selectHistoricalSession(selection)).rejects.toThrow();
+		}
+		expect(fenced).toBe(0);
+		expect(f.listCalls).toEqual([]);
+		await f.runtime.stop();
+	});
+
+	test("historical owner rejects well-formed but different manifest, source and attempt authority", async () => {
+		const expected = historicalSelection();
+		const f = fixture({
+			historicalSelectionFence: value => JSON.stringify(value) === JSON.stringify(expected),
+			historicalResumeFence: (id, value) =>
+				id === "migration:resume:attempt-1" &&
+				value.requestKey === expected.preparedAuthority.requestKey &&
+				value.historicalSource?.manifestDigest === expected.manifestDigest &&
+				value.payloadHash === "e".repeat(64),
+		});
+		await f.runtime.start();
+		for (const selection of [
+			{ ...expected, manifestDigest: "f".repeat(64) },
+			{ ...expected, historicalBinding: { ...expected.historicalBinding, sessionId: "different-full-id" } },
+			{
+				...expected,
+				historicalBinding: {
+					...expected.historicalBinding,
+					provenance: { ...expected.historicalBinding.provenance, nodeRef: "/mappings/1" },
+				},
+			},
+			{ ...expected, preparedAuthority: { ...expected.preparedAuthority, leaseId: "new-lease" } },
+		])
+			await expect(f.runtime.selectHistoricalSession(selection)).rejects.toThrow("selection authority fence");
+		await expect(
+			f.runtime.resumeHistoricalSession("migration:resume:attempt-2", historicalEvidence()),
+		).rejects.toThrow("resume authority fence");
+		for (const patch of [
+			{ payloadHash: "f".repeat(64) },
+			{ historicalSource: { ...historicalEvidence().historicalSource!, manifestDigest: "f".repeat(64) } },
+		])
+			await expect(
+				f.runtime.resumeHistoricalSession("migration:resume:attempt-1", { ...historicalEvidence(), ...patch }),
+			).rejects.toThrow("resume authority fence");
+		expect(f.listCalls).toEqual([]);
+		expect(f.historicalResumeCalls).toEqual([]);
+		await f.runtime.stop();
+	});
+
+	test("historical selection requires exact public receipt identity and canonical in-workspace path", async () => {
+		let receipt: unknown;
+		const f = fixture({
+			historicalSelectionFence: () => true,
+			list: async () => {
+				const outcome = historicalList();
+				if (!outcome.ok) throw new Error("Expected list fixture success.");
+				Reflect.set(outcome.result, "savedSession", receipt);
+				return outcome;
+			},
+		});
+		await f.runtime.start();
+		const malformed: unknown[] = [
+			undefined,
+			null,
+			{},
+			{ ...savedSession(), id: "session" },
+			{ ...savedSession(), raw: "forbidden" },
+		];
+		for (const path of [
+			"relative",
+			"/foreign/session.jsonl",
+			tenant.canonicalWorkspace,
+			"/workspace/project-10/session",
+			"/workspace/project-1/../foreign/session",
+			"/workspace/project-1/./saved",
+			"/workspace/project-1/saved\n",
+		])
+			malformed.push({ ...savedSession(), path });
+		for (const field of ["dev", "ino", "size", "mtimeMs", "mtimeNs", "sha256", "nlink", "ctimeNs"]) {
+			const saved = savedSession();
+			Reflect.deleteProperty(saved.identity, field);
+			malformed.push(saved);
+		}
+		for (const change of [
+			{ dev: 1 },
+			{ ino: "-1" },
+			{ size: -1 },
+			{ size: 1.5 },
+			{ mtimeMs: Infinity },
+			{ mtimeMs: -1 },
+			{ mtimeNs: "1.2" },
+			{ sha256: "bad" },
+			{ nlink: "" },
+			{ ctimeNs: "x" },
+			{ raw: "secret" },
+		])
+			malformed.push({ ...savedSession(), identity: { ...savedSession().identity, ...change } });
+		for (receipt of malformed)
+			await expect(f.runtime.selectHistoricalSession(historicalSelection())).rejects.toMatchObject({
+				code: "invalid_result",
+			});
+		expect(f.historicalResumeCalls).toEqual([]);
+		await f.runtime.stop();
+	});
+
+	test("historical listing failures and absent saved receipt cannot fall back to live sessions", async () => {
+		for (const list of [
+			async () => ({
+				ok: false as const,
+				operation: "session.list" as const,
+				certainty: "retryable" as const,
+				error: { code: "missing", message: "not selected" },
+			}),
+			async () => ({
+				ok: true as const,
+				operation: "session.list" as const,
+				result: {
+					indexSeq: 1,
+					warnings: [],
+					sessions: [{ sessionId: tenant.sessionId, endpointGeneration: 1, cwd: tenant.canonicalWorkspace }],
+				},
+			}),
+		]) {
+			const f = fixture({ list, historicalSelectionFence: () => true });
+			await f.runtime.start();
+			await expect(f.runtime.selectHistoricalSession(historicalSelection())).rejects.toThrow();
+			expect(f.listCalls).toHaveLength(1);
+			expect(f.historicalResumeCalls).toEqual([]);
+			expect(f.calls).toEqual(["start"]);
+			await f.runtime.stop();
+		}
+	});
+
+	test.each(["selection", "resume"] as const)(
+		"historical %s does not invoke after pending admission times out",
+		async mode => {
+			const entered = deferred<void>();
+			const release = deferred<boolean>();
+			const fence = () => {
+				entered.resolve();
+				return release.promise;
+			};
+			const f = fixture({ historicalSelectionFence: fence, historicalResumeFence: fence });
+			await f.runtime.start();
+			const pending =
+				mode === "selection"
+					? f.runtime.selectHistoricalSession(historicalSelection(), 15)
+					: f.runtime.resumeHistoricalSession("migration:resume:attempt-1", historicalEvidence(), 15);
+			const failure = pending.catch(error => error);
+			await entered.promise;
+			expect(await failure).toMatchObject({ code: "timeout" });
+			release.resolve(true);
+			await new Promise(resolve => setTimeout(resolve, 0));
+			expect(f.listCalls).toEqual([]);
+			expect(f.historicalResumeCalls).toEqual([]);
+			await f.runtime.stop();
+		},
+	);
+
+	test.each(["selection", "resume"] as const)(
+		"historical %s rechecks running ownership after admission",
+		async mode => {
+			const entered = deferred<void>();
+			const release = deferred<boolean>();
+			const fence = () => {
+				entered.resolve();
+				return release.promise;
+			};
+			const f = fixture({ historicalSelectionFence: fence, historicalResumeFence: fence });
+			await f.runtime.start();
+			const pending = (
+				mode === "selection"
+					? f.runtime.selectHistoricalSession(historicalSelection())
+					: f.runtime.resumeHistoricalSession("migration:resume:attempt-1", historicalEvidence())
+			).catch(error => error);
+			await entered.promise;
+			const stopped = f.runtime.stop();
+			release.resolve(true);
+			expect(await pending).toMatchObject({ code: "runtime_interrupted" });
+			await stopped;
+			expect(f.listCalls).toEqual([]);
+			expect(f.historicalResumeCalls).toEqual([]);
+		},
+	);
+
+	test("historical selection snapshots caller authority and saved receipt around awaited fences", async () => {
+		const entered = deferred<void>();
+		const release = deferred<boolean>();
+		const postEntered = deferred<void>();
+		const postRelease = deferred<boolean>();
+		let fences = 0;
+		const seen: ManagedSdkHistoricalSelection[] = [];
+		const listed = savedSession();
+		const expected = savedSession();
+		const f = fixture({
+			historicalSelectionFence: value => {
+				seen.push(value);
+				if (++fences === 1) {
+					entered.resolve();
+					return release.promise;
+				}
+				postEntered.resolve();
+				return postRelease.promise;
+			},
+			list: async () => historicalList(listed),
+		});
+		await f.runtime.start();
+		const selection = historicalSelection();
+		const selecting = f.runtime.selectHistoricalSession(selection);
+		await entered.promise;
+		Reflect.set(selection.preparedAuthority, "canonicalWorkspace", "/foreign");
+		Reflect.set(selection.historicalBinding, "sessionId", "foreign");
+		release.resolve(true);
+		await postEntered.promise;
+		Reflect.set(listed.identity, "sha256", "f".repeat(64));
+		Reflect.set(listed, "path", "/foreign");
+		postRelease.resolve(true);
+		expect(await selecting).toEqual(expected);
+		expect(seen[0]).toEqual(historicalSelection());
+		expect(seen[1]).toBe(seen[0]);
+		expect(f.listCalls[0]?.target).toEqual({ cwd: tenant.canonicalWorkspace, resolveSessionId: tenant.sessionId });
+		await f.runtime.stop();
+	});
+
+	test("selection revocation after listing denies receipt publication", async () => {
+		let granted = true;
+		const f = fixture({
+			historicalSelectionFence: () => granted,
+			list: async () => {
+				granted = false;
+				return historicalList();
+			},
+		});
+		await f.runtime.start();
+		await expect(f.runtime.selectHistoricalSession(historicalSelection())).rejects.toThrow("fence was lost");
+		expect(f.listCalls).toHaveLength(1);
+		expect(f.historicalResumeCalls).toEqual([]);
+		await f.runtime.stop();
+	});
+
+	test("historical resume validates namespace, persisted phase, receipt and request before admission", async () => {
+		let fences = 0;
+		const f = fixture({
+			historicalResumeFence: () => {
+				fences += 1;
+				return true;
+			},
+		});
+		await f.runtime.start();
+		for (const id of [
+			"",
+			"migration:resume:",
+			"resume:attempt-1",
+			" migration:resume:attempt-1",
+			"migration:resume:attempt-1\n",
+		])
+			await expect(f.runtime.resumeHistoricalSession(id, historicalEvidence())).rejects.toThrow();
+		const mutations: Array<(value: ReturnType<typeof historicalEvidence>) => void> = [
+			value => {
+				Reflect.set(value, "state", "intent_prepared");
+			},
+			value => {
+				Reflect.set(value, "state", "uncertain");
+			},
+			value => {
+				Reflect.deleteProperty(value, "historicalSource");
+			},
+			value => {
+				Reflect.set(value, "requestKey", "other");
+			},
+			value => {
+				Reflect.set(value.actor, "id", "foreign");
+			},
+			value => {
+				Reflect.set(value.target, "cwd", "/foreign");
+			},
+			value => {
+				Reflect.set(value.target, "sessionId", "session");
+			},
+			value => {
+				Reflect.set(value.target, "sessionPath", "/metadata/path");
+			},
+			value => {
+				Reflect.set(value.target, "sessionIdentity", { ...savedSession().identity });
+			},
+			value => {
+				Reflect.set(value.target, "stateRoot", "/private");
+			},
+			value => {
+				Reflect.set(value.preparedAuthority, "generation", 1);
+			},
+			value => {
+				Reflect.set(value.historicalSource!.savedSession.identity, "sha256", "f".repeat(64));
+			},
+			value => {
+				Reflect.set(value, "source", { ...tenant, requestKey: "old" });
+			},
+			value => {
+				Reflect.set(value, "acknowledged", {
+					...value.preparedAuthority,
+					sessionId: tenant.sessionId,
+					generation: 1,
+				});
+			},
+		];
+		for (const mutate of mutations) {
+			const value = historicalEvidence();
+			mutate(value);
+			await expect(f.runtime.resumeHistoricalSession("migration:resume:attempt-1", value)).rejects.toThrow();
+		}
+		expect(fences).toBe(0);
+		expect(f.historicalResumeCalls).toEqual([]);
+		await f.runtime.stop();
+	});
+
+	test("historical resume snapshots input and returns raw acknowledgement without a post-effect fence", async () => {
+		const entered = deferred<void>();
+		const release = deferred<boolean>();
+		const never = deferred<boolean>();
+		const evidence = historicalEvidence();
+		const expected = structuredClone(evidence);
+		let fences = 0;
+		const outcome: Awaited<ReturnType<LifecycleService["resume"]>> = {
+			ok: true,
+			operation: "session.resume",
+			result: { sessionId: "foreign-result-for-caller-to-reject", endpointGeneration: 1 },
+		};
+		const f = fixture({
+			historicalResumeFence: (_id, value) => {
+				expect(value).toEqual(expected);
+				if (++fences === 1) {
+					entered.resolve();
+					return release.promise;
+				}
+				return never.promise;
+			},
+			historicalResume: async () => outcome,
+		});
+		await f.runtime.start();
+		const pending = f.runtime.resumeHistoricalSession("migration:resume:attempt-1", evidence, 500);
+		await entered.promise;
+		Reflect.set(evidence.target, "sessionPath", "/foreign");
+		Reflect.set(evidence.preparedAuthority, "leaseId", "foreign");
+		Reflect.set(evidence.actor, "id", "foreign");
+		release.resolve(true);
+		expect(await pending).toBe(outcome);
+		expect(fences).toBe(1);
+		expect(f.historicalResumeCalls[0]).toMatchObject({
+			actor: expected.actor,
+			requestKey: expected.requestKey,
+			target: expected.target,
+		});
+		expect(f.calls).toEqual(["start"]);
+		await f.runtime.stop();
+	});
+
+	test("historical invocation failure is not retried and repeat admission is owner-controlled", async () => {
+		const failure = new Error("transport failed after dispatch");
+		let admitted = false;
+		const f = fixture({
+			historicalResumeFence: () => {
+				if (admitted) return false;
+				admitted = true;
+				return true;
+			},
+			historicalResume: async () => {
+				throw failure;
+			},
+		});
+		await f.runtime.start();
+		await expect(f.runtime.resumeHistoricalSession("migration:resume:attempt-1", historicalEvidence())).rejects.toBe(
+			failure,
+		);
+		await expect(
+			f.runtime.resumeHistoricalSession("migration:resume:attempt-1", historicalEvidence()),
+		).rejects.toThrow("resume authority fence");
+		expect(f.historicalResumeCalls).toHaveLength(1);
+		expect(f.calls).toEqual(["start"]);
+		await f.runtime.stop();
+	});
+
+	test.each(["selection", "resume"] as const)(
+		"historical %s awaits lease admission and denies a late negative result",
+		async mode => {
+			const entered = deferred<void>();
+			const release = deferred<boolean>();
+			const fence = () => {
+				entered.resolve();
+				return release.promise;
+			};
+			const f = fixture({ historicalSelectionFence: fence, historicalResumeFence: fence });
+			await f.runtime.start();
+			const pending = (
+				mode === "selection"
+					? f.runtime.selectHistoricalSession(historicalSelection())
+					: f.runtime.resumeHistoricalSession("migration:resume:attempt-1", historicalEvidence())
+			).catch(error => error);
+			await entered.promise;
+			expect(f.listCalls).toEqual([]);
+			expect(f.historicalResumeCalls).toEqual([]);
+			release.resolve(false);
+			expect(await pending).toBeInstanceOf(Error);
+			expect(f.listCalls).toEqual([]);
+			expect(f.historicalResumeCalls).toEqual([]);
+			await f.runtime.stop();
+		},
+	);
+
+	test("historical resume returns unsuccessful raw acknowledgement without fence reentry or retry", async () => {
+		const outcome: Awaited<ReturnType<LifecycleService["resume"]>> = {
+			ok: false,
+			operation: "session.resume",
+			certainty: "uncertain",
+			error: { code: "lost", message: "possibly applied" },
+		};
+		let fences = 0;
+		const f = fixture({
+			historicalResumeFence: () => {
+				fences += 1;
+				return fences === 1;
+			},
+			historicalResume: async () => outcome,
+		});
+		await f.runtime.start();
+		expect(await f.runtime.resumeHistoricalSession("migration:resume:attempt-1", historicalEvidence())).toBe(outcome);
+		expect(fences).toBe(1);
+		expect(f.historicalResumeCalls).toHaveLength(1);
+		expect(f.calls).toEqual(["start"]);
+		await f.runtime.stop();
+	});
+
+	test("historical resume timeout keeps the single possibly-applied invocation without late proof effects", async () => {
+		const entered = deferred<void>();
+		const release = deferred<Awaited<ReturnType<LifecycleService["resume"]>>>();
+		let fences = 0;
+		const f = fixture({
+			historicalResumeFence: () => {
+				fences += 1;
+				return true;
+			},
+			historicalResume: async () => {
+				entered.resolve();
+				return release.promise;
+			},
+		});
+		await f.runtime.start();
+		const failure = f.runtime
+			.resumeHistoricalSession("migration:resume:attempt-1", historicalEvidence(), 15)
+			.catch(error => error);
+		await entered.promise;
+		expect(await failure).toMatchObject({ code: "timeout" });
+		release.resolve({
+			ok: true,
+			operation: "session.resume",
+			result: { sessionId: tenant.sessionId, endpointGeneration: 1 },
+		});
+		await new Promise(resolve => setTimeout(resolve, 0));
+		expect(fences).toBe(1);
+		expect(f.historicalResumeCalls).toHaveLength(1);
+		expect(f.calls).toEqual(["start"]);
+		await expect(f.runtime.acquireAttachment(tenant)).rejects.toThrow("not registered");
+		await f.runtime.stop();
+	});
+
 	test("purpose-only grants prove identity and retirement but never authorize active traffic", async () => {
 		const operation = operationIdentity();
 		const accesses: ManagedSdkAccess[] = [];

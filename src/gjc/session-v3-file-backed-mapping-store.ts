@@ -10,6 +10,13 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { dirname } from "node:path";
+import { isDeepStrictEqual } from "node:util";
+import {
+	assertManagedLifecycleEvidenceUpdate,
+	copyManagedLifecycleEvidence,
+	type ManagedLifecycleEvidence,
+	managedLifecycleEvidenceHash,
+} from "./managed-lifecycle-evidence";
 import {
 	canonicalSessionMappingKey,
 	type ProvisionalSessionOperation,
@@ -45,8 +52,26 @@ import {
 	type SessionAuthorityV3Result,
 	type SessionAuthorityV3Tombstone,
 } from "./session-authority-v3";
+import {
+	assertBootstrapAccess,
+	assertBootstrapAccessCurrent,
+	assertBootstrapOperation,
+	type SessionAuthorityV3BootstrapAccess,
+} from "./session-authority-v3-activation";
 import { SessionMappingStore } from "./session-mapping-memory-store";
 import type { ManagedTurnAuthority } from "./turn-runner";
+
+export interface SessionAuthorityV3BootstrapStage {
+	read(): SessionAuthorityV3Document;
+	begin(operationId: string, evidence: ManagedLifecycleEvidence): Promise<SessionOperation>;
+	advance(
+		operationId: string,
+		expectedEvidenceHash: string,
+		evidence: ManagedLifecycleEvidence,
+	): Promise<SessionOperation>;
+	/** Promotes only persisted active-generation proof; remote proof belongs to the restricted coordinator. */
+	promote(operationId: string, expectedEvidenceHash: string, evidence: ManagedLifecycleEvidence): Promise<void>;
+}
 
 /** Canonical V3 authority storage. This deliberately has no V2 compatibility,
  * attachment, descriptor, or terminal persistence path. The activation marker
@@ -235,14 +260,16 @@ class V3FileSessionAuthority extends SessionAuthority {
 			readonly records: readonly SessionAuthorityRecord[];
 			readonly provisional: readonly ProvisionalSessionOperation[];
 		},
+		assertCurrent?: () => void,
 	): void {
 		this.mutate(() => {
+			assertCurrent?.();
 			const next = mutation(this.entries(), this.provisionalEntries());
 			this.replaceAll(next.records, next.provisional);
-		});
+		}, assertCurrent);
 	}
 
-	private mutate<T>(action: () => T): T {
+	private mutate<T>(action: () => T, assertCurrent?: () => void): T {
 		if (this.#closed) throw new Error("Session authority store is closed.");
 		const lock = AuthorityMutationLock.acquire(this.filePath);
 		let durableMutation = false;
@@ -258,7 +285,7 @@ class V3FileSessionAuthority extends SessionAuthority {
 			try {
 				result = action();
 				if (this.hasDirtyJournal()) {
-					this.persist(lock);
+					this.persist(lock, assertCurrent);
 					durableMutation = true;
 				}
 			} catch (error) {
@@ -304,7 +331,7 @@ class V3FileSessionAuthority extends SessionAuthority {
 		this.#generation += 1;
 	}
 
-	private persist(lock: AuthorityMutationLock): void {
+	private persist(lock: AuthorityMutationLock, assertCurrent?: () => void): void {
 		lock.assertHeld(this.filePath);
 		const document: SessionAuthorityV3Document = {
 			kind: SESSION_AUTHORITY_V3_KIND,
@@ -326,6 +353,7 @@ class V3FileSessionAuthority extends SessionAuthority {
 			closeSync(descriptor);
 			descriptor = undefined;
 			lock.assertHeld(this.filePath);
+			assertCurrent?.();
 			renameAttempted = true;
 			renameSync(temporary, this.filePath);
 			replaced = true;
@@ -380,6 +408,140 @@ export class V3FileBackedSessionMappingStore extends SessionMappingStore {
 	}
 	get epoch(): string {
 		return this.authorityEpoch;
+	}
+	bootstrapStage(access: SessionAuthorityV3BootstrapAccess): SessionAuthorityV3BootstrapStage {
+		const path = this.#authority.filePath;
+		const assertCurrent = () => assertBootstrapAccessCurrent(access, path);
+		assertCurrent();
+		const mutate = async (
+			kind: "begin" | "advance" | "promote",
+			operationId: string,
+			expectedHash: string | undefined,
+			input: ManagedLifecycleEvidence,
+		): Promise<SessionOperation> => {
+			const evidence = copyManagedLifecycleEvidence(input);
+			const acknowledgement = kind === "advance" && evidence.state === "acknowledged_unproven";
+			const uncertain = kind === "advance" && evidence.state === "uncertain";
+			// The invocation's owned durable intent authorizes acknowledgement
+			// capture even if its external lease was just revoked. Fresh lease proof
+			// remains mandatory before adoption, promotion, or another effect.
+			if (acknowledgement || uncertain) await assertBootstrapAccess(access, path);
+			else await assertBootstrapOperation(access, path, evidence);
+			const source = evidence.historicalSource;
+			if (
+				source === undefined ||
+				source.manifestDigest !== assertCurrent() ||
+				!operationId.startsWith("migration:resume:") ||
+				operationId.length === "migration:resume:".length
+			)
+				throw new Error("Historical bootstrap operation does not match its manifest and namespaced identity.");
+			let updated!: SessionOperation;
+			this.#authority.replaceAuthorityState((records, provisional) => {
+				const index = records.findIndex(record => record.chatId === source.historicalBinding.chatId);
+				const record = records[index];
+				if (
+					record === undefined ||
+					record.projectId !== evidence.preparedAuthority.projectId ||
+					record.sessionId !== source.historicalBinding.sessionId
+				)
+					throw new Error("Historical bootstrap source occurrence is unavailable.");
+				const found = record.journal.find(operation => operation.id === operationId);
+				if (record.historicalBinding === undefined) {
+					if (
+						kind === "promote" &&
+						found?.state === "complete" &&
+						found.lifecycle !== undefined &&
+						managedLifecycleEvidenceHash(found.lifecycle) === expectedHash &&
+						isDeepStrictEqual(found.lifecycle, evidence) &&
+						isDeepStrictEqual(
+							record.managedAuthority,
+							authorityV3ForDurableChat(evidence.acknowledged, "bootstrap", record.chatId),
+						)
+					) {
+						updated = found;
+						return { records, provisional };
+					}
+					throw new Error("Historical bootstrap cannot rewrite an already managed occurrence.");
+				}
+				if (!isDeepStrictEqual(record.historicalBinding, source.historicalBinding))
+					throw new Error("Historical bootstrap evidence names a different source occurrence.");
+				if (kind === "begin") {
+					if (evidence.state !== "intent_prepared")
+						throw new Error("Historical bootstrap must durably prepare before invocation.");
+					if (found !== undefined) {
+						if (!isDeepStrictEqual(found.lifecycle, evidence))
+							throw new Error("Historical bootstrap operation already has different evidence.");
+						updated = found;
+						return { records, provisional };
+					}
+					if (record.journal.some(operation => operation.lifecycle?.historicalSource !== undefined))
+						throw new Error("Historical bootstrap cannot start a new key for an existing attempt.");
+					updated = {
+						id: operationId,
+						ingressId: operationId,
+						kind: "resume",
+						state: "pending",
+						startedAt: evidence.recordedAt,
+						detail: evidence.payloadHash,
+						lifecycle: evidence,
+					};
+				} else {
+					if (
+						found?.lifecycle === undefined ||
+						found.state === "complete" ||
+						found.state === "conflict" ||
+						managedLifecycleEvidenceHash(found.lifecycle) !== expectedHash
+					)
+						throw new Error("Historical bootstrap evidence changed before journal mutation.");
+					if (found.lifecycle.state === "uncertain" && evidence.state !== "uncertain")
+						throw new Error("Uncertain bootstrap recovery requires original-incarnation public evidence.");
+					if (acknowledgement && found.lifecycle.state !== "invoking")
+						throw new Error("Bootstrap acknowledgement requires this attempt's durable invocation.");
+					assertManagedLifecycleEvidenceUpdate(found.lifecycle, evidence);
+					updated = { ...found, lifecycle: evidence };
+				}
+				let replacement: SessionAuthorityRecord = {
+					...record,
+					journal:
+						found === undefined
+							? [...record.journal, updated]
+							: record.journal.map(operation => (operation.id === operationId ? updated : operation)),
+				};
+				if (kind === "promote") {
+					if (
+						evidence.state !== "active_generation_proven" ||
+						evidence.acknowledged === undefined ||
+						evidence.proven === undefined ||
+						!isDeepStrictEqual(found!.lifecycle, evidence)
+					)
+						throw new Error("Historical bootstrap promotion requires already persisted exact generation proof.");
+					updated = { ...updated, state: "complete", completedAt: evidence.recordedAt };
+					const { historicalBinding: _history, ...fields } = replacement;
+					replacement = {
+						...fields,
+						managedAuthority: authorityV3ForDurableChat(evidence.acknowledged, "bootstrap", record.chatId),
+						journal: record.journal.map(operation => (operation.id === operationId ? updated : operation)),
+					};
+				}
+				return { records: records.map((item, offset) => (offset === index ? replacement : item)), provisional };
+			}, assertCurrent);
+			return structuredClone(updated);
+		};
+		return Object.freeze({
+			read: () => {
+				assertCurrent();
+				const document = parseSessionAuthorityV3Document(readFileSync(path));
+				if (document === undefined) throw new Error("Historical bootstrap stage is not a valid V3 document.");
+				return document;
+			},
+			begin: (operationId: string, evidence: ManagedLifecycleEvidence) =>
+				mutate("begin", operationId, undefined, evidence),
+			advance: (operationId: string, hash: string, evidence: ManagedLifecycleEvidence) =>
+				mutate("advance", operationId, hash, evidence),
+			promote: async (operationId: string, hash: string, evidence: ManagedLifecycleEvidence) => {
+				await mutate("promote", operationId, hash, evidence);
+			},
+		});
 	}
 	assertServingReady(): void {
 		if (

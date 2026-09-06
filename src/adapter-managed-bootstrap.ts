@@ -1,29 +1,32 @@
 import { createHash } from "node:crypto";
-import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
+import { lstat, mkdir, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
-import { type ActiveManagedV3Runtime, startActiveManagedRuntime } from "./adapter-managed-v3-runtime";
+import { isDeepStrictEqual } from "node:util";
 import type { GjcRuntimeLocations } from "./contracts";
-import type {
-	ManagedAuthorityLifecycleOutcome,
-	ManagedAuthorityPreparedRebindIntent,
-} from "./gjc/managed-authority-activation";
 import {
-	type ManagedBootstrapOptions,
-	ManagedBootstrapService,
-	type ManagedBootstrapStartResult,
-} from "./gjc/managed-bootstrap";
-import type { ManagedSdkRuntime, TenantSessionKey } from "./gjc/managed-sdk-runtime";
-import type { LegacyManagedSessionAuthorityEvidence } from "./gjc/managed-session-authority";
-import type { SessionAuthorityRecord } from "./gjc/session-authority";
+	createManagedLifecycleEvidence,
+	type ManagedLifecycleEvidence,
+	managedLifecycleEvidenceHash,
+	transitionManagedLifecycleEvidence,
+} from "./gjc/managed-lifecycle-evidence";
+import { ManagedOperationDeadline } from "./gjc/managed-operation-deadline";
+import {
+	type ManagedSdkAttachment,
+	type ManagedSdkHistoricalSelection,
+	ManagedSdkRuntime,
+	type ManagedSdkRuntimeDeps,
+	type TenantSessionKey,
+} from "./gjc/managed-sdk-runtime";
 import { AuthorityMutationLock } from "./gjc/session-authority-file";
+import type { HistoricalSessionBinding } from "./gjc/session-authority-types";
+import type { SessionAuthorityV3Operation } from "./gjc/session-authority-v3";
 import {
 	activateSessionAuthorityV3,
 	type SessionAuthorityV3ActivationResult,
+	type SessionAuthorityV3BootstrapContext,
 } from "./gjc/session-authority-v3-activation";
-import type { SessionAuthorityV2Document } from "./gjc/session-authority-v3-migration";
-import { validateSessionFile } from "./gjc/session-file";
-import type { SessionMapping, SessionMappingStore } from "./gjc/session-router";
 import { V3FileBackedSessionMappingStore } from "./gjc/session-v3-file-backed-mapping-store";
+import type { ManagedPreparedTurnAuthority } from "./gjc/turn-runner";
 import type { RegisteredProject } from "./projects/registry";
 import type { RuntimeSingletonLock } from "./runtime-singleton-lock";
 
@@ -33,9 +36,11 @@ export interface ManagedBootstrapAuthority {
 	readonly leaseId: string;
 	readonly epoch: string;
 	assertFence(): Promise<void> | void;
+	/** Non-yielding final check of the same owned lease, including expiry/revocation. */
+	assertCurrent(): void;
 }
 
-/** Resolves current project, workspace, and exclusive lease authority; it must not create a workspace or lease. */
+/** Resolves existing owned authority; it must not create a workspace or lease. */
 export interface ManagedBootstrapAuthorityResolver {
 	resolve(principalId: string, projectId: string): Promise<ManagedBootstrapAuthority | undefined>;
 }
@@ -43,21 +48,12 @@ export interface ManagedBootstrapAuthorityResolver {
 export interface AdapterManagedBootstrapInput {
 	readonly locations: Pick<GjcRuntimeLocations, "agentDir"> & Readonly<{ stateRoot: string }>;
 	readonly configuredOwnerUserId: string;
-	/** Explicit legacy bootstrap seam; production V3 activation omits this view. */
-	readonly mappings?: Pick<SessionMappingStore, "mappingRecordsIterable">;
 	readonly sourcePath: string;
 	readonly runtimeLock: RuntimeSingletonLock;
 	readonly authority: ManagedBootstrapAuthorityResolver;
-	/** Validates request-scoped lease identities after the migration bootstrap lease is no longer current. */
-	readonly liveTenantFence?: (key: TenantSessionKey) => boolean | Promise<boolean>;
-	readonly runtime: ManagedSdkRuntime;
-	readonly lifecycle: Pick<ManagedSdkRuntime, "resumeLifecycleSession">;
-}
-
-export interface AdapterManagedBootstrap {
-	readonly options: ManagedBootstrapOptions;
-	readonly service: ManagedBootstrapService;
-	start(): Promise<ManagedBootstrapStartResult>;
+	readonly timeoutMs?: number;
+	/** Transport test seam; the coordinator always supplies the production purpose fences. */
+	readonly createRuntime?: (agentDir: string, deps: ManagedSdkRuntimeDeps) => ManagedSdkRuntime;
 }
 
 export type AdapterSessionAuthorityV3Activation =
@@ -66,413 +62,435 @@ export type AdapterSessionAuthorityV3Activation =
 			status: "activated";
 			activation: SessionAuthorityV3ActivationResult;
 			store: V3FileBackedSessionMappingStore;
-			managed: ActiveManagedV3Runtime;
 	  }>;
 
-/**
- * Converts the canonical V2 authority directly to canonical V3. Binding
- * derivation consumes only the private replay graph supplied by activation;
- * it never opens a mapped session file, transcript, or workspace artifact.
- */
+interface BootstrapTarget {
+	readonly source: HistoricalSessionBinding;
+	readonly prepared: ManagedPreparedTurnAuthority;
+	readonly operationId: string;
+}
+
+/** Restricted activation owns its Router, stage capabilities and one-time invocation admission. */
 export async function activateAdapterSessionAuthorityV3(
 	input: AdapterManagedBootstrapInput,
 ): Promise<AdapterSessionAuthorityV3Activation> {
-	assertAbsolute(input.locations.agentDir, "agentDir");
-	assertAbsolute(input.locations.stateRoot, "stateRoot");
-	assertAbsolute(input.sourcePath, "sourcePath");
+	for (const path of [input.locations.agentDir, input.locations.stateRoot, input.sourcePath])
+		if (!isAbsolute(path) || resolve(path) !== path)
+			throw new TypeError("Bootstrap paths must be canonical absolute paths.");
+	const deadline = new ManagedOperationDeadline(input.timeoutMs, "adapter authority bootstrap");
+	const step = <T>(action: () => Promise<T>): Promise<T> => {
+		deadline.remaining();
+		return deadline.wait(action());
+	};
+	let runtime: ManagedSdkRuntime | undefined;
+	let store: V3FileBackedSessionMappingStore | undefined;
+	let context: SessionAuthorityV3BootstrapContext | undefined;
+	let lock: AuthorityMutationLock | undefined;
+	const targets = new Map<string, BootstrapTarget>();
+	const invoking = new Set<string>();
+	const consumed = new Set<string>();
+	const proven = new Map<string, { prepared: ManagedPreparedTurnAuthority; attachment: ManagedSdkAttachment }>();
+	const commitAuthorities = new Map<string, ManagedBootstrapAuthority>();
+	const failures: unknown[] = [];
+	let result: AdapterSessionAuthorityV3Activation | undefined;
 
-	// An absent source is the one permitted source mutation before activation:
-	// install the canonical empty V2 document, then snapshot it in the V3 activator.
-	await input.runtimeLock.assertOwnsPath(input.sourcePath);
-	const mutationLock = AuthorityMutationLock.acquire(input.sourcePath);
-	const authorities = new Map<string, ManagedBootstrapAuthority>();
-	let replayedGraph: SessionAuthorityV2Document | undefined;
-	let activation: SessionAuthorityV3ActivationResult | undefined;
-	let activationFailure: unknown;
-	let activationFailed = false;
-	try {
-		await ensureLegacySource(input.sourcePath);
-		activation = await activateSessionAuthorityV3({
-			canonicalPath: input.sourcePath,
-			runtimeLock: input.runtimeLock,
-			mutationLock,
-			stagingRoot: input.locations.stateRoot,
-			resolveBindings: decodedDocument => {
-				replayedGraph = decodedDocument;
-				// Preserve the explicit legacy seam's fail-closed behavior for callers
-				// that still provide an independent mapping view. Production managed
-				// activation omits this view and derives only from the private replay.
-				if (
-					decodedDocument.mappings.length === 0 &&
-					input.mappings !== undefined &&
-					[...input.mappings.mappingRecordsIterable()].length > 0
-				)
-					return undefined;
-				// Conversion preserves generation-free history. Only the restricted
-				// post-stage bootstrap may acquire fresh public generation authority.
-				return [];
+	const currentAuthority = async (prepared: ManagedPreparedTurnAuthority): Promise<boolean> => {
+		const authority = await step(() => input.authority.resolve(prepared.principalId, prepared.projectId));
+		if (
+			authority === undefined ||
+			authority.project.id !== prepared.projectId ||
+			authority.project.cwd !== prepared.canonicalWorkspace ||
+			authority.canonicalWorkspace !== prepared.canonicalWorkspace ||
+			authority.leaseId !== prepared.leaseId ||
+			authority.epoch !== prepared.epoch ||
+			typeof authority.assertCurrent !== "function"
+		)
+			return false;
+		await step(async () => await authority.assertFence());
+		commitAuthorities.set(prepared.requestKey, authority);
+		return true;
+	};
+	const operationFor = (id: string): SessionAuthorityV3Operation | undefined => {
+		const target = targets.get(id);
+		return target === undefined
+			? undefined
+			: context?.stage
+					.read()
+					.mappings.find(record => record.chatId === target.source.chatId)
+					?.journal.find(operation => operation.id === id);
+	};
+	const preparedFence = async (evidence: ManagedLifecycleEvidence): Promise<boolean> => {
+		const source = evidence.historicalSource;
+		if (context === undefined || source === undefined || source.manifestDigest !== context.manifestDigest)
+			return false;
+		const target = [...targets.values()].find(item => isDeepStrictEqual(item.source, source.historicalBinding));
+		if (target === undefined || !isDeepStrictEqual(target.prepared, evidence.preparedAuthority)) return false;
+		await step(() => context!.assertCurrent());
+		return currentAuthority(evidence.preparedAuthority);
+	};
+	const createRuntime = () => {
+		const deps: ManagedSdkRuntimeDeps = {
+			drainTimeoutMs: deadline.remaining(),
+			historicalSelectionFence: async selection => {
+				if (context === undefined || selection.manifestDigest !== context.manifestDigest) return false;
+				const target = [...targets.values()].find(item =>
+					isDeepStrictEqual(item.source, selection.historicalBinding),
+				);
+				if (target === undefined || !isDeepStrictEqual(target.prepared, selection.preparedAuthority)) return false;
+				await step(() => context!.assertCurrent());
+				return currentAuthority(target.prepared);
 			},
-		});
-	} catch (error) {
-		activationFailed = true;
-		activationFailure = error;
-	}
+			historicalResumeFence: async (id, evidence) => {
+				if (
+					!invoking.has(id) ||
+					consumed.has(id) ||
+					!isDeepStrictEqual(operationFor(id)?.lifecycle, evidence) ||
+					!(await preparedFence(evidence))
+				)
+					return false;
+				if (!invoking.has(id) || consumed.has(id) || !isDeepStrictEqual(operationFor(id)?.lifecycle, evidence))
+					return false;
+				consumed.add(id);
+				return true;
+			},
+			tenantFence: async (key, access) => {
+				if (access.kind !== "adoption-proof" || context === undefined) return false;
+				const evidence = operationFor(access.operationId)?.lifecycle;
+				return (
+					evidence?.state === "acknowledged_unproven" &&
+					evidence.requestKey === access.requestKey &&
+					evidence.payloadHash === access.payloadHash &&
+					sameTenant(evidence.acknowledged, key) &&
+					(await preparedFence(evidence))
+				);
+			},
+		};
+		return (
+			input.createRuntime ?? ((agentDir, dependencies) => new ManagedSdkRuntime({ agentDir, deps: dependencies }))
+		)(input.locations.agentDir, deps);
+	};
+
 	try {
-		mutationLock.release();
+		await step(() => input.runtimeLock.assertOwnsPath(input.sourcePath));
+		lock = AuthorityMutationLock.acquire(input.sourcePath);
+		await step(() => ensureLegacySource(input.sourcePath));
+		const activation = await step(() =>
+			activateSessionAuthorityV3({
+				canonicalPath: input.sourcePath,
+				runtimeLock: input.runtimeLock,
+				mutationLock: lock!,
+				stagingRoot: input.locations.stateRoot,
+				timeoutMs: deadline.remaining(),
+				bootstrapTenantFence: preparedFence,
+				beforeBootstrapCommit: async () => {
+					if (proven.size !== targets.size)
+						throw new Error("Bootstrap commit requires this attempt's complete public proofs.");
+					if (runtime !== undefined) await step(() => runtime!.reconcile());
+					for (const proof of proven.values()) {
+						if (!(await currentAuthority(proof.prepared)))
+							throw new Error("Bootstrap generation or lease changed before canonical commit.");
+					}
+					return () => {
+						deadline.remaining();
+						for (const proof of proven.values()) {
+							commitAuthorities.get(proof.prepared.requestKey)!.assertCurrent();
+							if (!proof.attachment.isCurrent())
+								throw new Error("Bootstrap attachment changed at canonical replacement.");
+						}
+					};
+				},
+				bootstrap: async current => {
+					context = current;
+					const graph = current.stage.read();
+					if (
+						graph.provisionalOperations.some(
+							operation => operation.historicalBinding !== undefined && operation.state !== "complete",
+						)
+					)
+						return;
+					const sessionIds = new Set<string>();
+					// Complete all local source/owner checks before constructing the public runtime.
+					for (const mapping of graph.mappings) {
+						if (mapping.historicalBinding === undefined) {
+							// An earlier process's numeric generation cannot prove its original
+							// incarnation after restart (#5356). No new resume key or cached replay.
+							throw new Error("Retained managed bootstrap proof requires original-incarnation recovery.");
+						}
+						const source = mapping.historicalBinding;
+						const scope = historicalScope(source);
+						if (
+							scope === undefined ||
+							mapping.reassignment !== undefined ||
+							mapping.observations?.__gjcSessionMappingRetirement !== undefined
+						)
+							return;
+						if (sessionIds.has(mapping.sessionId)) return;
+						sessionIds.add(mapping.sessionId);
+						const previous = mapping.journal.find(
+							operation => operation.lifecycle?.historicalSource !== undefined,
+						);
+						if (previous !== undefined && previous.lifecycle?.state !== "intent_prepared") return;
+						const authority = await step(() => input.authority.resolve(scope.principalId, mapping.projectId));
+						if (
+							authority === undefined ||
+							authority.project.id !== mapping.projectId ||
+							!isAbsolute(authority.canonicalWorkspace) ||
+							resolve(authority.canonicalWorkspace) !== authority.canonicalWorkspace ||
+							authority.project.cwd !== authority.canonicalWorkspace ||
+							(source.canonicalWorkspace !== undefined &&
+								source.canonicalWorkspace !== authority.canonicalWorkspace)
+						)
+							return;
+						await step(async () => await authority.assertFence());
+						const identity = hash(
+							JSON.stringify([
+								current.manifestDigest,
+								source.provenance,
+								scope,
+								mapping.projectId,
+								authority.canonicalWorkspace,
+								source.sessionId,
+							]),
+						);
+						const prepared: ManagedPreparedTurnAuthority = previous?.lifecycle?.preparedAuthority ?? {
+							...scope,
+							projectId: mapping.projectId,
+							canonicalWorkspace: authority.canonicalWorkspace,
+							leaseId: authority.leaseId,
+							epoch: authority.epoch,
+							requestKey: `migration:resume:${identity}`,
+						};
+						// Receipt identity is immutable; a new lease cannot rewrite an old attempt.
+						if (!(await currentAuthority(prepared))) return;
+						targets.set(previous?.id ?? `migration:resume:${identity}`, {
+							source,
+							prepared,
+							operationId: previous?.id ?? `migration:resume:${identity}`,
+						});
+					}
+					runtime = createRuntime();
+					await step(() => runtime!.start());
+					for (const target of targets.values()) {
+						let evidence = operationFor(target.operationId)?.lifecycle;
+						if (evidence === undefined) {
+							const selection: ManagedSdkHistoricalSelection = {
+								manifestDigest: current.manifestDigest,
+								historicalBinding: target.source,
+								preparedAuthority: target.prepared,
+							};
+							const savedSession = await step(() =>
+								runtime!.selectHistoricalSession(selection, deadline.remaining()),
+							);
+							const { dev, ino, size, mtimeMs, mtimeNs, sha256 } = savedSession.identity;
+							evidence = createManagedLifecycleEvidence({
+								operation: "session.resume",
+								preparedAuthority: target.prepared,
+								historicalSource: {
+									kind: "bootstrap-history",
+									manifestDigest: current.manifestDigest,
+									historicalBinding: target.source,
+									savedSession,
+								},
+								payloadHash: hash(JSON.stringify([target.operationId, target.source, savedSession])),
+								target: {
+									sessionId: savedSession.id,
+									cwd: target.prepared.canonicalWorkspace,
+									sessionPath: savedSession.path,
+									sessionIdentity: { dev, ino, size, mtimeMs, mtimeNs, sha256 },
+								},
+							});
+							await step(() => current.stage.begin(target.operationId, evidence!));
+						}
+						const dispatched = transitionManagedLifecycleEvidence(evidence, "invoking");
+						await step(() =>
+							current.stage.advance(target.operationId, managedLifecycleEvidenceHash(evidence!), dispatched),
+						);
+						invoking.add(target.operationId);
+						try {
+							const outcome = await step(() =>
+								runtime!.resumeHistoricalSession(target.operationId, dispatched, deadline.remaining()),
+							);
+							if (
+								!outcome.ok ||
+								outcome.operation !== "session.resume" ||
+								outcome.result.sessionId !== target.source.sessionId ||
+								!Number.isSafeInteger(outcome.result.endpointGeneration) ||
+								outcome.result.endpointGeneration! <= 0
+							)
+								throw new Error(
+									"Historical resume did not acknowledge the exact session and positive generation.",
+								);
+							const acknowledged = {
+								...target.prepared,
+								sessionId: outcome.result.sessionId,
+								generation: outcome.result.endpointGeneration!,
+							};
+							const ack = transitionManagedLifecycleEvidence(dispatched, "acknowledged_unproven", {
+								acknowledged,
+							});
+							// No resolve, registration, proof, or fresh external fence precedes this write.
+							await step(() =>
+								current.stage.advance(target.operationId, managedLifecycleEvidenceHash(dispatched), ack),
+							);
+							const key = tenant(acknowledged);
+							const attachment = await step(() =>
+								runtime!.proveLifecycleTenant(key, {
+									operationId: target.operationId,
+									requestKey: ack.requestKey,
+									payloadHash: ack.payloadHash,
+								}),
+							);
+							if (
+								!attachment.isCurrent() ||
+								attachment.generation !== acknowledged.generation ||
+								!(await preparedFence(ack))
+							)
+								throw new Error("Historical bootstrap lost its exact adoption proof.");
+							const active = transitionManagedLifecycleEvidence(ack, "active_generation_proven", {
+								proven: {
+									kind: "managed-generation",
+									sessionId: acknowledged.sessionId,
+									generation: acknowledged.generation,
+									leaseId: acknowledged.leaseId,
+									epoch: acknowledged.epoch,
+								},
+							});
+							await step(() =>
+								current.stage.advance(target.operationId, managedLifecycleEvidenceHash(ack), active),
+							);
+							await step(() =>
+								current.stage.promote(target.operationId, managedLifecycleEvidenceHash(active), active),
+							);
+							proven.set(target.operationId, { prepared: target.prepared, attachment });
+						} catch (error) {
+							const retained = operationFor(target.operationId)?.lifecycle;
+							if (retained?.state === "invoking" || retained?.state === "acknowledged_unproven") {
+								try {
+									const uncertain = transitionManagedLifecycleEvidence(retained, "uncertain");
+									await step(() =>
+										current.stage.advance(
+											target.operationId,
+											managedLifecycleEvidenceHash(retained),
+											uncertain,
+										),
+									);
+								} catch (persistenceError) {
+									throw new AggregateError(
+										[error, persistenceError],
+										"Bootstrap failure and uncertainty persistence failed.",
+									);
+								}
+							}
+							throw error;
+						} finally {
+							invoking.delete(target.operationId);
+						}
+					}
+				},
+			}),
+		);
+		context = undefined;
+		if (activation.status === "blocked") result = { status: "blocked", activation };
+		else {
+			store = new V3FileBackedSessionMappingStore(input.sourcePath, lock);
+			store.setLegacyAdminPrincipalId(input.configuredOwnerUserId);
+			result = { status: "activated", activation, store };
+		}
 	} catch (error) {
-		if (activationFailed)
-			throw new AggregateError([activationFailure, error], "Authority activation and lock release failed.");
-		throw error;
-	}
-	if (activationFailed) throw activationFailure;
-	if (activation === undefined) throw new Error("Authority activation did not produce a result.");
-	if (activation.status === "blocked") return { status: "blocked", activation };
-	await input.runtimeLock.assertOwnsPath(input.sourcePath);
-	const store = new V3FileBackedSessionMappingStore(input.sourcePath);
-	const managed = await startActiveManagedRuntime({
-		mappings: store,
-		runtime: input.runtime,
-		liveTenantFence: async key => await tenantFence(input, authorities, key, replayedGraph),
-	});
-	return { status: "activated", activation, store, managed };
-}
-
-/**
- * Production-only composition for the v2 -> public-SDK authority activation.
- * It deliberately synthesizes evidence from mapping metadata and filesystem
- * bytes only; session JSONL files, artifacts, and transcripts are never read.
- */
-export function createAdapterManagedBootstrap(input: AdapterManagedBootstrapInput): AdapterManagedBootstrap {
-	assertAbsolute(input.locations.agentDir, "agentDir");
-	assertAbsolute(input.locations.stateRoot, "stateRoot");
-	assertAbsolute(input.sourcePath, "sourcePath");
-
-	const authorityByStableKey = new Map<string, ManagedBootstrapAuthority>();
-	const preparedByIdentity = new Map<string, Readonly<{ intent: ManagedAuthorityPreparedRebindIntent }>>();
-	const options: ManagedBootstrapOptions = {
-		agentDir: input.locations.agentDir,
-		stateRoot: input.locations.stateRoot,
-		sourcePath: input.sourcePath,
-		runtimeLock: input.runtimeLock,
-		legacyEvidence: async () => {
-			const mappings = requireMappings(input);
-			preparedByIdentity.clear();
-			authorityByStableKey.clear();
-			const evidence = await legacyEvidence(input, authorityByStableKey);
-			for (const mapping of mappings.mappingRecordsIterable()) {
-				const prepared = await prepare(input, mapping, authorityByStableKey);
-				if (prepared !== undefined) preparedByIdentity.set(identityFor(prepared.intent), prepared);
+		failures.push(error);
+	} finally {
+		context = undefined;
+		// No bootstrap attachment or purpose grant crosses the serving boundary.
+		let shutdown: Promise<void> | undefined;
+		try {
+			shutdown = runtime?.dispose();
+			if (shutdown !== undefined) await deadline.wait(shutdown);
+		} catch (error) {
+			if (!failures.includes(error)) failures.push(error);
+		}
+		if (result?.status !== "activated" || failures.length > 0) {
+			try {
+				store?.close();
+			} catch (error) {
+				failures.push(error);
 			}
-			return evidence;
-		},
-		bindings: async checkpoint =>
-			checkpoint.records
-				.filter(record => record.status === "intent_prepared")
-				.flatMap(record => {
-					const prepared = preparedByIdentity.get(record.identity);
-					return prepared === undefined ? [] : [{ intent: prepared.intent }];
-				}),
-		lifecycle: {
-			resume: async intent => await resume(input.lifecycle, intent),
-			recover: async intent => await resume(input.lifecycle, intent),
-		},
-		tenantFence: async key => await tenantFence(input, authorityByStableKey, key),
-		preparedIntentFence: async intent => await preparedFence(input, authorityByStableKey, intent),
-		createRuntime: () => input.runtime,
-	};
-	const service = new ManagedBootstrapService(options);
-	return { options, service, start: () => service.start() };
-}
-
-async function legacyEvidence(
-	input: AdapterManagedBootstrapInput,
-	authorities: Map<string, ManagedBootstrapAuthority>,
-): Promise<LegacyManagedSessionAuthorityEvidence> {
-	const source = await readOrCreateLegacySource(input.sourcePath);
-	const wal = await readOptional(`${input.sourcePath}.wal`);
-	const mappings = requireMappings(input);
-	const records: Array<LegacyManagedSessionAuthorityEvidence["records"][number]> = [];
-	for (const mapping of mappings.mappingRecordsIterable()) {
-		const prepared = await prepare(input, mapping, authorities);
-		if (prepared === undefined) {
-			records.push({ sessionId: mapping.sessionId });
-			continue;
 		}
-		records.push({
-			principalId: prepared.intent.principalId,
-			projectId: prepared.intent.projectId,
-			canonicalWorkspace: prepared.intent.canonicalWorkspace,
-			chatId: prepared.intent.chatId,
-			sessionId: prepared.intent.sessionId,
-		});
-	}
-	const manifestBytes = Buffer.from(JSON.stringify(records));
-	return {
-		sourceDigest: digest(source),
-		// Activation makes its own byte-for-byte source backup.
-		backupDigest: digest(source),
-		walDigest: digest(wal),
-		targetManifestDigest: digest(manifestBytes),
-		records,
-	};
-}
-
-function toSessionMapping(record: SessionAuthorityRecord): SessionMapping {
-	return {
-		...(record.managedAuthority === undefined ? {} : { principalId: record.managedAuthority.principalId }),
-		chatId: record.chatId,
-		projectId: record.projectId,
-		sessionId: record.sessionId,
-		...(record.managedAuthority === undefined ? {} : { managedAuthority: record.managedAuthority }),
-		...(record.sessionFile === undefined ? {} : { sessionFile: record.sessionFile }),
-		...(record.activeLeaf === undefined ? {} : { activeLeaf: record.activeLeaf }),
-		rawFrameCursor: record.rawFrameCursor,
-		eventCursor: record.eventCursor,
-		operationId: record.operationId,
-		...(record.assistantText === undefined ? {} : { assistantText: record.assistantText }),
-		...(record.events === undefined ? {} : { events: record.events }),
-		...(record.modelSelection === undefined ? {} : { modelSelection: record.modelSelection }),
-		...(record.attachment === undefined ? {} : { attachment: record.attachment }),
-	};
-}
-
-async function readOrCreateLegacySource(sourcePath: string): Promise<Buffer> {
-	try {
-		return await readFile(sourcePath);
-	} catch (error) {
-		if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
-		const source = Buffer.from('{"kind":"openwebui-gjc-session-authority","version":2,"mappings":[]}\n');
-		await mkdir(dirname(sourcePath), { recursive: true });
-		await writeFile(sourcePath, source, { flag: "wx", mode: 0o600 }).catch(async writeError => {
-			if (!(writeError instanceof Error) || !("code" in writeError) || writeError.code !== "EEXIST")
-				throw writeError;
-		});
-		return await readFile(sourcePath);
-	}
-}
-
-async function ensureLegacySource(sourcePath: string): Promise<void> {
-	try {
-		await lstat(sourcePath);
-		return;
-	} catch (error) {
-		if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
-	}
-	const source = Buffer.from('{"kind":"openwebui-gjc-session-authority","version":2,"mappings":[]}\n');
-	await mkdir(dirname(sourcePath), { recursive: true });
-	await writeFile(sourcePath, source, { flag: "wx", mode: 0o600 }).catch(async writeError => {
-		if (!(writeError instanceof Error) || !("code" in writeError) || writeError.code !== "EEXIST") throw writeError;
-	});
-}
-
-async function prepare(
-	input: AdapterManagedBootstrapInput,
-	mapping: SessionMapping,
-	authorities: Map<string, ManagedBootstrapAuthority>,
-): Promise<Readonly<{ intent: ManagedAuthorityPreparedRebindIntent }> | undefined> {
-	const principalId = mapping.principalId?.trim() || input.configuredOwnerUserId;
-	if (!nonEmpty(principalId) || !identityFields(mapping)) return undefined;
-	const authority = await input.authority.resolve(principalId, mapping.projectId);
-	if (authority === undefined || authority.project.id !== mapping.projectId) return undefined;
-	const canonicalWorkspace = resolve(authority.canonicalWorkspace);
-	if (!isAbsolute(canonicalWorkspace) || canonicalWorkspace !== resolve(authority.project.cwd)) return undefined;
-	const attachment = mapping.attachment;
-	if (
-		attachment === undefined ||
-		attachment.expectedSessionId !== mapping.sessionId ||
-		resolve(attachment.expectedCwd) !== canonicalWorkspace ||
-		mapping.sessionFile === undefined
-	)
-		return undefined;
-	try {
-		validateSessionFile(authority.project, mapping.sessionFile);
-	} catch {
-		return undefined;
-	}
-	const stableKey = hash(
-		JSON.stringify([
-			principalId,
-			mapping.projectId,
-			canonicalWorkspace,
-			mapping.chatId,
-			mapping.sessionId,
-			mapping.operationId,
-		]),
-	);
-	const operationHash = hash(
-		JSON.stringify([mapping.operationId, mapping.chatId, mapping.projectId, mapping.sessionId]),
-	);
-	const intent: ManagedAuthorityPreparedRebindIntent = Object.freeze({
-		principalId,
-		projectId: mapping.projectId,
-		canonicalWorkspace,
-		chatId: mapping.chatId,
-		sessionId: mapping.sessionId,
-		actorDigest: hash(JSON.stringify([principalId, mapping.projectId])),
-		actorRef: `${principalId}:${mapping.projectId}`,
-		stableKey,
-		operationHash,
-		requestHash: hash(JSON.stringify([stableKey, "resume"])),
-		payloadHash: hash(JSON.stringify([mapping.sessionFile, attachment.payloadDigest])),
-		leaseId: authority.leaseId,
-		epoch: authority.epoch,
-		preparedAt: new Date(0).toISOString(),
-		observedAt: new Date(0).toISOString(),
-		rawFrameCursor: mapping.rawFrameCursor,
-		eventCursor: mapping.eventCursor,
-		...(mapping.activeLeaf === undefined ? {} : { activeLeaf: mapping.activeLeaf }),
-	});
-	authorities.set(stableKey, authority);
-	return { intent };
-}
-
-async function resume(
-	lifecycle: Pick<ManagedSdkRuntime, "resumeLifecycleSession">,
-	intent: ManagedAuthorityPreparedRebindIntent,
-): Promise<ManagedAuthorityLifecycleOutcome> {
-	try {
-		const result = await lifecycle.resumeLifecycleSession({
-			actor: { id: intent.principalId, namespace: intent.projectId },
-			capability: "session.resume",
-			requestKey: intent.stableKey,
-			target: { sessionId: intent.sessionId, cwd: intent.canonicalWorkspace },
-		});
-		const value = result as unknown as { result?: { sessionId?: unknown; endpointGeneration?: unknown } };
-		const sessionId = value.result?.sessionId;
-		const endpointGeneration = value.result?.endpointGeneration;
-		if (typeof sessionId !== "string" || sessionId !== intent.sessionId || !positive(endpointGeneration))
-			return { ok: false, reason: "Public lifecycle resume did not return the exact session generation." };
-		return { ok: true, sessionId, endpointGeneration, acknowledgedAt: new Date().toISOString() };
-	} catch (error) {
-		return { ok: false, reason: error instanceof Error ? error.message : "Public lifecycle resume failed." };
-	}
-}
-
-async function preparedFence(
-	input: AdapterManagedBootstrapInput,
-	authorities: Map<string, ManagedBootstrapAuthority>,
-	intent: ManagedAuthorityPreparedRebindIntent,
-	graph?: SessionAuthorityV2Document,
-): Promise<boolean> {
-	const authority = authorities.get(intent.stableKey);
-	if (authority === undefined || authority.leaseId !== intent.leaseId || authority.epoch !== intent.epoch)
-		return false;
-	try {
-		const current = await input.authority.resolve(intent.principalId, intent.projectId);
-		if (
-			current === undefined ||
-			current.project.id !== intent.projectId ||
-			resolve(current.canonicalWorkspace) !== intent.canonicalWorkspace ||
-			current.leaseId !== intent.leaseId ||
-			current.epoch !== intent.epoch ||
-			findOperationId(input, intent, graph) === undefined
-		)
-			return false;
-		await authority.assertFence();
-		await current.assertFence();
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-async function tenantFence(
-	input: AdapterManagedBootstrapInput,
-	authorities: Map<string, ManagedBootstrapAuthority>,
-	key: TenantSessionKey,
-	graph?: SessionAuthorityV2Document,
-): Promise<boolean> {
-	const operationId = findOperationId(input, key, graph);
-	if (operationId === undefined) return false;
-	const stableKey = hash(
-		JSON.stringify([key.principalId, key.projectId, key.canonicalWorkspace, key.chatId, key.sessionId, operationId]),
-	);
-	const authority = authorities.get(stableKey);
-	if (authority === undefined || authority.leaseId !== key.leaseId || authority.epoch !== key.epoch)
-		return (await input.liveTenantFence?.(key)) ?? false;
-	try {
-		const current = await input.authority.resolve(key.principalId, key.projectId);
-		if (
-			current === undefined ||
-			current.project.id !== key.projectId ||
-			resolve(current.canonicalWorkspace) !== key.canonicalWorkspace ||
-			current.leaseId !== key.leaseId ||
-			current.epoch !== key.epoch
-		)
-			return false;
-		await authority.assertFence();
-		await current.assertFence();
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-function findOperationId(
-	input: AdapterManagedBootstrapInput,
-	key: Pick<TenantSessionKey, "principalId" | "projectId" | "chatId" | "sessionId">,
-	graph?: SessionAuthorityV2Document,
-): string | undefined {
-	let operationId: string | undefined;
-	const mappings =
-		graph === undefined
-			? input.mappings === undefined
-				? []
-				: input.mappings.mappingRecordsIterable()
-			: graph.mappings.map(toSessionMapping);
-	for (const mapping of mappings) {
-		if (
-			(mapping.principalId?.trim() || input.configuredOwnerUserId) === key.principalId &&
-			mapping.projectId === key.projectId &&
-			mapping.chatId === key.chatId &&
-			mapping.sessionId === key.sessionId
-		) {
-			if (operationId !== undefined) return undefined;
-			operationId = mapping.operationId;
+		if (runtime !== undefined && runtime.state !== "stopped") {
+			// An expired wait is not a shutdown receipt. Keep the owned mutation
+			// lease in place rather than allowing another attempt to overlap it.
+			failures.push(new Error("Bootstrap shutdown is unproven; mutation ownership remains held."));
+			const heldLock = lock;
+			if (shutdown !== undefined)
+				void shutdown.then(
+					() => {
+						if (runtime?.state === "stopped") {
+							try {
+								heldLock?.release();
+							} catch (error) {
+								console.error("Bootstrap shutdown completed but mutation ownership release failed:", error);
+							}
+						}
+					},
+					() => {
+						/* Failure is retained by the caller; no unproven lock release. */
+					},
+				);
+		} else {
+			try {
+				lock?.release();
+			} catch (error) {
+				failures.push(error);
+			}
 		}
+		deadline.close();
 	}
-	return operationId;
+	if (failures.length > 0) throw new AggregateError(failures, "Managed historical bootstrap failed.");
+	if (result === undefined) throw new Error("Managed historical bootstrap produced no result.");
+	return result;
 }
 
-function requireMappings(input: AdapterManagedBootstrapInput): Pick<SessionMappingStore, "mappingRecordsIterable"> {
-	if (input.mappings === undefined)
-		throw new Error("A SessionMappingStore is required for the explicit legacy managed bootstrap seam.");
-	return input.mappings;
-}
-
-function identityFor(intent: ManagedAuthorityPreparedRebindIntent): string {
-	return JSON.stringify([
-		intent.principalId,
-		intent.projectId,
-		intent.canonicalWorkspace,
-		intent.chatId,
-		intent.sessionId,
-	]);
-}
-function identityFields(mapping: SessionMapping): boolean {
-	return [mapping.chatId, mapping.projectId, mapping.sessionId, mapping.operationId].every(nonEmpty);
-}
-function nonEmpty(value: unknown): value is string {
-	return typeof value === "string" && value.length > 0;
-}
-function positive(value: unknown): value is number {
-	return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
-}
-function digest(bytes: Uint8Array): string {
-	return createHash("sha256").update(bytes).digest("hex");
-}
-async function readOptional(path: string): Promise<Buffer> {
+function historicalScope(source: HistoricalSessionBinding): { principalId: string; chatId: string } | undefined {
+	if (source.sessionId === undefined) return undefined;
 	try {
-		return await readFile(path);
-	} catch (error) {
-		if (typeof error === "object" && error !== null && (error as NodeJS.ErrnoException).code === "ENOENT")
-			return Buffer.alloc(0);
-		throw error;
+		const key: unknown = JSON.parse(source.chatId);
+		if (
+			Array.isArray(key) &&
+			key.length === 2 &&
+			key.every(value => typeof value === "string" && value.length > 0) &&
+			JSON.stringify(key) === source.chatId &&
+			source.principalId === key[0]
+		)
+			return { principalId: key[0], chatId: key[1] };
+	} catch {
+		/* An unscoped source must first receive an explicit tenant-scoped history binding. */
 	}
+	// Do not silently re-key a historical graph or infer ownership from session paths.
+	return undefined;
+}
+function tenant(value: ManagedPreparedTurnAuthority & { sessionId: string; generation: number }): TenantSessionKey {
+	const { requestKey: _requestKey, ...key } = value;
+	return key;
+}
+function sameTenant(value: unknown, key: TenantSessionKey): boolean {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		Object.entries(key).every(([field, expected]) => Reflect.get(value, field) === expected)
+	);
 }
 function hash(value: string): string {
 	return createHash("sha256").update(value).digest("hex");
 }
-function assertAbsolute(value: string, label: string): void {
-	if (!isAbsolute(value)) throw new TypeError(`${label} must be absolute.`);
+async function ensureLegacySource(path: string): Promise<void> {
+	try {
+		await lstat(path);
+		return;
+	} catch (error) {
+		if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
+	}
+	await mkdir(dirname(path), { recursive: true });
+	await writeFile(path, '{"kind":"openwebui-gjc-session-authority","version":2,"mappings":[]}\n', {
+		flag: "wx",
+		mode: 0o600,
+	});
 }

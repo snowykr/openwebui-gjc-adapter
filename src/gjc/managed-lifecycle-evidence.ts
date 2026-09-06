@@ -422,7 +422,7 @@ function isManagedHistoricalLifecycleSource(
 	);
 }
 
-function isHistoricalSavedSession(
+export function isHistoricalSavedSession(
 	value: unknown,
 	sessionId: string,
 	workspace: string,

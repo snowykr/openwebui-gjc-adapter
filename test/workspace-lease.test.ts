@@ -78,6 +78,58 @@ async function withForeignProcessUid<T>(operation: () => Promise<T>): Promise<T>
 }
 
 describe("durable workspace leases", () => {
+	test("synchronous commit fence is read-only and rejects expiry, cleanup and substitution", async () => {
+		const f = await createManager();
+		try {
+			const lease = await f.manager.acquire({
+				safeKey: SAFE_KEY,
+				holderId: "bootstrap",
+				operation: "migration",
+				leaseMs: 100,
+			});
+			const before = await fs.readFile(lease.lockPath);
+			lease.assertFenceSync();
+			expect(await fs.readFile(lease.lockPath)).toEqual(before);
+			f.setNow(1_100);
+			expect(() => lease.assertFenceSync()).toThrow("expired");
+			f.setNow(1_101);
+			const replacement = await f.manager.acquire({
+				safeKey: SAFE_KEY,
+				holderId: "replacement",
+				operation: "migration",
+				leaseMs: 100,
+			});
+			expect(() => lease.assertFenceSync()).toThrow("fence");
+			await replacement.setCleanupPending();
+			expect(() => replacement.assertFenceSync()).toThrow("cleanup");
+			await replacement.release();
+			expect(() => replacement.assertFenceSync()).toThrow("released");
+		} finally {
+			await fs.rm(f.stateRoot, { recursive: true, force: true });
+		}
+	});
+
+	test("synchronous commit fence refuses symlink and oversized lease records", async () => {
+		const f = await createManager();
+		try {
+			const lease = await f.manager.acquire({
+				safeKey: SAFE_KEY,
+				holderId: "bootstrap",
+				operation: "migration",
+				leaseMs: 100,
+			});
+			const backup = `${lease.lockPath}.saved`;
+			await fs.rename(lease.lockPath, backup);
+			await fs.symlink(backup, lease.lockPath);
+			expect(() => lease.assertFenceSync()).toThrow();
+			await fs.unlink(lease.lockPath);
+			await fs.writeFile(lease.lockPath, " ".repeat(16 * 1024 + 1));
+			expect(() => lease.assertFenceSync()).toThrow("commit record");
+		} finally {
+			await fs.rm(f.stateRoot, { recursive: true, force: true });
+		}
+	});
+
 	test("encodes and parses a canonical credential-free lease fence identifier", () => {
 		const reference = {
 			safeKey: SAFE_KEY,

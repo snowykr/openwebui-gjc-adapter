@@ -1,4 +1,13 @@
+import { isAbsolute, resolve } from "node:path";
 import { lifecycle, router } from "@gajae-code/coding-agent/sdk";
+import {
+	copyManagedLifecycleEvidence,
+	isHistoricalSavedSession,
+	isHistoricalSessionBinding,
+	type ManagedHistoricalSavedSession,
+	type ManagedLifecycleEvidence,
+} from "./managed-lifecycle-evidence";
+import type { HistoricalSessionBinding } from "./session-authority-types";
 import type { ManagedPreparedTurnAuthority } from "./turn-runner";
 
 export const MANAGED_SDK_OWNER_STATES = [
@@ -43,6 +52,12 @@ export interface ManagedSdkLifecycleOperation {
 	readonly payloadHash: string;
 }
 
+export interface ManagedSdkHistoricalSelection {
+	readonly manifestDigest: string;
+	readonly historicalBinding: HistoricalSessionBinding;
+	readonly preparedAuthority: ManagedPreparedTurnAuthority;
+}
+
 export type ManagedSdkAccess =
 	| Readonly<{ kind: "active" }>
 	| (ManagedSdkLifecycleOperation & Readonly<{ kind: "adoption-proof" }>)
@@ -84,6 +99,13 @@ export interface ManagedSdkRuntimeDeps {
 	/** Re-proves tenant registration and lease/epoch authority at each boundary. */
 	readonly tenantFence?: (key: TenantSessionKey, access: ManagedSdkAccess) => boolean | Promise<boolean>;
 	readonly preparedTenantFence?: (authority: ManagedPreparedTurnAuthority) => boolean | Promise<boolean>;
+	/** Dedicated generation-free selection admission; absence denies historical listing. */
+	readonly historicalSelectionFence?: (selection: ManagedSdkHistoricalSelection) => boolean | Promise<boolean>;
+	/** Consumes initial invoking admission against durable operation evidence and the current attempt lease. */
+	readonly historicalResumeFence?: (
+		operationId: string,
+		evidence: ManagedLifecycleEvidence,
+	) => boolean | Promise<boolean>;
 	readonly drainTimeoutMs?: number;
 	readonly maxFrameSubscriptions?: number;
 	readonly maxFramesPerSubscription?: number;
@@ -151,6 +173,8 @@ export class ManagedSdkRuntime {
 	readonly #lifecycle: ReturnType<typeof lifecycle.createSessionLifecycleService>;
 	readonly #tenantFence: ManagedSdkRuntimeDeps["tenantFence"];
 	readonly #preparedTenantFence: ManagedSdkRuntimeDeps["preparedTenantFence"];
+	readonly #historicalSelectionFence: ManagedSdkRuntimeDeps["historicalSelectionFence"];
+	readonly #historicalResumeFence: ManagedSdkRuntimeDeps["historicalResumeFence"];
 	readonly #drainTimeoutMs: number;
 	readonly #pending = new Set<PendingCall>();
 	readonly #tokens = new WeakMap<
@@ -187,6 +211,8 @@ export class ManagedSdkRuntime {
 		const deps = options.deps ?? {};
 		this.#tenantFence = deps.tenantFence;
 		this.#preparedTenantFence = deps.preparedTenantFence;
+		this.#historicalSelectionFence = deps.historicalSelectionFence;
+		this.#historicalResumeFence = deps.historicalResumeFence;
 		this.#drainTimeoutMs = finiteTimeout(deps.drainTimeoutMs, DEFAULT_OPERATION_TIMEOUT_MS);
 		this.#maxSubscriptions = positiveLimit(deps.maxFrameSubscriptions, DEFAULT_MAX_SUBSCRIPTIONS);
 		this.#maxFramesPerSubscription = positiveLimit(
@@ -208,6 +234,102 @@ export class ManagedSdkRuntime {
 
 	get bootstrapAdmissionOpen(): boolean {
 		return this.#bootstrapAdmission;
+	}
+
+	async selectHistoricalSession(
+		selection: ManagedSdkHistoricalSelection,
+		timeoutMs?: number,
+	): Promise<ManagedHistoricalSavedSession> {
+		const value = structuredClone(selection);
+		assertHistoricalSelection(value);
+		freezeHistoricalInput(value);
+		const fence = this.#historicalSelectionFence;
+		return this.#track(timeoutMs, async budget => {
+			if (fence === undefined || !(await fence(value)))
+				throw new Error("Historical selection authority fence was lost or unavailable.");
+			budget.remaining();
+			this.#assertOwner();
+			const outcome = await this.#lifecycle.list({
+				actor: { id: value.preparedAuthority.principalId, namespace: "openwebui-gjc-adapter" },
+				capability: "session.list",
+				target: {
+					cwd: value.preparedAuthority.canonicalWorkspace,
+					resolveSessionId: value.historicalBinding.sessionId,
+				},
+				timeoutMs: budget.remaining(),
+			});
+			budget.remaining();
+			if (!outcome.ok || outcome.operation !== "session.list")
+				throw new ManagedSdkOperationError("lifecycle_list_failed", "Historical saved-session selection failed.");
+			const result: unknown = outcome.result;
+			if (
+				!isRecord(result) ||
+				!isHistoricalSavedSession(
+					result.savedSession,
+					value.historicalBinding.sessionId!,
+					value.preparedAuthority.canonicalWorkspace,
+				)
+			)
+				throw new ManagedSdkOperationError(
+					"invalid_result",
+					"Historical selection requires the exact public saved-session receipt.",
+				);
+			const saved = structuredClone(result.savedSession);
+			if (!(await fence(value))) throw new Error("Historical selection authority fence was lost.");
+			budget.remaining();
+			this.#assertOwner();
+			return saved;
+		});
+	}
+
+	/** Initial historical invocation only. The owner must persist this acknowledgement before any proof or reauthorization. */
+	async resumeHistoricalSession(
+		operationId: string,
+		evidence: ManagedLifecycleEvidence,
+		timeoutMs?: number,
+	): ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["resume"]> {
+		const value = freezeHistoricalInput(copyManagedLifecycleEvidence(evidence));
+		if (
+			!exactHistoricalString(operationId) ||
+			!operationId.startsWith("migration:resume:") ||
+			operationId.length === "migration:resume:".length ||
+			value.operation !== "session.resume" ||
+			value.state !== "invoking" ||
+			value.historicalSource === undefined ||
+			value.acknowledged !== undefined ||
+			value.proven !== undefined
+		)
+			throw new TypeError(
+				"Historical resume requires a namespaced initial invoking operation and historical source.",
+			);
+		assertHistoricalSelection({
+			manifestDigest: value.historicalSource.manifestDigest,
+			historicalBinding: value.historicalSource.historicalBinding,
+			preparedAuthority: value.preparedAuthority,
+		});
+		const saved = value.historicalSource.savedSession;
+		const { dev, ino, size, mtimeMs, mtimeNs, sha256 } = saved.identity;
+		const target = Object.freeze({
+			sessionId: saved.id,
+			cwd: value.preparedAuthority.canonicalWorkspace,
+			sessionPath: saved.path,
+			sessionIdentity: Object.freeze({ dev, ino, size, mtimeMs, mtimeNs, sha256 }),
+		});
+		const fence = this.#historicalResumeFence;
+		return this.#track(timeoutMs, async budget => {
+			if (fence === undefined || !(await fence(operationId, value)))
+				throw new Error("Historical resume authority fence was lost or unavailable.");
+			budget.remaining();
+			this.#assertOwner();
+			// No post-effect fence, attachment proof or retry may delay the owner's durable acknowledgement.
+			return this.#lifecycle.resume({
+				actor: value.actor,
+				capability: "session.resume",
+				requestKey: value.requestKey,
+				target,
+				timeoutMs: budget.remaining(),
+			});
+		});
 	}
 
 	createLifecycleSession(
@@ -1017,6 +1139,58 @@ async function boundedWait<T>(promise: Promise<T>, timeoutMs: number, code: stri
 
 function nonEmpty(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0;
+}
+
+function exactHistoricalString(value: unknown): value is string {
+	return nonEmpty(value) && value.trim() === value && !/[\p{Cc}]/u.test(value);
+}
+
+function assertHistoricalSelection(value: ManagedSdkHistoricalSelection): void {
+	if (
+		!isRecord(value) ||
+		Object.keys(value).some(field => !["manifestDigest", "historicalBinding", "preparedAuthority"].includes(field)) ||
+		typeof value.manifestDigest !== "string" ||
+		value.manifestDigest.length !== 64 ||
+		!/^[a-f0-9]{64}$/.test(value.manifestDigest) ||
+		!isHistoricalSessionBinding(value.historicalBinding)
+	)
+		throw new TypeError("Historical selection requires an exact manifest and historical binding.");
+	const prepared = value.preparedAuthority;
+	const fields = [
+		"principalId",
+		"projectId",
+		"canonicalWorkspace",
+		"chatId",
+		"leaseId",
+		"epoch",
+		"requestKey",
+	] as const;
+	if (
+		!isRecord(prepared) ||
+		Object.keys(prepared).some(field => !fields.some(expected => expected === field)) ||
+		!fields.every(field => exactHistoricalString(prepared[field])) ||
+		!isAbsolute(prepared.canonicalWorkspace) ||
+		resolve(prepared.canonicalWorkspace) !== prepared.canonicalWorkspace
+	)
+		throw new TypeError("Historical selection requires complete canonical prepared authority without a generation.");
+	const historical = value.historicalBinding;
+	if (
+		!exactHistoricalString(historical.sessionId) ||
+		historical.projectId !== prepared.projectId ||
+		(historical.chatId !== prepared.chatId &&
+			historical.chatId !== JSON.stringify([prepared.principalId, prepared.chatId])) ||
+		(historical.principalId !== undefined && historical.principalId !== prepared.principalId) ||
+		(historical.canonicalWorkspace !== undefined && historical.canonicalWorkspace !== prepared.canonicalWorkspace)
+	)
+		throw new TypeError("Historical selection source does not match its prepared tenant and workspace.");
+}
+
+function freezeHistoricalInput<T>(value: T): T {
+	if (typeof value === "object" && value !== null) {
+		for (const child of Object.values(value)) freezeHistoricalInput(child);
+		Object.freeze(value);
+	}
+	return value;
 }
 
 function assertTenantKey(key: TenantSessionKey): void {

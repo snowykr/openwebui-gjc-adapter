@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
-import { constants, readFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -280,6 +280,37 @@ export class WorkspaceLeaseManager {
 		});
 	}
 
+	/** Read-only final commit check; never yields or renews the lease. */
+	assertFenceSync(reference: WorkspaceLeaseReference): WorkspaceLeaseRecord {
+		const lockPath = this.lockPath(reference.safeKey);
+		const descriptor = openSync(lockPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+		try {
+			const before = fstatSync(descriptor);
+			if (!before.isFile() || before.size > 16 * 1024) throw new Error("Invalid workspace lease commit record.");
+			const current = parseRecord(JSON.parse(readFileSync(descriptor, "utf8")), lockPath);
+			const after = fstatSync(descriptor),
+				named = lstatSync(lockPath);
+			if (
+				!named.isFile() ||
+				named.isSymbolicLink() ||
+				named.dev !== before.dev ||
+				named.ino !== before.ino ||
+				after.size !== before.size ||
+				after.mtimeMs !== before.mtimeMs ||
+				after.ctimeMs !== before.ctimeMs ||
+				named.size !== after.size ||
+				named.mtimeMs !== after.mtimeMs ||
+				named.ctimeMs !== after.ctimeMs
+			)
+				throw new Error("Workspace lease changed during commit validation.");
+			assertCurrentFence(current, reference, this.readClock(current.observedAt), "commit");
+			if (current.cleanupPending) throw new Error("Workspace cleanup is pending at commit.");
+			return current;
+		} finally {
+			closeSync(descriptor);
+		}
+	}
+
 	async release(lease: WorkspaceLease | WorkspaceLeaseReference): Promise<void>;
 	async release(
 		safeKey: string,
@@ -514,6 +545,11 @@ export class WorkspaceLease {
 	async assertFence(): Promise<WorkspaceLeaseRecord> {
 		if (this.#released) throw new Error("Workspace lease has been released");
 		return this.#manager.assertFence(this);
+	}
+
+	assertFenceSync(): void {
+		if (this.#released) throw new Error("Workspace lease has been released");
+		this.#manager.assertFenceSync(this.reference);
 	}
 
 	async release(): Promise<void> {

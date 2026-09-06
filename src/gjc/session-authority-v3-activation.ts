@@ -14,7 +14,9 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { RuntimeSingletonLock } from "../runtime-singleton-lock";
+import type { ManagedLifecycleEvidence } from "./managed-lifecycle-evidence";
 import { ManagedOperationDeadline } from "./managed-operation-deadline";
 import { AuthorityMutationLock } from "./session-authority-file";
 import { FileSessionAuthority } from "./session-authority-persistence";
@@ -29,7 +31,10 @@ import {
 	type SessionAuthorityV2Document,
 	stageSessionAuthorityV3Migration,
 } from "./session-authority-v3-migration";
-import { V3FileBackedSessionMappingStore } from "./session-v3-file-backed-mapping-store";
+import {
+	type SessionAuthorityV3BootstrapStage,
+	V3FileBackedSessionMappingStore,
+} from "./session-v3-file-backed-mapping-store";
 
 const MAX_AUTHORITY_BYTES = 128 * 1024 * 1024;
 const MAX_WAL_BYTES = 128 * 1024 * 1024;
@@ -57,6 +62,12 @@ export interface SessionAuthorityV3ActivationOptions {
 	readonly timeoutMs?: number;
 	/** Exact, managed authority identities; no runtime-derived authority is consulted. */
 	readonly bindings?: readonly ManagedTurnAuthorityBinding[];
+	/** Restricted coordinator mutates the retained ordinary stage, never supplies replacement bytes. */
+	readonly bootstrap?: (context: SessionAuthorityV3BootstrapContext) => Promise<void>;
+	/** Revalidates resolved tenant/workspace and the current attempt lease; never rewrites receipt provenance. */
+	readonly bootstrapTenantFence?: (evidence: ManagedLifecycleEvidence) => boolean | Promise<boolean>;
+	/** Fresh public attachment/lease proof immediately before canonical replacement. */
+	readonly beforeBootstrapCommit?: () => Promise<() => void>;
 	/** Resolves occurrence-specific identities only after ordinary historical V3 reopen. */
 	readonly resolveBindings?: (
 		decodedDocument: SessionAuthorityV2Document,
@@ -76,6 +87,52 @@ export interface SessionAuthorityV3ActivationContext {
 	readonly manifestDigest: string;
 	assertCurrent(): Promise<void>;
 	remaining(): number;
+}
+
+export interface SessionAuthorityV3BootstrapContext extends SessionAuthorityV3ActivationContext {
+	readonly stage: SessionAuthorityV3BootstrapStage;
+}
+
+declare const bootstrapAccessBrand: unique symbol;
+export interface SessionAuthorityV3BootstrapAccess {
+	readonly [bootstrapAccessBrand]: true;
+}
+const bootstrapAccess = new WeakMap<
+	SessionAuthorityV3BootstrapAccess,
+	{
+		readonly path: string;
+		readonly manifestDigest: string;
+		readonly check: () => Promise<void>;
+		readonly checkSync: () => void;
+		readonly tenantFence: NonNullable<SessionAuthorityV3ActivationOptions["bootstrapTenantFence"]>;
+	}
+>();
+
+/** Only the activator can issue this capability after immutable capture and ordinary stage reopen. */
+export function assertBootstrapAccessCurrent(access: SessionAuthorityV3BootstrapAccess, path: string): string {
+	const owner = bootstrapAccess.get(access);
+	if (owner === undefined || owner.path !== resolve(path))
+		throw new Error("Historical bootstrap activation ownership is unavailable.");
+	owner.checkSync();
+	return owner.manifestDigest;
+}
+
+export async function assertBootstrapAccess(access: SessionAuthorityV3BootstrapAccess, path: string): Promise<void> {
+	assertBootstrapAccessCurrent(access, path);
+	await bootstrapAccess.get(access)!.check();
+	assertBootstrapAccessCurrent(access, path);
+}
+
+export async function assertBootstrapOperation(
+	access: SessionAuthorityV3BootstrapAccess,
+	path: string,
+	evidence: ManagedLifecycleEvidence,
+): Promise<void> {
+	await assertBootstrapAccess(access, path);
+	const owner = bootstrapAccess.get(access)!;
+	if (!(await owner.tenantFence(structuredClone(evidence))))
+		throw new Error("Historical bootstrap operation lease or tenant fence was lost.");
+	await assertBootstrapAccess(access, path);
 }
 
 export interface SessionAuthorityV3ActiveMarker {
@@ -125,6 +182,12 @@ async function activateUnderDeadline(
 	deadline: ManagedOperationDeadline,
 ): Promise<SessionAuthorityV3ActivationResult> {
 	const canonicalPath = resolve(options.canonicalPath);
+	if (options.bootstrap !== undefined && (options.bindings !== undefined || options.resolveBindings !== undefined))
+		throw new Error("Historical bootstrap cannot be combined with binding replacement.");
+	if (options.bootstrap !== undefined && typeof options.bootstrapTenantFence !== "function")
+		throw new Error("Historical bootstrap requires a live operation tenant fence.");
+	if (options.bootstrap !== undefined && typeof options.beforeBootstrapCommit !== "function")
+		throw new Error("Historical bootstrap requires public commit revalidation.");
 	if (
 		!(options.runtimeLock instanceof RuntimeSingletonLock) ||
 		!(options.mutationLock instanceof AuthorityMutationLock)
@@ -223,14 +286,27 @@ async function activateUnderDeadline(
 		if (!canonicalSnapshotMatches(canonicalPath, snapshot))
 			throw new Error("Canonical V2 authority changed during binding resolution.");
 		retainHistoricalStage(root, historicalPath, initialHistoricalBytes, manifestDigest);
+		if (options.bootstrap !== undefined)
+			assertBootstrapGraph(
+				initialHistoricalBytes,
+				readRegular(historicalPath, MAX_AUTHORITY_BYTES, "retained bootstrap graph"),
+				manifestDigest,
+			);
 	};
 	await assertBootstrapCurrent();
+	if (options.bootstrap !== undefined)
+		assertBootstrapGraph(
+			initialHistoricalBytes,
+			readRegular(historicalPath, MAX_AUTHORITY_BYTES, "retained bootstrap graph"),
+			manifestDigest,
+		);
 	// A changed stage may contain prepared or acknowledged lifecycle work. Until
 	// its journal is reconciled, never replace it by converting the original V2
 	// graph again, even when an earlier resolver returned no bindings or threw.
 	if (
-		!retainedHistoricalBytes.equals(initialHistoricalBytes) ||
-		!readRegular(historicalPath, MAX_AUTHORITY_BYTES, "historical V3 stage").equals(initialHistoricalBytes)
+		options.bootstrap === undefined &&
+		(!retainedHistoricalBytes.equals(initialHistoricalBytes) ||
+			!readRegular(historicalPath, MAX_AUTHORITY_BYTES, "historical V3 stage").equals(initialHistoricalBytes))
 	)
 		return {
 			status: "blocked",
@@ -239,23 +315,49 @@ async function activateUnderDeadline(
 			reasons: ["Retained historical stage requires journal reconciliation before binding resolution."],
 		};
 	const historicalIdentity = fileIdentity(historicalPath);
-	const bindings =
-		options.resolveBindings === undefined
-			? (options.bindings ?? [])
-			: await deadline.wait(
-					Promise.resolve(
-						options.resolveBindings(decodedDocument, {
-							stagedPath: historicalPath,
-							manifestDigest,
-							assertCurrent: assertBootstrapCurrent,
-							remaining: () => deadline.remaining(),
-						}),
-					),
-				);
+	const bootstrapStore = new V3FileBackedSessionMappingStore(historicalPath);
+	const access = Object.freeze({}) as SessionAuthorityV3BootstrapAccess;
+	bootstrapAccess.set(access, {
+		path: historicalPath,
+		manifestDigest,
+		check: assertBootstrapCurrent,
+		tenantFence: options.bootstrapTenantFence ?? (() => false),
+		checkSync: () => {
+			deadline.remaining();
+			options.mutationLock.assertHeld(canonicalPath);
+			if (
+				!canonicalSnapshotMatches(canonicalPath, snapshot) ||
+				digest(readRegular(join(root, "source-manifest.json"), 16 * 1024, "immutable source manifest")) !==
+					manifestDigest
+			)
+				throw new Error("Historical bootstrap source ownership changed before mutation.");
+			retainHistoricalStage(root, historicalPath, initialHistoricalBytes, manifestDigest);
+		},
+	});
+	let bindings: readonly ManagedTurnAuthorityBinding[] | undefined;
+	try {
+		const context: SessionAuthorityV3ActivationContext = {
+			stagedPath: historicalPath,
+			manifestDigest,
+			assertCurrent: assertBootstrapCurrent,
+			remaining: () => deadline.remaining(),
+		};
+		if (options.bootstrap !== undefined)
+			await deadline.wait(options.bootstrap({ ...context, stage: bootstrapStore.bootstrapStage(access) }));
+		else
+			bindings =
+				options.resolveBindings === undefined
+					? (options.bindings ?? [])
+					: await deadline.wait(Promise.resolve(options.resolveBindings(decodedDocument, context)));
+	} finally {
+		bootstrapAccess.delete(access);
+		bootstrapStore.close();
+	}
 	await assertLocks();
 	if (
-		!matchesFileIdentity(historicalPath, historicalIdentity) ||
-		!readRegular(historicalPath, MAX_AUTHORITY_BYTES, "historical V3 stage").equals(initialHistoricalBytes)
+		options.bootstrap === undefined &&
+		(!matchesFileIdentity(historicalPath, historicalIdentity) ||
+			!readRegular(historicalPath, MAX_AUTHORITY_BYTES, "historical V3 stage").equals(initialHistoricalBytes))
 	)
 		return {
 			status: "blocked",
@@ -263,7 +365,7 @@ async function activateUnderDeadline(
 			markerPath,
 			reasons: ["Binding resolution changed the historical stage; retained journal cannot be discarded."],
 		};
-	if (bindings === undefined)
+	if (options.bootstrap === undefined && bindings === undefined)
 		return {
 			status: "blocked",
 			canonicalPath,
@@ -277,19 +379,27 @@ async function activateUnderDeadline(
 			markerPath,
 			reasons: ["Canonical V2 authority changed during private replay or binding resolution."],
 		};
-	const staged = stageSessionAuthorityV3Migration({
-		snapshot: {
-			originalBaseBytes: snapshot.base,
-			originalBaseDigest: snapshot.baseDigest,
-			originalWalBytes: snapshot.wal,
-			originalWalDigest: snapshot.walDigest,
-		},
-		decodedDocument: {
-			mappings: decodedDocument.mappings,
-			provisionalOperations: decodedDocument.provisionalOperations,
-		},
-		bindings,
-	});
+	const bootstrapBytes =
+		options.bootstrap === undefined
+			? undefined
+			: readRegular(historicalPath, MAX_AUTHORITY_BYTES, "bootstrapped V3 stage");
+	if (bootstrapBytes !== undefined) assertBootstrapGraph(initialHistoricalBytes, bootstrapBytes, manifestDigest);
+	const staged =
+		bootstrapBytes === undefined
+			? stageSessionAuthorityV3Migration({
+					snapshot: {
+						originalBaseBytes: snapshot.base,
+						originalBaseDigest: snapshot.baseDigest,
+						originalWalBytes: snapshot.wal,
+						originalWalDigest: snapshot.walDigest,
+					},
+					decodedDocument: {
+						mappings: decodedDocument.mappings,
+						provisionalOperations: decodedDocument.provisionalOperations,
+					},
+					bindings,
+				})
+			: { status: "staged" as const, v3Bytes: bootstrapBytes, v3Digest: digest(bootstrapBytes) };
 	if (staged.status === "blocked") {
 		return { status: "blocked", canonicalPath, markerPath, reasons: staged.reasons };
 	}
@@ -298,6 +408,13 @@ async function activateUnderDeadline(
 	const canonicalBytes = Buffer.from(staged.v3Bytes);
 	if (!Buffer.from(encodeSessionAuthorityV3Document(parsed)).equals(canonicalBytes))
 		throw new Error("V3 transformer did not produce deterministic canonical bytes.");
+	if (hasUnboundServingAuthority(parsed))
+		return {
+			status: "blocked",
+			canonicalPath,
+			markerPath,
+			reasons: ["Staged historical authority requires restricted bootstrap generation proof before activation."],
+		};
 	const stagePath = join(root, "canonical.v3.json");
 	writePrivate(root, "canonical.v3.json", canonicalBytes);
 	// Reopening is deliberately against the private copy. It proves the strict V3
@@ -306,17 +423,10 @@ async function activateUnderDeadline(
 	store.close();
 	const reopened = readRegular(stagePath, MAX_AUTHORITY_BYTES, "staged V3 authority");
 	if (!reopened.equals(canonicalBytes)) throw new Error("Reopening the V3 authority changed its deterministic bytes.");
-	if (hasUnboundServingAuthority(parsed))
-		return {
-			status: "blocked",
-			canonicalPath,
-			markerPath,
-			reasons: ["Staged historical authority requires restricted bootstrap generation proof before activation."],
-		};
-
 	const journal: ActivationJournal = {
 		kind: "openwebui-gjc-session-authority-v3-activation",
 		version: 1,
+		bootstrap: options.bootstrap !== undefined,
 		phase: "prepared",
 		activationV3Digest: staged.v3Digest,
 		source: { baseDigest: snapshot.baseDigest, walDigest: snapshot.walDigest, walPresent: snapshot.walPresent },
@@ -339,6 +449,13 @@ async function activateUnderDeadline(
 			reasons: ["Canonical V2 authority changed before the activation swap."],
 		};
 
+	let finalBootstrapCheck: (() => void) | undefined;
+	if (options.bootstrap !== undefined) {
+		deadline.remaining();
+		finalBootstrapCheck = await deadline.wait(options.beforeBootstrapCommit!());
+		if (typeof finalBootstrapCheck !== "function")
+			throw new Error("Bootstrap commit requires a synchronous final proof check.");
+	}
 	writePrivate(root, "activation.json", encode({ ...journal, phase: "committing" }));
 	fsyncDirectory(root);
 	options.afterBoundary?.("committing");
@@ -354,6 +471,7 @@ async function activateUnderDeadline(
 	if (lstatSync(markerPath, { throwIfNoEntry: false }) !== undefined)
 		throw new Error("Active V3 marker appeared before the activation commit boundary.");
 	options.mutationLock.assertHeld(canonicalPath);
+	finalBootstrapCheck?.();
 	renameSync(stagePath, canonicalPath);
 	fsyncDirectory(dirname(canonicalPath));
 	options.afterBoundary?.("base");
@@ -386,6 +504,64 @@ async function activateUnderDeadline(
 	fsyncDirectory(root);
 	options.afterBoundary?.("marker");
 	return activated(canonicalPath, markerPath, marker);
+}
+
+function assertBootstrapGraph(initialBytes: Buffer, retainedBytes: Buffer, manifestDigest: string): void {
+	const initial = parseSessionAuthorityV3Document(initialBytes);
+	const retained = parseSessionAuthorityV3Document(retainedBytes);
+	if (
+		initial === undefined ||
+		retained === undefined ||
+		initial.mappings.length !== retained.mappings.length ||
+		!isDeepStrictEqual(initial.provisionalOperations, retained.provisionalOperations)
+	)
+		throw new Error("Historical bootstrap changed the retained source graph.");
+	for (let index = 0; index < initial.mappings.length; index++) {
+		const original = initial.mappings[index]!;
+		const current = retained.mappings[index]!;
+		if (original.historicalBinding === undefined) {
+			if (!isDeepStrictEqual(original, current))
+				throw new Error("Bootstrap changed an already managed source occurrence.");
+			continue;
+		}
+		const { historicalBinding: _history, managedAuthority: _managed, journal, ...fields } = current;
+		if (
+			!isDeepStrictEqual(
+				{
+					...fields,
+					historicalBinding: original.historicalBinding,
+					journal: journal.slice(0, original.journal.length),
+				},
+				original,
+			)
+		)
+			throw new Error("Historical bootstrap changed immutable source history or projections.");
+		const appended = journal.slice(original.journal.length);
+		if (appended.length > 1) throw new Error("Historical bootstrap contains competing migration operations.");
+		const operation = appended[0];
+		if (
+			operation !== undefined &&
+			(!operation.id.startsWith("migration:resume:") ||
+				operation.lifecycle?.historicalSource?.manifestDigest !== manifestDigest ||
+				!isDeepStrictEqual(operation.lifecycle.historicalSource.historicalBinding, original.historicalBinding))
+		)
+			throw new Error("Historical bootstrap journal does not bind its exact source occurrence.");
+		if (current.managedAuthority !== undefined) {
+			const evidence = operation?.lifecycle;
+			if (
+				operation?.state !== "complete" ||
+				evidence?.state !== "active_generation_proven" ||
+				evidence.acknowledged === undefined ||
+				!isDeepStrictEqual(current.managedAuthority, {
+					...evidence.acknowledged,
+					chatId: current.chatId,
+					authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+				})
+			)
+				throw new Error("Historical bootstrap promotion lacks its completed exact generation receipt.");
+		} else if (!isDeepStrictEqual(current.historicalBinding, original.historicalBinding))
+			throw new Error("Historical bootstrap changed original occurrence provenance.");
+	}
 }
 
 function retainHistoricalStage(root: string, stagePath: string, initialBytes: Buffer, manifestDigest: string): void {
@@ -471,6 +647,13 @@ function recover(
 						digest(readRegular(walPath, MAX_WAL_BYTES, "committing original WAL")) !== journal.source.walDigest
 			)
 				throw new Error("Committing activation WAL identity changed; refusing recovery mutation.");
+			if (journal.bootstrap)
+				return {
+					status: "blocked",
+					canonicalPath,
+					markerPath,
+					reasons: ["Uncommitted bootstrap requires original-incarnation proof before replacing canonical V2."],
+				};
 			mutationLock.assertHeld(canonicalPath);
 			renameSync(stagePath, canonicalPath);
 		}
@@ -961,6 +1144,7 @@ function activated(
 type ActivationJournal = Readonly<{
 	kind: "openwebui-gjc-session-authority-v3-activation";
 	version: 1;
+	bootstrap: boolean;
 	phase: "prepared" | "committing" | "swapped" | "marked";
 	activationV3Digest: string;
 	source: SessionAuthorityV3ActiveMarker["source"];
@@ -1000,9 +1184,10 @@ function isJournal(value: unknown): value is ActivationJournal {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const journal = value as Partial<ActivationJournal>;
 	return (
-		Object.keys(value).length === 7 &&
+		Object.keys(value).length === 8 &&
 		journal.kind === "openwebui-gjc-session-authority-v3-activation" &&
 		journal.version === 1 &&
+		typeof journal.bootstrap === "boolean" &&
 		(journal.phase === "prepared" ||
 			journal.phase === "committing" ||
 			journal.phase === "swapped" ||
