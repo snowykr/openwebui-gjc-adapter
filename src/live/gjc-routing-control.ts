@@ -550,9 +550,11 @@ async function runManagedBranch(
 			);
 		} catch (error) {
 			try {
-				if (canTransitionManagedLifecycleState(lifecycleEvidence.state, "uncertain"))
-					recordLifecycle(transitionManagedLifecycleEvidence(lifecycleEvidence, "uncertain"));
-				mappings.transitionOperation(turn.chatId, turn.userMessageId, "uncertain", hash);
+				if (mappings.operation(turn.chatId, turn.userMessageId)?.state !== "complete") {
+					if (canTransitionManagedLifecycleState(lifecycleEvidence.state, "uncertain"))
+						recordLifecycle(transitionManagedLifecycleEvidence(lifecycleEvidence, "uncertain"));
+					mappings.transitionOperation(turn.chatId, turn.userMessageId, "uncertain", hash);
+				}
 			} catch (persistenceError) {
 				throw new AggregateError([error, persistenceError], "Managed branch failure could not be recorded.");
 			}

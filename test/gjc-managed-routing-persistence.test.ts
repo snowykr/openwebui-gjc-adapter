@@ -681,6 +681,66 @@ describe("managed routing persistence", () => {
 		},
 	);
 
+	test.each(["throw", "timeout"] as const)(
+		"branch publication %s after commit preserves immutable replay",
+		async mode => {
+			const f = fixture();
+			let release!: () => void;
+			const gate = new Promise<void>(resolve => {
+				release = resolve;
+			});
+			try {
+				await routeGjcTurn(f.input());
+				let forks = 0;
+				const runner = Object.assign(f.runner, {
+					async forkManagedSuccessor(input: ManagedSuccessorInput) {
+						await input.onInvoking?.();
+						forks += 1;
+						const managedAuthority = { ...input.target, sessionId: "committed-branch", generation: 2 };
+						await input.onAcknowledged?.(managedAuthority);
+						const successor = { tenant: managedAuthority, generation: 2, isCurrent: () => true };
+						await input.publish(successor);
+						return { successor, managedAuthority, operationHash: input.source.requestKey };
+					},
+				});
+				const transaction = runner.withLifecyclePublication.bind(runner);
+				const failure = new Error("response failed after commit");
+				runner.withLifecyclePublication = (address, effect) =>
+					transaction(address, async lifecycle => {
+						const publish = lifecycle.publishManaged.bind(lifecycle);
+						lifecycle.publishManaged = async (proof, write) => {
+							await publish(proof, write);
+							if (mode === "timeout") await gate;
+							throw failure;
+						};
+						return effect(lifecycle);
+					});
+				const gateway = () =>
+					createGjcRoutingLiveGatewayRunner({ turnRunner: runner, mappings: f.store, turnTimeoutMs: 2_000 });
+				const observed = await gateway()
+					.run(branchTurn())
+					.catch(error => error);
+				if (mode === "throw") expect(observed).toBe(failure);
+				else expect(observed).toMatchObject({ code: "timeout" });
+				const receipt = f.store.operationScoped(f.scope, "branch-1")!;
+				expect(receipt.state).toBe("complete");
+				expect(receipt.lifecycle?.state).toBe("active_generation_proven");
+				expect(receipt.result).toBeDefined();
+				const bytes = readFileSync(f.file);
+				release();
+				await new Promise(resolve => setTimeout(resolve, 0));
+				expect(readFileSync(f.file).equals(bytes)).toBe(true);
+				f.reopen();
+				expect(f.store.operationScoped(f.scope, "branch-1")).toEqual(receipt);
+				await expect(gateway().run(branchTurn())).resolves.toMatchObject({ content: "continued:branch prompt" });
+				expect(forks).toBe(1);
+			} finally {
+				release();
+				f.close();
+			}
+		},
+	);
+
 	test("branch fork, state and prompt consume the same configured budget", async () => {
 		const f = fixture();
 		try {
