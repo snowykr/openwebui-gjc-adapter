@@ -138,10 +138,18 @@ export function createManagedSessionOperations(
 			epoch: authority.epoch,
 		};
 	};
-	const acquire = async (authority: ManagedTurnAuthority) => {
+	const acquireWithin = async (authority: ManagedTurnAuthority, deadline: ManagedOperationDeadline) => {
 		const key = tenant(authority);
-		await runtime.reconcile();
-		return await runtime.acquireAttachment(key);
+		await deadline.wait(runtime.reconcile(deadline.remaining()));
+		return await deadline.wait(runtime.acquireAttachment(key, deadline.remaining()));
+	};
+	const acquire = async (authority: ManagedTurnAuthority) => {
+		const deadline = new ManagedOperationDeadline(defaultTimeoutMs, "attachment acquisition");
+		try {
+			return await acquireWithin(authority, deadline);
+		} finally {
+			deadline.close();
+		}
 	};
 	const invoke = async (
 		authority: ManagedTurnAuthority,
@@ -157,8 +165,8 @@ export function createManagedSessionOperations(
 		options?.signal?.addEventListener("abort", onAbort, { once: true });
 		try {
 			const key = tenant(authority);
-			await deadline.wait(runtime.reconcile());
-			const attachment = await deadline.wait(runtime.acquireAttachment(key));
+			await deadline.wait(runtime.reconcile(deadline.remaining()));
+			const attachment = await deadline.wait(runtime.acquireAttachment(key, deadline.remaining()));
 			throwIfAborted(options?.signal);
 			return await deadline.wait(
 				runtime.request(attachment, frame, {
@@ -273,6 +281,7 @@ export function createManagedSessionOperations(
 						});
 				}
 			};
+			deadline.remaining();
 			await deadline.wait(Promise.resolve(input.onInvoking?.()));
 			const outcome = externalOutcome(await deadline.wait<unknown>(invokeLifecycle()));
 			if (!isLifecycleSuccess(outcome)) {
@@ -292,7 +301,7 @@ export function createManagedSessionOperations(
 					throw new ManagedTurnUncertainError(
 						`Managed session.${operation} acknowledgement does not match the exact session.`,
 					);
-				await deadline.wait(requireRetired(runtime, key));
+				await requireRetired(runtime, key, deadline);
 			} else if (operation !== "list") {
 				const lifecycleTenant = tenantFromLifecycle(authority, outcome, operation, target);
 				if (lifecycleTenant === undefined)
@@ -300,6 +309,7 @@ export function createManagedSessionOperations(
 						"Managed lifecycle acknowledgement lacks the expected session id and positive generation.",
 					);
 				const acknowledged = { ...lifecycleTenant, requestKey, authorityEpoch: SESSION_AUTHORITY_V3_EPOCH };
+				deadline.remaining();
 				await deadline.wait(Promise.resolve(input.onAcknowledged?.(acknowledged)));
 				try {
 					throwIfAborted(input.signal);
@@ -308,8 +318,8 @@ export function createManagedSessionOperations(
 						tenant: lifecycleTenant,
 						attachment: await deadline.wait(
 							input.lifecycleOperation === undefined
-								? runtime.registerLifecycleTenant(lifecycleTenant)
-								: runtime.proveLifecycleTenant(lifecycleTenant, input.lifecycleOperation),
+								? runtime.registerLifecycleTenant(lifecycleTenant, deadline.remaining())
+								: runtime.proveLifecycleTenant(lifecycleTenant, input.lifecycleOperation, deadline.remaining()),
 						),
 					} satisfies ManagedLifecycleResult;
 				} catch (error) {
@@ -321,6 +331,7 @@ export function createManagedSessionOperations(
 							target: { sessionId: lifecycleTenant.sessionId, endpointGeneration: lifecycleTenant.generation },
 							timeoutMs: deadline.remaining(),
 						});
+						deadline.remaining();
 						runtime.unregisterTenant(lifecycleTenant);
 					} catch (cleanup) {
 						throw new AggregateError([error, cleanup], "Managed lifecycle success has uncertain cleanup.");
@@ -362,7 +373,7 @@ export function createManagedSessionOperations(
 		const cursors = new Set<string>();
 		let cursor: string | undefined;
 		for (let page = 0; page < MAX_QUERY_PAGES; page += 1) {
-			const attachment = await deadline.wait(acquire(authority));
+			const attachment = await acquireWithin(authority, deadline);
 			const result = await deadline.wait(
 				runtime.request(
 					attachment,
@@ -428,20 +439,22 @@ export function createManagedSessionOperations(
 		let abortPromise: Promise<Readonly<Record<string, unknown>>> | undefined;
 		const cancelAfterDispatch = () => {
 			if (dispatched && abortPromise === undefined) {
-				abortPromise = request({
-					authority,
-					operation: "turn.abort",
-					input: { mode: "terminal", scope: "turn" },
-					idempotencyKey: authority.requestKey,
-					timeoutMs: Math.max(1, deadline.expiresAt - Date.now()),
-				});
-				void abortPromise.catch(() => undefined);
+				const remaining = deadline.expiresAt - Date.now();
+				if (remaining > 0)
+					abortPromise = request({
+						authority,
+						operation: "turn.abort",
+						input: { mode: "terminal", scope: "turn" },
+						idempotencyKey: authority.requestKey,
+						timeoutMs: remaining,
+					});
+				void abortPromise?.catch(() => undefined);
 			}
 			deadline.fail(new GjcTurnCancelledError());
 		};
 		input.signal?.addEventListener("abort", cancelAfterDispatch, { once: true });
 		try {
-			const attachment = await deadline.wait(acquire(authority));
+			const attachment = await acquireWithin(authority, deadline);
 			const assertCurrent = () => {
 				throwIfAborted(input.signal);
 				deadline.remaining();
@@ -550,7 +563,7 @@ export function createManagedSessionOperations(
 					}),
 				);
 			}
-			const current = await deadline.wait(runtime.acquireAttachment(tenant(authority)));
+			const current = await deadline.wait(runtime.acquireAttachment(tenant(authority), deadline.remaining()));
 			assertCurrent();
 			if (current !== attachment)
 				throw new ManagedTurnUncertainError("Managed turn attachment changed before completion.");
@@ -647,14 +660,15 @@ function lifecycleMessage(value: unknown, fallback: string): string {
 		? value.error.message
 		: fallback;
 }
-async function requireRetired(runtime: ManagedSdkRuntime, key: TenantSessionKey, cause?: unknown): Promise<void> {
-	await runtime.reconcile();
-	const status = await runtime.generationStatus(key);
+async function requireRetired(
+	runtime: ManagedSdkRuntime,
+	key: TenantSessionKey,
+	deadline: ManagedOperationDeadline,
+): Promise<void> {
+	await deadline.wait(runtime.reconcile(deadline.remaining()));
+	const status = await deadline.wait(runtime.generationStatus(key, deadline.remaining()));
 	if (status.status !== "retired")
-		throw new ManagedTurnUncertainError(
-			"Exact managed generation retirement is not proven.",
-			cause === undefined ? undefined : { cause },
-		);
+		throw new ManagedTurnUncertainError("Exact managed generation retirement is not proven.");
 }
 export function decodeRouterPage(frame: unknown, query: string): ManagedRouterPage {
 	if (!isRecord(frame) || frame.type !== "query_response")

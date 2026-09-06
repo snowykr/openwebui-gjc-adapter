@@ -26,6 +26,7 @@
 
 ### Fixed
 
+- Propagated live query/request/prompt/retirement deadlines through compound runtime acquisition and proof calls, with pre-effect checks and a bounded standalone acquisition. Removed the expired-cancellation one-millisecond abort renewal and corrected runtime fake lifecycle argument shapes.
 - Bounded successor source admission, lifecycle invocation, acknowledgement, target proof, publication callback, and cleanup under one deadline. Propagated remaining time into compound runtime reconciliation/acquisition/adoption/status calls and rejected late queued effects without renewal; successor request identity remains independent of incidental transport timeout.
 - Delivered public lifecycle mutation outcomes before renewed lease/registration checks can hide their acknowledgement. Active/adoption/retirement proof and post-read list disclosure retain independent authorization; a production revoked-lease create regression preserves acknowledged identity in an uncertain canonical provisional record across reopen without publishing or prompting.
 - Separated internal external-lifecycle deadlines from public SDK readiness configuration. Create/resume and catalog callers no longer send short or over-60-second operation budgets as `readinessTimeoutMs`; an explicitly supplied SDK readiness value remains unchanged and must satisfy the public 4,000–60,000 ms range.

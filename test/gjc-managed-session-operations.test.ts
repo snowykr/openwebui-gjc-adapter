@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import type { ManagedSdkAttachment, ManagedSdkRuntime, TenantSessionKey } from "../src/gjc/managed-sdk-runtime";
 import type { ManagedTurnAuthority } from "../src/gjc/turn-runner";
 import { createManagedSessionOperations, ManagedTurnUncertainError } from "../src/live/gjc-managed-session-operations";
@@ -16,6 +16,87 @@ const authority: ManagedTurnAuthority = {
 };
 
 describe("managed session operations", () => {
+	test.each(["acquire", "query", "request", "prompt"] as const)(
+		"late %s reconciliation cannot acquire or dispatch under a renewed budget",
+		async operation => {
+			const fake = new FakeRuntime();
+			const entered = deferred<void>();
+			const release = deferred<void>();
+			fake.reconcile = async timeoutMs => {
+				fake.reconcileTimeouts.push(timeoutMs);
+				entered.resolve();
+				await release.promise;
+			};
+			const operations = createManagedSessionOperations(fake.runtime, 50);
+			const pending = (
+				operation === "acquire"
+					? operations.acquire(authority)
+					: operation === "query"
+						? operations.getModels(authority)
+						: operation === "request"
+							? operations.request({ authority, operation: "turn.steer" })
+							: operations.prompt({ authority, operation: "turn.prompt", text: "blocked" })
+			).catch(error => error);
+			await entered.promise;
+			expect(await pending).toMatchObject({ code: "timeout" });
+			expect(fake.reconcileTimeouts[0]).toBeGreaterThan(0);
+			expect(fake.reconcileTimeouts[0]).toBeLessThanOrEqual(50);
+			release.resolve();
+			await new Promise(resolve => setTimeout(resolve, 0));
+			expect(fake.acquireTimeouts).toEqual([]);
+			expect(fake.requests).toEqual([]);
+		},
+	);
+
+	test("retirement reconcile expiry cannot start generation observation", async () => {
+		const fake = new FakeRuntime();
+		let now = Date.now();
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		fake.reconcile = async timeoutMs => {
+			fake.reconcileTimeouts.push(timeoutMs);
+			now += 1_001;
+		};
+		try {
+			await expect(
+				createManagedSessionOperations(fake.runtime, 1_000).close({
+					authority,
+					target: { sessionId: authority.sessionId },
+				}),
+			).rejects.toMatchObject({ code: "timeout" });
+			expect(fake.lifecycle).toHaveLength(1);
+			expect(fake.statusTimeouts).toEqual([]);
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
+	test("expired postdispatch cancellation does not create a fresh one-millisecond abort", async () => {
+		const fake = new FakeRuntime();
+		const controller = new AbortController();
+		let now = Date.now();
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		let admissionCount = 0;
+		try {
+			await expect(
+				createManagedSessionOperations(fake.runtime, 1_000).prompt({
+					authority,
+					operation: "turn.prompt",
+					text: "cancel",
+					signal: controller.signal,
+					onDispatch: () => {
+						admissionCount = fake.reconcileTimeouts.length;
+						now += 1_001;
+						controller.abort();
+					},
+				}),
+			).rejects.toMatchObject({ code: "gjc_turn_cancelled" });
+			expect(fake.reconcileTimeouts).toHaveLength(admissionCount);
+			expect(fake.requests.filter(request => request.operation === "turn.abort")).toEqual([]);
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
 	test("uses external lifecycle adoption, exact tenant authority, public Router envelopes, and bounded pages", async () => {
 		const fake = new FakeRuntime();
 		const operations = createManagedSessionOperations(fake.runtime);
@@ -376,12 +457,18 @@ class FakeRuntime {
 	repeatCursor = false;
 	queryHandler: ((frame: Record<string, unknown>, page: number) => Promise<Record<string, unknown>>) | undefined;
 	readonly requestTimeouts: (number | undefined)[] = [];
+	readonly reconcileTimeouts: (number | undefined)[] = [];
+	readonly acquireTimeouts: (number | undefined)[] = [];
+	readonly statusTimeouts: (number | undefined)[] = [];
 	queryCount = 0;
 	get runtime(): ManagedSdkRuntime {
 		return this as unknown as ManagedSdkRuntime;
 	}
-	async reconcile() {}
-	async acquireAttachment(key: unknown) {
+	async reconcile(timeoutMs?: number) {
+		this.reconcileTimeouts.push(timeoutMs);
+	}
+	async acquireAttachment(key: unknown, timeoutMs?: number) {
+		this.acquireTimeouts.push(timeoutMs);
 		const tenant = key as typeof authority;
 		if (
 			this.rejectTenant ||
@@ -524,22 +611,23 @@ class FakeRuntime {
 		};
 		return unsubscribe;
 	}
-	async generationStatus() {
+	async generationStatus(_key: unknown, timeoutMs?: number) {
+		this.statusTimeouts.push(timeoutMs);
 		return { status: this.status };
 	}
-	async forkLifecycleSession(request: Record<string, unknown>) {
+	async forkLifecycleSession(_tenant: unknown, request: Record<string, unknown>) {
 		this.lifecycle.push({ operation: "fork", request });
 		return lifecycleSuccess();
 	}
-	async closeLifecycleSession(request: Record<string, unknown>) {
+	async closeLifecycleSession(_tenant: unknown, request: Record<string, unknown>) {
 		this.lifecycle.push({ operation: "close", request });
 		return this.retirementOutcome;
 	}
-	async deleteLifecycleSession(request: Record<string, unknown>) {
+	async deleteLifecycleSession(_tenant: unknown, request: Record<string, unknown>) {
 		this.lifecycle.push({ operation: "delete", request });
 		return this.retirementOutcome;
 	}
-	async listLifecycleSessions(request: Record<string, unknown>) {
+	async listLifecycleSessions(_tenant: unknown, request: Record<string, unknown>) {
 		this.lifecycle.push({ operation: "list", request });
 		return { ok: true, result: { sessions: [] } };
 	}
