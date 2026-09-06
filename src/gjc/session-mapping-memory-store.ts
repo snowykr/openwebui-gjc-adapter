@@ -1030,6 +1030,10 @@ function provisionalOperationForScope(
 	operation: ProvisionalSessionOperation,
 	scope: CanonicalScope,
 ): ProvisionalSessionOperation {
+	if (operation.historicalBinding !== undefined) {
+		bindingForScope(operation, scope, false);
+		return structuredClone(operation);
+	}
 	const { managedAuthority: _managed, historicalBinding: _history, ...rest } = operation;
 	return {
 		...rest,
@@ -1042,6 +1046,10 @@ function provisionalOperationForScope(
 }
 
 function operationResultForScope(result: SessionOperationResult, scope: CanonicalScope): SessionOperationResult {
+	if (result.historicalBinding !== undefined) {
+		bindingForScope(result, scope, true);
+		return structuredClone(result);
+	}
 	const { managedAuthority: _managed, historicalBinding: _history, ...rest } = result;
 	const { principalId, ...mapping } = result.mapping as SessionOperationResult["mapping"] & {
 		readonly principalId?: string;
@@ -1111,6 +1119,10 @@ function operationForScope(
 }
 
 function resultForLogicalScope(result: SessionOperationResult, scope: CanonicalScope): SessionOperationResult {
+	if (result.historicalBinding !== undefined) {
+		bindingForScope(result, scope, false);
+		return structuredClone(result);
+	}
 	const { managedAuthority: _managed, historicalBinding: _history, ...rest } = result;
 	return {
 		...rest,
@@ -1147,7 +1159,7 @@ function bindingForScope(
 			throw new Error("Historical authority principal does not match the requested scope.");
 		if (history.chatId !== scope.chatId && history.chatId !== scope.key)
 			throw new Error("Historical authority chat does not match the requested scope.");
-		return { historicalBinding: { ...history, chatId: stored ? scope.key : scope.chatId } };
+		return copied;
 	}
 	if (copied.managedAuthority === undefined) return copied;
 	return {
@@ -1158,6 +1170,10 @@ function bindingForScope(
 }
 
 function authorityRecordForScope(record: SessionAuthorityRecord, scope: CanonicalScope): SessionAuthorityRecord {
+	if (record.historicalBinding !== undefined) {
+		bindingForScope(record, scope, false);
+		return structuredClone(record);
+	}
 	const { managedAuthority: _managed, historicalBinding: _history, ...rest } = record;
 	return {
 		...rest,
@@ -1188,6 +1204,10 @@ function authorityTombstoneForScope(
 	tombstone: SessionAuthorityTombstone,
 	scope: CanonicalScope,
 ): SessionAuthorityTombstone {
+	if (tombstone.historicalBinding !== undefined) {
+		bindingForScope(tombstone, scope, false);
+		return structuredClone(tombstone);
+	}
 	const { managedAuthority: _managed, historicalBinding: _history, ...rest } = tombstone;
 	return {
 		...rest,

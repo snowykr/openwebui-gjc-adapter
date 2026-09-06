@@ -700,7 +700,7 @@ function bindingV3(
 	if (value.historicalBinding !== undefined) {
 		if (value.managedAuthority !== undefined) throw new Error("Historical evidence cannot carry managed authority.");
 		const history = structuredClone(value.historicalBinding);
-		return { historicalBinding: durableChatId === undefined ? history : { ...history, chatId: durableChatId } };
+		return { historicalBinding: history };
 	}
 	return { managedAuthority: authorityV3ForDurableChat(value.managedAuthority, context, durableChatId) };
 }
@@ -710,7 +710,10 @@ function toV3Result(result: SessionOperationResult, context: string, durableChat
 	return {
 		...rest,
 		...bindingV3(result, context, durableChatId),
-		mapping: resultMappingForDurableChat(result.mapping, durableChatId),
+		mapping: resultMappingForDurableChat(
+			result.mapping,
+			result.historicalBinding === undefined ? durableChatId : undefined,
+		),
 	};
 }
 function toV3Operation(
@@ -761,6 +764,7 @@ function resultMappingForDurableChat(
 	return durableChatId === undefined ? v3 : { ...v3, chatId: durableChatId };
 }
 function toV3Tombstone(tombstone: SessionAuthorityTombstone, durableChatId?: string): SessionAuthorityV3Tombstone {
+	const ownedChatId = tombstone.historicalBinding === undefined ? durableChatId : undefined;
 	const {
 		version: _version,
 		attachment: _attachment,
@@ -772,12 +776,10 @@ function toV3Tombstone(tombstone: SessionAuthorityTombstone, durableChatId?: str
 	} = tombstone;
 	return {
 		...rest,
-		...(durableChatId === undefined
-			? {}
-			: { chatId: durableChatId, header: { ...rest.header, chatId: durableChatId } }),
+		...(ownedChatId === undefined ? {} : { chatId: ownedChatId, header: { ...rest.header, chatId: ownedChatId } }),
 		version: 3,
 		authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
-		...bindingV3(tombstone, "tombstone", durableChatId),
+		...bindingV3(tombstone, "tombstone", ownedChatId),
 		journal: journal.map(item => toV3Operation(item, "tombstone operation", durableChatId)),
 		...(prior === undefined ? {} : { prior: toV3Tombstone(prior, durableChatId) }),
 	};

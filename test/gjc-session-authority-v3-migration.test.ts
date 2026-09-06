@@ -230,7 +230,7 @@ describe("generation-free ordinary V3 historical migration", () => {
 			const replay = store.operationScoped(scope, "turn");
 			expect(replay?.result?.assistantText).toBe("answer");
 			expect(replay?.result?.mapping.sessionFile).toBe("/legacy/replay.jsonl");
-			expect(replay?.result?.historicalBinding?.chatId).toBe("chat-a");
+			expect(replay?.result).toEqual(document.mappings[0]!.journal[0]!.result);
 			expect(store.operationScoped(foreign, "turn")).toBeUndefined();
 			expect(store.operationsScoped(scope).map(operation => operation.state)).toEqual([
 				"complete",
@@ -238,7 +238,9 @@ describe("generation-free ordinary V3 historical migration", () => {
 				"conflict",
 				"uncertain",
 			]);
-			expect(store.provisionalOperationScoped(scope, "provisional")?.historicalBinding?.chatId).toBe("chat-a");
+			expect(store.provisionalOperationScoped(scope, "provisional")?.historicalBinding).toEqual(
+				document.provisionalOperations[0]!.historicalBinding,
+			);
 			expect(() => store.beginOperationScoped(scope, { id: "new", kind: "prompt" })).toThrow(
 				"explicit bootstrap proof",
 			);
@@ -283,6 +285,11 @@ describe("generation-free ordinary V3 historical migration", () => {
 			const current = store.getScoped(scope);
 			if (current?.managedAuthority === undefined) throw new Error("Missing proven current mapping.");
 			const original = store.operationScoped(scope, "turn");
+			expect(original?.result).toEqual(document.mappings[0]!.journal[0]!.result);
+			expect(store.operationScoped(scope, "next")?.acknowledgedSuccessor).toEqual(
+				document.mappings[0]!.journal[1]!.acknowledgedSuccessor,
+			);
+			const persistedBefore = parseSessionAuthorityV3Document(readFileSync(file))!;
 			store.beginOperationScoped(scope, { id: "later", kind: "prompt", detail: "later-hash" });
 			store.completeOperationWithMappingScoped(
 				scope,
@@ -295,6 +302,12 @@ describe("generation-free ordinary V3 historical migration", () => {
 			expect(store.operationScoped(scope, "turn")?.result?.managedAuthority).toBeUndefined();
 			expect(store.operationScoped(scope, "turn")?.result?.historicalBinding).toBeDefined();
 			expect(store.operationScoped(scope, "later")?.result?.managedAuthority?.generation).toBe(7);
+			expect(store.operationScoped(scope, "later")?.result?.mapping.chatId).toBe(scope.chatId);
+			const persistedAfter = parseSessionAuthorityV3Document(readFileSync(file))!;
+			expect(persistedAfter.mappings[0]!.journal.slice(0, persistedBefore.mappings[0]!.journal.length)).toEqual([
+				...persistedBefore.mappings[0]!.journal,
+			]);
+			expect(persistedAfter.mappings[0]!.reassignment).toEqual(persistedBefore.mappings[0]!.reassignment);
 			store.close();
 			const reopened = new V3FileBackedSessionMappingStore(file);
 			expect(reopened.operationScoped(scope, "turn")).toEqual(original);

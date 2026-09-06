@@ -330,6 +330,12 @@ describe("adapter managed bootstrap composition", () => {
 						7,
 					);
 					expect(reopened.getScoped({ principalId: "foreign", chatId: "chat" })).toBeUndefined();
+					const retainedOlder = persisted.mappings[0]!.reassignment!.priorTombstone!;
+					const older = reopened.operationAuthorityScoped({ principalId: "owner", chatId: "chat" }, "older-turn");
+					expect(older?.chatId).toBe(retainedOlder.chatId);
+					expect(older?.header).toEqual(retainedOlder.header);
+					expect(older?.historicalBinding).toEqual(retainedOlder.historicalBinding);
+					expect(older?.journal).toEqual(retainedOlder.journal);
 					expect(
 						reopened.operationScoped({ principalId: "owner", chatId: "chat" }, "older-turn")?.result
 							?.historicalBinding,
