@@ -137,6 +137,134 @@ const active = (owner = "tenant-a", lastActivityAt = 0): ManagedIdleGenerationRe
 });
 
 describe("managed idle reaper", () => {
+	test.each(["active", "admission", "lease", "fence", "close", "reconcile", "status", "publication"] as const)(
+		"bounds hanging %s within the single retirement budget and drains stop",
+		async phase => {
+			const never = new Promise<never>(() => {});
+			const entered = deferred<void>();
+			const stall = () => {
+				entered.resolve();
+				return never;
+			};
+			let closes = 0;
+			let statuses = 0;
+			let released = 0;
+			const store = new Store([active()]);
+			if (phase === "active") store.active = stall;
+			if (phase === "publication") store.publishRetired = stall;
+			const subject = harness([], "retired", undefined, {
+				records: store,
+				closeTimeoutMs: 60,
+				admission: {
+					acquire: async () =>
+						phase === "admission"
+							? stall()
+							: () => {
+									released += 1;
+								},
+				},
+				leases: {
+					acquire: async () =>
+						phase === "lease"
+							? stall()
+							: {
+									assertFence: async () => {
+										if (phase === "fence") await stall();
+									},
+									release: async () => {
+										released += 1;
+									},
+								},
+				},
+				runtime: {
+					closeLifecycleSession: async request => {
+						closes += 1;
+						if (phase === "close") await stall();
+						expect(request.timeoutMs).toBeGreaterThan(0);
+						expect(request.timeoutMs).toBeLessThanOrEqual(60);
+						return { ok: true, result: { sessionId: request.target.sessionId } };
+					},
+					reconcile: async () => {
+						if (phase === "reconcile") await stall();
+					},
+					generationStatus: async () => {
+						statuses += 1;
+						if (phase === "status") await stall();
+						return { status: "retired", evidence: retirementEvidence };
+					},
+				},
+			});
+			const scan = subject.reaper.runOnce();
+			void scan.catch(() => undefined);
+			await entered.promise;
+			const stop = subject.reaper.stop();
+			void stop.catch(() => undefined);
+			await expect(scan).rejects.toMatchObject({ code: "timeout" });
+			await expect(stop).rejects.toMatchObject({ code: "timeout" });
+			expect(store.evicted).toEqual([]);
+			if (["active", "admission", "lease", "fence"].includes(phase)) expect(closes).toBe(0);
+			if (["close", "reconcile"].includes(phase)) expect(statuses).toBe(0);
+			if (["reconcile", "status", "publication"].includes(phase)) expect(store.acknowledged).toHaveLength(1);
+			if (phase === "publication") {
+				expect(store.retired).toHaveLength(1);
+				expect(store.uncertain).toEqual([]);
+			}
+			if (["fence", "close", "reconcile", "status", "publication"].includes(phase)) expect(released).toBe(2);
+		},
+	);
+
+	test.each(["admission", "lease"] as const)("releases a late %s without late close dispatch", async phase => {
+		const gate = deferred<void>();
+		const entered = deferred<void>();
+		const released = deferred<void>();
+		let closes = 0;
+		const subject = harness([active()], "retired", undefined, {
+			closeTimeoutMs: 30,
+			admission: {
+				acquire: async () => {
+					if (phase === "admission") {
+						entered.resolve();
+						await gate.promise;
+					}
+					return () => {
+						if (phase === "admission") released.resolve();
+					};
+				},
+			},
+			leases: {
+				acquire: async () => {
+					entered.resolve();
+					await gate.promise;
+					return {
+						assertFence: async () => {
+							throw new Error("late fence");
+						},
+						release: async () => {
+							released.resolve();
+						},
+					};
+				},
+			},
+			runtime: {
+				closeLifecycleSession: async () => {
+					closes += 1;
+					throw new Error("late close");
+				},
+				reconcile: async () => {},
+				generationStatus: async () => ({ status: "unknown" }),
+			},
+		});
+		const scan = subject.reaper.runOnce();
+		void scan.catch(() => undefined);
+		await entered.promise;
+		await expect(scan).rejects.toMatchObject({ code: "timeout" });
+		gate.resolve();
+		await released.promise;
+		expect(closes).toBe(0);
+		expect(subject.store.prepared).toEqual([]);
+		await subject.reaper.stop();
+	});
+
 	test("polls at the configured interval but waits the full idle threshold and clears once on stop", async () => {
 		let now = DEFAULT_MANAGED_IDLE_TIMEOUT_MS - 1;
 		let poll!: () => void;

@@ -1,10 +1,13 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, mock, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { activateAdapterSessionAuthorityV3, createAdapterManagedBootstrap } from "../src/adapter-managed-bootstrap";
 import type { SessionMapping } from "../src/gjc/session-router";
+import { V3FileBackedSessionMappingStore } from "../src/gjc/session-v3-file-backed-mapping-store";
 import type { RegisteredProject } from "../src/projects/registry";
+import { RuntimeSingletonLock } from "../src/runtime-singleton-lock";
 
 const project = (cwd: string): RegisteredProject => ({
 	id: "project",
@@ -37,6 +40,89 @@ function mapping(principalId: string | undefined, sessionFile: string, workspace
 }
 
 describe("adapter managed bootstrap composition", () => {
+	test("reopens unbound scoped history before any public runtime or lifecycle effect", async () => {
+		const root = await mkdtemp(join(tmpdir(), "adapter-managed-unbound-"));
+		const sourcePath = join(root, "authority.json");
+		const chatId = JSON.stringify(["owner", "chat"]);
+		const timestamp = "2026-01-01T00:00:00.000Z";
+		const original = JSON.stringify({
+			kind: "openwebui-gjc-session-authority",
+			version: 2,
+			mappings: [
+				{
+					version: 2,
+					chatId,
+					projectId: "project",
+					sessionId: "session",
+					createdAt: timestamp,
+					header: { chatId, projectId: "project", sessionId: "session" },
+					rawFrameCursor: 0,
+					eventCursor: 0,
+					operationId: "turn",
+					sessionFile: "/history/session.jsonl",
+					observations: {
+						__gjcSessionMappingScope: { principalId: "owner", chatId: "chat" },
+					},
+					journal: [
+						{
+							id: "turn",
+							kind: "prompt",
+							state: "complete",
+							startedAt: timestamp,
+							completedAt: timestamp,
+							result: {
+								kind: "turn",
+								assistantText: "retained answer",
+								mapping: {
+									chatId,
+									projectId: "project",
+									sessionId: "session",
+									operationId: "turn",
+									rawFrameCursor: 0,
+									eventCursor: 0,
+								},
+							},
+						},
+					],
+				},
+			],
+			provisionalOperations: [],
+		});
+		await writeFile(sourcePath, original);
+		const runtimeLock = await RuntimeSingletonLock.acquire(root);
+		const effect = mock(() => {
+			throw new Error("Public effects are forbidden before staged proof.");
+		});
+		try {
+			const result = await activateAdapterSessionAuthorityV3({
+				locations: { agentDir: root, stateRoot: root },
+				configuredOwnerUserId: "owner",
+				sourcePath,
+				runtimeLock,
+				authority: { resolve: effect },
+				runtime: { start: effect, resumeExternalLifecycleSession: effect } as never,
+				lifecycle: { resumeLifecycleSession: effect },
+			});
+			expect(result.status).toBe("blocked");
+			expect(effect).not.toHaveBeenCalled();
+			expect(await Bun.file(sourcePath).text()).toBe(original);
+			expect(await Bun.file(`${sourcePath}.v3-active.json`).exists()).toBe(false);
+			const staged = join(
+				root,
+				`session-authority-v3-${createHash("sha256").update(sourcePath).digest("hex").slice(0, 16)}`,
+				"canonical.v3.json",
+			);
+			const store = new V3FileBackedSessionMappingStore(staged);
+			expect(store.getScoped({ principalId: "owner", chatId: "chat" })).toBeUndefined();
+			expect(store.operationScoped({ principalId: "owner", chatId: "chat" }, "turn")?.result?.assistantText).toBe(
+				"retained answer",
+			);
+			store.close();
+		} finally {
+			await runtimeLock.release();
+		}
+	});
+
 	test("activates an absent authority as an empty canonical V3 store without reading session files", async () => {
 		const root = await mkdtemp(join(tmpdir(), "adapter-managed-v3-empty-"));
 		const sourcePath = join(root, "authority.v2.json");
@@ -49,16 +135,18 @@ describe("adapter managed bootstrap composition", () => {
 			acquireAttachment: async () => ({ isCurrent: () => true }),
 			generationStatus: async () => ({ status: "current" }),
 		} as never;
+		const runtimeLock = await RuntimeSingletonLock.acquire(root);
 		const result = await activateAdapterSessionAuthorityV3({
 			locations: { agentDir: root, stateRoot: root },
 			configuredOwnerUserId: "owner",
 			mappings: { mappingRecordsIterable: function* () {} },
 			sourcePath,
-			runtimeLock: { release: async () => {} } as never,
+			runtimeLock,
 			authority: { resolve: async () => undefined },
 			runtime,
 			lifecycle: {} as never,
 		});
+		await runtimeLock.release();
 		expect(result.status).toBe("activated");
 		if (result.status !== "activated") return;
 		expect(result.store.mappingRecords()).toEqual([]);
@@ -70,6 +158,7 @@ describe("adapter managed bootstrap composition", () => {
 		const sourcePath = join(root, "authority.v2.json");
 		const bytes = '{"kind":"openwebui-gjc-session-authority","version":2,"mappings":[]}\n';
 		await writeFile(sourcePath, bytes);
+		const runtimeLock = await RuntimeSingletonLock.acquire(root);
 		const result = await activateAdapterSessionAuthorityV3({
 			locations: { agentDir: root, stateRoot: root },
 			configuredOwnerUserId: "owner",
@@ -79,11 +168,12 @@ describe("adapter managed bootstrap composition", () => {
 				},
 			},
 			sourcePath,
-			runtimeLock: { release: async () => {} } as never,
+			runtimeLock,
 			authority: { resolve: async () => undefined },
 			runtime: {} as never,
 			lifecycle: {} as never,
 		});
+		await runtimeLock.release();
 		expect(result.status).toBe("blocked");
 		expect(await Bun.file(sourcePath).text()).toBe(bytes);
 	});

@@ -6,6 +6,7 @@ import {
 	type ManagedLifecycleEvidence,
 	managedLifecycleEvidenceHash,
 } from "./managed-lifecycle-evidence";
+import type { HistoricalSessionBinding } from "./session-authority-types";
 import {
 	isJsonValue,
 	isNonEmptyString,
@@ -37,10 +38,13 @@ export interface ManagedTurnAuthorityV3 extends ManagedTurnAuthority {
 	readonly authorityEpoch: typeof SESSION_AUTHORITY_V3_EPOCH;
 }
 
-export interface SessionAuthorityV3Result {
+export type SessionAuthorityV3Binding =
+	| { readonly managedAuthority: ManagedTurnAuthorityV3; readonly historicalBinding?: never }
+	| { readonly managedAuthority?: never; readonly historicalBinding: HistoricalSessionBinding };
+
+export type SessionAuthorityV3Result = SessionAuthorityV3Binding & {
 	readonly kind: "turn" | "control" | "close";
 	readonly assistantText: string;
-	readonly managedAuthority: ManagedTurnAuthorityV3;
 	readonly events?: readonly GjcTurnEvent[];
 	readonly mapping: Readonly<{
 		chatId: string;
@@ -49,16 +53,17 @@ export interface SessionAuthorityV3Result {
 		rawFrameCursor: number;
 		eventCursor: number;
 		operationId: string;
+		sessionFile?: string;
+		activeLeaf?: string;
 		modelSelection?: NormalizedModelSelection;
 	}>;
 	readonly correlation?: Readonly<Record<string, string>>;
 	readonly gate?: Readonly<{ gateId: string; commandId?: string; turnId?: string; sessionId?: string }>;
-}
+};
 
-export interface SessionAuthorityV3AcknowledgedSuccessor {
+export type SessionAuthorityV3AcknowledgedSuccessor = SessionAuthorityV3Binding & {
 	readonly sessionId: string;
-	readonly managedAuthority: ManagedTurnAuthorityV3;
-}
+};
 
 export interface SessionAuthorityV3Operation {
 	readonly id: string;
@@ -73,7 +78,7 @@ export interface SessionAuthorityV3Operation {
 	readonly lifecycle?: ManagedLifecycleEvidence;
 }
 
-export interface SessionAuthorityV3Tombstone {
+export type SessionAuthorityV3Tombstone = SessionAuthorityV3Binding & {
 	readonly version: typeof SESSION_AUTHORITY_V3_VERSION;
 	readonly authorityEpoch: typeof SESSION_AUTHORITY_V3_EPOCH;
 	readonly chatId: string;
@@ -81,6 +86,8 @@ export interface SessionAuthorityV3Tombstone {
 	readonly sessionId: string;
 	readonly createdAt: string;
 	readonly header: Readonly<{ chatId: string; projectId: string; sessionId: string }>;
+	readonly sessionFile?: string;
+	readonly activeLeaf?: string;
 	readonly rawFrameCursor: number;
 	readonly eventCursor: number;
 	readonly operationId: string;
@@ -88,11 +95,10 @@ export interface SessionAuthorityV3Tombstone {
 	readonly events?: readonly GjcTurnEvent[];
 	readonly modelSelection?: NormalizedModelSelection;
 	readonly observations?: Readonly<Record<string, unknown>>;
-	readonly managedAuthority: ManagedTurnAuthorityV3;
 	readonly journal: readonly SessionAuthorityV3Operation[];
 	readonly retiredAt: string;
 	readonly prior?: SessionAuthorityV3Tombstone;
-}
+};
 
 export interface SessionAuthorityV3Reassignment {
 	readonly state: "pending" | "rolled_back" | "committed";
@@ -110,7 +116,7 @@ export interface SessionAuthorityV3Reassignment {
 	readonly priorTombstone?: SessionAuthorityV3Tombstone;
 }
 
-export interface SessionAuthorityV3Mapping {
+export type SessionAuthorityV3Mapping = SessionAuthorityV3Binding & {
 	readonly version: typeof SESSION_AUTHORITY_V3_VERSION;
 	readonly authorityEpoch: typeof SESSION_AUTHORITY_V3_EPOCH;
 	readonly chatId: string;
@@ -118,6 +124,8 @@ export interface SessionAuthorityV3Mapping {
 	readonly sessionId: string;
 	readonly createdAt: string;
 	readonly header: Readonly<{ chatId: string; projectId: string; sessionId: string }>;
+	readonly sessionFile?: string;
+	readonly activeLeaf?: string;
 	readonly rawFrameCursor: number;
 	readonly eventCursor: number;
 	readonly operationId: string;
@@ -125,17 +133,23 @@ export interface SessionAuthorityV3Mapping {
 	readonly events?: readonly GjcTurnEvent[];
 	readonly modelSelection?: NormalizedModelSelection;
 	readonly observations?: Readonly<Record<string, unknown>>;
-	readonly managedAuthority: ManagedTurnAuthorityV3;
 	readonly journal: readonly SessionAuthorityV3Operation[];
 	readonly reassignment?: SessionAuthorityV3Reassignment;
-}
+};
 
-export interface SessionAuthorityV3ProvisionalOperation extends SessionAuthorityV3Operation {
+export type SessionAuthorityV3ProvisionalOperation = SessionAuthorityV3Operation & {
 	readonly chatId: string;
 	readonly projectId: string;
-	readonly sessionId?: string;
-	readonly managedAuthority?: ManagedTurnAuthorityV3;
-}
+	readonly sessionFile?: string;
+	readonly activeLeaf?: string;
+} & (
+		| ({ readonly sessionId: string } & SessionAuthorityV3Binding)
+		| {
+				readonly sessionId?: never;
+				readonly managedAuthority?: never;
+				readonly historicalBinding?: HistoricalSessionBinding;
+		  }
+	);
 
 export interface SessionAuthorityV3Document {
 	readonly kind: typeof SESSION_AUTHORITY_V3_KIND;
@@ -158,9 +172,14 @@ const FORBIDDEN_FIELDS = new Set([
 	"tmuxPanePid",
 	"tmuxOwnershipTag",
 	"ownedAt",
-	"sessionFile",
-	"activeLeaf",
 	"recoveryAttachment",
+	"token",
+	"endpointToken",
+	"endpointUrl",
+	"endpointIncarnation",
+	"processIncarnation",
+	"hostIncarnation",
+	"pid",
 ]);
 const operationKinds = new Set<SessionAuthorityV3OperationKind>([
 	"create",
@@ -215,11 +234,12 @@ export function isSessionAuthorityV3RelationallyValid(
 	const provisionalIdentities = new Set<string>();
 	for (const mapping of document.mappings) {
 		if (mappings.has(mapping.chatId)) return false;
+		const mappingBinding = bindingIdentity(mapping);
 		const scope = mapping.observations?.__gjcSessionMappingScope;
 		if (
 			scope !== undefined &&
 			(!isRecord(scope) ||
-				scope.principalId !== mapping.managedAuthority.principalId ||
+				scope.principalId !== mappingBinding?.principalId ||
 				(scope.chatId !== undefined &&
 					(typeof scope.chatId !== "string" ||
 						JSON.stringify([scope.principalId, scope.chatId]) !== mapping.chatId)))
@@ -235,8 +255,8 @@ export function isSessionAuthorityV3RelationallyValid(
 			) {
 				if (
 					tombstone.chatId !== mapping.chatId ||
-					tombstone.managedAuthority.principalId !== mapping.managedAuthority.principalId ||
-					!validateAuthority(tombstone.managedAuthority, tombstone)
+					!compatibleOwnership(mapping, tombstone, false) ||
+					!validateBinding(tombstone, tombstone)
 				)
 					return false;
 				if (!validateJournal(tombstone, tombstone.journal, identities)) return false;
@@ -250,8 +270,8 @@ export function isSessionAuthorityV3RelationallyValid(
 				provisional.lifecycle,
 				provisional.chatId,
 				provisional.projectId,
-				provisional.managedAuthority ??
-					(mapping?.projectId === provisional.projectId ? mapping.managedAuthority : undefined),
+				bindingIdentity(provisional) ??
+					(mapping?.projectId === provisional.projectId ? bindingIdentity(mapping) : undefined),
 			)
 		)
 			return false;
@@ -263,13 +283,13 @@ export function isSessionAuthorityV3RelationallyValid(
 		const publicationReceipt = isCompletedPublicationReceipt(mapping, provisional);
 		if (
 			mapping !== undefined &&
-			provisional.managedAuthority !== undefined &&
-			provisional.managedAuthority.principalId !== mapping.managedAuthority.principalId
+			bindingIdentity(provisional) !== undefined &&
+			!compatibleOwnership(mapping, provisional, mapping.projectId === provisional.projectId)
 		)
 			return false;
 		if (
 			provisional.sessionId !== undefined &&
-			!validateAuthority(provisional.managedAuthority, {
+			!validateBinding(provisional, {
 				chatId: provisional.chatId,
 				projectId: provisional.projectId,
 				sessionId: provisional.sessionId,
@@ -277,8 +297,8 @@ export function isSessionAuthorityV3RelationallyValid(
 		)
 			return false;
 		const owner =
-			provisional.managedAuthority ??
-			(mapping?.projectId === provisional.projectId ? mapping.managedAuthority : undefined);
+			bindingIdentity(provisional) ??
+			(mapping?.projectId === provisional.projectId ? bindingIdentity(mapping) : undefined);
 		if (
 			(provisional.result !== undefined || provisional.acknowledgedSuccessor !== undefined) &&
 			(owner === undefined ||
@@ -287,7 +307,7 @@ export function isSessionAuthorityV3RelationallyValid(
 						chatId: provisional.chatId,
 						projectId: provisional.projectId,
 						sessionId: owner.sessionId,
-						managedAuthority: owner,
+						binding: owner,
 					},
 					[provisional],
 					new Map(),
@@ -333,6 +353,17 @@ export function encodeSessionAuthorityV3Document(document: SessionAuthorityV3Doc
 	return `${JSON.stringify(canonicalize(copySessionAuthorityV3Document(document)))}\n`;
 }
 
+/** Historical journal/tombstone nodes remain readable; unbound live mappings
+ * and unresolved provisional roots cannot admit a serving runtime. */
+export function hasUnboundServingAuthority(document: SessionAuthorityV3Document): boolean {
+	return (
+		document.mappings.some(mapping => mapping.historicalBinding !== undefined) ||
+		document.provisionalOperations.some(
+			operation => operation.historicalBinding !== undefined && operation.state !== "complete",
+		)
+	);
+}
+
 function isMapping(value: unknown): value is SessionAuthorityV3Mapping {
 	return (
 		isRecordShape(value, [
@@ -351,6 +382,9 @@ function isMapping(value: unknown): value is SessionAuthorityV3Mapping {
 			"modelSelection",
 			"observations",
 			"managedAuthority",
+			"historicalBinding",
+			"sessionFile",
+			"activeLeaf",
 			"journal",
 			"reassignment",
 		]) &&
@@ -360,10 +394,7 @@ function isMapping(value: unknown): value is SessionAuthorityV3Mapping {
 		isTimestamp(value.createdAt) &&
 		isCursors(value) &&
 		optionalFieldsValid(value) &&
-		validateAuthority(
-			value.managedAuthority,
-			value as Readonly<{ chatId: unknown; projectId: unknown; sessionId: unknown }>,
-		) &&
+		validateBinding(value, value as Readonly<{ chatId: unknown; projectId: unknown; sessionId: unknown }>) &&
 		Array.isArray(value.journal) &&
 		value.journal.every(
 			operation =>
@@ -372,7 +403,7 @@ function isMapping(value: unknown): value is SessionAuthorityV3Mapping {
 					operation.lifecycle,
 					value.chatId as string,
 					value.projectId as string,
-					value.managedAuthority,
+					bindingIdentity(value),
 				) &&
 				validateLifecycleSourceReference(operation, value.journal as SessionAuthorityV3Operation[]),
 		) &&
@@ -398,6 +429,9 @@ function isProvisional(value: unknown): value is SessionAuthorityV3ProvisionalOp
 			"projectId",
 			"sessionId",
 			"managedAuthority",
+			"historicalBinding",
+			"sessionFile",
+			"activeLeaf",
 		])
 	)
 		return false;
@@ -405,13 +439,9 @@ function isProvisional(value: unknown): value is SessionAuthorityV3ProvisionalOp
 		isNonEmptyString(value.chatId) &&
 		isNonEmptyString(value.projectId) &&
 		isOperation(value) &&
-		validateLifecycleOwner(value.lifecycle, value.chatId, value.projectId, value.managedAuthority) &&
-		((value.sessionId === undefined && value.managedAuthority === undefined) ||
-			(isNonEmptyString(value.sessionId) &&
-				validateAuthority(
-					value.managedAuthority,
-					value as unknown as Readonly<{ chatId: unknown; projectId: unknown; sessionId: unknown }>,
-				)))
+		validProjection(value) &&
+		validateLifecycleOwner(value.lifecycle, value.chatId, value.projectId, bindingIdentity(value)) &&
+		validateBinding(value, { chatId: value.chatId, projectId: value.projectId, sessionId: value.sessionId }, true)
 	);
 }
 
@@ -432,6 +462,9 @@ function isOperation(value: unknown): value is SessionAuthorityV3Operation {
 			"projectId",
 			"sessionId",
 			"managedAuthority",
+			"historicalBinding",
+			"sessionFile",
+			"activeLeaf",
 		])
 	)
 		return false;
@@ -484,6 +517,7 @@ function validateOperationLifecycle(operation: SessionAuthorityV3Operation): boo
 	if (
 		successor !== undefined &&
 		(lifecycle.acknowledged === undefined ||
+			successor.managedAuthority === undefined ||
 			successor.sessionId !== lifecycle.acknowledged.sessionId ||
 			!matchesLifecycleAuthority(successor.managedAuthority, lifecycle.acknowledged))
 	)
@@ -494,6 +528,7 @@ function validateOperationLifecycle(operation: SessionAuthorityV3Operation): boo
 	if (lifecycle.state !== "active_generation_proven" && lifecycle.state !== "retired") return false;
 	const result = operation.result;
 	if (result === undefined) return true;
+	if (result.managedAuthority === undefined) return false;
 	if (lifecycle.operation === "session.close") {
 		const source = lifecycle.source;
 		const retirement = lifecycle.retirement;
@@ -547,6 +582,7 @@ function isResult(value: unknown): value is SessionAuthorityV3Result {
 			"kind",
 			"assistantText",
 			"managedAuthority",
+			"historicalBinding",
 			"events",
 			"mapping",
 			"correlation",
@@ -555,7 +591,7 @@ function isResult(value: unknown): value is SessionAuthorityV3Result {
 		(value.kind !== "turn" && value.kind !== "control" && value.kind !== "close") ||
 		typeof value.assistantText !== "string" ||
 		!isResultMapping(value.mapping) ||
-		!validateAuthority(value.managedAuthority, value.mapping)
+		!validateBinding(value, value.mapping)
 	)
 		return false;
 	const correlation = value.correlation as Record<string, unknown> | undefined;
@@ -587,20 +623,23 @@ function isResultMapping(value: unknown): value is SessionAuthorityV3Result["map
 			"rawFrameCursor",
 			"eventCursor",
 			"operationId",
+			"sessionFile",
+			"activeLeaf",
 			"modelSelection",
 		]) &&
 		[value.chatId, value.projectId, value.sessionId, value.operationId].every(isNonEmptyString) &&
 		isCursors(value) &&
+		validProjection(value) &&
 		(value.modelSelection === undefined || normalizeModelSelection(value.modelSelection) !== undefined)
 	);
 }
 
 function isSuccessor(value: unknown): value is SessionAuthorityV3AcknowledgedSuccessor {
-	const authority = isRecord(value) ? (value.managedAuthority as Record<string, unknown> | undefined) : undefined;
+	const authority = bindingIdentity(value);
 	return (
-		isRecordShape(value, ["sessionId", "managedAuthority"]) &&
+		isRecordShape(value, ["sessionId", "managedAuthority", "historicalBinding"]) &&
 		isNonEmptyString(value.sessionId) &&
-		validateAuthority(value.managedAuthority, {
+		validateBinding(value, {
 			chatId: authority?.chatId,
 			projectId: authority?.projectId,
 			sessionId: value.sessionId,
@@ -676,6 +715,9 @@ function isTombstone(value: unknown): value is SessionAuthorityV3Tombstone {
 			"modelSelection",
 			"observations",
 			"managedAuthority",
+			"historicalBinding",
+			"sessionFile",
+			"activeLeaf",
 			"journal",
 			"retiredAt",
 			"prior",
@@ -687,10 +729,7 @@ function isTombstone(value: unknown): value is SessionAuthorityV3Tombstone {
 		isTimestamp(value.retiredAt) &&
 		isCursors(value) &&
 		optionalFieldsValid(value) &&
-		validateAuthority(
-			value.managedAuthority,
-			value as Readonly<{ chatId: unknown; projectId: unknown; sessionId: unknown }>,
-		) &&
+		validateBinding(value, value as Readonly<{ chatId: unknown; projectId: unknown; sessionId: unknown }>) &&
 		Array.isArray(value.journal) &&
 		value.journal.every(
 			operation =>
@@ -699,7 +738,7 @@ function isTombstone(value: unknown): value is SessionAuthorityV3Tombstone {
 					operation.lifecycle,
 					value.chatId as string,
 					value.projectId as string,
-					value.managedAuthority,
+					bindingIdentity(value),
 				) &&
 				validateLifecycleSourceReference(operation, value.journal as SessionAuthorityV3Operation[]),
 		) &&
@@ -709,6 +748,7 @@ function isTombstone(value: unknown): value is SessionAuthorityV3Tombstone {
 
 function validateLifecycleOwner(value: unknown, chatId: string, projectId: string, owner?: unknown): boolean {
 	if (value === undefined) return true;
+	if (isRecord(owner) && owner.kind === "unbound-history") return false;
 	if (!isManagedLifecycleEvidence(value)) return false;
 	const prepared = value.preparedAuthority;
 	if (
@@ -777,20 +817,26 @@ function validateLifecycleSourceReference(
 }
 
 function validateJournal(
-	owner: Pick<SessionAuthorityV3Mapping, "chatId" | "projectId" | "sessionId" | "managedAuthority">,
+	owner: {
+		readonly chatId: string;
+		readonly projectId: string;
+		readonly sessionId?: unknown;
+		readonly binding?: Record<string, unknown>;
+		readonly managedAuthority?: ManagedTurnAuthorityV3;
+		readonly historicalBinding?: HistoricalSessionBinding;
+	},
 	journal: readonly SessionAuthorityV3Operation[],
 	identities: Map<string, string>,
 ): boolean {
 	const local = new Set<string>();
+	const ownerBinding = owner.binding ?? bindingIdentity(owner);
 	for (const operation of journal) {
-		if (!validateLifecycleOwner(operation.lifecycle, owner.chatId, owner.projectId, owner.managedAuthority))
-			return false;
+		if (!validateLifecycleOwner(operation.lifecycle, owner.chatId, owner.projectId, ownerBinding)) return false;
 		const successor = operation.acknowledgedSuccessor;
 		if (
 			successor !== undefined &&
-			(!validateAuthority(successor.managedAuthority, { ...owner, sessionId: successor.sessionId }) ||
-				successor.managedAuthority.principalId !== owner.managedAuthority.principalId ||
-				successor.managedAuthority.canonicalWorkspace !== owner.managedAuthority.canonicalWorkspace)
+			(!validateBinding(successor, { ...owner, sessionId: successor.sessionId }) ||
+				!compatibleBindingOwnership(ownerBinding, bindingIdentity(successor), true))
 		)
 			return false;
 		for (const identifier of operationIdentifiers(operation))
@@ -801,9 +847,8 @@ function validateJournal(
 			(operation.result.mapping.chatId !== owner.chatId ||
 				operation.result.mapping.projectId !== owner.projectId ||
 				operation.result.mapping.operationId !== operation.id ||
-				operation.result.managedAuthority.principalId !== owner.managedAuthority.principalId ||
-				operation.result.managedAuthority.canonicalWorkspace !== owner.managedAuthority.canonicalWorkspace ||
-				!validateAuthority(operation.result.managedAuthority, operation.result.mapping))
+				!compatibleBindingOwnership(ownerBinding, bindingIdentity(operation.result), true) ||
+				!validateBinding(operation.result, operation.result.mapping))
 		)
 			return false;
 		if (!addOperationIdentity(identities, owner.chatId, operation)) return false;
@@ -856,7 +901,7 @@ function isCompletedPublicationReceipt(
 			operation.result !== undefined &&
 			(provisional.sessionId === undefined ||
 				(provisional.sessionId === operation.result.mapping.sessionId &&
-					isDeepStrictEqual(provisional.managedAuthority, operation.result.managedAuthority)))
+					publicationBindingMatches(provisional, operation.result)))
 		);
 	};
 	if (matches(mapping)) return true;
@@ -903,6 +948,139 @@ function validateAuthority(
 	);
 }
 
+function validateBinding(
+	value: unknown,
+	identity: { readonly chatId?: unknown; readonly projectId?: unknown; readonly sessionId?: unknown },
+	unassigned = false,
+): boolean {
+	if (!isRecord(value)) return false;
+	if (value.managedAuthority !== undefined)
+		return (
+			value.historicalBinding === undefined &&
+			isNonEmptyString(identity.sessionId) &&
+			validateAuthority(value.managedAuthority, {
+				chatId: identity.chatId,
+				projectId: identity.projectId,
+				sessionId: identity.sessionId,
+			})
+		);
+	if (value.historicalBinding !== undefined) return isHistoricalSessionBinding(value.historicalBinding, identity);
+	return unassigned && identity.sessionId === undefined;
+}
+
+export function isHistoricalSessionBinding(
+	value: unknown,
+	identity?: { readonly chatId?: unknown; readonly projectId?: unknown; readonly sessionId?: unknown },
+): value is HistoricalSessionBinding {
+	if (
+		!isRecordShape(value, [
+			"kind",
+			"chatId",
+			"projectId",
+			"sessionId",
+			"principalId",
+			"canonicalWorkspace",
+			"reason",
+			"provenance",
+		]) ||
+		value.kind !== "unbound-history" ||
+		!isNonEmptyString(value.chatId) ||
+		!isNonEmptyString(value.projectId) ||
+		(value.sessionId !== undefined && !isNonEmptyString(value.sessionId)) ||
+		(value.principalId !== undefined && !isNonEmptyString(value.principalId)) ||
+		(value.canonicalWorkspace !== undefined &&
+			(!isNonEmptyString(value.canonicalWorkspace) || !isAbsolute(value.canonicalWorkspace)))
+	)
+		return false;
+	if (
+		identity !== undefined &&
+		(value.chatId !== identity.chatId ||
+			value.projectId !== identity.projectId ||
+			value.sessionId !== identity.sessionId)
+	)
+		return false;
+	const principal = scopedPrincipal(value.chatId);
+	if (principal !== undefined && value.principalId !== principal) return false;
+	if (
+		value.reason !==
+		(value.principalId === undefined || value.canonicalWorkspace === undefined
+			? "ownership-unresolved"
+			: "generation-unproven")
+	)
+		return false;
+	const provenance = value.provenance;
+	return (
+		exactKeys(provenance, ["source", "documentHash", "nodeRef", "nodeHash"]) &&
+		provenance.source === "v2" &&
+		isDigest(provenance.documentHash) &&
+		isDigest(provenance.nodeHash) &&
+		typeof provenance.nodeRef === "string" &&
+		/^\/(?:mappings|provisionalOperations)\/(?:0|[1-9][0-9]*)(?:\/(?:[^~/]|~[01])+)*$/.test(provenance.nodeRef)
+	);
+}
+
+function isDigest(value: unknown): boolean {
+	return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+function scopedPrincipal(chatId: string): string | undefined {
+	try {
+		const scope: unknown = JSON.parse(chatId);
+		return Array.isArray(scope) &&
+			scope.length === 2 &&
+			scope.every(isNonEmptyString) &&
+			JSON.stringify(scope) === chatId
+			? scope[0]
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+function bindingIdentity(value: unknown): Record<string, unknown> | undefined {
+	if (!isRecord(value)) return undefined;
+	const binding = value.managedAuthority ?? value.historicalBinding;
+	return isRecord(binding) ? binding : undefined;
+}
+function compatibleOwnership(owner: unknown, child: unknown, workspace: boolean): boolean {
+	return compatibleBindingOwnership(bindingIdentity(owner), bindingIdentity(child), workspace);
+}
+function compatibleBindingOwnership(
+	owner: Record<string, unknown> | undefined,
+	child: Record<string, unknown> | undefined,
+	workspace: boolean,
+): boolean {
+	if (owner === undefined || child === undefined) return false;
+	for (const field of workspace ? ["principalId", "canonicalWorkspace"] : ["principalId"]) {
+		if (owner[field] !== undefined && child[field] !== undefined && owner[field] !== child[field]) return false;
+		if (owner.kind !== "unbound-history" && child.kind !== "unbound-history" && owner[field] !== child[field])
+			return false;
+	}
+	return true;
+}
+
+function publicationBindingMatches(
+	provisional: SessionAuthorityV3ProvisionalOperation,
+	result: SessionAuthorityV3Result,
+): boolean {
+	if (provisional.managedAuthority !== undefined || result.managedAuthority !== undefined)
+		return isDeepStrictEqual(provisional.managedAuthority, result.managedAuthority);
+	const left = provisional.historicalBinding;
+	const right = result.historicalBinding;
+	return (
+		left !== undefined &&
+		right !== undefined &&
+		(["chatId", "projectId", "sessionId", "principalId", "canonicalWorkspace"] as const).every(
+			field => left[field] === right[field],
+		)
+	);
+}
+
+function validProjection(value: Record<string, unknown>): boolean {
+	return (
+		(value.sessionFile === undefined || (isNonEmptyString(value.sessionFile) && isAbsolute(value.sessionFile))) &&
+		(value.activeLeaf === undefined || isNonEmptyString(value.activeLeaf))
+	);
+}
+
 function isIdentity(value: Record<string, unknown>): boolean {
 	const header = value.header as Record<string, unknown> | undefined;
 	return (
@@ -935,6 +1113,7 @@ function isCursors(value: Record<string, unknown>): boolean {
 }
 function optionalFieldsValid(value: Record<string, unknown>): boolean {
 	return (
+		validProjection(value) &&
 		(value.assistantText === undefined || typeof value.assistantText === "string") &&
 		(value.events === undefined || (Array.isArray(value.events) && value.events.every(isEvent))) &&
 		(value.modelSelection === undefined || normalizeModelSelection(value.modelSelection) !== undefined) &&
@@ -986,11 +1165,24 @@ function tombstoneRoots(
 			? []
 			: [reassignment.priorTombstone];
 }
-function containsForbiddenLegacyField(value: unknown): boolean {
-	if (Array.isArray(value)) return value.some(containsForbiddenLegacyField);
+function containsForbiddenLegacyField(value: unknown, path = ""): boolean {
+	if (Array.isArray(value))
+		return value.some((child, index) => containsForbiddenLegacyField(child, `${path}/${index}`));
 	if (!isRecord(value)) return false;
+	const projection =
+		/^(?:\/mappings\/\d+(?:\/reassignment\/(?:sourceTombstone|priorTombstone)(?:\/prior)*)?|\/provisionalOperations\/\d+)(?:\/journal\/\d+\/result\/mapping)?$/.test(
+			path,
+		) ||
+		/^\/provisionalOperations\/\d+\/result\/mapping$/.test(path) ||
+		/^\/(?:journal\/\d+\/result\/mapping|result\/mapping|reassignment\/(?:sourceTombstone|priorTombstone)(?:\/prior)*(?:\/journal\/\d+\/result\/mapping)?)$/.test(
+			path,
+		) ||
+		(path === "" && (value.version === 3 || (isNonEmptyString(value.chatId) && isNonEmptyString(value.projectId))));
 	return Object.entries(value).some(
-		([key, child]) => FORBIDDEN_FIELDS.has(key) || containsForbiddenLegacyField(child),
+		([key, child]) =>
+			FORBIDDEN_FIELDS.has(key) ||
+			((key === "sessionFile" || key === "activeLeaf") && !projection) ||
+			containsForbiddenLegacyField(child, `${path}/${key}`),
 	);
 }
 function canonicalize(value: unknown): unknown {

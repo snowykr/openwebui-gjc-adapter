@@ -59,8 +59,16 @@ export function requiresUncertainAcknowledgedSuccessorCompletionReconciliation(
 	detail: string | undefined,
 	result: SessionOperationResult | undefined,
 ): boolean {
-	if (operation.state !== "uncertain" || state !== "complete") return false;
+	if (state !== "complete") return false;
 	const successor = operation.acknowledgedSuccessor;
+	if (
+		operation.state !== "complete" &&
+		(result?.historicalBinding !== undefined ||
+			operation.result?.historicalBinding !== undefined ||
+			(successor !== undefined && "historicalBinding" in successor && successor.historicalBinding !== undefined))
+	)
+		return true;
+	if (operation.state !== "uncertain") return false;
 	if (
 		(operation.kind !== "create" && operation.kind !== "branch") ||
 		successor === undefined ||
@@ -74,6 +82,7 @@ export function requiresUncertainAcknowledgedSuccessorCompletionReconciliation(
 		const expected = successor.managedAuthority;
 		const actual = result.managedAuthority;
 		return (
+			expected === undefined ||
 			actual === undefined ||
 			actual.generation !== expected.generation ||
 			![
@@ -88,6 +97,7 @@ export function requiresUncertainAcknowledgedSuccessorCompletionReconciliation(
 			].every(key => Reflect.get(actual, key) === Reflect.get(expected, key))
 		);
 	}
+	if (!("attachment" in successor)) return true;
 	return (
 		operation.kind !== "create" ||
 		result.mapping.sessionFile === undefined ||

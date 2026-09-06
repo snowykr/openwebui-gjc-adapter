@@ -13,7 +13,7 @@ import type {
 	SessionOperation,
 } from "./session-authority-types";
 import { SESSION_AUTHORITY_VERSION } from "./session-authority-types";
-import { SESSION_AUTHORITY_V3_EPOCH } from "./session-authority-v3";
+import { isHistoricalSessionBinding, SESSION_AUTHORITY_V3_EPOCH } from "./session-authority-v3";
 import {
 	hasOnlyKeys,
 	isJsonValue,
@@ -248,6 +248,17 @@ function hasConsistentResultSession(
 ): boolean {
 	const result = operation.result;
 	if (result === undefined) return true;
+	if (result.historicalBinding !== undefined) {
+		const history = result.historicalBinding;
+		return (
+			operation.state === "complete" &&
+			isHistoricalSessionBinding(history, result.mapping) &&
+			(owner.managedAuthority === undefined ||
+				((history.principalId === undefined || history.principalId === owner.managedAuthority.principalId) &&
+					(history.canonicalWorkspace === undefined ||
+						history.canonicalWorkspace === owner.managedAuthority.canonicalWorkspace)))
+		);
+	}
 	const authority = result.managedAuthority;
 	if (authority === undefined) return result.mapping.sessionId === owner.sessionId;
 	return (

@@ -6,6 +6,7 @@ import {
 	copyOperation,
 	copyOperationResult,
 	copyProvisionalOperation,
+	copySessionAuthorityBinding,
 	copyTombstone,
 } from "./session-authority-copy";
 import {
@@ -18,7 +19,9 @@ import { reconcileSessionAuthority } from "./session-authority-reconciliation";
 import { isAuthorityDocumentRelationallyValid } from "./session-authority-record-validation";
 import type {
 	AcknowledgedSuccessor,
+	DistributiveOmit,
 	ProvisionalSessionOperation,
+	SessionAuthorityBinding,
 	SessionAuthorityInput,
 	SessionAuthorityRecord,
 	SessionAuthorityTargetIdentity,
@@ -274,6 +277,7 @@ export class SessionAuthorityJournal {
 	reserve(
 		operation: Omit<ProvisionalSessionOperation, "state" | "startedAt" | "completedAt">,
 	): ProvisionalSessionOperation {
+		assertExclusiveProvisionalBinding(operation);
 		const record = this.records.get(operation.chatId);
 		const reassignment = record?.reassignment;
 		const ingressId = operation.ingressId ?? operation.id;
@@ -303,7 +307,13 @@ export class SessionAuthorityJournal {
 			throw new Error(`Session operation ${ingressId} requires reconciliation.`);
 		}
 		assertReservableIdentity(operation, journalFor(record), [...this.provisional.values()]);
-		const next = { ...operation, state: "pending" as const, startedAt: new Date().toISOString() };
+		const { managedAuthority: _managedAuthority, historicalBinding: _historicalBinding, ...fields } = operation;
+		const next = copyProvisionalOperation({
+			...fields,
+			...copySessionAuthorityBinding(operation),
+			state: "pending",
+			startedAt: new Date().toISOString(),
+		});
 		this.setProvisional(key, next);
 		return copyProvisionalOperation(next);
 	}
@@ -311,6 +321,7 @@ export class SessionAuthorityJournal {
 		operation: Omit<ProvisionalSessionOperation, "state" | "startedAt" | "completedAt">,
 		mapping: SessionAuthorityInput,
 	): SessionAuthorityRecord {
+		assertExclusiveProvisionalBinding(operation);
 		const record = this.records.get(operation.chatId),
 			reassignment = record?.reassignment,
 			ingressId = operation.ingressId ?? operation.id,
@@ -328,6 +339,16 @@ export class SessionAuthorityJournal {
 		const reserved = assertPublishableIdentity(operation, this.provisional.get(key), journalFor(record), [
 			...this.provisional.values(),
 		]);
+		if (
+			operation.historicalBinding !== undefined ||
+			record?.historicalBinding !== undefined ||
+			reserved.historicalBinding !== undefined ||
+			mapping.historicalBinding !== undefined ||
+			(reserved.acknowledgedSuccessor !== undefined &&
+				"historicalBinding" in reserved.acknowledgedSuccessor &&
+				reserved.acknowledgedSuccessor.historicalBinding !== undefined)
+		)
+			throw new Error(`Session operation ${ingressId} requires reconciliation.`);
 		const completedAt = new Date().toISOString();
 		const journalOperation: SessionOperation = {
 			id: operation.id,
@@ -374,6 +395,15 @@ export class SessionAuthorityJournal {
 				throw new Error("Completed session operations are immutable.");
 			return copyProvisionalOperation(current);
 		}
+		if (
+			state === "complete" &&
+			(current.historicalBinding !== undefined ||
+				current.result?.historicalBinding !== undefined ||
+				(current.acknowledgedSuccessor !== undefined &&
+					"historicalBinding" in current.acknowledgedSuccessor &&
+					current.acknowledgedSuccessor.historicalBinding !== undefined))
+		)
+			throw new Error(`Session operation ${ingressId} requires reconciliation.`);
 		const next = {
 			...current,
 			state,
@@ -386,12 +416,15 @@ export class SessionAuthorityJournal {
 	attach(
 		chatId: string,
 		ingressId: string,
-		attachment: Pick<ProvisionalSessionOperation, "sessionId" | "sessionFile" | "attachment" | "managedAuthority">,
+		attachment: SessionAuthorityBinding &
+			Pick<ProvisionalSessionOperation, "sessionId" | "sessionFile" | "activeLeaf" | "attachment">,
 	): ProvisionalSessionOperation {
 		const key = provisionalKey(chatId, ingressId),
 			current = this.provisional.get(key);
 		if (current === undefined || current.state !== "pending")
 			throw new Error(`Session operation ${ingressId} requires reconciliation.`);
+		if (current.historicalBinding !== undefined || attachment.historicalBinding !== undefined)
+			throw new Error("Historical session authority requires an explicit proven binding transaction.");
 		const legacyValid =
 			attachment.attachment?.tmuxSocket !== undefined &&
 			attachment.attachment.tmuxPane !== undefined &&
@@ -410,7 +443,19 @@ export class SessionAuthorityJournal {
 			);
 		if (attachment.sessionId === undefined || legacyValid === managedValid)
 			throw new Error("Provisional session authority requires an exact endpoint and owned-pane proof.");
-		const next = { ...current, ...attachment };
+		if (current.managedAuthority !== undefined && !isDeepStrictEqual(current.managedAuthority, managed))
+			throw new Error("Provisional managed authority cannot be replaced by ordinary attachment.");
+		const { managedAuthority: _currentManaged, historicalBinding: _currentHistorical, ...currentFields } = current;
+		const {
+			managedAuthority: _attachedManaged,
+			historicalBinding: _attachedHistorical,
+			...attachmentFields
+		} = attachment;
+		const next = copyProvisionalOperation({
+			...currentFields,
+			...attachmentFields,
+			...copySessionAuthorityBinding(attachment),
+		});
 		this.setProvisional(key, next);
 		return copyProvisionalOperation(next);
 	}
@@ -527,6 +572,8 @@ export class SessionAuthorityJournal {
 			),
 			current = record.journal[index];
 		if (current === undefined) throw new Error(`Unknown session operation ${operationId}.`);
+		if (record.historicalBinding !== undefined && current.state !== "complete" && state === "complete")
+			throw new Error(`Session operation ${operationId} requires reconciliation.`);
 		if (requiresUncertainAcknowledgedSuccessorCompletionReconciliation(current, state, detail, result))
 			throw new Error(`Session operation ${operationId} requires reconciliation.`);
 		if (current.state === "complete") {
@@ -663,6 +710,13 @@ export class SessionAuthorityJournal {
 		}
 	}
 }
+function assertExclusiveProvisionalBinding(
+	operation: Omit<ProvisionalSessionOperation, "state" | "startedAt" | "completedAt">,
+): asserts operation is DistributiveOmit<ProvisionalSessionOperation, "state" | "startedAt" | "completedAt"> {
+	if (operation.managedAuthority !== undefined && operation.historicalBinding !== undefined)
+		throw new Error("Session authority bindings are mutually exclusive.");
+}
+
 function journalFor(record: SessionAuthorityRecord | undefined): readonly SessionOperation[] {
 	if (record === undefined) return [];
 	const journal = [...record.journal];
@@ -730,9 +784,15 @@ function assertTargetIdentity(target: SessionAuthorityTargetIdentity): void {
 }
 
 function toTombstone(record: SessionAuthorityRecord, retiredAt: string): SessionAuthorityTombstone {
-	const { reassignment: _reassignment, ...source } = record;
+	const {
+		reassignment: _reassignment,
+		managedAuthority: _managedAuthority,
+		historicalBinding: _historicalBinding,
+		...source
+	} = record;
 	return {
 		...source,
+		...copySessionAuthorityBinding(record),
 		header: { ...source.header },
 		...(source.events === undefined ? {} : { events: copyEvents(source.events) }),
 		...(source.modelSelection === undefined ? {} : { modelSelection: { ...source.modelSelection } }),

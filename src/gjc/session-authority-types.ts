@@ -4,6 +4,29 @@ import type { GjcTurnEvent, ManagedTurnAuthority } from "./turn-runner";
 
 export const SESSION_AUTHORITY_VERSION = 2 as const;
 
+/** Occurrence-specific inert history; never authorizes attachment or lifecycle effects. */
+export interface HistoricalSessionBinding {
+	readonly kind: "unbound-history";
+	readonly chatId: string;
+	readonly projectId: string;
+	readonly sessionId?: string;
+	readonly principalId?: string;
+	readonly canonicalWorkspace?: string;
+	readonly reason: "generation-unproven" | "ownership-unresolved";
+	readonly provenance: {
+		readonly source: "v2";
+		readonly documentHash: string;
+		readonly nodeRef: string;
+		readonly nodeHash: string;
+	};
+}
+
+export type SessionAuthorityBinding =
+	| { readonly managedAuthority?: ManagedTurnAuthority; readonly historicalBinding?: never }
+	| { readonly managedAuthority?: never; readonly historicalBinding: HistoricalSessionBinding };
+
+export type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
+
 export class SessionAuthorityLoadError extends Error {
 	constructor(
 		readonly filePath: string,
@@ -57,7 +80,12 @@ export type EndpointSessionAttachmentProof = Omit<
 
 export type AcknowledgedSuccessor =
 	| { readonly sessionId: string; readonly attachment: EndpointSessionAttachmentProof }
-	| { readonly sessionId: string; readonly managedAuthority: ManagedTurnAuthority };
+	| { readonly sessionId: string; readonly managedAuthority: ManagedTurnAuthority; readonly historicalBinding?: never }
+	| {
+			readonly sessionId: string;
+			readonly managedAuthority?: never;
+			readonly historicalBinding: HistoricalSessionBinding;
+	  };
 
 export interface SessionOperationGateBinding {
 	readonly gateId: string;
@@ -66,10 +94,9 @@ export interface SessionOperationGateBinding {
 	readonly sessionId?: string;
 }
 
-export interface SessionOperationResult {
+export type SessionOperationResult = SessionAuthorityBinding & {
 	readonly kind: "turn" | "control" | "close";
 	readonly assistantText: string;
-	readonly managedAuthority?: ManagedTurnAuthority;
 	readonly events?: readonly GjcTurnEvent[];
 	readonly mapping: Readonly<{
 		chatId: string;
@@ -88,7 +115,7 @@ export interface SessionOperationResult {
 	 * of a superseded gate can still recompute the durable request hash even
 	 * after the gate event itself is no longer retained on the record. */
 	readonly gate?: SessionOperationGateBinding;
-}
+};
 
 export interface SessionOperation {
 	readonly id: string;
@@ -112,7 +139,7 @@ export interface SessionAuthorityTargetIdentity {
 	readonly detail?: string;
 }
 
-export interface SessionAuthorityTombstone {
+export type SessionAuthorityTombstone = SessionAuthorityBinding & {
 	readonly version: typeof SESSION_AUTHORITY_VERSION;
 	readonly chatId: string;
 	readonly projectId: string;
@@ -129,11 +156,10 @@ export interface SessionAuthorityTombstone {
 	readonly modelSelection?: NormalizedModelSelection;
 	readonly observations?: Readonly<Record<string, unknown>>;
 	readonly attachment?: SessionAttachmentProof;
-	readonly managedAuthority?: ManagedTurnAuthority;
 	readonly journal: readonly SessionOperation[];
 	readonly retiredAt: string;
 	readonly prior?: SessionAuthorityTombstone;
-}
+};
 
 export interface SessionAuthorityReassignment {
 	readonly state: SessionProjectReassignmentState;
@@ -149,17 +175,18 @@ export interface SessionAuthorityReassignment {
 
 /** A mapping's reassignment marker is intentionally optional for v2 documents. */
 
-export interface ProvisionalSessionOperation extends SessionOperation {
-	readonly chatId: string;
-	readonly projectId: string;
-	readonly sessionId?: string;
-	readonly sessionFile?: string;
-	readonly attachment?: SessionAttachmentProof;
-	readonly managedAuthority?: ManagedTurnAuthority;
-}
+export type ProvisionalSessionOperation = SessionOperation &
+	SessionAuthorityBinding & {
+		readonly chatId: string;
+		readonly projectId: string;
+		readonly sessionId?: string;
+		readonly sessionFile?: string;
+		readonly activeLeaf?: string;
+		readonly attachment?: SessionAttachmentProof;
+	};
 
 /** The mapping identity header is deliberately separate from replaceable observations. */
-export interface SessionAuthorityRecord {
+export type SessionAuthorityRecord = SessionAuthorityBinding & {
 	readonly version: typeof SESSION_AUTHORITY_VERSION;
 	readonly chatId: string;
 	readonly projectId: string;
@@ -176,12 +203,14 @@ export interface SessionAuthorityRecord {
 	readonly modelSelection?: NormalizedModelSelection;
 	readonly observations?: Readonly<Record<string, unknown>>;
 	readonly attachment?: SessionAttachmentProof;
-	readonly managedAuthority?: ManagedTurnAuthority;
 	readonly journal: readonly SessionOperation[];
 	readonly reassignment?: SessionAuthorityReassignment;
-}
+};
 
-export type SessionAuthorityInput = Omit<SessionAuthorityRecord, "version" | "createdAt" | "header" | "journal"> &
+export type SessionAuthorityInput = DistributiveOmit<
+	SessionAuthorityRecord,
+	"version" | "createdAt" | "header" | "journal"
+> &
 	Partial<Pick<SessionAuthorityRecord, "createdAt" | "journal" | "header" | "version">>;
 export const SESSION_AUTHORITY_MIGRATION_VERSION = 1 as const;
 

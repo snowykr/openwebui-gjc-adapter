@@ -14,9 +14,13 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { RuntimeSingletonLock } from "../runtime-singleton-lock";
+import { ManagedOperationDeadline } from "./managed-operation-deadline";
+import { AuthorityMutationLock } from "./session-authority-file";
 import { FileSessionAuthority } from "./session-authority-persistence";
 import {
 	encodeSessionAuthorityV3Document,
+	hasUnboundServingAuthority,
 	parseSessionAuthorityV3Document,
 	SESSION_AUTHORITY_V3_EPOCH,
 } from "./session-authority-v3";
@@ -31,16 +35,32 @@ const MAX_AUTHORITY_BYTES = 128 * 1024 * 1024;
 const MAX_WAL_BYTES = 128 * 1024 * 1024;
 const SHA256 = /^[a-f0-9]{64}$/;
 
-export type SessionAuthorityV3ActivationBoundary = "snapshot" | "backup" | "stage" | "swap" | "marker";
+export type SessionAuthorityV3ActivationBoundary =
+	| "snapshot"
+	| "backup"
+	| "manifest"
+	| "working"
+	| "replay"
+	| "historical-stage"
+	| "stage"
+	| "committing"
+	| "base"
+	| "wal"
+	| "swap"
+	| "marker";
 
 export interface SessionAuthorityV3ActivationOptions {
 	/** The V2 canonical authority. Its mutation and runtime locks are held by the caller. */
 	readonly canonicalPath: string;
+	readonly runtimeLock: RuntimeSingletonLock;
+	readonly mutationLock: AuthorityMutationLock;
+	readonly timeoutMs?: number;
 	/** Exact, managed authority identities; no runtime-derived authority is consulted. */
 	readonly bindings?: readonly ManagedTurnAuthorityBinding[];
-	/** Resolves exact managed identities from the private, replayed V2 graph. */
+	/** Resolves occurrence-specific identities only after ordinary historical V3 reopen. */
 	readonly resolveBindings?: (
 		decodedDocument: SessionAuthorityV2Document,
+		context: SessionAuthorityV3ActivationContext,
 	) =>
 		| readonly ManagedTurnAuthorityBinding[]
 		| undefined
@@ -49,6 +69,13 @@ export interface SessionAuthorityV3ActivationOptions {
 	readonly stagingRoot: string;
 	/** Test-only crash seam, called only after the named boundary is durable. */
 	readonly afterBoundary?: (boundary: SessionAuthorityV3ActivationBoundary) => void;
+}
+
+export interface SessionAuthorityV3ActivationContext {
+	readonly stagedPath: string;
+	readonly manifestDigest: string;
+	assertCurrent(): Promise<void>;
+	remaining(): number;
 }
 
 export interface SessionAuthorityV3ActiveMarker {
@@ -85,33 +112,41 @@ export function readSessionAuthorityV3ActiveMarker(canonicalPath: string): Sessi
 export async function activateSessionAuthorityV3(
 	options: SessionAuthorityV3ActivationOptions,
 ): Promise<SessionAuthorityV3ActivationResult> {
+	const deadline = new ManagedOperationDeadline(options.timeoutMs, "authority activation");
+	try {
+		return await deadline.wait(activateUnderDeadline(options, deadline));
+	} finally {
+		deadline.close();
+	}
+}
+
+async function activateUnderDeadline(
+	options: SessionAuthorityV3ActivationOptions,
+	deadline: ManagedOperationDeadline,
+): Promise<SessionAuthorityV3ActivationResult> {
 	const canonicalPath = resolve(options.canonicalPath);
+	if (
+		!(options.runtimeLock instanceof RuntimeSingletonLock) ||
+		!(options.mutationLock instanceof AuthorityMutationLock)
+	)
+		throw new Error("Canonical activation requires held runtime and mutation lock capabilities.");
+	const assertLocks = async () => {
+		deadline.remaining();
+		await deadline.wait(options.runtimeLock.assertOwnsPath(canonicalPath));
+		options.mutationLock.assertHeld(canonicalPath);
+	};
+	await assertLocks();
 	const root = privateRoot(options.stagingRoot, canonicalPath);
 	const markerPath = `${canonicalPath}.v3-active.json`;
 	const journalPath = join(root, "activation.json");
 
-	const recovered = recover(canonicalPath, markerPath, root, journalPath);
+	const recovered = recover(canonicalPath, markerPath, root, journalPath, options.mutationLock);
 	if (recovered !== undefined) return recovered;
 
-	const snapshot = snapshotV2(canonicalPath);
-	options.afterBoundary?.("snapshot");
-	writePrivate(root, "source.v2.json", snapshot.base);
-	if (snapshot.walPresent) writePrivate(root, "source.v2.wal", snapshot.wal);
-	else {
-		const staleWal = lstatSync(join(root, "source.v2.wal"), { throwIfNoEntry: false });
-		if (staleWal !== undefined) {
-			if (staleWal.isSymbolicLink() || !staleWal.isFile())
-				throw new Error("Immutable V2 WAL backup is not a regular file.");
-			unlinkSync(join(root, "source.v2.wal"));
-		}
-	}
-	writePrivate(
-		root,
-		"source.v2.absence.json",
-		Buffer.from(`${JSON.stringify({ walPresent: snapshot.walPresent })}\n`),
+	const snapshot = await deadline.wait(
+		captureImmutableSnapshot(canonicalPath, root, assertLocks, options.afterBoundary),
 	);
-	fsyncDirectory(root);
-	options.afterBoundary?.("backup");
+	await assertLocks();
 
 	const privateV2 = join(root, "replay.v2.json");
 	writePrivate(root, "replay.v2.json", snapshot.base);
@@ -124,13 +159,76 @@ export async function activateSessionAuthorityV3(
 			unlinkSync(join(root, "replay.v2.json.wal"));
 		}
 	}
-	const replayed = new FileSessionAuthority(privateV2);
+	fsyncDirectory(root);
+	options.afterBoundary?.("working");
+	await assertLocks();
+	const replayed = new FileSessionAuthority(privateV2, undefined, {
+		sourcePath: canonicalPath,
+		baseDigest: snapshot.baseDigest,
+		baseMtimeMs: snapshot.baseIdentity.mtimeMs,
+		walDigest: snapshot.walPresent ? snapshot.walDigest : null,
+	});
+	fsyncRegular(privateV2, "private replayed V2 authority");
+	const replayWal = join(root, "replay.v2.json.wal");
+	const replayWalPresent = lstatSync(replayWal, { throwIfNoEntry: false }) !== undefined;
+	if (replayWalPresent) fsyncRegular(replayWal, "private replayed V2 WAL");
+	writePrivate(
+		root,
+		"replay-evidence.json",
+		encode({
+			kind: "openwebui-gjc-v3-private-replay",
+			version: 1,
+			manifestDigest: digest(
+				readRegular(join(root, "source-manifest.json"), 16 * 1024, "immutable source manifest"),
+			),
+			baseDigest: digest(readRegular(privateV2, MAX_AUTHORITY_BYTES, "private replayed V2 authority")),
+			baseGeneration: baseGeneration(readRegular(privateV2, MAX_AUTHORITY_BYTES, "private replayed V2 authority")),
+			walDigest: replayWalPresent ? digest(readRegular(replayWal, MAX_WAL_BYTES, "private replayed V2 WAL")) : null,
+		}),
+	);
+	fsyncDirectory(root);
+	options.afterBoundary?.("replay");
+	await assertLocks();
 	const decodedDocument: SessionAuthorityV2Document = {
 		mappings: replayed.entries(),
 		provisionalOperations: replayed.provisionalEntries(),
 	};
+	const historical = stageSessionAuthorityV3Migration({
+		snapshot: {
+			originalBaseBytes: snapshot.base,
+			originalBaseDigest: snapshot.baseDigest,
+			originalWalBytes: snapshot.wal,
+			originalWalDigest: snapshot.walDigest,
+		},
+		decodedDocument,
+	});
+	if (historical.status === "blocked")
+		return { status: "blocked", canonicalPath, markerPath, reasons: historical.reasons };
+	const historicalPath = join(root, "historical.v3.json");
+	writePrivate(root, "historical.v3.json", Buffer.from(historical.v3Bytes));
+	const historicalStore = new V3FileBackedSessionMappingStore(historicalPath);
+	historicalStore.close();
+	if (!readRegular(historicalPath, MAX_AUTHORITY_BYTES, "historical V3 stage").equals(Buffer.from(historical.v3Bytes)))
+		throw new Error("Ordinary historical V3 reopen changed staged authority bytes.");
+	fsyncDirectory(root);
+	options.afterBoundary?.("historical-stage");
+	await assertLocks();
 	const bindings =
-		options.resolveBindings === undefined ? options.bindings : await options.resolveBindings(decodedDocument);
+		options.resolveBindings === undefined
+			? (options.bindings ?? [])
+			: await deadline.wait(
+					Promise.resolve(
+						options.resolveBindings(decodedDocument, {
+							stagedPath: historicalPath,
+							manifestDigest: digest(
+								readRegular(join(root, "source-manifest.json"), 16 * 1024, "immutable source manifest"),
+							),
+							assertCurrent: assertLocks,
+							remaining: () => deadline.remaining(),
+						}),
+					),
+				);
+	await assertLocks();
 	if (bindings === undefined)
 		return {
 			status: "blocked",
@@ -174,6 +272,13 @@ export async function activateSessionAuthorityV3(
 	store.close();
 	const reopened = readRegular(stagePath, MAX_AUTHORITY_BYTES, "staged V3 authority");
 	if (!reopened.equals(canonicalBytes)) throw new Error("Reopening the V3 authority changed its deterministic bytes.");
+	if (hasUnboundServingAuthority(parsed))
+		return {
+			status: "blocked",
+			canonicalPath,
+			markerPath,
+			reasons: ["Staged historical authority requires restricted bootstrap generation proof before activation."],
+		};
 
 	const journal: ActivationJournal = {
 		kind: "openwebui-gjc-session-authority-v3-activation",
@@ -181,10 +286,17 @@ export async function activateSessionAuthorityV3(
 		phase: "prepared",
 		activationV3Digest: staged.v3Digest,
 		source: { baseDigest: snapshot.baseDigest, walDigest: snapshot.walDigest, walPresent: snapshot.walPresent },
+		identities: {
+			sourceBase: snapshot.baseIdentity,
+			sourceWal: snapshot.walIdentity,
+			stagedBase: fileIdentity(stagePath),
+		},
+		manifestDigest: digest(readRegular(join(root, "source-manifest.json"), 16 * 1024, "immutable snapshot manifest")),
 	};
 	writePrivate(root, "activation.json", encode(journal));
 	fsyncDirectory(root);
 	options.afterBoundary?.("stage");
+	await assertLocks();
 	if (!canonicalSnapshotMatches(canonicalPath, snapshot))
 		return {
 			status: "blocked",
@@ -195,14 +307,35 @@ export async function activateSessionAuthorityV3(
 
 	writePrivate(root, "activation.json", encode({ ...journal, phase: "committing" }));
 	fsyncDirectory(root);
+	options.afterBoundary?.("committing");
+	await assertLocks();
+	if (!canonicalSnapshotMatches(canonicalPath, snapshot))
+		throw new Error("Canonical V2 authority changed at the activation commit boundary.");
+	assertRetainedManifest(root, canonicalPath, journal);
+	if (
+		!matchesFileIdentity(stagePath, journal.identities.stagedBase) ||
+		digest(readRegular(stagePath, MAX_AUTHORITY_BYTES, "committing staged V3")) !== journal.activationV3Digest
+	)
+		throw new Error("Staged V3 authority changed at the activation commit boundary.");
+	if (lstatSync(markerPath, { throwIfNoEntry: false }) !== undefined)
+		throw new Error("Active V3 marker appeared before the activation commit boundary.");
+	options.mutationLock.assertHeld(canonicalPath);
 	renameSync(stagePath, canonicalPath);
-	const canonicalWalPath = `${canonicalPath}.wal`;
-	const canonicalWal = lstatSync(canonicalWalPath, { throwIfNoEntry: false });
-	if (canonicalWal?.isFile()) unlinkSync(canonicalWalPath);
 	fsyncDirectory(dirname(canonicalPath));
+	options.afterBoundary?.("base");
+	await assertLocks();
+	assertCommittedBase(canonicalPath, journal);
+	removeOriginalWal(canonicalPath, journal);
+	fsyncDirectory(dirname(canonicalPath));
+	options.afterBoundary?.("wal");
+	await assertLocks();
 	writePrivate(root, "activation.json", encode({ ...journal, phase: "swapped" }));
 	fsyncDirectory(root);
 	options.afterBoundary?.("swap");
+	await assertLocks();
+	assertCommittedBase(canonicalPath, journal);
+	assertWalAbsent(canonicalPath);
+	new V3FileBackedSessionMappingStore(canonicalPath, options.mutationLock).close();
 
 	// This is the sole marker creation point. The canonical V3 store never
 	// rewrites this activation identity when mutable authority state changes.
@@ -213,8 +346,8 @@ export async function activateSessionAuthorityV3(
 		activationV3Digest: staged.v3Digest,
 		source: journal.source,
 	};
-	writeAtomic(markerPath, encode(marker));
-	fsyncDirectory(dirname(markerPath));
+	options.mutationLock.assertHeld(canonicalPath);
+	writeImmutable(markerPath, encode(marker));
 	writePrivate(root, "activation.json", encode({ ...journal, phase: "marked" }));
 	fsyncDirectory(root);
 	options.afterBoundary?.("marker");
@@ -226,25 +359,24 @@ function recover(
 	markerPath: string,
 	root: string,
 	journalPath: string,
+	mutationLock: AuthorityMutationLock,
 ): SessionAuthorityV3ActivationResult | undefined {
 	const markerNamed = lstatSync(markerPath, { throwIfNoEntry: false });
 	const marker = readMarker(markerPath);
 	const journal = readJournal(journalPath);
-	if (
-		markerNamed !== undefined &&
-		(markerNamed.isSymbolicLink() || !markerNamed.isFile() || marker === undefined) &&
-		journal?.phase !== "committing" &&
-		journal?.phase !== "swapped"
-	)
+	if (journal !== undefined) assertRetainedManifest(root, canonicalPath, journal);
+	if (markerNamed !== undefined && (markerNamed.isSymbolicLink() || !markerNamed.isFile() || marker === undefined))
 		throw new Error("Active V3 marker is invalid.");
 	if (marker !== undefined) {
 		if (journal !== undefined && !journalMatchesMarker(journal, marker))
 			throw new Error("Active V3 marker does not match the activation journal.");
 		if (canonicalV3Shape(canonicalPath) && sourceSnapshotMatches(root, marker.source)) {
+			assertWalAbsent(canonicalPath);
 			// The marker is the activation commit record. A crash after its fsync but
 			// before the journal checkpoint is forward-only: never restore V2 or
 			// compare against later mutable canonical bytes.
 			if (journal !== undefined && journal.phase !== "marked") {
+				mutationLock.assertHeld(canonicalPath);
 				writePrivate(root, "activation.json", encode({ ...journal, phase: "marked" }));
 				fsyncDirectory(root);
 			}
@@ -257,19 +389,92 @@ function recover(
 	if (journal.phase === "marked")
 		throw new Error("Activation journal is marked but the active marker does not bind the canonical V3 authority.");
 	if (journal.phase === "committing" || journal.phase === "swapped") {
-		const base = readSourceBase(root, journal.source);
-		renameReplace(join(root, "restore.v2.json"), canonicalPath, base);
-		const walPath = `${canonicalPath}.wal`;
-		if (journal.source.walPresent) {
-			const wal = readSourceWal(root, journal.source);
-			renameReplace(join(root, "restore.v2.wal"), walPath, wal);
-		} else {
-			const named = lstatSync(walPath, { throwIfNoEntry: false });
-			if (named?.isFile()) unlinkSync(walPath);
+		const stagePath = join(root, "canonical.v3.json");
+		if (journal.phase === "committing" && matchesFileIdentity(canonicalPath, journal.identities.sourceBase)) {
+			if (
+				digest(readRegular(canonicalPath, MAX_AUTHORITY_BYTES, "committing original V2")) !==
+					journal.source.baseDigest ||
+				!matchesFileIdentity(stagePath, journal.identities.stagedBase) ||
+				digest(readRegular(stagePath, MAX_AUTHORITY_BYTES, "committing staged V3")) !==
+					journal.activationV3Digest ||
+				!canonicalV3Shape(stagePath)
+			)
+				throw new Error("Committing activation cannot prove its original source and staged replacement.");
+			const walPath = `${canonicalPath}.wal`;
+			if (
+				journal.identities.sourceWal === null
+					? lstatSync(walPath, { throwIfNoEntry: false }) !== undefined
+					: !matchesFileIdentity(walPath, journal.identities.sourceWal) ||
+						digest(readRegular(walPath, MAX_WAL_BYTES, "committing original WAL")) !== journal.source.walDigest
+			)
+				throw new Error("Committing activation WAL identity changed; refusing recovery mutation.");
+			mutationLock.assertHeld(canonicalPath);
+			renameSync(stagePath, canonicalPath);
 		}
+		if (
+			!matchesFileIdentity(canonicalPath, journal.identities.stagedBase) ||
+			digest(readRegular(canonicalPath, MAX_AUTHORITY_BYTES, "committing V3 authority")) !==
+				journal.activationV3Digest ||
+			!canonicalV3Shape(canonicalPath) ||
+			!sourceSnapshotMatches(root, journal.source)
+		)
+			throw new Error(
+				"Committing activation cannot prove its canonical V3 replacement; automatic V2 restoration is forbidden.",
+			);
+		mutationLock.assertHeld(canonicalPath);
+		removeOriginalWal(canonicalPath, journal);
 		fsyncDirectory(dirname(canonicalPath));
+		new V3FileBackedSessionMappingStore(canonicalPath, mutationLock).close();
+		const recoveredMarker: SessionAuthorityV3ActiveMarker = {
+			kind: "openwebui-gjc-session-authority-active",
+			version: 1,
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+			activationV3Digest: journal.activationV3Digest,
+			source: journal.source,
+		};
+		mutationLock.assertHeld(canonicalPath);
+		writeImmutable(markerPath, encode(recoveredMarker));
+		writePrivate(root, "activation.json", encode({ ...journal, phase: "marked" }));
+		fsyncDirectory(root);
+		return activated(canonicalPath, markerPath, recoveredMarker);
 	}
+	if (
+		!matchesFileIdentity(canonicalPath, journal.identities.sourceBase) ||
+		digest(readRegular(canonicalPath, MAX_AUTHORITY_BYTES, "prepared V2 authority")) !== journal.source.baseDigest ||
+		(journal.identities.sourceWal === null
+			? lstatSync(`${canonicalPath}.wal`, { throwIfNoEntry: false }) !== undefined
+			: !matchesFileIdentity(`${canonicalPath}.wal`, journal.identities.sourceWal) ||
+				digest(readRegular(`${canonicalPath}.wal`, MAX_WAL_BYTES, "prepared V2 WAL")) !== journal.source.walDigest)
+	)
+		throw new Error("Prepared activation source changed; refusing to replace its snapshots.");
 	return undefined;
+}
+
+function assertCommittedBase(canonicalPath: string, journal: ActivationJournal): void {
+	if (
+		!matchesFileIdentity(canonicalPath, journal.identities.stagedBase) ||
+		digest(readRegular(canonicalPath, MAX_AUTHORITY_BYTES, "committing V3 authority")) !==
+			journal.activationV3Digest ||
+		!canonicalV3Shape(canonicalPath)
+	)
+		throw new Error("Committed V3 authority identity or content changed before activation.");
+}
+
+function removeOriginalWal(canonicalPath: string, journal: ActivationJournal): void {
+	const walPath = `${canonicalPath}.wal`;
+	if (lstatSync(walPath, { throwIfNoEntry: false }) === undefined) return;
+	if (
+		journal.identities.sourceWal === null ||
+		!matchesFileIdentity(walPath, journal.identities.sourceWal) ||
+		digest(readRegular(walPath, MAX_WAL_BYTES, "committing V2 WAL")) !== journal.source.walDigest
+	)
+		throw new Error("Committing activation WAL identity changed; refusing recovery mutation.");
+	unlinkSync(walPath);
+}
+
+function assertWalAbsent(canonicalPath: string): void {
+	if (lstatSync(`${canonicalPath}.wal`, { throwIfNoEntry: false }) !== undefined)
+		throw new Error("Canonical V3 activation requires the committed WAL absence.");
 }
 
 function snapshotV2(canonicalPath: string): {
@@ -278,7 +483,10 @@ function snapshotV2(canonicalPath: string): {
 	walPresent: boolean;
 	baseDigest: string;
 	walDigest: string;
+	baseIdentity: ActivationFileIdentity;
+	walIdentity: ActivationFileIdentity | null;
 } {
+	const baseIdentity = fileIdentity(canonicalPath);
 	const base = readRegular(canonicalPath, MAX_AUTHORITY_BYTES, "canonical V2 authority");
 	fsyncRegular(canonicalPath, "canonical V2 authority");
 	const walPath = `${canonicalPath}.wal`;
@@ -286,20 +494,203 @@ function snapshotV2(canonicalPath: string): {
 	if (walNamed?.isSymbolicLink() || (walNamed !== undefined && !walNamed.isFile()))
 		throw new Error("Canonical V2 WAL is not a regular file.");
 	const walPresent = walNamed !== undefined;
+	const walIdentity = walPresent ? fileIdentity(walPath) : null;
 	const wal = walPresent ? readRegular(walPath, MAX_WAL_BYTES, "canonical V2 WAL") : Buffer.alloc(0);
 	if (walPresent) fsyncRegular(walPath, "canonical V2 WAL");
 	fsyncDirectory(dirname(canonicalPath));
-	return { base, wal, walPresent, baseDigest: digest(base), walDigest: digest(wal) };
+	if (
+		!matchesFileIdentity(canonicalPath, baseIdentity) ||
+		(walIdentity === null
+			? lstatSync(walPath, { throwIfNoEntry: false }) !== undefined
+			: !matchesFileIdentity(walPath, walIdentity))
+	)
+		throw new Error("Canonical V2 source identity changed during snapshot capture.");
+	return { base, wal, walPresent, baseDigest: digest(base), walDigest: digest(wal), baseIdentity, walIdentity };
+}
+
+interface ImmutableSourceManifest {
+	readonly kind: "openwebui-gjc-v3-source-snapshot";
+	readonly version: 1;
+	readonly canonicalPath: string;
+	readonly authorityEpoch: typeof SESSION_AUTHORITY_V3_EPOCH;
+	readonly canonicalReplaced: false;
+	readonly originalBaseGeneration: string | null;
+	readonly source: {
+		readonly base: ActivationFileIdentity;
+		readonly wal: ActivationFileIdentity | null;
+		readonly baseDigest: string;
+		readonly walDigest: string;
+	};
+	readonly snapshots: {
+		readonly base: ActivationFileIdentity;
+		readonly wal: ActivationFileIdentity | null;
+		readonly absence: ActivationFileIdentity;
+		readonly absenceDigest: string;
+	};
+}
+
+async function captureImmutableSnapshot(
+	canonicalPath: string,
+	root: string,
+	assertCurrent: () => Promise<void>,
+	afterBoundary?: SessionAuthorityV3ActivationOptions["afterBoundary"],
+): Promise<ReturnType<typeof snapshotV2>> {
+	const manifestPath = join(root, "source-manifest.json");
+	if (lstatSync(manifestPath, { throwIfNoEntry: false }) !== undefined) {
+		const value: unknown = JSON.parse(
+			readRegular(manifestPath, 16 * 1024, "immutable source manifest").toString("utf8"),
+		);
+		if (!isSourceManifest(value) || value.canonicalPath !== canonicalPath)
+			throw new Error("Invalid immutable source manifest.");
+		const basePath = join(root, "source.v2.json"),
+			walPath = join(root, "source.v2.wal"),
+			absencePath = join(root, "source.v2.absence.json");
+		if (
+			!matchesFileIdentity(basePath, value.snapshots.base) ||
+			!matchesFileIdentity(absencePath, value.snapshots.absence) ||
+			(value.snapshots.wal === null
+				? lstatSync(walPath, { throwIfNoEntry: false }) !== undefined
+				: !matchesFileIdentity(walPath, value.snapshots.wal))
+		)
+			throw new Error("Immutable source snapshot identity changed.");
+		const base = readRegular(basePath, MAX_AUTHORITY_BYTES, "immutable source base");
+		const wal =
+			value.source.wal === null ? Buffer.alloc(0) : readRegular(walPath, MAX_WAL_BYTES, "immutable source WAL");
+		const absence = readRegular(absencePath, 16 * 1024, "immutable WAL presence evidence");
+		if (
+			digest(base) !== value.source.baseDigest ||
+			digest(wal) !== value.source.walDigest ||
+			digest(absence) !== value.snapshots.absenceDigest ||
+			baseGeneration(base) !== value.originalBaseGeneration ||
+			!absence.equals(encode({ walPresent: value.source.wal !== null, baseIdentity: value.source.base }))
+		)
+			throw new Error("Immutable source snapshot content changed.");
+		const snapshot = {
+			base,
+			wal,
+			walPresent: value.source.wal !== null,
+			baseDigest: value.source.baseDigest,
+			walDigest: value.source.walDigest,
+			baseIdentity: value.source.base,
+			walIdentity: value.source.wal,
+		};
+		if (!canonicalSnapshotMatches(canonicalPath, snapshot))
+			throw new Error("Canonical source changed from its immutable manifest.");
+		return snapshot;
+	}
+	const snapshot = snapshotV2(canonicalPath);
+	afterBoundary?.("snapshot");
+	await assertCurrent();
+	writeImmutable(join(root, "source.v2.json"), snapshot.base);
+	if (snapshot.walPresent) writeImmutable(join(root, "source.v2.wal"), snapshot.wal);
+	else if (lstatSync(join(root, "source.v2.wal"), { throwIfNoEntry: false }) !== undefined)
+		throw new Error("Immutable source WAL conflicts with captured absence.");
+	const absence = encode({ walPresent: snapshot.walPresent, baseIdentity: snapshot.baseIdentity });
+	writeImmutable(join(root, "source.v2.absence.json"), absence);
+	afterBoundary?.("backup");
+	await assertCurrent();
+	if (!canonicalSnapshotMatches(canonicalPath, snapshot))
+		throw new Error("Canonical source changed before immutable manifest commit.");
+	const manifest: ImmutableSourceManifest = {
+		kind: "openwebui-gjc-v3-source-snapshot",
+		version: 1,
+		canonicalPath,
+		authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+		canonicalReplaced: false,
+		originalBaseGeneration: baseGeneration(snapshot.base),
+		source: {
+			base: snapshot.baseIdentity,
+			wal: snapshot.walIdentity,
+			baseDigest: snapshot.baseDigest,
+			walDigest: snapshot.walDigest,
+		},
+		snapshots: {
+			base: fileIdentity(join(root, "source.v2.json")),
+			wal: snapshot.walPresent ? fileIdentity(join(root, "source.v2.wal")) : null,
+			absence: fileIdentity(join(root, "source.v2.absence.json")),
+			absenceDigest: digest(absence),
+		},
+	};
+	writeImmutable(manifestPath, encode(manifest));
+	afterBoundary?.("manifest");
+	await assertCurrent();
+	return snapshot;
+}
+
+function baseGeneration(bytes: Buffer): string | null {
+	const value: unknown = JSON.parse(bytes.toString("utf8"));
+	if (typeof value !== "object" || value === null || Array.isArray(value))
+		throw new Error("Invalid V2 source document.");
+	const generation: unknown = Reflect.get(value, "generation");
+	if (generation === undefined) return null;
+	if (typeof generation !== "string" || generation.length === 0) throw new Error("Invalid V2 source base generation.");
+	return generation;
+}
+
+function isSourceManifest(value: unknown): value is ImmutableSourceManifest {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const manifest = value as Partial<ImmutableSourceManifest>;
+	const source = manifest.source,
+		snapshots = manifest.snapshots;
+	return (
+		Object.keys(value).length === 8 &&
+		manifest.kind === "openwebui-gjc-v3-source-snapshot" &&
+		manifest.version === 1 &&
+		typeof manifest.canonicalPath === "string" &&
+		manifest.canonicalPath === resolve(manifest.canonicalPath) &&
+		manifest.authorityEpoch === SESSION_AUTHORITY_V3_EPOCH &&
+		manifest.canonicalReplaced === false &&
+		(manifest.originalBaseGeneration === null ||
+			(typeof manifest.originalBaseGeneration === "string" && manifest.originalBaseGeneration.length > 0)) &&
+		typeof source === "object" &&
+		source !== null &&
+		Object.keys(source).length === 4 &&
+		isFileIdentity(source.base) &&
+		(source.wal === null || isFileIdentity(source.wal)) &&
+		SHA256.test(source.baseDigest) &&
+		SHA256.test(source.walDigest) &&
+		typeof snapshots === "object" &&
+		snapshots !== null &&
+		Object.keys(snapshots).length === 4 &&
+		isFileIdentity(snapshots.base) &&
+		isFileIdentity(snapshots.absence) &&
+		SHA256.test(snapshots.absenceDigest) &&
+		(source.wal === null ? snapshots.wal === null : isFileIdentity(snapshots.wal))
+	);
+}
+
+function writeImmutable(path: string, bytes: Buffer): void {
+	if (lstatSync(path, { throwIfNoEntry: false }) !== undefined) {
+		if (!readRegular(path, MAX_AUTHORITY_BYTES, "immutable snapshot").equals(bytes))
+			throw new Error("Refusing to overwrite conflicting immutable snapshot evidence.");
+		fsyncRegular(path, "immutable snapshot");
+		fsyncDirectory(dirname(path));
+		return;
+	}
+	const descriptor = openSync(
+		path,
+		constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+		0o600,
+	);
+	try {
+		writeFileSync(descriptor, bytes);
+		fsyncSync(descriptor);
+	} finally {
+		closeSync(descriptor);
+	}
+	fsyncDirectory(dirname(path));
 }
 
 function canonicalSnapshotMatches(canonicalPath: string, snapshot: ReturnType<typeof snapshotV2>): boolean {
 	try {
+		if (!matchesFileIdentity(canonicalPath, snapshot.baseIdentity)) return false;
 		if (digest(readRegular(canonicalPath, MAX_AUTHORITY_BYTES, "canonical V2 authority")) !== snapshot.baseDigest)
 			return false;
 		const walPath = `${canonicalPath}.wal`;
 		const walNamed = lstatSync(walPath, { throwIfNoEntry: false });
 		if (walNamed?.isSymbolicLink() || (walNamed !== undefined && !walNamed.isFile())) return false;
 		if ((walNamed !== undefined) !== snapshot.walPresent) return false;
+		if (snapshot.walIdentity !== null && !matchesFileIdentity(walPath, snapshot.walIdentity)) return false;
 		return (
 			!snapshot.walPresent || digest(readRegular(walPath, MAX_WAL_BYTES, "canonical V2 WAL")) === snapshot.walDigest
 		);
@@ -338,9 +729,15 @@ function readRegular(path: string, maximum: number, label: string): Buffer {
 		const current = lstatSync(path, { throwIfNoEntry: false });
 		if (
 			after.size !== before.size ||
+			after.mtimeMs !== before.mtimeMs ||
+			after.ctimeMs !== before.ctimeMs ||
+			after.mode !== before.mode ||
 			current === undefined ||
 			current.dev !== before.dev ||
-			current.ino !== before.ino
+			current.ino !== before.ino ||
+			current.mtimeMs !== before.mtimeMs ||
+			current.ctimeMs !== before.ctimeMs ||
+			current.mode !== before.mode
 		)
 			throw new Error(`${label} changed while it was read.`);
 		return bytes;
@@ -381,10 +778,6 @@ function writeAtomic(path: string, bytes: Buffer): void {
 	}
 }
 
-function renameReplace(temporary: string, destination: string, bytes: Buffer): void {
-	writeAtomic(temporary, bytes);
-	renameSync(temporary, destination);
-}
 function fsyncRegular(path: string, label: string): void {
 	const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
 	try {
@@ -437,6 +830,35 @@ function sourceSnapshotMatches(root: string, source: SessionAuthorityV3ActiveMar
 	}
 }
 
+function assertRetainedManifest(root: string, canonicalPath: string, journal: ActivationJournal): void {
+	const bytes = readRegular(join(root, "source-manifest.json"), 16 * 1024, "immutable snapshot manifest");
+	const manifest: unknown = JSON.parse(bytes.toString("utf8"));
+	if (
+		digest(bytes) !== journal.manifestDigest ||
+		!isSourceManifest(manifest) ||
+		manifest.canonicalPath !== canonicalPath ||
+		manifest.source.baseDigest !== journal.source.baseDigest ||
+		manifest.source.walDigest !== journal.source.walDigest ||
+		(manifest.source.wal !== null) !== journal.source.walPresent ||
+		JSON.stringify(manifest.source.base) !== JSON.stringify(journal.identities.sourceBase) ||
+		JSON.stringify(manifest.source.wal) !== JSON.stringify(journal.identities.sourceWal)
+	)
+		throw new Error("Activation journal does not match its immutable source manifest.");
+	const walPath = join(root, "source.v2.wal"),
+		absencePath = join(root, "source.v2.absence.json");
+	if (
+		!matchesFileIdentity(join(root, "source.v2.json"), manifest.snapshots.base) ||
+		!matchesFileIdentity(absencePath, manifest.snapshots.absence) ||
+		digest(readRegular(absencePath, 16 * 1024, "immutable WAL presence evidence")) !==
+			manifest.snapshots.absenceDigest ||
+		(manifest.snapshots.wal === null
+			? lstatSync(walPath, { throwIfNoEntry: false }) !== undefined
+			: !matchesFileIdentity(walPath, manifest.snapshots.wal)) ||
+		!sourceSnapshotMatches(root, journal.source)
+	)
+		throw new Error("Immutable source snapshot identity or content changed during recovery.");
+}
+
 function readSourceBase(root: string, source: SessionAuthorityV3ActiveMarker["source"]): Buffer {
 	const base = readRegular(join(root, "source.v2.json"), MAX_AUTHORITY_BYTES, "immutable V2 backup");
 	if (digest(base) !== source.baseDigest)
@@ -479,15 +901,18 @@ type ActivationJournal = Readonly<{
 	phase: "prepared" | "committing" | "swapped" | "marked";
 	activationV3Digest: string;
 	source: SessionAuthorityV3ActiveMarker["source"];
+	identities: Readonly<{
+		sourceBase: ActivationFileIdentity;
+		sourceWal: ActivationFileIdentity | null;
+		stagedBase: ActivationFileIdentity;
+	}>;
+	manifestDigest: string;
 }>;
 function readJournal(path: string): ActivationJournal | undefined {
-	try {
-		const value: unknown = JSON.parse(readRegular(path, 16 * 1024, "activation journal").toString("utf8"));
-		if (!isJournal(value)) throw new Error("Invalid activation journal.");
-		return value;
-	} catch {
-		return undefined;
-	}
+	if (lstatSync(path, { throwIfNoEntry: false }) === undefined) return undefined;
+	const value: unknown = JSON.parse(readRegular(path, 16 * 1024, "activation journal").toString("utf8"));
+	if (!isJournal(value)) throw new Error("Invalid activation journal.");
+	return value;
 }
 function isMarker(value: unknown): value is SessionAuthorityV3ActiveMarker {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
@@ -512,7 +937,7 @@ function isJournal(value: unknown): value is ActivationJournal {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const journal = value as Partial<ActivationJournal>;
 	return (
-		Object.keys(value).length === 5 &&
+		Object.keys(value).length === 7 &&
 		journal.kind === "openwebui-gjc-session-authority-v3-activation" &&
 		journal.version === 1 &&
 		(journal.phase === "prepared" ||
@@ -520,6 +945,15 @@ function isJournal(value: unknown): value is ActivationJournal {
 			journal.phase === "swapped" ||
 			journal.phase === "marked") &&
 		SHA256.test(journal.activationV3Digest ?? "") &&
+		SHA256.test(journal.manifestDigest ?? "") &&
+		journal.identities !== undefined &&
+		journal.identities !== null &&
+		Object.keys(journal.identities).length === 3 &&
+		isFileIdentity(journal.identities.sourceBase) &&
+		isFileIdentity(journal.identities.stagedBase) &&
+		(journal.identities.sourceWal === null
+			? journal.source?.walPresent === false
+			: isFileIdentity(journal.identities.sourceWal) && journal.source?.walPresent === true) &&
 		isMarker({
 			kind: "openwebui-gjc-session-authority-active",
 			version: 1,
@@ -528,4 +962,55 @@ function isJournal(value: unknown): value is ActivationJournal {
 			source: journal.source,
 		})
 	);
+}
+
+interface ActivationFileIdentity {
+	readonly dev: string;
+	readonly ino: string;
+	readonly mode: string;
+	readonly size: string;
+	readonly mtimeNs: string;
+	readonly mtimeMs: number;
+}
+
+function fileIdentity(path: string): ActivationFileIdentity {
+	const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+	try {
+		const stat = fstatSync(descriptor, { bigint: true });
+		if (!stat.isFile()) throw new Error("Activation identity is not a regular file.");
+		return {
+			dev: String(stat.dev),
+			ino: String(stat.ino),
+			mode: String(stat.mode),
+			size: String(stat.size),
+			mtimeNs: String(stat.mtimeNs),
+			mtimeMs: fstatSync(descriptor).mtimeMs,
+		};
+	} finally {
+		closeSync(descriptor);
+	}
+}
+
+function isFileIdentity(value: unknown): value is ActivationFileIdentity {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		!Array.isArray(value) &&
+		Object.keys(value).length === 6 &&
+		typeof Reflect.get(value, "mtimeMs") === "number" &&
+		Number.isFinite(Reflect.get(value, "mtimeMs")) &&
+		Reflect.get(value, "mtimeMs") >= 0 &&
+		["dev", "ino", "mode", "size", "mtimeNs"].every(
+			key => typeof Reflect.get(value, key) === "string" && /^\d+$/.test(Reflect.get(value, key)),
+		)
+	);
+}
+
+function matchesFileIdentity(path: string, expected: ActivationFileIdentity): boolean {
+	try {
+		const current = fileIdentity(path);
+		return (Object.keys(current) as (keyof ActivationFileIdentity)[]).every(key => current[key] === expected[key]);
+	} catch {
+		return false;
+	}
 }

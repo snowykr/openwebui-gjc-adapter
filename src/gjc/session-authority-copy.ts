@@ -1,7 +1,9 @@
 import { copyManagedLifecycleEvidence } from "./managed-lifecycle-evidence";
 import type {
 	AcknowledgedSuccessor,
+	EndpointSessionAttachmentProof,
 	ProvisionalSessionOperation,
+	SessionAuthorityBinding,
 	SessionAuthorityRecord,
 	SessionAuthorityTombstone,
 	SessionOperation,
@@ -18,8 +20,23 @@ export interface ManagedAcknowledgedSuccessor {
 }
 
 export type ManagedSessionOperation = Omit<SessionOperation, "acknowledgedSuccessor"> & {
-	readonly acknowledgedSuccessor?: ManagedAcknowledgedSuccessor;
+	readonly acknowledgedSuccessor?: Exclude<
+		AcknowledgedSuccessor,
+		{ readonly attachment: EndpointSessionAttachmentProof }
+	>;
 };
+
+export function copySessionAuthorityBinding(value: SessionAuthorityBinding): SessionAuthorityBinding {
+	if (value.historicalBinding !== undefined) {
+		if (value.managedAuthority !== undefined) throw new Error("Session authority bindings are mutually exclusive.");
+		return {
+			historicalBinding: { ...value.historicalBinding, provenance: { ...value.historicalBinding.provenance } },
+		};
+	}
+	return value.managedAuthority === undefined
+		? {}
+		: { managedAuthority: copyManagedAuthority(value.managedAuthority) };
+}
 
 export function copyManagedAuthority(authority: ManagedTurnAuthority): ManagedTurnAuthority {
 	const v3Authority = authority as ManagedTurnAuthority & { readonly authorityEpoch?: string };
@@ -38,11 +55,10 @@ export function copyManagedAuthority(authority: ManagedTurnAuthority): ManagedTu
 }
 
 export function copyOperationResult(result: SessionOperationResult): SessionOperationResult {
+	const { managedAuthority: _managedAuthority, historicalBinding: _historicalBinding, ...fields } = result;
 	return {
-		...result,
-		...(result.managedAuthority === undefined
-			? {}
-			: { managedAuthority: copyManagedAuthority(result.managedAuthority) }),
+		...fields,
+		...copySessionAuthorityBinding(result),
 		...(result.events === undefined ? {} : { events: copyEvents(result.events) }),
 		mapping: {
 			...result.mapping,
@@ -59,6 +75,7 @@ export function copyOperationResult(result: SessionOperationResult): SessionOper
 					}),
 		},
 		...(result.correlation === undefined ? {} : { correlation: { ...result.correlation } }),
+		...(result.gate === undefined ? {} : { gate: { ...result.gate } }),
 	};
 }
 
@@ -70,8 +87,10 @@ export function copyEvents(events: readonly GjcTurnEvent[]): GjcTurnEvent[] {
 }
 
 export function copy(record: SessionAuthorityRecord): SessionAuthorityRecord {
+	const { managedAuthority: _managedAuthority, historicalBinding: _historicalBinding, ...fields } = record;
 	return {
-		...record,
+		...fields,
+		...copySessionAuthorityBinding(record),
 		header: { ...record.header },
 		events: record.events === undefined ? undefined : copyEvents(record.events),
 		...(record.modelSelection === undefined ? {} : { modelSelection: { ...record.modelSelection } }),
@@ -79,9 +98,6 @@ export function copy(record: SessionAuthorityRecord): SessionAuthorityRecord {
 		...(record.attachment === undefined
 			? {}
 			: { attachment: { ...record.attachment, descriptorStat: { ...record.attachment.descriptorStat } } }),
-		...(record.managedAuthority === undefined
-			? {}
-			: { managedAuthority: copyManagedAuthority(record.managedAuthority) }),
 		journal: record.journal.map(operation => copyOperation(operation)),
 		...(record.reassignment === undefined
 			? {}
@@ -99,8 +115,8 @@ export function copy(record: SessionAuthorityRecord): SessionAuthorityRecord {
 				}),
 	};
 }
-export function copyOperation(operation: SessionOperation): SessionOperation;
 export function copyOperation(operation: ManagedSessionOperation): ManagedSessionOperation;
+export function copyOperation(operation: SessionOperation): SessionOperation;
 export function copyOperation(operation: SessionOperation | ManagedSessionOperation) {
 	return {
 		...operation,
@@ -113,9 +129,11 @@ export function copyOperation(operation: SessionOperation | ManagedSessionOperat
 }
 
 export function copyProvisionalOperation(operation: ProvisionalSessionOperation): ProvisionalSessionOperation {
+	const { managedAuthority: _managedAuthority, historicalBinding: _historicalBinding, ...fields } = operation;
 	return {
-		...operation,
-		...copyOperation(operation),
+		...fields,
+		...copyOperation(fields),
+		...copySessionAuthorityBinding(operation),
 		...(operation.attachment === undefined
 			? {}
 			: {
@@ -124,35 +142,51 @@ export function copyProvisionalOperation(operation: ProvisionalSessionOperation)
 						descriptorStat: { ...operation.attachment.descriptorStat },
 					},
 				}),
-		...(operation.managedAuthority === undefined
-			? {}
-			: { managedAuthority: copyManagedAuthority(operation.managedAuthority) }),
 	};
 }
 
-export function copyAcknowledgedSuccessor(successor: AcknowledgedSuccessor): AcknowledgedSuccessor;
 export function copyAcknowledgedSuccessor(successor: ManagedAcknowledgedSuccessor): ManagedAcknowledgedSuccessor;
+export function copyAcknowledgedSuccessor(
+	successor: NonNullable<ManagedSessionOperation["acknowledgedSuccessor"]>,
+): NonNullable<ManagedSessionOperation["acknowledgedSuccessor"]>;
+export function copyAcknowledgedSuccessor(successor: AcknowledgedSuccessor): AcknowledgedSuccessor;
 export function copyAcknowledgedSuccessor(
 	successor: AcknowledgedSuccessor | ManagedAcknowledgedSuccessor,
 ): AcknowledgedSuccessor | ManagedAcknowledgedSuccessor;
 export function copyAcknowledgedSuccessor(
 	successor: AcknowledgedSuccessor | ManagedAcknowledgedSuccessor,
 ): AcknowledgedSuccessor | ManagedAcknowledgedSuccessor {
+	if ("historicalBinding" in successor && successor.historicalBinding !== undefined) {
+		if (successor.managedAuthority !== undefined)
+			throw new Error("Session authority bindings are mutually exclusive.");
+		return {
+			sessionId: successor.sessionId,
+			historicalBinding: {
+				...successor.historicalBinding,
+				provenance: { ...successor.historicalBinding.provenance },
+			},
+		};
+	}
 	if ("managedAuthority" in successor) {
+		if (successor.managedAuthority === undefined) throw new Error("Acknowledged successor lacks managed authority.");
 		return {
 			sessionId: successor.sessionId,
 			managedAuthority: copyManagedAuthority(successor.managedAuthority),
 		};
 	}
-	return {
-		...successor,
-		attachment: { ...successor.attachment, descriptorStat: { ...successor.attachment.descriptorStat } },
-	};
+	if ("attachment" in successor)
+		return {
+			...successor,
+			attachment: { ...successor.attachment, descriptorStat: { ...successor.attachment.descriptorStat } },
+		};
+	throw new Error("Acknowledged successor lacks authority evidence.");
 }
 
 export function copyTombstone(tombstone: SessionAuthorityTombstone): SessionAuthorityTombstone {
+	const { managedAuthority: _managedAuthority, historicalBinding: _historicalBinding, ...fields } = tombstone;
 	return {
-		...tombstone,
+		...fields,
+		...copySessionAuthorityBinding(tombstone),
 		header: { ...tombstone.header },
 		events: tombstone.events === undefined ? undefined : copyEvents(tombstone.events),
 		...(tombstone.modelSelection === undefined ? {} : { modelSelection: { ...tombstone.modelSelection } }),
@@ -160,9 +194,6 @@ export function copyTombstone(tombstone: SessionAuthorityTombstone): SessionAuth
 		...(tombstone.attachment === undefined
 			? {}
 			: { attachment: { ...tombstone.attachment, descriptorStat: { ...tombstone.attachment.descriptorStat } } }),
-		...(tombstone.managedAuthority === undefined
-			? {}
-			: { managedAuthority: copyManagedAuthority(tombstone.managedAuthority) }),
 		journal: tombstone.journal.map(operation => copyOperation(operation)),
 		...(tombstone.prior === undefined ? {} : { prior: copyTombstone(tombstone.prior) }),
 	};

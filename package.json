@@ -63,6 +63,7 @@
 			"types": "./src/*.ts",
 			"import": "./src/*.ts"
 		},
+		"./gjc/*": null,
 		"./branches/*": {
 			"types": "./src/branches/*.ts",
 			"import": "./src/branches/*.ts"

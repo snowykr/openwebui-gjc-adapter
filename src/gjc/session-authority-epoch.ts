@@ -1,6 +1,7 @@
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from "node:fs";
 
 import {
+	hasUnboundServingAuthority,
 	isSessionAuthorityV3Document,
 	SESSION_AUTHORITY_V3_EPOCH,
 	SESSION_AUTHORITY_V3_VERSION,
@@ -68,6 +69,7 @@ function classify(bytes: Buffer): SessionAuthorityEpochProbe {
 		!isSessionAuthorityV3Document(value)
 	)
 		return blocked();
+	if (hasUnboundServingAuthority(value)) return blocked();
 	return { status: "v3", selection: "managed-store" };
 }
 

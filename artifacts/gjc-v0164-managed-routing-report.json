@@ -1,6 +1,6 @@
 {
   "kind": "managed-routing-api-package-test-report",
-  "startedAt": "2026-09-06T15:04:12.354Z",
+  "startedAt": "2026-09-06T17:07:19.881Z",
   "limitations": [
     "Hermetic provider and exclusively owned probe workspace; no browser.",
     "Session-only isolated cleanup does not prove production replacement-race-safe close; SDK issue #5345 remains open.",
@@ -10,11 +10,11 @@
   "withheldBeforeProviderResponse": true,
   "acknowledgement": {
     "type": "control_response",
-    "id": "e18aba52-4414-4eb9-b2e2-136154d5e67d",
+    "id": "03c20d6b-2bf2-4b52-9b52-5745f71a476a",
     "ok": true,
     "result": {
-      "commandId": "ee0005d7-f3dc-4749-957f-67d7cbec55fa",
-      "turnId": "a63a574a-9900-4da0-ab8d-96423236d333",
+      "commandId": "32ba0042-c758-438f-bc5f-5032c808b247",
+      "turnId": "f4c488a4-7246-44db-8f93-27b858ea1cc7",
       "accepted": true
     }
   },
@@ -35,7 +35,7 @@
       "ok": true,
       "operation": "session.close",
       "result": {
-        "sessionId": "7a000960-2bfa-4b8b-8acb-0a1bf10193c2",
+        "sessionId": "c4909667-1844-4c0a-bbbc-04d66e62578e",
         "note": "Endpoint close was unreachable; sent SIGTERM to the durably identified session process."
       }
     },
@@ -50,13 +50,13 @@
     }
   },
   "routerStopped": true,
-  "finishedAt": "2026-09-06T15:04:18.251Z",
+  "finishedAt": "2026-09-06T17:07:26.166Z",
   "responses": [
     {
       "operation": "model.set",
       "response": {
         "type": "control_response",
-        "id": "a497bb00-21af-4e37-afc4-84247e3c7531",
+        "id": "56d1641d-7027-4fb9-9798-aa8a3ffe9d10",
         "ok": true,
         "result": {
           "provider": "compat-local",
@@ -69,7 +69,7 @@
       "operation": "thinking.set",
       "response": {
         "type": "control_response",
-        "id": "fc23a83d-1b6c-419e-8791-29f0c7c5fd15",
+        "id": "a720f74d-ee6d-44aa-955b-6d0128ae4752",
         "ok": true,
         "result": {
           "changed": true
@@ -80,7 +80,7 @@
       "operation": "workflow.gates.list",
       "response": {
         "type": "query_response",
-        "id": "aa311dfa-be85-4f68-becb-ed19376ef9a1",
+        "id": "946bc398-f687-4e2b-a66d-6e003f6c4cce",
         "ok": true,
         "page": {
           "items": [],
@@ -93,19 +93,15 @@
       "operation": "turn.prompt",
       "response": {
         "type": "control_response",
-        "id": "e18aba52-4414-4eb9-b2e2-136154d5e67d",
+        "id": "03c20d6b-2bf2-4b52-9b52-5745f71a476a",
         "ok": true,
         "result": {
-          "commandId": "ee0005d7-f3dc-4749-957f-67d7cbec55fa",
-          "turnId": "a63a574a-9900-4da0-ab8d-96423236d333",
+          "commandId": "32ba0042-c758-438f-bc5f-5032c808b247",
+          "turnId": "f4c488a4-7246-44db-8f93-27b858ea1cc7",
           "accepted": true
         }
       }
     }
   ],
-  "errors": [],
-  "sdkVersion": "0.16.4",
-  "invocation": "bun scripts/gjc-managed-runtime-compat.ts",
-  "sourceReport": "<TEMP>/gjc-managed-route-compat-QFCmSi/report.json",
-  "sourceReportSha256": "7f0908614467d724cb29645652975395f3687106f560ee7fa64a231a251b86e9"
+  "errors": []
 }

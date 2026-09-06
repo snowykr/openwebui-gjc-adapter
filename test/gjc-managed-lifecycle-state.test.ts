@@ -24,10 +24,12 @@ import { copyOperation, copyProvisionalOperation } from "../src/gjc/session-auth
 import {
 	encodeSessionAuthorityV3Document,
 	isSessionAuthorityV3Document,
+	type ManagedTurnAuthorityV3,
 	parseSessionAuthorityV3Document,
 	SESSION_AUTHORITY_V3_EPOCH,
 	SESSION_AUTHORITY_V3_KIND,
 	type SessionAuthorityV3Document,
+	type SessionAuthorityV3Mapping,
 	type SessionAuthorityV3Operation,
 	type SessionAuthorityV3Result,
 } from "../src/gjc/session-authority-v3";
@@ -168,7 +170,11 @@ function documentWith(evidence?: ManagedLifecycleEvidence): SessionAuthorityV3Do
 	};
 }
 
-function journalDocument(operation: SessionAuthorityV3Operation): SessionAuthorityV3Document {
+function journalDocument(operation: SessionAuthorityV3Operation): SessionAuthorityV3Document & {
+	readonly mappings: readonly [
+		Extract<SessionAuthorityV3Mapping, { readonly managedAuthority: ManagedTurnAuthorityV3 }>,
+	];
+} {
 	const chatId = JSON.stringify([prepared.principalId, prepared.chatId]);
 	return {
 		...documentWith(),
@@ -195,7 +201,7 @@ function journalDocument(operation: SessionAuthorityV3Operation): SessionAuthori
 function lifecycleResult(
 	authority: ManagedTurnAuthority,
 	kind: SessionAuthorityV3Result["kind"] = "turn",
-): SessionAuthorityV3Result {
+): Extract<SessionAuthorityV3Result, { readonly managedAuthority: ManagedTurnAuthorityV3 }> {
 	const chatId = JSON.stringify([authority.principalId, authority.chatId]);
 	return {
 		kind,

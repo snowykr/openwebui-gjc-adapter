@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import type { NormalizedModelSelection } from "../contracts";
+import { ManagedOperationDeadline } from "../gjc/managed-operation-deadline";
 import { ManagedSdkOperationError, type ManagedSdkRuntime } from "../gjc/managed-sdk-runtime";
 import { SESSION_AUTHORITY_V3_EPOCH } from "../gjc/session-authority-v3";
 import { normalizeModelSelection } from "../gjc/session-operation-codec";
@@ -27,7 +28,6 @@ import {
 	createManagedSessionOperations,
 	type ManagedGateInput,
 	type ManagedLifecycleInput,
-	ManagedOperationDeadline,
 	type ManagedSessionOperations,
 	type ManagedTurnInput,
 } from "./gjc-managed-session-operations";

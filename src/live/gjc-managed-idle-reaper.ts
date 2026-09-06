@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { isAbsolute, resolve } from "node:path";
 import { transitionManagedLifecycleEvidence } from "../gjc/managed-lifecycle-evidence";
+import { ManagedOperationDeadline } from "../gjc/managed-operation-deadline";
 import type { TenantSessionKey } from "../gjc/managed-sdk-runtime";
 import type { SessionOperation } from "../gjc/session-authority";
 import { SESSION_AUTHORITY_V3_EPOCH } from "../gjc/session-authority-v3";
@@ -147,6 +148,13 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 		this.#timeoutMs = input.idleTimeoutMs ?? DEFAULT_MANAGED_IDLE_TIMEOUT_MS;
 		if (!Number.isSafeInteger(this.#timeoutMs) || this.#timeoutMs <= 0)
 			throw new TypeError("idleTimeoutMs must be a positive safe integer.");
+		if (
+			input.closeTimeoutMs !== undefined &&
+			(!Number.isSafeInteger(input.closeTimeoutMs) ||
+				input.closeTimeoutMs <= 0 ||
+				input.closeTimeoutMs > 2_147_483_647)
+		)
+			throw new TypeError("closeTimeoutMs must be a positive finite timer-safe integer.");
 		this.#now = input.now ?? Date.now;
 		this.#clearInterval = input.clearInterval ?? (timer => globalThis.clearInterval(timer));
 		if (input.pollIntervalMs !== undefined) {
@@ -168,16 +176,20 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 
 	runOnce(): Promise<void> {
 		if (this.#stopped) return Promise.resolve();
+		const deadline = new ManagedOperationDeadline(this.input.closeTimeoutMs, "idle retirement");
 		const scan = Promise.resolve()
-			.then(() => this.scan())
-			.finally(() => this.#scans.delete(scan));
+			.then(() => this.scan(deadline))
+			.finally(() => {
+				deadline.close();
+				this.#scans.delete(scan);
+			});
 		this.#scans.add(scan);
 		return scan;
 	}
 
-	private async scan(): Promise<void> {
+	private async scan(deadline: ManagedOperationDeadline): Promise<void> {
 		if (this.#stopped) return;
-		const records = await this.input.records.active();
+		const records = await within(deadline, () => this.input.records.active());
 		const results = await Promise.allSettled(
 			records.map(async record => {
 				if (
@@ -186,12 +198,15 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 						(record.state !== "active" || record.lastActivityAt + this.#timeoutMs > this.#now()))
 				)
 					return;
-				if (record.state === "closing" && (await this.input.records.pendingRetirement(record)) === undefined)
+				if (
+					record.state === "closing" &&
+					(await within(deadline, () => this.input.records.pendingRetirement(record))) === undefined
+				)
 					return;
 				if (this.#stopped) return;
 				const key = recordIdentity(record.authority);
 				if (this.#inFlight.has(key)) return;
-				const work = this.reap(record);
+				const work = this.reap(record, deadline);
 				this.#inFlight.set(key, work);
 				try {
 					await work;
@@ -220,7 +235,7 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 		await this.#draining;
 	}
 
-	private async reap(record: ManagedIdleGenerationRecord): Promise<void> {
+	private async reap(record: ManagedIdleGenerationRecord, deadline: ManagedOperationDeadline): Promise<void> {
 		const key = tenantKey(record.authority);
 		let releaseAdmission: (() => void) | undefined;
 		let lease: ManagedIdleLease | undefined;
@@ -228,49 +243,75 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 		let retired = false;
 		const errors: unknown[] = [];
 		try {
-			releaseAdmission = await this.input.admission.acquire(key);
+			await within(deadline, async () => {
+				const acquired = await this.input.admission.acquire(key);
+				try {
+					deadline.remaining();
+				} catch (error) {
+					acquired?.();
+					throw error;
+				}
+				releaseAdmission = acquired;
+			});
 			if (releaseAdmission === undefined || this.#stopped) return;
-			lease = await this.input.leases.acquire(key);
+			await within(deadline, async () => {
+				const acquired = await this.input.leases.acquire(key);
+				try {
+					deadline.remaining();
+				} catch (error) {
+					try {
+						await acquired?.release();
+					} catch (releaseError) {
+						this.#lastPollFailure = Object.freeze({ error: releaseError, at: this.#now() });
+					}
+					throw error;
+				}
+				lease = acquired;
+			});
 			if (lease === undefined || this.#stopped) return;
-			await lease.assertFence();
+			await within(deadline, () => lease!.assertFence());
 			if (record.state === "closing") {
-				intent = await this.input.records.pendingRetirement(record);
+				intent = await within(deadline, () => this.input.records.pendingRetirement(record));
 				if (intent === undefined) return;
 				retired = true;
-				await this.finishRetirement(record, intent, lease);
+				await this.finishRetirement(record, intent, lease, deadline);
 				return;
 			}
 			const proposed = { key: closeKey(record.authority), authority: record.authority, requestedAt: this.#now() };
-			const prepared = await this.input.records.prepareClose(record, proposed);
+			const prepared = await within(deadline, () => this.input.records.prepareClose(record, proposed));
 			if (prepared === false) return;
 			intent = prepared === true ? proposed : prepared;
 			let outcome: Awaited<ReturnType<ManagedIdleLifecycleRuntime["closeLifecycleSession"]>>;
 			try {
-				await lease.assertFence();
+				await within(deadline, () => lease!.assertFence());
 				if (this.#stopped) {
-					await this.input.records.markUncertain(record, intent, "Stopped after durable close reservation.");
+					await deadline.wait(
+						this.input.records.markUncertain(record, intent, "Stopped after durable close reservation."),
+					);
 					return;
 				}
-				outcome = await this.input.runtime.closeLifecycleSession({
-					tenant: key,
-					actor: { id: record.authority.principalId, namespace: "openwebui-gjc-adapter" },
-					capability: "session.close",
-					requestKey: intent.key,
-					target: { sessionId: record.authority.sessionId, endpointGeneration: record.authority.generation },
-					timeoutMs: this.input.closeTimeoutMs,
-				});
+				outcome = await within(deadline, () =>
+					this.input.runtime.closeLifecycleSession({
+						tenant: key,
+						actor: { id: record.authority.principalId, namespace: "openwebui-gjc-adapter" },
+						capability: "session.close",
+						requestKey: intent!.key,
+						target: { sessionId: record.authority.sessionId, endpointGeneration: record.authority.generation },
+						timeoutMs: deadline.remaining(),
+					}),
+				);
 				if (!outcome.ok || outcome.result?.sessionId !== key.sessionId)
 					throw new Error("Managed close lacks matching success and exact retirement.");
-				await this.input.records.acknowledge(record, intent, outcome.result.sessionId);
-				await lease.assertFence();
-				await this.input.runtime.reconcile();
-				await lease.assertFence();
-				const status = await this.input.runtime.generationStatus(key);
-				await lease.assertFence();
+				await within(deadline, () => this.input.records.acknowledge(record, intent!, outcome.result!.sessionId));
+				await within(deadline, () => lease!.assertFence());
+				await within(deadline, () => this.input.runtime.reconcile());
+				await within(deadline, () => lease!.assertFence());
+				const status = await within(deadline, () => this.input.runtime.generationStatus(key));
+				await within(deadline, () => lease!.assertFence());
 				if (status.status === "retired" && status.evidence !== undefined) {
-					await this.input.records.retire(record, intent, { ...status.evidence });
+					await within(deadline, () => this.input.records.retire(record, intent!, { ...status.evidence }));
 					retired = true;
-					await this.finishRetirement(record, intent, lease);
+					await this.finishRetirement(record, intent, lease, deadline);
 					return;
 				}
 				throw new Error(
@@ -280,7 +321,7 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 				errors.push(error);
 				if (!retired) {
 					try {
-						await this.input.records.markUncertain(record, intent, errorMessage(error));
+						await deadline.wait(this.input.records.markUncertain(record, intent, errorMessage(error)));
 					} catch (persistenceError) {
 						errors.push(persistenceError);
 					}
@@ -290,7 +331,7 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 			errors.push(error);
 		} finally {
 			try {
-				await lease?.release();
+				if (lease !== undefined) await deadline.wait(lease.release());
 			} catch (releaseError) {
 				errors.push(releaseError);
 			}
@@ -299,7 +340,7 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 			} catch (releaseError) {
 				errors.push(releaseError);
 			}
-			throwFailures(errors);
+			throwFailures([...new Set(errors)]);
 		}
 	}
 
@@ -307,10 +348,11 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 		record: ManagedIdleGenerationRecord,
 		intent: ManagedIdleCloseIntent,
 		lease: ManagedIdleLease,
+		deadline: ManagedOperationDeadline,
 	): Promise<void> {
 		const revalidate = async () => {
-			await lease.assertFence();
-			const pending = await this.input.records.pendingRetirement(record);
+			await within(deadline, () => lease.assertFence());
+			const pending = await within(deadline, () => this.input.records.pendingRetirement(record));
 			if (
 				pending === undefined ||
 				pending.key !== intent.key ||
@@ -320,10 +362,16 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 				throw new Error("Managed retirement receipt changed before local cleanup.");
 		};
 		await revalidate();
-		await this.input.records.publishRetired?.(record, intent);
+		if (this.input.records.publishRetired !== undefined)
+			await within(deadline, () => this.input.records.publishRetired!(record, intent));
 		await revalidate();
-		await this.input.records.evict(record, intent);
+		await within(deadline, () => this.input.records.evict(record, intent));
 	}
+}
+
+function within<T>(deadline: ManagedOperationDeadline, work: () => Promise<T>): Promise<T> {
+	deadline.remaining();
+	return deadline.wait(work());
 }
 
 class ManagedV3GenerationStore implements ManagedIdleGenerationStore {

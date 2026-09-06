@@ -389,7 +389,11 @@ async function runManagedBranch(
 		assertCurrentBranchPredecessor(mappings, turn.chatId, existing, turn.userMessageId);
 		const authority = managedSuccessorAuthority(source, forked.successor);
 		const acknowledged = mappings.operation(turn.chatId, turn.userMessageId)?.acknowledgedSuccessor;
-		if (acknowledged === undefined || !("managedAuthority" in acknowledged))
+		if (
+			acknowledged === undefined ||
+			!("managedAuthority" in acknowledged) ||
+			acknowledged.managedAuthority === undefined
+		)
 			throw new Error("Managed branch successor acknowledgement was not persisted.");
 		assertManagedAuthority(acknowledged.managedAuthority, authority);
 		assertManagedAuthority(forked.managedAuthority, authority);

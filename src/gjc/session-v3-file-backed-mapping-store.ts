@@ -22,10 +22,13 @@ import {
 	type SessionOperationResult,
 	type SessionOperationState,
 } from "./session-authority";
-import type { ManagedAcknowledgedSuccessor, ManagedSessionOperation } from "./session-authority-copy";
 import { AuthorityMutationLock } from "./session-authority-file";
 import { SessionAuthorityDurabilityError } from "./session-authority-persistence";
-import { type AcknowledgedSuccessor, SessionAuthorityLoadError } from "./session-authority-types";
+import {
+	type AcknowledgedSuccessor,
+	type HistoricalSessionBinding,
+	SessionAuthorityLoadError,
+} from "./session-authority-types";
 import {
 	encodeSessionAuthorityV3Document,
 	type ManagedTurnAuthorityV3,
@@ -33,34 +36,17 @@ import {
 	SESSION_AUTHORITY_V3_EPOCH,
 	SESSION_AUTHORITY_V3_KIND,
 	type SessionAuthorityV3AcknowledgedSuccessor,
+	type SessionAuthorityV3Binding,
 	type SessionAuthorityV3Document,
 	type SessionAuthorityV3Mapping,
 	type SessionAuthorityV3Operation,
 	type SessionAuthorityV3ProvisionalOperation,
 	type SessionAuthorityV3Reassignment,
+	type SessionAuthorityV3Result,
 	type SessionAuthorityV3Tombstone,
 } from "./session-authority-v3";
 import { SessionMappingStore } from "./session-mapping-memory-store";
 import type { ManagedTurnAuthority } from "./turn-runner";
-
-type ManagedSessionAuthorityTombstone = Omit<SessionAuthorityTombstone, "journal" | "prior"> & {
-	readonly journal: readonly ManagedSessionOperation[];
-	readonly prior?: ManagedSessionAuthorityTombstone;
-};
-type ManagedSessionAuthorityReassignment = Omit<
-	NonNullable<SessionAuthorityRecord["reassignment"]>,
-	"sourceTombstone" | "priorTombstone"
-> & {
-	readonly sourceTombstone?: ManagedSessionAuthorityTombstone;
-	readonly priorTombstone?: ManagedSessionAuthorityTombstone;
-};
-type ManagedSessionAuthorityRecord = Omit<SessionAuthorityRecord, "journal" | "reassignment"> & {
-	readonly journal: readonly ManagedSessionOperation[];
-	readonly reassignment?: ManagedSessionAuthorityReassignment;
-};
-type ManagedProvisionalSessionOperation = Omit<ProvisionalSessionOperation, "acknowledgedSuccessor"> & {
-	readonly acknowledgedSuccessor?: ManagedAcknowledgedSuccessor;
-};
 
 /** Canonical V3 authority storage. This deliberately has no V2 compatibility,
  * attachment, descriptor, or terminal persistence path. The activation marker
@@ -70,17 +56,21 @@ class V3FileSessionAuthority extends SessionAuthority {
 	#generation = 0;
 	#closed = false;
 
-	constructor(readonly filePath: string) {
+	constructor(
+		readonly filePath: string,
+		heldMutationLock?: AuthorityMutationLock,
+	) {
 		super();
-		const lock = AuthorityMutationLock.acquire(filePath);
+		const lock = heldMutationLock ?? AuthorityMutationLock.acquire(filePath);
 		try {
+			lock.assertHeld(filePath);
 			if (existsSync(filePath)) {
 				this.load();
 				super.reconcileRestart(false);
-				if (this.hasDirtyJournal()) this.persist();
+				if (this.hasDirtyJournal()) this.persist(lock);
 			}
 		} finally {
-			lock.release();
+			if (heldMutationLock === undefined) lock.release();
 		}
 	}
 
@@ -95,10 +85,20 @@ class V3FileSessionAuthority extends SessionAuthority {
 	}
 
 	override set(input: SessionAuthorityInput): SessionAuthorityRecord {
-		return this.mutate(() => super.set(input));
+		return this.mutate(() => {
+			this.assertNotHistorical(input.chatId);
+			return super.set(input);
+		});
 	}
 	override upsert(input: SessionAuthorityInput): SessionAuthorityRecord {
-		return this.mutate(() => super.upsert(input));
+		return this.mutate(() => {
+			this.assertNotHistorical(input.chatId);
+			return super.upsert(input);
+		});
+	}
+	private assertNotHistorical(chatId: string): void {
+		if (this.get(chatId)?.historicalBinding !== undefined)
+			throw new Error("Historical session requires explicit bootstrap proof before live mutation.");
 	}
 	override reassignProject(chatId: string, currentProjectId: string, nextProjectId: string): boolean {
 		return this.mutate(() => super.reassignProject(chatId, currentProjectId, nextProjectId));
@@ -154,6 +154,9 @@ class V3FileSessionAuthority extends SessionAuthority {
 		result: SessionOperationResult,
 	): SessionAuthorityRecord {
 		return this.mutate(() => {
+			this.assertNotHistorical(chatId);
+			if (mapping.historicalBinding !== undefined)
+				throw new Error("Historical mapping cannot be published as an active operation.");
 			const durableMapping = {
 				...mapping,
 				managedAuthority: authorityV3(mapping.managedAuthority, `mapping ${chatId}`),
@@ -167,7 +170,10 @@ class V3FileSessionAuthority extends SessionAuthority {
 		chatId: string,
 		operation: Omit<SessionOperation, "state" | "startedAt" | "completedAt">,
 	): SessionAuthorityRecord {
-		return this.mutate(() => super.beginOperation(chatId, operation));
+		return this.mutate(() => {
+			this.assertNotHistorical(chatId);
+			return super.beginOperation(chatId, operation);
+		});
 	}
 	override discardPendingOperation(
 		chatId: string,
@@ -178,7 +184,10 @@ class V3FileSessionAuthority extends SessionAuthority {
 	override reserveProvisionalOperation(
 		operation: Omit<ProvisionalSessionOperation, "state" | "startedAt" | "completedAt">,
 	): ProvisionalSessionOperation {
-		return this.mutate(() => super.reserveProvisionalOperation(operation));
+		return this.mutate(() => {
+			this.assertNotHistorical(operation.chatId);
+			return super.reserveProvisionalOperation(operation);
+		});
 	}
 	override discardPendingProvisionalOperation(
 		chatId: string,
@@ -241,6 +250,7 @@ class V3FileSessionAuthority extends SessionAuthority {
 		let failed = false;
 		let result!: T;
 		try {
+			lock.assertHeld(this.filePath);
 			// A second writer may have committed between calls; always reload under
 			// the shared file lock before deriving the next immutable V3 document.
 			if (existsSync(this.filePath)) this.load();
@@ -248,7 +258,7 @@ class V3FileSessionAuthority extends SessionAuthority {
 			try {
 				result = action();
 				if (this.hasDirtyJournal()) {
-					this.persist();
+					this.persist(lock);
 					durableMutation = true;
 				}
 			} catch (error) {
@@ -287,14 +297,15 @@ class V3FileSessionAuthority extends SessionAuthority {
 		if (document === undefined)
 			throw new SessionAuthorityLoadError(this.filePath, "authority document is not strict V3");
 		this.replaceAllWithReferences(
-			document.mappings.map(fromV3Mapping) as unknown as SessionAuthorityRecord[],
-			document.provisionalOperations.map(fromV3Provisional) as unknown as ProvisionalSessionOperation[],
+			document.mappings.map(fromV3Mapping),
+			document.provisionalOperations.map(fromV3Provisional),
 		);
 		this.clearDirtyJournal();
 		this.#generation += 1;
 	}
 
-	private persist(): void {
+	private persist(lock: AuthorityMutationLock): void {
+		lock.assertHeld(this.filePath);
 		const document: SessionAuthorityV3Document = {
 			kind: SESSION_AUTHORITY_V3_KIND,
 			version: 3,
@@ -314,6 +325,7 @@ class V3FileSessionAuthority extends SessionAuthority {
 			fsyncSync(descriptor);
 			closeSync(descriptor);
 			descriptor = undefined;
+			lock.assertHeld(this.filePath);
 			renameAttempted = true;
 			renameSync(temporary, this.filePath);
 			replaced = true;
@@ -358,8 +370,8 @@ class V3FileSessionAuthority extends SessionAuthority {
 export class V3FileBackedSessionMappingStore extends SessionMappingStore {
 	readonly authorityEpoch = SESSION_AUTHORITY_V3_EPOCH;
 	readonly #authority: V3FileSessionAuthority;
-	constructor(filePath: string) {
-		const authority = new V3FileSessionAuthority(filePath);
+	constructor(filePath: string, heldMutationLock?: AuthorityMutationLock) {
+		const authority = new V3FileSessionAuthority(filePath, heldMutationLock);
 		super(authority);
 		this.#authority = authority;
 	}
@@ -368,6 +380,15 @@ export class V3FileBackedSessionMappingStore extends SessionMappingStore {
 	}
 	get epoch(): string {
 		return this.authorityEpoch;
+	}
+	assertServingReady(): void {
+		if (
+			[...this.#authority.recordsIterable()].some(record => record.historicalBinding !== undefined) ||
+			this.#authority
+				.provisionalEntries()
+				.some(operation => operation.historicalBinding !== undefined && operation.state !== "complete")
+		)
+			throw new Error("Canonical V3 contains unbound history requiring restricted bootstrap.");
 	}
 	close(): void {
 		this.#authority.close();
@@ -422,21 +443,21 @@ function normalizePublishedOperation(
 ): SessionOperation {
 	const successor = operation.acknowledgedSuccessor;
 	const successorAuthority =
-		successor === undefined
-			? undefined
-			: (successor as AcknowledgedSuccessor & { readonly managedAuthority?: ManagedTurnAuthority }).managedAuthority;
+		successor !== undefined && "managedAuthority" in successor ? successor.managedAuthority : undefined;
 	const result = operation.result;
 	const normalizedResult =
 		result === undefined
 			? undefined
-			: {
-					...result,
-					managedAuthority: {
-						...(result.managedAuthority ?? managedAuthority),
-						chatId: durableChatId,
-					},
-					mapping: { ...result.mapping, chatId: durableChatId },
-				};
+			: result.historicalBinding !== undefined
+				? result
+				: {
+						...result,
+						managedAuthority: {
+							...(result.managedAuthority ?? managedAuthority),
+							chatId: durableChatId,
+						},
+						mapping: { ...result.mapping, chatId: durableChatId },
+					};
 	return {
 		...operation,
 		...(successor === undefined || successorAuthority === undefined
@@ -470,6 +491,7 @@ function normalizeResultAuthority(
 	result: SessionOperationResult,
 	mappingAuthority: ManagedTurnAuthority | undefined,
 ): SessionOperationResult {
+	if (result.historicalBinding !== undefined) return result;
 	return {
 		...result,
 		managedAuthority: authorityV3(
@@ -507,6 +529,28 @@ function authorityV3ForDurableChat(
 	const authority = authorityV3(value, context);
 	return durableChatId === undefined ? authority : { ...authority, chatId: durableChatId };
 }
+
+function bindingV3(
+	value: { readonly managedAuthority?: ManagedTurnAuthority; readonly historicalBinding?: HistoricalSessionBinding },
+	context: string,
+	durableChatId?: string,
+): SessionAuthorityV3Binding {
+	if (value.historicalBinding !== undefined) {
+		if (value.managedAuthority !== undefined) throw new Error("Historical evidence cannot carry managed authority.");
+		const history = structuredClone(value.historicalBinding);
+		return { historicalBinding: durableChatId === undefined ? history : { ...history, chatId: durableChatId } };
+	}
+	return { managedAuthority: authorityV3ForDurableChat(value.managedAuthority, context, durableChatId) };
+}
+
+function toV3Result(result: SessionOperationResult, context: string, durableChatId?: string): SessionAuthorityV3Result {
+	const { managedAuthority: _managed, historicalBinding: _history, ...rest } = result;
+	return {
+		...rest,
+		...bindingV3(result, context, durableChatId),
+		mapping: resultMappingForDurableChat(result.mapping, durableChatId),
+	};
+}
 function toV3Operation(
 	operation: SessionOperation,
 	context: string,
@@ -523,77 +567,43 @@ function toV3Operation(
 		...(result === undefined
 			? {}
 			: {
-					result: {
-						...result,
-						mapping: resultMappingForDurableChat(result.mapping, durableChatId),
-						managedAuthority: authorityV3ForDurableChat(
-							result.managedAuthority,
-							`${context} result`,
-							durableChatId,
-						),
-					},
+					result: toV3Result(result, `${context} result`, durableChatId),
 				}),
 	};
 }
 
 function toV3Successor(
-	successor: unknown,
+	successor: AcknowledgedSuccessor,
 	context: string,
 	durableChatId?: string,
 ): SessionAuthorityV3AcknowledgedSuccessor {
-	if (typeof successor !== "object" || successor === null) {
-		throw new Error(`V3 managed successor proof is required for ${context}.`);
-	}
-	const value = successor as Record<string, unknown>;
-	if (
-		Object.keys(value).some(key => key !== "sessionId" && key !== "managedAuthority") ||
-		typeof value.sessionId !== "string"
-	) {
+	if ("attachment" in successor) {
 		throw new Error(
 			`V3 managed successor proof is required for ${context}; legacy attachment state is not accepted.`,
 		);
 	}
 	return {
-		sessionId: value.sessionId,
-		managedAuthority: authorityV3ForDurableChat(value.managedAuthority, context, durableChatId),
+		sessionId: successor.sessionId,
+		...bindingV3(successor, context, durableChatId),
 	};
 }
 
-function fromV3Operation(operation: SessionAuthorityV3Operation): ManagedSessionOperation {
-	const { acknowledgedSuccessor, result, ...rest } = operation;
-	return {
-		...rest,
-		...(acknowledgedSuccessor === undefined
-			? {}
-			: {
-					acknowledgedSuccessor: {
-						sessionId: acknowledgedSuccessor.sessionId,
-						managedAuthority: authorityV3(acknowledgedSuccessor.managedAuthority, "reloaded successor"),
-					},
-				}),
-		...(result === undefined ? {} : { result: { ...result, managedAuthority: result.managedAuthority } }),
-	};
-}
-function stripMapping(
-	mapping: SessionOperationResult["mapping"],
-): SessionAuthorityV3Operation["result"] extends infer _ ? any : never {
-	const { sessionFile: _sessionFile, activeLeaf: _activeLeaf, attachment: _attachment, ...v3 } = mapping;
-	return v3;
+function fromV3Operation(operation: SessionAuthorityV3Operation): SessionOperation {
+	return structuredClone(operation);
 }
 function resultMappingForDurableChat(
 	mapping: SessionOperationResult["mapping"],
 	durableChatId: string | undefined,
-): SessionAuthorityV3Operation["result"] extends infer _ ? any : never {
-	const v3 = stripMapping(mapping);
+): SessionAuthorityV3Result["mapping"] {
+	const { attachment: _attachment, ...v3 } = mapping;
 	return durableChatId === undefined ? v3 : { ...v3, chatId: durableChatId };
 }
 function toV3Tombstone(tombstone: SessionAuthorityTombstone, durableChatId?: string): SessionAuthorityV3Tombstone {
 	const {
 		version: _version,
-		sessionFile: _sessionFile,
-		activeLeaf: _activeLeaf,
 		attachment: _attachment,
-		managedAuthority,
+		managedAuthority: _managedAuthority,
+		historicalBinding: _historicalBinding,
 		journal,
 		prior,
 		...rest
@@ -605,12 +615,12 @@ function toV3Tombstone(tombstone: SessionAuthorityTombstone, durableChatId?: str
 			: { chatId: durableChatId, header: { ...rest.header, chatId: durableChatId } }),
 		version: 3,
 		authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
-		managedAuthority: authorityV3ForDurableChat(managedAuthority, "tombstone", durableChatId),
+		...bindingV3(tombstone, "tombstone", durableChatId),
 		journal: journal.map(item => toV3Operation(item, "tombstone operation", durableChatId)),
 		...(prior === undefined ? {} : { prior: toV3Tombstone(prior, durableChatId) }),
 	};
 }
-function fromV3Tombstone(tombstone: SessionAuthorityV3Tombstone): ManagedSessionAuthorityTombstone {
+function fromV3Tombstone(tombstone: SessionAuthorityV3Tombstone): SessionAuthorityTombstone {
 	const { version: _version, authorityEpoch: _epoch, journal, prior, ...rest } = tombstone;
 	return {
 		...rest,
@@ -630,7 +640,9 @@ function toV3Reassignment(
 		...(priorTombstone === undefined ? {} : { priorTombstone: toV3Tombstone(priorTombstone, durableChatId) }),
 	};
 }
-function fromV3Reassignment(reassignment: SessionAuthorityV3Reassignment): ManagedSessionAuthorityReassignment {
+function fromV3Reassignment(
+	reassignment: SessionAuthorityV3Reassignment,
+): NonNullable<SessionAuthorityRecord["reassignment"]> {
 	const { sourceTombstone, priorTombstone, ...rest } = reassignment;
 	return {
 		...rest,
@@ -641,10 +653,9 @@ function fromV3Reassignment(reassignment: SessionAuthorityV3Reassignment): Manag
 function toV3Mapping(record: SessionAuthorityRecord): SessionAuthorityV3Mapping {
 	const {
 		version: _version,
-		sessionFile: _sessionFile,
-		activeLeaf: _activeLeaf,
 		attachment: _attachment,
-		managedAuthority,
+		managedAuthority: _managedAuthority,
+		historicalBinding: _historicalBinding,
 		journal,
 		reassignment,
 		...rest
@@ -653,11 +664,7 @@ function toV3Mapping(record: SessionAuthorityRecord): SessionAuthorityV3Mapping 
 		...rest,
 		version: 3,
 		authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
-		managedAuthority: authorityV3ForDurableChat(
-			managedAuthority,
-			`mapping ${record.chatId}`,
-			scopedDurableChatId(record),
-		),
+		...bindingV3(record, `mapping ${record.chatId}`, scopedDurableChatId(record)),
 		journal: journal.map(item =>
 			toV3Operation(item, `mapping ${record.chatId} operation`, scopedDurableChatId(record)),
 		),
@@ -666,7 +673,7 @@ function toV3Mapping(record: SessionAuthorityRecord): SessionAuthorityV3Mapping 
 			: { reassignment: toV3Reassignment(reassignment, scopedDurableChatId(record)) }),
 	};
 }
-function fromV3Mapping(mapping: SessionAuthorityV3Mapping): ManagedSessionAuthorityRecord {
+function fromV3Mapping(mapping: SessionAuthorityV3Mapping): SessionAuthorityRecord {
 	const { version: _version, authorityEpoch: _epoch, journal, reassignment, ...rest } = mapping;
 	return {
 		...rest,
@@ -676,33 +683,34 @@ function fromV3Mapping(mapping: SessionAuthorityV3Mapping): ManagedSessionAuthor
 	};
 }
 function toV3Provisional(operation: ProvisionalSessionOperation): SessionAuthorityV3ProvisionalOperation {
-	const { sessionFile: _sessionFile, attachment: _attachment, managedAuthority, ...rest } = operation;
+	const {
+		attachment: _attachment,
+		managedAuthority: _managed,
+		historicalBinding,
+		sessionId,
+		chatId,
+		projectId,
+		sessionFile,
+		activeLeaf,
+		...rest
+	} = operation;
 	const durableChatId = scopedProvisionalChatId(operation);
-	return {
+	const base = {
 		...toV3Operation(rest, `provisional ${operation.id}`, durableChatId),
-		chatId: operation.chatId,
-		projectId: operation.projectId,
-		...(operation.sessionId === undefined
-			? {}
-			: {
-					sessionId: operation.sessionId,
-					managedAuthority: authorityV3ForDurableChat(
-						managedAuthority,
-						`provisional ${operation.id}`,
-						durableChatId,
-					),
-				}),
+		chatId,
+		projectId,
+		...(sessionFile === undefined ? {} : { sessionFile }),
+		...(activeLeaf === undefined ? {} : { activeLeaf }),
 	};
+	return sessionId === undefined
+		? {
+				...base,
+				...(historicalBinding === undefined ? {} : { historicalBinding: structuredClone(historicalBinding) }),
+			}
+		: { ...base, sessionId, ...bindingV3(operation, `provisional ${operation.id}`, durableChatId) };
 }
-function fromV3Provisional(operation: SessionAuthorityV3ProvisionalOperation): ManagedProvisionalSessionOperation {
-	const { managedAuthority, ...rest } = operation;
-	return {
-		...fromV3Operation(rest),
-		chatId: operation.chatId,
-		projectId: operation.projectId,
-		...(operation.sessionId === undefined ? {} : { sessionId: operation.sessionId }),
-		...(managedAuthority === undefined ? {} : { managedAuthority }),
-	};
+function fromV3Provisional(operation: SessionAuthorityV3ProvisionalOperation): ProvisionalSessionOperation {
+	return structuredClone(operation);
 }
 
 function scopedDurableChatId(record: SessionAuthorityRecord): string | undefined {

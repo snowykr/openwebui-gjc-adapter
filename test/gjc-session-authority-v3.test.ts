@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createManagedLifecycleEvidence } from "../src/gjc/managed-lifecycle-evidence";
+import type { HistoricalSessionBinding } from "../src/gjc/session-authority-types";
 import {
 	encodeSessionAuthorityV3Document,
 	isSessionAuthorityV3Document,
@@ -141,7 +143,184 @@ function clonedGolden(): Record<string, any> {
 	return JSON.parse(JSON.stringify(golden()));
 }
 
+function historical(
+	chat: string,
+	projectId: string,
+	sessionId: string | undefined,
+	nodeRef: string,
+): HistoricalSessionBinding {
+	return {
+		kind: "unbound-history",
+		chatId: chat,
+		projectId,
+		...(sessionId === undefined ? {} : { sessionId }),
+		principalId: "tenant-a",
+		canonicalWorkspace: "/srv/projects/a",
+		reason: "generation-unproven",
+		provenance: { source: "v2", documentHash: "a".repeat(64), nodeHash: "b".repeat(64), nodeRef },
+	};
+}
+function historicalGolden(): unknown {
+	const convert = (value: unknown, nodeRef: string): unknown => {
+		if (Array.isArray(value)) return value.map((child, index) => convert(child, `${nodeRef}/${index}`));
+		if (value === null || typeof value !== "object") return value;
+		const entries = Object.entries(value);
+		const raw = entries.find(([key]) => key === "managedAuthority")?.[1];
+		const projection: Record<string, unknown> = Object.fromEntries(
+			entries
+				.filter(([key]) => key !== "managedAuthority")
+				.map(([key, child]) => [key, convert(child, `${nodeRef}/${key}`)]),
+		);
+		if (raw !== undefined && raw !== null && typeof raw === "object") {
+			const chat = Reflect.get(raw, "chatId");
+			const projectId = Reflect.get(raw, "projectId");
+			const sessionId = Reflect.get(raw, "sessionId");
+			if (typeof chat !== "string" || typeof projectId !== "string" || typeof sessionId !== "string")
+				throw new Error("Bad fixture identity.");
+			projection.historicalBinding = historical(chat, projectId, sessionId, nodeRef);
+		}
+		return projection;
+	};
+	return convert(golden(), "");
+}
+
 describe("session authority v3 full graph", () => {
+	test("round-trips generation-free ordinary history at every identity occurrence", () => {
+		const value = historicalGolden();
+		expect(isSessionAuthorityV3Document(value)).toBe(true);
+		if (!isSessionAuthorityV3Document(value)) throw new Error("Historical fixture must be valid V3.");
+		const parsed = parseSessionAuthorityV3Document(encodeSessionAuthorityV3Document(value))!;
+		expect(parsed).toEqual(value);
+		expect(parsed.mappings[0]!.managedAuthority).toBeUndefined();
+		expect(parsed.mappings[0]!.journal[0]!.result!.historicalBinding?.sessionId).toBe("session-current");
+		expect(parsed.mappings[0]!.journal[1]!.acknowledgedSuccessor!.historicalBinding?.sessionId).toBe("session-next");
+		expect(parsed.mappings[0]!.reassignment!.sourceTombstone!.prior!.historicalBinding?.sessionId).toBe(
+			"session-older",
+		);
+		expect(parsed.provisionalOperations[0]!.historicalBinding?.sessionId).toBe("session-b");
+	});
+
+	test("rejects simultaneous bindings and forged authority fields on unbound history", () => {
+		const raw = historicalGolden();
+		if (!isSessionAuthorityV3Document(raw)) throw new Error("Historical fixture must be valid V3.");
+		for (const patch of [{ generation: 0 }, { generation: 9 }, { leaseId: "invented" }, { requestKey: "invented" }]) {
+			const candidate = {
+				...raw,
+				mappings: [
+					{ ...raw.mappings[0]!, historicalBinding: { ...raw.mappings[0]!.historicalBinding!, ...patch } },
+				],
+			};
+			expect(isSessionAuthorityV3Document(candidate)).toBe(false);
+		}
+		expect(
+			isSessionAuthorityV3Document({
+				...raw,
+				mappings: [{ ...raw.mappings[0]!, managedAuthority: authority("chat-a", "project-a", "session-current") }],
+			}),
+		).toBe(false);
+		const bound = golden();
+		expect(
+			isSessionAuthorityV3Document({
+				...bound,
+				mappings: [
+					{ ...bound.mappings[0], managedAuthority: { ...bound.mappings[0].managedAuthority, generation: 0 } },
+				],
+			}),
+		).toBe(false);
+	});
+
+	test("allows inert projection fields only at declared graph locations", () => {
+		const value = historicalGolden();
+		if (!isSessionAuthorityV3Document(value)) throw new Error("Historical fixture must be valid V3.");
+		const root = value.mappings[0]!;
+		const result = root.journal[0]!.result!;
+		const projected = {
+			...value,
+			mappings: [
+				{
+					...root,
+					sessionFile: "/projection/current.jsonl",
+					activeLeaf: "leaf",
+					journal: [
+						{
+							...root.journal[0]!,
+							result: {
+								...result,
+								mapping: { ...result.mapping, sessionFile: "/projection/replay.jsonl", activeLeaf: "old-leaf" },
+							},
+						},
+						...root.journal.slice(1),
+					],
+				},
+			],
+		};
+		expect(isSessionAuthorityV3Document(projected)).toBe(true);
+		expect(
+			isSessionAuthorityV3Document({
+				...projected,
+				mappings: [{ ...projected.mappings[0], observations: { sessionFile: "/hidden" } }],
+			}),
+		).toBe(false);
+		expect(
+			isSessionAuthorityV3Document({
+				...projected,
+				mappings: [{ ...projected.mappings[0], events: [{ type: "event", payload: { descriptor: "private" } }] }],
+			}),
+		).toBe(false);
+	});
+
+	test("rejects scoped foreign historical ownership and lifecycle claims on unbound nodes", () => {
+		const scoped = JSON.stringify(["tenant-a", "chat-a"]);
+		const binding = historical(scoped, "project-a", "session-a", "/provisionalOperations/0");
+		const provisional = {
+			id: "reserve",
+			kind: "create",
+			state: "uncertain",
+			startedAt: timestamp,
+			chatId: scoped,
+			projectId: "project-a",
+			sessionId: "session-a",
+			historicalBinding: binding,
+		};
+		const document = {
+			kind: SESSION_AUTHORITY_V3_KIND,
+			version: 3,
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+			mappings: [],
+			provisionalOperations: [provisional],
+		};
+		expect(isSessionAuthorityV3Document(document)).toBe(true);
+		expect(
+			isSessionAuthorityV3Document({
+				...document,
+				provisionalOperations: [{ ...provisional, historicalBinding: { ...binding, principalId: "foreign" } }],
+			}),
+		).toBe(false);
+		const prepared = {
+			principalId: "tenant-a",
+			projectId: "project-a",
+			canonicalWorkspace: "/srv/projects/a",
+			chatId: "chat-a",
+			leaseId: "lease",
+			epoch: "epoch",
+			requestKey: "create",
+		};
+		const lifecycle = createManagedLifecycleEvidence(
+			{
+				operation: "session.create",
+				preparedAuthority: prepared,
+				target: { cwd: prepared.canonicalWorkspace },
+				payloadHash: "a".repeat(64),
+			},
+			timestamp,
+		);
+		expect(
+			isSessionAuthorityV3Document({
+				...document,
+				provisionalOperations: [{ ...provisional, detail: lifecycle.payloadHash, lifecycle }],
+			}),
+		).toBe(false);
+	});
 	test("opens the golden graph and preserves runtime epochs across mutation and reopen", () => {
 		const root = mkdtempSync(join(tmpdir(), "gjc-v3-golden-store-"));
 		const file = join(root, "authority.json");
@@ -154,12 +333,12 @@ describe("session authority v3 full graph", () => {
 			store = new SessionV3FileBackedMappingStore(file);
 			expect(store.operation("chat-a", "next-prompt")?.state).toBe("uncertain");
 			const persisted = parseSessionAuthorityV3Document(readFileSync(file, "utf8"))!;
-			expect(persisted.mappings[0].managedAuthority.epoch).toBe("runtime-1");
+			expect(persisted.mappings[0].managedAuthority?.epoch).toBe("runtime-1");
 			expect(persisted.mappings[0].journal[0].result).toEqual(
 				parseSessionAuthorityV3Document(JSON.stringify(golden()))!.mappings[0].journal[0].result,
 			);
-			expect(persisted.mappings[0].journal[1].acknowledgedSuccessor?.managedAuthority.epoch).toBe("runtime-4");
-			expect(persisted.mappings[0].reassignment?.sourceTombstone?.prior?.managedAuthority.epoch).toBe("runtime-3");
+			expect(persisted.mappings[0].journal[1].acknowledgedSuccessor?.managedAuthority?.epoch).toBe("runtime-4");
+			expect(persisted.mappings[0].reassignment?.sourceTombstone?.prior?.managedAuthority?.epoch).toBe("runtime-3");
 			expect(persisted.provisionalOperations[0].managedAuthority?.epoch).toBe("runtime-5");
 		} finally {
 			store?.close();

@@ -34,6 +34,7 @@ function mapping(overrides: Partial<SessionMapping> = {}): SessionMapping {
 function store(mappings: readonly SessionMapping[]): SessionV3FileBackedMappingStore {
 	return {
 		epoch: SESSION_AUTHORITY_V3_EPOCH,
+		assertServingReady() {},
 		*mappingRecordsIterable() {
 			yield* mappings;
 		},
@@ -71,6 +72,18 @@ function runtime(status: "current" | "replaced" | "unknown" = "current", current
 }
 
 describe("startActiveManagedRuntime", () => {
+	test("rejects unresolved historical roots before public runtime effects", () => {
+		const fake = runtime();
+		const mappings = store([]);
+		mappings.assertServingReady = () => {
+			throw new Error("Unbound staged history.");
+		};
+		expect(() => startActiveManagedRuntime({ runtime: fake.runtime, mappings, liveTenantFence: () => true })).toThrow(
+			"Unbound staged history",
+		);
+		expect(fake.calls).toEqual([]);
+	});
+
 	test("passes the configured budget into managed operations and rejects changed startup budgets", async () => {
 		const fake = runtime();
 		const timeouts: number[] = [];
@@ -224,6 +237,19 @@ describe("startActiveManagedRuntime", () => {
 			}),
 		).rejects.toThrow("legacy attachment");
 		expect(fake.calls).toContain("dispose");
+	});
+
+	test("retains inert projection paths without using them for tenant authority", async () => {
+		const fake = runtime();
+		const active = await startActiveManagedRuntime({
+			runtime: fake.runtime,
+			mappings: store([mapping({ sessionFile: "/inert/history.jsonl", activeLeaf: "old-leaf" })]),
+			liveTenantFence: () => true,
+		});
+		expect(fake.registrations).toHaveLength(1);
+		expect(Object.hasOwn(fake.registrations[0]!, "sessionFile")).toBe(false);
+		expect(fake.registrations[0]!.generation).toBe(7);
+		await active.dispose();
 	});
 
 	test("disposes the process-owned runtime when a provisional generation cannot be proven current", async () => {

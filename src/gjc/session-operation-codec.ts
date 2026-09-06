@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { GJC_THINKING_LEVELS, type NormalizedModelSelection } from "../contracts";
-import { copy, copyEvents } from "./session-authority-copy";
+import { copy, copyEvents, copySessionAuthorityBinding } from "./session-authority-copy";
 import type {
 	SessionAttachmentProof,
+	SessionAuthorityBinding,
 	SessionAuthorityInput,
 	SessionAuthorityRecord,
 	SessionOperation,
@@ -10,9 +12,9 @@ import type {
 	SessionOperationResult,
 } from "./session-authority-types";
 import { isRecord } from "./session-authority-validation-primitives";
-import type { GjcTurnEvent, ManagedTurnAuthority } from "./turn-runner";
+import type { GjcTurnEvent } from "./turn-runner";
 
-export interface SessionOperationMapping {
+export type SessionOperationMapping = SessionAuthorityBinding & {
 	readonly chatId: string;
 	readonly projectId: string;
 	readonly sessionId: string;
@@ -25,8 +27,7 @@ export interface SessionOperationMapping {
 	readonly events?: readonly GjcTurnEvent[];
 	readonly modelSelection?: NormalizedModelSelection;
 	readonly attachment?: SessionAttachmentProof;
-	readonly managedAuthority?: ManagedTurnAuthority;
-}
+};
 
 export function hashTurnIngress(input: {
 	readonly chatId: string;
@@ -95,12 +96,12 @@ export function operationResult(
 			rawFrameCursor: mapping.rawFrameCursor,
 			eventCursor: mapping.eventCursor,
 			operationId: mapping.operationId,
-			...(mapping.modelSelection === undefined ? {} : { modelSelection: mapping.modelSelection }),
+			...(mapping.modelSelection === undefined ? {} : { modelSelection: { ...mapping.modelSelection } }),
 			...(mapping.attachment === undefined ? {} : { attachment: copyAttachment(mapping.attachment) }),
 		},
-		...(mapping.managedAuthority === undefined ? {} : { managedAuthority: { ...mapping.managedAuthority } }),
+		...copySessionAuthorityBinding(mapping),
 		...(kind === "close" ? { correlation: { closeStatus: "closed" } } : {}),
-		...(gate === undefined ? {} : { gate }),
+		...(gate === undefined ? {} : { gate: { ...gate } }),
 	};
 }
 
@@ -147,13 +148,17 @@ export function provisionalKey(chatId: string, ingressId: string): string {
 	return JSON.stringify([chatId, ingressId]);
 }
 export function createAuthorityIdentity(input: SessionAuthorityInput): SessionAuthorityRecord {
+	const { managedAuthority: _managedAuthority, historicalBinding: _historicalBinding, ...fields } = input;
 	const createdAt = input.createdAt ?? new Date().toISOString();
 	const journal = appendJournal([], input.journal ?? []);
 	const operation = journal.find(
 		candidate => candidate.id === input.operationId || candidate.ingressId === input.operationId,
 	);
+	if (input.historicalBinding !== undefined && input.journal === undefined)
+		throw new Error("Historical session authority requires an explicit journal without synthesized operations.");
 	return copy({
-		...input,
+		...fields,
+		...copySessionAuthorityBinding(input),
 		version: 2,
 		createdAt,
 		header: input.header ?? {
@@ -161,7 +166,12 @@ export function createAuthorityIdentity(input: SessionAuthorityInput): SessionAu
 			projectId: input.projectId,
 			sessionId: input.sessionId,
 		},
-		journal: operation === undefined ? [...journal, implicitOperation(input.operationId, createdAt)] : journal,
+		journal:
+			input.historicalBinding !== undefined
+				? [...input.journal!]
+				: operation === undefined
+					? [...journal, implicitOperation(input.operationId, createdAt)]
+					: journal,
 	});
 }
 
@@ -169,16 +179,41 @@ export function updateAuthorityIdentity(
 	input: SessionAuthorityInput,
 	existing: SessionAuthorityRecord,
 ): SessionAuthorityRecord {
+	const { managedAuthority: _existingManaged, historicalBinding: _existingHistorical, ...existingFields } = existing;
+	const { managedAuthority: _inputManaged, historicalBinding: _inputHistorical, ...inputFields } = input;
+	if (
+		existing.historicalBinding !== undefined &&
+		(input.managedAuthority !== undefined ||
+			(input.historicalBinding !== undefined &&
+				!isDeepStrictEqual(input.historicalBinding, existing.historicalBinding)) ||
+			input.chatId !== existing.chatId ||
+			input.projectId !== existing.projectId ||
+			input.sessionId !== existing.sessionId ||
+			input.operationId !== existing.operationId ||
+			input.attachment !== undefined)
+	)
+		throw new Error("Historical session authority requires an explicit proven binding transaction.");
+	if (existing.managedAuthority !== undefined && input.historicalBinding !== undefined)
+		throw new Error("Managed session authority cannot be replaced with unbound history.");
+	if (
+		existing.historicalBinding !== undefined &&
+		(input.journal ?? []).some(operation => !existing.journal.some(prior => isDeepStrictEqual(prior, operation)))
+	)
+		throw new Error("Historical journal updates require explicit reconciliation.");
+	const binding = input.managedAuthority === undefined && input.historicalBinding === undefined ? existing : input;
 	const journal = appendJournal(existing.journal, input.journal ?? []);
 	const operation = journal.find(
 		candidate => candidate.id === input.operationId || candidate.ingressId === input.operationId,
 	);
+	if (input.historicalBinding !== undefined && existing.historicalBinding === undefined && operation === undefined)
+		throw new Error("Historical session authority cannot synthesize a completed operation.");
 	if (operation?.state === "conflict" || operation?.state === "uncertain") {
 		throw new Error(`Session operation ${input.operationId} requires reconciliation.`);
 	}
 	return copy({
-		...existing,
-		...input,
+		...existingFields,
+		...inputFields,
+		...copySessionAuthorityBinding(binding),
 		version: 2,
 		createdAt: existing.createdAt,
 		header: {
@@ -187,7 +222,11 @@ export function updateAuthorityIdentity(
 			sessionId: input.sessionId,
 		},
 		journal:
-			operation === undefined ? [...journal, implicitOperation(input.operationId, existing.createdAt)] : journal,
+			existing.historicalBinding !== undefined
+				? [...existing.journal]
+				: operation === undefined
+					? [...journal, implicitOperation(input.operationId, existing.createdAt)]
+					: journal,
 	});
 }
 

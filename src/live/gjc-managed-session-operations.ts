@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { NormalizedModelSelection } from "../contracts";
+import { DEFAULT_MANAGED_OPERATION_TIMEOUT_MS, ManagedOperationDeadline } from "../gjc/managed-operation-deadline";
 import {
 	type ManagedSdkAttachment,
 	type ManagedSdkObservedFrame,
@@ -17,7 +18,6 @@ import {
 
 const MAX_QUERY_PAGES = 256;
 const MAX_QUERY_ITEMS = 100_000;
-const DEFAULT_OPERATION_TIMEOUT_MS = 60_000;
 const ATTACHMENT_CHECK_MS = 100;
 
 export class ManagedTurnUncertainError extends Error {
@@ -121,7 +121,7 @@ export interface ManagedSessionOperations {
  */
 export function createManagedSessionOperations(
 	runtime: ManagedSdkRuntime,
-	defaultTimeoutMs = DEFAULT_OPERATION_TIMEOUT_MS,
+	defaultTimeoutMs = DEFAULT_MANAGED_OPERATION_TIMEOUT_MS,
 ): ManagedSessionOperations {
 	if (!Number.isSafeInteger(defaultTimeoutMs) || defaultTimeoutMs <= 0 || defaultTimeoutMs > 2_147_483_647)
 		throw new TypeError("Managed timeoutMs must be a positive finite timer-safe integer.");
@@ -893,54 +893,6 @@ function nonEmptyString(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0;
 }
 
-/** One finite budget, including attachment acquisition, every page, observers and publication fencing. */
-export class ManagedOperationDeadline {
-	readonly expiresAt: number;
-	readonly #failure: Promise<never>;
-	readonly #timer: ReturnType<typeof setTimeout>;
-	readonly #timeout: ManagedSdkOperationError;
-	#reject!: (error: unknown) => void;
-	#stopped = false;
-	#error: unknown;
-	constructor(timeoutMs = DEFAULT_OPERATION_TIMEOUT_MS, operation: string) {
-		if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2_147_483_647)
-			throw new TypeError("Managed timeoutMs must be a positive finite timer-safe integer.");
-		this.expiresAt = Date.now() + timeoutMs;
-		this.#timeout = new ManagedSdkOperationError("timeout", `Managed ${operation} timed out after ${timeoutMs}ms.`);
-		this.#failure = new Promise<never>((_resolve, reject) => {
-			this.#reject = reject;
-		});
-		void this.#failure.catch(() => undefined);
-		this.#timer = setTimeout(() => this.fail(this.#timeout), timeoutMs);
-		this.#timer.unref?.();
-	}
-	remaining(): number {
-		if (this.#stopped) throw this.#error;
-		const remaining = this.expiresAt - Date.now();
-		if (remaining <= 0) {
-			this.fail(this.#timeout);
-			throw this.#timeout;
-		}
-		return remaining;
-	}
-	async wait<T>(promise: Promise<T>): Promise<T> {
-		// Attach the rejection handler even when this budget has already failed.
-		const pending = Promise.race([promise, this.#failure]);
-		const value = await pending;
-		this.remaining();
-		return value;
-	}
-	fail(error: unknown): void {
-		if (this.#stopped) return;
-		this.#stopped = true;
-		this.#error = error;
-		clearTimeout(this.#timer);
-		this.#reject(error);
-	}
-	close(): void {
-		this.fail(new ManagedSdkOperationError("operation_closed", "Managed operation observation is closed."));
-	}
-}
 function frameCursor(events: readonly GjcTurnEvent[]): number {
 	let cursor = 0;
 	for (const event of events) {

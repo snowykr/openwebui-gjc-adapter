@@ -347,7 +347,7 @@ describe("CLI module boundaries", () => {
 		const entrypoint = readFileSync(join(ROOT, "src/index.ts"), "utf8");
 		for (const module of ["session-frames", "turn-runner", "cli-lifecycle-backend", "tmux-ownership"])
 			expect(entrypoint).not.toContain(`./gjc/${module}`);
-		expect(manifest.exports["./gjc/*"]).toBeUndefined();
+		expect(manifest.exports["./gjc/*"]).toBeNull();
 		expect(manifest.dependencies["@gajae-code/coding-agent"]).toBe("0.16.4");
 		expect(manifest.dependencies[["@gajae-code", "bridge-client"].join("/")]).toBeUndefined();
 		expect(manifest.patchedDependencies).toBeUndefined();
@@ -392,6 +392,12 @@ describe("CLI module boundaries", () => {
 			"openwebui-gjc-adapter/live/gjc-routing-test-barrier",
 		])
 			await expect(import(path)).rejects.toThrow();
+	});
+
+	test("package resolution blocks managed SDK internals despite the root wildcard", () => {
+		for (const path of ["gjc/managed-sdk-runtime", "gjc/session-authority-v3", "gjc/managed-operation-deadline"])
+			expect(() => import.meta.resolve(`openwebui-gjc-adapter/${path}`)).toThrow();
+		expect(import.meta.resolve("openwebui-gjc-adapter/cli")).toContain("/src/cli.ts");
 	});
 
 	test("keeps the live routing type graph below the runner facade", () => {

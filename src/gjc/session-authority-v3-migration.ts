@@ -1,28 +1,20 @@
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
+import { isAttachmentProof } from "./session-authority-operation-validation";
 import type {
-	AcknowledgedSuccessor,
+	HistoricalSessionBinding,
 	ProvisionalSessionOperation,
-	SessionAuthorityReassignment,
 	SessionAuthorityRecord,
-	SessionAuthorityTombstone,
-	SessionOperation,
-	SessionOperationResult,
 } from "./session-authority-types";
 import {
 	encodeSessionAuthorityV3Document,
 	isSessionAuthorityV3Document,
-	type ManagedTurnAuthorityV3,
 	SESSION_AUTHORITY_V3_EPOCH,
 	SESSION_AUTHORITY_V3_KIND,
 	SESSION_AUTHORITY_V3_VERSION,
 	type SessionAuthorityV3Document,
-	type SessionAuthorityV3Mapping,
-	type SessionAuthorityV3Operation,
-	type SessionAuthorityV3ProvisionalOperation,
-	type SessionAuthorityV3Reassignment,
-	type SessionAuthorityV3Result,
-	type SessionAuthorityV3Tombstone,
 } from "./session-authority-v3";
+import { isNonEmptyString, isRecord } from "./session-authority-validation-primitives";
 import type { ManagedTurnAuthority } from "./turn-runner";
 
 export interface SessionAuthorityV2Document {
@@ -30,40 +22,34 @@ export interface SessionAuthorityV2Document {
 	readonly provisionalOperations?: readonly ProvisionalSessionOperation[];
 }
 
-/** An authority is accepted only for this complete, durable session identity. */
+/** A binding proves one exact source occurrence, never every use of a session ID. */
 export interface ManagedTurnAuthorityBinding {
+	readonly nodeRef: string;
 	readonly chatId: string;
 	readonly projectId: string;
 	readonly sessionId: string;
 	readonly managedAuthority: ManagedTurnAuthority;
 }
-
 export interface SessionAuthorityV3MigrationBlocked {
 	readonly status: "blocked";
 	readonly reasons: readonly string[];
 }
-
 export interface SessionAuthorityV3MigrationReady {
 	readonly status: "ready";
 	readonly document: SessionAuthorityV3Document;
 }
-
 export type SessionAuthorityV3MigrationReport = SessionAuthorityV3MigrationBlocked | SessionAuthorityV3MigrationReady;
-
-/** Immutable source evidence. The WAL is retained as evidence and is never replayed or modified here. */
 export interface SessionAuthorityV2Snapshot {
 	readonly originalBaseBytes: Uint8Array;
 	readonly originalBaseDigest: string;
 	readonly originalWalBytes: Uint8Array;
 	readonly originalWalDigest: string;
 }
-
 export interface StageSessionAuthorityV3MigrationRequest {
 	readonly snapshot: SessionAuthorityV2Snapshot;
 	readonly decodedDocument: SessionAuthorityV2Document;
-	readonly bindings: readonly ManagedTurnAuthorityBinding[];
+	readonly bindings?: readonly ManagedTurnAuthorityBinding[];
 }
-
 export interface StagedSessionAuthorityV3Migration {
 	readonly status: "staged";
 	readonly originalBaseBytes: Uint8Array;
@@ -74,70 +60,75 @@ export interface StagedSessionAuthorityV3Migration {
 	readonly v3Digest: string;
 	readonly document: SessionAuthorityV3Document;
 }
-
 export type StageSessionAuthorityV3MigrationReport =
 	| SessionAuthorityV3MigrationBlocked
 	| StagedSessionAuthorityV3Migration;
 
-/**
- * Pure conversion of a decoded V2 graph. Every V3 authority is supplied by the
- * caller; no endpoint, attachment, or terminal-derived identity is consulted.
- */
-export function migrateSessionAuthorityV2ToV3(
-	document: SessionAuthorityV2Document,
-	bindings: readonly ManagedTurnAuthorityBinding[],
-): SessionAuthorityV3MigrationReport {
-	const authorityByIdentity = bindingIndex(bindings);
-	if (authorityByIdentity.status === "blocked") return authorityByIdentity;
-	const source = structuredClone(document) as SessionAuthorityV2Document;
-	const reasons: string[] = [];
-	const authorityFor = (identity: Identity, context: string): ManagedTurnAuthorityV3 | undefined => {
-		const authority = authorityByIdentity.authorities.get(identityKey(identity));
-		if (authority === undefined) {
-			reasons.push(`${context} has no exact managed authority binding for ${identityKey(identity)}.`);
-			return undefined;
-		}
-		return authority;
-	};
-
-	const authorityResolver = Object.assign(authorityFor, { successor: authorityByIdentity.successor });
-	const mappings = source.mappings.map((mapping, index) =>
-		migrateMapping(mapping, `mapping ${index}`, authorityResolver, reasons),
-	);
-	const provisionalOperations = (source.provisionalOperations ?? []).map((operation, index) =>
-		migrateProvisional(operation, `provisional operation ${index}`, authorityResolver, reasons),
-	);
-	if (reasons.length > 0 || mappings.some(isUndefined) || provisionalOperations.some(isUndefined))
-		return blocked(reasons);
-	const result: SessionAuthorityV3Document = {
-		kind: SESSION_AUTHORITY_V3_KIND,
-		version: SESSION_AUTHORITY_V3_VERSION,
-		authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
-		mappings: mappings as SessionAuthorityV3Mapping[],
-		provisionalOperations: provisionalOperations as SessionAuthorityV3ProvisionalOperation[],
-	};
-	if (!isSessionAuthorityV3Document(result))
-		return blocked(["The V2 graph cannot be represented as a valid SessionAuthorityV3Document."]);
-	return { status: "ready", document: result };
+type Identity = { readonly chatId: string; readonly projectId: string; readonly sessionId?: string };
+type Owner = { readonly principalId?: string; readonly canonicalWorkspace?: string; readonly projectId: string };
+interface Conversion {
+	readonly documentHash: string;
+	readonly bindings: ReadonlyMap<string, ManagedTurnAuthorityBinding>;
+	readonly used: Set<string>;
 }
 
-/**
- * Snapshot-first staging: verifies immutable source evidence, copies it before
- * conversion, and returns bytes for a caller-owned private destination only.
- */
+/** Pure lossless graph conversion: historical nodes remain non-serving until individually proven. */
+export function migrateSessionAuthorityV2ToV3(
+	document: SessionAuthorityV2Document,
+	bindings: readonly ManagedTurnAuthorityBinding[] = [],
+): SessionAuthorityV3MigrationReport {
+	try {
+		const sourceJson = canonicalJson(document);
+		const documentHash = sha256(new TextEncoder().encode(sourceJson));
+		const source: unknown = JSON.parse(sourceJson);
+		if (
+			!isRecord(source) ||
+			Object.keys(source).some(key => key !== "mappings" && key !== "provisionalOperations") ||
+			!Array.isArray(source.mappings) ||
+			(source.provisionalOperations !== undefined && !Array.isArray(source.provisionalOperations))
+		)
+			throw new Error("Source is not a decoded V2 authority graph.");
+		const index = new Map<string, ManagedTurnAuthorityBinding>();
+		for (const binding of bindings) {
+			if (
+				!isNonEmptyString(binding.nodeRef) ||
+				!/^\/(?:mappings|provisionalOperations)\/(?:0|[1-9][0-9]*)(?:\/(?:[^~/]|~[01])+)*$/.test(binding.nodeRef)
+			)
+				throw new Error("Every managed binding requires an exact source nodeRef JSON pointer.");
+			if (index.has(binding.nodeRef)) throw new Error(`Duplicate managed authority binding at ${binding.nodeRef}.`);
+			index.set(binding.nodeRef, structuredClone(binding));
+		}
+		const context: Conversion = { documentHash, bindings: index, used: new Set() };
+		const converted: unknown = {
+			kind: SESSION_AUTHORITY_V3_KIND,
+			version: SESSION_AUTHORITY_V3_VERSION,
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+			mappings: source.mappings.map((node, index) => convertRecord(node, `/mappings/${index}`, context)),
+			provisionalOperations: (source.provisionalOperations ?? []).map((node, index) =>
+				convertProvisional(node, `/provisionalOperations/${index}`, context),
+			),
+		};
+		for (const nodeRef of index.keys())
+			if (!context.used.has(nodeRef))
+				throw new Error(`Binding does not name an identity-bearing source occurrence: ${nodeRef}.`);
+		if (!isSessionAuthorityV3Document(converted))
+			throw new Error("The V2 graph cannot be represented losslessly as ordinary V3 history.");
+		return { status: "ready", document: converted };
+	} catch (error) {
+		return blocked(error instanceof Error ? error.message : "Malformed V2 graph.");
+	}
+}
+
 export function stageSessionAuthorityV3Migration(
 	request: StageSessionAuthorityV3MigrationRequest,
 ): StageSessionAuthorityV3MigrationReport {
 	const base = new Uint8Array(request.snapshot.originalBaseBytes);
 	const wal = new Uint8Array(request.snapshot.originalWalBytes);
 	if (sha256(base) !== request.snapshot.originalBaseDigest)
-		return blocked(["Original V2 base bytes do not match their supplied digest."]);
+		return blocked("Original V2 base bytes do not match their supplied digest.");
 	if (sha256(wal) !== request.snapshot.originalWalDigest)
-		return blocked(["Original V2 WAL bytes do not match their supplied digest."]);
-	const migrated = migrateSessionAuthorityV2ToV3(
-		structuredClone(request.decodedDocument),
-		request.bindings.map(binding => ({ ...binding, managedAuthority: { ...binding.managedAuthority } })),
-	);
+		return blocked("Original V2 WAL bytes do not match their supplied digest.");
+	const migrated = migrateSessionAuthorityV2ToV3(request.decodedDocument, request.bindings);
 	if (migrated.status === "blocked") return migrated;
 	const v3Bytes = new TextEncoder().encode(encodeSessionAuthorityV3Document(migrated.document));
 	return {
@@ -152,314 +143,374 @@ export function stageSessionAuthorityV3Migration(
 	};
 }
 
-type Identity = Readonly<{ chatId: string; projectId: string; sessionId: string }>;
-type AuthorityFor = (identity: Identity, context: string) => ManagedTurnAuthorityV3 | undefined;
-
-function migrateMapping(
-	mapping: SessionAuthorityRecord,
-	context: string,
-	authorityFor: AuthorityFor,
-	reasons: string[],
-): SessionAuthorityV3Mapping | undefined {
-	const identity = mappingIdentity(mapping, context, reasons);
-	if (identity === undefined) return undefined;
-	const managedAuthority = authorityFor(identity, context);
-	const journal = mapping.journal.map((operation, index) =>
-		migrateOperation(operation, `${context} journal ${index}`, authorityFor, reasons),
-	);
-	const reassignment =
-		mapping.reassignment === undefined
-			? undefined
-			: migrateReassignment(mapping.reassignment, `${context} reassignment`, authorityFor, reasons);
-	if (
-		managedAuthority === undefined ||
-		journal.some(isUndefined) ||
-		(mapping.reassignment !== undefined && reassignment === undefined)
-	)
-		return undefined;
-	return strip({
-		version: SESSION_AUTHORITY_V3_VERSION,
-		authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
-		chatId: mapping.chatId,
-		projectId: mapping.projectId,
-		sessionId: mapping.sessionId,
-		createdAt: mapping.createdAt,
-		header: { ...mapping.header },
-		rawFrameCursor: mapping.rawFrameCursor,
-		eventCursor: mapping.eventCursor,
-		operationId: mapping.operationId,
-		assistantText: mapping.assistantText,
-		events: mapping.events,
-		modelSelection: mapping.modelSelection,
-		observations: mapping.observations,
-		managedAuthority,
+function convertRecord(
+	value: unknown,
+	nodeRef: string,
+	context: Conversion,
+	inherited?: Owner,
+): Record<string, unknown> {
+	const node = record(value, nodeRef);
+	if (node.version !== 2 || node.authorityEpoch !== undefined || !Array.isArray(node.journal))
+		throw new Error(`Invalid V2 record at ${nodeRef}.`);
+	const identity = identityOf(node, nodeRef);
+	const owner = ownerOf(node, identity, inherited);
+	const {
+		version: _version,
+		attachment: _attachment,
+		managedAuthority: _managed,
+		historicalBinding: _historical,
 		journal,
 		reassignment,
-	}) as SessionAuthorityV3Mapping;
-}
-
-function migrateProvisional(
-	operation: ProvisionalSessionOperation,
-	context: string,
-	authorityFor: AuthorityFor,
-	reasons: string[],
-): SessionAuthorityV3ProvisionalOperation | undefined {
-	if (operation.sessionId === undefined) {
-		const converted = migrateOperation(operation, context, authorityFor, reasons);
-		if (converted === undefined) return undefined;
-		return strip({
-			...converted,
-			chatId: operation.chatId,
-			projectId: operation.projectId,
-		}) as SessionAuthorityV3ProvisionalOperation;
-	}
-	const identity = checkedIdentity(
-		{ chatId: operation.chatId, projectId: operation.projectId, sessionId: operation.sessionId },
-		context,
-		reasons,
-	);
-	const managedAuthority = identity === undefined ? undefined : authorityFor(identity, context);
-	const converted = migrateOperation(operation, context, authorityFor, reasons);
-	if (converted === undefined || managedAuthority === undefined || identity === undefined) return undefined;
-	return strip({ ...converted, ...identity, managedAuthority }) as SessionAuthorityV3ProvisionalOperation;
-}
-
-function migrateOperation(
-	operation: SessionOperation,
-	context: string,
-	authorityFor: AuthorityFor,
-	reasons: string[],
-): SessionAuthorityV3Operation | undefined {
-	const result =
-		operation.result === undefined
-			? undefined
-			: migrateResult(operation.result, `${context} result`, authorityFor, reasons);
-	const acknowledgedSuccessor =
-		operation.acknowledgedSuccessor === undefined
-			? undefined
-			: migrateSuccessor(operation.acknowledgedSuccessor, `${context} successor`, authorityFor, reasons);
-	if (
-		(operation.result !== undefined && result === undefined) ||
-		(operation.acknowledgedSuccessor !== undefined && acknowledgedSuccessor === undefined)
-	)
-		return undefined;
-	return strip({
-		id: operation.id,
-		kind: operation.kind,
-		state: operation.state,
-		ingressId: operation.ingressId,
-		startedAt: operation.startedAt,
-		completedAt: operation.completedAt,
-		detail: operation.detail,
-		result,
-		acknowledgedSuccessor,
-	}) as SessionAuthorityV3Operation;
-}
-
-function migrateResult(
-	result: SessionOperationResult,
-	context: string,
-	authorityFor: AuthorityFor,
-	reasons: string[],
-): SessionAuthorityV3Result | undefined {
-	const identity = mappingIdentity(result.mapping, context, reasons);
-	const managedAuthority = identity === undefined ? undefined : authorityFor(identity, context);
-	if (managedAuthority === undefined) return undefined;
-	return strip({
-		kind: result.kind,
-		assistantText: result.assistantText,
-		managedAuthority,
-		events: result.events,
-		mapping: {
-			chatId: result.mapping.chatId,
-			projectId: result.mapping.projectId,
-			sessionId: result.mapping.sessionId,
-			rawFrameCursor: result.mapping.rawFrameCursor,
-			eventCursor: result.mapping.eventCursor,
-			operationId: result.mapping.operationId,
-			modelSelection: result.mapping.modelSelection,
-		},
-		correlation: result.correlation,
-		gate: result.gate,
-	}) as SessionAuthorityV3Result;
-}
-
-function migrateSuccessor(
-	successor: AcknowledgedSuccessor,
-	context: string,
-	authorityFor: AuthorityFor,
-	reasons: string[],
-) {
-	// V2 successor metadata has no project/chat identity. It is deliberately not
-	// guessed: the supplied binding must identify it by the successor session.
-	const matching = authorityForSuccessor(successor.sessionId, context, authorityFor, reasons);
-	return matching === undefined ? undefined : { sessionId: successor.sessionId, managedAuthority: matching };
-}
-
-function authorityForSuccessor(
-	sessionId: string,
-	context: string,
-	authorityFor: AuthorityFor,
-	reasons: string[],
-): ManagedTurnAuthorityV3 | undefined {
-	// authorityFor intentionally has no enumeration capability. Successors are
-	// resolved from the binding index captured below through this scoped helper.
-	const resolver = authorityFor as AuthorityFor & { successor?: (id: string) => ManagedTurnAuthorityV3 | undefined };
-	const authority = resolver.successor?.(sessionId);
-	if (authority === undefined)
-		reasons.push(`${context} has no unambiguous managed authority binding for successor session ${sessionId}.`);
-	return authority;
-}
-
-function migrateReassignment(
-	reassignment: SessionAuthorityReassignment,
-	context: string,
-	authorityFor: AuthorityFor,
-	reasons: string[],
-): SessionAuthorityV3Reassignment | undefined {
-	const sourceTombstone =
-		reassignment.sourceTombstone === undefined
-			? undefined
-			: migrateTombstone(reassignment.sourceTombstone, `${context} source tombstone`, authorityFor, reasons);
-	const priorTombstone =
-		reassignment.priorTombstone === undefined
-			? undefined
-			: migrateTombstone(reassignment.priorTombstone, `${context} prior tombstone`, authorityFor, reasons);
-	if (
-		(reassignment.sourceTombstone !== undefined && sourceTombstone === undefined) ||
-		(reassignment.priorTombstone !== undefined && priorTombstone === undefined)
-	)
-		return undefined;
-	return strip({ ...reassignment, sourceTombstone, priorTombstone }) as SessionAuthorityV3Reassignment;
-}
-
-function migrateTombstone(
-	tombstone: SessionAuthorityTombstone,
-	context: string,
-	authorityFor: AuthorityFor,
-	reasons: string[],
-): SessionAuthorityV3Tombstone | undefined {
-	const identity = mappingIdentity(tombstone, context, reasons);
-	const managedAuthority = identity === undefined ? undefined : authorityFor(identity, context);
-	const journal = tombstone.journal.map((operation, index) =>
-		migrateOperation(operation, `${context} journal ${index}`, authorityFor, reasons),
-	);
-	const prior =
-		tombstone.prior === undefined
-			? undefined
-			: migrateTombstone(tombstone.prior, `${context} prior`, authorityFor, reasons);
-	if (
-		managedAuthority === undefined ||
-		journal.some(isUndefined) ||
-		(tombstone.prior !== undefined && prior === undefined)
-	)
-		return undefined;
-	return strip({
+		prior,
+		...projection
+	} = node;
+	validateAttachment(node.attachment, identity.sessionId, nodeRef);
+	if (node.historicalBinding !== undefined)
+		throw new Error(`V2 source already contains a historical binding at ${nodeRef}.`);
+	return {
+		...projection,
 		version: SESSION_AUTHORITY_V3_VERSION,
 		authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
-		chatId: tombstone.chatId,
-		projectId: tombstone.projectId,
-		sessionId: tombstone.sessionId,
-		createdAt: tombstone.createdAt,
-		header: { ...tombstone.header },
-		rawFrameCursor: tombstone.rawFrameCursor,
-		eventCursor: tombstone.eventCursor,
-		operationId: tombstone.operationId,
-		assistantText: tombstone.assistantText,
-		events: tombstone.events,
-		modelSelection: tombstone.modelSelection,
-		observations: tombstone.observations,
-		managedAuthority,
-		journal,
-		retiredAt: tombstone.retiredAt,
-		prior,
-	}) as SessionAuthorityV3Tombstone;
-}
-
-function bindingIndex(bindings: readonly ManagedTurnAuthorityBinding[]):
-	| SessionAuthorityV3MigrationBlocked
-	| {
-			readonly status: "ready";
-			readonly authorities: ReadonlyMap<string, ManagedTurnAuthorityV3>;
-			readonly successor: (sessionId: string) => ManagedTurnAuthorityV3 | undefined;
-	  } {
-	const authorities = new Map<string, ManagedTurnAuthorityV3>();
-	const bySuccessor = new Map<string, ManagedTurnAuthorityV3[]>();
-	const reasons: string[] = [];
-	for (const binding of bindings) {
-		const identity = checkedIdentity(binding, "managed authority binding", reasons);
-		if (identity === undefined || !sameIdentity(binding.managedAuthority, identity)) {
-			if (identity !== undefined)
-				reasons.push(
-					`managed authority binding conflicts with its authority identity for ${identityKey(identity)}.`,
-				);
-			continue;
-		}
-		const key = identityKey(identity);
-		if (authorities.has(key)) reasons.push(`Duplicate managed authority binding for ${key}.`);
-		else authorities.set(key, { ...binding.managedAuthority, authorityEpoch: SESSION_AUTHORITY_V3_EPOCH });
-		const values = bySuccessor.get(identity.sessionId) ?? [];
-		values.push({ ...binding.managedAuthority, authorityEpoch: SESSION_AUTHORITY_V3_EPOCH });
-		bySuccessor.set(identity.sessionId, values);
-	}
-	if (reasons.length > 0) return blocked(reasons);
-	const successor = (sessionId: string) => {
-		const matches = bySuccessor.get(sessionId) ?? [];
-		return matches.length === 1 ? matches[0] : undefined;
+		...convertBinding(node, identity, owner, nodeRef, context),
+		journal: node.journal.map((operation, index) =>
+			convertOperation(operation, `${nodeRef}/journal/${index}`, identity, owner, context),
+		),
+		...(reassignment === undefined
+			? {}
+			: { reassignment: convertReassignment(reassignment, `${nodeRef}/reassignment`, owner, context) }),
+		...(prior === undefined ? {} : { prior: convertRecord(prior, `${nodeRef}/prior`, context, owner) }),
 	};
-	return { status: "ready", authorities, successor };
 }
 
-function mappingIdentity(
-	value: Pick<SessionAuthorityRecord, "chatId" | "projectId" | "sessionId">,
-	context: string,
-	reasons: string[],
-): Identity | undefined {
-	return checkedIdentity(value, context, reasons);
-}
-
-function checkedIdentity(
-	value: Readonly<{ chatId: unknown; projectId: unknown; sessionId: unknown }>,
-	context: string,
-	reasons: string[],
-): Identity | undefined {
-	const { chatId, projectId, sessionId } = value;
-	if (![chatId, projectId, sessionId].every(isNonEmptyString)) {
-		reasons.push(`${context} has an incomplete identity.`);
-		return undefined;
+function convertReassignment(
+	value: unknown,
+	nodeRef: string,
+	owner: Owner,
+	context: Conversion,
+): Record<string, unknown> {
+	const node = record(value, nodeRef);
+	const { sourceTombstone, priorTombstone, ...fields } = node;
+	const source =
+		sourceTombstone === undefined
+			? undefined
+			: convertRecord(sourceTombstone, `${nodeRef}/sourceTombstone`, context, owner);
+	let prior: Record<string, unknown> | undefined;
+	if (priorTombstone !== undefined) {
+		if (
+			isRecord(sourceTombstone) &&
+			isDeepStrictEqual(sourceTombstone.prior, priorTombstone) &&
+			isRecord(source?.prior)
+		) {
+			const canonicalPath = `${nodeRef}/sourceTombstone/prior`;
+			const aliasPath = `${nodeRef}/priorTombstone`;
+			assertDuplicateBindings(context, canonicalPath, aliasPath);
+			const sourceOwner = ownerOf(sourceTombstone, identityOf(sourceTombstone, `${nodeRef}/sourceTombstone`), owner);
+			const convertedAlias = convertRecord(priorTombstone, aliasPath, context, sourceOwner);
+			const normalized = normalizeAliasProvenance(convertedAlias, canonicalPath, aliasPath);
+			if (!isRecord(normalized) || !isDeepStrictEqual(source.prior, normalized))
+				throw new Error("Duplicate prior history cannot be represented without changing retained evidence.");
+			prior = normalized;
+		} else prior = convertRecord(priorTombstone, `${nodeRef}/priorTombstone`, context, owner);
 	}
-	return { chatId: chatId as string, projectId: projectId as string, sessionId: sessionId as string };
+	return {
+		...fields,
+		...(source === undefined ? {} : { sourceTombstone: source }),
+		...(prior === undefined ? {} : { priorTombstone: prior }),
+	};
 }
 
-function sameIdentity(value: ManagedTurnAuthority, identity: Identity): boolean {
-	return (
-		value.chatId === identity.chatId &&
-		value.projectId === identity.projectId &&
-		value.sessionId === identity.sessionId
+function assertDuplicateBindings(context: Conversion, canonicalPath: string, aliasPath: string): void {
+	for (const [path, binding] of context.bindings) {
+		const canonical = path === canonicalPath || path.startsWith(`${canonicalPath}/`);
+		const alias = path === aliasPath || path.startsWith(`${aliasPath}/`);
+		if (!canonical && !alias) continue;
+		const peerPath = canonical
+			? aliasPath + path.slice(canonicalPath.length)
+			: canonicalPath + path.slice(aliasPath.length);
+		const peer = context.bindings.get(peerPath);
+		if (
+			peer === undefined ||
+			binding.chatId !== peer.chatId ||
+			binding.projectId !== peer.projectId ||
+			binding.sessionId !== peer.sessionId ||
+			!isDeepStrictEqual(withEpoch(binding.managedAuthority), withEpoch(peer.managedAuthority))
+		)
+			throw new Error(`Duplicated history requires equal explicit occurrence bindings at ${path} and ${peerPath}.`);
+	}
+}
+function normalizeAliasProvenance(value: unknown, canonicalPath: string, aliasPath: string): unknown {
+	if (Array.isArray(value)) return value.map(child => normalizeAliasProvenance(child, canonicalPath, aliasPath));
+	if (!isRecord(value)) return value;
+	return Object.fromEntries(
+		Object.entries(value).map(([key, child]) => {
+			if (
+				key === "historicalBinding" &&
+				isRecord(child) &&
+				isRecord(child.provenance) &&
+				typeof child.provenance.nodeRef === "string"
+			) {
+				const reference = child.provenance.nodeRef;
+				return [
+					key,
+					{
+						...child,
+						provenance: {
+							...child.provenance,
+							nodeRef:
+								reference === aliasPath || reference.startsWith(`${aliasPath}/`)
+									? canonicalPath + reference.slice(aliasPath.length)
+									: reference,
+						},
+					},
+				];
+			}
+			return [key, normalizeAliasProvenance(child, canonicalPath, aliasPath)];
+		}),
 	);
 }
-function identityKey(identity: Identity): string {
-	return JSON.stringify([identity.chatId, identity.projectId, identity.sessionId]);
+
+function convertOperation(
+	value: unknown,
+	nodeRef: string,
+	identity: Identity,
+	owner: Owner,
+	context: Conversion,
+): Record<string, unknown> {
+	const node = record(value, nodeRef);
+	const { result, acknowledgedSuccessor, ...fields } = node;
+	return {
+		...fields,
+		...(result === undefined ? {} : { result: convertResult(result, `${nodeRef}/result`, owner, context) }),
+		...(acknowledgedSuccessor === undefined
+			? {}
+			: {
+					acknowledgedSuccessor: convertSuccessor(
+						acknowledgedSuccessor,
+						`${nodeRef}/acknowledgedSuccessor`,
+						identity,
+						owner,
+						context,
+					),
+				}),
+	};
 }
-function isNonEmptyString(value: unknown): value is string {
-	return typeof value === "string" && value.length > 0;
+
+function convertResult(value: unknown, nodeRef: string, owner: Owner, context: Conversion): Record<string, unknown> {
+	const node = record(value, nodeRef);
+	const mapping = record(node.mapping, `${nodeRef}/mapping`);
+	const identity = identityOf(mapping, nodeRef);
+	const { attachment: _attachment, ...projection } = mapping;
+	validateAttachment(mapping.attachment, identity.sessionId, `${nodeRef}/mapping`);
+	const { mapping: _mapping, managedAuthority: _managed, historicalBinding: _historical, ...fields } = node;
+	if (node.historicalBinding !== undefined)
+		throw new Error(`V2 source already contains a historical binding at ${nodeRef}.`);
+	return {
+		...fields,
+		mapping: projection,
+		...convertBinding(node, identity, ownerOf(node, identity, owner), nodeRef, context),
+	};
 }
-function isUndefined<T>(value: T | undefined): value is undefined {
-	return value === undefined;
+
+function convertSuccessor(
+	value: unknown,
+	nodeRef: string,
+	parent: Identity,
+	owner: Owner,
+	context: Conversion,
+): Record<string, unknown> {
+	const node = record(value, nodeRef);
+	if (!isNonEmptyString(node.sessionId)) throw new Error(`Successor has no session identity at ${nodeRef}.`);
+	const identity = { chatId: parent.chatId, projectId: parent.projectId, sessionId: node.sessionId };
+	validateAttachment(node.attachment, identity.sessionId, nodeRef);
+	const { attachment: _attachment, managedAuthority: _managed, historicalBinding: _historical, ...fields } = node;
+	if (node.historicalBinding !== undefined)
+		throw new Error(`V2 source already contains a historical binding at ${nodeRef}.`);
+	return { ...fields, ...convertBinding(node, identity, ownerOf(node, identity, owner), nodeRef, context) };
 }
-function blocked(reasons: readonly string[]): SessionAuthorityV3MigrationBlocked {
-	return { status: "blocked", reasons: [...new Set(reasons)].sort() };
+
+function convertProvisional(value: unknown, nodeRef: string, context: Conversion): Record<string, unknown> {
+	const node = record(value, nodeRef);
+	const identity = identityOf(node, nodeRef, true);
+	const owner = ownerOf(node, identity);
+	validateAttachment(node.attachment, identity.sessionId, nodeRef);
+	const { attachment: _attachment, managedAuthority: _managed, historicalBinding: _historical, ...fields } = node;
+	if (node.historicalBinding !== undefined)
+		throw new Error(`V2 source already contains a historical binding at ${nodeRef}.`);
+	const operation = convertOperation(fields, nodeRef, identity, owner, context);
+	if (identity.sessionId === undefined) {
+		if (node.managedAuthority !== undefined || context.bindings.has(nodeRef))
+			throw new Error("Unassigned reservation cannot carry a generation binding.");
+		return node.result === undefined && node.acknowledgedSuccessor === undefined
+			? operation
+			: { ...operation, ...convertBinding(node, identity, owner, nodeRef, context) };
+	}
+	return { ...operation, ...convertBinding(node, identity, owner, nodeRef, context) };
+}
+
+function convertBinding(
+	node: Record<string, unknown>,
+	identity: Identity,
+	owner: Owner,
+	nodeRef: string,
+	context: Conversion,
+): Record<string, unknown> {
+	const binding = context.bindings.get(nodeRef);
+	if (binding !== undefined) {
+		context.used.add(nodeRef);
+		if (
+			binding.chatId !== identity.chatId ||
+			binding.projectId !== identity.projectId ||
+			binding.sessionId !== identity.sessionId
+		)
+			throw new Error(`Binding does not match the exact source occurrence at ${nodeRef}.`);
+	}
+	const existing = node.managedAuthority;
+	if (existing !== undefined && !isRecord(existing)) throw new Error(`Malformed managed authority at ${nodeRef}.`);
+	const supplied = binding?.managedAuthority;
+	const actual = existing ?? supplied;
+	if (actual !== undefined) {
+		if (
+			!isRecord(actual) ||
+			actual.chatId !== identity.chatId ||
+			actual.projectId !== identity.projectId ||
+			actual.sessionId !== identity.sessionId ||
+			(owner.principalId !== undefined && actual.principalId !== owner.principalId) ||
+			(owner.canonicalWorkspace !== undefined && actual.canonicalWorkspace !== owner.canonicalWorkspace)
+		)
+			throw new Error(`Managed occurrence ownership conflicts at ${nodeRef}.`);
+		if (
+			existing !== undefined &&
+			supplied !== undefined &&
+			!isDeepStrictEqual(withEpoch(existing), withEpoch(supplied))
+		)
+			throw new Error(`Binding would rewrite historical generation authority at ${nodeRef}.`);
+		return { managedAuthority: withEpoch(actual) };
+	}
+	const historicalBinding: HistoricalSessionBinding = {
+		kind: "unbound-history",
+		...identity,
+		...(owner.principalId === undefined ? {} : { principalId: owner.principalId }),
+		...(owner.canonicalWorkspace === undefined ? {} : { canonicalWorkspace: owner.canonicalWorkspace }),
+		reason:
+			owner.principalId === undefined || owner.canonicalWorkspace === undefined
+				? "ownership-unresolved"
+				: "generation-unproven",
+		provenance: { source: "v2", documentHash: context.documentHash, nodeRef, nodeHash: jsonHash(node) },
+	};
+	return { historicalBinding };
+}
+
+function ownerOf(node: Record<string, unknown>, identity: Identity, inherited?: Owner): Owner {
+	const scope = isRecord(node.observations) ? node.observations.__gjcSessionMappingScope : undefined;
+	const canonical = canonicalScope(identity.chatId);
+	let principalId = canonical?.[0];
+	if (scope !== undefined) {
+		if (
+			!isRecord(scope) ||
+			!isNonEmptyString(scope.principalId) ||
+			(scope.chatId !== undefined &&
+				(!isNonEmptyString(scope.chatId) || JSON.stringify([scope.principalId, scope.chatId]) !== identity.chatId))
+		)
+			throw new Error("Malformed or ambiguous legacy principal scope metadata.");
+		if (principalId !== undefined && principalId !== scope.principalId)
+			throw new Error("Foreign legacy principal scope metadata.");
+		principalId = scope.principalId;
+	}
+	const managed = node.managedAuthority;
+	if (managed !== undefined && !isRecord(managed)) throw new Error("Malformed historical managed authority.");
+	if (isRecord(managed)) {
+		if (!isNonEmptyString(managed.principalId) || !isNonEmptyString(managed.canonicalWorkspace))
+			throw new Error("Incomplete historical managed owner.");
+		if (principalId !== undefined && principalId !== managed.principalId)
+			throw new Error("Foreign historical managed principal.");
+		principalId = managed.principalId;
+	}
+	if (principalId !== undefined && inherited?.principalId !== undefined && principalId !== inherited.principalId)
+		throw new Error("Historical child crosses principal ownership.");
+	const canonicalWorkspace = isRecord(managed)
+		? managed.canonicalWorkspace
+		: inherited?.projectId === identity.projectId
+			? inherited.canonicalWorkspace
+			: undefined;
+	if (canonicalWorkspace !== undefined && typeof canonicalWorkspace !== "string")
+		throw new Error("Malformed historical workspace.");
+	return {
+		projectId: identity.projectId,
+		...((principalId ?? inherited?.principalId) === undefined
+			? {}
+			: { principalId: principalId ?? inherited?.principalId }),
+		...(canonicalWorkspace === undefined ? {} : { canonicalWorkspace }),
+	};
+}
+function identityOf(node: Record<string, unknown>, context: string, unassigned = false): Identity {
+	if (
+		!isNonEmptyString(node.chatId) ||
+		!isNonEmptyString(node.projectId) ||
+		(!unassigned && !isNonEmptyString(node.sessionId)) ||
+		(node.sessionId !== undefined && !isNonEmptyString(node.sessionId))
+	)
+		throw new Error(`Incomplete historical identity at ${context}.`);
+	return {
+		chatId: node.chatId,
+		projectId: node.projectId,
+		...(node.sessionId === undefined ? {} : { sessionId: node.sessionId }),
+	};
+}
+function validateAttachment(value: unknown, sessionId: string | undefined, context: string): void {
+	if (value !== undefined && (!isAttachmentProof(value) || value.expectedSessionId !== sessionId))
+		throw new Error(
+			`Malformed legacy attachment at ${context}; conversion cannot discard malformed source evidence.`,
+		);
+}
+function record(value: unknown, context: string): Record<string, unknown> {
+	if (!isRecord(value)) throw new Error(`Malformed graph node at ${context}.`);
+	return value;
+}
+function withEpoch(value: unknown): Record<string, unknown> {
+	if (!isRecord(value)) throw new Error("Malformed managed authority.");
+	if (value.authorityEpoch !== undefined && value.authorityEpoch !== SESSION_AUTHORITY_V3_EPOCH)
+		throw new Error("Foreign managed authority epoch.");
+	return { ...value, authorityEpoch: SESSION_AUTHORITY_V3_EPOCH };
+}
+function canonicalScope(chatId: string): readonly [string, string] | undefined {
+	try {
+		const scope: unknown = JSON.parse(chatId);
+		if (
+			Array.isArray(scope) &&
+			scope.length === 2 &&
+			scope.every(isNonEmptyString) &&
+			JSON.stringify(scope) === chatId
+		)
+			return [scope[0], scope[1]];
+	} catch {
+		/* Unscoped history remains unowned. */
+	}
+	return undefined;
+}
+function blocked(reason: string): SessionAuthorityV3MigrationBlocked {
+	return { status: "blocked", reasons: [reason] };
 }
 function sha256(bytes: Uint8Array): string {
 	return createHash("sha256").update(bytes).digest("hex");
 }
-
-function strip(value: unknown): unknown {
-	if (Array.isArray(value)) return value.map(strip);
-	if (value === null || typeof value !== "object") return value;
-	return Object.fromEntries(
-		Object.entries(value as Record<string, unknown>)
-			.filter(([, item]) => item !== undefined)
-			.map(([key, item]) => [key, strip(item)]),
-	);
+function jsonHash(value: unknown): string {
+	return sha256(new TextEncoder().encode(canonicalJson(value)));
+}
+function canonicalJson(value: unknown, depth = 0): string {
+	if (depth > 64) throw new Error("Historical graph exceeds the supported depth.");
+	if (
+		value === null ||
+		typeof value === "string" ||
+		typeof value === "boolean" ||
+		(typeof value === "number" && Number.isFinite(value))
+	)
+		return JSON.stringify(value);
+	if (Array.isArray(value)) return `[${Array.from(value, item => canonicalJson(item, depth + 1)).join(",")}]`;
+	if (!isRecord(value) || (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null))
+		throw new Error("Historical graph is not JSON data.");
+	return `{${Object.keys(value)
+		.filter(key => value[key] !== undefined)
+		.sort()
+		.map(key => `${JSON.stringify(key)}:${canonicalJson(value[key], depth + 1)}`)
+		.join(",")}}`;
 }

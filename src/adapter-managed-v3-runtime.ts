@@ -37,6 +37,7 @@ const starts = new WeakMap<ManagedSdkRuntime, RuntimeStart>();
  */
 export function startActiveManagedRuntime(options: StartActiveManagedRuntimeOptions): Promise<ActiveManagedV3Runtime> {
 	assertOptions(options);
+	options.mappings.assertServingReady();
 	const existing = starts.get(options.runtime);
 	if (existing !== undefined) {
 		if (
@@ -102,8 +103,7 @@ async function start(options: StartActiveManagedRuntimeOptions): Promise<ActiveM
 }
 
 function tenantFor(mapping: SessionMapping): TenantSessionKey {
-	if (mapping.attachment !== undefined || mapping.sessionFile !== undefined)
-		throw new Error("Canonical V3 startup rejects legacy attachment evidence.");
+	if (mapping.attachment !== undefined) throw new Error("Canonical V3 startup rejects legacy attachment evidence.");
 	const authority = mapping.managedAuthority;
 	if (authority === undefined || !isManagedV3Authority(authority))
 		throw new Error("Canonical V3 startup requires complete managed authority at the exact V3 epoch.");
@@ -170,6 +170,8 @@ function assertOptions(options: StartActiveManagedRuntimeOptions): void {
 	if (typeof options.liveTenantFence !== "function") throw new TypeError("An external live tenant fence is required.");
 	if (options.mappings === undefined || typeof options.mappings.mappingRecordsIterable !== "function")
 		throw new TypeError("A canonical SessionV3FileBackedMappingStore is required.");
+	if (typeof options.mappings.assertServingReady !== "function")
+		throw new TypeError("Canonical V3 serving readiness validation is required.");
 	if (options.mappings.epoch !== SESSION_AUTHORITY_V3_EPOCH)
 		throw new Error("Managed V3 startup requires the canonical V3 mapping store epoch.");
 }

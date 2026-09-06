@@ -10,6 +10,7 @@ import { parseSessionAuthorityV3Document, SESSION_AUTHORITY_V3_EPOCH } from "../
 import { replayCloseOperation } from "../src/gjc/session-operation-codec";
 import { replayOperation } from "../src/gjc/session-turn-router";
 import { SessionV3FileBackedMappingStore } from "../src/gjc/session-v3-file-backed-mapping-store";
+import type { ManagedTurnAuthority } from "../src/gjc/turn-runner";
 
 const authority = (chatId = "chat-1", projectId = "project-1", sessionId = "session-1") => ({
 	authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
@@ -52,7 +53,13 @@ const managedMapping = (principalId = "user-1", operationId = "initial") => ({
 	managedAuthority: { ...authority(), principalId },
 });
 
-const completionResult = (operationId: string, kind: SessionOperationResult["kind"]): SessionOperationResult => ({
+const completionResult = (
+	operationId: string,
+	kind: SessionOperationResult["kind"],
+): SessionOperationResult & {
+	readonly managedAuthority: ManagedTurnAuthority;
+	readonly historicalBinding?: never;
+} => ({
 	kind,
 	assistantText: kind === "close" ? "" : "original answer",
 	events: [{ type: "message", id: "event-1", payload: { answer: "original" } }],
@@ -997,10 +1004,15 @@ describe("SessionV3FileBackedMappingStore", () => {
 			expect(document).toBeDefined();
 			expect(document?.mappings).toHaveLength(1);
 			expect(document?.mappings[0]?.chatId).toBe(durableChatId);
-			expect(document?.mappings[0]?.managedAuthority.chatId).toBe(durableChatId);
-			for (const operation of document?.mappings[0]?.journal ?? []) {
+			const durableMapping = document?.mappings[0];
+			if (durableMapping?.managedAuthority === undefined)
+				throw new Error("expected managed authority for the durable mapping");
+			expect(durableMapping.managedAuthority.chatId).toBe(durableChatId);
+			for (const operation of durableMapping.journal) {
 				if (operation.result === undefined) continue;
 				expect(operation.result.mapping.chatId).toBe(durableChatId);
+				if (operation.result.managedAuthority === undefined)
+					throw new Error("expected managed authority for the durable result");
 				expect(operation.result.managedAuthority.chatId).toBe(durableChatId);
 			}
 			expect(document?.provisionalOperations[0]?.chatId).toBe(durableChatId);
