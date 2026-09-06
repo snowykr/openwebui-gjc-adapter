@@ -10,7 +10,7 @@ ENV BUN_INSTALL=/opt/bun \
 LABEL org.opencontainers.image.version="0.16.4"
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git openssh-client sqlite3 tini tmux unzip \
+    && apt-get install -y --no-install-recommends ca-certificates curl git openssh-client sqlite3 tini unzip \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=bun-runtime /usr/local/bin/bun /opt/bun/bin/bun
 

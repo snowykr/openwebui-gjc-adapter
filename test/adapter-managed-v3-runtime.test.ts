@@ -71,6 +71,42 @@ function runtime(status: "current" | "replaced" | "unknown" = "current", current
 }
 
 describe("startActiveManagedRuntime", () => {
+	test("passes the configured budget into managed operations and rejects changed startup budgets", async () => {
+		const fake = runtime();
+		const timeouts: number[] = [];
+		Object.assign(fake.runtime, {
+			async request(_attachment: unknown, _frame: unknown, options: { timeoutMs: number }) {
+				timeouts.push(options.timeoutMs);
+				return await new Promise(() => {});
+			},
+		});
+		const options = { runtime: fake.runtime, mappings: store([]), liveTenantFence: () => true, turnTimeoutMs: 35 };
+		const active = await startActiveManagedRuntime(options);
+		await expect(
+			active.runner.operations.query(mapping().managedAuthority!, "models.list/current"),
+		).rejects.toMatchObject({ code: "timeout" });
+		expect(timeouts).toHaveLength(1);
+		expect(timeouts[0]).toBeGreaterThan(0);
+		expect(timeouts[0]).toBeLessThanOrEqual(35);
+		await expect(startActiveManagedRuntime({ ...options, turnTimeoutMs: 40 })).rejects.toThrow(
+			"different startup dependencies",
+		);
+		await active.dispose();
+	});
+	test("rejects invalid budgets before runtime startup effects", () => {
+		for (const turnTimeoutMs of [0, -1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483_648]) {
+			const fake = runtime();
+			expect(() =>
+				startActiveManagedRuntime({
+					runtime: fake.runtime,
+					mappings: store([]),
+					liveTenantFence: () => true,
+					turnTimeoutMs,
+				}),
+			).toThrow("turnTimeoutMs");
+			expect(fake.calls).toEqual([]);
+		}
+	});
 	test("starts once and exposes only a reconciled, fenced direct V3 runtime", async () => {
 		const fake = runtime();
 		const fenceKeys: TenantSessionKey[] = [];

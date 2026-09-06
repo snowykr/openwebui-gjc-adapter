@@ -240,7 +240,7 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 		).rejects.toThrow("GJC prompt failed");
 		expect(liveEvents).toEqual([]);
 	});
-	test("preserves artifact fallback events after observing a terminal frame", async () => {
+	test("preserves late result events before projecting terminal completion", async () => {
 		const turnRunner = new FakeGjcTurnRunner();
 		turnRunner.observedEvents = [{ type: "agent_start" }, { type: "agent_end" }];
 		turnRunner.events = [
@@ -260,16 +260,16 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 		const result = await runner.run({
 			project,
 			prompt: "hello",
-			chatId: "chat-artifact-fallback",
-			messageId: "assistant-artifact-fallback",
-			userMessageId: "user-artifact-fallback",
+			chatId: "chat-late-events",
+			messageId: "assistant-late-events",
+			userMessageId: "user-late-events",
 			userMessageParentId: null,
 			ownerUserId: "owner-test",
 			preparedManagedAuthority: managedPreparedAuthority({
 				projectId: project.id,
 				canonicalWorkspace: project.cwd,
-				chatId: "chat-artifact-fallback",
-				requestKey: "user-artifact-fallback",
+				chatId: "chat-late-events",
+				requestKey: "user-late-events",
 			}),
 			continued: false,
 			requestedModelId: "gjc",

@@ -265,7 +265,7 @@ function createManagedSelectionRuntime(baseUrl: string): ManagedSdkRuntime {
 		readonly sessionId: string;
 		readonly generation: number;
 		readonly attachment: router.SessionAttachment;
-		pendingGate: boolean;
+		pendingGate: Record<string, unknown> | undefined;
 		status: "current" | "retired";
 	};
 	const sessions = new Map<string, SelectionSession>();
@@ -283,7 +283,7 @@ function createManagedSelectionRuntime(baseUrl: string): ManagedSdkRuntime {
 		session = {
 			sessionId,
 			generation,
-			pendingGate: false,
+			pendingGate: undefined,
 			status: "current",
 			attachment: {
 				sessionId,
@@ -303,7 +303,7 @@ function createManagedSelectionRuntime(baseUrl: string): ManagedSdkRuntime {
 		seq: number,
 	): Promise<void> => {
 		await onFrame?.(session.attachment, {
-			body,
+			body: { ...body, sessionId: session.sessionId, ...correlation },
 			name: "event",
 			sessionId: session.sessionId,
 			generation: session.generation,
@@ -431,7 +431,7 @@ function createManagedSelectionRuntime(baseUrl: string): ManagedSdkRuntime {
 			return {
 				type: "query_response",
 				ok: true,
-				page: { items: session.pendingGate ? [workflowGate(session)] : [], complete: true },
+				page: { items: session.pendingGate === undefined ? [] : [session.pendingGate], complete: true },
 			};
 		}
 		if (query === "models.list/current") {
@@ -508,8 +508,18 @@ function createManagedSelectionRuntime(baseUrl: string): ManagedSdkRuntime {
 				turnId: `selection-turn-${nextCorrelation}`,
 			};
 			if (result.value.gate === true) {
-				session.pendingGate = true;
-				await emit(session, workflowGate(session, correlation), correlation, 1);
+				session.pendingGate = workflowGate(session, correlation);
+				await emit(
+					session,
+					{
+						type: "action_needed",
+						kind: "ask",
+						id: "selection-action-1",
+						workflowGateId: session.pendingGate.gateId,
+					},
+					correlation,
+					1,
+				);
 			} else {
 				const assistant = await coordinatorRequest("/assistant");
 				const text =
@@ -517,20 +527,26 @@ function createManagedSelectionRuntime(baseUrl: string): ManagedSdkRuntime {
 						? assistant.value.text
 						: "selection fixture assistant";
 				await emit(session, { type: "message_update", id: "selection-assistant", text }, correlation, 1);
-				await emit(session, { type: "agent_end", id: "selection-agent-end" }, correlation, 2);
+				await emit(session, { type: "agent_end", id: "selection-agent-end", finalText: text }, correlation, 2);
 			}
-			return { type: "control_response", ok: true, result: { accepted: true, correlation } };
+			return { type: "control_response", ok: true, result: { accepted: true, ...correlation } };
 		}
 		if (operation === "workflow.gate_answer") {
+			if (
+				session.pendingGate === undefined ||
+				input.id !== session.pendingGate.gateId ||
+				input.expectedSessionId !== session.sessionId
+			)
+				throw new ManagedSdkOperationError("gate_response_failed", "Selection fixture gate target is not current.");
 			const result = await coordinatorRequest("/gate", { method: "POST" });
 			if (!result.ok) throw new ManagedSdkOperationError("gate_response_failed", result.message);
-			session.pendingGate = false;
+			session.pendingGate = undefined;
 			const correlation = {
 				commandId: `selection-command-${++nextCorrelation}`,
 				turnId: `selection-turn-${nextCorrelation}`,
 			};
-			await emit(session, { type: "agent_end", id: "selection-agent-end" }, correlation, 1);
-			return { type: "control_response", ok: true, result: { accepted: true, correlation } };
+			await emit(session, { type: "agent_end", id: "selection-agent-end", finalText: "" }, correlation, 1);
+			return { type: "control_response", ok: true, result: { accepted: true, ...correlation } };
 		}
 		if (operation === "turn.abort") return { type: "control_response", ok: true, result: { accepted: true } };
 		return { type: "control_response", ok: true, result: {} };
@@ -584,7 +600,7 @@ function createManagedSelectionRuntime(baseUrl: string): ManagedSdkRuntime {
 
 function workflowGate(
 	session: { readonly sessionId: string },
-	correlation: Readonly<{ commandId: string; turnId: string }> = { commandId: "", turnId: "" },
+	correlation: Readonly<{ commandId: string; turnId: string }>,
 ): Record<string, unknown> {
 	return {
 		type: "workflow_gate",

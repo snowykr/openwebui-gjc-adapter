@@ -312,6 +312,48 @@ describe("CLI module boundaries", () => {
 		expect(publicEntrypoint).not.toContain('export * from "./gjc/public-sdk-contract"');
 		expect(manifest.exports["./gjc/public-sdk-contract"]).toBeUndefined();
 	});
+	test("delivery surfaces exclude retired transports and private lifecycle exports", () => {
+		const manifest = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
+		const files = ["src", "test", ".github/workflows"].flatMap(directory =>
+			readdirSync(join(ROOT, directory), { recursive: true, withFileTypes: true })
+				.filter(entry => entry.isFile() && /\.(?:ts|json|ya?ml)$/.test(entry.name))
+				.map(entry => join(entry.parentPath, entry.name)),
+		);
+		files.push(join(ROOT, "package.json"), join(ROOT, "tsconfig.json"));
+		const legacy = ["r", "pc"].join("");
+		const forbidden = [
+			new RegExp(`\\b${legacy}(?:[-_](?:client|runner|frames|workflow|errors))\\b`, "i"),
+			new RegExp(`\\b(?:parse|create)${["R", "pc"].join("")}\\w*\\b`),
+			new RegExp(`--mode\\s+${legacy}\\b`, "i"),
+			new RegExp(
+				`\\b(?:private[-_\\s]+daemon|daemon\\/(?:runtime|control)|${["broker", "_hello"].join("")})\\b`,
+				"i",
+			),
+			new RegExp(
+				`from\\s+["'](?:${["@gajae-code", "bridge-client"].join("/")}|@gajae-code/coding-agent/sdk/(?:client|acp|broker))`,
+			),
+		];
+		expect(files.filter(file => forbidden.some(pattern => pattern.test(readFileSync(file, "utf8"))))).toEqual([]);
+		const sourceNames = files
+			.filter(file => file.startsWith(join(ROOT, "src")))
+			.map(file => file.slice(ROOT.length + 1));
+		expect(
+			sourceNames.filter(file =>
+				/\/(?:public-sdk-|sdk-v3-|cli-lifecycle-|gjc-public-sdk-|tmux-ownership)/.test(file),
+			),
+		).toEqual([]);
+		for (const module of [`${legacy}-client-transport`, `${legacy}-client-runner`, `${legacy}-runner`, "sdk-v3-cli"])
+			expect(existsSync(join(ROOT, "src/gjc", `${module}.ts`))).toBe(false);
+		const entrypoint = readFileSync(join(ROOT, "src/index.ts"), "utf8");
+		for (const module of ["session-frames", "turn-runner", "cli-lifecycle-backend", "tmux-ownership"])
+			expect(entrypoint).not.toContain(`./gjc/${module}`);
+		expect(manifest.exports["./gjc/*"]).toBeUndefined();
+		expect(manifest.dependencies["@gajae-code/coding-agent"]).toBe("0.16.4");
+		expect(manifest.dependencies[["@gajae-code", "bridge-client"].join("/")]).toBeUndefined();
+		expect(manifest.patchedDependencies).toBeUndefined();
+		for (const version of ["0.10.0", "0.11.6", "0.12.7", "0.12.8"])
+			expect(existsSync(join(ROOT, "patches", `@gajae-code%2Fcoding-agent@${version}.patch`))).toBe(false);
+	});
 	test("pins explicit live package exports and blocks internal live modules", () => {
 		const manifest = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")) as {
 			exports: Record<string, unknown>;

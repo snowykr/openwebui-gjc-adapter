@@ -174,6 +174,7 @@ export async function buildResolvedAdapterServerOptions(
 		activeManagedV3Runtime = await startActiveManagedRuntime({
 			mappings,
 			runtime: runtime as ManagedSdkRuntime,
+			turnTimeoutMs: config.turnTimeoutMs,
 			liveTenantFence:
 				dependencies.managedSdkTenantFence ??
 				(key =>

@@ -68,16 +68,11 @@ export interface ManagedCloseInput {
 
 export type GjcTurnEventObserver = (event: GjcTurnEvent) => Promise<void> | void;
 export type {
-	GjcLifecycleOwner,
 	GjcLifecyclePublicationAddress,
 	GjcLifecycleScoped,
-	GjcLifecycleTestBarrierEvidence,
-	GjcLifecycleTestBarrierHook,
-	GjcLifecycleTestBarrierPhase,
 	GjcLifecycleTransaction,
 	GjcSessionAddress,
 } from "./lifecycle-transaction";
-export { GjcCloseReceipt } from "./lifecycle-transaction";
 
 export interface GjcStartNewSessionInput {
 	readonly cwd: string;
@@ -204,26 +199,9 @@ export interface GjcTurnRunner {
 	stop?(): void;
 	cancelTurn?(input: GjcCancelTurnInput): void | Promise<void>;
 	clearTurnCancellation?(input: GjcCancelTurnInput): void;
-	resolveSessionRoot?(cwd: string): string;
-	discardSessionAttachment?(cwd: string, sessionId: string): void;
 	withLifecyclePublication?<T>(
 		address: GjcLifecyclePublicationAddress,
 		effect: (lifecycle: GjcLifecycleTransaction) => Promise<T>,
-	): Promise<T>;
-	/** Runs a close-only lifecycle transaction without recovering or attaching a dropped cache entry. */
-	withLifecycleClosePreflight?<T>(
-		address: GjcLifecyclePublicationAddress,
-		effect: (lifecycle: GjcLifecycleTransaction) => Promise<T>,
-	): Promise<T>;
-	startNewSession<T>(
-		input: GjcStartNewSessionInput,
-		publish: (result: GjcSessionAddress & GjcTurnResult, lifecycle: GjcLifecycleTransaction) => Promise<T>,
-		beforePrompt: (
-			address: GjcSessionAddress,
-			attachment: SessionAttachmentProof,
-			lifecycle: GjcLifecycleTransaction,
-		) => Promise<void>,
-		onFailure?: (lifecycle: GjcLifecycleTransaction, error: unknown) => Promise<void>,
 	): Promise<T>;
 	startManagedSession?<T>(
 		input: GjcStartNewSessionInput & { readonly preparedManagedAuthority: ManagedPreparedTurnAuthority },

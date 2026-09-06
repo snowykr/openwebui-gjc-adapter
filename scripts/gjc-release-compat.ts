@@ -291,7 +291,7 @@ async function writeReports(directory: string, report: Record<string, unknown>):
 	const operations = report.operations as Array<{ name: string }>;
 	await writeFile(
 		join(directory, "operation-report.md"),
-		`## GJC release compatibility\n\n- CLI version: ${JSON.stringify(report.cliVersion ?? null)}\n- Observed operations: ${operations.map(operation => `\`${operation.name}\``).join(", ") || "none"}\n- Absolute resume: ${JSON.stringify(report.absoluteResume ?? null)}\n- Cleanup: ${JSON.stringify(report.cleanup ?? null)}\n- Public managed SDK harness: lifecycle and Router APIs only; no direct transport observations.\n- Static source contract artifact: \`test/gjc-sdk-v3-contract.test.ts\` (separate test artifact; not observed by this runtime harness).\n`,
+		`## GJC release compatibility\n\n- CLI version: ${JSON.stringify(report.cliVersion ?? null)}\n- Observed operations: ${operations.map(operation => `\`${operation.name}\``).join(", ") || "none"}\n- Absolute resume: ${JSON.stringify(report.absoluteResume ?? null)}\n- Cleanup: ${JSON.stringify(report.cleanup ?? null)}\n- Public managed SDK harness: lifecycle and Router APIs only; no direct transport observations.\n- Static source contract artifact: \`test/cli-module-boundaries.test.ts\` (separate test artifact; not observed by this runtime harness).\n`,
 	);
 }
 

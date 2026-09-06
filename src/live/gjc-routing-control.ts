@@ -3,7 +3,6 @@ import { scopedSessionMappingStore } from "../gjc/scoped-session-mapping-store";
 import type { routeGjcTurn, SessionMapping, SessionMappingStore } from "../gjc/session-router";
 import {
 	type GjcControlResult,
-	type GjcLifecycleTestBarrierHook,
 	GjcTurnCancelledError,
 	type ManagedGenerationProof,
 	type ManagedTurnAuthority,
@@ -21,7 +20,6 @@ export interface RoutingControlDependencies {
 	readonly mappings: SessionMappingStore;
 	readonly outbox?: OutboxStore;
 	readonly ownerUserId?: string;
-	readonly testBarrierHook?: GjcLifecycleTestBarrierHook;
 }
 export async function runRoutingControl(
 	input: RoutingControlDependencies,
@@ -76,8 +74,6 @@ export async function runRoutingControl(
 				projectId: existing.projectId,
 				chatId: existing.chatId,
 				sessionId: existing.sessionId,
-				sessionFile: existing.sessionFile,
-				recoveryAttachment: existing.attachment,
 			},
 			async lifecycle => {
 				throwIfAborted(turn.signal);

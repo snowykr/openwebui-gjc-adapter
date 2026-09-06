@@ -71,6 +71,23 @@ describe("managed session operations", () => {
 		);
 	});
 
+	test("rejects failed and foreign close or delete acknowledgements even when generation is retired", async () => {
+		for (const operation of ["close", "delete"] as const) {
+			for (const outcome of [
+				{ ok: false, certainty: "retryable" },
+				{ ok: true },
+				{ ok: true, result: { sessionId: "replacement" } },
+			]) {
+				const fake = new FakeRuntime();
+				fake.status = "retired";
+				fake.retirementOutcome = outcome;
+				const operations = createManagedSessionOperations(fake.runtime);
+				await expect(
+					operations[operation]({ authority, target: { sessionId: authority.sessionId } }),
+				).rejects.toBeInstanceOf(ManagedTurnUncertainError);
+			}
+		}
+	});
 	test("rejects incomplete or tenant-mismatched authority before the Router request", async () => {
 		const fake = new FakeRuntime();
 		const operations = createManagedSessionOperations(fake.runtime);
@@ -124,6 +141,102 @@ describe("managed session operations", () => {
 			createManagedSessionOperations(fake.runtime).query(authority, "models.list/current"),
 		).rejects.toThrow("repeated");
 	});
+
+	test("bounds public queries to 256 pages and 100000 total items", async () => {
+		const pages = new FakeRuntime();
+		pages.queryHandler = async (_frame, page) => queryResponse([], `page-${page}`);
+		await expect(
+			createManagedSessionOperations(pages.runtime).query(authority, "models.list/current"),
+		).rejects.toThrow("page bound");
+		expect(pages.requests).toHaveLength(256);
+		const items = new FakeRuntime();
+		items.queryHandler = async (_frame, page) =>
+			queryResponse(
+				Array.from({ length: 50_001 }, () => "item"),
+				page === 1 ? "next" : undefined,
+			);
+		await expect(
+			createManagedSessionOperations(items.runtime).query(authority, "models.list/current"),
+		).rejects.toThrow("item bound");
+		expect(items.requests).toHaveLength(2);
+	});
+
+	test("fails closed on malformed and error query envelopes", async () => {
+		for (const response of [
+			{ type: "control_response", ok: true, result: {} },
+			{ type: "query_response", ok: false, error: { message: "query denied" } },
+			{ type: "query_response", ok: true, page: { items: [], complete: false } },
+			{ type: "query_response", ok: true, page: { items: [], complete: true, continuationCursor: "unexpected" } },
+			{ type: "query_response", ok: true, page: { items: [], complete: false, continuationCursor: "" } },
+			{ type: "query_response", ok: true, page: { items: {}, complete: true } },
+		]) {
+			const fake = new FakeRuntime();
+			fake.queryHandler = async () => response;
+			await expect(
+				createManagedSessionOperations(fake.runtime).query(authority, "models.list/current"),
+			).rejects.toThrow();
+			expect(fake.requests).toHaveLength(1);
+		}
+	});
+
+	test("uses one total query deadline rather than renewing the timeout on each page", async () => {
+		const fake = new FakeRuntime();
+		const releaseSecond = deferred<Record<string, unknown>>();
+		fake.queryHandler = async (_frame, page) => {
+			if (page === 1) {
+				await new Promise(resolve => setTimeout(resolve, 30));
+				return queryResponse(["one"], "next");
+			}
+			return releaseSecond.promise;
+		};
+		await expect(
+			createManagedSessionOperations(fake.runtime).query(authority, "models.list/current", {}, 100),
+		).rejects.toMatchObject({ code: "timeout" });
+		expect(fake.requests).toHaveLength(2);
+		expect(fake.requestTimeouts[1]!).toBeLessThan(fake.requestTimeouts[0]! - 10);
+		releaseSecond.resolve(queryResponse(["two"], "must-not-fetch"));
+		await new Promise(resolve => setTimeout(resolve, 0));
+		expect(fake.requests).toHaveLength(2);
+	});
+
+	test("rejects invalid query and turn timeouts before any Router dispatch", async () => {
+		for (const timeoutMs of [0, -1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483_648]) {
+			const fake = new FakeRuntime();
+			const operations = createManagedSessionOperations(fake.runtime);
+			await expect(operations.query(authority, "models.list/current", {}, timeoutMs)).rejects.toBeInstanceOf(
+				TypeError,
+			);
+			await expect(
+				operations.prompt({ authority, operation: "turn.prompt", text: "no", timeoutMs }),
+			).rejects.toBeInstanceOf(TypeError);
+			expect(fake.requests).toHaveLength(0);
+		}
+	});
+
+	test("requires real terminal events for prompt, follow-up and gate continuation", async () => {
+		const fake = new FakeRuntime();
+		const operations = createManagedSessionOperations(fake.runtime);
+		const input = { authority, operation: "turn.prompt", text: "hello", timeoutMs: 1_000 };
+		for (const run of [
+			() => operations.prompt(input),
+			() => operations.followUp(input),
+			() => operations.answerGate({ ...input, gateId: "gate-1", answer: "yes" }),
+		]) {
+			await expect(run()).resolves.toMatchObject({
+				text: "terminal done",
+				events: [
+					{ type: "message_update", text: "done" },
+					{ type: "agent_end", payload: { finalText: "terminal done" } },
+				],
+			});
+			expect(fake.subscriptions).toHaveLength(0);
+		}
+		expect(fake.requests.filter(request => request.operation === "workflow.gate_answer")[0]?.input).toEqual({
+			id: "gate-1",
+			response: "yes",
+			expectedSessionId: authority.sessionId,
+		});
+	});
 });
 
 function withoutIdentity(): Omit<ManagedTurnAuthority, "sessionId" | "generation"> {
@@ -132,6 +245,7 @@ function withoutIdentity(): Omit<ManagedTurnAuthority, "sessionId" | "generation
 }
 
 class FakeRuntime {
+	readonly state = "running";
 	readonly attachment = { isCurrent: () => true };
 	readonly externalLifecycle: { operation: string; request: Record<string, unknown> }[] = [];
 	readonly lifecycle: { operation: string; request: Record<string, unknown> }[] = [];
@@ -139,8 +253,12 @@ class FakeRuntime {
 	readonly registered: unknown[] = [];
 	readonly subscriptions: ((frame: unknown) => Promise<void>)[] = [];
 	status: "retired" | "current" | "unknown" = "current";
+	retirementOutcome: Record<string, unknown> = lifecycleSuccess();
 	rejectTenant = false;
 	repeatCursor = false;
+	queryHandler: ((frame: Record<string, unknown>, page: number) => Promise<Record<string, unknown>>) | undefined;
+	readonly requestTimeouts: (number | undefined)[] = [];
+	queryCount = 0;
 	get runtime(): ManagedSdkRuntime {
 		return this as unknown as ManagedSdkRuntime;
 	}
@@ -173,9 +291,17 @@ class FakeRuntime {
 		this.externalLifecycle.push({ operation: "resume", request });
 		return { kind: "result", outcome: lifecycleSuccess() };
 	}
-	async request(_attachment: unknown, frame: Record<string, unknown>, options?: { onDispatch?: () => void }) {
+	async request(
+		_attachment: unknown,
+		frame: Record<string, unknown>,
+		options?: { beforeDispatch?: () => void; onDispatch?: () => void; timeoutMs?: number },
+	) {
+		options?.beforeDispatch?.();
 		this.requests.push(frame);
+		this.requestTimeouts.push(options?.timeoutMs);
 		options?.onDispatch?.();
+		if (frame.type === "query_request" && this.queryHandler !== undefined)
+			return await this.queryHandler(frame, ++this.queryCount);
 		if (
 			frame.operation === "turn.prompt" ||
 			frame.operation === "turn.follow_up" ||
@@ -188,7 +314,19 @@ class FakeRuntime {
 					body: { type: "message_update", id: "frame-1", text: "done" },
 					sessionId: authority.sessionId,
 					generation: authority.generation,
+					commandId: "command-1",
+					turnId: "turn-1",
 					seq: 1,
+				},
+			});
+			await listener({
+				frame: {
+					body: { type: "agent_end", finalText: "terminal done" },
+					sessionId: authority.sessionId,
+					generation: authority.generation,
+					commandId: "command-1",
+					turnId: "turn-1",
+					seq: 2,
 				},
 			});
 		}
@@ -198,7 +336,11 @@ class FakeRuntime {
 				frame.cursor === undefined || this.repeatCursor ? "next" : undefined,
 			);
 		if (frame.type === "query_request") return queryResponse([]);
-		return { type: "control_response", ok: true, result: { commandId: "command-1", turnId: "turn-1" } };
+		return {
+			type: "control_response",
+			ok: true,
+			result: { accepted: true, commandId: "command-1", turnId: "turn-1" },
+		};
 	}
 	subscribeFrames(
 		_attachment: unknown,
@@ -216,12 +358,34 @@ class FakeRuntime {
 		return unsubscribe;
 	}
 	prepareFrameSubscription(_attachment: unknown, _operation: string, listener: (frame: unknown) => Promise<void>) {
-		this.subscriptions.push(listener);
+		const buffered: unknown[] = [];
+		let bound = false;
+		let active = true;
+		let tail = Promise.resolve();
+		const deliver = async (frame: unknown) => {
+			if (!bound) {
+				buffered.push(frame);
+				return;
+			}
+			tail = tail.then(async () => {
+				if (active) await listener(frame);
+			});
+			void tail.catch(() => undefined);
+		};
+		this.subscriptions.push(deliver);
 		const unsubscribe = (() => {
-			this.subscriptions.splice(this.subscriptions.indexOf(listener), 1);
+			if (!active) return;
+			active = false;
+			this.subscriptions.splice(this.subscriptions.indexOf(deliver), 1);
 		}) as (() => void) & { bind(correlation: unknown): void; drain(): Promise<void> };
-		unsubscribe.bind = () => undefined;
-		unsubscribe.drain = async () => undefined;
+		unsubscribe.bind = () => {
+			bound = true;
+			for (const frame of buffered) void deliver(frame);
+			buffered.length = 0;
+		};
+		unsubscribe.drain = async () => {
+			await tail;
+		};
 		return unsubscribe;
 	}
 	async generationStatus() {
@@ -233,11 +397,11 @@ class FakeRuntime {
 	}
 	async closeLifecycleSession(request: Record<string, unknown>) {
 		this.lifecycle.push({ operation: "close", request });
-		return lifecycleSuccess();
+		return this.retirementOutcome;
 	}
 	async deleteLifecycleSession(request: Record<string, unknown>) {
 		this.lifecycle.push({ operation: "delete", request });
-		return lifecycleSuccess();
+		return this.retirementOutcome;
 	}
 	async listLifecycleSessions(request: Record<string, unknown>) {
 		this.lifecycle.push({ operation: "list", request });
@@ -258,4 +422,11 @@ function queryResponse(items: readonly unknown[], continuationCursor?: string) {
 			...(continuationCursor === undefined ? {} : { continuationCursor }),
 		},
 	};
+}
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>(done => {
+		resolve = done;
+	});
+	return { promise, resolve };
 }

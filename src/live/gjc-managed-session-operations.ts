@@ -1,6 +1,12 @@
 import { createHash } from "node:crypto";
 import type { NormalizedModelSelection } from "../contracts";
-import type { ManagedSdkAttachment, ManagedSdkRuntime, TenantSessionKey } from "../gjc/managed-sdk-runtime";
+import {
+	type ManagedSdkAttachment,
+	type ManagedSdkObservedFrame,
+	ManagedSdkOperationError,
+	type ManagedSdkRuntime,
+	type TenantSessionKey,
+} from "../gjc/managed-sdk-runtime";
 import {
 	GjcTurnCancelledError,
 	type GjcTurnEvent,
@@ -10,6 +16,8 @@ import {
 
 const MAX_QUERY_PAGES = 256;
 const MAX_QUERY_ITEMS = 100_000;
+const DEFAULT_OPERATION_TIMEOUT_MS = 60_000;
+const ATTACHMENT_CHECK_MS = 100;
 
 export class ManagedTurnUncertainError extends Error {
 	constructor(message: string, options?: ErrorOptions) {
@@ -51,9 +59,6 @@ export interface ManagedRequestInput {
 export interface ManagedTurnInput extends ManagedRequestInput {
 	readonly text: string;
 	readonly observer?: (event: GjcTurnEvent) => void | Promise<void>;
-	readonly artifactProject?: (
-		events: readonly GjcTurnEvent[],
-	) => readonly GjcTurnEvent[] | Promise<readonly GjcTurnEvent[]>;
 }
 
 export interface ManagedGateInput extends ManagedRequestInput {
@@ -104,7 +109,12 @@ export interface ManagedSessionOperations {
  * Isolated managed traffic adapter. It deliberately owns no descriptors, clients,
  * credentials, shells, or fallback transport: every remote action is a Router request.
  */
-export function createManagedSessionOperations(runtime: ManagedSdkRuntime): ManagedSessionOperations {
+export function createManagedSessionOperations(
+	runtime: ManagedSdkRuntime,
+	defaultTimeoutMs = DEFAULT_OPERATION_TIMEOUT_MS,
+): ManagedSessionOperations {
+	if (!Number.isSafeInteger(defaultTimeoutMs) || defaultTimeoutMs <= 0 || defaultTimeoutMs > 2_147_483_647)
+		throw new TypeError("Managed timeoutMs must be a positive finite timer-safe integer.");
 	const tenant = (authority: ManagedTurnAuthority): TenantSessionKey => {
 		assertAuthority(authority);
 		return {
@@ -171,10 +181,9 @@ export function createManagedSessionOperations(runtime: ManagedSdkRuntime): Mana
 		outcome = externalOutcome(outcome);
 		if (!isLifecycleSuccess(outcome)) {
 			if (operation === "close" || operation === "delete") {
-				if (key === undefined)
-					throw new ManagedTurnUncertainError("Managed retirement lacks an exact generation authority.");
-				await requireRetired(runtime, key);
-				return outcome;
+				throw new ManagedTurnUncertainError(
+					`Managed session.${operation} lacks a successful lifecycle acknowledgement.`,
+				);
 			}
 			if (isUncertainLifecycleOutcome(outcome))
 				throw new ManagedTurnUncertainError(`Managed session.${operation} outcome is uncertain.`);
@@ -183,6 +192,10 @@ export function createManagedSessionOperations(runtime: ManagedSdkRuntime): Mana
 		if (operation === "close" || operation === "delete") {
 			if (key === undefined)
 				throw new ManagedTurnUncertainError("Managed retirement lacks an exact generation authority.");
+			if (!isRecord(outcome) || !isRecord(outcome.result) || outcome.result.sessionId !== key.sessionId)
+				throw new ManagedTurnUncertainError(
+					`Managed session.${operation} acknowledgement does not match the exact session.`,
+				);
 			await requireRetired(runtime, key);
 		} else if (operation !== "list") {
 			const lifecycleTenant = tenantFromLifecycle(authority, outcome, operation, target);
@@ -230,21 +243,29 @@ export function createManagedSessionOperations(runtime: ManagedSdkRuntime): Mana
 			input.operation,
 		);
 	};
-	const query = async (
+	const queryPages = async (
 		authority: ManagedTurnAuthority,
 		name: string,
-		input: Readonly<Record<string, unknown>> = {},
-		timeoutMs?: number,
+		input: Readonly<Record<string, unknown>>,
+		deadline: ManagedOperationDeadline,
 	) => {
 		if (!name) throw new TypeError("Managed query is required.");
 		const items: unknown[] = [];
 		const cursors = new Set<string>();
 		let cursor: string | undefined;
 		for (let page = 0; page < MAX_QUERY_PAGES; page += 1) {
-			const result = await invoke(
-				authority,
-				{ type: "query_request", query: name, input: { ...input }, ...(cursor === undefined ? {} : { cursor }) },
-				{ authority, operation: name, timeoutMs },
+			const attachment = await deadline.wait(acquire(authority));
+			const result = await deadline.wait(
+				runtime.request(
+					attachment,
+					{ type: "query_request", query: name, input: { ...input }, ...(cursor === undefined ? {} : { cursor }) },
+					{
+						timeoutMs: deadline.remaining(),
+						beforeDispatch: () => {
+							deadline.remaining();
+						},
+					},
+				),
 			);
 			const parsed = decodeRouterPage(result, name);
 			if (items.length + parsed.items.length > MAX_QUERY_ITEMS)
@@ -260,86 +281,183 @@ export function createManagedSessionOperations(runtime: ManagedSdkRuntime): Mana
 		}
 		throw new Error(`Managed ${name} query exceeded page bound.`);
 	};
+	const query = async (
+		authority: ManagedTurnAuthority,
+		name: string,
+		input: Readonly<Record<string, unknown>> = {},
+		timeoutMs?: number,
+	) => {
+		const deadline = new ManagedOperationDeadline(timeoutMs ?? defaultTimeoutMs, name);
+		try {
+			return await queryPages(authority, name, input, deadline);
+		} finally {
+			deadline.close();
+		}
+	};
 	const runTurn = async (
 		operation: "turn.prompt" | "turn.follow_up" | "turn.abort_and_prompt" | "workflow.gate_answer",
 		input: ManagedTurnInput | ManagedGateInput,
 	): Promise<GjcTurnResult> => {
 		throwIfAborted(input.signal);
+		const deadline = new ManagedOperationDeadline(input.timeoutMs ?? defaultTimeoutMs, operation);
 		const authority = input.authority;
-		const attachment = await acquire(authority);
 		const events: GjcTurnEvent[] = [];
 		const eventIds = new Set<string>();
 		const observe = async (event: GjcTurnEvent) => {
-			const identity = event.id ?? payloadHash(event.payload ?? { type: event.type, text: event.text });
+			const identity =
+				event.id === undefined
+					? payloadHash(event.payload ?? { type: event.type, text: event.text })
+					: `${event.type}:${event.id}:${event.payload?.seq ?? ""}`;
 			if (eventIds.has(identity)) return;
 			eventIds.add(identity);
 			events.push(event);
-			await (input as ManagedTurnInput | ManagedGateInput).observer?.(event);
+			await input.observer?.(event);
 		};
 		let closed = false;
-		const subscription = runtime.prepareFrameSubscription(attachment, operation, async observed => {
-			if (closed) return;
-			const event = normalizeFrame({
-				...observed.frame.body,
-				...(observed.frame.seq === undefined ? {} : { seq: observed.frame.seq }),
-				...(observed.frame.publicationId === undefined ? {} : { publicationId: observed.frame.publicationId }),
-			});
-			if (event !== undefined) await observe(event);
-		});
+		let subscription: ReturnType<ManagedSdkRuntime["prepareFrameSubscription"]> | undefined;
+		let attachmentCheck: ReturnType<typeof setInterval> | undefined;
 		let dispatched = false;
 		let abortPromise: Promise<Readonly<Record<string, unknown>>> | undefined;
 		const cancelAfterDispatch = () => {
-			if (!dispatched || abortPromise !== undefined) return;
-			abortPromise = request({
-				authority,
-				operation: "turn.abort",
-				input: { mode: "terminal", scope: "turn" },
-				idempotencyKey: authority.requestKey,
-			});
-			void abortPromise.catch(() => undefined);
+			if (dispatched && abortPromise === undefined) {
+				abortPromise = request({
+					authority,
+					operation: "turn.abort",
+					input: { mode: "terminal", scope: "turn" },
+					idempotencyKey: authority.requestKey,
+					timeoutMs: Math.max(1, deadline.expiresAt - Date.now()),
+				});
+				void abortPromise.catch(() => undefined);
+			}
+			deadline.fail(new GjcTurnCancelledError());
 		};
 		input.signal?.addEventListener("abort", cancelAfterDispatch, { once: true });
 		try {
-			const response = await request({
-				...input,
-				operation,
-				input:
-					operation === "workflow.gate_answer"
-						? {
-								id: (input as ManagedGateInput).gateId,
-								response: (input as ManagedGateInput).answer,
-								expectedSessionId: authority.sessionId,
-							}
-						: {
-								text: (input as ManagedTurnInput).text,
-							},
-				onDispatch: () => {
-					dispatched = true;
-					input.onDispatch?.();
-					if (input.signal?.aborted) cancelAfterDispatch();
-				},
+			const attachment = await deadline.wait(acquire(authority));
+			const assertCurrent = () => {
+				throwIfAborted(input.signal);
+				deadline.remaining();
+				if (runtime.state !== "running" || !attachment.attachment.isCurrent())
+					throw new ManagedTurnUncertainError("Managed turn lost its current runtime attachment.");
+			};
+			assertCurrent();
+			attachmentCheck = setInterval(() => {
+				try {
+					assertCurrent();
+				} catch (error) {
+					deadline.fail(error);
+				}
+			}, ATTACHMENT_CHECK_MS);
+			attachmentCheck.unref?.();
+			const baseline = new Set(
+				(await queryPages(authority, "workflow.gates.list", {}, deadline)).map(durableGateId),
+			);
+			assertCurrent();
+			let correlation: ReturnType<typeof decodeAcknowledgedCorrelation> | undefined;
+			let terminal: GjcTurnEvent | undefined;
+			let complete!: (gate: Record<string, unknown> | undefined) => void;
+			const completion = new Promise<Record<string, unknown> | undefined>(resolve => {
+				complete = resolve;
 			});
-			subscription.bind(decodeAcknowledgedCorrelation(response, authority));
-			if (input.signal?.aborted) {
-				await abortPromise;
-				throw new GjcTurnCancelledError();
+			const checkedActions = new Set<string>();
+			subscription = runtime.prepareFrameSubscription(attachment, operation, async observed => {
+				if (closed || terminal !== undefined || correlation === undefined) return;
+				try {
+					assertCurrent();
+					const event = correlatedEvent(observed, correlation, authority);
+					if (event === undefined || event.type === "workflow_gate") return;
+					if (event.type === "agent_failed")
+						throw new ManagedSdkOperationError("prompt_failed", terminalFailureMessage(event.payload));
+					if (event.type === "agent_end") {
+						if (typeof event.payload?.finalText !== "string")
+							throw new ManagedSdkOperationError("invalid_result", "Managed agent_end omitted finalText.");
+						terminal = event;
+					}
+					await observe(event);
+					if (event.type === "agent_end") complete(undefined);
+					if (event.type !== "action_needed" || event.payload?.kind !== "ask") return;
+					const actionId = event.payload.actionId ?? event.id;
+					if (!nonEmptyString(actionId) || checkedActions.has(actionId)) return;
+					if (checkedActions.size >= MAX_QUERY_PAGES)
+						throw new ManagedSdkOperationError("invalid_result", "Managed turn exceeded action query bound.");
+					checkedActions.add(actionId);
+					const accepted = correlation;
+					// Do not block ordered frame delivery on a query: a terminal may arrive while it is pending.
+					void queryPages(authority, "workflow.gates.list", {}, deadline)
+						.then(gates => {
+							if (closed || terminal !== undefined) return;
+							const gate = resolveDurableGate(gates, baseline, event.payload!, accepted, authority);
+							if (gate !== undefined) complete(gate);
+						})
+						.catch(error => {
+							if (!closed && terminal === undefined) deadline.fail(error);
+						});
+				} catch (error) {
+					deadline.fail(error);
+					throw error;
+				}
+			});
+			const response = decodeControlResponse(
+				await deadline.wait(
+					runtime.request(
+						attachment,
+						{
+							type: "control_request",
+							operation,
+							input:
+								operation === "workflow.gate_answer"
+									? {
+											id: (input as ManagedGateInput).gateId,
+											response: (input as ManagedGateInput).answer,
+											expectedSessionId: authority.sessionId,
+										}
+									: { text: (input as ManagedTurnInput).text },
+							idempotencyKey: input.idempotencyKey ?? authority.requestKey,
+						},
+						{
+							timeoutMs: deadline.remaining(),
+							beforeDispatch: assertCurrent,
+							onDispatch: () => {
+								dispatched = true;
+								input.onDispatch?.();
+								if (input.signal?.aborted && abortPromise === undefined) cancelAfterDispatch();
+							},
+						},
+					),
+				),
+				operation,
+			);
+			correlation = decodeAcknowledgedCorrelation(response, authority);
+			subscription.bind(correlation);
+			const gate = await deadline.wait(completion);
+			await deadline.wait(subscription.drain());
+			closed = true;
+			subscription();
+			if (terminal === undefined && gate !== undefined) {
+				await deadline.wait(
+					observe({
+						type: "workflow_gate",
+						id: durableGateId(gate),
+						payload: { ...gate, ...correlation, sessionId: authority.sessionId },
+					}),
+				);
 			}
-			for (const event of responseEventsFrom(response)) await observe(event);
-			await subscription.drain();
-			const projected =
-				"artifactProject" in input && input.artifactProject !== undefined
-					? await input.artifactProject(events)
-					: events;
+			const current = await deadline.wait(runtime.acquireAttachment(tenant(authority)));
+			assertCurrent();
+			if (current.attachment !== attachment.attachment)
+				throw new ManagedTurnUncertainError("Managed turn attachment changed before completion.");
 			return {
-				text: finalizedText(response, projected),
-				events: projected,
+				text: terminal === undefined ? accumulatedText(events) : (terminal.payload!.finalText as string),
+				events,
 				rawFrameCursor: frameCursor(events),
-				eventCursor: projected.length,
+				eventCursor: events.length,
 			};
 		} finally {
 			input.signal?.removeEventListener("abort", cancelAfterDispatch);
+			if (attachmentCheck !== undefined) clearInterval(attachmentCheck);
 			closed = true;
-			subscription();
+			subscription?.();
+			deadline.close();
 		}
 	};
 	return {
@@ -520,32 +638,47 @@ function requireExactTenant(key: TenantSessionKey | undefined): TenantSessionKey
 function decodeAcknowledgedCorrelation(
 	result: Readonly<Record<string, unknown>>,
 	authority: ManagedTurnAuthority,
-): Readonly<{ commandId?: string; turnId?: string; publicationId?: string }> {
+): Readonly<{ commandId: string; turnId: string }> {
 	const value = isRecord(result.result) ? result.result : result;
 	const correlation = isRecord(value.correlation) ? value.correlation : value;
 	const commandId = correlation.commandId;
 	const turnId = correlation.turnId;
-	const publicationId = correlation.publicationId;
-	if (typeof commandId !== "string" && typeof turnId !== "string" && typeof publicationId !== "string")
-		throw new Error("Managed Router acknowledgement lacks correlation identity.");
-	if (typeof value.sessionId === "string" && value.sessionId !== authority.sessionId)
-		throw new Error("Managed Router acknowledgement references a foreign session.");
-	return {
-		...(typeof commandId === "string" ? { commandId } : {}),
-		...(typeof turnId === "string" ? { turnId } : {}),
-		...(typeof publicationId === "string" ? { publicationId } : {}),
-	};
-}
-function responseEventsFrom(result: Readonly<Record<string, unknown>>): readonly GjcTurnEvent[] {
-	const value = isRecord(result.result) ? result.result : result;
-	return Array.isArray(value.events)
-		? value.events.map(normalizeFrame).filter((event): event is GjcTurnEvent => event !== undefined)
-		: [];
+	if (!nonEmptyString(commandId) || !nonEmptyString(turnId))
+		throw new ManagedSdkOperationError(
+			"invalid_result",
+			"Managed Router acknowledgement lacks command and turn correlation identity.",
+		);
+	for (const record of [result, value, correlation]) {
+		if (
+			(record.sessionId !== undefined && record.sessionId !== authority.sessionId) ||
+			(record.commandId !== undefined && record.commandId !== commandId) ||
+			(record.turnId !== undefined && record.turnId !== turnId)
+		)
+			throw new ManagedSdkOperationError(
+				"invalid_result",
+				"Managed Router acknowledgement references a foreign correlation.",
+			);
+	}
+	return { commandId, turnId };
 }
 function normalizeFrame(frame: Record<string, unknown>): GjcTurnEvent | undefined {
 	const value = frame.type === "event" && isRecord(frame.payload) ? frame.payload : frame;
 	if (typeof value.type !== "string") return undefined;
-	const text = typeof value.text === "string" ? value.text : typeof value.delta === "string" ? value.delta : undefined;
+	const assistant = isRecord(value.assistantMessageEvent) ? value.assistantMessageEvent : undefined;
+	const text =
+		assistant === undefined
+			? typeof value.text === "string"
+				? value.text
+				: typeof value.delta === "string"
+					? value.delta
+					: undefined
+			: assistant.type === "text_delta"
+				? typeof assistant.delta === "string"
+					? assistant.delta
+					: typeof assistant.text === "string"
+						? assistant.text
+						: undefined
+				: undefined;
 	return {
 		type: value.type,
 		...(text === undefined ? {} : { text }),
@@ -553,14 +686,146 @@ function normalizeFrame(frame: Record<string, unknown>): GjcTurnEvent | undefine
 		payload: value,
 	};
 }
-function finalizedText(result: Readonly<Record<string, unknown>>, events: readonly GjcTurnEvent[]): string {
-	const value = isRecord(result.result) ? result.result : result;
-	if (typeof value.finalizedAssistantText === "string") return value.finalizedAssistantText;
-	if (typeof value.text === "string") return value.text;
+function accumulatedText(events: readonly GjcTurnEvent[]): string {
 	return events
 		.filter(event => event.type === "message_update" && typeof event.text === "string")
 		.map(event => event.text)
 		.join("");
+}
+function correlatedEvent(
+	observed: ManagedSdkObservedFrame,
+	correlation: Readonly<{ commandId: string; turnId: string }>,
+	authority: ManagedTurnAuthority,
+): GjcTurnEvent | undefined {
+	const frame = observed.frame;
+	if (
+		frame.sessionId !== authority.sessionId ||
+		frame.generation !== authority.generation ||
+		frame.commandId !== correlation.commandId ||
+		frame.turnId !== correlation.turnId
+	)
+		return undefined;
+	const event = normalizeFrame(frame.body);
+	if (event === undefined) return undefined;
+	const expected = { ...correlation, sessionId: authority.sessionId };
+	for (const record of [frame.body, event.payload, event.payload?.correlation]) {
+		if (record === undefined) continue;
+		if (!isRecord(record)) return undefined;
+		for (const key of ["sessionId", "commandId", "turnId"] as const)
+			if (record[key] !== undefined && record[key] !== expected[key]) return undefined;
+	}
+	return {
+		...event,
+		payload: {
+			...event.payload,
+			...expected,
+			...(frame.seq === undefined ? {} : { seq: frame.seq }),
+			...(frame.publicationId === undefined ? {} : { publicationId: frame.publicationId }),
+		},
+	};
+}
+function durableGateId(value: unknown): string {
+	const id = isRecord(value) ? (value.gate_id ?? value.gateId ?? value.id) : undefined;
+	if (!nonEmptyString(id))
+		throw new ManagedSdkOperationError("invalid_result", "Durable workflow gate omitted its id.");
+	return id;
+}
+function resolveDurableGate(
+	items: readonly unknown[],
+	baseline: ReadonlySet<string>,
+	action: Readonly<Record<string, unknown>>,
+	correlation: Readonly<{ commandId: string; turnId: string }>,
+	authority: ManagedTurnAuthority,
+): Record<string, unknown> | undefined {
+	if (action.workflowGateId !== undefined && !nonEmptyString(action.workflowGateId))
+		throw new ManagedSdkOperationError("invalid_result", "action_needed.workflowGateId must be non-empty.");
+	const expected = { ...correlation, sessionId: authority.sessionId };
+	const matches = items.filter((value): value is Record<string, unknown> => {
+		const id = durableGateId(value);
+		if (!isRecord(value) || (action.workflowGateId !== undefined && action.workflowGateId !== id)) return false;
+		if (value.status !== undefined && value.status !== "pending") return false;
+		const nested = value.correlation;
+		if (nested !== undefined && !isRecord(nested)) return false;
+		const records = isRecord(nested) ? [value, nested] : [value];
+		let explicit = false;
+		let complete = false;
+		for (const record of records) {
+			for (const key of ["sessionId", "commandId", "turnId"] as const) {
+				if (record[key] === undefined) continue;
+				explicit = true;
+				if (record[key] !== expected[key]) return false;
+			}
+			if (
+				record.sessionId === expected.sessionId &&
+				record.commandId === expected.commandId &&
+				record.turnId === expected.turnId
+			)
+				complete = true;
+		}
+		return complete || (!explicit && !baseline.has(id));
+	});
+	if (matches.length > 1)
+		throw new ManagedSdkOperationError(
+			"invalid_result",
+			"Managed turn opened multiple matching durable workflow gates.",
+		);
+	return matches[0];
+}
+function terminalFailureMessage(payload: Readonly<Record<string, unknown>> | undefined): string {
+	if (isRecord(payload?.error) && nonEmptyString(payload.error.message)) return payload.error.message;
+	return "Managed SDK agent failed.";
+}
+function nonEmptyString(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0;
+}
+
+/** One finite budget, including attachment acquisition, every page, observers and publication fencing. */
+class ManagedOperationDeadline {
+	readonly expiresAt: number;
+	readonly #failure: Promise<never>;
+	readonly #timer: ReturnType<typeof setTimeout>;
+	readonly #timeout: ManagedSdkOperationError;
+	#reject!: (error: unknown) => void;
+	#stopped = false;
+	#error: unknown;
+	constructor(timeoutMs = DEFAULT_OPERATION_TIMEOUT_MS, operation: string) {
+		if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2_147_483_647)
+			throw new TypeError("Managed timeoutMs must be a positive finite timer-safe integer.");
+		this.expiresAt = Date.now() + timeoutMs;
+		this.#timeout = new ManagedSdkOperationError("timeout", `Managed ${operation} timed out after ${timeoutMs}ms.`);
+		this.#failure = new Promise<never>((_resolve, reject) => {
+			this.#reject = reject;
+		});
+		void this.#failure.catch(() => undefined);
+		this.#timer = setTimeout(() => this.fail(this.#timeout), timeoutMs);
+		this.#timer.unref?.();
+	}
+	remaining(): number {
+		if (this.#stopped) throw this.#error;
+		const remaining = this.expiresAt - Date.now();
+		if (remaining <= 0) {
+			this.fail(this.#timeout);
+			throw this.#timeout;
+		}
+		return remaining;
+	}
+	async wait<T>(promise: Promise<T>): Promise<T> {
+		// Attach the rejection handler even when this budget has already failed.
+		const pending = Promise.race([promise, this.#failure]);
+		const value = await pending;
+		this.remaining();
+		return value;
+	}
+	fail(error: unknown): void {
+		if (this.#stopped) return;
+		this.#stopped = true;
+		this.#error = error;
+		clearTimeout(this.#timer);
+		this.#reject(error);
+	}
+	close(): void {
+		this.fail(new ManagedSdkOperationError("operation_closed", "Managed operation observation is closed."));
+	}
 }
 function frameCursor(events: readonly GjcTurnEvent[]): number {
 	let cursor = 0;

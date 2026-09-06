@@ -67,6 +67,7 @@ describe("GJC SDK runtime provenance", () => {
 		expect(dockerfile).not.toContain("git apply");
 		expect(dockerfile).not.toContain("packages/natives");
 		expect(dockerfile).not.toContain("GJC_UPSTREAM_COMMIT");
+		expect(dockerfile).not.toMatch(/\btmux\b/);
 	});
 
 	test("documents exact coding-agent provenance and the public managed SDK cutover target", async () => {
@@ -79,7 +80,8 @@ describe("GJC SDK runtime provenance", () => {
 			expect(document).toContain("generationStatus");
 			expect(document).toContain("Production");
 			expect(document).toContain("public managed SDK");
-			expect(document).toContain("atomic cutover");
+			expect(document).toContain("exact-close");
+			expect(document).toContain("cutover approval");
 		}
 	});
 
@@ -229,7 +231,7 @@ describe("GJC SDK runtime provenance", () => {
 		const runner = await Bun.file(join(ROOT, "scripts/gjc-release-compat.ts")).text();
 
 		expect(runner).toContain(
-			"Static source contract artifact: \\`test/gjc-sdk-v3-contract.test.ts\\` (separate test artifact; not observed by this runtime harness).",
+			"Static source contract artifact: \\`test/cli-module-boundaries.test.ts\\` (separate test artifact; not observed by this runtime harness).",
 		);
 		expect(runner).not.toContain("structuralFallbackEvidence");
 		expect(runner).not.toContain("passed-by-test");

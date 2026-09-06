@@ -1,0 +1,107 @@
+{
+  "kind": "managed-routing-api-package-test-report",
+  "sdkVersion": "0.16.4",
+  "invocation": "bun scripts/gjc-managed-runtime-compat.ts",
+  "sourceReport": "<TEMP>/gjc-managed-route-compat-gX91xv/report.json",
+  "sourceReportSha256": "02cfabd85f49f8bfa619808fa2a9063dfb2e364658c5f27b3c7dced47abdfe4e",
+  "startedAt": "2026-09-06T12:34:59.303Z",
+  "finishedAt": "2026-09-06T12:35:04.870Z",
+  "withheldBeforeProviderResponse": true,
+  "acknowledgement": {
+    "type": "control_response",
+    "id": "da1ad183-2801-420d-8804-1d148c652e50",
+    "ok": true,
+    "result": {
+      "commandId": "ceebe5c1-a81d-4a95-9645-2e36bc9ee003",
+      "turnId": "8fd93cd2-7fa2-4ba7-9037-b6cdf5ef8821",
+      "accepted": true
+    }
+  },
+  "result": {
+    "text": "compatibility-ok\n\nThere is nothing left to do.",
+    "events": [
+      "agent_start",
+      "agent_end"
+    ],
+    "generation": 1
+  },
+  "replayedWithoutDispatch": true,
+  "cleanup": {
+    "acknowledgement": {
+      "ok": true,
+      "operation": "session.close",
+      "result": {
+        "sessionId": "71a6fae4-7d8f-4180-874c-bd197d0cad8e",
+        "note": "Endpoint close was unreachable; sent SIGTERM to the durably identified session process."
+      }
+    },
+    "retirement": {
+      "status": "retired",
+      "evidence": {
+        "source": "session_index",
+        "observedIndexSeq": 3,
+        "evidenceIndexSeq": 3,
+        "event": "host_unregistered"
+      }
+    }
+  },
+  "routerStopped": true,
+  "errors": [],
+  "limitations": [
+    "Hermetic provider and exclusively owned probe workspace; no browser.",
+    "Session-only isolated cleanup does not prove production replacement-race-safe close; SDK issue #5345 remains open.",
+    "This probe verifies managed prompt completion and durable replay, not every workflow-gate or cancellation path."
+  ],
+  "responses": [
+    {
+      "operation": "model.set",
+      "response": {
+        "type": "control_response",
+        "id": "2d89a22a-62ed-4ea7-9654-c926870224ed",
+        "ok": true,
+        "result": {
+          "provider": "compat-local",
+          "modelId": "hermetic-model",
+          "thinkingLevel": "off"
+        }
+      }
+    },
+    {
+      "operation": "thinking.set",
+      "response": {
+        "type": "control_response",
+        "id": "a72436d5-c228-44f4-b5f6-bce9ecb6c38c",
+        "ok": true,
+        "result": {
+          "changed": true
+        }
+      }
+    },
+    {
+      "operation": "workflow.gates.list",
+      "response": {
+        "type": "query_response",
+        "id": "d68006b4-14e4-4055-9c34-943ec865efd5",
+        "ok": true,
+        "page": {
+          "items": [],
+          "complete": true,
+          "revision": "1"
+        }
+      }
+    },
+    {
+      "operation": "turn.prompt",
+      "response": {
+        "type": "control_response",
+        "id": "da1ad183-2801-420d-8804-1d148c652e50",
+        "ok": true,
+        "result": {
+          "commandId": "ceebe5c1-a81d-4a95-9645-2e36bc9ee003",
+          "turnId": "8fd93cd2-7fa2-4ba7-9037-b6cdf5ef8821",
+          "accepted": true
+        }
+      }
+    }
+  ]
+}

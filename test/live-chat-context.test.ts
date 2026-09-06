@@ -540,9 +540,6 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 			};
 		});
 		const turnRunner: GjcTurnRunner = {
-			async startNewSession() {
-				throw new Error("Lease lifecycle fixture requires managed session startup.");
-			},
 			async startManagedSession(input, publish, beforePrompt) {
 				const prepared = input.preparedManagedAuthority;
 				if (

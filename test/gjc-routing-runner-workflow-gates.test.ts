@@ -178,19 +178,49 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 		let abortCalls = 0;
 		let subscriptionsClosed = 0;
 		const requests: Record<string, unknown>[] = [];
+		const currentAttachment = { isCurrent: () => true };
 		const runtime = {
+			state: "running",
 			async reconcile() {},
 			async acquireAttachment(tenant: unknown) {
-				return { tenant, generation: authority.generation, attachment: { isCurrent: () => true } };
+				return { tenant, generation: authority.generation, attachment: currentAttachment };
 			},
-			prepareFrameSubscription() {
+			prepareFrameSubscription(
+				_attachment: unknown,
+				operation: string,
+				listener: Parameters<ManagedSdkRuntime["prepareFrameSubscription"]>[2],
+			) {
+				let active = true;
+				let delivery = Promise.resolve();
 				return Object.assign(
 					() => {
+						if (!active) return;
+						active = false;
 						subscriptionsClosed += 1;
 					},
 					{
-						bind() {},
-						async drain() {},
+						bind(correlation: Parameters<ReturnType<ManagedSdkRuntime["prepareFrameSubscription"]>["bind"]>[0]) {
+							if (answerCalls !== 2) return;
+							delivery = Promise.resolve().then(async () => {
+								if (!active) return;
+								await listener({
+									tenant: authority,
+									operation,
+									correlation,
+									frame: {
+										name: "event",
+										body: { type: "agent_end", finalText: "accepted" },
+										...correlation,
+										sessionId: authority.sessionId,
+										generation: authority.generation,
+										seq: 1,
+									},
+								});
+							});
+						},
+						async drain() {
+							await delivery;
+						},
 					},
 				);
 			},
@@ -199,6 +229,8 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 				frame: Record<string, unknown>,
 				options?: { beforeDispatch?: () => void; onDispatch?: () => void },
 			) {
+				if (frame.type === "query_request")
+					return { type: "query_response", ok: true, page: { items: [], complete: true } };
 				if (frame.operation === "workflow.gate_answer") {
 					answerCalls += 1;
 					if (answerCalls === 1) cancellation.abort();
@@ -211,7 +243,7 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 				return {
 					type: "control_response",
 					ok: true,
-					result: { commandId: "command-1", turnId: "turn-1", finalizedAssistantText: "accepted" },
+					result: { commandId: "command-1", turnId: "turn-1", accepted: true },
 				};
 			},
 		} as unknown as ManagedSdkRuntime;
@@ -317,7 +349,7 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 			handleWorkflowGateReply({ turnRunner, mappings }, replyInput("1"), mapping, {
 				...gateLifecycle(mapping),
 				publishManaged: undefined,
-			}),
+			} as unknown as GjcLifecycleTransaction),
 		).rejects.toThrow("requires managed lifecycle publication");
 		expect(turnRunner.gateResponses).toHaveLength(0);
 		expect(mappings.operation("chat-1", "user-2")).toBeUndefined();
@@ -381,10 +413,6 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 			let publicationCalls = 0;
 			const lifecycle: GjcLifecycleTransaction = {
 				...gateLifecycle(mapping),
-				async publish() {
-					publicationCalls += 1;
-					throw new Error("legacy publication forbidden");
-				},
 				async publishManaged() {
 					publicationCalls += 1;
 					throw new Error("invalid publication");
@@ -406,9 +434,6 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 		let managedPublications = 0;
 		const lifecycle: GjcLifecycleTransaction = {
 			...fixture,
-			async publish() {
-				throw new Error("legacy publication forbidden");
-			},
 			async publishManaged(proof, write) {
 				managedPublications += 1;
 				return await fixture.publishManaged!(proof, write);
@@ -828,7 +853,6 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 			});
 
 			await expect(resumed.run(replyInput("1"))).resolves.toEqual({ content: "workflow gate accepted" });
-			expect(turnRunner.starts).toHaveLength(0);
 			expect(turnRunner.managedStarts).toHaveLength(0);
 			expect(turnRunner.continues).toHaveLength(0);
 			expect(turnRunner.gateResponses).toMatchObject([
@@ -906,7 +930,7 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 		});
 		expect(readerCount).toBe(0);
 		expect(turnRunner.gateResponses).toHaveLength(0);
-		expect(turnRunner.starts).toHaveLength(0);
+		expect(turnRunner.managedStarts).toHaveLength(0);
 	});
 
 	test("rejects pending missing or mismatched bindings without mutable reads or writes", async () => {

@@ -1,4 +1,4 @@
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import type { NormalizedModelSelection } from "../src/contracts";
 import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import type {
@@ -18,10 +18,9 @@ import type {
 } from "../src/gjc/turn-runner";
 import { GjcTurnCancelledError } from "../src/gjc/turn-runner";
 import type { RegisteredProject } from "../src/projects/registry";
-import { attachmentProof, lifecycleFixture } from "./gjc-lifecycle-fixtures";
+import type { lifecycleFixture } from "./gjc-lifecycle-fixtures";
 
 export class FakeGjcTurnRunner implements GjcTurnRunner {
-	readonly starts: GjcStartNewSessionInput[] = [];
 	readonly managedStarts: (GjcStartNewSessionInput & {
 		readonly preparedManagedAuthority: ManagedPreparedTurnAuthority;
 	})[] = [];
@@ -43,39 +42,6 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 	completionBarrier?: Promise<void>;
 	completionError?: Error;
 	private readonly lifecycleAuthorities = new WeakMap<GjcLifecycleTransaction, ManagedTurnAuthority>();
-
-	async startNewSession<T>(
-		input: GjcStartNewSessionInput,
-		publish: (
-			result: GjcSessionAddress & GjcTurnResult,
-			lifecycle: ReturnType<typeof lifecycleFixture>,
-		) => Promise<T>,
-	): Promise<T> {
-		this.starts.push(input);
-		for (const event of this.observedEvents ?? this.events) await input.observer?.(event);
-		await this.completionBarrier;
-		if (this.completionError !== undefined) throw this.completionError;
-		const result = {
-			cwd: input.cwd,
-			sessionRoot: input.sessionRoot,
-			projectId: input.projectId,
-			chatId: input.chatId,
-			sessionId: "session-1",
-			text: `new:${input.text}`,
-			events: this.events,
-			sessionFile: join(input.sessionRoot, "session-1.jsonl"),
-			activeLeaf: "leaf-1",
-			rawFrameCursor: 7,
-			eventCursor: 3,
-			...(this.startModelSelection === undefined
-				? input.modelSelection === undefined
-					? {}
-					: { modelSelection: input.modelSelection }
-				: { modelSelection: this.startModelSelection }),
-		};
-		const lifecycle = lifecycleFixture(result);
-		return await publish({ ...result, attachment: attachmentProof(result) }, lifecycle);
-	}
 
 	async startManagedSession<T>(
 		input: GjcStartNewSessionInput & { readonly preparedManagedAuthority: ManagedPreparedTurnAuthority },
@@ -240,13 +206,6 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 	private managedLifecycle(address: GjcSessionAddress): GjcLifecycleTransaction {
 		const lifecycle: GjcLifecycleTransaction = {
 			address,
-			owner: {},
-			assertClosePreflight(): never {
-				throw new Error("Routing fake has no close authority.");
-			},
-			async publish(): Promise<never> {
-				throw new Error("Routing fake rejects legacy publication.");
-			},
 			publishManaged: async (proof, write) => {
 				const authority = this.lifecycleAuthorities.get(lifecycle);
 				if (authority === undefined) throw new Error("Routing fake lifecycle authority is unbound.");
@@ -265,12 +224,6 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 				)
 					throw new Error("Routing fake rejected mismatched managed proof.");
 				return write();
-			},
-			async publishClosed(): Promise<never> {
-				throw new Error("Routing fake has no close publication.");
-			},
-			async handoff(): Promise<never> {
-				throw new Error("Routing fake has no successor authority.");
 			},
 		};
 		return lifecycle;

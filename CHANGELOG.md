@@ -13,11 +13,11 @@
 
 ### Changed
 
-- Production serving now consumes the public managed SDK from `@gajae-code/coding-agent` 0.16.4 with matching AI/native packages from the npm registry, replacing the hosted development tarball. The container uses pinned Bun 1.4.0 and the registry CLI. Both mode values require canonical V3 plus an active marker before startup effects; `SessionRouter.generationStatus` supplies positive exact-generation retirement evidence. Historical development contract evidence remains separate. Legacy bridge source and the tmux container dependency still await the atomic cutover; this release pin alone does not complete that migration.
+- Production serving now consumes the public managed SDK from `@gajae-code/coding-agent` 0.16.4 with matching AI/native packages from the npm registry, replacing the hosted development tarball. The container uses pinned Bun 1.4.0 and the registry CLI. Both mode values require canonical V3 plus an active marker before startup effects; `SessionRouter.generationStatus` supplies positive exact-generation retirement evidence. Historical development contract evidence remains separate. Removed the raw bridge transport, descriptor-backed lifecycle contracts, CLI/tmux lifecycle source and container dependency; the public exact-close gap still blocks aggregate cutover approval.
 - Recorded the SDK 0.16.4 exact-close contract gap: public binding APIs omit the opaque incarnation required to fence a remote close. Production close remains fail-closed; isolated session-ID-only harness closes and subsequent positive retirement do not prove replacement-race safety.
 - Documented strict `GJC_OPENWEBUI_MODE` handling: only `managed` and `existing` are accepted; omitted, empty, whitespace-padded, case-variant, and other values fail closed with `GJC_OPENWEBUI_MODE must be exactly managed or existing`.
 - Streamed assistant reasoning/text and lifecycle events while a turn is running instead of waiting for transcript completion. Workflow-gate continuations use the same streaming path.
-- Made GJC session JSONL, artifacts, and correlated SDK finals authoritative while preserving OpenWebUI rows as projections and user-owned fields during reprojection.
+- Kept GJC session JSONL and artifacts as historical projection sources while requiring managed authority and correlated public SDK terminal evidence for live operations; OpenWebUI rows remain projections and user-owned fields survive reprojection.
 - Separated project identity from model identity and made the bare `gjc` model an input-only alias; emitted model ids are canonical normalized tuples.
 - Made runtime path resolution deterministic and isolated from ambient `GJC_CONFIG_DIR`, `PI_CONFIG_DIR`, and `GJC_CODING_AGENT_DIR`.
 - Clarified managed Docker feasibility prerequisites and existing-route ownership, separated adapter/OpenWebUI readiness from GJC provider/model availability, and documented picker-to-`DEFAULT`, profile, and role-assignment semantics without adding runtime controls.
@@ -26,6 +26,7 @@
 
 ### Fixed
 
+- Separated public SDK control acknowledgement from semantic completion: managed turns await correlated terminal final text or a unique durable gate, with one finite deadline, observer failure propagation, and exactly-once dispatched cancellation. Added an executed public-SDK managed-routing/replay probe.
 - Rejected failed turns before exposing a successful stream and required the referenced session final before accepting completion.
 - Preserved terminal-event chronology, streamed lifecycle delivery, text-shaped GJC deltas, and text-only turn recovery.
 - Unwrapped nested SDK event payloads, projected GJC message-event variants, avoided duplicate artifact lifecycle events, and isolated best-effort OpenWebUI progress delivery failures from accepted GJC turns.

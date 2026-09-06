@@ -122,7 +122,7 @@ describe("managed turn runner", () => {
 		expect(writes).toBe(1);
 	});
 
-	test("creates through external lifecycle adoption and streams ordered public Router frames before request settlement", async () => {
+	test("creates through external lifecycle adoption and replays ordered public Router frames after acknowledgement binding", async () => {
 		const fake = new RunnerRuntime();
 		const runner = createManagedGjcTurnRunner(fake.runtime);
 		const observed: string[] = [];
@@ -352,11 +352,90 @@ describe("managed turn runner", () => {
 		}
 	});
 
+	test("rejects malformed thinking acknowledgements without dispatching a prompt", async () => {
+		for (const thinkingSetResult of [
+			{},
+			{ changed: false },
+			{ changed: "true" },
+			{ changed: 1 },
+			{ changed: true, extra: true },
+			{ provider: "openai", modelId: "gpt-5" },
+			{ ...modelSelection, thinkingLevel: "low" },
+			{ ...modelSelection, extra: true },
+			{ changed: true, ...modelSelection },
+		] as const) {
+			const fake = new RunnerRuntime();
+			fake.thinkingSetResult = thinkingSetResult;
+			await expect(
+				createManagedGjcTurnRunner(fake.runtime).continue({
+					...address(),
+					authority,
+					userMessageId: "thinking-invalid",
+					text: "invalid",
+					rawFrameCursor: 0,
+					eventCursor: 0,
+					operationId: "thinking-invalid",
+					modelSelection,
+				}),
+			).rejects.toMatchObject({ code: "invalid_result" });
+			expect(fake.requests.map(frame => frame.operation)).toEqual(["model.set", "thinking.set"]);
+			expect(fake.subscriptions).toHaveLength(0);
+		}
+	});
+
+	test("accepts an exact normalized selection from thinking.set as well as changed:true", async () => {
+		const fake = new RunnerRuntime();
+		fake.thinkingSetResult = { ...modelSelection };
+		const result = await createManagedGjcTurnRunner(fake.runtime).continue({
+			...address(),
+			authority,
+			userMessageId: "thinking-selection",
+			text: "selected",
+			rawFrameCursor: 0,
+			eventCursor: 0,
+			operationId: "thinking-selection",
+			modelSelection,
+		});
+		expect(result.modelSelection).toEqual(modelSelection);
+		expect(result.text).toBe("done");
+		expect(fake.requests.map(frame => frame.operation)).toEqual(["model.set", "thinking.set", "turn.follow_up"]);
+	});
+
+	test("does not return the acknowledged runner result before its delayed public terminal", async () => {
+		const fake = new RunnerRuntime();
+		fake.delayTerminal = true;
+		const observed = deferred<void>();
+		const turn = createManagedGjcTurnRunner(fake.runtime).continue({
+			...address(),
+			authority,
+			userMessageId: "delayed-terminal",
+			text: "hello",
+			rawFrameCursor: 0,
+			eventCursor: 0,
+			operationId: "delayed-terminal",
+			observer: () => {
+				observed.resolve();
+			},
+		});
+		await observed.promise;
+		let settled = false;
+		void turn.then(() => {
+			settled = true;
+		});
+		await new Promise(resolve => setTimeout(resolve, 10));
+		expect(settled).toBe(false);
+		await fake.subscriptions[0]!.listener(
+			routerFrame({ type: "agent_end", id: "b", finalText: "authoritative delayed" }, 2),
+		);
+		await expect(turn).resolves.toMatchObject({ text: "authoritative delayed", rawFrameCursor: 2 });
+		expect(fake.unsubscribed).toBe(1);
+	});
+
 	test("requires exact retirement for close and performs pre-prompt cleanup once after failure", async () => {
 		const fake = new RunnerRuntime();
 		const runner = createManagedGjcTurnRunner(fake.runtime);
 		fake.status = "retired";
-		await runner.closePreflight({ authority, target: { sessionId: authority.sessionId } });
+		await runner.operations.close({ authority, target: { sessionId: authority.sessionId } });
 		expect(fake.closeCalls).toBe(1);
 		fake.failPrompt = true;
 		await expect(
@@ -372,7 +451,7 @@ describe("managed turn runner", () => {
 		).rejects.toThrow("prompt failure");
 		expect(fake.closeCalls).toBe(2);
 		fake.status = "replaced";
-		await expect(runner.closePreflight({ authority, target: { sessionId: authority.sessionId } })).rejects.toThrow(
+		await expect(runner.operations.close({ authority, target: { sessionId: authority.sessionId } })).rejects.toThrow(
 			"retirement",
 		);
 	});
@@ -506,6 +585,7 @@ function managedAbortAndPromptInput(signal?: AbortSignal) {
 }
 
 class RunnerRuntime {
+	readonly state = "running";
 	readonly attachment = { isCurrent: () => true };
 	readonly requests: Record<string, unknown>[] = [];
 	readonly subscriptions: { correlation: Record<string, unknown>; listener: (frame: unknown) => Promise<void> }[] = [];
@@ -522,6 +602,7 @@ class RunnerRuntime {
 	closeCalls = 0;
 	failPrompt = false;
 	failAbortAndPrompt = false;
+	delayTerminal = false;
 	setterFailure: "model.set" | "thinking.set" | undefined;
 	modelSetResult: Readonly<Record<string, unknown>> | undefined;
 	forkResult: { readonly sessionId: string; readonly endpointGeneration: number } = {
@@ -553,7 +634,14 @@ class RunnerRuntime {
 		if (request === undefined) throw new Error("Complete managed tenant authority is required.");
 		return { kind: "result", outcome: lifecycleSuccess() };
 	}
-	async request(_attachment: unknown, frame: Record<string, unknown>, options?: { onDispatch?: () => void }) {
+	async request(
+		_attachment: unknown,
+		frame: Record<string, unknown>,
+		options?: { beforeDispatch?: () => void; onDispatch?: () => void },
+	) {
+		options?.beforeDispatch?.();
+		if (frame.type === "query_request")
+			return { type: "query_response", ok: true, page: { items: [], complete: true } };
 		this.subscriptionCountAtRequest.push(this.subscriptions.length);
 		this.requests.push(frame);
 		if (frame.operation === "model.set") {
@@ -586,12 +674,13 @@ class RunnerRuntime {
 			if (active === undefined) throw new Error("managed frame subscription must precede request");
 			await active.listener(routerFrame({ type: "message_update", id: "a", text: "done" }, 1));
 			await active.listener(routerFrame({ type: "message_update", id: "a", text: "done" }, 1));
-			await active.listener(routerFrame({ type: "agent_end", id: "b" }, 2));
+			if (!this.delayTerminal)
+				await active.listener(routerFrame({ type: "agent_end", id: "b", finalText: "done" }, 2));
 		}
 		return {
 			type: "control_response",
 			ok: true as const,
-			result: { commandId: "command-1", turnId: "turn-1", finalizedAssistantText: "done" },
+			result: { commandId: "command-1", turnId: "turn-1", accepted: true },
 		};
 	}
 	subscribeFrames(
@@ -614,20 +703,38 @@ class RunnerRuntime {
 		return unsubscribe;
 	}
 	prepareFrameSubscription(_attachment: unknown, operation: string, listener: (frame: unknown) => Promise<void>) {
-		const subscription = { correlation: {}, listener };
+		const buffered: unknown[] = [];
+		let bound = false;
+		let active = true;
+		let tail = Promise.resolve();
+		const deliver = async (frame: unknown) => {
+			if (!bound) {
+				buffered.push(frame);
+				return;
+			}
+			tail = tail.then(async () => {
+				if (active) await listener(frame);
+			});
+			void tail.catch(() => undefined);
+		};
+		const subscription = { correlation: {}, listener: deliver };
 		this.subscriptions.push(subscription);
 		this.subscriptionHistory.push(subscription);
 		const unsubscribe = (() => {
+			if (!active) return;
+			active = false;
 			this.unsubscribed += 1;
-			this.subscriptions.splice(
-				this.subscriptions.findIndex(item => item.listener === listener),
-				1,
-			);
+			this.subscriptions.splice(this.subscriptions.indexOf(subscription), 1);
 		}) as (() => void) & { bind(correlation: Record<string, unknown>): void; drain(): Promise<void> };
 		unsubscribe.bind = correlation => {
 			subscription.correlation = correlation;
+			bound = true;
+			for (const frame of buffered) void deliver(frame);
+			buffered.length = 0;
 		};
-		unsubscribe.drain = async () => undefined;
+		unsubscribe.drain = async () => {
+			await tail;
+		};
 		void operation;
 		return unsubscribe;
 	}
@@ -665,4 +772,11 @@ function routerFrame(body: Record<string, unknown>, seq: number) {
 			seq,
 		},
 	};
+}
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>(done => {
+		resolve = done;
+	});
+	return { promise, resolve };
 }

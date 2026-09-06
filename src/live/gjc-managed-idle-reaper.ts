@@ -61,7 +61,7 @@ export interface ManagedIdleLifecycleRuntime {
 		readonly requestKey: string;
 		readonly target: Readonly<{ sessionId: string; endpointGeneration: number }>;
 		readonly timeoutMs?: number;
-	}): Promise<Readonly<{ ok: boolean; certainty?: string }>>;
+	}): Promise<Readonly<{ ok: boolean; certainty?: string; result?: Readonly<{ sessionId: string }> }>>;
 	reconcile(): Promise<void>;
 	generationStatus(key: TenantSessionKey): Promise<Readonly<{ status: string }>>;
 }
@@ -174,13 +174,17 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 			lease = await this.input.leases.acquire(key);
 			if (lease === undefined || this.#stopped) return;
 			await lease.assertFence();
-			intent = { key: closeKey(record.authority), authority: record.authority, requestedAt: this.#now() };
-			const prepared = await this.input.records.prepareClose(record, intent);
+			const proposed = { key: closeKey(record.authority), authority: record.authority, requestedAt: this.#now() };
+			const prepared = await this.input.records.prepareClose(record, proposed);
 			if (prepared === false) return;
-			if (prepared !== true) intent = prepared;
-			await lease.assertFence();
-			let outcome: Readonly<{ ok: boolean; certainty?: string }>;
+			intent = prepared === true ? proposed : prepared;
+			let outcome: Awaited<ReturnType<ManagedIdleLifecycleRuntime["closeLifecycleSession"]>>;
 			try {
+				await lease.assertFence();
+				if (this.#stopped) {
+					await this.input.records.restoreActive(record, intent);
+					return;
+				}
 				outcome = await this.input.runtime.closeLifecycleSession({
 					tenant: key,
 					actor: { id: record.authority.principalId, namespace: "openwebui-gjc-adapter" },
@@ -193,8 +197,8 @@ class ManagedIdleReaperImpl implements ManagedIdleReaper {
 				await this.input.runtime.reconcile();
 				await lease.assertFence();
 				const status = await this.input.runtime.generationStatus(key);
-				if (status.status === "retired") {
-					await lease.assertFence();
+				await lease.assertFence();
+				if (outcome.ok && outcome.result?.sessionId === key.sessionId && status.status === "retired") {
 					await this.input.records.retire(record, intent);
 					retired = true;
 					await lease.assertFence();
@@ -237,11 +241,10 @@ class ManagedV3GenerationStore implements ManagedIdleGenerationStore {
 				continue;
 			const scope = { principalId: authority.principalId, chatId: mapping.chatId };
 			const operations = this.mappings.operationsScoped(scope);
-			const pending = operations.some(operation => operation.state === "pending" && operation.kind !== "close");
 			records.push({
 				authority,
 				lastActivityAt: latestActivityAt(operations),
-				state: pending ? "inflight" : "active",
+				state: generationState(mapping, operations),
 			});
 		}
 		return records;
@@ -255,11 +258,10 @@ class ManagedV3GenerationStore implements ManagedIdleGenerationStore {
 		const mapping = this.mappings.getScoped(scope);
 		if (mapping === undefined || !sameManagedAuthority(mapping, record.authority)) return false;
 		const operations = this.mappings.operationsScoped(scope);
-		const currentOperation = operations.find(operation => operation.id === mapping.operationId);
-		if (currentOperation !== undefined && currentOperation.state !== "complete") return false;
+		if (generationState(mapping, operations) !== "active" || latestActivityAt(operations) !== record.lastActivityAt)
+			return false;
 		const closeOperations = operations.filter(operation => operation.kind === "close");
-		const prior =
-			closeOperations.find(operation => operation.id === intent.key) ?? closeOperations[closeOperations.length - 1];
+		const prior = closeOperations[closeOperations.length - 1];
 		const key = nextManagedCloseIngress(intent.key, mapping.operationId, closeOperations, prior);
 		this.mappings.beginOperationScoped(scope, {
 			id: key,
@@ -386,6 +388,50 @@ function latestActivityAt(operations: readonly SessionOperation[]): number {
 		}
 	}
 	return latest;
+}
+
+function generationState(mapping: SessionMapping, operations: readonly SessionOperation[]): ManagedIdleGenerationState {
+	if (operations.some(operation => operation.state === "pending")) return "inflight";
+	const current = operations.find(operation => operation.id === mapping.operationId);
+	if (current === undefined || current.state !== "complete") return "uncertain";
+	const authority = mapping.managedAuthority!;
+	const base = closeKey(authority);
+	for (let index = 0; index < operations.length; index += 1) {
+		const operation = operations[index]!;
+		if (operation.kind !== "close") {
+			if (operation.state === "uncertain" || operation.state === "conflict") return "uncertain";
+			continue;
+		}
+		const idleClose =
+			operation.id === base ||
+			operation.id.startsWith(`${base}:retry:`) ||
+			operation.id.startsWith(`${base}:rearmed:`);
+		if (operation.state !== "complete") {
+			// Only an explicitly not-applied idle close is safe to retry. Manual or
+			// uncertain closes must be reconciled by their owner, including after restart.
+			if (operation.state !== "conflict" || !idleClose) return "uncertain";
+			continue;
+		}
+		const result = operation.result;
+		if (
+			result?.kind !== "close" ||
+			result.correlation?.closeStatus !== "closed" ||
+			result.correlation.mappingOperationId !== mapping.operationId ||
+			result.mapping.chatId !== mapping.chatId ||
+			result.mapping.projectId !== mapping.projectId ||
+			result.mapping.sessionId !== mapping.sessionId ||
+			!sameManagedAuthority({ ...mapping, managedAuthority: result.managedAuthority }, authority)
+		)
+			continue;
+		const closedAt = Date.parse(operation.completedAt ?? operation.startedAt);
+		const laterActivity = operations.some((activity, activityIndex) => {
+			if (activity.kind === "close") return false;
+			const activityAt = Date.parse(activity.completedAt ?? activity.startedAt);
+			return activityAt > closedAt || (activityAt === closedAt && activityIndex > index);
+		});
+		if (!laterActivity) return "closing";
+	}
+	return "active";
 }
 
 function nextManagedCloseIngress(

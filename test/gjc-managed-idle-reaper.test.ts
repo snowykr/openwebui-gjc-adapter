@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import type { ManagedTurnAuthority } from "../src/gjc/turn-runner";
 import {
+	type CreateManagedIdleReaperInput,
 	createManagedIdleReaper,
+	DEFAULT_MANAGED_IDLE_TIMEOUT_MS,
 	type ManagedIdleCloseIntent,
 	type ManagedIdleGenerationRecord,
 	type ManagedIdleGenerationStore,
@@ -59,7 +61,11 @@ class Store implements ManagedIdleGenerationStore {
 function harness(
 	records: ManagedIdleGenerationRecord[],
 	status = "retired",
-	outcome: { ok: boolean; certainty?: string } = { ok: true },
+	outcome: { ok: boolean; certainty?: string; result?: { sessionId: string } } = {
+		ok: true,
+		result: { sessionId: "session-a" },
+	},
+	overrides: Partial<CreateManagedIdleReaperInput> = {},
 ) {
 	const store = new Store(records);
 	const closeKeys: string[] = [];
@@ -94,6 +100,7 @@ function harness(
 				return { status };
 			},
 		},
+		...overrides,
 	});
 	return { reaper, store, closeKeys, counts: () => ({ reconciles, leases, admissions }) };
 }
@@ -105,6 +112,151 @@ const active = (owner = "tenant-a", lastActivityAt = 0): ManagedIdleGenerationRe
 });
 
 describe("managed idle reaper", () => {
+	test("polls at the configured interval but waits the full idle threshold and clears once on stop", async () => {
+		let now = DEFAULT_MANAGED_IDLE_TIMEOUT_MS - 1;
+		let poll!: () => void;
+		const cleared: unknown[] = [];
+		const timer = { unref() {} } as unknown as ReturnType<typeof setInterval>;
+		const subject = harness([active()], "retired", undefined, {
+			idleTimeoutMs: DEFAULT_MANAGED_IDLE_TIMEOUT_MS,
+			now: () => now,
+			pollIntervalMs: 25,
+			setInterval(handler, delay) {
+				expect(delay).toBe(25);
+				poll = handler;
+				return timer;
+			},
+			clearInterval(value) {
+				cleared.push(value);
+			},
+		});
+		poll();
+		await subject.reaper.runOnce();
+		expect(subject.closeKeys).toEqual([]);
+		now += 1;
+		await subject.reaper.runOnce();
+		expect(subject.closeKeys).toHaveLength(1);
+		await Promise.all([subject.reaper.stop(), subject.reaper.stop()]);
+		poll();
+		await subject.reaper.runOnce();
+		expect(subject.closeKeys).toHaveLength(1);
+		expect(cleared).toEqual([timer]);
+	});
+	test("rejects invalid timer configuration without installing a poller", () => {
+		let installed = 0;
+		for (const value of [0, -1, 0.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+			for (const field of ["idleTimeoutMs", "pollIntervalMs"] as const)
+				expect(() =>
+					harness([], "retired", undefined, {
+						[field]: value,
+						setInterval() {
+							installed += 1;
+							throw new Error("unexpected poll");
+						},
+					}),
+				).toThrow("positive safe integer");
+		}
+		expect(installed).toBe(0);
+	});
+	test("requires matching successful close acknowledgement as well as positive retirement", async () => {
+		for (const outcome of [
+			{ ok: false, certainty: "retryable" },
+			{ ok: true },
+			{ ok: true, result: { sessionId: "replacement" } },
+		]) {
+			const subject = harness([active()], "retired", outcome);
+			await subject.reaper.runOnce();
+			expect(subject.store.uncertain).toHaveLength(1);
+			expect(subject.store.retired).toEqual([]);
+			expect(subject.store.evicted).toEqual([]);
+			await subject.reaper.stop();
+		}
+	});
+	test("does not close a pending turn or stream, closing record, or uncertain generation", async () => {
+		const subject = harness(
+			["inflight", "closing", "uncertain"].map(state => ({ ...active(), state }) as ManagedIdleGenerationRecord),
+		);
+		await subject.reaper.runOnce();
+		expect(subject.closeKeys).toEqual([]);
+		expect(subject.counts()).toEqual({ admissions: 0, leases: 0, reconciles: 0 });
+		await subject.reaper.stop();
+	});
+	test("rechecks stale generation evidence after admission and releases both guards", async () => {
+		let releasedAdmission = 0;
+		let releasedLease = 0;
+		const subject = harness([active()], "retired", undefined, {
+			admission: {
+				acquire: async () => () => {
+					releasedAdmission += 1;
+				},
+			},
+			leases: {
+				acquire: async () => ({
+					assertFence: async () => undefined,
+					release: async () => {
+						releasedLease += 1;
+					},
+				}),
+			},
+		});
+		subject.store.prepare = false;
+		await subject.reaper.runOnce();
+		expect(subject.closeKeys).toEqual([]);
+		expect([releasedAdmission, releasedLease]).toEqual([1, 1]);
+		await subject.reaper.stop();
+	});
+	test("stop fences a queued admission before lease acquisition or mutation", async () => {
+		let release!: (release: () => void) => void;
+		const admission = new Promise<() => void>(resolve => {
+			release = resolve;
+		});
+		let entered!: () => void;
+		const ready = new Promise<void>(resolve => {
+			entered = resolve;
+		});
+		let released = 0;
+		const subject = harness([active()], "retired", undefined, {
+			admission: {
+				acquire: async () => {
+					entered();
+					return admission;
+				},
+			},
+		});
+		const scan = subject.reaper.runOnce();
+		await ready;
+		let stopped = false;
+		const stopping = subject.reaper.stop().then(() => {
+			stopped = true;
+		});
+		await Promise.resolve();
+		expect(stopped).toBe(false);
+		release(() => {
+			released += 1;
+		});
+		await Promise.all([scan, stopping]);
+		expect(subject.closeKeys).toEqual([]);
+		expect(subject.counts().leases).toBe(0);
+		expect(released).toBe(1);
+	});
+	test("fence loss after prepare retains uncertainty and never dispatches close", async () => {
+		let checks = 0;
+		const subject = harness([active()], "retired", undefined, {
+			leases: {
+				acquire: async () => ({
+					assertFence: async () => {
+						if (++checks === 2) throw new Error("lease lost");
+					},
+					release: async () => undefined,
+				}),
+			},
+		});
+		await subject.reaper.runOnce();
+		expect(subject.closeKeys).toEqual([]);
+		expect(subject.store.uncertain[0]).toContain("lease lost");
+		expect(subject.store.evicted).toEqual([]);
+		await subject.reaper.stop();
+	});
 	test("retires only eligible exact active generations before eviction and publication", async () => {
 		const subject = harness([active(), active("tenant-b", 95), { ...active("tenant-c"), state: "uncertain" }]);
 		await subject.reaper.runOnce();
@@ -152,7 +304,7 @@ describe("managed idle reaper", () => {
 					closes += 1;
 					signalCloseStarted();
 					await pendingClose;
-					return { ok: true };
+					return { ok: true, result: { sessionId: "session-a" } };
 				},
 				reconcile: async () => undefined,
 				generationStatus: async () => ({ status: "retired" }),
@@ -185,7 +337,7 @@ describe("managed idle reaper", () => {
 			admission: { acquire: async () => () => undefined },
 			leases: { acquire: async () => undefined },
 			runtime: {
-				closeLifecycleSession: async () => ({ ok: true }),
+				closeLifecycleSession: async () => ({ ok: true, result: { sessionId: "session-a" } }),
 				reconcile: async () => undefined,
 				generationStatus: async () => ({ status: "retired" }),
 			},

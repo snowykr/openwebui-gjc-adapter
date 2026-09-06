@@ -11,6 +11,7 @@ export type ActiveManagedV3TenantFence = (key: TenantSessionKey) => boolean | Pr
 export interface StartActiveManagedRuntimeOptions {
 	readonly mappings: SessionV3FileBackedMappingStore;
 	readonly runtime: ManagedSdkRuntime;
+	readonly turnTimeoutMs?: number;
 	/** Re-proves the live external lease and epoch; the runtime's internal fence is not a substitute. */
 	readonly liveTenantFence: ActiveManagedV3TenantFence;
 }
@@ -40,7 +41,8 @@ export function startActiveManagedRuntime(options: StartActiveManagedRuntimeOpti
 	if (existing !== undefined) {
 		if (
 			existing.options.mappings !== options.mappings ||
-			existing.options.liveTenantFence !== options.liveTenantFence
+			existing.options.liveTenantFence !== options.liveTenantFence ||
+			existing.options.turnTimeoutMs !== options.turnTimeoutMs
 		)
 			return Promise.reject(new Error("Managed V3 runtime is already owned by different startup dependencies."));
 		return existing.promise;
@@ -82,7 +84,7 @@ async function start(options: StartActiveManagedRuntimeOptions): Promise<ActiveM
 		let disposePromise: Promise<void> | undefined;
 		return Object.freeze({
 			runtime: options.runtime,
-			runner: createManagedGjcTurnRunner(options.runtime),
+			runner: createManagedGjcTurnRunner(options.runtime, options.turnTimeoutMs),
 			tenantFence,
 			dispose: async () => {
 				disposePromise ??= options.runtime.dispose();
@@ -148,6 +150,13 @@ function isTenantKey(value: TenantSessionKey): boolean {
 function assertOptions(options: StartActiveManagedRuntimeOptions): void {
 	if (options === undefined || options === null || typeof options !== "object")
 		throw new TypeError("Managed V3 runtime startup options are required.");
+	if (
+		options.turnTimeoutMs !== undefined &&
+		(!Number.isSafeInteger(options.turnTimeoutMs) ||
+			options.turnTimeoutMs <= 0 ||
+			options.turnTimeoutMs > 2_147_483_647)
+	)
+		throw new TypeError("Managed turnTimeoutMs must be a positive finite timer-safe integer.");
 	if (
 		options.runtime === undefined ||
 		typeof options.runtime.start !== "function" ||

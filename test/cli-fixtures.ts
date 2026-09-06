@@ -83,6 +83,14 @@ interface FakeManagedSession {
 	status: "current" | "retired";
 }
 
+interface FakeManagedFrameSubscription {
+	readonly managed: ManagedSdkAttachment;
+	readonly operation: string;
+	enqueue(frame: ManagedSdkObservedFrame["frame"]): void;
+	detach(): void;
+	drain(): Promise<void>;
+}
+
 /**
  * In-process direct managed-runtime fixture. It models the process-owned
  * Runtime/Router/lifecycle boundary rather than exposing a legacy turn runner
@@ -94,8 +102,10 @@ export class FakeManagedSdkRuntime implements ManagedSdkRuntimeDependency {
 	readonly requests: FakeManagedRequest[] = [];
 	readonly tenants: TenantSessionKey[] = [];
 	#nextSession = 1;
+	#nextTurn = 1;
 	readonly #sessions = new Map<string, FakeManagedSession>();
 	readonly #attachments = new Map<string, ManagedSdkAttachment["attachment"]>();
+	readonly #subscriptions = new Set<FakeManagedFrameSubscription>();
 
 	async start(): Promise<void> {
 		if (this.state === "new") this.state = "running";
@@ -106,7 +116,10 @@ export class FakeManagedSdkRuntime implements ManagedSdkRuntimeDependency {
 	}
 
 	async dispose(): Promise<void> {
+		const subscriptions = [...this.#subscriptions];
+		for (const subscription of subscriptions) subscription.detach();
 		this.state = "stopped";
+		await Promise.all(subscriptions.map(subscription => subscription.drain()));
 	}
 
 	registerTenant(key: TenantSessionKey): void {
@@ -150,25 +163,87 @@ export class FakeManagedSdkRuntime implements ManagedSdkRuntimeDependency {
 
 	prepareFrameSubscription(
 		managed: ManagedSdkAttachment,
-		_operation: string,
-		_listener: (frame: ManagedSdkObservedFrame) => void | Promise<void>,
+		operation: string,
+		listener: (frame: ManagedSdkObservedFrame) => void | Promise<void>,
 	): ManagedSdkPendingFrameSubscription {
 		this.assertManagedAttachment(managed);
-		const pending = (() => undefined) as ManagedSdkPendingFrameSubscription;
-		pending.bind = () => undefined;
-		pending.drain = async () => undefined;
+		if (this.state !== "running" || operation.trim().length === 0)
+			throw new Error("Fake managed subscription requires a running runtime and operation.");
+		const attachment = { ...managed, tenant: { ...managed.tenant } };
+		let active = true;
+		let correlation: ManagedSdkFrameCorrelation | undefined;
+		let tail = Promise.resolve();
+		const buffered: ManagedSdkObservedFrame["frame"][] = [];
+		const enqueue = (frame: ManagedSdkObservedFrame["frame"]) => {
+			if (!active) return;
+			if (correlation === undefined) {
+				buffered.push(frame);
+				return;
+			}
+			const bound = correlation;
+			if (
+				(bound.commandId !== undefined && bound.commandId !== frame.commandId) ||
+				(bound.turnId !== undefined && bound.turnId !== frame.turnId) ||
+				(bound.publicationId !== undefined && bound.publicationId !== frame.publicationId)
+			)
+				return;
+			tail = tail.then(async () => {
+				if (!active) return;
+				this.assertManagedAttachment(attachment);
+				await listener({ tenant: attachment.tenant, operation, correlation: bound, frame });
+			});
+			void tail.catch(() => undefined);
+		};
+		const pending = (() => {
+			active = false;
+			buffered.length = 0;
+			this.#subscriptions.delete(subscription);
+		}) as ManagedSdkPendingFrameSubscription;
+		pending.bind = acknowledged => {
+			if (!active || correlation !== undefined)
+				throw new Error("Fake managed subscription is closed or already bound.");
+			this.assertManagedAttachment(attachment);
+			if (
+				![acknowledged.commandId, acknowledged.turnId, acknowledged.publicationId].some(
+					value => typeof value === "string" && value.length > 0,
+				)
+			)
+				throw new Error("Fake managed subscription requires acknowledged correlation.");
+			correlation = { ...acknowledged };
+			for (const frame of buffered) enqueue(frame);
+			buffered.length = 0;
+		};
+		pending.drain = async () => {
+			for (;;) {
+				const current = tail;
+				await current;
+				if (current === tail) return;
+			}
+		};
+		const subscription: FakeManagedFrameSubscription = {
+			managed: attachment,
+			operation,
+			enqueue,
+			detach: pending,
+			drain: pending.drain,
+		};
+		this.#subscriptions.add(subscription);
 		return pending;
 	}
 
 	subscribeFrames(
 		managed: ManagedSdkAttachment,
-		_operation: string,
-		_correlation: ManagedSdkFrameCorrelation,
-		_listener: (frame: ManagedSdkObservedFrame) => void | Promise<void>,
+		operation: string,
+		correlation: ManagedSdkFrameCorrelation,
+		listener: (frame: ManagedSdkObservedFrame) => void | Promise<void>,
 	): ManagedSdkFrameSubscription {
-		this.assertManagedAttachment(managed);
-		const subscription = (() => undefined) as ManagedSdkFrameSubscription;
-		subscription.drain = async () => undefined;
+		const subscription = this.prepareFrameSubscription(managed, operation, listener);
+		try {
+			subscription.bind(correlation);
+		} catch (error) {
+			subscription();
+			throw error;
+		}
 		return subscription;
 	}
 
@@ -206,16 +281,27 @@ export class FakeManagedSdkRuntime implements ManagedSdkRuntimeDependency {
 		if (operation === "thinking.set") return { type: "control_response", ok: true, result: { changed: true } };
 		if (operation === "turn.prompt" || operation === "turn.follow_up" || operation === "turn.abort_and_prompt") {
 			const text = typeof input.text === "string" ? input.text : "";
+			const turn = this.#nextTurn++;
+			const correlation = { commandId: `command-fixture-${turn}`, turnId: `turn-fixture-${turn}` };
+			const events = [...this.events, { type: "agent_end", finalText: `assistant from gjc: ${text}` }];
+			for (const [index, event] of events.entries()) {
+				const observed: ManagedSdkObservedFrame["frame"] = {
+					name: "event",
+					sessionId: managed.tenant.sessionId,
+					generation: managed.generation,
+					...correlation,
+					seq: index + 1,
+					body: { ...event, sessionId: managed.tenant.sessionId, ...correlation },
+				};
+				for (const subscription of this.#subscriptions) {
+					if (subscription.operation === operation && sameTenant(subscription.managed.tenant, managed.tenant))
+						subscription.enqueue(observed);
+				}
+			}
 			return {
 				type: "control_response",
 				ok: true,
-				result: {
-					accepted: true,
-					commandId: "command-fixture",
-					turnId: "turn-fixture",
-					finalizedAssistantText: `assistant from gjc: ${text}`,
-					events: this.events,
-				},
+				result: { accepted: true, ...correlation },
 			};
 		}
 		return {
@@ -398,10 +484,6 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 	events: GjcTurnResult["events"] = [{ type: "assistant", text: "assistant from gjc" }];
 	readonly #managedAuthorities = new WeakMap<object, ManagedTurnAuthority>();
 
-	async startNewSession<T>(): Promise<T> {
-		throw new Error("CLI turn fixture requires managed session startup.");
-	}
-
 	async startManagedSession<T>(
 		input: GjcStartNewSessionInput & { readonly preparedManagedAuthority: ManagedPreparedTurnAuthority },
 		publish: (
@@ -488,13 +570,6 @@ export class FakeGjcTurnRunner implements GjcTurnRunner {
 		};
 		return await effect(lifecycle);
 	}
-	async withLifecycleClosePreflight<T>(
-		address: GjcSessionAddress,
-		effect: (lifecycle: ReturnType<typeof lifecycleFixture>) => Promise<T>,
-	): Promise<T> {
-		return await effect(lifecycleFixture(address));
-	}
-
 	async getState(input: GjcSessionStateInput): Promise<GjcSessionState> {
 		const managedState = this.bindManagedAuthority(input);
 		return {

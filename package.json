@@ -29,7 +29,6 @@
 	},
 	"dependencies": {
 		"@gajae-code/ai": "0.16.4",
-		"@gajae-code/bridge-client": "0.13.3",
 		"@gajae-code/coding-agent": "0.16.4",
 		"@gajae-code/natives": "0.16.4"
 	},

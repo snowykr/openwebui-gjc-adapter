@@ -50,10 +50,6 @@ export class GoldenTurnRunner implements GjcTurnRunner {
 
 	constructor(private readonly sessionFile: string) {}
 
-	async startNewSession<T>(): Promise<T> {
-		throw new Error("Golden fixture requires managed session startup.");
-	}
-
 	async startManagedSession<T>(
 		input: GjcStartNewSessionInput & { readonly preparedManagedAuthority: ManagedPreparedTurnAuthority },
 		publish: (

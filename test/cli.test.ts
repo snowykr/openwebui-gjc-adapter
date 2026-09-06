@@ -192,7 +192,10 @@ describe("adapter CLI service", () => {
 			ownerUserId: "normal-user",
 			projectId: "openwebui",
 		});
-		expect(delivered[0]?.events).toHaveLength(1);
+		expect(delivered[0]?.events).toMatchObject([
+			{ type: "status", data: { description: "Tool started", done: false } },
+			{ type: "status", data: { description: "agent_end", done: true } },
+		]);
 	});
 
 	test("projects configured folders while building service options", async () => {

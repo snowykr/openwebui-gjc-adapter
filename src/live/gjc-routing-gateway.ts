@@ -7,11 +7,7 @@ import {
 	type SessionMapping,
 	type SessionMappingStore,
 } from "../gjc/session-router";
-import type {
-	GjcLifecycleTestBarrierHook,
-	ManagedPreparedTurnAuthority,
-	ManagedTurnAuthority,
-} from "../gjc/turn-runner";
+import type { ManagedPreparedTurnAuthority, ManagedTurnAuthority } from "../gjc/turn-runner";
 import { projectPendingWorkflowGateMessage } from "../projection/workflow-gates";
 import type { OutboxStore } from "../state/outbox";
 import type { LiveGatewayRunner, LiveGatewayRunnerInput, LiveGatewayRunnerResult } from "./chat-completions";
@@ -50,7 +46,6 @@ export interface CreateGjcRoutingLiveGatewayRunnerInput {
 		turn: LiveGatewayRunnerInput,
 	) => NeutralModelReader | Promise<NeutralModelReader>;
 	readonly modelReaderFactory?: ModelReaderFactory;
-	/** Test-only synchronization point; it never receives endpoint credentials. */ readonly testBarrierHook?: GjcLifecycleTestBarrierHook;
 }
 
 export type NeutralModelReader = ModelReader;
