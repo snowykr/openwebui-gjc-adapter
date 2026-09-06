@@ -848,6 +848,9 @@ export class ManagedSdkRuntime {
 			if (this.#registrations.get(generationIdentity(key)) !== registration)
 				throw new Error("Tenant registration changed before lifecycle invocation.");
 			const result = await invoke(external ? value : { ...value, timeoutMs: budget.remaining() }, key);
+			// An applied identity must reach the durable owner before another fence
+			// can fail or hang. A mutation receipt never grants live authority.
+			if (method !== "list") return result;
 			await this.#assertAuthorized(key, false, true, access);
 			budget.remaining();
 			if (this.#registrations.get(generationIdentity(key)) !== registration)
@@ -881,11 +884,8 @@ export class ManagedSdkRuntime {
 				throw new Error("Prepared tenant authority fence was lost or unavailable.");
 			budget.remaining();
 			this.#assertOwner();
-			const result = await this.#lifecycle.createExternal(value);
-			if (!(await fence(prepared))) throw new Error("Prepared tenant authority fence was lost.");
-			budget.remaining();
-			this.#assertOwner(false, true);
-			return result;
+			// Persist acknowledgement before adoption or live-authority checks.
+			return this.#lifecycle.createExternal(value);
 		});
 	}
 

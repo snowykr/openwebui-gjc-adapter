@@ -20,7 +20,7 @@ import { createUserWorkspaceRegistry } from "../src/security/user-workspace";
 import { createWorkspaceLeaseManager, workspaceLeaseId } from "../src/security/workspace-lease";
 import { writeDirectV3Authority } from "./cli-fixtures";
 
-async function fixture() {
+async function fixture(controls: { afterCreate?: () => Promise<void> } = {}) {
 	const root = await mkdtemp(join(tmpdir(), "gjc-production-lifecycle-"));
 	const stateRoot = join(root, "state");
 	const sessionRoot = join(root, "sessions");
@@ -93,6 +93,7 @@ async function fixture() {
 										generation: 1,
 										isCurrent: () => true,
 									} as router.SessionAttachment);
+									await controls.afterCreate?.();
 									return {
 										ok: true,
 										operation: "session.create",
@@ -209,6 +210,43 @@ test("production fences permit create acknowledgement, proof, prompt and immutab
 		expect(await f.deps.tenantFence!(key, { kind: "active" })).toBe(false);
 		await expect(f.runtime.acquireAttachment(key)).rejects.toThrow("fence");
 		expect(f.calls).toEqual(dispatched);
+	} finally {
+		await f.close();
+	}
+});
+
+test("production create persists its exact acknowledgement even when the lease is revoked by the effect", async () => {
+	const controls: { afterCreate?: () => Promise<void> } = {};
+	const f = await fixture(controls);
+	controls.afterCreate = () => f.lease.release();
+	try {
+		await expect(
+			routeGjcTurn({
+				project: { ...f.project, cwd: f.workspace.root, sessionRoot: f.workspace.sessionRoot },
+				principalId: f.prepared.principalId,
+				chatId: f.prepared.chatId,
+				userMessageId: "ingress",
+				text: "hello",
+				preparedManagedAuthority: f.prepared,
+				mappings: f.mappings,
+				runner: createManagedGjcTurnRunner(f.runtime, 2_000),
+			}),
+		).rejects.toThrow();
+		const operation = f.mappings.provisionalOperationScoped(f.prepared, "ingress")!;
+		expect(operation.state).toBe("uncertain");
+		expect(operation.lifecycle?.state).toBe("uncertain");
+		expect(operation.lifecycle?.acknowledged).toEqual({ ...f.prepared, sessionId: "assigned", generation: 1 });
+		expect(operation.lifecycle?.proven).toBeUndefined();
+		expect(operation.result).toBeUndefined();
+		expect(f.calls).toEqual(["create"]);
+		const key = { ...f.prepared, sessionId: "assigned", generation: 1 };
+		await expect(f.runtime.acquireAttachment(key)).rejects.toThrow("fence");
+		const reopened = new V3FileBackedSessionMappingStore(join(f.root, "sessions", "openwebui-session-mappings.json"));
+		try {
+			expect(reopened.provisionalOperationScoped(f.prepared, "ingress")).toEqual(operation);
+		} finally {
+			reopened.close();
+		}
 	} finally {
 		await f.close();
 	}

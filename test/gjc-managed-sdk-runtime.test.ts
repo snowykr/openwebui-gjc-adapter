@@ -188,6 +188,7 @@ function fixture(
 		omitTenantFence?: boolean;
 		omitPreparedFence?: boolean;
 		request?: () => Promise<Record<string, unknown>>;
+		onMutation?: () => void | Promise<void>;
 		close?: LifecycleService["close"];
 		list?: LifecycleService["list"];
 		historicalResume?: LifecycleService["resume"];
@@ -228,23 +229,28 @@ function fixture(
 	> = {
 		async close(request) {
 			closeCalls.push(request);
+			await options.onMutation?.();
 			if (options.close !== undefined) return await options.close(request);
 			return { ok: true, operation: "session.close", result: { sessionId: request.target.sessionId } };
 		},
 		async createExternal(request) {
 			createCalls.push(request);
+			await options.onMutation?.();
 			return { ok: true, operation: "session.create", result: { sessionId: "created", endpointGeneration: 1 } };
 		},
 		async create(request) {
 			internalCreateCalls.push(request);
+			await options.onMutation?.();
 			return { ok: true, operation: "session.create", result: { sessionId: "created", endpointGeneration: 1 } };
 		},
 		async fork(request) {
 			forkCalls.push(request);
+			await options.onMutation?.();
 			return { ok: true, operation: "session.fork", result: { sessionId: "forked", endpointGeneration: 1 } };
 		},
 		async resumeExternal(request) {
 			resumeCalls.push(request);
+			await options.onMutation?.();
 			return {
 				kind: "result",
 				outcome: {
@@ -261,6 +267,7 @@ function fixture(
 		},
 		async resume(request) {
 			historicalResumeCalls.push(request);
+			await options.onMutation?.();
 			if (options.historicalResume !== undefined) return options.historicalResume(request);
 			return {
 				ok: true,
@@ -378,6 +385,150 @@ function invokeExternal(
 }
 
 describe("managed SDK runtime", () => {
+	test.each([
+		"prepared",
+		"external-create",
+		"external-resume",
+		"create",
+		"resume",
+		"fork",
+		"close",
+		"retirement",
+	] as const)("%s mutation acknowledgement is not hidden by a revoked or hanging post-effect fence", async method => {
+		for (const hang of [false, true]) {
+			let applied = false;
+			let afterEffectChecks = 0;
+			let hangFence = hang;
+			const withheld = deferred<boolean>();
+			const fence = () => {
+				if (!applied) return true;
+				afterEffectChecks += 1;
+				return hangFence ? withheld.promise : false;
+			};
+			const f = fixture({
+				fence,
+				preparedFence: fence,
+				onMutation: () => {
+					applied = true;
+				},
+			});
+			f.runtime.registerTenant(tenant);
+			await f.runtime.start();
+			try {
+				const common = { actor: closeRequest().actor, requestKey: "mutation-1", timeoutMs: 250 };
+				let pending: Promise<unknown>;
+				switch (method) {
+					case "prepared":
+						pending = invokeExternal(f.runtime, "prepared", {}, 250);
+						break;
+					case "external-create":
+						pending = invokeExternal(f.runtime, "create", {}, 250);
+						break;
+					case "external-resume":
+						pending = invokeExternal(f.runtime, "resume", {}, 250);
+						break;
+					case "create":
+						pending = f.runtime.createLifecycleSession(tenant, {
+							...common,
+							capability: "session.create",
+							target: { cwd: tenant.canonicalWorkspace },
+						});
+						break;
+					case "resume":
+						pending = f.runtime.resumeLifecycleSession(tenant, {
+							...common,
+							capability: "session.resume",
+							target: { sessionId: tenant.sessionId, cwd: tenant.canonicalWorkspace },
+						});
+						break;
+					case "fork":
+						pending = f.runtime.forkLifecycleSession(tenant, {
+							...common,
+							capability: "session.fork",
+							target: { sourceSessionId: tenant.sessionId, cwd: tenant.canonicalWorkspace },
+						});
+						break;
+					case "close":
+						pending = f.runtime.closeLifecycleSession(tenant, closeRequest());
+						break;
+					case "retirement":
+						pending = f.runtime.retireLifecycleSession(tenant, closeRequest(), operationIdentity());
+						break;
+				}
+				const receipt = await pending;
+				expect(applied).toBe(true);
+				expect(afterEffectChecks).toBe(0);
+				expect(receipt).toEqual(
+					method === "external-resume"
+						? {
+								kind: "result",
+								outcome: {
+									ok: true,
+									operation: "session.resume",
+									result: { sessionId: tenant.sessionId, endpointGeneration: tenant.generation },
+								},
+							}
+						: {
+								ok: true,
+								operation: `session.${method === "prepared" || method === "external-create" ? "create" : method === "retirement" ? "close" : method}`,
+								result:
+									method === "close" || method === "retirement"
+										? { sessionId: tenant.sessionId }
+										: {
+												sessionId:
+													method === "fork"
+														? "forked"
+														: method === "resume"
+															? tenant.sessionId
+															: "created",
+												endpointGeneration: 1,
+											},
+							},
+				);
+				hangFence = false;
+				await expect(f.runtime.acquireAttachment(tenant)).rejects.toThrow("fence was lost");
+				await expect(f.runtime.proveLifecycleTenant(tenant, operationIdentity())).rejects.toThrow("fence was lost");
+				expect(f.calls).not.toContain("request");
+			} finally {
+				withheld.resolve(false);
+				await f.runtime.stop();
+			}
+		}
+	});
+
+	test("list disclosure remains fenced after the public read completes", async () => {
+		let allowed = true;
+		const f = fixture({
+			fence: () => allowed,
+			list: async () => {
+				allowed = false;
+				return {
+					ok: true,
+					operation: "session.list",
+					result: {
+						indexSeq: 1,
+						sessions: [
+							{
+								sessionId: tenant.sessionId,
+								cwd: tenant.canonicalWorkspace,
+								endpointGeneration: tenant.generation,
+							},
+						],
+						warnings: [],
+					},
+				};
+			},
+		});
+		f.runtime.registerTenant(tenant);
+		await f.runtime.start();
+		try {
+			await expect(f.runtime.listLifecycleSessions(tenant, listRequest())).rejects.toThrow("fence was lost");
+			expect(f.listCalls).toHaveLength(1);
+		} finally {
+			await f.runtime.stop();
+		}
+	});
+
 	test.each(["prepared", "create", "resume"] as const)(
 		"%s external lifecycle separates small logical budgets from unchanged readiness configuration",
 		async method => {
@@ -1431,7 +1582,7 @@ describe("managed SDK runtime", () => {
 	});
 
 	test.each(["adoption", "retirement", "status"] as const)(
-		"rechecks %s purpose revocation after an awaited boundary",
+		"retains %s outcome without turning revoked authority into proof",
 		async mode => {
 			let allowed = true;
 			const revoke = async () => {
@@ -1457,7 +1608,13 @@ describe("managed SDK runtime", () => {
 					: mode === "retirement"
 						? f.runtime.retireLifecycleSession(tenant, closeRequest(), operationIdentity())
 						: f.runtime.retirementGenerationStatus(tenant, operationIdentity());
-			await expect(result).rejects.toThrow("fence was lost");
+			if (mode === "retirement") {
+				const receipt = await result;
+				expect(receipt).toEqual({ ok: true, operation: "session.close", result: { sessionId: tenant.sessionId } });
+				await expect(f.runtime.retirementGenerationStatus(tenant, operationIdentity())).rejects.toThrow(
+					"fence was lost",
+				);
+			} else await expect(result).rejects.toThrow("fence was lost");
 			expect(f.closeCalls).toHaveLength(mode === "retirement" ? 1 : 0);
 			await expect(f.runtime.acquireAttachment(tenant)).rejects.toThrow("fence was lost");
 			await f.runtime.stop();
@@ -1663,7 +1820,7 @@ describe("managed SDK runtime", () => {
 		).rejects.toThrow();
 		expect(f.createCalls).toEqual([]);
 		await f.runtime.createPreparedExternalLifecycleSession(preparedAuthority(), createRequest());
-		expect(seen).toEqual([preparedAuthority(), preparedAuthority()]);
+		expect(seen).toEqual([preparedAuthority()]);
 		expect(f.createCalls[0]!.readinessTimeoutMs).toBe(4_000);
 		await f.runtime.stop();
 	});
@@ -2029,7 +2186,7 @@ describe("managed SDK runtime", () => {
 		expect(delivered).toBe(false);
 	});
 
-	test("does not return lifecycle success as proof after the live tenant fence is lost", async () => {
+	test("returns close acknowledgement after revocation but rejects fresh live proof", async () => {
 		let allowed = true;
 		const f = fixture({
 			fence: () => allowed,
@@ -2040,7 +2197,10 @@ describe("managed SDK runtime", () => {
 		});
 		f.runtime.registerTenant(tenant);
 		await f.runtime.start();
-		await expect(f.runtime.closeLifecycleSession(tenant, closeRequest())).rejects.toThrow("fence was lost");
+		const receipt = await f.runtime.closeLifecycleSession(tenant, closeRequest());
+		expect(receipt).toEqual({ ok: true, operation: "session.close", result: { sessionId: tenant.sessionId } });
+		await expect(f.runtime.acquireAttachment(tenant)).rejects.toThrow("fence was lost");
+		await expect(f.runtime.generationStatus(tenant)).rejects.toThrow("fence was lost");
 		expect(f.closeCalls).toHaveLength(1);
 		await f.runtime.stop();
 	});
@@ -2349,7 +2509,7 @@ describe("managed SDK runtime", () => {
 							? await current.runtime.closeLifecycleSession({ tenant, request })
 							: await current.runtime.closeLifecycleSession({ tenant, ...request });
 				expect(outcome).toEqual({ ok: true, operation: "session.close", result: { sessionId: tenant.sessionId } });
-				expect(fenceChecks).toBe(2);
+				expect(fenceChecks).toBe(1);
 				expect(current.closeCalls).toHaveLength(1);
 				expect(current.closeCalls[0]?.target).toEqual(request.target);
 				expect(current.closeCalls[0]?.requestKey).toBe(request.requestKey);
