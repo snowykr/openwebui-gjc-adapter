@@ -66,10 +66,8 @@ export function reconcileSessionAuthority(
 
 function interruptedLifecycle(evidence: ManagedLifecycleEvidence): ManagedLifecycleEvidence {
 	// A prompt interruption does not revoke an already proven generation. Prepared
-	// intent also proves no invocation began; neither requires an invented edge.
+	// intent and cleanup_pending do not claim an invocation; restart cannot invent one.
 	if (evidence.state === "invoking" || evidence.state === "acknowledged_unproven" || evidence.state === "closing")
 		return transitionManagedLifecycleEvidence(evidence, "uncertain", {}, evidence.recordedAt);
-	if (evidence.state === "cleanup_pending")
-		return transitionManagedLifecycleEvidence(evidence, "cleanup_uncertain", {}, evidence.recordedAt);
 	return evidence;
 }

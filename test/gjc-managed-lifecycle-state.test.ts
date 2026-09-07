@@ -954,6 +954,33 @@ describe("canonical managed lifecycle evidence", () => {
 		expect(uncertain.requestHash).toBe(initial.requestHash);
 	});
 
+	test.each(["cleanup_pending", "invoking", "cleanup_uncertain"] as const)(
+		"normal V3 reopen preserves cleanup dispatch certainty for %s",
+		state => {
+			const pending = transitionManagedLifecycleEvidence(acknowledgedEvidence(), "cleanup_pending", {}, later);
+			const evidence =
+				state === "cleanup_pending" ? pending : transitionManagedLifecycleEvidence(pending, state, {}, later);
+			const root = mkdtempSync(join(tmpdir(), "gjc-cleanup-restart-"));
+			const path = join(root, "authority.json");
+			try {
+				writeFileSync(path, encodeSessionAuthorityV3Document(documentWith(evidence)));
+				const store = new SessionV3FileBackedMappingStore(path);
+				store.close();
+				const retained = parseSessionAuthorityV3Document(readFileSync(path))!.provisionalOperations[0]!;
+				expect(retained.state).toBe("uncertain");
+				expect(retained.lifecycle).toEqual({ ...evidence, state: state === "invoking" ? "uncertain" : state });
+				expect(retained.sessionId).toBeUndefined();
+				expect(retained.result).toBeUndefined();
+				const first = readFileSync(path);
+				const reopened = new SessionV3FileBackedMappingStore(path);
+				reopened.close();
+				expect(readFileSync(path).equals(first)).toBe(true);
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
+
 	test("normal V3 reopen cannot restore pre-close proof through uncertainty", () => {
 		const active = transitionManagedLifecycleEvidence(
 			acknowledgedEvidence(),
