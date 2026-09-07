@@ -141,6 +141,9 @@ export function copyProvisionalOperation(operation: ProvisionalSessionOperation)
 		...fields,
 		...copyOperation(fields),
 		...copySessionAuthorityBinding(operation),
+		...(operation.cleanup === undefined
+			? {}
+			: { cleanup: { ...operation.cleanup, lifecycle: copyManagedLifecycleEvidence(operation.cleanup.lifecycle) } }),
 		...(operation.lateCreateAcknowledgement === undefined
 			? {}
 			: {

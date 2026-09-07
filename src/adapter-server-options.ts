@@ -797,6 +797,7 @@ async function assertStagedManagedTenantFence(
 		const candidates = operations.filter(operation => {
 			const lifecycle = operation.lifecycle;
 			if (
+				("purpose" in operation && operation.purpose === "model-catalog") ||
 				operation.state !== "pending" ||
 				lifecycle === undefined ||
 				lifecycle.payloadHash !== operation.detail ||

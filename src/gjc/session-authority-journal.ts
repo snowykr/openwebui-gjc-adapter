@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
+import { isManagedCatalogProvisional } from "./managed-lifecycle-evidence";
 import {
 	copy,
 	copyAcknowledgedSuccessor,
@@ -395,6 +396,8 @@ export class SessionAuthorityJournal {
 				throw new Error("Completed session operations are immutable.");
 			return copyProvisionalOperation(current);
 		}
+		if (current.purpose !== undefined)
+			throw new Error("Catalog lifecycle evidence requires its original operation-scoped owner.");
 		if (
 			state === "complete" &&
 			(current.historicalBinding !== undefined ||
@@ -423,6 +426,7 @@ export class SessionAuthorityJournal {
 			current = this.provisional.get(key);
 		if (current === undefined || current.state !== "pending")
 			throw new Error(`Session operation ${ingressId} requires reconciliation.`);
+		if (current.purpose !== undefined) throw new Error("Catalog provisionals cannot attach serving authority.");
 		if (current.historicalBinding !== undefined || attachment.historicalBinding !== undefined)
 			throw new Error("Historical session authority requires an explicit proven binding transaction.");
 		const legacyValid =
@@ -704,7 +708,10 @@ export class SessionAuthorityJournal {
 		}
 	}
 	private setProvisional(key: string, operation: ProvisionalSessionOperation): void {
+		if (!isManagedCatalogProvisional(operation)) throw new Error("Invalid canonical catalog provisional.");
 		const prior = this.provisional.get(key);
+		if (prior !== undefined && prior.purpose !== operation.purpose)
+			throw new Error("Canonical provisional purpose is immutable.");
 		this.provisional.set(key, operation);
 		if (prior !== operation && !(prior !== undefined && JSON.stringify(prior) === JSON.stringify(operation))) {
 			this.#dirtyProvisional.add(key);

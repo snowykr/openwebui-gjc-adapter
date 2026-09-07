@@ -102,6 +102,8 @@ export function managedProvisionalCreateAdmissionHash(operation: ProvisionalSess
 		operation.activeLeaf !== undefined ||
 		operation.attachment !== undefined ||
 		operation.lateLifecycleAcknowledgement !== undefined ||
+		operation.cleanup !== undefined ||
+		(operation.purpose !== undefined && operation.purpose !== "model-catalog") ||
 		operation.projectId !== evidence.preparedAuthority.projectId ||
 		(operation.chatId !== evidence.preparedAuthority.chatId &&
 			operation.chatId !==
@@ -116,6 +118,7 @@ export function managedProvisionalCreateAdmissionHash(operation: ProvisionalSess
 		id: operation.id,
 		ingressId: operation.ingressId ?? operation.id,
 		kind: operation.kind,
+		...(operation.purpose === undefined ? {} : { purpose: operation.purpose }),
 		startedAt: operation.startedAt,
 		detail: operation.detail,
 		lifecycle: Object.fromEntries(
@@ -177,6 +180,110 @@ export function isManagedLateCreateAcknowledgement(
 	} catch {
 		return false;
 	}
+}
+
+/** Catalog evidence is a nonpublished provisional; its cleanup owns a separate close request. */
+export function isManagedCatalogProvisional(value: unknown): boolean {
+	if (!isRecord(value)) return false;
+	if (value.purpose === undefined) return value.cleanup === undefined;
+	const evidence = value.lifecycle;
+	if (
+		value.purpose !== "model-catalog" ||
+		value.kind !== "create" ||
+		!isManagedLifecycleEvidence(evidence) ||
+		evidence.operation !== "session.create" ||
+		evidence.source !== undefined ||
+		evidence.sourceProofRef !== undefined ||
+		evidence.historicalSource !== undefined ||
+		[
+			"sessionId",
+			"sessionFile",
+			"activeLeaf",
+			"managedAuthority",
+			"historicalBinding",
+			"attachment",
+			"result",
+			"acknowledgedSuccessor",
+			"lateLifecycleAcknowledgement",
+		].some(field => value[field] !== undefined) ||
+		!isTimestamp(value.startedAt) ||
+		Date.parse(evidence.recordedAt) < Date.parse(value.startedAt) ||
+		value.projectId !== evidence.preparedAuthority.projectId ||
+		(value.chatId !== evidence.preparedAuthority.chatId &&
+			value.chatId !==
+				JSON.stringify([evidence.preparedAuthority.principalId, evidence.preparedAuthority.chatId])) ||
+		value.detail !== evidence.payloadHash
+	)
+		return false;
+	const child = value.cleanup;
+	if (child === undefined)
+		return (
+			!["closing", "cleanup_pending", "cleanup_uncertain", "retired"].includes(evidence.state) &&
+			(value.state === "complete") === (evidence.state === "terminal_failure")
+		);
+	if (
+		value.lateCreateAcknowledgement !== undefined ||
+		evidence.acknowledged === undefined ||
+		!["acknowledged_unproven", "closing", "cleanup_uncertain", "uncertain", "retired"].includes(evidence.state) ||
+		!hasOnlyKeys(child, ["id", "ingressId", "kind", "state", "startedAt", "completedAt", "detail", "lifecycle"]) ||
+		!isNonEmptyString(child.id) ||
+		!isNonEmptyString(child.ingressId) ||
+		child.kind !== "close" ||
+		[child.id, child.ingressId].some(id => id === value.id || id === (value.ingressId ?? value.id)) ||
+		!["pending", "complete", "uncertain", "conflict"].includes(String(child.state)) ||
+		!isTimestamp(child.startedAt) ||
+		Date.parse(child.startedAt) < Date.parse(value.startedAt) ||
+		!isManagedLifecycleEvidence(child.lifecycle)
+	)
+		return false;
+	const close = child.lifecycle;
+	if (
+		close.operation !== "session.close" ||
+		close.sourceProofRef !== undefined ||
+		close.historicalSource !== undefined ||
+		!isDeepStrictEqual(close.source, evidence.acknowledged) ||
+		close.requestKey === evidence.requestKey ||
+		!scopeFields.every(field => close.preparedAuthority[field] === evidence.preparedAuthority[field]) ||
+		close.payloadHash !== child.detail ||
+		Date.parse(close.recordedAt) < Date.parse(child.startedAt) ||
+		(evidence.state === "acknowledged_unproven"
+			? Date.parse(child.startedAt) < Date.parse(evidence.recordedAt)
+			: Date.parse(child.startedAt) > Date.parse(evidence.recordedAt)) ||
+		close.proven !== undefined ||
+		close.acknowledged !== undefined ||
+		!hasOnlyKeys(close.target, ["sessionId", "endpointGeneration"]) ||
+		close.target.sessionId !== evidence.acknowledged.sessionId ||
+		close.target.endpointGeneration !== evidence.acknowledged.generation
+	)
+		return false;
+	if (child.state === "complete") {
+		if (
+			!isTimestamp(child.completedAt) ||
+			Date.parse(child.completedAt) < Date.parse(close.recordedAt) ||
+			!["retired", "terminal_failure"].includes(close.state)
+		)
+			return false;
+	} else if (child.completedAt !== undefined || ["retired", "terminal_failure"].includes(close.state)) return false;
+	if (["acknowledged_unproven", "retired"].includes(close.state) && close.closeAcknowledgement === undefined)
+		return false;
+	if (
+		close.closeAcknowledgement !== undefined &&
+		Date.parse(close.closeAcknowledgement.observedAt) < Date.parse(child.startedAt)
+	)
+		return false;
+	if (close.state === "retired") {
+		if (
+			evidence.state !== "retired" ||
+			value.state !== "complete" ||
+			child.state !== "complete" ||
+			!isTimestamp(value.completedAt) ||
+			Date.parse(value.completedAt) < Date.parse(child.completedAt as string) ||
+			!isDeepStrictEqual(evidence.retirement, close.retirement) ||
+			Date.parse(close.closeAcknowledgement!.observedAt) > Date.parse(close.retirement!.observedAt)
+		)
+			return false;
+	} else if (evidence.state === "retired" || value.state === "complete") return false;
+	return true;
 }
 
 type LifecycleReservation = Pick<SessionOperation, "id" | "ingressId" | "kind" | "startedAt" | "detail" | "lifecycle">;

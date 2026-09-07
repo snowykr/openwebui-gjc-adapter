@@ -10,7 +10,9 @@ export function assertReservableIdentity(
 	provisional: readonly ProvisionalSessionOperation[],
 ): void {
 	const ingressId = operation.ingressId ?? operation.id;
-	const ownedProvisional = provisional.filter(candidate => candidate.chatId === operation.chatId);
+	const ownedProvisional = provisional
+		.filter(candidate => candidate.chatId === operation.chatId)
+		.flatMap(candidate => (candidate.cleanup === undefined ? [candidate] : [candidate, candidate.cleanup]));
 	if (hasIdentityCollision(operation, journal) || hasIdentityCollision(operation, ownedProvisional))
 		throw new Error(`Session ingress ${ingressId} conflicts with an existing operation.`);
 	if (hasIdentityOverlap(operation, journal))
@@ -24,6 +26,8 @@ export function assertPublishableIdentity(
 	provisional: readonly ProvisionalSessionOperation[],
 ): ProvisionalSessionOperation {
 	const ingressId = operation.ingressId ?? operation.id;
+	if (operation.purpose !== undefined || reserved?.purpose !== undefined)
+		throw new Error("Catalog provisionals cannot publish a serving mapping.");
 	if (
 		reserved === undefined ||
 		reserved.state !== "pending" ||
@@ -38,7 +42,9 @@ export function assertPublishableIdentity(
 		hasIdentityCollision(operation, journal) ||
 		hasIdentityCollision(
 			operation,
-			provisional.filter(candidate => candidate.chatId === operation.chatId && candidate !== reserved),
+			provisional
+				.filter(candidate => candidate.chatId === operation.chatId && candidate !== reserved)
+				.flatMap(candidate => (candidate.cleanup === undefined ? [candidate] : [candidate, candidate.cleanup])),
 		)
 	)
 		throw new Error(`Session ingress ${ingressId} conflicts with an existing operation.`);
@@ -51,7 +57,9 @@ export function assertBeginableIdentity(
 	provisional: readonly ProvisionalSessionOperation[],
 ): void {
 	const ingressId = operation.ingressId ?? operation.id;
-	const ownedProvisional = provisional.filter(candidate => candidate.chatId === chatId);
+	const ownedProvisional = provisional
+		.filter(candidate => candidate.chatId === chatId)
+		.flatMap(candidate => (candidate.cleanup === undefined ? [candidate] : [candidate, candidate.cleanup]));
 	if (hasIdentityCollision(operation, ownedProvisional))
 		throw new Error(`Session ingress ${ingressId} conflicts with an existing operation.`);
 	if (hasIdentityOverlap(operation, ownedProvisional))

@@ -5,7 +5,9 @@ import {
 	copyManagedLifecycleEvidence,
 	createManagedLateCreateAcknowledgement,
 	createManagedLateLifecycleAcknowledgement,
+	createManagedLifecycleEvidence,
 	createManagedRetirementEvidence,
+	isManagedCatalogProvisional,
 	isManagedLateCreateAcknowledgement,
 	isManagedLateLifecycleAcknowledgement,
 	isManagedLifecycleEvidence,
@@ -16,6 +18,7 @@ import {
 	type ManagedLifecycleEvidence,
 	managedHistoricalPublicationAssociation,
 	managedLifecycleAdmissionHash,
+	managedLifecycleEvidenceHash,
 	managedProvisionalCreateAdmissionHash,
 	transitionManagedLifecycleEvidence,
 } from "./managed-lifecycle-evidence";
@@ -41,7 +44,7 @@ import type {
 import { copySessionMapping } from "./session-mapping-copy";
 import type { SessionMapping, SessionMappingScope } from "./session-mapping-store";
 import { operationResult } from "./session-operation-codec";
-import type { ManagedTurnAuthority } from "./turn-runner";
+import type { ManagedPreparedTurnAuthority, ManagedTurnAuthority } from "./turn-runner";
 
 const SCOPED_MAPPING_OBSERVATION = "__gjcSessionMappingScope";
 const SCOPED_MAPPING_RETIREMENT_OBSERVATION = "__gjcSessionMappingRetirement";
@@ -606,6 +609,233 @@ export class SessionMappingStore {
 		assertLegacyKeyAvailable(this.authority, chatId);
 		this.writeLifecycleEvidence(chatId, operationId, payloadHash, evidence);
 	}
+	/** A catalog owner never publishes a mapping or borrows an active generation. */
+	reserveManagedCatalogScoped(
+		scope: SessionMappingScope,
+		input: {
+			readonly operationId: string;
+			readonly prepared: ManagedPreparedTurnAuthority;
+			readonly payloadHash: string;
+		},
+	): ProvisionalSessionOperation {
+		const canonical = canonicalScopeFor(scope);
+		const prepared = lifecyclePreparedAuthority(input.prepared);
+		if (prepared.principalId !== scope.principalId || prepared.chatId !== scope.chatId || !input.operationId)
+			throw new Error("Catalog reservation does not match its tenant scope.");
+		const recordedAt = new Date().toISOString();
+		const lifecycle = createManagedLifecycleEvidence(
+			{
+				operation: "session.create",
+				preparedAuthority: prepared,
+				payloadHash: input.payloadHash,
+				target: { kind: "existing_path", path: prepared.canonicalWorkspace },
+			},
+			recordedAt,
+		);
+		const reserved: ProvisionalSessionOperation = {
+			id: input.operationId,
+			ingressId: input.operationId,
+			kind: "create",
+			purpose: "model-catalog",
+			chatId: canonical.key,
+			projectId: prepared.projectId,
+			state: "pending",
+			startedAt: recordedAt,
+			detail: input.payloadHash,
+			lifecycle,
+		};
+		this.mutateAuthorityState((records, provisional) => {
+			const root = records.find(record => record.chatId === canonical.key);
+			if (
+				root !== undefined &&
+				(root.historicalBinding !== undefined ||
+					isRetiredRecord(root) ||
+					!isScopedRecordFor(root, canonical) ||
+					root.projectId !== prepared.projectId ||
+					root.managedAuthority?.canonicalWorkspace !== prepared.canonicalWorkspace)
+			)
+				throw new Error("Catalog reservation conflicts with its canonical tenant owner.");
+			if (provisional.some(operation => operation.chatId === canonical.key && operation.state !== "complete"))
+				throw new Error("Catalog reservation conflicts with unfinished provisional work.");
+			return { records, provisional: [...provisional, reserved] };
+		});
+		return provisionalOperationForScope(reserved, canonical);
+	}
+	advanceManagedCatalogScoped(
+		scope: SessionMappingScope,
+		admitted: ProvisionalSessionOperation,
+		expectedHash: string,
+		evidence: ManagedLifecycleEvidence,
+	): ProvisionalSessionOperation {
+		return this.mutateManagedCatalog(scope, admitted, retained => {
+			if (retained.cleanup !== undefined || managedLifecycleEvidenceHash(retained.lifecycle!) !== expectedHash)
+				throw new Error("Catalog create evidence changed before mutation.");
+			assertManagedLifecycleEvidenceUpdate(retained.lifecycle!, evidence);
+			if (isDeepStrictEqual(retained.lifecycle, evidence)) return retained;
+			if (evidence.state === "invoking" && retained.state !== "pending")
+				throw new Error("Catalog invocation requires pending original admission.");
+			return {
+				...retained,
+				lifecycle: copyManagedLifecycleEvidence(evidence),
+				...(evidence.state === "uncertain" ? { state: "uncertain" as const } : {}),
+				...(evidence.state === "terminal_failure"
+					? { state: "complete" as const, completedAt: evidence.recordedAt }
+					: {}),
+			};
+		});
+	}
+	reserveManagedCatalogCleanupScoped(
+		scope: SessionMappingScope,
+		admitted: ProvisionalSessionOperation,
+		expectedHash: string,
+		input: { readonly operationId: string; readonly requestKey: string; readonly payloadHash: string },
+	): ProvisionalSessionOperation {
+		return this.mutateManagedCatalog(scope, admitted, retained => {
+			const prior = retained.lifecycle!;
+			if (
+				retained.state !== "pending" ||
+				retained.cleanup !== undefined ||
+				retained.lateCreateAcknowledgement !== undefined ||
+				managedLifecycleEvidenceHash(prior) !== expectedHash ||
+				prior.acknowledged === undefined ||
+				!["active_generation_proven", "acknowledged_unproven"].includes(prior.state)
+			)
+				throw new Error("Catalog cleanup requires this owner's original acknowledged generation.");
+			const recordedAt = new Date().toISOString();
+			const lifecycle =
+				prior.state === "active_generation_proven"
+					? transitionManagedLifecycleEvidence(prior, "closing", {}, recordedAt)
+					: prior;
+			const cleanup = {
+				id: input.operationId,
+				ingressId: input.operationId,
+				kind: "close" as const,
+				state: "pending" as const,
+				startedAt: recordedAt,
+				detail: input.payloadHash,
+				lifecycle: createManagedLifecycleEvidence(
+					{
+						operation: "session.close",
+						preparedAuthority: { ...prior.preparedAuthority, requestKey: input.requestKey },
+						source: prior.acknowledged,
+						payloadHash: input.payloadHash,
+						target: {
+							sessionId: prior.acknowledged.sessionId,
+							endpointGeneration: prior.acknowledged.generation,
+						},
+					},
+					recordedAt,
+				),
+			};
+			return { ...retained, lifecycle, cleanup };
+		});
+	}
+	advanceManagedCatalogCleanupScoped(
+		scope: SessionMappingScope,
+		admitted: ProvisionalSessionOperation,
+		expectedHash: string,
+		evidence: ManagedLifecycleEvidence,
+	): ProvisionalSessionOperation {
+		const originalChild = structuredClone(admitted.cleanup);
+		return this.mutateManagedCatalog(scope, admitted, retained => {
+			const child = retained.cleanup;
+			if (
+				child === undefined ||
+				originalChild === undefined ||
+				child.id !== originalChild.id ||
+				child.ingressId !== originalChild.ingressId ||
+				child.startedAt !== originalChild.startedAt ||
+				child.detail !== originalChild.detail ||
+				child.lifecycle.requestHash !== originalChild.lifecycle.requestHash ||
+				!isDeepStrictEqual(child.lifecycle.preparedAuthority, originalChild.lifecycle.preparedAuthority) ||
+				!isDeepStrictEqual(child.lifecycle.source, originalChild.lifecycle.source) ||
+				managedLifecycleEvidenceHash(child.lifecycle) !== expectedHash
+			)
+				throw new Error("Catalog cleanup evidence changed before mutation.");
+			assertManagedLifecycleEvidenceUpdate(child.lifecycle, evidence);
+			if (isDeepStrictEqual(child.lifecycle, evidence)) return retained;
+			if (evidence.state === "invoking" && (retained.state !== "pending" || child.state !== "pending"))
+				throw new Error("Catalog cleanup invocation requires pending original admission.");
+			if (child.state === "complete" || child.state === "conflict")
+				throw new Error("Catalog cleanup evidence is immutable.");
+			if (
+				child.lifecycle.closeAcknowledgement === undefined &&
+				evidence.closeAcknowledgement !== undefined &&
+				Date.parse(evidence.closeAcknowledgement.observedAt) < Date.parse(child.lifecycle.recordedAt)
+			)
+				throw new Error("Catalog close acknowledgement predates its original invocation.");
+			let parent = retained.lifecycle!;
+			if (evidence.state === "uncertain" && parent.state !== "uncertain" && parent.state !== "cleanup_uncertain")
+				parent = transitionManagedLifecycleEvidence(
+					parent,
+					parent.state === "acknowledged_unproven" ? "cleanup_uncertain" : "uncertain",
+					{},
+					evidence.recordedAt,
+				);
+			if (evidence.state === "retired") {
+				parent = transitionManagedLifecycleEvidence(
+					parent,
+					"retired",
+					{ retirement: evidence.retirement },
+					evidence.recordedAt,
+				);
+			}
+			const terminal = evidence.state === "retired" || evidence.state === "terminal_failure";
+			return {
+				...retained,
+				lifecycle: parent,
+				...(evidence.state === "uncertain" ? { state: "uncertain" as const } : {}),
+				...(evidence.state === "retired" ? { state: "complete" as const, completedAt: evidence.recordedAt } : {}),
+				cleanup: {
+					...child,
+					lifecycle: copyManagedLifecycleEvidence(evidence),
+					...(evidence.state === "uncertain" ? { state: "uncertain" as const } : {}),
+					...(terminal ? { state: "complete" as const, completedAt: evidence.recordedAt } : {}),
+				},
+			};
+		});
+	}
+	private mutateManagedCatalog(
+		scope: SessionMappingScope,
+		admitted: ProvisionalSessionOperation,
+		update: (retained: ProvisionalSessionOperation) => ProvisionalSessionOperation,
+	): ProvisionalSessionOperation {
+		const canonical = canonicalScopeFor(scope);
+		const original = structuredClone(admitted);
+		if (
+			!isManagedCatalogProvisional(original) ||
+			original.purpose !== "model-catalog" ||
+			original.lifecycle?.preparedAuthority.principalId !== scope.principalId ||
+			original.lifecycle.preparedAuthority.chatId !== scope.chatId
+		)
+			throw new Error("Catalog mutation lacks its original tenant owner.");
+		let updated!: ProvisionalSessionOperation;
+		this.mutateAuthorityState((records, provisional) => {
+			const candidates = provisional.filter(
+				operation => operation.chatId === canonical.key && operation.id === original.id,
+			);
+			const retained = candidates.length === 1 ? candidates[0] : undefined;
+			if (
+				retained === undefined ||
+				retained.purpose !== "model-catalog" ||
+				retained.startedAt !== original.startedAt ||
+				retained.ingressId !== original.ingressId ||
+				retained.projectId !== original.projectId ||
+				retained.detail !== original.detail ||
+				!isDeepStrictEqual(retained.lifecycle?.preparedAuthority, original.lifecycle!.preparedAuthority) ||
+				retained.lifecycle?.requestHash !== original.lifecycle!.requestHash ||
+				!isDeepStrictEqual(retained.lifecycle?.target, original.lifecycle!.target)
+			)
+				throw new Error("Catalog reservation changed before mutation.");
+			updated = update(retained);
+			if (!isManagedCatalogProvisional(updated)) throw new Error("Invalid canonical catalog mutation.");
+			if (isDeepStrictEqual(updated, retained)) return { records, provisional };
+			if (retained.state === "complete" || retained.state === "conflict")
+				throw new Error("Catalog reservation is immutable.");
+			return { records, provisional: provisional.map(operation => (operation === retained ? updated : operation)) };
+		});
+		return provisionalOperationForScope(structuredClone(updated), canonical);
+	}
 	reserveManagedRetirementScoped(
 		scope: SessionMappingScope,
 		source: ManagedTurnAuthority,
@@ -1014,6 +1244,8 @@ export class SessionMappingStore {
 			let found = false;
 			const update = <T extends SessionOperation>(operation: T): T => {
 				if (operation.id !== operationId && operation.ingressId !== operationId) return operation;
+				if ("purpose" in operation && operation.purpose !== undefined)
+					throw new Error("Catalog lifecycle evidence requires its original operation-scoped owner.");
 				if (
 					found ||
 					operation.state === "complete" ||

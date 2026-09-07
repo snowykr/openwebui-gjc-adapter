@@ -1,6 +1,7 @@
 import { isAbsolute } from "node:path";
 import {
 	hasManagedHistoricalSourceChat,
+	isManagedCatalogProvisional,
 	type ManagedHistoricalAssociationOwner,
 	managedHistoricalPublicationAssociation,
 	managedHistoricalSourceAssociation,
@@ -199,6 +200,7 @@ export function isAuthorityDocumentRelationallyValid(
 	)
 		return false;
 	for (const operation of provisionalOperations) {
+		if (!isManagedCatalogProvisional(operation)) return false;
 		const direct = mappingByChatId.get(operation.chatId);
 		const associated = [...mappingByChatId.values()].filter(
 			candidate =>
@@ -243,6 +245,13 @@ export function isAuthorityDocumentRelationallyValid(
 			provisionalIdentities.add(key);
 			identities.set(key, identity);
 		}
+		if (operation.cleanup !== undefined)
+			for (const identifier of operationIdentifiers(operation.cleanup)) {
+				const key = `${namespace}\u0000${identifier}`;
+				if (provisionalIdentities.has(key) || identities.has(key)) return false;
+				provisionalIdentities.add(key);
+				identities.set(key, operationIdentity(operation.cleanup));
+			}
 	}
 	return true;
 }

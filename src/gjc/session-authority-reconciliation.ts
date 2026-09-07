@@ -51,23 +51,49 @@ export function reconcileSessionAuthority(
 		if (copyResults) reconciled.push(copy(next));
 	}
 	for (const operation of provisional.values()) {
-		if (operation.state !== "pending") continue;
+		if (operation.state !== "pending" && operation.cleanup?.state !== "pending") continue;
 		const key = provisionalKey(operation.chatId, operation.ingressId ?? operation.id);
 		provisional.set(key, {
 			...operation,
-			state: "uncertain",
+			state: operation.state === "pending" ? "uncertain" : operation.state,
 			detail: operation.detail ?? "restart before completion",
-			...(operation.lifecycle === undefined ? {} : { lifecycle: interruptedLifecycle(operation.lifecycle) }),
+			...(operation.lifecycle === undefined
+				? {}
+				: {
+						lifecycle: interruptedLifecycle(
+							operation.lifecycle,
+							operation.cleanup === undefined
+								? operation.lifecycle.recordedAt
+								: new Date(
+										Math.max(
+											Date.parse(operation.lifecycle.recordedAt),
+											Date.parse(operation.cleanup.startedAt),
+										),
+									).toISOString(),
+						),
+					}),
+			...(operation.cleanup?.state !== "pending"
+				? {}
+				: {
+						cleanup: {
+							...operation.cleanup,
+							state: "uncertain",
+							lifecycle: interruptedLifecycle(operation.cleanup.lifecycle),
+						},
+					}),
 		});
 		dirtyProvisional?.add(key);
 	}
 	return reconciled;
 }
 
-function interruptedLifecycle(evidence: ManagedLifecycleEvidence): ManagedLifecycleEvidence {
+function interruptedLifecycle(
+	evidence: ManagedLifecycleEvidence,
+	recordedAt = evidence.recordedAt,
+): ManagedLifecycleEvidence {
 	// A prompt interruption does not revoke an already proven generation. Prepared
 	// intent and cleanup_pending do not claim an invocation; restart cannot invent one.
 	if (evidence.state === "invoking" || evidence.state === "acknowledged_unproven" || evidence.state === "closing")
-		return transitionManagedLifecycleEvidence(evidence, "uncertain", {}, evidence.recordedAt);
+		return transitionManagedLifecycleEvidence(evidence, "uncertain", {}, recordedAt);
 	return evidence;
 }

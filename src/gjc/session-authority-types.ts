@@ -137,6 +137,18 @@ export interface SessionOperation {
 export type SessionProjectReassignmentState = "pending" | "rolled_back" | "committed";
 export type ProjectReassignmentState = SessionProjectReassignmentState;
 
+/** A catalog close has its own immutable request identity, never a serving result. */
+export interface CatalogCleanupOperation {
+	readonly id: string;
+	readonly ingressId: string;
+	readonly kind: "close";
+	readonly state: SessionOperationState;
+	readonly startedAt: string;
+	readonly completedAt?: string;
+	readonly detail: string;
+	readonly lifecycle: ManagedLifecycleEvidence;
+}
+
 export interface SessionAuthorityTargetIdentity {
 	readonly id: string;
 	readonly ingressId?: string;
@@ -184,6 +196,8 @@ export type ProvisionalSessionOperation = SessionOperation &
 	SessionAuthorityBinding & {
 		readonly chatId: string;
 		readonly projectId: string;
+		readonly purpose?: "model-catalog";
+		readonly cleanup?: CatalogCleanupOperation;
 		readonly lateCreateAcknowledgement?: ManagedLateCreateAcknowledgement;
 		readonly sessionId?: string;
 		readonly sessionFile?: string;

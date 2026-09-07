@@ -4,6 +4,7 @@ import type { NormalizedModelSelection } from "../contracts";
 import {
 	hasManagedHistoricalSourceChat,
 	isHistoricalSessionBinding,
+	isManagedCatalogProvisional,
 	isManagedLateCreateAcknowledgement,
 	isManagedLateLifecycleAcknowledgement,
 	isManagedLifecycleEvidence,
@@ -18,7 +19,7 @@ import {
 
 export { isHistoricalSessionBinding } from "./managed-lifecycle-evidence";
 
-import type { HistoricalSessionBinding } from "./session-authority-types";
+import type { CatalogCleanupOperation, HistoricalSessionBinding } from "./session-authority-types";
 import {
 	isJsonValue,
 	isNonEmptyString,
@@ -153,6 +154,8 @@ export type SessionAuthorityV3Mapping = SessionAuthorityV3Binding & {
 export type SessionAuthorityV3ProvisionalOperation = SessionAuthorityV3Operation & {
 	readonly chatId: string;
 	readonly projectId: string;
+	readonly purpose?: "model-catalog";
+	readonly cleanup?: CatalogCleanupOperation;
 	readonly lateCreateAcknowledgement?: ManagedLateCreateAcknowledgement;
 	readonly sessionFile?: string;
 	readonly activeLeaf?: string;
@@ -311,6 +314,14 @@ export function isSessionAuthorityV3RelationallyValid(
 			if (provisionalIdentities.has(key)) return false;
 			provisionalIdentities.add(key);
 		}
+		if (provisional.cleanup !== undefined) {
+			for (const identifier of operationIdentifiers(provisional.cleanup)) {
+				const key = `${namespace}\u0000${identifier}`;
+				if (provisionalIdentities.has(key)) return false;
+				provisionalIdentities.add(key);
+			}
+			if (!addOperationIdentity(identities, namespace, provisional.cleanup)) return false;
+		}
 		const publicationReceipt = isCompletedPublicationReceipt(mapping, provisional);
 		if (
 			mapping !== undefined &&
@@ -462,6 +473,8 @@ function isProvisional(value: unknown): value is SessionAuthorityV3ProvisionalOp
 			"acknowledgedSuccessor",
 			"lifecycle",
 			"lateCreateAcknowledgement",
+			"purpose",
+			"cleanup",
 			"chatId",
 			"projectId",
 			"sessionId",
@@ -472,8 +485,9 @@ function isProvisional(value: unknown): value is SessionAuthorityV3ProvisionalOp
 		])
 	)
 		return false;
-	const { lateCreateAcknowledgement, ...operation } = value;
+	const { lateCreateAcknowledgement, purpose: _purpose, cleanup: _cleanup, ...operation } = value;
 	return (
+		isManagedCatalogProvisional(value) &&
 		isNonEmptyString(value.chatId) &&
 		isNonEmptyString(value.projectId) &&
 		isOperation(operation) &&

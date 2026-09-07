@@ -6,6 +6,7 @@ import {
 	createManagedLateCreateAcknowledgement,
 	createManagedLateLifecycleAcknowledgement,
 	createManagedLifecycleEvidence,
+	isManagedCatalogProvisional,
 	isManagedLifecycleEvidence,
 	lifecycleExactAuthority,
 	lifecyclePreparedAuthority,
@@ -530,6 +531,511 @@ function passiveReceiptFixture(kind: "create" | "branch" | "resume" = "branch") 
 }
 
 describe("session authority v3 full graph", () => {
+	function catalogFixture() {
+		const root = mkdtempSync(join(tmpdir(), "gjc-catalog-owner-"));
+		const path = join(root, "authority.json");
+		writeFileSync(
+			path,
+			encodeSessionAuthorityV3Document({
+				kind: SESSION_AUTHORITY_V3_KIND,
+				version: 3,
+				authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+				mappings: [],
+				provisionalOperations: [],
+			}),
+		);
+		const store = new SessionV3FileBackedMappingStore(path);
+		const prepared = lifecyclePreparedAuthority(authority("catalog-chat", "project-a", "unused"));
+		const scope = { principalId: prepared.principalId, chatId: prepared.chatId };
+		const reserved = store.reserveManagedCatalogScoped(scope, {
+			operationId: "catalog-create",
+			prepared,
+			payloadHash: "c".repeat(64),
+		});
+		const advance = (state: Parameters<typeof transitionManagedLifecycleEvidence>[1], patch = {}) => {
+			const current = store.provisionalOperationScoped(scope, reserved.id)!;
+			return store.advanceManagedCatalogScoped(
+				scope,
+				reserved,
+				managedLifecycleEvidenceHash(current.lifecycle!),
+				transitionManagedLifecycleEvidence(current.lifecycle!, state, patch),
+			);
+		};
+		const acknowledge = (proven = false) => {
+			const admitted = advance("invoking");
+			const acknowledged = { ...prepared, sessionId: "catalog-created", generation: 8 };
+			advance("acknowledged_unproven", { acknowledged });
+			if (proven)
+				advance("active_generation_proven", {
+					proven: {
+						kind: "managed-generation",
+						sessionId: acknowledged.sessionId,
+						generation: acknowledged.generation,
+						leaseId: prepared.leaseId,
+						epoch: prepared.epoch,
+					},
+				});
+			return { admitted, acknowledged };
+		};
+		let cleanupOwner: ProvisionalSessionOperation;
+		const cleanup = () => {
+			const current = store.provisionalOperationScoped(scope, reserved.id)!;
+			cleanupOwner = store.reserveManagedCatalogCleanupScoped(
+				scope,
+				reserved,
+				managedLifecycleEvidenceHash(current.lifecycle!),
+				{
+					operationId: "catalog-close",
+					requestKey: "catalog-close-request",
+					payloadHash: "d".repeat(64),
+				},
+			);
+			return cleanupOwner;
+		};
+		const advanceCleanup = (state: Parameters<typeof transitionManagedLifecycleEvidence>[1], patch = {}) => {
+			const current = store.provisionalOperationScoped(scope, reserved.id)!;
+			return store.advanceManagedCatalogCleanupScoped(
+				scope,
+				cleanupOwner,
+				managedLifecycleEvidenceHash(current.cleanup!.lifecycle),
+				transitionManagedLifecycleEvidence(current.cleanup!.lifecycle, state, patch),
+			);
+		};
+		return {
+			root,
+			path,
+			store,
+			prepared,
+			scope,
+			reserved,
+			advance,
+			acknowledge,
+			cleanup,
+			advanceCleanup,
+			close: () => {
+				store.close();
+				rmSync(root, { recursive: true, force: true });
+			},
+		};
+	}
+
+	test.each([false, true])(
+		"catalog retirement atomically completes both owners without publication with proof=%s",
+		proven => {
+			const f = catalogFixture();
+			try {
+				const { acknowledged } = f.acknowledge(proven);
+				const reserved = f.cleanup();
+				const originalParent = reserved.lifecycle!;
+				f.advanceCleanup("invoking");
+				const closeAcknowledgement = {
+					sessionId: acknowledged.sessionId,
+					generation: acknowledged.generation,
+					observedAt: new Date().toISOString(),
+				};
+				const ack = f.advanceCleanup("acknowledged_unproven", { closeAcknowledgement });
+				expect(ack.lifecycle).toEqual(originalParent);
+				const retirement = {
+					sessionId: acknowledged.sessionId,
+					generation: acknowledged.generation,
+					acknowledgedSessionId: acknowledged.sessionId,
+					observedAt: new Date().toISOString(),
+					evidence: {
+						source: "session_index",
+						event: "host_unregistered",
+						observedIndexSeq: 3,
+						evidenceIndexSeq: 3,
+					},
+				};
+				const completed = f.advanceCleanup("retired", { retirement });
+				expect(completed.state).toBe("complete");
+				expect(completed.lifecycle!.state).toBe("retired");
+				expect(completed.cleanup!.state).toBe("complete");
+				expect(completed.cleanup!.lifecycle.retirement).toEqual(completed.lifecycle!.retirement);
+				expect(completed.cleanup!.lifecycle.closeAcknowledgement).toEqual(closeAcknowledgement);
+				expect(completed.cleanup!.lifecycle.requestHash).toBe(reserved.cleanup!.lifecycle.requestHash);
+				expect(completed.lifecycle!.requestHash).toBe(originalParent.requestHash);
+				expect(completed.result).toBeUndefined();
+				expect(completed.sessionId).toBeUndefined();
+				expect(f.store.getScoped(f.scope)).toBeUndefined();
+				const bytes = readFileSync(f.path);
+				const inode = statSync(f.path).ino;
+				expect(f.advanceCleanup("retired")).toEqual(completed);
+				expect(readFileSync(f.path).equals(bytes)).toBe(true);
+				expect(statSync(f.path).ino).toBe(inode);
+				f.store.close();
+				const reopened = new SessionV3FileBackedMappingStore(f.path);
+				try {
+					expect(reopened.provisionalOperationScoped(f.scope, f.reserved.id)).toEqual(completed);
+					expect(() => reopened.assertServingReady()).not.toThrow();
+					expect(reopened.getScoped(f.scope)).toBeUndefined();
+				} finally {
+					reopened.close();
+				}
+			} finally {
+				f.close();
+			}
+		},
+	);
+
+	test.each([false, true])(
+		"catalog cleanup excludes competing mutation and unsupported retry with proof=%s",
+		proven => {
+			const f = catalogFixture();
+			try {
+				const { acknowledged } = f.acknowledge(proven);
+				const reserved = f.cleanup();
+				const before = readFileSync(f.path);
+				expect(() => f.cleanup()).toThrow("original acknowledged");
+				expect(() =>
+					f.advance(proven ? "closing" : "active_generation_proven", {
+						proven: {
+							kind: "managed-generation",
+							sessionId: acknowledged.sessionId,
+							generation: acknowledged.generation,
+							leaseId: f.prepared.leaseId,
+							epoch: f.prepared.epoch,
+						},
+					}),
+				).toThrow("create evidence changed");
+				expect(() => f.store.discardPendingProvisionalOperationScoped(f.scope, f.reserved)).toThrow(
+					"requires reconciliation",
+				);
+				expect(() => f.store.transitionProvisionalOperationScoped(f.scope, f.reserved.id, "uncertain")).toThrow(
+					"operation-scoped owner",
+				);
+				expect(readFileSync(f.path).equals(before)).toBe(true);
+				f.advanceCleanup("invoking");
+				const uncertain = f.advanceCleanup("uncertain");
+				expect(uncertain.state).toBe("uncertain");
+				expect(uncertain.cleanup!.state).toBe("uncertain");
+				expect(uncertain.lifecycle!.state).toBe(proven ? "uncertain" : "cleanup_uncertain");
+				expect(uncertain.cleanup!.lifecycle.requestHash).toBe(reserved.cleanup!.lifecycle.requestHash);
+				expect(() =>
+					f.advanceCleanup("acknowledged_unproven", {
+						closeAcknowledgement: {
+							sessionId: acknowledged.sessionId,
+							generation: acknowledged.generation,
+							observedAt: new Date().toISOString(),
+						},
+					}),
+				).toThrow("fresh public request-bound evidence");
+				expect(() => f.advanceCleanup("terminal_failure")).toThrow("not-applied evidence");
+				expect(() => f.cleanup()).toThrow("original acknowledged");
+			} finally {
+				f.close();
+			}
+		},
+	);
+
+	test("catalog cleanup updates bind the distinct original close reservation and fresh observation", () => {
+		const f = catalogFixture();
+		try {
+			const { acknowledged } = f.acknowledge();
+			const owner = f.cleanup();
+			const invoking = f.advanceCleanup("invoking");
+			const current = invoking.cleanup!.lifecycle;
+			const hash = managedLifecycleEvidenceHash(current);
+			const bytes = readFileSync(f.path);
+			const inode = statSync(f.path).ino;
+			for (const admitted of [
+				f.reserved,
+				{ ...owner, cleanup: { ...owner.cleanup!, id: "other-close" } },
+				{ ...owner, cleanup: { ...owner.cleanup!, ingressId: "other-ingress" } },
+				{
+					...owner,
+					lifecycle: { ...owner.lifecycle!, preparedAuthority: { ...f.prepared, leaseId: "foreign-lease" } },
+				},
+			]) {
+				expect(() => f.store.advanceManagedCatalogCleanupScoped(f.scope, admitted, hash, current)).toThrow();
+			}
+			expect(() =>
+				f.store.advanceManagedCatalogCleanupScoped({ ...f.scope, principalId: "foreign" }, owner, hash, current),
+			).toThrow();
+			expect(() =>
+				f.store.advanceManagedCatalogCleanupScoped(
+					f.scope,
+					owner,
+					managedLifecycleEvidenceHash(owner.cleanup!.lifecycle),
+					current,
+				),
+			).toThrow("changed before mutation");
+			const staleAck = transitionManagedLifecycleEvidence(current, "acknowledged_unproven", {
+				closeAcknowledgement: {
+					sessionId: acknowledged.sessionId,
+					generation: acknowledged.generation,
+					observedAt: timestamp,
+				},
+			});
+			expect(() => f.store.advanceManagedCatalogCleanupScoped(f.scope, owner, hash, staleAck)).toThrow(
+				"predates its original invocation",
+			);
+			expect(readFileSync(f.path).equals(bytes)).toBe(true);
+			expect(statSync(f.path).ino).toBe(inode);
+		} finally {
+			f.close();
+		}
+	});
+
+	test("catalog local cancellation completes only before invocation and persists nonserving history", () => {
+		const f = catalogFixture();
+		try {
+			const completed = f.advance("terminal_failure");
+			expect(completed.state).toBe("complete");
+			expect(completed.cleanup).toBeUndefined();
+			expect(completed.result).toBeUndefined();
+			const document = parseSessionAuthorityV3Document(readFileSync(f.path))!;
+			expect(inheritedValid(document)).toBe(true);
+			const invalid = {
+				...document,
+				provisionalOperations: [
+					{ ...document.provisionalOperations[0]!, state: "pending", completedAt: undefined },
+				],
+			};
+			expect(isSessionAuthorityV3Document(invalid)).toBe(false);
+			expect(() => f.cleanup()).toThrow("original acknowledged");
+			f.store.close();
+			const reopened = new SessionV3FileBackedMappingStore(f.path);
+			try {
+				expect(() => reopened.assertServingReady()).not.toThrow();
+				expect(reopened.provisionalOperationScoped(f.scope, f.reserved.id)).toEqual(completed);
+			} finally {
+				reopened.close();
+			}
+		} finally {
+			f.close();
+		}
+	});
+
+	test("reopened prepared catalog create cannot admit an invocation", () => {
+		const f = catalogFixture();
+		try {
+			f.store.close();
+			const reopened = new SessionV3FileBackedMappingStore(f.path);
+			try {
+				const retained = reopened.provisionalOperationScoped(f.scope, f.reserved.id)!;
+				expect(retained.state).toBe("uncertain");
+				expect(retained.lifecycle!.state).toBe("intent_prepared");
+				const bytes = readFileSync(f.path),
+					inode = statSync(f.path).ino;
+				expect(() =>
+					reopened.advanceManagedCatalogScoped(
+						f.scope,
+						f.reserved,
+						managedLifecycleEvidenceHash(retained.lifecycle!),
+						transitionManagedLifecycleEvidence(retained.lifecycle!, "invoking"),
+					),
+				).toThrow("pending original admission");
+				expect(
+					reopened.advanceManagedCatalogScoped(
+						f.scope,
+						f.reserved,
+						managedLifecycleEvidenceHash(retained.lifecycle!),
+						retained.lifecycle!,
+					),
+				).toEqual(retained);
+				expect(readFileSync(f.path).equals(bytes)).toBe(true);
+				expect(statSync(f.path).ino).toBe(inode);
+			} finally {
+				reopened.close();
+			}
+		} finally {
+			f.close();
+		}
+	});
+
+	test.each([
+		[false, "intent_prepared"],
+		[true, "intent_prepared"],
+		[false, "invoking"],
+		[true, "invoking"],
+		[false, "acknowledged_unproven"],
+		[true, "acknowledged_unproven"],
+	] as const)(
+		"catalog cleanup retains independent request identity without serving binding proof=%s state=%s",
+		(proven, state) => {
+			const f = catalogFixture();
+			try {
+				const { acknowledged } = f.acknowledge(proven);
+				let pending = f.cleanup();
+				if (state !== "intent_prepared") pending = f.advanceCleanup("invoking");
+				if (state === "acknowledged_unproven")
+					pending = f.advanceCleanup(state, {
+						closeAcknowledgement: {
+							sessionId: acknowledged.sessionId,
+							generation: acknowledged.generation,
+							observedAt: new Date().toISOString(),
+						},
+					});
+				expect(isManagedCatalogProvisional(pending)).toBe(true);
+				expect(pending.lifecycle!.state).toBe(proven ? "closing" : "acknowledged_unproven");
+				expect(pending.cleanup!.lifecycle.state).toBe(state);
+				expect(pending.cleanup!.lifecycle.source).toEqual(acknowledged);
+				expect(pending.cleanup!.lifecycle.requestKey).not.toBe(pending.lifecycle!.requestKey);
+				expect(pending.sessionId).toBeUndefined();
+				expect(pending.managedAuthority).toBeUndefined();
+				expect(pending.result).toBeUndefined();
+				expect(f.store.getScoped(f.scope)).toBeUndefined();
+				const bytes = readFileSync(f.path);
+				const copied = copyProvisionalOperation(pending);
+				Object.assign(copied.cleanup!.lifecycle.source!, { generation: 99 });
+				expect(pending.cleanup!.lifecycle.source!.generation).toBe(8);
+				expect(() =>
+					f.store.attachProvisionalOperationScoped(f.scope, f.reserved.id, {
+						sessionId: acknowledged.sessionId,
+						managedAuthority: acknowledged,
+					}),
+				).toThrow("cannot attach");
+				expect(() =>
+					f.store.recordLifecycleEvidenceScoped(f.scope, f.reserved.id, pending.detail!, pending.lifecycle!),
+				).toThrow("operation-scoped owner");
+				expect(readFileSync(f.path).equals(bytes)).toBe(true);
+				f.store.close();
+				const reopened = new SessionV3FileBackedMappingStore(f.path);
+				const retained = reopened.provisionalOperationScoped(f.scope, f.reserved.id)!;
+				expect(retained.state).toBe("uncertain");
+				expect(retained.cleanup!.state).toBe("uncertain");
+				expect(retained.cleanup!.lifecycle).toEqual(
+					state === "intent_prepared"
+						? pending.cleanup!.lifecycle
+						: transitionManagedLifecycleEvidence(
+								pending.cleanup!.lifecycle,
+								"uncertain",
+								{},
+								pending.cleanup!.lifecycle.recordedAt,
+							),
+				);
+				expect(retained.lifecycle!.state).toBe("uncertain");
+				expect(() => reopened.assertServingReady()).toThrow("unfinished provisional");
+				if (state === "intent_prepared") {
+					const bytes = readFileSync(f.path),
+						inode = statSync(f.path).ino;
+					expect(() =>
+						reopened.advanceManagedCatalogCleanupScoped(
+							f.scope,
+							pending,
+							managedLifecycleEvidenceHash(retained.cleanup!.lifecycle),
+							transitionManagedLifecycleEvidence(retained.cleanup!.lifecycle, "invoking"),
+						),
+					).toThrow("pending original admission");
+					expect(
+						reopened.advanceManagedCatalogCleanupScoped(
+							f.scope,
+							pending,
+							managedLifecycleEvidenceHash(retained.cleanup!.lifecycle),
+							retained.cleanup!.lifecycle,
+						),
+					).toEqual(retained);
+					expect(readFileSync(f.path).equals(bytes)).toBe(true);
+					expect(statSync(f.path).ino).toBe(inode);
+				}
+				expect(() =>
+					reopened.reserveManagedCatalogCleanupScoped(
+						f.scope,
+						f.reserved,
+						managedLifecycleEvidenceHash(retained.lifecycle!),
+						{
+							operationId: "retry-close",
+							requestKey: "retry-key",
+							payloadHash: "e".repeat(64),
+						},
+					),
+				).toThrow("original acknowledged");
+				reopened.close();
+			} finally {
+				f.close();
+			}
+		},
+	);
+
+	test("catalog passive create receipt is purpose-bound and cannot own cleanup or publication", () => {
+		const f = catalogFixture();
+		try {
+			const admitted = f.advance("invoking");
+			const acknowledged = { ...f.prepared, sessionId: "late-created", generation: 3 };
+			const { purpose: _purpose, ...ordinary } = admitted;
+			expect(managedProvisionalCreateAdmissionHash(admitted)).not.toBe(
+				managedProvisionalCreateAdmissionHash(ordinary),
+			);
+			f.advance("uncertain");
+			const receipt = createManagedLateCreateAcknowledgement(admitted, acknowledged);
+			f.store.recordLateCreateAcknowledgementScoped(f.scope, admitted, receipt);
+			const retained = f.store.provisionalOperationScoped(f.scope, f.reserved.id)!;
+			expect(retained.lateCreateAcknowledgement).toEqual(receipt);
+			expect(retained.cleanup).toBeUndefined();
+			expect(() => f.cleanup()).toThrow("original acknowledged");
+			expect(() =>
+				f.store.publishProvisionalOperationScoped(f.scope, f.reserved, {
+					chatId: f.scope.chatId,
+					principalId: f.scope.principalId,
+					projectId: f.prepared.projectId,
+					sessionId: acknowledged.sessionId,
+					managedAuthority: acknowledged,
+					rawFrameCursor: 0,
+					eventCursor: 0,
+					operationId: f.reserved.id,
+				}),
+			).toThrow("cannot publish");
+			expect(f.store.getScoped(f.scope)).toBeUndefined();
+		} finally {
+			f.close();
+		}
+	});
+
+	test("catalog cleanup schema rejects foreign source, aliases, forged completion and ordinary owners", () => {
+		const f = catalogFixture();
+		try {
+			f.acknowledge(true);
+			f.cleanup();
+			const document = parseSessionAuthorityV3Document(readFileSync(f.path))!;
+			const original = document.provisionalOperations[0]!;
+			expect(inheritedValid(document)).toBe(true);
+			for (const patch of [
+				{ purpose: undefined },
+				{ purpose: "other" },
+				{ state: "complete", completedAt: new Date().toISOString() },
+				{ sessionId: "catalog-created" },
+				{ result: {} },
+				{ lateCreateAcknowledgement: {} },
+				{ cleanup: { ...original.cleanup, id: original.id } },
+				{ cleanup: { ...original.cleanup, ingressId: original.ingressId } },
+				{ cleanup: { ...original.cleanup, result: {} } },
+				{
+					cleanup: {
+						...original.cleanup,
+						lifecycle: {
+							...original.cleanup!.lifecycle,
+							source: { ...original.cleanup!.lifecycle.source, generation: 99 },
+						},
+					},
+				},
+				{ cleanup: { ...original.cleanup, startedAt: "2099-01-01T00:00:00.000Z" } },
+			]) {
+				const invalid = { ...document, provisionalOperations: [{ ...original, ...patch }] };
+				expect(isSessionAuthorityV3Document(invalid)).toBe(false);
+				expect(parseSessionAuthorityV3Document(JSON.stringify(invalid))).toBeUndefined();
+				expect(inheritedValid(invalid as SessionAuthorityV3Document)).toBe(false);
+			}
+			const duplicate = { ...original, id: "second", ingressId: "second" };
+			expect(isSessionAuthorityV3Document({ ...document, provisionalOperations: [original, duplicate] })).toBe(
+				false,
+			);
+			const before = readFileSync(f.path);
+			expect(() =>
+				f.store.reserveProvisionalOperationScoped(f.scope, {
+					id: "catalog-close",
+					ingressId: "other",
+					kind: "create",
+					chatId: f.scope.chatId,
+					projectId: f.prepared.projectId,
+				}),
+			).toThrow();
+			expect(readFileSync(f.path).equals(before)).toBe(true);
+		} finally {
+			f.close();
+		}
+	});
+
 	function initialCreateReceiptFixture() {
 		const prepared = lifecyclePreparedAuthority(authority("chat-a", "project-a", "unused"));
 		const lifecycle = transitionManagedLifecycleEvidence(
