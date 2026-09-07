@@ -10,11 +10,14 @@ import {
 	type AdapterManagedBootstrapAttempt,
 	startAdapterSessionAuthorityV3Activation,
 } from "../src/adapter-managed-bootstrap";
+import { ManagedBootstrapAdmissionOwner } from "../src/adapter-managed-bootstrap-admission";
 import { ManagedOperationDeadline } from "../src/gjc/managed-operation-deadline";
 import { ManagedSdkRuntime } from "../src/gjc/managed-sdk-runtime";
 import { parseSessionAuthorityV3Document, type SessionAuthorityV3Document } from "../src/gjc/session-authority-v3";
+import { SqliteProjectRegistrationStore } from "../src/projects/registration-store";
 import { RuntimeSingletonLock } from "../src/runtime-singleton-lock";
-import { type WorkspaceLease, WorkspaceLeaseManager, workspaceLeaseId } from "../src/security/workspace-lease";
+import { UserWorkspaceRegistry } from "../src/security/user-workspace";
+import { WorkspaceLeaseManager } from "../src/security/workspace-lease";
 import { apiKey, providerResponse, writeLocalProviderConfig } from "./gjc-release-compat-fixtures";
 import { promptAndAwaitTerminal } from "./gjc-release-compat-runtime";
 import { connectFor, publicLifecycle, startPublicSdk, stopPublicSdk } from "./gjc-release-compat-sdk";
@@ -36,7 +39,10 @@ if (process.argv[2] === "--replay") {
 
 async function probe(): Promise<void> {
 	const root = await mkdtemp(join(tmpdir(), "gjc-saved-resume-compat-"));
-	const workspace = join(root, "workspace");
+	const actor = { id: "saved-resume-compat", namespace: "openwebui-gjc-adapter" } as const;
+	const workspace = process.argv.includes("--bootstrap")
+		? (await new UserWorkspaceRegistry({ stateRoot: join(root, "adapter-state") }).open(actor.id)).root
+		: join(root, "workspace");
 	const agentDir = join(workspace, ".gjc", "agent");
 	await mkdir(workspace, { recursive: true });
 	const provider = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: providerResponse });
@@ -44,7 +50,6 @@ async function probe(): Promise<void> {
 	process.env.GJC_CODING_AGENT_DIR = agentDir;
 	process.env.GJC_COMPAT_LOCAL_API_KEY = apiKey;
 	const budget = new ManagedOperationDeadline(90_000, "saved resume compatibility");
-	const actor = { id: "saved-resume-compat", namespace: "openwebui-gjc-adapter" } as const;
 	const observations: { name: string; value: unknown }[] = [];
 	const errors: unknown[] = [];
 	const report: Record<string, unknown> = {
@@ -325,7 +330,7 @@ async function bootstrapProbe(
 	acknowledge: (identity: { sessionId: string; generation: number }) => void,
 ): Promise<void> {
 	const stateRoot = join(root, "adapter-state");
-	await mkdir(stateRoot);
+	await mkdir(stateRoot, { recursive: true });
 	const sourcePath = join(stateRoot, "authority.json");
 	const unscoped = process.argv.includes("--bootstrap-unscoped");
 	const chatId = unscoped ? "saved-chat" : JSON.stringify([principalId, "saved-chat"]);
@@ -404,7 +409,8 @@ async function bootstrapProbe(
 	});
 	await writeFile(sourcePath, original);
 	const lock = await RuntimeSingletonLock.acquire(stateRoot);
-	let lease: WorkspaceLease | undefined;
+	let projectStore: SqliteProjectRegistrationStore | undefined;
+	let admissionOwner: ManagedBootstrapAdmissionOwner | undefined;
 	let admissionReleased = false;
 	const stagePath = join(
 		stateRoot,
@@ -415,6 +421,17 @@ async function bootstrapProbe(
 	let initialGraph: SessionAuthorityV3Document | undefined;
 	let attempt: AdapterManagedBootstrapAttempt | undefined;
 	try {
+		projectStore = new SqliteProjectRegistrationStore(join(stateRoot, "projects.sqlite"));
+		const registry = new UserWorkspaceRegistry({ stateRoot });
+		const leaseManager = new WorkspaceLeaseManager({ stateRoot });
+		const sourceRoot = join(root, "source-project");
+		await mkdir(sourceRoot);
+		projectStore.linkProject(
+			{ id: "probe-project", name: "probe", cwd: sourceRoot, allowedRoot: root, createdAt: new Date(stamp) },
+			"admin",
+		);
+		admissionOwner = new ManagedBootstrapAdmissionOwner({ projectStore, registry, leaseManager, leaseMs: 30_000 });
+		const owner = admissionOwner;
 		attempt = startAdapterSessionAuthorityV3Activation({
 			locations: { agentDir, stateRoot },
 			sourcePath,
@@ -432,45 +449,16 @@ async function bootstrapProbe(
 						(await readFile(sourcePath, "utf8")) !== original
 					)
 						throw new Error("Probe admission lacks its original staged authority.");
-					await request.assertCurrent();
-					request.remaining();
-					request.signal.throwIfAborted();
-					lease = await new WorkspaceLeaseManager({ stateRoot }).acquire({
-						safeKey: createHash("sha256").update(principalId).digest("hex"),
-						holderId: "public-bootstrap-probe",
-						operation: "migration",
-						leaseMs: 30_000,
-					});
+					await owner.admit(request);
 				},
 				release: async () => {
 					if (runtime !== undefined && runtime.state !== "stopped")
 						throw new Error("Probe runtime has not stopped.");
-					await lease?.release();
+					await owner.release();
 					admissionReleased = true;
 				},
 			},
-			authority: {
-				resolve: async (owner, projectId) =>
-					owner !== principalId || projectId !== "probe-project" || lease === undefined || admissionReleased
-						? undefined
-						: {
-								project: {
-									id: projectId,
-									name: "probe",
-									cwd: workspace,
-									allowedRoot: workspace,
-									createdAt: new Date(stamp),
-								},
-								canonicalWorkspace: workspace,
-								leaseId: workspaceLeaseId(lease.reference),
-								epoch: "exclusive-probe-epoch",
-								assertFence: async () => {
-									budget.remaining();
-									await lease!.assertFence();
-								},
-								assertCurrent: () => lease!.assertFenceSync(),
-							},
-			},
+			authority: owner,
 			createRuntime: (directory, deps) => {
 				initialGraph = parseSessionAuthorityV3Document(readFileSync(stagePath));
 				runtime = new ManagedSdkRuntime({
@@ -515,6 +503,9 @@ async function bootstrapProbe(
 				record.journal[0].result.managedAuthority !== undefined ||
 				record.journal[0].result.historicalBinding === undefined ||
 				record.journal.at(-1)?.lifecycle?.state !== "active_generation_proven" ||
+				record.managedAuthority.canonicalWorkspace !== workspace ||
+				projectStore.getProject("probe-project")?.cwd !== sourceRoot ||
+				!admissionReleased ||
 				runtime?.state !== "stopped"
 			)
 				throw new Error("Bootstrap failed history, proof, or runtime isolation invariants.");
@@ -527,6 +518,8 @@ async function bootstrapProbe(
 					terminalReassignmentHistoryPreserved: terminalHistory,
 					unscopedOwnerResolved: unscoped,
 					postStageAdmissionReleased: admissionReleased,
+					registeredWorkspaceAdmission: true,
+					sourceProjectUnchanged: projectStore.getProject("probe-project")?.cwd === sourceRoot,
 					bootstrapRuntimeStopped: true,
 					migrationOperationCount: record.journal.length - 1,
 				},
@@ -536,6 +529,8 @@ async function bootstrapProbe(
 		}
 	} finally {
 		await attempt?.settled;
+		await admissionOwner?.release();
+		projectStore?.close();
 		await lock.release();
 	}
 }

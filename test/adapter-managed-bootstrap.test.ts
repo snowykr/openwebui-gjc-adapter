@@ -8,6 +8,7 @@ import { dirname, join } from "node:path";
 import type { lifecycle, router } from "@gajae-code/coding-agent/sdk";
 import {
 	type AdapterManagedBootstrapInput,
+	type ManagedBootstrapAuthority,
 	startAdapterSessionAuthorityV3Activation,
 } from "../src/adapter-managed-bootstrap";
 import { ManagedSdkRuntime, type ManagedSdkRuntimeDeps } from "../src/gjc/managed-sdk-runtime";
@@ -42,6 +43,8 @@ async function fixture(
 		configuredOwner?: string;
 		explicitOwner?: string;
 		stopAtPrepared?: boolean;
+		cleanupPending?: boolean;
+		cleanupDuringFence?: boolean;
 		transformSource?: (source: SessionAuthorityV2Document) => SessionAuthorityV2Document;
 	} = {},
 ) {
@@ -154,8 +157,13 @@ async function fixture(
 									await Promise.resolve();
 									stale = true;
 								}
+								if (options.cleanupDuringFence) {
+									await Promise.resolve();
+									options.cleanupPending = true;
+								}
 							},
 							assertCurrent: () => {
+								if (options.cleanupPending) throw new Error("Workspace cleanup is pending");
 								if (!live) throw new Error("lease revoked at commit");
 							},
 						},
@@ -331,6 +339,167 @@ function withReassignment(
 }
 
 describe("adapter managed bootstrap composition", () => {
+	test.each(["before", "during"] as const)(
+		"bootstrap rejects cleanup-pending authority %s the asynchronous fence before historical SDK effects",
+		async phase => {
+			const f = await fixture({ cleanupPending: phase === "before", cleanupDuringFence: phase === "during" });
+			try {
+				const attempt = startAdapterSessionAuthorityV3Activation(f.input);
+				await expect(attempt.result).rejects.toThrow("bootstrap failed");
+				await attempt.settled;
+				expect(f.calls).not.toContain("list");
+				expect(f.calls).not.toContain("resume");
+				expect(f.calls).not.toContain("reconcile");
+				expect(await readFile(f.sourcePath, "utf8")).toBe(f.original);
+				expect(await Bun.file(`${f.sourcePath}.v3-active.json`).exists()).toBe(false);
+			} finally {
+				await f.cleanup();
+			}
+		},
+	);
+
+	test("bootstrap retains original authority methods and receivers across awaited lease validation", async () => {
+		const f = await fixture();
+		const resolveAuthority = f.input.authority.resolve.bind(f.input.authority);
+		let fences = 0;
+		let currentChecks = 0;
+		f.input.authority.resolve = async (principalId, projectId) => {
+			const original = (await resolveAuthority(principalId, projectId))!;
+			const retained: ManagedBootstrapAuthority = {
+				...original,
+				async assertFence() {
+					expect(this).toBe(retained);
+					fences += 1;
+					await original.assertFence();
+					this.assertCurrent = () => {
+						throw new Error("replacement assertion must not run");
+					};
+					Reflect.set(this, "leaseId", "replacement lease");
+				},
+				assertCurrent() {
+					expect(this).toBe(retained);
+					currentChecks += 1;
+					original.assertCurrent();
+				},
+			};
+			return retained;
+		};
+		try {
+			const attempt = startAdapterSessionAuthorityV3Activation(f.input);
+			const result = await attempt.result;
+			await attempt.settled;
+			expect(result.status).toBe("activated");
+			if (result.status === "activated") result.store.close();
+			expect(currentChecks).toBeGreaterThan(fences);
+			expect(f.evidence()?.preparedAuthority.leaseId).toBe("lease");
+			expect(f.calls.filter(call => call === "resume")).toHaveLength(1);
+		} finally {
+			await f.cleanup();
+		}
+	});
+
+	test("historical resume consumes admission only at the single synchronous dispatch boundary", async () => {
+		const f = await fixture({
+			onResume: () => {
+				const operation = f.graph().mappings[0]!.journal.at(-1)!;
+				expect(f.deps().historicalResumeFenceSync!(operation.id, operation.lifecycle!)).toBe(false);
+			},
+		});
+		const createRuntime = f.input.createRuntime!;
+		let validations = 0;
+		Reflect.set(f.input, "createRuntime", (agentDir: string, deps: ManagedSdkRuntimeDeps) =>
+			createRuntime(agentDir, {
+				...deps,
+				historicalResumeFence: async (id, evidence) => {
+					for (let attempt = 0; attempt < 2; attempt += 1) {
+						expect(await deps.historicalResumeFence!(id, evidence)).toBe(true);
+						validations += 1;
+					}
+					return true;
+				},
+			}),
+		);
+		try {
+			const attempt = startAdapterSessionAuthorityV3Activation(f.input);
+			const result = await attempt.result;
+			await attempt.settled;
+			expect(result.status).toBe("activated");
+			if (result.status === "activated") result.store.close();
+			expect(validations).toBe(2);
+			expect(f.calls.filter(call => call === "resume")).toHaveLength(1);
+		} finally {
+			await f.cleanup();
+		}
+	});
+
+	test.each(["stage", "manifest", "checkpoint", "snapshot"] as const)(
+		"historical boundaries reject identical-byte %s replacement before effects",
+		async changed => {
+			for (const phase of ["list", "resume", "disclosure"] as const) {
+				const f = await fixture();
+				const path =
+					changed === "stage"
+						? f.stagePath
+						: join(
+								dirname(f.stagePath),
+								changed === "manifest"
+									? "source-manifest.json"
+									: changed === "checkpoint"
+										? "historical-stage.json"
+										: "source.v2.json",
+							);
+				let replaced = false;
+				let selections = 0;
+				const replace = () => {
+					const bytes = readFileSync(path);
+					renameSync(path, `${path}.retained`);
+					writeFileSync(path, bytes);
+					replaced = true;
+				};
+				const createRuntime = f.input.createRuntime!;
+				Reflect.set(f.input, "createRuntime", (agentDir: string, deps: ManagedSdkRuntimeDeps) =>
+					createRuntime(agentDir, {
+						...deps,
+						historicalSelectionFence: async selection => {
+							const allowed = await deps.historicalSelectionFence!(selection);
+							selections += 1;
+							if ((phase === "list" && selections === 1) || (phase === "disclosure" && selections === 2))
+								queueMicrotask(replace);
+							return allowed;
+						},
+						historicalResumeFence: async (id, evidence) => {
+							const allowed = await deps.historicalResumeFence!(id, evidence);
+							if (phase === "resume") queueMicrotask(replace);
+							return allowed;
+						},
+					}),
+				);
+				try {
+					const attempt = startAdapterSessionAuthorityV3Activation(f.input);
+					await expect(attempt.result).rejects.toThrow("bootstrap failed");
+					if (phase === "resume") {
+						await expect(attempt.settled).rejects.toThrow();
+						expect(await Bun.file(`${f.sourcePath}.lock`).exists()).toBe(true);
+					} else {
+						await attempt.settled;
+					}
+					expect(replaced).toBe(true);
+					expect(f.calls.filter(call => call === "list")).toHaveLength(phase === "list" ? 0 : 1);
+					expect(f.calls).not.toContain("resume");
+					expect(f.calls).not.toContain("reconcile");
+					expect(
+						f.graph().mappings[0]!.journal.filter(operation => operation.lifecycle !== undefined),
+					).toHaveLength(phase === "resume" ? 1 : 0);
+					expect(await readFile(f.sourcePath, "utf8")).toBe(f.original);
+					expect(await Bun.file(`${f.sourcePath}.v3-active.json`).exists()).toBe(false);
+				} finally {
+					if (replaced) renameSync(`${path}.retained`, path);
+					await f.cleanup();
+				}
+			}
+		},
+	);
+
 	test("bootstrap snapshots caller paths, owner callbacks and original receipt scope before admission", async () => {
 		const f = await fixture({
 			onResume: () => {

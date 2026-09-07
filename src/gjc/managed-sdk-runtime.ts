@@ -119,11 +119,13 @@ export interface ManagedSdkRuntimeDeps {
 	readonly preparedTenantFence?: (authority: ManagedPreparedTurnAuthority) => boolean | Promise<boolean>;
 	/** Dedicated generation-free selection admission; absence denies historical listing. */
 	readonly historicalSelectionFence?: (selection: ManagedSdkHistoricalSelection) => boolean | Promise<boolean>;
-	/** Consumes initial invoking admission against durable operation evidence and the current attempt lease. */
+	readonly historicalSelectionFenceSync?: (selection: ManagedSdkHistoricalSelection) => boolean;
+	/** Validates initial invoking admission; synchronous dispatch consumes it exactly once. */
 	readonly historicalResumeFence?: (
 		operationId: string,
 		evidence: ManagedLifecycleEvidence,
 	) => boolean | Promise<boolean>;
+	readonly historicalResumeFenceSync?: (operationId: string, evidence: ManagedLifecycleEvidence) => boolean;
 	/** Independent canonical catalog ownership. Neither fence grants active routing authority. */
 	readonly catalogFence?: (
 		reference: ManagedSdkCatalogReference,
@@ -289,6 +291,8 @@ export class ManagedSdkRuntime {
 	readonly #preparedTenantFence: ManagedSdkRuntimeDeps["preparedTenantFence"];
 	readonly #historicalSelectionFence: ManagedSdkRuntimeDeps["historicalSelectionFence"];
 	readonly #historicalResumeFence: ManagedSdkRuntimeDeps["historicalResumeFence"];
+	readonly #historicalSelectionFenceSync: ManagedSdkRuntimeDeps["historicalSelectionFenceSync"];
+	readonly #historicalResumeFenceSync: ManagedSdkRuntimeDeps["historicalResumeFenceSync"];
 	readonly #catalogFence: ManagedSdkRuntimeDeps["catalogFence"];
 	readonly #catalogFenceSync: ManagedSdkRuntimeDeps["catalogFenceSync"];
 	readonly #drainTimeoutMs: number;
@@ -331,8 +335,10 @@ export class ManagedSdkRuntime {
 		const deps = options.deps ?? {};
 		this.#tenantFence = deps.tenantFence;
 		this.#preparedTenantFence = deps.preparedTenantFence;
-		this.#historicalSelectionFence = deps.historicalSelectionFence;
-		this.#historicalResumeFence = deps.historicalResumeFence;
+		this.#historicalSelectionFence = deps.historicalSelectionFence?.bind(deps);
+		this.#historicalResumeFence = deps.historicalResumeFence?.bind(deps);
+		this.#historicalSelectionFenceSync = deps.historicalSelectionFenceSync?.bind(deps);
+		this.#historicalResumeFenceSync = deps.historicalResumeFenceSync?.bind(deps);
 		this.#catalogFence = deps.catalogFence?.bind(deps);
 		this.#catalogFenceSync = deps.catalogFenceSync?.bind(deps);
 		this.#drainTimeoutMs = finiteTimeout(deps.drainTimeoutMs, DEFAULT_OPERATION_TIMEOUT_MS);
@@ -379,9 +385,14 @@ export class ManagedSdkRuntime {
 		assertHistoricalSelection(value);
 		freezeHistoricalInput(value);
 		const fence = this.#historicalSelectionFence;
+		const syncFence = this.#historicalSelectionFenceSync;
 		return this.#track(timeoutMs, async budget => {
 			if (fence === undefined || !(await fence(value)))
 				throw new Error("Historical selection authority fence was lost or unavailable.");
+			budget.remaining();
+			this.#assertOwner();
+			if (syncFence?.(value) !== true)
+				throw new Error("Historical selection synchronous authority was lost or unavailable.");
 			budget.remaining();
 			this.#assertOwner();
 			const outcome = await this.#lifecycle.list({
@@ -411,6 +422,10 @@ export class ManagedSdkRuntime {
 				);
 			const saved = structuredClone(result.savedSession);
 			if (!(await fence(value))) throw new Error("Historical selection authority fence was lost.");
+			budget.remaining();
+			this.#assertOwner();
+			if (syncFence?.(value) !== true)
+				throw new Error("Historical selection synchronous authority was lost or unavailable.");
 			budget.remaining();
 			this.#assertOwner();
 			return saved;
@@ -456,9 +471,14 @@ export class ManagedSdkRuntime {
 			sessionIdentity: Object.freeze({ dev, ino, size, mtimeMs, mtimeNs, sha256 }),
 		});
 		const fence = this.#historicalResumeFence;
+		const syncFence = this.#historicalResumeFenceSync;
 		return this.#track(timeoutMs, async budget => {
 			if (fence === undefined || !(await fence(operationId, value)))
 				throw new Error("Historical resume authority fence was lost or unavailable.");
+			budget.remaining();
+			this.#assertOwner();
+			if (syncFence?.(operationId, value) !== true)
+				throw new Error("Historical resume synchronous authority was lost or unavailable.");
 			budget.remaining();
 			this.#assertOwner();
 			// No post-effect fence, attachment proof or retry may delay the owner's durable acknowledgement.

@@ -441,8 +441,7 @@ export class V3FileBackedSessionMappingStore extends SessionMappingStore {
 	}
 	bootstrapStage(access: SessionAuthorityV3BootstrapAccess): SessionAuthorityV3BootstrapStage {
 		const path = this.#authority.filePath;
-		const assertCurrent = () => assertBootstrapAccessCurrent(access, path);
-		assertCurrent();
+		assertBootstrapAccessCurrent(access, path);
 		const issuedReceipts = new Set<string>();
 		const admittedInvocations = new Map<string, SessionOperation>();
 		let stageIdentity = lstatSync(path, { bigint: true });
@@ -459,12 +458,16 @@ export class V3FileBackedSessionMappingStore extends SessionMappingStore {
 			)
 				throw new Error("Historical receipt staged authority identity changed.");
 		};
+		const assertCurrent = () => {
+			const manifestDigest = assertBootstrapAccessCurrent(access, path);
+			assertStageIdentity();
+			return manifestDigest;
+		};
 		const retainInvocation = (operation: SessionOperation): SessionAuthorityV3InvocationReceipt => {
 			assertCurrent();
 			const original = structuredClone(operation);
 			if (!isDeepStrictEqual(admittedInvocations.get(original.id), original))
 				throw new Error("Historical receipt requires this live attempt's original invocation.");
-			assertStageIdentity();
 			const initial = original.lifecycle;
 			if (
 				(original.state !== "pending" && original.state !== "uncertain") ||

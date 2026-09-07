@@ -16,6 +16,11 @@ export interface AdapterServerOptions {
 	runtimeRoot: string;
 	runtimeLock: RuntimeSingletonLock;
 	managedSdkRuntime?: ManagedSdkRuntimeOwnership;
+	/**
+	 * Releases runtime-dependent resources only after actual managed runtime disposal succeeds
+	 * (or when no runtime is owned), before singleton release. A bounded stop is not disposal.
+	 * Disposal rejection skips this callback; any cleanup failure retains singleton ownership.
+	 */
 	shutdownCleanup?: () => void | Promise<void>;
 	checks?: readonly AdapterHealthCheck[];
 	readiness?: AdapterReadinessOptions;
@@ -72,15 +77,19 @@ export async function startAdapterServer(options: AdapterServerOptions): Promise
 			}
 			for (const result of await Promise.allSettled(concurrentStops))
 				if (result.status === "rejected") failures.push(result.reason);
+			let disposed = false;
 			try {
 				await options.managedSdkRuntime?.dispose();
+				disposed = true;
 			} catch (error) {
 				failures.push(error);
 			}
-			try {
-				await options.shutdownCleanup?.();
-			} catch (error) {
-				failures.push(error);
+			if (disposed) {
+				try {
+					await options.shutdownCleanup?.();
+				} catch (error) {
+					failures.push(error);
+				}
 			}
 			if (failures.length === 0) {
 				try {
@@ -105,15 +114,19 @@ export async function startAdapterServer(options: AdapterServerOptions): Promise
 		} catch (stopError) {
 			failures.push(stopError);
 		}
+		let disposed = false;
 		try {
 			await options.managedSdkRuntime?.dispose();
+			disposed = true;
 		} catch (disposeError) {
 			failures.push(disposeError);
 		}
-		try {
-			await options.shutdownCleanup?.();
-		} catch (cleanupError) {
-			failures.push(cleanupError);
+		if (disposed) {
+			try {
+				await options.shutdownCleanup?.();
+			} catch (cleanupError) {
+				failures.push(cleanupError);
+			}
 		}
 		if (failures.length === 1) {
 			try {

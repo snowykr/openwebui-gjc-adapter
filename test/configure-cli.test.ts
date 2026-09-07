@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import {
 	chmodSync,
 	existsSync,
@@ -14,6 +14,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
+import * as adapterOptions from "../src/adapter-server-options";
 import { buildInstalledAdapterServerOptions, runCli } from "../src/cli";
 import { cleanupUnstartedAdapter } from "../src/cli-startup-cleanup";
 import type { AdapterConfig } from "../src/config";
@@ -31,6 +32,7 @@ import {
 	writeInstalledConfig,
 } from "../src/configure/private-config";
 import { renderExistingSystemdUnit } from "../src/configure/systemd";
+import { RuntimeSingletonLock } from "../src/runtime-singleton-lock";
 import type { AdapterServerOptions } from "../src/server";
 import { writeDirectV3Authority } from "./cli-fixtures";
 
@@ -269,6 +271,225 @@ describe("configure CLI grammar and acknowledgements", () => {
 		);
 		expect(events).toEqual(["runner", "cleanup", "lock"]);
 	});
+	test.each(["runner", "dispose", "cleanup"] as const)(
+		"configured startup retains actual runtime exclusion after %s fails",
+		async failing => {
+			const t = tempPath();
+			const lock = await RuntimeSingletonLock.acquire(t.directory);
+			const events: string[] = [];
+			const original = new Error("configured starter failed");
+			const failure = new Error(`${failing} failed`);
+			const effect = async (phase: string) => {
+				events.push(phase);
+				if (phase === failing) throw failure;
+			};
+			const options = {
+				routes: { runner: { stop: () => effect("runner") } },
+				managedSdkRuntime: { dispose: () => effect("dispose") },
+				shutdownCleanup: () => effect("cleanup"),
+				runtimeLock: lock,
+			} as unknown as AdapterServerOptions;
+			try {
+				const error = await cleanupUnstartedAdapter(options, original).catch(error => error);
+				expect(error).toBeInstanceOf(AggregateError);
+				expect(error.errors).toContain(original);
+				expect(error.errors).toContain(failure);
+				expect(events).toContain("dispose");
+				if (failing === "dispose") expect(events).not.toContain("cleanup");
+				await expect(RuntimeSingletonLock.acquire(t.directory)).rejects.toThrow("already owned");
+			} finally {
+				await lock.release();
+				t.cleanup();
+			}
+		},
+	);
+	test("configured startup waits for actual runtime disposal before resources and lock release", async () => {
+		const t = tempPath();
+		const lock = await RuntimeSingletonLock.acquire(t.directory);
+		const disposal = Promise.withResolvers<void>(),
+			entered = Promise.withResolvers<void>();
+		const events: string[] = [];
+		const original = new Error("starter failed");
+		const options = {
+			routes: {
+				runner: {
+					stop: async () => {
+						events.push("runner");
+					},
+				},
+			},
+			managedSdkRuntime: {
+				dispose: async () => {
+					entered.resolve();
+					await disposal.promise;
+					events.push("disposed");
+				},
+			},
+			shutdownCleanup: () => {
+				events.push("cleanup");
+			},
+			runtimeLock: lock,
+		} as unknown as AdapterServerOptions;
+		try {
+			const pending = cleanupUnstartedAdapter(options, original).catch(error => error);
+			await Promise.race([entered.promise, pending]);
+			expect(events).toEqual(["runner"]);
+			await expect(RuntimeSingletonLock.acquire(t.directory)).rejects.toThrow("already owned");
+			disposal.resolve();
+			expect(await pending).toBe(original);
+			expect(events).toEqual(["runner", "disposed", "cleanup"]);
+			const replacement = await RuntimeSingletonLock.acquire(t.directory);
+			await replacement.release();
+		} finally {
+			disposal.resolve();
+			await lock.release();
+			t.cleanup();
+		}
+	});
+	test.each(["runner", "cleanup"] as const)(
+		"configured startup waits for deferred %s before later cleanup stages and lock release",
+		async phase => {
+			const t = tempPath();
+			const lock = await RuntimeSingletonLock.acquire(t.directory);
+			const gate = Promise.withResolvers<void>();
+			const entered = Promise.withResolvers<void>();
+			const events: string[] = [];
+			const original = new Error("starter failed");
+			const originalRelease = lock.release.bind(lock);
+			const release = spyOn(lock, "release").mockImplementation(async () => {
+				events.push("lock");
+				await originalRelease();
+			});
+			const options = {
+				routes: {
+					runner: {
+						stop: async () => {
+							events.push("runner-start");
+							if (phase === "runner") {
+								entered.resolve();
+								await gate.promise;
+							}
+							events.push("runner-end");
+						},
+					},
+				},
+				managedSdkRuntime: {
+					dispose: async () => {
+						events.push("dispose");
+					},
+				},
+				shutdownCleanup: async () => {
+					events.push("cleanup-start");
+					if (phase === "cleanup") {
+						entered.resolve();
+						await gate.promise;
+					}
+					events.push("cleanup-end");
+				},
+				runtimeLock: lock,
+			} as unknown as AdapterServerOptions;
+			const pending = cleanupUnstartedAdapter(options, original).catch(error => error);
+			try {
+				await Promise.race([entered.promise, pending]);
+				expect(events).toEqual(
+					phase === "runner" ? ["runner-start"] : ["runner-start", "runner-end", "dispose", "cleanup-start"],
+				);
+				expect(release).not.toHaveBeenCalled();
+				await expect(RuntimeSingletonLock.acquire(t.directory)).rejects.toThrow("already owned");
+				gate.resolve();
+				expect(await pending).toBe(original);
+				expect(events).toEqual(["runner-start", "runner-end", "dispose", "cleanup-start", "cleanup-end", "lock"]);
+				expect(release).toHaveBeenCalledTimes(1);
+				const replacement = await RuntimeSingletonLock.acquire(t.directory);
+				await replacement.release();
+			} finally {
+				gate.resolve();
+				await pending;
+				release.mockRestore();
+				await originalRelease();
+				t.cleanup();
+			}
+		},
+	);
+	test("configured startup preserves the original and lock release failure after successful resource cleanup", async () => {
+		const t = tempPath();
+		const lock = await RuntimeSingletonLock.acquire(t.directory);
+		const original = new Error("starter failed");
+		const releaseFailure = new Error("lock release failed");
+		const events: string[] = [];
+		const release = spyOn(lock, "release").mockImplementation(async () => {
+			events.push("lock");
+			throw releaseFailure;
+		});
+		const options = {
+			routes: {
+				runner: {
+					stop: async () => {
+						events.push("runner");
+					},
+				},
+			},
+			managedSdkRuntime: {
+				dispose: async () => {
+					events.push("dispose");
+				},
+			},
+			shutdownCleanup: () => {
+				events.push("cleanup");
+			},
+			runtimeLock: lock,
+		} as unknown as AdapterServerOptions;
+		try {
+			const error = await cleanupUnstartedAdapter(options, original).catch(error => error);
+			expect(error).toBeInstanceOf(AggregateError);
+			expect(error.errors).toEqual([original, releaseFailure]);
+			expect(error.errors[0]).toBe(original);
+			expect(error.errors[1]).toBe(releaseFailure);
+			expect(events).toEqual(["runner", "dispose", "cleanup", "lock"]);
+			expect(release).toHaveBeenCalledTimes(1);
+			await expect(RuntimeSingletonLock.acquire(t.directory)).rejects.toThrow("already owned");
+		} finally {
+			release.mockRestore();
+			await lock.release();
+			t.cleanup();
+		}
+	});
+	test("configured startup without runtime ownership retains the lock after dependent cleanup fails", async () => {
+		const t = tempPath();
+		const lock = await RuntimeSingletonLock.acquire(t.directory);
+		const release = spyOn(lock, "release");
+		const original = new Error("starter failed");
+		const cleanupFailure = new Error("dependent cleanup failed");
+		const events: string[] = [];
+		const options = {
+			routes: {
+				runner: {
+					stop: async () => {
+						events.push("runner");
+					},
+				},
+			},
+			shutdownCleanup: async () => {
+				events.push("cleanup");
+				throw cleanupFailure;
+			},
+			runtimeLock: lock,
+		} as unknown as AdapterServerOptions;
+		try {
+			const error = await cleanupUnstartedAdapter(options, original).catch(error => error);
+			expect(error).toBeInstanceOf(AggregateError);
+			expect(error.errors).toEqual([original, cleanupFailure]);
+			expect(error.errors[0]).toBe(original);
+			expect(error.errors[1]).toBe(cleanupFailure);
+			expect(events).toEqual(["runner", "cleanup"]);
+			expect(release).not.toHaveBeenCalled();
+			await expect(RuntimeSingletonLock.acquire(t.directory)).rejects.toThrow("already owned");
+		} finally {
+			release.mockRestore();
+			await lock.release();
+			t.cleanup();
+		}
+	});
 	test("builds installed server options without contacting a temporarily unavailable OpenWebUI", async () => {
 		const t = tempPath();
 		const originalFetch = globalThis.fetch;
@@ -313,6 +534,53 @@ describe("configure CLI grammar and acknowledgements", () => {
 			t.cleanup();
 		}
 	});
+	test.each(["runner", "dispose", "cleanup"] as const)(
+		"installed initialization retains runtime ownership after %s failure",
+		async failing => {
+			const t = tempPath();
+			const lock = await RuntimeSingletonLock.acquire(t.directory);
+			const failure = new Error(`${failing} failed`);
+			const events: string[] = [];
+			const effect = async (phase: string) => {
+				events.push(phase);
+				if (phase === failing) throw failure;
+			};
+			const options = {
+				routes: { runner: { stop: () => effect("runner") } },
+				managedSdkRuntime: { dispose: () => effect("dispose") },
+				shutdownCleanup: () => effect("cleanup"),
+				runtimeLock: lock,
+			} as unknown as AdapterServerOptions;
+			const build = spyOn(adapterOptions, "buildResolvedAdapterServerOptions").mockResolvedValue(options);
+			try {
+				const error = await buildInstalledAdapterServerOptions({
+					bindHost: "127.0.0.1",
+					bindPort: 8765,
+					adapterApiToken: "adapter-token",
+					openWebUIBaseUrl: "http://openwebui.test",
+					statePath: t.directory,
+					gjcCommand: "gjc",
+					turnTimeoutMs: 1_000,
+					sessionRoot: t.directory,
+					allowedProjectRoots: [t.directory],
+					projects: [],
+				}).catch(error => error);
+				expect(build).toHaveBeenCalledTimes(1);
+				expect(error).toBeInstanceOf(AggregateError);
+				expect(error.errors[0].message).toBe(
+					"installed adapter configuration is missing runtime credentials or mode",
+				);
+				expect(error.errors).toContain(failure);
+				expect(events).toEqual(failing === "dispose" ? ["runner", "dispose"] : ["runner", "dispose", "cleanup"]);
+				await expect(RuntimeSingletonLock.acquire(t.directory)).rejects.toThrow("already owned");
+			} finally {
+				build.mockRestore();
+				await lock.release();
+				t.cleanup();
+			}
+		},
+	);
+
 	test("cleans the base runtime before rejecting incomplete installed credentials", async () => {
 		const t = tempPath();
 		const originalFetch = globalThis.fetch;

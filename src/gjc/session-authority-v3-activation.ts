@@ -446,13 +446,7 @@ async function activateUnderDeadline(
 		checkSync: () => {
 			deadline.remaining();
 			options.mutationLock.assertHeld(canonicalPath);
-			if (
-				!canonicalSnapshotMatches(canonicalPath, snapshot) ||
-				digest(readRegular(join(root, "source-manifest.json"), 16 * 1024, "immutable source manifest")) !==
-					manifestDigest
-			)
-				throw new Error("Historical bootstrap source ownership changed before mutation.");
-			retainHistoricalStage(root, historicalPath, initialHistoricalBytes, manifestDigest);
+			receiptCheck();
 		},
 	});
 	let bindings: readonly ManagedTurnAuthorityBinding[] | undefined;

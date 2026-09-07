@@ -49,6 +49,15 @@ export interface ManagedBootstrapAuthorityResolver {
 	resolve(principalId: string, projectId: string): Promise<ManagedBootstrapAuthority | undefined>;
 }
 
+function snapshotBootstrapAuthority(authority: ManagedBootstrapAuthority): ManagedBootstrapAuthority {
+	return Object.freeze({
+		...authority,
+		project: Object.freeze({ ...authority.project }),
+		assertFence: authority.assertFence.bind(authority),
+		assertCurrent: authority.assertCurrent.bind(authority),
+	});
+}
+
 export interface ManagedBootstrapCandidate {
 	readonly source: HistoricalSessionBinding;
 	readonly principalId: string;
@@ -180,8 +189,29 @@ async function activate(
 			typeof authority.assertCurrent !== "function"
 		)
 			return false;
-		await step(async () => await authority.assertFence());
-		commitAuthorities.set(prepared.requestKey, authority);
+		const retained = snapshotBootstrapAuthority(authority);
+		await step(async () => await retained.assertFence());
+		retained.assertCurrent();
+		commitAuthorities.set(prepared.requestKey, retained);
+		return true;
+	};
+	const currentAuthoritySync = (prepared: ManagedPreparedTurnAuthority): boolean => {
+		deadline.remaining();
+		if (closing || context === undefined) return false;
+		input.runtimeLock.assertOwnsPathSync(input.sourcePath);
+		lock!.assertHeld(input.sourcePath);
+		context.stage.read();
+		const authority = commitAuthorities.get(prepared.requestKey);
+		if (
+			authority === undefined ||
+			authority.project.id !== prepared.projectId ||
+			authority.canonicalWorkspace !== prepared.canonicalWorkspace ||
+			authority.project.cwd !== prepared.canonicalWorkspace ||
+			authority.leaseId !== prepared.leaseId ||
+			authority.epoch !== prepared.epoch
+		)
+			return false;
+		authority.assertCurrent();
 		return true;
 	};
 	const operationFor = (id: string): SessionAuthorityV3Operation | undefined => {
@@ -221,6 +251,17 @@ async function activate(
 				await step(() => context!.assertCurrent());
 				return currentAuthority(target.prepared);
 			},
+			historicalSelectionFenceSync: selection => {
+				if (context === undefined || selection.manifestDigest !== context.manifestDigest) return false;
+				const target = [...targets.values()].find(item =>
+					isDeepStrictEqual(item.source, selection.historicalBinding),
+				);
+				return (
+					target !== undefined &&
+					isDeepStrictEqual(target.prepared, selection.preparedAuthority) &&
+					currentAuthoritySync(target.prepared)
+				);
+			},
 			historicalResumeFence: async (id, evidence) => {
 				if (
 					!invoking.has(id) ||
@@ -230,6 +271,16 @@ async function activate(
 				)
 					return false;
 				if (!invoking.has(id) || consumed.has(id) || !isDeepStrictEqual(operationFor(id)?.lifecycle, evidence))
+					return false;
+				return true;
+			},
+			historicalResumeFenceSync: (id, evidence) => {
+				if (
+					!invoking.has(id) ||
+					consumed.has(id) ||
+					!isDeepStrictEqual(operationFor(id)?.lifecycle, evidence) ||
+					!currentAuthoritySync(evidence.preparedAuthority)
+				)
 					return false;
 				consumed.add(id);
 				return true;
@@ -361,23 +412,25 @@ async function activate(
 								source.canonicalWorkspace !== authority.canonicalWorkspace)
 						)
 							return;
-						await step(async () => await authority.assertFence());
+						const retained = snapshotBootstrapAuthority(authority);
+						await step(async () => await retained.assertFence());
+						retained.assertCurrent();
 						const identity = hash(
 							JSON.stringify([
 								current.manifestDigest,
 								source.provenance,
 								scope,
 								projectId,
-								authority.canonicalWorkspace,
+								retained.canonicalWorkspace,
 								source.sessionId,
 							]),
 						);
 						const prepared: ManagedPreparedTurnAuthority = previous?.lifecycle?.preparedAuthority ?? {
 							...scope,
 							projectId,
-							canonicalWorkspace: authority.canonicalWorkspace,
-							leaseId: authority.leaseId,
-							epoch: authority.epoch,
+							canonicalWorkspace: retained.canonicalWorkspace,
+							leaseId: retained.leaseId,
+							epoch: retained.epoch,
 							requestKey: `migration:resume:${identity}`,
 						};
 						// Receipt identity is immutable; a new lease cannot rewrite an old attempt.

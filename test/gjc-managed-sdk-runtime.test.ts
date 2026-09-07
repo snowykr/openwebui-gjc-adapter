@@ -195,6 +195,9 @@ function fixture(
 		preparedFence?: ManagedSdkRuntimeDeps["preparedTenantFence"];
 		historicalSelectionFence?: ManagedSdkRuntimeDeps["historicalSelectionFence"];
 		historicalResumeFence?: ManagedSdkRuntimeDeps["historicalResumeFence"];
+		historicalSelectionFenceSync?: ManagedSdkRuntimeDeps["historicalSelectionFenceSync"];
+		historicalResumeFenceSync?: ManagedSdkRuntimeDeps["historicalResumeFenceSync"];
+		omitHistoricalSync?: boolean;
 		catalogFence?: ManagedSdkRuntimeDeps["catalogFence"];
 		catalogFenceSync?: ManagedSdkRuntimeDeps["catalogFenceSync"];
 		beforeRouterDispatch?: () => Promise<void>;
@@ -368,6 +371,17 @@ function fixture(
 			...(options.omitPreparedFence ? {} : { preparedTenantFence: options.preparedFence ?? (() => true) }),
 			historicalSelectionFence: options.historicalSelectionFence,
 			historicalResumeFence: options.historicalResumeFence,
+			historicalSelectionFenceSync: options.omitHistoricalSync
+				? undefined
+				: (options.historicalSelectionFenceSync ??
+					(selection => JSON.stringify(selection) === JSON.stringify(historicalSelection()))),
+			historicalResumeFenceSync: options.omitHistoricalSync
+				? undefined
+				: (options.historicalResumeFenceSync ??
+					((id, evidence) =>
+						id === "migration:resume:attempt-1" &&
+						evidence.state === "invoking" &&
+						evidence.historicalSource?.savedSession.id === tenant.sessionId)),
 			catalogFence: options.catalogFence,
 			catalogFenceSync: options.catalogFenceSync,
 			...(options.drainTimeoutMs === undefined ? {} : { drainTimeoutMs: options.drainTimeoutMs }),
@@ -2032,7 +2046,7 @@ describe("managed SDK runtime", () => {
 					target: { cwd: tenant.canonicalWorkspace, sessionId: tenant.sessionId, readinessTimeoutMs },
 				});
 			};
-			let now = performance.now();
+			let now = 1_000;
 			const clock = spyOn(performance, "now").mockImplementation(() => now);
 			try {
 				const call = invoke(4_000);
@@ -2053,6 +2067,247 @@ describe("managed SDK runtime", () => {
 			}
 		},
 	);
+
+	test.each(["list", "resume", "disclosure"] as const)(
+		"historical %s denies runtime stop inside its synchronous fence",
+		async phase => {
+			let checks = 0;
+			let stopping: Promise<void> | undefined;
+			const fence = () => {
+				checks += 1;
+				if (phase !== "disclosure" || checks === 2) stopping = f.runtime.stop();
+				return true;
+			};
+			const f = fixture({
+				historicalSelectionFence: () => true,
+				historicalResumeFence: () => true,
+				historicalSelectionFenceSync: fence,
+				historicalResumeFenceSync: fence,
+				list: async () => historicalList(),
+			});
+			await f.runtime.start();
+			try {
+				await expect(
+					phase === "resume"
+						? f.runtime.resumeHistoricalSession(
+								"migration:resume:attempt-1",
+								historicalEvidence(),
+								f.observeHistoricalOutcome,
+							)
+						: f.runtime.selectHistoricalSession(historicalSelection()),
+				).rejects.toThrow();
+				expect(f.listCalls).toHaveLength(phase === "disclosure" ? 1 : 0);
+				expect(f.historicalResumeCalls).toEqual([]);
+				expect(f.historicalOutcomes).toEqual([]);
+			} finally {
+				await stopping;
+				await f.runtime.dispose();
+			}
+		},
+	);
+
+	test("historical disclosure checks deadline after its synchronous fence", async () => {
+		let checks = 0;
+		let now = performance.now();
+		const f = fixture({
+			historicalSelectionFence: () => true,
+			historicalSelectionFenceSync: () => {
+				checks += 1;
+				if (checks === 2) now += 501;
+				return true;
+			},
+			list: async () => historicalList(),
+		});
+		await f.runtime.start();
+		const clock = spyOn(performance, "now").mockImplementation(() => now);
+		try {
+			await expect(f.runtime.selectHistoricalSession(historicalSelection(), 500)).rejects.toMatchObject({
+				code: "timeout",
+			});
+			expect(checks).toBe(2);
+			expect(f.listCalls).toHaveLength(1);
+		} finally {
+			clock.mockRestore();
+			await f.runtime.dispose();
+		}
+	});
+
+	test.each(["list", "resume", "disclosure"] as const)(
+		"historical %s rechecks synchronous authority after final async fence",
+		async phase => {
+			let live = true;
+			let selections = 0;
+			const f = fixture({
+				historicalSelectionFence: async () => {
+					selections += 1;
+					const admitted = live;
+					if ((phase === "list" && selections === 1) || (phase === "disclosure" && selections === 2))
+						queueMicrotask(() => {
+							live = false;
+						});
+					return admitted;
+				},
+				historicalSelectionFenceSync: () => live,
+				historicalResumeFence: async () => {
+					const admitted = live;
+					queueMicrotask(() => {
+						live = false;
+					});
+					return admitted;
+				},
+				historicalResumeFenceSync: () => live,
+				list: async () => historicalList(),
+			});
+			await f.runtime.start();
+			try {
+				await expect(
+					phase === "resume"
+						? f.runtime.resumeHistoricalSession(
+								"migration:resume:attempt-1",
+								historicalEvidence(),
+								f.observeHistoricalOutcome,
+							)
+						: f.runtime.selectHistoricalSession(historicalSelection()),
+				).rejects.toThrow("synchronous authority");
+				expect(f.listCalls).toHaveLength(phase === "disclosure" ? 1 : 0);
+				expect(f.historicalResumeCalls).toHaveLength(0);
+				expect(f.historicalOutcomes).toEqual([]);
+			} finally {
+				await f.runtime.dispose();
+			}
+		},
+	);
+
+	test.each(["list", "resume"] as const)(
+		"historical %s denies missing synchronous fence before SDK effect",
+		async phase => {
+			const f = fixture({
+				historicalSelectionFence: () => true,
+				historicalResumeFence: () => true,
+				omitHistoricalSync: true,
+				list: async () => historicalList(),
+			});
+			await f.runtime.start();
+			try {
+				await expect(
+					phase === "resume"
+						? f.runtime.resumeHistoricalSession(
+								"migration:resume:attempt-1",
+								historicalEvidence(),
+								f.observeHistoricalOutcome,
+							)
+						: f.runtime.selectHistoricalSession(historicalSelection()),
+				).rejects.toThrow("synchronous authority");
+				expect(f.listCalls).toEqual([]);
+				expect(f.historicalResumeCalls).toEqual([]);
+			} finally {
+				await f.runtime.dispose();
+			}
+		},
+	);
+
+	test.each(["list", "resume", "disclosure"] as const)(
+		"historical %s denies false or throwing synchronous fences",
+		async phase => {
+			for (const mode of ["false", "throw"] as const) {
+				let checks = 0;
+				const deny = () => {
+					checks += 1;
+					if (phase === "disclosure" && checks === 1) return true;
+					if (mode === "throw") throw new Error("synchronous authority revoked");
+					return false;
+				};
+				const f = fixture({
+					historicalSelectionFence: () => true,
+					historicalResumeFence: () => true,
+					historicalSelectionFenceSync: deny,
+					historicalResumeFenceSync: deny,
+					list: async () => historicalList(),
+				});
+				await f.runtime.start();
+				try {
+					await expect(
+						phase === "resume"
+							? f.runtime.resumeHistoricalSession(
+									"migration:resume:attempt-1",
+									historicalEvidence(),
+									f.observeHistoricalOutcome,
+								)
+							: f.runtime.selectHistoricalSession(historicalSelection()),
+					).rejects.toThrow("synchronous authority");
+					expect(checks).toBe(phase === "disclosure" ? 2 : 1);
+					expect(f.listCalls).toHaveLength(phase === "disclosure" ? 1 : 0);
+					expect(f.historicalResumeCalls).toEqual([]);
+					expect(f.historicalOutcomes).toEqual([]);
+				} finally {
+					await f.runtime.dispose();
+				}
+			}
+		},
+	);
+
+	test("historical fences retain original callbacks and dependency receivers", async () => {
+		const receivers: ManagedSdkRuntimeDeps[] = [];
+		const checks: string[] = [];
+		const replacement = () => {
+			throw new Error("replacement fence must not run");
+		};
+		const f = fixture({
+			async historicalSelectionFence(this: ManagedSdkRuntimeDeps) {
+				receivers.push(this);
+				checks.push("selection");
+				Reflect.set(this, "historicalSelectionFence", replacement);
+				Reflect.set(this, "historicalSelectionFenceSync", replacement);
+				await Promise.resolve();
+				return true;
+			},
+			historicalSelectionFenceSync(this: ManagedSdkRuntimeDeps) {
+				receivers.push(this);
+				checks.push("selection-sync");
+				return true;
+			},
+			async historicalResumeFence(this: ManagedSdkRuntimeDeps) {
+				receivers.push(this);
+				checks.push("resume");
+				Reflect.set(this, "historicalResumeFence", replacement);
+				Reflect.set(this, "historicalResumeFenceSync", replacement);
+				await Promise.resolve();
+				return true;
+			},
+			historicalResumeFenceSync(this: ManagedSdkRuntimeDeps) {
+				receivers.push(this);
+				checks.push("resume-sync");
+				return true;
+			},
+			list: async () => historicalList(),
+		});
+		await f.runtime.start();
+		try {
+			expect(await f.runtime.selectHistoricalSession(historicalSelection())).toEqual(savedSession());
+			await f.runtime.resumeHistoricalSession(
+				"migration:resume:attempt-1",
+				historicalEvidence(),
+				f.observeHistoricalOutcome,
+			);
+			expect(checks).toEqual([
+				"selection",
+				"selection-sync",
+				"selection",
+				"selection-sync",
+				"resume",
+				"resume-sync",
+			]);
+			for (const receiver of receivers) {
+				expect(receiver).toBe(receivers[0]);
+				expect(receiver.createLifecycleService).toBeFunction();
+			}
+			expect(f.listCalls).toHaveLength(1);
+			expect(f.historicalResumeCalls).toHaveLength(1);
+			expect(f.historicalOutcomes).toHaveLength(1);
+		} finally {
+			await f.runtime.dispose();
+		}
+	});
 
 	test("selects only the exact public saved receipt and resumes without creating routing authority", async () => {
 		const selection = historicalSelection();
@@ -2767,12 +3022,19 @@ describe("managed SDK runtime", () => {
 			const persist = deferred<void>();
 			const persistenceError = new Error("original receipt write failed");
 			let fences = 0;
+			let live = true;
+			let syncFences = 0;
 			const f = fixture({
 				historicalResumeFence: () => {
 					fences += 1;
 					return fences === 1;
 				},
+				historicalResumeFenceSync: () => {
+					syncFences += 1;
+					return live;
+				},
 				historicalResume: () => {
+					live = false;
 					entered.resolve();
 					return release.promise;
 				},
@@ -2818,6 +3080,7 @@ describe("managed SDK runtime", () => {
 			expect(f.historicalOutcomes[0]).not.toBe(outcome);
 			expect(f.historicalOutcomes[0]!.ok && f.historicalOutcomes[0]!.result).not.toBe(outcome.result);
 			expect(fences).toBe(1);
+			expect(syncFences).toBe(1);
 			if (mode === "success") {
 				persist.resolve();
 				await scopeSettled;
