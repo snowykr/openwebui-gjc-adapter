@@ -211,7 +211,7 @@ async function runManagedLifecycleControl(
 	};
 	const owner: ManagedLifecycleControlOwner = {
 		operation,
-		source,
+		source: { ...source },
 		preparedAuthority: lifecyclePreparedAuthority(source),
 		lifecycleOperation: { operationId: turn.userMessageId, requestKey: source.requestKey, payloadHash: hash },
 		onInvoking: () => {
@@ -232,7 +232,6 @@ async function runManagedLifecycleControl(
 				throw new Error("Managed session.new returned the source session.");
 			const durable = mappings.operation(turn.chatId, turn.userMessageId);
 			if (
-				creating &&
 				durable?.state === "uncertain" &&
 				durable.lifecycle?.state === "uncertain" &&
 				durable.lifecycle.acknowledged === undefined

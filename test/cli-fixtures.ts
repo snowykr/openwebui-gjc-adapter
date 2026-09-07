@@ -343,8 +343,15 @@ export class FakeManagedSdkRuntime implements ManagedSdkRuntimeDependency {
 		return this.createSession();
 	}
 
-	async resumeExternalLifecycleSession(_request: any, _second?: any): Promise<any> {
-		return { ok: true, result: { sessionId: "session-fixture-resumed", endpointGeneration: 1 } };
+	async resumeExternalLifecycleSession(
+		_request: any,
+		_second?: any,
+		_timeoutMs?: number,
+		onOutcome?: (outcome: unknown) => void | Promise<void>,
+	): Promise<any> {
+		const outcome = { ok: true, result: { sessionId: "session-fixture-resumed", endpointGeneration: 1 } };
+		await onOutcome?.(outcome);
+		return outcome;
 	}
 
 	async resumeLifecycleSession(_request: any, _second?: any): Promise<any> {

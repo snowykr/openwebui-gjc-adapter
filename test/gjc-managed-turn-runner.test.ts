@@ -878,9 +878,9 @@ describe("managed turn runner", () => {
 		const fake = new RunnerRuntime();
 		let resumes = 0;
 		const resume = fake.resumeExternalLifecycleSession.bind(fake);
-		fake.resumeExternalLifecycleSession = async (key, request) => {
+		fake.resumeExternalLifecycleSession = async (key, request, timeoutMs, onOutcome) => {
 			resumes += 1;
-			return resume(key, request);
+			return resume(key, request, timeoutMs, onOutcome);
 		};
 		const runner = createManagedGjcTurnRunner(fake.runtime);
 		await expect(
@@ -1019,10 +1019,12 @@ describe("managed turn runner", () => {
 				await onOutcome?.(outcome);
 				return outcome;
 			};
-			fake.resumeExternalLifecycleSession = async (_key, request) => {
+			fake.resumeExternalLifecycleSession = async (_key, request, _timeoutMs, onOutcome) => {
 				order.push("sdk");
 				fake.externalLifecycle.push(request!);
-				return { kind: "result", outcome: { ok: true, result: expected } };
+				const outcome = { kind: "result", outcome: { ok: true as const, result: expected } };
+				await onOutcome?.(outcome);
+				return outcome;
 			};
 			const owner = controlOwner(input, {
 				onInvoking: () => {
@@ -1284,9 +1286,16 @@ class RunnerRuntime {
 		await onOutcome?.(outcome);
 		return outcome;
 	}
-	async resumeExternalLifecycleSession(_tenant: unknown, request?: Record<string, unknown>) {
+	async resumeExternalLifecycleSession(
+		_tenant: unknown,
+		request?: Record<string, unknown>,
+		_timeoutMs?: number,
+		onOutcome?: (outcome: unknown) => void | Promise<void>,
+	) {
 		if (request === undefined) throw new Error("Complete managed tenant authority is required.");
-		return { kind: "result", outcome: lifecycleSuccess() };
+		const outcome = { kind: "result", outcome: lifecycleSuccess() };
+		await onOutcome?.(outcome);
+		return outcome;
 	}
 	async request(
 		_attachment: unknown,

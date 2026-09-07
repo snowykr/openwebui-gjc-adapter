@@ -384,6 +384,9 @@ export class ManagedSdkRuntime {
 			  >,
 		request?: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["resumeExternal"]>[0],
 		timeoutMs?: number,
+		onOutcome?: (
+			outcome: Awaited<ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["resumeExternal"]>>,
+		) => void | Promise<void>,
 	): ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["resumeExternal"]> {
 		return this.#invokeLifecycle(
 			"resumeExternal",
@@ -392,6 +395,7 @@ export class ManagedSdkRuntime {
 			value => this.#lifecycle.resumeExternal(value),
 			ACTIVE_ACCESS,
 			timeoutMs,
+			onOutcome,
 		);
 	}
 

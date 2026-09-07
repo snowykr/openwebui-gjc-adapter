@@ -265,6 +265,7 @@ export function createManagedSessionOperations(
 								},
 							},
 							timeoutMs,
+							observeOutcome,
 						);
 					case "fork":
 						return runtime.forkLifecycleSession(
@@ -351,12 +352,8 @@ export function createManagedSessionOperations(
 					throw new Error(
 						"Managed lifecycle acknowledgement lacks the expected session id and positive generation.",
 					);
-				const acknowledged = { ...lifecycleTenant, requestKey, authorityEpoch: SESSION_AUTHORITY_V3_EPOCH };
 				deadline.remaining();
-				if (operation === "create" || operation === "fork") {
-					if (!outcomeObserved)
-						throw new Error("Managed lifecycle outcome was not observed by its durable owner.");
-				} else await deadline.wait(Promise.resolve(input.onAcknowledged?.(acknowledged)));
+				if (!outcomeObserved) throw new Error("Managed lifecycle outcome was not observed by its durable owner.");
 				await deadline.wait(Promise.resolve(input.beforeProof?.()));
 				try {
 					throwIfAborted(input.signal);

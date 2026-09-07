@@ -65,7 +65,7 @@ function fixture() {
 }
 
 describe("managed routing persistence", () => {
-	for (const operation of ["branch", "session.new"] as const) {
+	for (const operation of ["branch", "session.new", "session.resume"] as const) {
 		test.each(["same-source", "replacement", "write-failure", "mutated-input", "mutated-input-failure"] as const)(
 			`late original ${operation} receipt remains passive after timeout with %s`,
 			async mode => {
@@ -160,6 +160,19 @@ describe("managed routing persistence", () => {
 											result: { sessionId: "late-original-successor", endpointGeneration: 9 },
 										};
 									},
+									resumeExternal: async () => {
+										forks += 1;
+										entered.resolve();
+										await response.promise;
+										return {
+											kind: "result",
+											outcome: {
+												ok: true,
+												operation: "session.resume",
+												result: { sessionId: tenant.sessionId, endpointGeneration: tenant.generation },
+											},
+										};
+									},
 								}) as never,
 						},
 					});
@@ -173,12 +186,15 @@ describe("managed routing persistence", () => {
 						},
 					});
 					const operations = createManagedSessionOperations(runtime);
-					if (operation === "session.new")
+					if (operation !== "branch")
 						Object.assign(runner, {
 							runControl: (async (_turn, _mapping, _lifecycle, _successor, _onDispatch, owner, execution) => {
 								borrowed = {
-									authority: owner!.preparedAuthority,
-									target: { path: tenant.canonicalWorkspace },
+									authority: operation === "session.new" ? owner!.preparedAuthority : owner!.source,
+									target:
+										operation === "session.new"
+											? { path: tenant.canonicalWorkspace }
+											: { sessionIdOrPrefix: tenant.sessionId, path: tenant.canonicalWorkspace },
 									signal: callerSignal.signal,
 									timeoutMs: execution!.timeoutMs,
 									lifecycleOperation: owner!.lifecycleOperation,
@@ -186,7 +202,9 @@ describe("managed routing persistence", () => {
 									onAcknowledged: value => owner!.onAcknowledged(value),
 									beforeProof: () => owner!.beforeProof?.(),
 								};
-								const result = await operations.create(borrowed);
+								const result = await (operation === "session.new" ? operations.create : operations.resume)(
+									borrowed,
+								);
 								return controlResult({ ...result.tenant, requestKey: owner!.source.requestKey });
 							}) satisfies NonNullable<GjcTurnRunner["runControl"]>,
 						});
@@ -243,8 +261,8 @@ describe("managed routing persistence", () => {
 						await disposal;
 						const receipt = f.store.operationScoped(f.scope, turn.userMessageId)!;
 						expect(receipt.lateLifecycleAcknowledgement?.acknowledged).toEqual({
-							sessionId: "late-original-successor",
-							generation: 9,
+							sessionId: operation === "session.resume" ? tenant.sessionId : "late-original-successor",
+							generation: operation === "session.resume" ? tenant.generation : 9,
 						});
 						expect(receipt.lifecycle).toEqual(uncertain.lifecycle);
 						expect(receipt.acknowledgedSuccessor).toBeUndefined();

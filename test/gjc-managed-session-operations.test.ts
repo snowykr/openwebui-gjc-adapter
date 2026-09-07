@@ -512,10 +512,17 @@ class FakeRuntime {
 		await onOutcome?.(outcome);
 		return outcome;
 	}
-	async resumeExternalLifecycleSession(_tenant: unknown, request: Record<string, unknown>, timeoutMs?: number) {
+	async resumeExternalLifecycleSession(
+		_tenant: unknown,
+		request: Record<string, unknown>,
+		timeoutMs?: number,
+		onOutcome?: (outcome: unknown) => void | Promise<void>,
+	) {
 		this.externalTimeouts.push(timeoutMs);
 		this.externalLifecycle.push({ operation: "resume", request });
-		return { kind: "result", outcome: lifecycleSuccess() };
+		const outcome = { kind: "result", outcome: lifecycleSuccess() };
+		await onOutcome?.(outcome);
+		return outcome;
 	}
 	async request(
 		_attachment: unknown,

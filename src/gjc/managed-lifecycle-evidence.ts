@@ -88,12 +88,13 @@ export function managedLifecycleAdmissionHash(operation: LifecycleReservation): 
 		evidence.source === undefined ||
 		!(
 			(operation.kind === "create" && evidence.operation === "session.create") ||
-			(operation.kind === "branch" && evidence.operation === "session.fork")
+			(operation.kind === "branch" && evidence.operation === "session.fork") ||
+			(operation.kind === "resume" && evidence.operation === "session.resume")
 		) ||
 		evidence.payloadHash !== operation.detail ||
 		Date.parse(evidence.recordedAt) < Date.parse(operation.startedAt)
 	)
-		throw new Error("Late lifecycle observation requires an exact successor reservation.");
+		throw new Error("Late lifecycle observation requires an exact control reservation.");
 	return requestHash({
 		id: operation.id,
 		ingressId: operation.ingressId ?? operation.id,
@@ -121,7 +122,7 @@ export function createManagedLateLifecycleAcknowledgement(
 		admitted.acknowledgedSuccessor !== undefined ||
 		!isAuthority(acknowledged) ||
 		!preparedFields.every(field => acknowledged[field] === evidence.preparedAuthority[field]) ||
-		acknowledged.sessionId === evidence.source!.sessionId ||
+		!matchesPassiveLifecycleTarget(evidence, acknowledged) ||
 		!isTimestamp(observedAt) ||
 		Date.parse(observedAt) < Date.parse(evidence.recordedAt)
 	)
@@ -155,7 +156,10 @@ export function isManagedLateLifecycleAcknowledgement(
 			hasOnlyKeys(value.acknowledged, ["sessionId", "generation"]) &&
 			isNonEmptyString(value.acknowledged.sessionId) &&
 			positiveInteger(value.acknowledged.generation) &&
-			value.acknowledged.sessionId !== operation.lifecycle.source!.sessionId
+			matchesPassiveLifecycleTarget(
+				operation.lifecycle,
+				value.acknowledged as { sessionId: string; generation: number },
+			)
 		);
 	} catch {
 		return false;
@@ -166,6 +170,15 @@ export function copyManagedLateLifecycleAcknowledgement(
 	value: ManagedLateLifecycleAcknowledgement,
 ): ManagedLateLifecycleAcknowledgement {
 	return { ...value, acknowledged: { ...value.acknowledged } };
+}
+
+function matchesPassiveLifecycleTarget(
+	evidence: ManagedLifecycleEvidence,
+	target: { readonly sessionId: string; readonly generation: number },
+): boolean {
+	return evidence.operation === "session.resume"
+		? target.sessionId === evidence.source!.sessionId && target.generation === evidence.source!.generation
+		: target.sessionId !== evidence.source!.sessionId;
 }
 
 /** Structural view shared by V3 and its inherited in-memory relational validator. */

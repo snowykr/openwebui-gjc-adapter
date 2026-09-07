@@ -476,7 +476,7 @@ function resultfulHistoricalReservation(omitOwner = false) {
 	};
 }
 
-function passiveReceiptFixture(kind: "create" | "branch" = "branch") {
+function passiveReceiptFixture(kind: "create" | "branch" | "resume" = "branch") {
 	const document = clonedGolden();
 	const root = document.mappings[0];
 	const source = lifecycleExactAuthority(root.managedAuthority);
@@ -484,14 +484,16 @@ function passiveReceiptFixture(kind: "create" | "branch" = "branch") {
 	const evidence = transitionManagedLifecycleEvidence(
 		createManagedLifecycleEvidence(
 			{
-				operation: kind === "create" ? "session.create" : "session.fork",
+				operation: kind === "create" ? "session.create" : kind === "resume" ? "session.resume" : "session.fork",
 				source,
 				preparedAuthority: prepared,
 				payloadHash: "a".repeat(64),
 				target:
 					kind === "create"
 						? { kind: "existing_path", path: source.canonicalWorkspace }
-						: { sourceSessionId: source.sessionId, cwd: source.canonicalWorkspace },
+						: kind === "resume"
+							? { sessionIdOrPrefix: source.sessionId, path: source.canonicalWorkspace }
+							: { sourceSessionId: source.sessionId, cwd: source.canonicalWorkspace },
 			},
 			timestamp,
 		),
@@ -508,7 +510,11 @@ function passiveReceiptFixture(kind: "create" | "branch" = "branch") {
 		detail: evidence.payloadHash,
 		lifecycle: evidence,
 	};
-	const acknowledged = { ...prepared, sessionId: "late-successor", generation: 9 };
+	const acknowledged = {
+		...prepared,
+		sessionId: kind === "resume" ? source.sessionId : "late-successor",
+		generation: kind === "resume" ? source.generation : 9,
+	};
 	const receipt = createManagedLateLifecycleAcknowledgement(admitted, acknowledged, "2026-08-24T00:00:02.000Z");
 	const uncertain: SessionAuthorityV3Operation = {
 		...admitted,
@@ -521,6 +527,25 @@ function passiveReceiptFixture(kind: "create" | "branch" = "branch") {
 }
 
 describe("session authority v3 full graph", () => {
+	test("selected resume passive receipt cannot substitute another session or generation", () => {
+		const f = passiveReceiptFixture("resume");
+		for (const patch of [{ sessionId: "other" }, { generation: f.acknowledged.generation + 1 }]) {
+			expect(() =>
+				createManagedLateLifecycleAcknowledgement(
+					f.admitted,
+					{ ...f.acknowledged, ...patch },
+					f.receipt.observedAt,
+				),
+			).toThrow("original invocation");
+			const document = structuredClone(f.document);
+			document.mappings[0].journal.at(-1).lateLifecycleAcknowledgement.acknowledged = {
+				...f.receipt.acknowledged,
+				...patch,
+			};
+			expect(isSessionAuthorityV3Document(document)).toBe(false);
+		}
+	});
+
 	test.each([false, true])("rejects passive receipts on provisional operations with bound=%s", bound => {
 		const f = passiveReceiptFixture();
 		const provisional = {
@@ -684,7 +709,7 @@ describe("session authority v3 full graph", () => {
 		}
 	});
 
-	test.each(["create", "branch"] as const)(
+	test.each(["create", "branch", "resume"] as const)(
 		"passive %s receipt preserves exact admission without granting successor proof",
 		kind => {
 			const f = passiveReceiptFixture(kind);
