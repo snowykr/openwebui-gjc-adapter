@@ -669,6 +669,7 @@ async function acquireWorkspaceLease(
 		queueLimit,
 		input.signal,
 	);
+	let admissionOwnsRelease = false;
 	try {
 		if (input.signal?.aborted) throw new WorkspaceAdmissionCancelledError();
 		const lease = await input.workspaceLeaseManager.acquire({
@@ -679,13 +680,14 @@ async function acquireWorkspaceLease(
 		});
 		if (lease === undefined) throw new WorkspaceLeaseUncertainError();
 		const admission = new WorkspaceLeaseAdmission(lease, durationMs, heartbeatMs, releaseAdmission);
+		admissionOwnsRelease = true;
 		if (input.signal?.aborted) {
 			if (!(await admission.finish())) throw new WorkspaceLeaseUncertainError();
 			throw new WorkspaceAdmissionCancelledError();
 		}
 		return admission;
 	} catch (error) {
-		releaseAdmission();
+		if (!admissionOwnsRelease) releaseAdmission();
 		throw error;
 	}
 }
