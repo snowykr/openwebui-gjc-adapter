@@ -179,6 +179,42 @@ async function fixture() {
 }
 
 describe("session authority V3 activation", () => {
+	test("explicit mutation duration covers long activation without renewal and still expires", async () => {
+		const f = await fixture();
+		const started = Date.now();
+		const now = spyOn(Date, "now").mockReturnValue(started);
+		const lock = AuthorityMutationLock.acquire(f.canonicalPath, 60_000);
+		try {
+			const before = await readFile(`${f.canonicalPath}.lock`);
+			now.mockReturnValue(started + 30_001);
+			lock.assertHeld(f.canonicalPath);
+			expect((await readFile(`${f.canonicalPath}.lock`)).equals(before)).toBe(true);
+			now.mockReturnValue(started + 60_000);
+			expect(() => lock.assertHeld(f.canonicalPath)).toThrow("ownership was lost");
+			expect(() => AuthorityMutationLock.acquire(f.canonicalPath)).toThrow();
+			expect((await readFile(`${f.canonicalPath}.lock`)).equals(before)).toBe(true);
+		} finally {
+			now.mockRestore();
+			lock.release();
+			await f.cleanup();
+		}
+	});
+
+	test.each([0, -1, NaN, Infinity, 1.5, 2_147_483_648])(
+		"invalid mutation duration %s creates no lock",
+		async duration => {
+			const f = await fixture();
+			try {
+				expect(() => AuthorityMutationLock.acquire(f.canonicalPath, duration)).toThrow(
+					"positive timer-safe integer",
+				);
+				expect(await Bun.file(`${f.canonicalPath}.lock`).exists()).toBe(false);
+			} finally {
+				await f.cleanup();
+			}
+		},
+	);
+
 	test("settlement drains a delayed bootstrap producer after its bounded result expires", async () => {
 		const f = await historicalFixture();
 		const lock = AuthorityMutationLock.acquire(f.canonicalPath);

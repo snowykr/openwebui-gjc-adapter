@@ -237,7 +237,7 @@ async function activate(
 
 	try {
 		await step(() => input.runtimeLock.assertOwnsPath(input.sourcePath));
-		lock = AuthorityMutationLock.acquire(input.sourcePath);
+		lock = AuthorityMutationLock.acquire(input.sourcePath, deadline.remaining());
 		await step(() =>
 			ensureLegacySource(input.sourcePath, () => {
 				deadline.remaining();

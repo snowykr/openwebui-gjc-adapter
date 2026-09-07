@@ -26,6 +26,7 @@
 
 ### Fixed
 
+- Bound the canonical bootstrap mutation lease to the original remaining operation budget instead of an unrelated fixed thirty seconds. Long valid attempts retain ownership without renewal; explicit duration validation, expiry, and live-owner exclusion remain enforced.
 - Separated restricted-bootstrap operation results from actual cleanup settlement and added an attempt-owned post-stage admission phase. Late acquisition/cleanup and failed stop retain mutation exclusion; concurrent failed attempts cannot release another admission owner. Updated the public probe to acquire its migration lease only after historical staging. Production operator admission and serving handoff remain incomplete.
 - Implemented initial restricted-bootstrap owner resolution: existing principal first, configured administrator only for genuinely unowned history. Atomic promotion uses one canonical live key while exact historical identities remain immutable and attributable through a unique completed bootstrap receipt. Added destination/owner conflicts, completed provisional provenance, ordinary scoped writes/reopen, unchanged prepared retry, and no uncertain redispatch coverage; operator provisioning and original-incarnation recovery remain incomplete.
 - Preserved immutable historical chat/header/result identities in scoped history reads and canonical serialization; only managed live views normalize chat IDs. Kept historical tenant checks and non-serving boundaries, with exact receipt/tombstone assertions across managed writes and reopen.

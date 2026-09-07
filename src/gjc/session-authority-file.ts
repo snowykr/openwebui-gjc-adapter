@@ -28,12 +28,14 @@ export class AuthorityMutationLock {
 		private readonly identity: { readonly dev: number; readonly ino: number },
 	) {}
 
-	static acquire(authorityPath: string): AuthorityMutationLock {
+	static acquire(authorityPath: string, leaseMs = LEASE_MS): AuthorityMutationLock {
+		if (!Number.isSafeInteger(leaseMs) || leaseMs <= 0 || leaseMs > 2_147_483_647)
+			throw new TypeError("Authority mutation lease duration must be a positive timer-safe integer.");
 		const path = `${resolve(authorityPath)}.lock`;
 		mkdirSync(dirname(path), { recursive: true });
 
 		for (let attempt = 0; attempt <= RECOVERY_ATTEMPTS; attempt += 1) {
-			const record = createLockRecord();
+			const record = createLockRecord(leaseMs);
 
 			try {
 				const identity = writeNewLock(path, record);
@@ -83,11 +85,11 @@ export class AuthorityMutationLock {
 	}
 }
 
-function createLockRecord(): AuthorityMutationLockRecord {
+function createLockRecord(leaseMs: number): AuthorityMutationLockRecord {
 	return {
 		owner: randomUUID(),
 		pid: process.pid,
-		leaseExpiresAt: Date.now() + LEASE_MS,
+		leaseExpiresAt: Date.now() + leaseMs,
 	};
 }
 

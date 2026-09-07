@@ -331,6 +331,24 @@ function withReassignment(
 }
 
 describe("adapter managed bootstrap composition", () => {
+	test("bootstrap keeps the original finite mutation lease beyond thirty seconds", async () => {
+		const started = Date.now();
+		const now = spyOn(Date, "now").mockReturnValue(started);
+		const f = await fixture({ timeoutMs: 60_000, onResume: () => now.mockReturnValue(started + 30_001) });
+		try {
+			const attempt = startAdapterSessionAuthorityV3Activation(f.input);
+			const result = await attempt.result;
+			if (result.status !== "activated") throw new Error("Expected bounded long activation.");
+			result.store.close();
+			await attempt.settled;
+			expect(f.calls.filter(call => call === "resume")).toHaveLength(1);
+			expect(f.evidence()?.state).toBe("active_generation_proven");
+		} finally {
+			now.mockRestore();
+			await f.cleanup();
+		}
+	});
+
 	test.each(["lstat", "mkdir", "write", "reject"] as const)(
 		"source initialization %s cannot outlive successful cleanup settlement",
 		async phase => {
