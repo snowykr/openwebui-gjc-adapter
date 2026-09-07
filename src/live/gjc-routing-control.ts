@@ -222,7 +222,7 @@ async function runManagedLifecycleControl(
 			if (admitted?.lifecycle?.state !== "invoking")
 				throw new Error("Managed control invocation was not durably reserved.");
 		},
-		onAcknowledged: authority => {
+		onAcknowledged: (authority, endpointReceipt) => {
 			assertManagedAuthority(authority, {
 				...source,
 				sessionId: creating ? authority.sessionId : source.sessionId,
@@ -240,7 +240,12 @@ async function runManagedLifecycleControl(
 				mappings.recordLateLifecycleAcknowledgement(
 					turn.chatId,
 					admitted,
-					createManagedLateLifecycleAcknowledgement(admitted, lifecycleExactAuthority(authority)),
+					createManagedLateLifecycleAcknowledgement(
+						admitted,
+						lifecycleExactAuthority(authority),
+						undefined,
+						endpointReceipt,
+					),
 				);
 				passiveAcknowledgement = true;
 				return;
@@ -248,6 +253,7 @@ async function runManagedLifecycleControl(
 			record(
 				transitionManagedLifecycleEvidence(evidence, "acknowledged_unproven", {
 					acknowledged: lifecycleExactAuthority(authority),
+					...(endpointReceipt === undefined ? {} : { endpointReceipt }),
 				}),
 			);
 			if (creating)
@@ -426,7 +432,7 @@ async function runManagedBranch(
 						if (admitted?.lifecycle?.state !== "invoking")
 							throw new Error("Managed fork invocation was not durably reserved.");
 					},
-					onAcknowledged: authority => {
+					onAcknowledged: (authority, endpointReceipt) => {
 						assertManagedAuthority(authority, {
 							...source,
 							sessionId: authority.sessionId,
@@ -449,7 +455,12 @@ async function runManagedBranch(
 							mappings.recordLateLifecycleAcknowledgement(
 								turn.chatId,
 								admitted,
-								createManagedLateLifecycleAcknowledgement(admitted, lifecycleExactAuthority(authority)),
+								createManagedLateLifecycleAcknowledgement(
+									admitted,
+									lifecycleExactAuthority(authority),
+									undefined,
+									endpointReceipt,
+								),
 							);
 							passiveAcknowledgement = true;
 							return;
@@ -457,6 +468,7 @@ async function runManagedBranch(
 						recordLifecycle(
 							transitionManagedLifecycleEvidence(lifecycleEvidence, "acknowledged_unproven", {
 								acknowledged: lifecycleExactAuthority(authority),
+								...(endpointReceipt === undefined ? {} : { endpointReceipt }),
 							}),
 						);
 						mappings.recordAcknowledgedSuccessor(turn.chatId, turn.userMessageId, hash, {

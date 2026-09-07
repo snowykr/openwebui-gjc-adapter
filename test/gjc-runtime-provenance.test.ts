@@ -4,9 +4,9 @@ import { join } from "node:path";
 import { lifecycle, router } from "@gajae-code/coding-agent/sdk";
 
 const ROOT = join(import.meta.dir, "..");
-const GJC_VERSION = "0.16.4";
+const GJC_VERSION = "0.16.6";
 const CODING_AGENT_INTEGRITY =
-	"sha512-cnqyYOEGygPp87gCEkqahNiRYoBhL4gxvQnWY16lDADThfNjhrl7VP+5f9cLakevI+pjRbTSdDBw/iZ3Nc6PCw==";
+	"sha512-53/Mdppx1gDzdtslKpGpuhVEU9he5+G7WfaHCXdbXRBYAbjkKBVwL9xFN9bAlRbX+gwWRShvr/dnYmTV2PHrWw==";
 const BUN_IMAGE_DIGEST = "sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6";
 const PYTHON_IMAGE_DIGEST = "sha256:8a7e7cc04fd3e2bd787f7f24e22d5d119aa590d429b50c95dfe12b3abe52f48b";
 

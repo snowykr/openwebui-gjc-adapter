@@ -355,7 +355,7 @@ describe("CLI module boundaries", () => {
 		for (const module of ["session-frames", "turn-runner", "cli-lifecycle-backend", "tmux-ownership"])
 			expect(entrypoint).not.toContain(`./gjc/${module}`);
 		expect(manifest.exports["./gjc/*"]).toBeNull();
-		expect(manifest.dependencies["@gajae-code/coding-agent"]).toBe("0.16.4");
+		expect(manifest.dependencies["@gajae-code/coding-agent"]).toBe("0.16.6");
 		expect(manifest.dependencies[["@gajae-code", "bridge-client"].join("/")]).toBeUndefined();
 		expect(manifest.patchedDependencies).toBeUndefined();
 		for (const version of ["0.10.0", "0.11.6", "0.12.7", "0.12.8"])

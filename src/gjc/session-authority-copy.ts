@@ -1,4 +1,8 @@
-import { copyManagedLateLifecycleAcknowledgement, copyManagedLifecycleEvidence } from "./managed-lifecycle-evidence";
+import {
+	copyManagedLateCreateAcknowledgement,
+	copyManagedLateLifecycleAcknowledgement,
+	copyManagedLifecycleEvidence,
+} from "./managed-lifecycle-evidence";
 import type {
 	AcknowledgedSuccessor,
 	EndpointSessionAttachmentProof,
@@ -147,10 +151,7 @@ export function copyProvisionalOperation(operation: ProvisionalSessionOperation)
 		...(operation.lateCreateAcknowledgement === undefined
 			? {}
 			: {
-					lateCreateAcknowledgement: {
-						...operation.lateCreateAcknowledgement,
-						acknowledged: { ...operation.lateCreateAcknowledgement.acknowledged },
-					},
+					lateCreateAcknowledgement: copyManagedLateCreateAcknowledgement(operation.lateCreateAcknowledgement),
 				}),
 		...(operation.attachment === undefined
 			? {}

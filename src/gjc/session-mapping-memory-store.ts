@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
 import {
 	assertManagedLifecycleEvidenceUpdate,
+	copyManagedLateCreateAcknowledgement,
 	copyManagedLateLifecycleAcknowledgement,
 	copyManagedLifecycleEvidence,
 	createManagedLateCreateAcknowledgement,
@@ -8,6 +9,7 @@ import {
 	createManagedLifecycleEvidence,
 	createManagedRetirementEvidence,
 	isManagedCatalogProvisional,
+	isManagedEndpointReceipt,
 	isManagedLateCreateAcknowledgement,
 	isManagedLateLifecycleAcknowledgement,
 	isManagedLifecycleEvidence,
@@ -20,6 +22,7 @@ import {
 	managedLifecycleAdmissionHash,
 	managedLifecycleEvidenceHash,
 	managedProvisionalCreateAdmissionHash,
+	requireManagedEndpointReceipt,
 	transitionManagedLifecycleEvidence,
 } from "./managed-lifecycle-evidence";
 import {
@@ -701,6 +704,7 @@ export class SessionMappingStore {
 				!["active_generation_proven", "acknowledged_unproven"].includes(prior.state)
 			)
 				throw new Error("Catalog cleanup requires this owner's original acknowledged generation.");
+			const endpointReceipt = requireManagedEndpointReceipt(prior);
 			const recordedAt = new Date().toISOString();
 			const lifecycle =
 				prior.state === "active_generation_proven"
@@ -719,10 +723,7 @@ export class SessionMappingStore {
 						preparedAuthority: { ...prior.preparedAuthority, requestKey: input.requestKey },
 						source: prior.acknowledged,
 						payloadHash: input.payloadHash,
-						target: {
-							sessionId: prior.acknowledged.sessionId,
-							endpointGeneration: prior.acknowledged.generation,
-						},
+						target: { ...endpointReceipt },
 					},
 					recordedAt,
 				),
@@ -870,9 +871,38 @@ export class SessionMappingStore {
 					existing.state !== "pending" ||
 					existing.detail !== input.payloadHash ||
 					existing.lifecycle?.requestKey !== input.requestKey ||
+					existing.lifecycle.state !== "closing" ||
+					existing.lifecycle.sourceProofRef === undefined ||
+					!isManagedEndpointReceipt(existing.lifecycle.target, source) ||
 					!isDeepStrictEqual(existing.lifecycle.source, lifecycleExactAuthority(source))
 				)
 					throw new Error("Managed retirement request conflicts with its durable reservation.");
+				const reference = existing.lifecycle.sourceProofRef;
+				const references = record.journal.filter(operation => operation.id === reference.operationId);
+				const prior = references.length === 1 ? references[0] : undefined;
+				if (
+					prior === undefined ||
+					prior.id === existing.id ||
+					prior.state !== "complete" ||
+					prior.completedAt === undefined ||
+					Date.parse(prior.completedAt) > Date.parse(existing.startedAt) ||
+					prior.lifecycle?.state !== "active_generation_proven" ||
+					prior.lifecycle.acknowledged === undefined ||
+					prior.lifecycle.proven === undefined ||
+					managedLifecycleEvidenceHash(prior.lifecycle) !== reference.evidenceHash ||
+					!isDeepStrictEqual(existing.lifecycle.target, requireManagedEndpointReceipt(prior.lifecycle)) ||
+					![
+						"principalId",
+						"projectId",
+						"canonicalWorkspace",
+						"chatId",
+						"sessionId",
+						"generation",
+						"leaseId",
+						"epoch",
+					].every(field => Reflect.get(prior.lifecycle!.acknowledged!, field) === Reflect.get(source, field))
+				)
+					throw new Error("Managed retirement reservation lost its original source receipt.");
 				reserved = operationForScope(existing, canonical);
 				return { records, provisional };
 			}
@@ -917,7 +947,7 @@ export class SessionMappingStore {
 					sourceOperationId: sourceOperation.id,
 					sourceEvidence: sourceOperation.lifecycle,
 					payloadHash: input.payloadHash,
-					target: { sessionId: source.sessionId, endpointGeneration: source.generation },
+					target: { ...requireManagedEndpointReceipt(sourceOperation.lifecycle) },
 				},
 				startedAt,
 			);
@@ -1071,6 +1101,7 @@ export class SessionMappingStore {
 			admitted,
 			{ ...prepared, ...observation.acknowledged },
 			observation.observedAt,
+			observation.endpointReceipt,
 		);
 		if (!isDeepStrictEqual(validated, observation))
 			throw new Error("Late create observation does not match its original invocation.");
@@ -1107,7 +1138,7 @@ export class SessionMappingStore {
 					operation === retained
 						? {
 								...operation,
-								lateCreateAcknowledgement: { ...observation, acknowledged: { ...observation.acknowledged } },
+								lateCreateAcknowledgement: copyManagedLateCreateAcknowledgement(observation),
 							}
 						: operation,
 				),
@@ -1146,6 +1177,7 @@ export class SessionMappingStore {
 			admitted,
 			{ ...prepared, ...observation.acknowledged },
 			observation.observedAt,
+			observation.endpointReceipt,
 		);
 		if (!isDeepStrictEqual(validated, observation))
 			throw new Error("Late lifecycle observation does not match its original invocation.");

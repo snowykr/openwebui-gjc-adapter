@@ -561,10 +561,21 @@ describe("session authority v3 full graph", () => {
 				transitionManagedLifecycleEvidence(current.lifecycle!, state, patch),
 			);
 		};
-		const acknowledge = (proven = false) => {
+		const acknowledge = (proven = false, withReceipt = true) => {
 			const admitted = advance("invoking");
 			const acknowledged = { ...prepared, sessionId: "catalog-created", generation: 8 };
-			advance("acknowledged_unproven", { acknowledged });
+			advance("acknowledged_unproven", {
+				acknowledged,
+				...(withReceipt
+					? {
+							endpointReceipt: {
+								sessionId: acknowledged.sessionId,
+								endpointGeneration: acknowledged.generation,
+								endpointIncarnation: "a".repeat(64),
+							},
+						}
+					: {}),
+			});
 			if (proven)
 				advance("active_generation_proven", {
 					proven: {
@@ -618,6 +629,120 @@ describe("session authority v3 full graph", () => {
 			},
 		};
 	}
+
+	test.each([false, true])(
+		"catalog missing endpoint receipt denies cleanup without mutation with proof=%s",
+		proven => {
+			const f = catalogFixture();
+			try {
+				f.acknowledge(proven, false);
+				const parent = f.store.provisionalOperationScoped(f.scope, f.reserved.id)!;
+				const bytes = readFileSync(f.path),
+					inode = statSync(f.path).ino;
+				expect(() => f.cleanup()).toThrow("original endpoint receipt");
+				expect(f.store.provisionalOperationScoped(f.scope, f.reserved.id)).toEqual(parent);
+				expect(f.store.provisionalOperationScoped(f.scope, f.reserved.id)!.cleanup).toBeUndefined();
+				expect(readFileSync(f.path).equals(bytes)).toBe(true);
+				expect(statSync(f.path).ino).toBe(inode);
+				expect(parseSessionAuthorityV3Document(bytes)!.provisionalOperations[0]!.lifecycle!.state).toBe(
+					proven ? "active_generation_proven" : "acknowledged_unproven",
+				);
+				f.store.close();
+				const reopened = new SessionV3FileBackedMappingStore(f.path);
+				try {
+					const retained = reopened.provisionalOperationScoped(f.scope, f.reserved.id)!;
+					expect(retained.lifecycle!.endpointReceipt).toBeUndefined();
+					expect(retained.cleanup).toBeUndefined();
+				} finally {
+					reopened.close();
+				}
+			} finally {
+				f.close();
+			}
+		},
+	);
+
+	test.each([false, true])(
+		"catalog cleanup copies the original endpoint pair and binds its relational hash with proof=%s",
+		proven => {
+			const f = catalogFixture();
+			try {
+				f.acknowledge(proven);
+				const parent = f.store.provisionalOperationScoped(f.scope, f.reserved.id)!;
+				const endpointReceipt = structuredClone(parent.lifecycle!.endpointReceipt!);
+				Object.assign(parent.lifecycle!.endpointReceipt!, { endpointIncarnation: "b".repeat(64) });
+				const reserved = f.cleanup();
+				expect(reserved.cleanup!.lifecycle.target).toEqual({ ...endpointReceipt });
+				expect(reserved.lifecycle!.endpointReceipt).toEqual(endpointReceipt);
+				const document = parseSessionAuthorityV3Document(readFileSync(f.path))!;
+				expect(inheritedValid(document)).toBe(true);
+				const original = document.provisionalOperations[0]!;
+				const child = original.cleanup!;
+				const forgedIntent = createManagedLifecycleEvidence(
+					{
+						operation: "session.close",
+						preparedAuthority: child.lifecycle.preparedAuthority,
+						source: child.lifecycle.source,
+						payloadHash: child.lifecycle.payloadHash,
+						target: { ...child.lifecycle.target, endpointIncarnation: "b".repeat(64) },
+					},
+					child.lifecycle.recordedAt,
+				);
+				expect(isManagedLifecycleEvidence(forgedIntent)).toBe(true);
+				for (const lifecycle of [forgedIntent, { ...child.lifecycle, requestHash: "f".repeat(64) }]) {
+					const invalid = {
+						...document,
+						provisionalOperations: [{ ...original, cleanup: { ...child, lifecycle } }],
+					};
+					expect(isSessionAuthorityV3Document(invalid)).toBe(false);
+					expect(parseSessionAuthorityV3Document(JSON.stringify(invalid))).toBeUndefined();
+					expect(inheritedValid(invalid)).toBe(false);
+				}
+				// Historical generation-only cleanup remains readable, not new reservation authority.
+				const { endpointReceipt: _receipt, ...historicalParent } = original.lifecycle!;
+				const historicalChild = createManagedLifecycleEvidence(
+					{
+						operation: "session.close",
+						preparedAuthority: child.lifecycle.preparedAuthority,
+						source: child.lifecycle.source,
+						payloadHash: child.lifecycle.payloadHash,
+						target: {
+							sessionId: endpointReceipt.sessionId,
+							endpointGeneration: endpointReceipt.endpointGeneration,
+						},
+					},
+					child.lifecycle.recordedAt,
+				);
+				const historicalDocument = {
+					...document,
+					provisionalOperations: [
+						{ ...original, lifecycle: historicalParent, cleanup: { ...child, lifecycle: historicalChild } },
+					],
+				};
+				expect(parseSessionAuthorityV3Document(JSON.stringify(historicalDocument))).toEqual(historicalDocument);
+				expect(inheritedValid(historicalDocument)).toBe(true);
+				const bytes = readFileSync(f.path);
+				Object.assign(reserved.cleanup!.lifecycle.target, { endpointIncarnation: "c".repeat(64) });
+				expect(f.store.provisionalOperationScoped(f.scope, f.reserved.id)!.cleanup!.lifecycle.target).toEqual({
+					...endpointReceipt,
+				});
+				expect(readFileSync(f.path).equals(bytes)).toBe(true);
+				f.store.close();
+				const reopened = new SessionV3FileBackedMappingStore(f.path);
+				try {
+					const retained = reopened.provisionalOperationScoped(f.scope, f.reserved.id)!;
+					expect(retained.lifecycle!.endpointReceipt).toEqual(endpointReceipt);
+					expect(retained.cleanup!.lifecycle.target).toEqual({ ...endpointReceipt });
+					expect(retained.cleanup!.lifecycle.requestHash).toBe(child.lifecycle.requestHash);
+					expect(reopened.getScoped(f.scope)).toBeUndefined();
+				} finally {
+					reopened.close();
+				}
+			} finally {
+				f.close();
+			}
+		},
+	);
 
 	test.each([false, true])(
 		"catalog retirement atomically completes both owners without publication with proof=%s",
@@ -1139,79 +1264,143 @@ describe("session authority v3 full graph", () => {
 			).toThrow("original invocation");
 	});
 
-	test("initial create passive storage is scoped immutable durable and failure atomic", () => {
-		const f = initialCreateReceiptFixture();
-		const root = mkdtempSync(join(tmpdir(), "gjc-late-initial-create-"));
-		const path = join(root, "authority.json");
-		writeFileSync(path, JSON.stringify(f.document));
-		let store = new SessionV3FileBackedMappingStore(path);
-		try {
-			const scoped = scopedSessionMappingStore(store, f.scope.principalId, f.scope.chatId);
-			const before = readFileSync(path);
-			const lock = AuthorityMutationLock.acquire(path);
+	test.each([false, true])(
+		"initial create passive storage is scoped immutable durable and failure atomic with endpoint=%s",
+		withReceipt => {
+			const f = initialCreateReceiptFixture();
+			// Synthetic original-result receipts exercise persistence, not live SDK endpoint authority.
+			const endpointReceipt = {
+				sessionId: f.acknowledged.sessionId,
+				endpointGeneration: f.acknowledged.generation,
+				endpointIncarnation: "a".repeat(64),
+			};
+			f.receipt = createManagedLateCreateAcknowledgement(
+				f.admitted,
+				f.acknowledged,
+				f.receipt.observedAt,
+				withReceipt ? endpointReceipt : undefined,
+			);
+			const originalReceipt = structuredClone(f.receipt);
+			const conflicts = [
+				createManagedLateCreateAcknowledgement(f.admitted, f.acknowledged, f.receipt.observedAt, {
+					...endpointReceipt,
+					endpointIncarnation: "b".repeat(64),
+				}),
+				...(withReceipt
+					? [createManagedLateCreateAcknowledgement(f.admitted, f.acknowledged, f.receipt.observedAt)]
+					: []),
+			];
+			const root = mkdtempSync(join(tmpdir(), "gjc-late-initial-create-"));
+			const path = join(root, "authority.json");
+			writeFileSync(path, JSON.stringify(f.document));
+			let store = new SessionV3FileBackedMappingStore(path);
 			try {
-				expect(() => scoped.recordLateCreateAcknowledgement(f.scope.chatId, f.admitted, f.receipt)).toThrow();
-			} finally {
-				lock.release();
-			}
-			expect(readFileSync(path).equals(before)).toBe(true);
-			expect(() =>
-				store.recordLateCreateAcknowledgementScoped({ ...f.scope, principalId: "foreign" }, f.admitted, f.receipt),
-			).toThrow("admitted owner");
-			const absent = { ...f.admitted, id: "absent", ingressId: "absent" };
-			expect(() =>
-				scoped.recordLateCreateAcknowledgement(
-					f.scope.chatId,
-					absent,
-					createManagedLateCreateAcknowledgement(absent, f.acknowledged, f.receipt.observedAt),
-				),
-			).toThrow("one retained provisional");
-			const changed = { ...f.admitted, startedAt: "2026-08-23T00:00:00.000Z" };
-			expect(() =>
-				scoped.recordLateCreateAcknowledgement(
-					f.scope.chatId,
-					changed,
-					createManagedLateCreateAcknowledgement(changed, f.acknowledged, f.receipt.observedAt),
-				),
-			).toThrow("retained reservation");
-			expect(() =>
-				scoped.recordLateCreateAcknowledgement(
-					f.scope.chatId,
-					{ ...f.admitted, lifecycle: { ...f.admitted.lifecycle!, recordedAt: "2026-08-24T00:00:03.000Z" } },
-					f.receipt,
-				),
-			).toThrow("original invocation");
-			expect(readFileSync(path).equals(before)).toBe(true);
-			scoped.recordLateCreateAcknowledgement(f.scope.chatId, f.admitted, f.receipt);
-			const bytes = readFileSync(path),
-				inode = statSync(path).ino;
-			scoped.recordLateCreateAcknowledgement(f.scope.chatId, f.admitted, f.receipt);
-			expect(readFileSync(path).equals(bytes)).toBe(true);
-			expect(statSync(path).ino).toBe(inode);
-			for (const patch of [
-				{ observedAt: "2026-08-24T00:00:03.000Z" },
-				{ acknowledged: { sessionId: "replacement", generation: 8 } },
-			]) {
+				const scoped = scopedSessionMappingStore(store, f.scope.principalId, f.scope.chatId);
+				const before = readFileSync(path);
+				const lock = AuthorityMutationLock.acquire(path);
+				try {
+					expect(() => scoped.recordLateCreateAcknowledgement(f.scope.chatId, f.admitted, f.receipt)).toThrow();
+				} finally {
+					lock.release();
+				}
+				expect(readFileSync(path).equals(before)).toBe(true);
 				expect(() =>
-					scoped.recordLateCreateAcknowledgement(f.scope.chatId, f.admitted, { ...f.receipt, ...patch }),
-				).toThrow("immutable");
+					store.recordLateCreateAcknowledgementScoped(
+						{ ...f.scope, principalId: "foreign" },
+						f.admitted,
+						f.receipt,
+					),
+				).toThrow("admitted owner");
+				const absent = { ...f.admitted, id: "absent", ingressId: "absent" };
+				expect(() =>
+					scoped.recordLateCreateAcknowledgement(
+						f.scope.chatId,
+						absent,
+						createManagedLateCreateAcknowledgement(absent, f.acknowledged, f.receipt.observedAt),
+					),
+				).toThrow("one retained provisional");
+				const changed = { ...f.admitted, startedAt: "2026-08-23T00:00:00.000Z" };
+				expect(() =>
+					scoped.recordLateCreateAcknowledgement(
+						f.scope.chatId,
+						changed,
+						createManagedLateCreateAcknowledgement(changed, f.acknowledged, f.receipt.observedAt),
+					),
+				).toThrow("retained reservation");
+				expect(() =>
+					scoped.recordLateCreateAcknowledgement(
+						f.scope.chatId,
+						{ ...f.admitted, lifecycle: { ...f.admitted.lifecycle!, recordedAt: "2026-08-24T00:00:03.000Z" } },
+						f.receipt,
+					),
+				).toThrow("original invocation");
+				expect(readFileSync(path).equals(before)).toBe(true);
+				scoped.recordLateCreateAcknowledgement(f.scope.chatId, f.admitted, f.receipt);
+				const bytes = readFileSync(path),
+					inode = statSync(path).ino;
+				scoped.recordLateCreateAcknowledgement(f.scope.chatId, f.admitted, f.receipt);
 				expect(readFileSync(path).equals(bytes)).toBe(true);
+				expect(statSync(path).ino).toBe(inode);
+				for (const patch of [
+					{ observedAt: "2026-08-24T00:00:03.000Z" },
+					{
+						acknowledged: { sessionId: "replacement", generation: 8 },
+						...(withReceipt
+							? { endpointReceipt: { ...endpointReceipt, sessionId: "replacement", endpointGeneration: 8 } }
+							: {}),
+					},
+				]) {
+					expect(() =>
+						scoped.recordLateCreateAcknowledgement(f.scope.chatId, f.admitted, { ...f.receipt, ...patch }),
+					).toThrow("immutable");
+					expect(readFileSync(path).equals(bytes)).toBe(true);
+				}
+				for (const conflict of conflicts) {
+					expect(() => store.recordLateCreateAcknowledgementScoped(f.scope, f.admitted, conflict)).toThrow(
+						"immutable",
+					);
+					expect(readFileSync(path).equals(bytes)).toBe(true);
+				}
+				const returned = store.provisionalOperationScoped(f.scope, f.admitted.id)!.lateCreateAcknowledgement!;
+				expect(returned).toEqual(originalReceipt);
+				if (withReceipt) {
+					Object.assign(f.receipt.endpointReceipt!, { endpointIncarnation: "c".repeat(64) });
+					Object.assign(returned.endpointReceipt!, { endpointIncarnation: "d".repeat(64) });
+				}
+				expect(store.provisionalOperationScoped(f.scope, f.admitted.id)!.lateCreateAcknowledgement).toEqual(
+					originalReceipt,
+				);
+				Object.assign(f.receipt.acknowledged, { generation: 99 });
+				store.close();
+				store = new SessionV3FileBackedMappingStore(path);
+				const retained = store.provisionalOperationScoped(f.scope, f.admitted.id)!;
+				expect(retained.lateCreateAcknowledgement).toEqual(originalReceipt);
+				for (const conflict of conflicts) {
+					expect(() => store.recordLateCreateAcknowledgementScoped(f.scope, f.admitted, conflict)).toThrow(
+						"immutable",
+					);
+					expect(readFileSync(path).equals(bytes)).toBe(true);
+				}
+				if (withReceipt) {
+					Object.assign(retained.lateCreateAcknowledgement!.endpointReceipt!, {
+						endpointIncarnation: "e".repeat(64),
+					});
+					expect(store.provisionalOperationScoped(f.scope, f.admitted.id)!.lateCreateAcknowledgement).toEqual(
+						originalReceipt,
+					);
+				}
+				expect(retained.lateCreateAcknowledgement!.acknowledged.generation).toBe(7);
+				expect(retained.lifecycle).toEqual(f.uncertain.lifecycle);
+				expect(retained.sessionId).toBeUndefined();
+				expect(retained.managedAuthority).toBeUndefined();
+				expect(store.getScoped(f.scope)).toBeUndefined();
+				expect(readFileSync(path).equals(bytes)).toBe(true);
+			} finally {
+				store.close();
+				rmSync(root, { recursive: true, force: true });
 			}
-			Object.assign(f.receipt.acknowledged, { generation: 99 });
-			store.close();
-			store = new SessionV3FileBackedMappingStore(path);
-			const retained = store.provisionalOperationScoped(f.scope, f.admitted.id)!;
-			expect(retained.lateCreateAcknowledgement!.acknowledged.generation).toBe(7);
-			expect(retained.lifecycle).toEqual(f.uncertain.lifecycle);
-			expect(retained.sessionId).toBeUndefined();
-			expect(retained.managedAuthority).toBeUndefined();
-			expect(store.getScoped(f.scope)).toBeUndefined();
-			expect(readFileSync(path).equals(bytes)).toBe(true);
-		} finally {
-			store.close();
-			rmSync(root, { recursive: true, force: true });
-		}
-	});
+		},
+	);
 
 	test("selected resume passive receipt cannot substitute another session or generation", () => {
 		const f = passiveReceiptFixture("resume");
@@ -1306,94 +1495,147 @@ describe("session authority v3 full graph", () => {
 		}
 	});
 
-	test("atomic late receipt capture is scoped, write-once, copy-isolated and replay-inert", () => {
-		const f = passiveReceiptFixture();
-		const scope = { principalId: "tenant-a", chatId: "chat-a" };
-		const root = f.document.mappings[0];
-		const key = JSON.stringify([scope.principalId, scope.chatId]);
-		root.chatId = key;
-		root.header.chatId = key;
-		root.managedAuthority.chatId = key;
-		root.journal = [{ ...f.uncertain }];
-		delete root.journal[0].lateLifecycleAcknowledgement;
-		delete root.reassignment;
-		f.document.provisionalOperations = [];
-		const temporary = mkdtempSync(join(tmpdir(), "gjc-atomic-late-receipt-"));
-		const path = join(temporary, "authority.json");
-		let store: SessionV3FileBackedMappingStore | undefined;
-		try {
-			writeFileSync(
-				path,
-				encodeSessionAuthorityV3Document(parseSessionAuthorityV3Document(JSON.stringify(f.document))!),
-			);
-			store = new SessionV3FileBackedMappingStore(path);
-			const scoped = scopedSessionMappingStore(store, scope.principalId, scope.chatId);
-			const before = readFileSync(path);
-			const lock = AuthorityMutationLock.acquire(path);
-			try {
-				expect(() => scoped.recordLateLifecycleAcknowledgement(scope.chatId, f.admitted, f.receipt)).toThrow();
-			} finally {
-				lock.release();
-			}
-			expect(readFileSync(path).equals(before)).toBe(true);
-			expect(() =>
-				store!.recordLateLifecycleAcknowledgementScoped(
-					{ ...scope, principalId: "foreign" },
-					f.admitted,
-					f.receipt,
-				),
-			).toThrow("admitted owner");
-			const replacement = { ...f.admitted, id: "replacement", ingressId: "replacement" };
-			const replacementReceipt = createManagedLateLifecycleAcknowledgement(
-				replacement,
+	test.each([false, true])(
+		"atomic late receipt capture is scoped, write-once, copy-isolated and replay-inert with endpoint=%s",
+		withReceipt => {
+			const f = passiveReceiptFixture();
+			const endpointReceipt = {
+				sessionId: f.acknowledged.sessionId,
+				endpointGeneration: f.acknowledged.generation,
+				endpointIncarnation: "a".repeat(64),
+			};
+			f.receipt = createManagedLateLifecycleAcknowledgement(
+				f.admitted,
 				f.acknowledged,
 				f.receipt.observedAt,
+				withReceipt ? endpointReceipt : undefined,
 			);
-			expect(() => scoped.recordLateLifecycleAcknowledgement(scope.chatId, replacement, replacementReceipt)).toThrow(
-				"one retained reservation",
-			);
-			expect(readFileSync(path).equals(before)).toBe(true);
-			const laterInvocation = {
-				...f.admitted,
-				lifecycle: { ...f.admitted.lifecycle!, recordedAt: "2026-08-24T00:00:03.000Z" },
-			};
-			expect(() => scoped.recordLateLifecycleAcknowledgement(scope.chatId, laterInvocation, f.receipt)).toThrow(
-				"original invocation",
-			);
-			expect(readFileSync(path).equals(before)).toBe(true);
-			scoped.recordLateLifecycleAcknowledgement(scope.chatId, f.admitted, f.receipt);
-			const committed = readFileSync(path),
-				identity = statSync(path).ino;
-			scoped.recordLateLifecycleAcknowledgement(scope.chatId, f.admitted, f.receipt);
-			expect(readFileSync(path).equals(committed)).toBe(true);
-			expect(statSync(path).ino).toBe(identity);
-			for (const patch of [
-				{ observedAt: "2026-08-24T00:00:03.000Z" },
-				{ acknowledged: { ...f.receipt.acknowledged, generation: 10 } },
-				{ admissionHash: "b".repeat(64) },
-			]) {
+			const originalReceipt = structuredClone(f.receipt);
+			const conflicts = [
+				createManagedLateLifecycleAcknowledgement(f.admitted, f.acknowledged, f.receipt.observedAt, {
+					...endpointReceipt,
+					endpointIncarnation: "b".repeat(64),
+				}),
+				...(withReceipt
+					? [createManagedLateLifecycleAcknowledgement(f.admitted, f.acknowledged, f.receipt.observedAt)]
+					: []),
+			];
+			const scope = { principalId: "tenant-a", chatId: "chat-a" };
+			const root = f.document.mappings[0];
+			const key = JSON.stringify([scope.principalId, scope.chatId]);
+			root.chatId = key;
+			root.header.chatId = key;
+			root.managedAuthority.chatId = key;
+			root.journal = [{ ...f.uncertain }];
+			delete root.journal[0].lateLifecycleAcknowledgement;
+			delete root.reassignment;
+			f.document.provisionalOperations = [];
+			const temporary = mkdtempSync(join(tmpdir(), "gjc-atomic-late-receipt-"));
+			const path = join(temporary, "authority.json");
+			let store: SessionV3FileBackedMappingStore | undefined;
+			try {
+				writeFileSync(
+					path,
+					encodeSessionAuthorityV3Document(parseSessionAuthorityV3Document(JSON.stringify(f.document))!),
+				);
+				store = new SessionV3FileBackedMappingStore(path);
+				const scoped = scopedSessionMappingStore(store, scope.principalId, scope.chatId);
+				const before = readFileSync(path);
+				const lock = AuthorityMutationLock.acquire(path);
+				try {
+					expect(() => scoped.recordLateLifecycleAcknowledgement(scope.chatId, f.admitted, f.receipt)).toThrow();
+				} finally {
+					lock.release();
+				}
+				expect(readFileSync(path).equals(before)).toBe(true);
 				expect(() =>
-					scoped.recordLateLifecycleAcknowledgement(scope.chatId, f.admitted, { ...f.receipt, ...patch }),
-				).toThrow();
+					store!.recordLateLifecycleAcknowledgementScoped(
+						{ ...scope, principalId: "foreign" },
+						f.admitted,
+						f.receipt,
+					),
+				).toThrow("admitted owner");
+				const replacement = { ...f.admitted, id: "replacement", ingressId: "replacement" };
+				const replacementReceipt = createManagedLateLifecycleAcknowledgement(
+					replacement,
+					f.acknowledged,
+					f.receipt.observedAt,
+				);
+				expect(() =>
+					scoped.recordLateLifecycleAcknowledgement(scope.chatId, replacement, replacementReceipt),
+				).toThrow("one retained reservation");
+				expect(readFileSync(path).equals(before)).toBe(true);
+				const laterInvocation = {
+					...f.admitted,
+					lifecycle: { ...f.admitted.lifecycle!, recordedAt: "2026-08-24T00:00:03.000Z" },
+				};
+				expect(() => scoped.recordLateLifecycleAcknowledgement(scope.chatId, laterInvocation, f.receipt)).toThrow(
+					"original invocation",
+				);
+				expect(readFileSync(path).equals(before)).toBe(true);
+				scoped.recordLateLifecycleAcknowledgement(scope.chatId, f.admitted, f.receipt);
+				const committed = readFileSync(path),
+					identity = statSync(path).ino;
+				scoped.recordLateLifecycleAcknowledgement(scope.chatId, f.admitted, f.receipt);
 				expect(readFileSync(path).equals(committed)).toBe(true);
+				expect(statSync(path).ino).toBe(identity);
+				for (const patch of [
+					{ observedAt: "2026-08-24T00:00:03.000Z" },
+					{ acknowledged: { ...f.receipt.acknowledged, generation: 10 } },
+					{ admissionHash: "b".repeat(64) },
+				]) {
+					expect(() =>
+						scoped.recordLateLifecycleAcknowledgement(scope.chatId, f.admitted, { ...f.receipt, ...patch }),
+					).toThrow();
+					expect(readFileSync(path).equals(committed)).toBe(true);
+				}
+				for (const conflict of conflicts) {
+					expect(() => store!.recordLateLifecycleAcknowledgementScoped(scope, f.admitted, conflict)).toThrow(
+						"immutable",
+					);
+					expect(readFileSync(path).equals(committed)).toBe(true);
+				}
+				const returned = store.operationScoped(scope, f.admitted.id)!.lateLifecycleAcknowledgement!;
+				expect(returned).toEqual(originalReceipt);
+				if (withReceipt) {
+					Object.assign(f.receipt.endpointReceipt!, { endpointIncarnation: "c".repeat(64) });
+					Object.assign(returned.endpointReceipt!, { endpointIncarnation: "d".repeat(64) });
+				}
+				expect(store.operationScoped(scope, f.admitted.id)!.lateLifecycleAcknowledgement).toEqual(originalReceipt);
+				Object.assign(f.receipt.acknowledged, { generation: 99 });
+				expect(
+					scoped.operation(scope.chatId, f.admitted.id)!.lateLifecycleAcknowledgement!.acknowledged.generation,
+				).toBe(9);
+				store.close();
+				store = new SessionV3FileBackedMappingStore(path);
+				const operation = store.operationScoped(scope, f.admitted.id)!;
+				expect(operation.lateLifecycleAcknowledgement).toEqual(originalReceipt);
+				for (const conflict of conflicts) {
+					expect(() => store!.recordLateLifecycleAcknowledgementScoped(scope, f.admitted, conflict)).toThrow(
+						"immutable",
+					);
+					expect(readFileSync(path).equals(committed)).toBe(true);
+				}
+				if (withReceipt) {
+					Object.assign(operation.lateLifecycleAcknowledgement!.endpointReceipt!, {
+						endpointIncarnation: "e".repeat(64),
+					});
+					expect(store.operationScoped(scope, f.admitted.id)!.lateLifecycleAcknowledgement).toEqual(
+						originalReceipt,
+					);
+				}
+				expect(readFileSync(path).equals(committed)).toBe(true);
+				expect(operation.lifecycle).toEqual(f.uncertain.lifecycle);
+				expect(operation.lateLifecycleAcknowledgement!.acknowledged.generation).toBe(9);
+				expect(operation.acknowledgedSuccessor).toBeUndefined();
+				expect(operation.result).toBeUndefined();
+				expect(store.getScoped(scope)!.sessionId).toBe(f.admitted.lifecycle!.source!.sessionId);
+			} finally {
+				store?.close();
+				rmSync(temporary, { recursive: true, force: true });
 			}
-			Object.assign(f.receipt.acknowledged, { generation: 99 });
-			expect(
-				scoped.operation(scope.chatId, f.admitted.id)!.lateLifecycleAcknowledgement!.acknowledged.generation,
-			).toBe(9);
-			store.close();
-			store = new SessionV3FileBackedMappingStore(path);
-			const operation = store.operationScoped(scope, f.admitted.id)!;
-			expect(operation.lifecycle).toEqual(f.uncertain.lifecycle);
-			expect(operation.lateLifecycleAcknowledgement!.acknowledged.generation).toBe(9);
-			expect(operation.acknowledgedSuccessor).toBeUndefined();
-			expect(operation.result).toBeUndefined();
-			expect(store.getScoped(scope)!.sessionId).toBe(f.admitted.lifecycle!.source!.sessionId);
-		} finally {
-			store?.close();
-			rmSync(temporary, { recursive: true, force: true });
-		}
-	});
+		},
+	);
 
 	test.each(["create", "branch", "resume"] as const)(
 		"passive %s receipt preserves exact admission without granting successor proof",

@@ -351,7 +351,11 @@ function createManagedSelectionRuntime(baseUrl: string) {
 		return {
 			ok: true as const,
 			operation: "session.create" as const,
-			result: { sessionId: session.sessionId, endpointGeneration: session.generation },
+			result: {
+				sessionId: session.sessionId,
+				endpointGeneration: session.generation,
+				endpointIncarnation: "a".repeat(64),
+			},
 		};
 	};
 	const retireSession = (request: Record<string, unknown>) => {
@@ -462,7 +466,7 @@ function createManagedSelectionRuntime(baseUrl: string) {
 	const runtimeWithFixtureOperations = runtime as unknown as {
 		closeLifecycleSession: (tenantOrRequest: unknown, request?: unknown) => Promise<unknown>;
 	};
-	// Selection scenarios simulate lifecycle retirement, not SDK 0.16.4's unavailable
+	// Selection scenarios simulate lifecycle retirement, not integration of persisted
 	// public exact-close authority. Real runtime close rejection has separate tests.
 	runtimeWithFixtureOperations.closeLifecycleSession = async (tenantOrRequest, request) => {
 		const tenant = request === undefined && isRecord(tenantOrRequest) ? tenantOrRequest.tenant : tenantOrRequest;

@@ -838,7 +838,11 @@ describe("managed turn runner", () => {
 		const fake = new RunnerRuntime();
 		fake.createPreparedExternalLifecycleSession = async (_prepared, request, _timeoutMs, onOutcome) => {
 			fake.externalLifecycle.push(request);
-			const outcome = { ok: true as const, result: { sessionId: "new-session", endpointGeneration: 12 } };
+			const outcome = {
+				ok: true as const,
+				operation: "session.create" as const,
+				result: { sessionId: "new-session", endpointGeneration: 12, endpointIncarnation: "a".repeat(64) },
+			};
 			await onOutcome?.(outcome);
 			return outcome;
 		};
@@ -1010,19 +1014,23 @@ describe("managed turn runner", () => {
 			const expected = {
 				sessionId: operation === "session.new" ? "new-session" : authority.sessionId,
 				endpointGeneration: operation === "session.new" ? 12 : authority.generation,
+				endpointIncarnation: "a".repeat(64),
 			};
 			const order: string[] = [];
 			fake.createPreparedExternalLifecycleSession = async (_key, request, _timeoutMs, onOutcome) => {
 				order.push("sdk");
 				fake.externalLifecycle.push(request);
-				const outcome = { ok: true as const, result: expected };
+				const outcome = { ok: true as const, operation: "session.create" as const, result: expected };
 				await onOutcome?.(outcome);
 				return outcome;
 			};
 			fake.resumeExternalLifecycleSession = async (_key, request, _timeoutMs, onOutcome) => {
 				order.push("sdk");
 				fake.externalLifecycle.push(request!);
-				const outcome = { kind: "result", outcome: { ok: true as const, result: expected } };
+				const outcome = {
+					kind: "result",
+					outcome: { ok: true as const, operation: "session.resume" as const, result: expected },
+				};
 				await onOutcome?.(outcome);
 				return outcome;
 			};
@@ -1086,7 +1094,11 @@ describe("managed turn runner", () => {
 		async operation => {
 			const fake = new RunnerRuntime();
 			fake.createPreparedExternalLifecycleSession = async (_key, _request, _timeoutMs, onOutcome) => {
-				const outcome = { ok: true as const, result: { sessionId: "new-session", endpointGeneration: 12 } };
+				const outcome = {
+					ok: true as const,
+					operation: "session.create" as const,
+					result: { sessionId: "new-session", endpointGeneration: 12, endpointIncarnation: "a".repeat(64) },
+				};
 				await onOutcome?.(outcome);
 				return outcome;
 			};
@@ -1293,7 +1305,7 @@ class RunnerRuntime {
 		onOutcome?: (outcome: unknown) => void | Promise<void>,
 	) {
 		if (request === undefined) throw new Error("Complete managed tenant authority is required.");
-		const outcome = { kind: "result", outcome: lifecycleSuccess() };
+		const outcome = { kind: "result", outcome: lifecycleSuccess("session.resume") };
 		await onOutcome?.(outcome);
 		return outcome;
 	}
@@ -1411,7 +1423,11 @@ class RunnerRuntime {
 	) {
 		const request = maybeRequest ?? (_tenantOrRequest as Record<string, unknown>);
 		this.forkRequests.push(request);
-		const outcome = { ok: true as const, operation: "session.fork", result: this.forkResult };
+		const outcome = {
+			ok: true as const,
+			operation: "session.fork",
+			result: { ...this.forkResult, endpointIncarnation: "a".repeat(64) },
+		};
 		await onOutcome?.(outcome);
 		return outcome;
 	}
@@ -1419,18 +1435,32 @@ class RunnerRuntime {
 		this.closeCalls += 1;
 		this.closeTimeouts.push(_maybeRequest?.timeoutMs);
 		await this.closeGate;
-		return lifecycleSuccess();
+		return {
+			ok: true as const,
+			result: { sessionId: authority.sessionId, endpointGeneration: authority.generation },
+		};
 	}
 	async deleteLifecycleSession(_tenantOrRequest?: unknown, _maybeRequest?: Record<string, unknown>) {
-		return lifecycleSuccess();
+		return {
+			ok: true as const,
+			result: { sessionId: authority.sessionId, endpointGeneration: authority.generation },
+		};
 	}
 	async listLifecycleSessions(_tenantOrRequest?: unknown, _maybeRequest?: Record<string, unknown>) {
 		return { ok: true, result: { sessions: [] } };
 	}
 }
 
-function lifecycleSuccess() {
-	return { ok: true as const, result: { sessionId: authority.sessionId, endpointGeneration: authority.generation } };
+function lifecycleSuccess(operation: "session.create" | "session.resume" = "session.create") {
+	return {
+		ok: true as const,
+		operation,
+		result: {
+			sessionId: authority.sessionId,
+			endpointGeneration: authority.generation,
+			endpointIncarnation: "a".repeat(64),
+		},
+	};
 }
 function routerFrame(body: Record<string, unknown>, seq: number) {
 	return {

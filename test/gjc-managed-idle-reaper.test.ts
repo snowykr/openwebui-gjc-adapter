@@ -1,5 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { createManagedLifecycleEvidence, lifecyclePreparedAuthority } from "../src/gjc/managed-lifecycle-evidence";
+import { ManagedOperationDeadline } from "../src/gjc/managed-operation-deadline";
 import type { ManagedTurnAuthority } from "../src/gjc/turn-runner";
 import {
 	type CreateManagedIdleReaperInput,
@@ -8,7 +10,9 @@ import {
 	type ManagedIdleCloseIntent,
 	type ManagedIdleGenerationRecord,
 	type ManagedIdleGenerationStore,
+	type ManagedIdlePreparedClose,
 } from "../src/live/gjc-managed-idle-reaper";
+import { FakeManagedSdkRuntime } from "./cli-fixtures";
 
 const authority = (principalId = "tenant-a", generation = 4): ManagedTurnAuthority => ({
 	principalId,
@@ -47,9 +51,42 @@ class Store implements ManagedIdleGenerationStore {
 	async active() {
 		return this.records;
 	}
-	async prepareClose(_record: ManagedIdleGenerationRecord, intent: ManagedIdleCloseIntent) {
+	async prepareClose(
+		record: ManagedIdleGenerationRecord,
+		intent: ManagedIdleCloseIntent,
+	): Promise<false | ManagedIdlePreparedClose> {
 		this.prepared.push(intent);
-		return this.prepare;
+		if (!this.prepare) return false;
+		const target = {
+			sessionId: record.authority.sessionId,
+			endpointGeneration: record.authority.generation,
+			endpointIncarnation: "a".repeat(64),
+		};
+		const operation = { operationId: intent.key, requestKey: intent.key, payloadHash: "b".repeat(64) };
+		return {
+			...intent,
+			target,
+			operation,
+			original: {
+				id: intent.key,
+				ingressId: intent.key,
+				kind: "close",
+				state: "pending",
+				startedAt: new Date(intent.requestedAt).toISOString(),
+				detail: operation.payloadHash,
+				lifecycle: {
+					...createManagedLifecycleEvidence({
+						operation: "session.close",
+						preparedAuthority: { ...lifecyclePreparedAuthority(record.authority), requestKey: intent.key },
+						source: record.authority,
+						target,
+						payloadHash: operation.payloadHash,
+					}),
+					state: "closing",
+					sourceProofRef: { operationId: "source", evidenceHash: "c".repeat(64) },
+				},
+			},
+		};
 	}
 	async pendingRetirement(record: ManagedIdleGenerationRecord) {
 		return this.prepared.find(intent => intent.authority === record.authority && this.retired.includes(intent.key));
@@ -86,7 +123,7 @@ class Store implements ManagedIdleGenerationStore {
 function harness(
 	records: ManagedIdleGenerationRecord[],
 	status = "retired",
-	outcome: { ok: boolean; certainty?: string; result?: { sessionId: string } } = {
+	outcome: { ok: boolean; operation?: string; certainty?: string; result?: { sessionId: string } } = {
 		ok: true,
 		result: { sessionId: "session-a" },
 	},
@@ -114,9 +151,14 @@ function harness(
 			},
 		},
 		runtime: {
-			async closeLifecycleSession(request) {
+			createProducerScope: () => new FakeManagedSdkRuntime().createProducerScope(),
+			async closeLifecycleSession(request, operation, onOutcome) {
 				closeKeys.push(request.requestKey);
-				return outcome;
+				expect(operation.requestKey).toBe(request.requestKey);
+				expect(request.target.endpointIncarnation).toBe("a".repeat(64));
+				const result = { operation: "session.close", ...outcome };
+				await onOutcome(result);
+				return result;
 			},
 			async reconcile() {
 				reconciles += 1;
@@ -137,7 +179,105 @@ const active = (owner = "tenant-a", lastActivityAt = 0): ManagedIdleGenerationRe
 });
 
 describe("managed idle reaper", () => {
-	test.each(["active", "admission", "lease", "fence", "close", "reconcile", "status", "publication"] as const)(
+	test.each(["close", "reconcile", "status"] as const)(
+		"retains admission and lease through actual late %s settlement without late retirement",
+		async phase => {
+			const gate = deferred<void>();
+			const entered = deferred<void>();
+			const uncertain = deferred<void>();
+			let releases = 0;
+			let closes = 0;
+			let statuses = 0;
+			const subject = harness([active()], "retired", undefined, {
+				closeTimeoutMs: 60,
+				admission: {
+					acquire: async () => () => {
+						releases += 1;
+					},
+				},
+				leases: {
+					acquire: async () => ({
+						assertFence: async () => undefined,
+						release: async () => {
+							releases += 1;
+						},
+					}),
+				},
+				runtime: {
+					createProducerScope: () => new FakeManagedSdkRuntime().createProducerScope(),
+					closeLifecycleSession: async (request, _operation, onOutcome) => {
+						closes += 1;
+						if (phase === "close") {
+							entered.resolve();
+							await gate.promise;
+						}
+						const outcome = {
+							ok: true,
+							operation: "session.close",
+							result: { sessionId: request.target.sessionId },
+						};
+						await onOutcome(outcome);
+						return outcome;
+					},
+					reconcile: async () => {
+						if (phase === "reconcile") {
+							entered.resolve();
+							await gate.promise;
+						}
+					},
+					generationStatus: async () => {
+						statuses += 1;
+						if (phase === "status") {
+							entered.resolve();
+							await gate.promise;
+						}
+						return { status: "retired", evidence: retirementEvidence };
+					},
+				},
+			});
+			const mark = subject.store.markUncertain.bind(subject.store);
+			subject.store.markUncertain = async (...args) => {
+				await mark(...args);
+				uncertain.resolve();
+			};
+			let settled = false;
+			const scan = subject.reaper.runOnce().finally(() => {
+				settled = true;
+			});
+			void scan.catch(() => undefined);
+			try {
+				await entered.promise;
+				await uncertain.promise;
+				expect(settled).toBe(false);
+				expect(releases).toBe(0);
+				expect(subject.store.acknowledged).toHaveLength(phase === "close" ? 0 : 1);
+				await subject.reaper.runOnce();
+				expect(closes).toBe(1);
+				let stopped = false;
+				const stop = subject.reaper.stop().finally(() => {
+					stopped = true;
+				});
+				void stop.catch(() => undefined);
+				await Promise.resolve();
+				expect(stopped).toBe(false);
+				gate.resolve();
+				await expect(scan).rejects.toMatchObject({ code: "timeout" });
+				await expect(stop).rejects.toMatchObject({ code: "timeout" });
+				expect(subject.store.acknowledged).toHaveLength(1);
+				expect(subject.store.records[0]?.state).toBe("uncertain");
+				expect(subject.store.retired).toEqual([]);
+				expect(subject.store.evicted).toEqual([]);
+				expect(subject.store.published).toEqual([]);
+				expect(statuses).toBe(phase === "status" ? 1 : 0);
+				expect(releases).toBe(2);
+			} finally {
+				gate.resolve();
+				await scan.catch(() => undefined);
+			}
+		},
+	);
+
+	test.each(["active", "fence", "publication"] as const)(
 		"bounds hanging %s within the single retirement budget and drains stop",
 		async phase => {
 			const never = new Promise<never>(() => {});
@@ -156,40 +296,37 @@ describe("managed idle reaper", () => {
 				records: store,
 				closeTimeoutMs: 60,
 				admission: {
-					acquire: async () =>
-						phase === "admission"
-							? stall()
-							: () => {
-									released += 1;
-								},
+					acquire: async () => () => {
+						released += 1;
+					},
 				},
 				leases: {
-					acquire: async () =>
-						phase === "lease"
-							? stall()
-							: {
-									assertFence: async () => {
-										if (phase === "fence") await stall();
-									},
-									release: async () => {
-										released += 1;
-									},
-								},
+					acquire: async () => ({
+						assertFence: async () => {
+							if (phase === "fence") await stall();
+						},
+						release: async () => {
+							released += 1;
+						},
+					}),
 				},
 				runtime: {
-					closeLifecycleSession: async request => {
+					createProducerScope: () => new FakeManagedSdkRuntime().createProducerScope(),
+					closeLifecycleSession: async (request, _operation, onOutcome) => {
 						closes += 1;
-						if (phase === "close") await stall();
 						expect(request.timeoutMs).toBeGreaterThan(0);
 						expect(request.timeoutMs).toBeLessThanOrEqual(60);
-						return { ok: true, result: { sessionId: request.target.sessionId } };
+						const outcome = {
+							ok: true,
+							operation: "session.close",
+							result: { sessionId: request.target.sessionId },
+						};
+						await onOutcome(outcome);
+						return outcome;
 					},
-					reconcile: async () => {
-						if (phase === "reconcile") await stall();
-					},
+					reconcile: async () => {},
 					generationStatus: async () => {
 						statuses += 1;
-						if (phase === "status") await stall();
 						return { status: "retired", evidence: retirementEvidence };
 					},
 				},
@@ -213,26 +350,49 @@ describe("managed idle reaper", () => {
 		},
 	);
 
-	test.each(["admission", "lease"] as const)("releases a late %s without late close dispatch", async phase => {
+	test.each([
+		["admission", false],
+		["lease", false],
+		["admission", true],
+		["lease", true],
+	] as const)("owns late %s acquisition and cleanup through stop (release failure: %s)", async (phase, fails) => {
 		const gate = deferred<void>();
 		const entered = deferred<void>();
-		const released = deferred<void>();
+		const releaseEntered = deferred<void>();
+		const releaseGate = deferred<void>();
+		const expired = deferred<unknown>();
+		const failure = new Error("late release failed");
+		const fail = ManagedOperationDeadline.prototype.fail;
+		const deadlineFailure = spyOn(ManagedOperationDeadline.prototype, "fail").mockImplementation(function (
+			this: ManagedOperationDeadline,
+			error,
+		) {
+			fail.call(this, error);
+			if (error instanceof Error && "code" in error && error.code === "timeout") expired.resolve(error);
+		});
 		let closes = 0;
+		let admissions = 0;
+		let leases = 0;
+		let admissionReleases = 0;
+		let leaseReleases = 0;
 		const subject = harness([active()], "retired", undefined, {
 			closeTimeoutMs: 30,
 			admission: {
 				acquire: async () => {
+					admissions += 1;
 					if (phase === "admission") {
 						entered.resolve();
 						await gate.promise;
 					}
 					return () => {
-						if (phase === "admission") released.resolve();
+						admissionReleases += 1;
+						if (phase === "admission" && fails) throw failure;
 					};
 				},
 			},
 			leases: {
 				acquire: async () => {
+					leases += 1;
 					entered.resolve();
 					await gate.promise;
 					return {
@@ -240,12 +400,16 @@ describe("managed idle reaper", () => {
 							throw new Error("late fence");
 						},
 						release: async () => {
-							released.resolve();
+							leaseReleases += 1;
+							releaseEntered.resolve();
+							await releaseGate.promise;
+							if (fails) throw failure;
 						},
 					};
 				},
 			},
 			runtime: {
+				createProducerScope: () => new FakeManagedSdkRuntime().createProducerScope(),
 				closeLifecycleSession: async () => {
 					closes += 1;
 					throw new Error("late close");
@@ -254,15 +418,127 @@ describe("managed idle reaper", () => {
 				generationStatus: async () => ({ status: "unknown" }),
 			},
 		});
-		const scan = subject.reaper.runOnce();
+		let settled = false;
+		const scan = subject.reaper.runOnce().finally(() => {
+			settled = true;
+		});
 		void scan.catch(() => undefined);
-		await entered.promise;
-		await expect(scan).rejects.toMatchObject({ code: "timeout" });
-		gate.resolve();
-		await released.promise;
-		expect(closes).toBe(0);
-		expect(subject.store.prepared).toEqual([]);
-		await subject.reaper.stop();
+		let stopping: Promise<void> | undefined;
+		try {
+			await entered.promise;
+			const timeout = await expired.promise;
+			expect(settled).toBe(false);
+			expect(admissionReleases).toBe(0);
+			await subject.reaper.runOnce();
+			expect(admissions).toBe(1);
+			expect(leases).toBe(phase === "lease" ? 1 : 0);
+			let stopped = false;
+			stopping = subject.reaper.stop().finally(() => {
+				stopped = true;
+			});
+			void stopping.catch(() => undefined);
+			await Promise.resolve();
+			expect(stopped).toBe(false);
+			gate.resolve();
+			if (phase === "lease") {
+				await releaseEntered.promise;
+				expect(settled).toBe(false);
+				expect(stopped).toBe(false);
+				expect(admissionReleases).toBe(0);
+				releaseGate.resolve();
+			}
+			if (fails) {
+				const error = await scan.catch(error => error);
+				expect(error).toBeInstanceOf(AggregateError);
+				expect(error.errors).toEqual([timeout, failure]);
+				await expect(stopping).rejects.toBe(error);
+				await expect(subject.reaper.stop()).rejects.toBe(error);
+			} else {
+				await expect(scan).rejects.toBe(timeout);
+				await expect(stopping).rejects.toBe(timeout);
+			}
+			expect(admissionReleases).toBe(phase === "lease" && fails ? 0 : 1);
+			expect(leaseReleases).toBe(phase === "lease" ? 1 : 0);
+			expect(closes).toBe(0);
+			expect(subject.store.prepared).toEqual([]);
+		} finally {
+			gate.resolve();
+			releaseGate.resolve();
+			await scan.catch(() => undefined);
+			await stopping?.catch(() => undefined);
+			deadlineFailure.mockRestore();
+		}
+	});
+
+	test.each([false, true])("owns late close preparation and uncertainty persistence with failure=%s", async fails => {
+		const entered = deferred<void>();
+		const gate = deferred<void>();
+		const expired = deferred<unknown>();
+		const failure = new Error("late preparation persistence failed");
+		const fail = ManagedOperationDeadline.prototype.fail;
+		const timeoutSpy = spyOn(ManagedOperationDeadline.prototype, "fail").mockImplementation(function (
+			this: ManagedOperationDeadline,
+			error,
+		) {
+			fail.call(this, error);
+			if (error instanceof Error && "code" in error && error.code === "timeout") expired.resolve(error);
+		});
+		let released = 0;
+		const subject = harness([active()], "retired", undefined, {
+			closeTimeoutMs: 30,
+			leases: {
+				acquire: async () => ({
+					assertFence: async () => undefined,
+					release: async () => {
+						released += 1;
+					},
+				}),
+			},
+		});
+		const prepare = subject.store.prepareClose.bind(subject.store);
+		subject.store.prepareClose = async (record, request) => {
+			entered.resolve();
+			await gate.promise;
+			return prepare(record, request);
+		};
+		if (fails)
+			subject.store.markUncertain = async () => {
+				throw failure;
+			};
+		let done = false;
+		const scan = subject.reaper.runOnce().finally(() => {
+			done = true;
+		});
+		void scan.catch(() => undefined);
+		let stopping: Promise<void> | undefined;
+		try {
+			await entered.promise;
+			const timeout = await expired.promise;
+			expect(done).toBe(false);
+			expect(released).toBe(0);
+			stopping = subject.reaper.stop();
+			void stopping.catch(() => undefined);
+			gate.resolve();
+			const error = await scan.catch(error => error);
+			await expect(stopping).rejects.toBe(error);
+			if (fails) {
+				expect(error).toBeInstanceOf(AggregateError);
+				expect(error.errors).toEqual([timeout, failure]);
+				expect(released).toBe(0);
+			} else {
+				expect(error).toBe(timeout);
+				expect(subject.store.uncertain).toHaveLength(1);
+				expect(subject.store.records[0]?.state).toBe("uncertain");
+				expect(released).toBe(1);
+			}
+			expect(subject.closeKeys).toEqual([]);
+			expect(subject.store.retired).toEqual([]);
+		} finally {
+			gate.resolve();
+			await scan.catch(() => undefined);
+			await stopping?.catch(() => undefined);
+			timeoutSpy.mockRestore();
+		}
 	});
 
 	test("polls at the configured interval but waits the full idle threshold and clears once on stop", async () => {
@@ -315,6 +591,7 @@ describe("managed idle reaper", () => {
 		for (const outcome of [
 			{ ok: false, certainty: "retryable" },
 			{ ok: true },
+			{ ok: true, operation: "session.delete", result: { sessionId: "session-a" } },
 			{ ok: true, result: { sessionId: "replacement" } },
 		]) {
 			const subject = harness([active()], "retired", outcome);
@@ -441,7 +718,16 @@ describe("managed idle reaper", () => {
 	test("retired status without public evidence retains the acknowledgement but cannot retire", async () => {
 		const subject = harness([active()], "retired", undefined, {
 			runtime: {
-				closeLifecycleSession: async request => ({ ok: true, result: { sessionId: request.target.sessionId } }),
+				createProducerScope: () => new FakeManagedSdkRuntime().createProducerScope(),
+				closeLifecycleSession: async (request, _operation, onOutcome) => {
+					const outcome = {
+						ok: true,
+						operation: "session.close",
+						result: { sessionId: request.target.sessionId },
+					};
+					await onOutcome(outcome);
+					return outcome;
+				},
 				reconcile: async () => undefined,
 				generationStatus: async () => ({ status: "retired" }),
 			},
@@ -461,9 +747,16 @@ describe("managed idle reaper", () => {
 			const failure = new Error(`${phase} failed`);
 			const subject = harness([active()], "retired", undefined, {
 				runtime: {
-					closeLifecycleSession: async request => {
+					createProducerScope: () => new FakeManagedSdkRuntime().createProducerScope(),
+					closeLifecycleSession: async (request, _operation, onOutcome) => {
 						order.push("close");
-						return { ok: true, result: { sessionId: request.target.sessionId } };
+						const outcome = {
+							ok: true,
+							operation: "session.close",
+							result: { sessionId: request.target.sessionId },
+						};
+						await onOutcome(outcome);
+						return outcome;
 					},
 					reconcile: async () => {
 						order.push("reconcile");
@@ -506,7 +799,7 @@ describe("managed idle reaper", () => {
 		expect(subject.store.uncertain).toHaveLength(1);
 		expect(subject.store.retired).toEqual([]);
 		expect(subject.store.evicted).toEqual([]);
-		await subject.reaper.stop();
+		await expect(subject.reaper.stop()).rejects.toBe(failure);
 	});
 
 	test("retains replaced, unknown, and lifecycle errors as uncertain", async () => {
@@ -532,11 +825,14 @@ describe("managed idle reaper", () => {
 			admission: { acquire: async () => () => undefined },
 			leases: { acquire: async () => ({ assertFence: async () => undefined, release: async () => undefined }) },
 			runtime: {
-				closeLifecycleSession: async () => {
+				createProducerScope: () => new FakeManagedSdkRuntime().createProducerScope(),
+				closeLifecycleSession: async (_request, _operation, onOutcome) => {
 					closes += 1;
 					signalCloseStarted();
 					await pendingClose;
-					return { ok: true, result: { sessionId: "session-a" } };
+					const outcome = { ok: true, operation: "session.close", result: { sessionId: "session-a" } };
+					await onOutcome(outcome);
+					return outcome;
 				},
 				reconcile: async () => undefined,
 				generationStatus: async () => ({ status: "retired", evidence: retirementEvidence }),
@@ -569,7 +865,10 @@ describe("managed idle reaper", () => {
 			admission: { acquire: async () => () => undefined },
 			leases: { acquire: async () => undefined },
 			runtime: {
-				closeLifecycleSession: async () => ({ ok: true, result: { sessionId: "session-a" } }),
+				createProducerScope: () => new FakeManagedSdkRuntime().createProducerScope(),
+				closeLifecycleSession: async () => {
+					throw new Error("Blocked lease must not dispatch close");
+				},
 				reconcile: async () => undefined,
 				generationStatus: async () => ({ status: "retired", evidence: retirementEvidence }),
 			},
@@ -585,6 +884,7 @@ describe("managed idle reaper", () => {
 			admission: { acquire: async () => () => undefined },
 			leases: { acquire: async () => ({ assertFence: async () => undefined, release: async () => undefined }) },
 			runtime: {
+				createProducerScope: () => new FakeManagedSdkRuntime().createProducerScope(),
 				closeLifecycleSession: async () => {
 					throw new Error("transport failed");
 				},
@@ -623,7 +923,7 @@ describe("managed idle reaper", () => {
 		},
 	);
 
-	test("preserves release failure after successful retirement and releases admission", async () => {
+	test("preserves release failure after successful retirement and retains admission", async () => {
 		const failure = new Error("lease release failed");
 		let released = 0;
 		const subject = harness([active()], "retired", undefined, {
@@ -642,12 +942,12 @@ describe("managed idle reaper", () => {
 			},
 		});
 		await expect(subject.reaper.runOnce()).rejects.toBe(failure);
-		expect(released).toBe(1);
+		expect(released).toBe(0);
 		expect(subject.store.evicted).toHaveLength(1);
 		expect(subject.store.uncertain).toEqual([]);
 		await subject.reaper.runOnce();
 		expect(subject.closeKeys).toHaveLength(1);
-		await subject.reaper.stop();
+		await expect(subject.reaper.stop()).rejects.toBe(failure);
 	});
 
 	test("revalidates the retirement receipt after publication and never evicts a changed authority", async () => {
@@ -663,13 +963,15 @@ describe("managed idle reaper", () => {
 		await subject.reaper.stop();
 	});
 
-	test("aggregates original lifecycle, persistence and guard release errors without replacing them", async () => {
+	test("aggregates original lifecycle and persistence failures without attempting guard release", async () => {
 		const original = new Error("close failed");
 		const persistence = new Error("uncertainty persistence failed");
 		const lease = new Error("lease release failed");
 		const admission = new Error("admission release failed");
+		let releases = 0;
 		const subject = harness([active()], "retired", undefined, {
 			runtime: {
+				createProducerScope: () => new FakeManagedSdkRuntime().createProducerScope(),
 				closeLifecycleSession: async () => {
 					throw original;
 				},
@@ -680,12 +982,14 @@ describe("managed idle reaper", () => {
 				acquire: async () => ({
 					assertFence: async () => undefined,
 					release: async () => {
+						releases += 1;
 						throw lease;
 					},
 				}),
 			},
 			admission: {
 				acquire: async () => () => {
+					releases += 1;
 					throw admission;
 				},
 			},
@@ -694,10 +998,11 @@ describe("managed idle reaper", () => {
 			throw persistence;
 		};
 		await expect(subject.reaper.runOnce()).rejects.toMatchObject({
-			errors: [original, persistence, lease, admission],
+			errors: [original, persistence],
 		});
+		expect(releases).toBe(0);
 		expect(subject.store.retired).toEqual([]);
-		await subject.reaper.stop();
+		await expect(subject.reaper.stop()).rejects.toMatchObject({ errors: [original, persistence] });
 	});
 
 	test("retains polling active() failure in the typed channel and rejects stop with the original", async () => {
@@ -765,10 +1070,17 @@ describe("managed idle reaper", () => {
 				},
 			},
 			runtime: {
-				closeLifecycleSession: async request => {
+				createProducerScope: () => new FakeManagedSdkRuntime().createProducerScope(),
+				closeLifecycleSession: async (request, _operation, onOutcome) => {
 					started.resolve();
 					await gate.promise;
-					return { ok: true, result: { sessionId: request.target.sessionId } };
+					const outcome = {
+						ok: true,
+						operation: "session.close",
+						result: { sessionId: request.target.sessionId },
+					};
+					await onOutcome(outcome);
+					return outcome;
 				},
 				reconcile: async () => undefined,
 				generationStatus: async () => ({ status: "retired", evidence: retirementEvidence }),

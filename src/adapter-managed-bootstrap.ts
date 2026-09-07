@@ -6,6 +6,7 @@ import type { GjcRuntimeLocations } from "./contracts";
 import {
 	createManagedLifecycleEvidence,
 	type ManagedLifecycleEvidence,
+	managedEndpointReceiptFromResult,
 	managedLifecycleEvidenceHash,
 	transitionManagedLifecycleEvidence,
 } from "./gjc/managed-lifecycle-evidence";
@@ -508,6 +509,12 @@ async function activate(
 															generation: outcome.result.endpointGeneration!,
 														}
 													: undefined,
+												valid
+													? managedEndpointReceiptFromResult(outcome.result, {
+															sessionId: outcome.result.sessionId,
+															generation: outcome.result.endpointGeneration!,
+														})
+													: undefined,
 											);
 											if (valid) ack = observed;
 										},
@@ -518,6 +525,10 @@ async function activate(
 							if (ack?.acknowledged === undefined)
 								throw new Error(
 									"Historical resume did not acknowledge the exact session and positive generation.",
+								);
+							if (ack.endpointReceipt === undefined)
+								throw new Error(
+									"Historical resume lacks its original endpoint receipt; renewed proof is denied.",
 								);
 							const acknowledgedEvidence = ack;
 							const acknowledged = ack.acknowledged;

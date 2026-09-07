@@ -1438,7 +1438,7 @@ describe("real admission owner with the actual V3 bootstrap coordinator", () => 
 							return {
 								ok: true,
 								operation: "session.resume",
-								result: { sessionId: "session", endpointGeneration: 7 },
+								result: { sessionId: "session", endpointGeneration: 7, endpointIncarnation: "a".repeat(64) },
 							};
 						},
 					} as unknown as lifecycle.AgentDirSessionLifecycleService;

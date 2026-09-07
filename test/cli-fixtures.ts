@@ -427,13 +427,21 @@ export class FakeManagedSdkRuntime implements ManagedSdkRuntimeDependency {
 		_timeoutMs?: number,
 		onOutcome?: (outcome: unknown) => void | Promise<void>,
 	): Promise<any> {
-		const outcome = { ok: true, result: { sessionId: "session-fixture-resumed", endpointGeneration: 1 } };
+		const outcome = {
+			ok: true,
+			operation: "session.resume",
+			result: { sessionId: "session-fixture-resumed", endpointGeneration: 1, endpointIncarnation: "a".repeat(64) },
+		};
 		await onOutcome?.(outcome);
 		return outcome;
 	}
 
 	async resumeLifecycleSession(_request: any, _second?: any): Promise<any> {
-		return { ok: true, result: { sessionId: "session-fixture-resumed", endpointGeneration: 1 } };
+		return {
+			ok: true,
+			operation: "session.resume",
+			result: { sessionId: "session-fixture-resumed", endpointGeneration: 1, endpointIncarnation: "a".repeat(64) },
+		};
 	}
 
 	async closeLifecycleSession(_tenantOrRequest: any, request?: any): Promise<any> {
@@ -470,7 +478,11 @@ export class FakeManagedSdkRuntime implements ManagedSdkRuntimeDependency {
 			status: "current",
 		});
 		this.registerTenant(tenant);
-		return { ok: true, result: { sessionId, endpointGeneration: generation } };
+		return {
+			ok: true,
+			operation: "session.create",
+			result: { sessionId, endpointGeneration: generation, endpointIncarnation: "a".repeat(64) },
+		};
 	}
 
 	private assertManagedAttachment(managed: ManagedSdkAttachment): void {

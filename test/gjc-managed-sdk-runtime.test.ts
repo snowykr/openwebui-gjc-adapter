@@ -134,7 +134,7 @@ function closeRequest(): CloseRequest {
 		target: {
 			sessionId: tenant.sessionId,
 			endpointGeneration: tenant.generation,
-			// Synthetic authority for boundary tests, not obtainable from SDK 0.16.4 public results.
+			// Synthetic authority for boundary tests, not evidence of a persisted public lifecycle receipt.
 			endpointIncarnation: "0123456789abcdef".repeat(4),
 		},
 		timeoutMs: 500,
@@ -1754,7 +1754,12 @@ describe("managed SDK runtime", () => {
 						pending = f.runtime.closeLifecycleSession(tenant, closeRequest());
 						break;
 					case "retirement":
-						pending = f.runtime.retireLifecycleSession(tenant, closeRequest(), operationIdentity());
+						pending = f.runtime.retireLifecycleSession(
+							tenant,
+							closeRequest(),
+							operationIdentity(),
+							() => undefined,
+						);
 						break;
 				}
 				const receipt = await pending;
@@ -3096,6 +3101,86 @@ describe("managed SDK runtime", () => {
 		},
 	);
 
+	test.each([false, true])(
+		"retirement raw observer remains owned after timeout with persistence failure=%s",
+		async fail => {
+			const entered = deferred<void>();
+			const response = deferred<Awaited<ReturnType<LifecycleService["close"]>>>();
+			const observed = deferred<void>();
+			const persist = deferred<void>();
+			const error = new Error("close acknowledgement persistence failed");
+			const f = fixture({
+				close: async () => {
+					entered.resolve();
+					return response.promise;
+				},
+			});
+			await f.runtime.start();
+			f.runtime.registerTenant(tenant);
+			const scope = f.runtime.createProducerScope();
+			const original = {
+				ok: true as const,
+				operation: "session.close" as const,
+				result: { sessionId: tenant.sessionId },
+			};
+			const pending = scope
+				.run(() =>
+					f.runtime.retireLifecycleSession(
+						tenant,
+						{ ...closeRequest(), timeoutMs: 15 },
+						operationIdentity(),
+						async outcome => {
+							expect(outcome).toEqual(original);
+							expect(outcome).not.toBe(original);
+							observed.resolve();
+							await persist.promise;
+						},
+					),
+				)
+				.catch(error => error);
+			await entered.promise;
+			expect(await pending).toMatchObject({ code: "timeout" });
+			const settled = scope.seal();
+			const disposal = f.runtime.dispose();
+			let done = false;
+			void disposal.then(
+				() => {
+					done = true;
+				},
+				() => {
+					done = true;
+				},
+			);
+			response.resolve(original);
+			await observed.promise;
+			expect(done).toBe(false);
+			if (fail) {
+				persist.reject(error);
+				await expect(settled).rejects.toThrow("persistence failed");
+				await expect(disposal).rejects.toThrow("persistence failed");
+			} else {
+				persist.resolve();
+				await settled;
+				await disposal;
+			}
+			expect(f.closeCalls).toHaveLength(1);
+			expect(f.statusCalls).toEqual([]);
+		},
+	);
+
+	test("retirement denies a missing original observer before authorization", async () => {
+		const f = fixture();
+		await f.runtime.start();
+		try {
+			await expect(
+				Reflect.apply(f.runtime.retireLifecycleSession, f.runtime, [tenant, closeRequest(), operationIdentity()]),
+			).rejects.toThrow("original outcome observer");
+			expect(f.closeCalls).toEqual([]);
+		} finally {
+			await f.runtime.dispose();
+		}
+	});
+
 	test("historical resume rejects a missing original observer before any admission", async () => {
 		let fences = 0;
 		const f = fixture({
@@ -3151,9 +3236,11 @@ describe("managed SDK runtime", () => {
 			...closeRequest(),
 			target: { sessionId: tenant.sessionId, endpointGeneration: tenant.generation },
 		};
-		await expect(f.runtime.retireLifecycleSession(tenant, request, operation)).rejects.toMatchObject({
-			code: "exact_close_authority_unavailable",
-		});
+		await expect(f.runtime.retireLifecycleSession(tenant, request, operation, () => undefined)).rejects.toMatchObject(
+			{
+				code: "exact_close_authority_unavailable",
+			},
+		);
 		expect(f.closeCalls).toEqual([]);
 		expect(f.statusCalls).toEqual([]);
 		expect(f.calls).not.toContain("request");
@@ -3268,13 +3355,18 @@ describe("managed SDK runtime", () => {
 		]) {
 			const operation = { ...operationIdentity(), ...change };
 			await expect(f.runtime.proveLifecycleTenant(tenant, operation)).rejects.toBeInstanceOf(TypeError);
-			await expect(f.runtime.retireLifecycleSession(tenant, closeRequest(), operation)).rejects.toBeInstanceOf(
-				TypeError,
-			);
+			await expect(
+				f.runtime.retireLifecycleSession(tenant, closeRequest(), operation, () => undefined),
+			).rejects.toBeInstanceOf(TypeError);
 			await expect(f.runtime.retirementGenerationStatus(tenant, operation)).rejects.toBeInstanceOf(TypeError);
 		}
 		await expect(
-			f.runtime.retireLifecycleSession(tenant, closeRequest(), { ...operationIdentity(), requestKey: "other" }),
+			f.runtime.retireLifecycleSession(
+				tenant,
+				closeRequest(),
+				{ ...operationIdentity(), requestKey: "other" },
+				() => undefined,
+			),
 		).rejects.toThrow("request key");
 		expect(authorized).toBe(0);
 		expect(f.calls).toEqual(["start"]);
@@ -3308,7 +3400,7 @@ describe("managed SDK runtime", () => {
 				mode === "adoption"
 					? f.runtime.proveLifecycleTenant(tenant, operationIdentity())
 					: mode === "retirement"
-						? f.runtime.retireLifecycleSession(tenant, closeRequest(), operationIdentity())
+						? f.runtime.retireLifecycleSession(tenant, closeRequest(), operationIdentity(), () => undefined)
 						: f.runtime.retirementGenerationStatus(tenant, operationIdentity());
 			if (mode === "retirement") {
 				const receipt = await result;
@@ -3368,7 +3460,7 @@ describe("managed SDK runtime", () => {
 				mode === "adoption"
 					? f.runtime.proveLifecycleTenant(tenant, operationIdentity())
 					: mode === "retirement"
-						? f.runtime.retireLifecycleSession(tenant, closeRequest(), operationIdentity())
+						? f.runtime.retireLifecycleSession(tenant, closeRequest(), operationIdentity(), () => undefined)
 						: f.runtime.retirementGenerationStatus(tenant, operationIdentity())
 			).catch(error => error);
 			await entered.promise;
@@ -3483,9 +3575,9 @@ describe("managed SDK runtime", () => {
 		await expect(f.runtime.closeLifecycleSession(tenant, closeRequest())).rejects.toThrow("fence was lost");
 		await expect(f.runtime.listLifecycleSessions(tenant, listRequest())).rejects.toThrow("fence was lost");
 		await expect(f.runtime.proveLifecycleTenant(tenant, operationIdentity())).rejects.toThrow("fence was lost");
-		await expect(f.runtime.retireLifecycleSession(tenant, closeRequest(), operationIdentity())).rejects.toThrow(
-			"fence was lost",
-		);
+		await expect(
+			f.runtime.retireLifecycleSession(tenant, closeRequest(), operationIdentity(), () => undefined),
+		).rejects.toThrow("fence was lost");
 		await expect(f.runtime.retirementGenerationStatus(tenant, operationIdentity())).rejects.toThrow("fence was lost");
 		await expect(
 			f.runtime.createPreparedExternalLifecycleSession(preparedAuthority(), createRequest()),
@@ -4201,7 +4293,7 @@ describe("managed SDK runtime", () => {
 					} as never),
 				).rejects.toMatchObject({
 					code: "exact_close_authority_unavailable",
-					message: expect.stringContaining("SDK 0.16.4 public binding/lifecycle results do not supply it"),
+					message: expect.stringContaining("Missing persisted incarnation authority"),
 				});
 				expect(current.closeCalls).toHaveLength(0);
 			} finally {

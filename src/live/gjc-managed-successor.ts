@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
+import { managedEndpointReceiptFromResult } from "../gjc/managed-lifecycle-evidence";
 import { ManagedOperationDeadline } from "../gjc/managed-operation-deadline";
 import type { ManagedSdkAttachment, ManagedSdkRuntime, TenantSessionKey } from "../gjc/managed-sdk-runtime";
-import { GjcTurnCancelledError, type ManagedTurnAuthority } from "../gjc/turn-runner";
+import { GjcTurnCancelledError, type ManagedEndpointReceipt, type ManagedTurnAuthority } from "../gjc/turn-runner";
 
 export interface ManagedSuccessorInput {
 	readonly source: ManagedTurnAuthority;
@@ -16,7 +17,10 @@ export interface ManagedSuccessorInput {
 		readonly payloadHash: string;
 	};
 	/** Persists the assigned target before cancellation, registration, or attachment proof. */
-	readonly onAcknowledged?: (authority: ManagedTurnAuthority) => Promise<void> | void;
+	readonly onAcknowledged?: (
+		authority: ManagedTurnAuthority,
+		endpointReceipt?: ManagedEndpointReceipt,
+	) => Promise<void> | void;
 	/** Renewed caller authority, deliberately separate from passive durable receipt capture. */
 	readonly beforeProof?: () => Promise<void> | void;
 	/** Called only after the exact target generation is reconciled, fenced, and current. */
@@ -74,6 +78,7 @@ export function createManagedSuccessorFlow(
 			let returnedTarget: TenantSessionKey | undefined;
 			let acknowledgedAuthority: ManagedTurnAuthority | undefined;
 			let acknowledgementPending = false;
+			let hasValidReceipt = false;
 			let invalidAcknowledgement: unknown;
 			let proofAdmissionPending = false;
 			try {
@@ -115,8 +120,13 @@ export function createManagedSuccessorFlow(
 								invalidAcknowledgement = error;
 								return;
 							}
+							const endpointReceipt = managedEndpointReceiptFromResult(outcome.result, acknowledgedAuthority);
+							hasValidReceipt = endpointReceipt !== undefined;
 							acknowledgementPending = true;
-							await input.onAcknowledged?.({ ...acknowledgedAuthority });
+							await input.onAcknowledged?.(
+								{ ...acknowledgedAuthority },
+								endpointReceipt === undefined ? undefined : { ...endpointReceipt },
+							);
 							acknowledgementPending = false;
 						},
 					),
@@ -125,6 +135,13 @@ export function createManagedSuccessorFlow(
 				if (invalidAcknowledgement !== undefined) throw invalidAcknowledgement;
 				if (!outcomeObserved || returnedTarget === undefined || acknowledgedAuthority === undefined)
 					throw new ManagedSuccessorUncertainError("Managed fork acknowledgement lacks a target identity.");
+				if (!hasValidReceipt)
+					throw new ManagedSuccessorUncertainError(
+						"Managed fork acknowledgement lacks its original endpoint receipt.",
+						{
+							acknowledgedAuthority,
+						},
+					);
 				// An abort after lifecycle invocation is ambiguous even when the fork later acknowledges.
 				if (input.signal?.aborted) throw new GjcTurnCancelledError();
 				proofAdmissionPending = true;
@@ -152,6 +169,16 @@ export function createManagedSuccessorFlow(
 						cause: error,
 						acknowledgedAuthority,
 					});
+				if (!hasValidReceipt && acknowledgedAuthority !== undefined)
+					throw error instanceof ManagedSuccessorUncertainError
+						? error
+						: new ManagedSuccessorUncertainError(
+								"Managed fork acknowledgement lacks its original endpoint receipt.",
+								{
+									cause: error,
+									acknowledgedAuthority,
+								},
+							);
 				if (proofAdmissionPending)
 					throw new ManagedSuccessorUncertainError("Managed successor proof admission was denied.", {
 						cause: error,

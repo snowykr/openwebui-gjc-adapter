@@ -902,11 +902,29 @@ describe("managed routing persistence", () => {
 	test("does not route a retired generation awaiting local cleanup after restart", async () => {
 		const f = fixture();
 		try {
+			const start = f.runner.startManagedSession.bind(f.runner);
+			f.runner.startManagedSession = (input, ...args) =>
+				start(
+					{
+						...input,
+						onLifecycleAcknowledged: authority =>
+							input.onLifecycleAcknowledged?.(authority, {
+								sessionId: authority.sessionId,
+								endpointGeneration: authority.generation,
+								endpointIncarnation: "a".repeat(64),
+							}),
+					},
+					...args,
+				);
 			await routeGjcTurn(f.input());
 			const records = createManagedV3GenerationStore(f.store);
 			const record = (await records.active())[0]!;
-			const intent = { key: "retirement", authority: record.authority, requestedAt: Date.now() };
-			expect(await records.prepareClose(record, intent)).toBe(true);
+			const intent = await records.prepareClose(record, {
+				key: "retirement",
+				authority: record.authority,
+				requestedAt: Date.now(),
+			});
+			if (intent === false) throw new Error("Expected an exact prepared retirement.");
 			await records.acknowledge(record, intent, record.authority.sessionId);
 			await records.retire(record, intent, {
 				source: "session_index",

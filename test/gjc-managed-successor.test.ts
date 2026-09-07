@@ -1,7 +1,7 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import type { lifecycle, router } from "@gajae-code/coding-agent/sdk";
 import { type ManagedSdkAttachment, ManagedSdkRuntime, type TenantSessionKey } from "../src/gjc/managed-sdk-runtime";
-import type { ManagedTurnAuthority } from "../src/gjc/turn-runner";
+import type { ManagedEndpointReceipt, ManagedTurnAuthority } from "../src/gjc/turn-runner";
 import { createManagedSuccessorFlow, ManagedSuccessorUncertainError } from "../src/live/gjc-managed-successor";
 
 const source: ManagedTurnAuthority = {
@@ -457,6 +457,212 @@ describe("managed successor with an explicit runtime boundary fake", () => {
 });
 
 describe("managed successor through real runtime admission", () => {
+	test("detaches original endpoint receipts across callbacks without adding routing or close authority", async () => {
+		const f = await runtimeFixture();
+		const expected = { ...successor, endpointIncarnation: "a".repeat(64) };
+		const rawResult = { ...expected, privateMetadata: { source: "sdk" } };
+		f.outcome = { ok: true, operation: "session.fork", result: rawResult };
+		const receipts: ManagedEndpointReceipt[] = [];
+		try {
+			const flow = createManagedSuccessorFlow(f.runtime);
+			for (let invocation = 0; invocation < 2; invocation++) {
+				const result = await flow.fork({
+					source,
+					target,
+					onAcknowledged: (acknowledged, endpointReceipt) => {
+						expect(acknowledged).toEqual(successorAuthority);
+						expect(endpointReceipt).toEqual(expected);
+						expect(endpointReceipt).not.toBe(rawResult);
+						if (endpointReceipt === undefined) throw new Error("Original endpoint receipt is required.");
+						receipts.push(endpointReceipt);
+						if (invocation === 0) {
+							Reflect.set(acknowledged, "sessionId", "caller-session");
+							Reflect.set(endpointReceipt, "sessionId", "caller-session");
+							Reflect.set(endpointReceipt, "endpointGeneration", 99);
+							Reflect.set(endpointReceipt, "endpointIncarnation", "caller-incarnation");
+						}
+					},
+					beforeProof: () => {
+						expect(receipts).toHaveLength(invocation + 1);
+						expect(rawResult).toEqual({ ...expected, privateMetadata: { source: "sdk" } });
+					},
+					publish: () => undefined,
+				});
+				expect(result.managedAuthority).toEqual(successorAuthority);
+				expect(result).not.toHaveProperty("endpointReceipt");
+				expect(result.successor.tenant).not.toHaveProperty("endpointIncarnation");
+			}
+			expect(receipts[0]).not.toBe(receipts[1]);
+			expect(receipts[1]).toEqual(expected);
+			expect(f.closes).toEqual([]);
+		} finally {
+			await f.runtime.dispose();
+		}
+	});
+
+	test.each([undefined, "", " ", null, 7, "not-a-hash", "A".repeat(64)])(
+		"preserves successor generation acknowledgement but denies proof with unavailable incarnation %j",
+		async endpointIncarnation => {
+			const f = await runtimeFixture();
+			f.outcome = {
+				ok: true,
+				operation: "session.fork",
+				result: { ...successor, endpointIncarnation },
+			} as ForkOutcome;
+			const acknowledged: ManagedTurnAuthority[] = [];
+			let persistenceCompleted = false;
+			let proved = false;
+			let published = false;
+			try {
+				const error = await createManagedSuccessorFlow(f.runtime)
+					.fork({
+						source,
+						target,
+						lifecycleOperation: {
+							operationId: "branch",
+							requestKey: source.requestKey,
+							payloadHash: "a".repeat(64),
+						},
+						onAcknowledged: async (authority, endpointReceipt) => {
+							acknowledged.push(authority);
+							expect(endpointReceipt).toBeUndefined();
+							await Promise.resolve();
+							persistenceCompleted = true;
+						},
+						beforeProof: () => {
+							proved = true;
+						},
+						publish: () => {
+							published = true;
+						},
+					})
+					.catch(error => error);
+				expect(error).toBeInstanceOf(ManagedSuccessorUncertainError);
+				expect(error.message).toContain("original endpoint receipt");
+				expect(error.acknowledgedAuthority).toEqual(successorAuthority);
+				expect(persistenceCompleted).toBe(true);
+				expect(acknowledged).toEqual([successorAuthority]);
+				expect(proved).toBe(false);
+				expect(published).toBe(false);
+				expect(f.order).not.toContain("attachment:forked-session");
+				expect(f.closes).toEqual([]);
+				await expect(f.runtime.acquireAttachment(successorAuthority)).rejects.toThrow("not registered");
+			} finally {
+				await f.runtime.dispose();
+			}
+		},
+	);
+
+	test("a callback cannot repair missing fork receipt authority or trigger cleanup by aborting", async () => {
+		const f = await runtimeFixture();
+		const controller = new AbortController();
+		const rawResult: typeof successor & Record<string, unknown> = { ...successor };
+		f.outcome = { ok: true, operation: "session.fork", result: rawResult };
+		const acknowledgements: ManagedTurnAuthority[] = [];
+		let proved = false;
+		let published = false;
+		try {
+			const error = await createManagedSuccessorFlow(f.runtime)
+				.fork({
+					source,
+					target,
+					signal: controller.signal,
+					onAcknowledged: (acknowledged, endpointReceipt) => {
+						acknowledgements.push(acknowledged);
+						expect(endpointReceipt).toBeUndefined();
+						rawResult.endpointIncarnation = "a".repeat(64);
+						controller.abort();
+					},
+					beforeProof: () => {
+						proved = true;
+					},
+					publish: () => {
+						published = true;
+					},
+				})
+				.catch(error => error);
+			expect(error).toBeInstanceOf(ManagedSuccessorUncertainError);
+			expect(error.message).toContain("original endpoint receipt");
+			expect(error.acknowledgedAuthority).toEqual(successorAuthority);
+			expect(acknowledgements).toEqual([successorAuthority]);
+			expect(rawResult.endpointIncarnation).toBe("a".repeat(64));
+			expect(proved).toBe(false);
+			expect(published).toBe(false);
+			expect(f.order).not.toContain("attachment:forked-session");
+			expect(f.closes).toEqual([]);
+			await expect(f.runtime.acquireAttachment(successorAuthority)).rejects.toThrow("not registered");
+		} finally {
+			await f.runtime.dispose();
+		}
+	});
+
+	test.each([
+		[true, false],
+		[true, true],
+		[false, false],
+		[false, true],
+	] as const)(
+		"retains late acknowledgement receipt=%s after timeout and abort with callback persistence failure=%s",
+		async (hasReceipt, persistenceFails) => {
+			const f = await runtimeFixture();
+			const controller = new AbortController();
+			let release!: (outcome: ForkOutcome) => void;
+			f.outcome = new Promise<ForkOutcome>(resolve => {
+				release = resolve;
+			});
+			let captured!: (receipt: ManagedEndpointReceipt | undefined) => void;
+			const acknowledgement = new Promise<ManagedEndpointReceipt | undefined>(resolve => {
+				captured = resolve;
+			});
+			const expected = { ...successor, endpointIncarnation: "b".repeat(64) };
+			const rawResult = hasReceipt ? expected : successor;
+			const failure = new Error("late endpoint receipt fsync failed");
+			let proved = false;
+			let published = false;
+			try {
+				const error = await createManagedSuccessorFlow(f.runtime, 25)
+					.fork({
+						source,
+						target,
+						signal: controller.signal,
+						onAcknowledged: (authority, endpointReceipt) => {
+							expect(authority).toEqual(successorAuthority);
+							captured(endpointReceipt);
+							if (persistenceFails) throw failure;
+						},
+						beforeProof: () => {
+							proved = true;
+						},
+						publish: () => {
+							published = true;
+						},
+					})
+					.catch(error => error);
+				expect(error).toBeInstanceOf(ManagedSuccessorUncertainError);
+				expect(error.cause).toMatchObject({ code: "timeout" });
+				expect(f.forks).toHaveLength(1);
+				controller.abort();
+				release({ ok: true, operation: "session.fork", result: rawResult });
+				expect(await acknowledgement).toEqual(hasReceipt ? expected : undefined);
+				expect(await acknowledgement).not.toBe(expected);
+				await new Promise(resolve => setTimeout(resolve, 0));
+				expect(proved).toBe(false);
+				expect(published).toBe(false);
+				expect(f.order).not.toContain("attachment:forked-session");
+				expect(f.closes).toEqual([]);
+				await expect(f.runtime.acquireAttachment(successorAuthority)).rejects.toThrow("not registered");
+			} finally {
+				release({ ok: true, operation: "session.fork", result: rawResult });
+				if (persistenceFails)
+					await expect(f.runtime.dispose()).rejects.toMatchObject({
+						message: "Original lifecycle outcome persistence failed.",
+						cause: failure,
+					});
+				else await f.runtime.dispose();
+			}
+		},
+	);
+
 	test("dispatches a public typed fork under exact tenant admission and acknowledges before target proof", async () => {
 		const f = await runtimeFixture();
 		try {
@@ -504,47 +710,55 @@ describe("managed successor through real runtime admission", () => {
 		}
 	});
 
-	test("waits for durable acknowledgement and retains its failure before target registration", async () => {
-		const f = await runtimeFixture();
-		let entered!: () => void;
-		const acknowledgementEntered = new Promise<void>(resolve => {
-			entered = resolve;
-		});
-		let rejectPersistence!: (reason: Error) => void;
-		const persistence = new Promise<void>((_resolve, reject) => {
-			rejectPersistence = reject;
-		});
-		const failure = new Error("authority fsync failed");
-		try {
-			const turn = createManagedSuccessorFlow(f.runtime)
-				.fork({
-					source,
-					target,
-					onAcknowledged: () => {
-						entered();
-						return persistence;
-					},
-					publish: () => {
-						f.order.push("publish");
-					},
-				})
-				.catch(error => error);
-			await acknowledgementEntered;
-			expect(f.order).not.toContain("attachment:forked-session");
-			expect(f.order).not.toContain("publish");
-			rejectPersistence(failure);
-			const error = await turn;
-			expect(error).toBeInstanceOf(ManagedSuccessorUncertainError);
-			expect(error.cause).toBe(failure);
-			expect(error.acknowledgedAuthority).toEqual(successorAuthority);
-			expect(f.closes).toEqual([]);
-			await expect(f.runtime.acquireAttachment(successorAuthority)).rejects.toThrow("not registered");
-		} finally {
-			await expect(f.runtime.dispose()).rejects.toThrow("Original lifecycle outcome persistence failed");
-		}
-	});
+	test.each([false, true])(
+		"retains callback persistence failure before receipt admission with receipt=%s",
+		async hasReceipt => {
+			const f = await runtimeFixture();
+			let entered!: () => void;
+			const acknowledgementEntered = new Promise<void>(resolve => {
+				entered = resolve;
+			});
+			let rejectPersistence!: (reason: Error) => void;
+			const persistence = new Promise<void>((_resolve, reject) => {
+				rejectPersistence = reject;
+			});
+			const failure = new Error("authority fsync failed");
+			const endpointReceipt = { ...successor, endpointIncarnation: "a".repeat(64) };
+			f.outcome = { ok: true, operation: "session.fork", result: hasReceipt ? endpointReceipt : successor };
+			try {
+				const turn = createManagedSuccessorFlow(f.runtime)
+					.fork({
+						source,
+						target,
+						onAcknowledged: (authority, receipt) => {
+							expect(authority).toEqual(successorAuthority);
+							expect(receipt).toEqual(hasReceipt ? endpointReceipt : undefined);
+							expect(receipt).not.toBe(endpointReceipt);
+							entered();
+							return persistence;
+						},
+						publish: () => {
+							f.order.push("publish");
+						},
+					})
+					.catch(error => error);
+				await acknowledgementEntered;
+				expect(f.order).not.toContain("attachment:forked-session");
+				expect(f.order).not.toContain("publish");
+				rejectPersistence(failure);
+				const error = await turn;
+				expect(error).toBeInstanceOf(ManagedSuccessorUncertainError);
+				expect(error.cause).toBe(failure);
+				expect(error.acknowledgedAuthority).toEqual(successorAuthority);
+				expect(f.closes).toEqual([]);
+				await expect(f.runtime.acquireAttachment(successorAuthority)).rejects.toThrow("not registered");
+			} finally {
+				await expect(f.runtime.dispose()).rejects.toThrow("Original lifecycle outcome persistence failed");
+			}
+		},
+	);
 
-	test.each(["failed", "missing-generation", "source-identity"] as const)(
+	test.each(["failed", "missing-generation", "source-identity", "missing-operation", "wrong-operation"] as const)(
 		"does not acknowledge or publish a %s fork result",
 		async mode => {
 			const f = await runtimeFixture();
@@ -557,15 +771,20 @@ describe("managed successor through real runtime admission", () => {
 								certainty: "uncertain",
 								error: { code: "failed", message: "failed" },
 							}
-						: {
+						: ({
 								ok: true,
-								operation: "session.fork",
+								...(mode === "missing-operation"
+									? {}
+									: { operation: mode === "wrong-operation" ? "session.close" : "session.fork" }),
 								result:
 									mode === "missing-generation"
 										? { sessionId: successor.sessionId }
-										: { sessionId: source.sessionId, endpointGeneration: source.generation },
-							};
+										: mode === "source-identity"
+											? { sessionId: source.sessionId, endpointGeneration: source.generation }
+											: { ...successor, endpointIncarnation: "a".repeat(64) },
+							} as ForkOutcome);
 				let acknowledged = false;
+				let proved = false;
 				let published = false;
 				await expect(
 					createManagedSuccessorFlow(f.runtime).fork({
@@ -574,6 +793,9 @@ describe("managed successor through real runtime admission", () => {
 						onAcknowledged: () => {
 							acknowledged = true;
 						},
+						beforeProof: () => {
+							proved = true;
+						},
 						publish: () => {
 							published = true;
 						},
@@ -581,7 +803,9 @@ describe("managed successor through real runtime admission", () => {
 				).rejects.toBeInstanceOf(ManagedSuccessorUncertainError);
 				expect(f.forks).toHaveLength(1);
 				expect(acknowledged).toBe(false);
+				expect(proved).toBe(false);
 				expect(published).toBe(false);
+				expect(f.order).not.toContain("attachment:forked-session");
 				expect(f.closes).toEqual([]);
 			} finally {
 				await f.runtime.dispose();
@@ -589,27 +813,43 @@ describe("managed successor through real runtime admission", () => {
 		},
 	);
 
-	test("retains cleanup uncertainty without SDK close dispatch when the public incarnation is unavailable", async () => {
+	test.each([false, true])("does not turn endpoint receipt availability=%s into close authority", async hasReceipt => {
 		const f = await runtimeFixture();
 		const failure = new Error("publication failed");
+		const endpointReceipt = { ...successor, endpointIncarnation: "a".repeat(64) };
+		f.outcome = { ok: true, operation: "session.fork", result: hasReceipt ? endpointReceipt : successor };
+		let published = false;
 		try {
 			const error = await createManagedSuccessorFlow(f.runtime)
 				.fork({
 					source,
 					target,
+					onAcknowledged: (authority, receipt) => {
+						expect(authority).toEqual(successorAuthority);
+						expect(receipt).toEqual(hasReceipt ? endpointReceipt : undefined);
+					},
 					publish: () => {
+						published = true;
 						throw failure;
 					},
 				})
 				.catch(error => error);
 			expect(error).toBeInstanceOf(ManagedSuccessorUncertainError);
 			expect(error.acknowledgedAuthority).toEqual(successorAuthority);
-			expect(error.cause.errors[0]).toBe(failure);
-			expect(error.cause.errors[1]).toMatchObject({ code: "exact_close_authority_unavailable" });
+			expect(published).toBe(hasReceipt);
 			expect(f.closes).toEqual([]);
-			await expect(f.runtime.acquireAttachment(successorAuthority)).resolves.toMatchObject({
-				generation: successor.endpointGeneration,
-			});
+			if (hasReceipt) {
+				expect(error.cause.errors[0]).toBe(failure);
+				expect(error.cause.errors[1]).toMatchObject({ code: "exact_close_authority_unavailable" });
+				await expect(f.runtime.acquireAttachment(successorAuthority)).resolves.toMatchObject({
+					generation: successor.endpointGeneration,
+				});
+			} else {
+				expect(error.message).toContain("original endpoint receipt");
+				expect(error.cause).toBeUndefined();
+				expect(f.order).not.toContain("attachment:forked-session");
+				await expect(f.runtime.acquireAttachment(successorAuthority)).rejects.toThrow("not registered");
+			}
 		} finally {
 			await f.runtime.dispose();
 		}
@@ -620,7 +860,11 @@ async function runtimeFixture() {
 	const state = {
 		allowed: true,
 		running: false,
-		outcome: { ok: true, operation: "session.fork", result: successor } as ForkOutcome,
+		outcome: {
+			ok: true,
+			operation: "session.fork",
+			result: { ...successor, endpointIncarnation: "a".repeat(64) },
+		} as ForkOutcome | Promise<ForkOutcome>,
 		order: [] as string[],
 		forks: [] as ForkRequest[],
 		closes: [] as CloseRequest[],
@@ -787,6 +1031,7 @@ class FakeRuntime {
 			result: {
 				sessionId: successor.sessionId,
 				endpointGeneration: successor.endpointGeneration,
+				endpointIncarnation: "a".repeat(64),
 				principalId: this.successorPrincipalId,
 			},
 		};

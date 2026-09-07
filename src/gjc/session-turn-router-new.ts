@@ -17,6 +17,7 @@ import {
 	GjcTurnCancelledError,
 	type GjcTurnResult,
 	getProjectSessionRoot,
+	type ManagedEndpointReceipt,
 	type ManagedGenerationProof,
 	type ManagedPreparedTurnAuthority,
 	type ManagedTurnAuthority,
@@ -139,7 +140,10 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 					throw new Error("Managed startup invocation lacks its durable provisional owner.");
 				admitted = structuredClone(reserved);
 			},
-			onLifecycleAcknowledged: async (acknowledged: ManagedTurnAuthority) => {
+			onLifecycleAcknowledged: async (
+				acknowledged: ManagedTurnAuthority,
+				endpointReceipt?: ManagedEndpointReceipt,
+			) => {
 				const authority = managedAuthorityFor(
 					prepared,
 					{
@@ -158,7 +162,12 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 					input.mappings.recordLateCreateAcknowledgement(
 						input.chatId,
 						admitted,
-						createManagedLateCreateAcknowledgement(admitted, lifecycleExactAuthority(acknowledged)),
+						createManagedLateCreateAcknowledgement(
+							admitted,
+							lifecycleExactAuthority(acknowledged),
+							undefined,
+							endpointReceipt,
+						),
 					);
 					passiveAcknowledgement = true;
 					return;
@@ -166,6 +175,7 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 				recordLifecycle(
 					transitionManagedLifecycleEvidence(lifecycleEvidence, "acknowledged_unproven", {
 						acknowledged: lifecycleExactAuthority(acknowledged),
+						...(endpointReceipt === undefined ? {} : { endpointReceipt }),
 					}),
 				);
 				input.mappings.attachProvisionalOperation(input.chatId, input.userMessageId, {

@@ -107,7 +107,7 @@ function publicationFixture(options: PublicationFixtureOptions = {}) {
 		throw new Error("Unexpected operation in close publication fixture.");
 	};
 	// This typed boundary fake tests journal publication only. It deliberately bypasses runtime
-	// admission and does not represent an exact-close path available in the SDK 0.16.4 public API.
+	// admission and does not prove integration of persisted public incarnation receipts.
 	const runtime: ManagedSdkRuntimeDependency = {
 		state: "running",
 		start: unexpected,
@@ -150,7 +150,7 @@ describe("managed session close routing through real runtime admission", () => {
 				f.observations.length = 0;
 				expect(await routeGjcSessionClose(f.input)).toEqual({
 					status: "uncertain",
-					message: expect.stringContaining("SDK 0.16.4 public binding/lifecycle results do not supply it"),
+					message: expect.stringContaining("Missing persisted incarnation authority"),
 				});
 				expect(f.calls).toHaveLength(0);
 				expect(f.observations).toHaveLength(0);

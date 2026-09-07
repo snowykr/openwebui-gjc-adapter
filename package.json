@@ -28,9 +28,9 @@
 		"fmt": "biome format --write ."
 	},
 	"dependencies": {
-		"@gajae-code/ai": "0.16.4",
-		"@gajae-code/coding-agent": "0.16.4",
-		"@gajae-code/natives": "0.16.4"
+		"@gajae-code/ai": "0.16.6",
+		"@gajae-code/coding-agent": "0.16.6",
+		"@gajae-code/natives": "0.16.6"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.5.5",

@@ -29,6 +29,7 @@ async function fixture(
 		failResume?: boolean;
 		sessionId?: string;
 		generation?: number;
+		endpointIncarnation?: unknown;
 		stale?: boolean;
 		empty?: boolean;
 		stopGate?: Promise<void>;
@@ -233,7 +234,13 @@ async function fixture(
 					return {
 						ok: true,
 						operation: "session.resume",
-						result: { sessionId: options.sessionId ?? "session", endpointGeneration: options.generation ?? 7 },
+						result: {
+							sessionId: options.sessionId ?? "session",
+							endpointGeneration: options.generation ?? 7,
+							endpointIncarnation: Object.hasOwn(options, "endpointIncarnation")
+								? options.endpointIncarnation
+								: "a".repeat(64),
+						},
 					};
 				},
 			} as unknown as lifecycle.AgentDirSessionLifecycleService;
@@ -339,6 +346,28 @@ function withReassignment(
 }
 
 describe("adapter managed bootstrap composition", () => {
+	test.each([undefined, "", "A".repeat(64), "0".repeat(63), 12])(
+		"historical invalid incarnation %j retains acknowledgement but denies renewed proof",
+		async endpointIncarnation => {
+			const f = await fixture({ endpointIncarnation });
+			try {
+				const attempt = startAdapterSessionAuthorityV3Activation(f.input);
+				await expect(attempt.result).rejects.toThrow("bootstrap failed");
+				await attempt.settled;
+				expect(f.evidence()?.state).toBe("uncertain");
+				expect(f.evidence()?.acknowledged).toMatchObject({ sessionId: "session", generation: 7 });
+				expect(f.evidence()?.endpointReceipt).toBeUndefined();
+				expect(f.evidence()?.proven).toBeUndefined();
+				expect(f.calls.filter(call => call === "resume")).toHaveLength(1);
+				expect(f.calls).not.toContain("reconcile");
+				expect(await Bun.file(`${f.sourcePath}.v3-active.json`).exists()).toBe(false);
+				expect(await readFile(f.sourcePath, "utf8")).toBe(f.original);
+			} finally {
+				await f.cleanup();
+			}
+		},
+	);
+
 	test.each(["before", "during"] as const)(
 		"bootstrap rejects cleanup-pending authority %s the asynchronous fence before historical SDK effects",
 		async phase => {
@@ -519,6 +548,11 @@ describe("adapter managed bootstrap composition", () => {
 			if (result.status === "activated") result.store.close();
 			expect(f.evidence()?.acknowledged?.generation).toBe(7);
 			expect(f.evidence()?.preparedAuthority.principalId).toBe("owner");
+			expect(f.evidence()?.endpointReceipt).toEqual({
+				sessionId: "session",
+				endpointGeneration: 7,
+				endpointIncarnation: "a".repeat(64),
+			});
 			expect(await Bun.file(join(f.root, "foreign-authority.json")).exists()).toBe(false);
 			expect(f.calls.filter(call => call === "resume")).toHaveLength(1);
 		} finally {
@@ -554,6 +588,11 @@ describe("adapter managed bootstrap composition", () => {
 				await attempt.settled;
 				expect(f.evidence()?.state).toBe("uncertain");
 				expect(f.evidence()?.acknowledged?.generation).toBe(outcome === "success" ? 7 : undefined);
+				expect(f.evidence()?.endpointReceipt).toEqual(
+					outcome === "success"
+						? { sessionId: "session", endpointGeneration: 7, endpointIncarnation: "a".repeat(64) }
+						: undefined,
+				);
 				expect(f.calls.filter(call => call === "resume")).toHaveLength(1);
 				expect(f.calls).not.toContain("reconcile");
 				expect(await Bun.file(`${f.sourcePath}.lock`).exists()).toBe(false);

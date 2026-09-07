@@ -4,6 +4,8 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	createManagedLifecycleEvidence,
+	lifecycleExactAuthority,
 	lifecyclePreparedAuthority,
 	managedLifecycleEvidenceHash,
 	transitionManagedLifecycleEvidence,
@@ -15,7 +17,7 @@ import { parseSessionAuthorityV3Document, SESSION_AUTHORITY_V3_EPOCH } from "../
 import { replayCloseOperation } from "../src/gjc/session-operation-codec";
 import { replayOperation } from "../src/gjc/session-turn-router";
 import { SessionV3FileBackedMappingStore } from "../src/gjc/session-v3-file-backed-mapping-store";
-import type { ManagedTurnAuthority } from "../src/gjc/turn-runner";
+import type { ManagedEndpointReceipt, ManagedTurnAuthority } from "../src/gjc/turn-runner";
 
 const authority = (chatId = "chat-1", projectId = "project-1", sessionId = "session-1") => ({
 	authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
@@ -107,7 +109,256 @@ const publication = (value: ReturnType<typeof replayMapping>) => ({
 	managedAuthority: value.managedAuthority,
 });
 
+function completeLifecycleSource(
+	store: SessionV3FileBackedMappingStore,
+	operationId: string,
+	endpointReceipt?: ManagedEndpointReceipt,
+) {
+	const scope = { principalId: "user-1", chatId: "chat-1" };
+	const source = lifecycleExactAuthority(store.getScoped(scope)!.managedAuthority!);
+	const prepared = { ...lifecyclePreparedAuthority(source), requestKey: `request-${operationId}` };
+	store.beginOperationScoped(scope, { id: operationId, kind: "resume", detail: "a".repeat(64) });
+	let evidence = createManagedLifecycleEvidence({
+		operation: "session.resume",
+		preparedAuthority: prepared,
+		source,
+		payloadHash: "a".repeat(64),
+		target: { sessionIdOrPrefix: source.sessionId, path: source.canonicalWorkspace },
+	});
+	store.recordLifecycleEvidenceScoped(scope, operationId, evidence.payloadHash, evidence);
+	evidence = transitionManagedLifecycleEvidence(evidence, "invoking");
+	store.recordLifecycleEvidenceScoped(scope, operationId, evidence.payloadHash, evidence);
+	const acknowledged = { ...prepared, sessionId: source.sessionId, generation: source.generation };
+	evidence = transitionManagedLifecycleEvidence(evidence, "acknowledged_unproven", {
+		acknowledged,
+		...(endpointReceipt === undefined ? {} : { endpointReceipt }),
+	});
+	store.recordLifecycleEvidenceScoped(scope, operationId, evidence.payloadHash, evidence);
+	evidence = transitionManagedLifecycleEvidence(evidence, "active_generation_proven", {
+		proven: {
+			kind: "managed-generation",
+			sessionId: acknowledged.sessionId,
+			generation: acknowledged.generation,
+			leaseId: acknowledged.leaseId,
+			epoch: acknowledged.epoch,
+		},
+	});
+	store.recordLifecycleEvidenceScoped(scope, operationId, evidence.payloadHash, evidence);
+	store.completeOperationWithMappingScoped(
+		scope,
+		operationId,
+		evidence.payloadHash,
+		{ ...managedMapping(), operationId, managedAuthority: acknowledged },
+		"control",
+	);
+	return store.operationScoped(scope, operationId)!;
+}
+
 describe("SessionV3FileBackedMappingStore", () => {
+	test.each([false, true])(
+		"ordinary acknowledgement seals endpoint presence through durable mutation and reopen with endpoint=%s",
+		withReceipt => {
+			const directory = mkdtempSync(join(tmpdir(), "gjc-v3-original-endpoint-"));
+			const filePath = join(directory, "authority.json");
+			const scope = { principalId: "user-1", chatId: "chat-1" };
+			const source = lifecycleExactAuthority(authority());
+			const prepared = { ...lifecyclePreparedAuthority(source), requestKey: "original-request" };
+			const acknowledged = { ...prepared, sessionId: "created-session", generation: 2 };
+			const endpointReceipt = {
+				sessionId: acknowledged.sessionId,
+				endpointGeneration: 2,
+				endpointIncarnation: "a".repeat(64),
+			};
+			let store = new SessionV3FileBackedMappingStore(filePath);
+			try {
+				store.setScoped(scope, managedMapping());
+				store.beginOperationScoped(scope, { id: "create-original", kind: "create", detail: "b".repeat(64) });
+				let evidence = createManagedLifecycleEvidence({
+					operation: "session.create",
+					preparedAuthority: prepared,
+					source,
+					payloadHash: "b".repeat(64),
+					target: { kind: "existing_path", path: source.canonicalWorkspace },
+				});
+				store.recordLifecycleEvidenceScoped(scope, "create-original", evidence.payloadHash, evidence);
+				evidence = transitionManagedLifecycleEvidence(evidence, "invoking");
+				store.recordLifecycleEvidenceScoped(scope, "create-original", evidence.payloadHash, evidence);
+				evidence = transitionManagedLifecycleEvidence(evidence, "acknowledged_unproven", {
+					acknowledged,
+					...(withReceipt ? { endpointReceipt } : {}),
+				});
+				store.recordLifecycleEvidenceScoped(scope, "create-original", evidence.payloadHash, evidence);
+				const expectedReceipt = withReceipt ? structuredClone(endpointReceipt) : undefined;
+				if (withReceipt) Object.assign(evidence.endpointReceipt!, { endpointIncarnation: "c".repeat(64) });
+				for (const reopen of [false, true]) {
+					if (reopen) {
+						store.close();
+						store = new SessionV3FileBackedMappingStore(filePath);
+					}
+					const retained = store.operationScoped(scope, "create-original")!;
+					const original = structuredClone(retained);
+					expect(retained.lifecycle!.endpointReceipt).toEqual(expectedReceipt);
+					expect(retained.lifecycle!.acknowledged).toEqual(acknowledged);
+					if (withReceipt)
+						Object.assign(retained.lifecycle!.endpointReceipt!, { endpointIncarnation: "d".repeat(64) });
+					expect(store.operationScoped(scope, retained.id)).toEqual(original);
+					const bytes = readFileSync(filePath),
+						inode = fs.statSync(filePath).ino;
+					const { endpointReceipt: _receipt, ...withoutReceipt } = original.lifecycle!;
+					const conflicts = [
+						{
+							...original.lifecycle!,
+							endpointReceipt: { ...endpointReceipt, endpointIncarnation: "e".repeat(64) },
+						},
+						...(withReceipt ? [withoutReceipt] : []),
+					];
+					for (const conflict of conflicts) {
+						expect(() =>
+							store.recordLifecycleEvidenceScoped(scope, retained.id, conflict.payloadHash, conflict),
+						).toThrow("sealed");
+						expect(store.operationScoped(scope, retained.id)).toEqual(original);
+						expect(readFileSync(filePath).equals(bytes)).toBe(true);
+						expect(fs.statSync(filePath).ino).toBe(inode);
+					}
+					expect(store.getScoped(scope)!.sessionId).toBe(source.sessionId);
+					expect(retained.acknowledgedSuccessor).toBeUndefined();
+					expect(retained.result).toBeUndefined();
+				}
+			} finally {
+				store.close();
+				rmSync(directory, { recursive: true, force: true });
+			}
+		},
+	);
+
+	test("pending exact close requires original completed source provenance and closing state", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-v3-pending-close-proof-"));
+		const filePath = join(directory, "authority.json");
+		const scope = { principalId: "user-1", chatId: "chat-1" };
+		const store = new SessionV3FileBackedMappingStore(filePath);
+		try {
+			store.setScoped(scope, managedMapping());
+			const receipt = { sessionId: "session-1", endpointGeneration: 1, endpointIncarnation: "a".repeat(64) };
+			completeLifecycleSource(store, "original-create", receipt);
+			const source = store.getScoped(scope)!.managedAuthority!;
+			const input = { operationId: "close", requestKey: "close-request", payloadHash: "c".repeat(64) };
+			const reserved = store.reserveManagedRetirementScoped(scope, source, input);
+			const bytes = readFileSync(filePath);
+			const valid = parseSessionAuthorityV3Document(bytes)!;
+			expect(store.reserveManagedRetirementScoped(scope, source, input)).toEqual(reserved);
+			expect(readFileSync(filePath).equals(bytes)).toBe(true);
+			const unbound = structuredClone(valid);
+			Reflect.deleteProperty(unbound.mappings[0]!.journal.at(-1)!.lifecycle!, "sourceProofRef");
+			expect(parseSessionAuthorityV3Document(JSON.stringify(unbound))).toBeUndefined();
+			writeFileSync(filePath, JSON.stringify(unbound));
+			const invalidBytes = readFileSync(filePath);
+			expect(() => store.reserveManagedRetirementScoped(scope, source, input)).toThrow();
+			expect(readFileSync(filePath).equals(invalidBytes)).toBe(true);
+			writeFileSync(filePath, bytes);
+			const prepared = structuredClone(valid);
+			Reflect.set(prepared.mappings[0]!.journal.at(-1)!.lifecycle!, "state", "intent_prepared");
+			expect(parseSessionAuthorityV3Document(JSON.stringify(prepared))).toEqual(prepared);
+			writeFileSync(filePath, JSON.stringify(prepared));
+			const preparedBytes = readFileSync(filePath);
+			expect(() => store.reserveManagedRetirementScoped(scope, source, input)).toThrow("conflicts");
+			expect(readFileSync(filePath).equals(preparedBytes)).toBe(true);
+			writeFileSync(filePath, bytes);
+			expect(store.reserveManagedRetirementScoped(scope, source, input)).toEqual(reserved);
+		} finally {
+			store.close();
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	test.each([false, true])("retirement selects the newest matching durable source with endpoint=%s", withReceipt => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-v3-retirement-source-"));
+		const filePath = join(directory, "authority.json");
+		const scope = { principalId: "user-1", chatId: "chat-1" };
+		// Synthetic acknowledgements prove store selection and durability, not live SDK close authority.
+		const earlierReceipt = { sessionId: "session-1", endpointGeneration: 1, endpointIncarnation: "a".repeat(64) };
+		const newestReceipt = { ...earlierReceipt, endpointIncarnation: "b".repeat(64) };
+		const expectedReceipt = structuredClone(newestReceipt);
+		let store = new SessionV3FileBackedMappingStore(filePath);
+		try {
+			store.setScoped(scope, managedMapping());
+			const earlier = completeLifecycleSource(store, "earlier-source", earlierReceipt);
+			const newest = completeLifecycleSource(store, "newest-source", withReceipt ? newestReceipt : undefined);
+			const expectedNewest = structuredClone(newest);
+			expect(earlier.lifecycle!.acknowledged!.generation).toBe(newest.lifecycle!.acknowledged!.generation);
+			expect(earlier.lifecycle!.endpointReceipt).toEqual(earlierReceipt);
+			expect(newest.lifecycle!.endpointReceipt).toEqual(withReceipt ? expectedReceipt : undefined);
+			Object.assign(newestReceipt, { endpointIncarnation: "c".repeat(64) });
+			if (withReceipt) Object.assign(newest.lifecycle!.endpointReceipt!, { endpointIncarnation: "d".repeat(64) });
+			expect(store.operationScoped(scope, newest.id)).toEqual(expectedNewest);
+			const sourceBytes = readFileSync(filePath);
+			store.close();
+			store = new SessionV3FileBackedMappingStore(filePath);
+			expect(readFileSync(filePath).equals(sourceBytes)).toBe(true);
+			expect(store.operationScoped(scope, earlier.id)).toEqual(earlier);
+			expect(store.operationScoped(scope, newest.id)).toEqual(expectedNewest);
+			const source = store.getScoped(scope)!.managedAuthority!;
+			expect(Object.hasOwn(source, "endpointGeneration")).toBe(false);
+			expect(Object.hasOwn(source, "endpointIncarnation")).toBe(false);
+			const input = { operationId: "retire", requestKey: "retire-request", payloadHash: "e".repeat(64) };
+			if (!withReceipt) {
+				for (const reopen of [false, true]) {
+					if (reopen) {
+						store.close();
+						store = new SessionV3FileBackedMappingStore(filePath);
+					}
+					const inode = fs.statSync(filePath).ino;
+					expect(() => store.reserveManagedRetirementScoped(scope, source, input)).toThrow(
+						"original endpoint receipt",
+					);
+					expect(store.operationScoped(scope, input.operationId)).toBeUndefined();
+					expect(store.operationScoped(scope, newest.id)).toEqual(expectedNewest);
+					expect(readFileSync(filePath).equals(sourceBytes)).toBe(true);
+					expect(fs.statSync(filePath).ino).toBe(inode);
+				}
+			} else {
+				const reserved = store.reserveManagedRetirementScoped(scope, source, input);
+				const sourceProofRef = {
+					operationId: newest.id,
+					evidenceHash: managedLifecycleEvidenceHash(expectedNewest.lifecycle!),
+				};
+				expect(reserved.lifecycle!.target).toEqual(expectedReceipt);
+				expect(reserved.lifecycle!.target).not.toEqual(earlierReceipt);
+				expect(reserved.lifecycle!.source).toEqual(lifecycleExactAuthority(source));
+				expect(reserved.lifecycle!.sourceProofRef).toEqual(sourceProofRef);
+				expect(sourceProofRef.evidenceHash).not.toBe(managedLifecycleEvidenceHash(earlier.lifecycle!));
+				const bytes = readFileSync(filePath);
+				const document = parseSessionAuthorityV3Document(bytes)!;
+				expect(document.mappings[0]!.journal.at(-1)!.lifecycle!.target).toEqual(expectedReceipt);
+				for (const reference of [
+					{ ...sourceProofRef, evidenceHash: "f".repeat(64) },
+					{ operationId: earlier.id, evidenceHash: managedLifecycleEvidenceHash(earlier.lifecycle!) },
+				]) {
+					const invalid = structuredClone(document);
+					Object.assign(invalid.mappings[0]!.journal.at(-1)!.lifecycle!, { sourceProofRef: reference });
+					expect(parseSessionAuthorityV3Document(JSON.stringify(invalid))).toBeUndefined();
+				}
+				Object.assign(reserved.lifecycle!.target, { endpointIncarnation: "c".repeat(64) });
+				Object.assign(reserved.lifecycle!.sourceProofRef!, { evidenceHash: "f".repeat(64) });
+				expect(store.operationScoped(scope, input.operationId)!.lifecycle!.target).toEqual(expectedReceipt);
+				expect(store.operationScoped(scope, input.operationId)!.lifecycle!.sourceProofRef).toEqual(sourceProofRef);
+				expect(store.reserveManagedRetirementScoped(scope, source, input).lifecycle!.target).toEqual(
+					expectedReceipt,
+				);
+				expect(readFileSync(filePath).equals(bytes)).toBe(true);
+				store.close();
+				store = new SessionV3FileBackedMappingStore(filePath);
+				const reopened = store.operationScoped(scope, input.operationId)!;
+				expect(reopened.state).toBe("uncertain");
+				expect(reopened.lifecycle!.target).toEqual(expectedReceipt);
+				expect(reopened.lifecycle!.sourceProofRef).toEqual(sourceProofRef);
+				expect(store.operationScoped(scope, newest.id)).toEqual(expectedNewest);
+			}
+		} finally {
+			store.close();
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
 	test("catalog dispatch snapshots observe another writer without reconciliation or writes", () => {
 		const directory = mkdtempSync(join(tmpdir(), "gjc-v3-catalog-snapshot-"));
 		const filePath = join(directory, "authority.json");
@@ -133,6 +384,7 @@ describe("SessionV3FileBackedMappingStore", () => {
 				managedLifecycleEvidenceHash(current.lifecycle!),
 				transitionManagedLifecycleEvidence(current.lifecycle!, "acknowledged_unproven", {
 					acknowledged: { ...prepared, sessionId: "catalog", generation: 2 },
+					endpointReceipt: { sessionId: "catalog", endpointGeneration: 2, endpointIncarnation: "a".repeat(64) },
 				}),
 			);
 			expect(reader.provisionalOperationScoped(scope, original.id)).toBeUndefined();

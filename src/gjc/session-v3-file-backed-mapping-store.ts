@@ -14,7 +14,9 @@ import { dirname } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
 	assertManagedLifecycleEvidenceUpdate,
+	copyManagedEndpointReceipt,
 	copyManagedLifecycleEvidence,
+	isManagedEndpointReceipt,
 	type ManagedLifecycleEvidence,
 	managedHistoricalSourceAssociation,
 	managedLifecycleEvidenceHash,
@@ -63,7 +65,7 @@ import {
 	type SessionAuthorityV3BootstrapAccess,
 } from "./session-authority-v3-activation";
 import { SessionMappingStore } from "./session-mapping-memory-store";
-import type { ManagedTurnAuthority } from "./turn-runner";
+import type { ManagedEndpointReceipt, ManagedTurnAuthority } from "./turn-runner";
 
 export interface SessionAuthorityV3BootstrapStage {
 	read(): SessionAuthorityV3Document;
@@ -80,7 +82,10 @@ export interface SessionAuthorityV3BootstrapStage {
 }
 
 export interface SessionAuthorityV3InvocationReceipt {
-	observe(identity: { readonly sessionId: string; readonly generation: number } | undefined): ManagedLifecycleEvidence;
+	observe(
+		identity: { readonly sessionId: string; readonly generation: number } | undefined,
+		endpointReceipt?: ManagedEndpointReceipt,
+	): ManagedLifecycleEvidence;
 	/** Called only after the raw invocation and its observation have settled. */
 	finish(): void;
 }
@@ -509,7 +514,12 @@ export class V3FileBackedSessionMappingStore extends SessionMappingStore {
 			admittedInvocations.delete(original.id);
 			issuedReceipts.add(original.id);
 			let expected = initial;
-			let observation: { identity: { sessionId: string; generation: number } | undefined } | undefined;
+			let observation:
+				| {
+						identity: { sessionId: string; generation: number } | undefined;
+						endpointReceipt?: ManagedEndpointReceipt;
+				  }
+				| undefined;
 			let failure: { error: unknown } | undefined;
 			let finished = false;
 			const assertReceiptCurrent = () => {
@@ -519,6 +529,7 @@ export class V3FileBackedSessionMappingStore extends SessionMappingStore {
 			const update = (
 				finish: boolean,
 				identity?: { sessionId: string; generation: number },
+				endpointReceipt?: ManagedEndpointReceipt,
 			): ManagedLifecycleEvidence => {
 				let updated!: ManagedLifecycleEvidence;
 				this.#authority.replaceAuthorityState((records, provisional) => {
@@ -540,6 +551,7 @@ export class V3FileBackedSessionMappingStore extends SessionMappingStore {
 					if (!finish && identity !== undefined) {
 						updated = transitionManagedLifecycleEvidence(evidence, "acknowledged_unproven", {
 							acknowledged: { ...initial.preparedAuthority, ...identity },
+							...(endpointReceipt === undefined ? {} : { endpointReceipt }),
 						});
 					}
 					if ((finish || identity === undefined || !owner.admitted()) && updated.state !== "uncertain")
@@ -564,7 +576,10 @@ export class V3FileBackedSessionMappingStore extends SessionMappingStore {
 				return copyManagedLifecycleEvidence(updated);
 			};
 			return Object.freeze({
-				observe: (value: { readonly sessionId: string; readonly generation: number } | undefined) => {
+				observe: (
+					value: { readonly sessionId: string; readonly generation: number } | undefined,
+					endpointReceipt?: ManagedEndpointReceipt,
+				) => {
 					if (finished) throw new Error("Historical receipt ownership is closed.");
 					try {
 						const identity = value === undefined ? undefined : structuredClone(value);
@@ -576,17 +591,30 @@ export class V3FileBackedSessionMappingStore extends SessionMappingStore {
 								identity.generation <= 0)
 						)
 							throw new Error("Historical receipt does not match its original session outcome.");
+						if (
+							endpointReceipt !== undefined &&
+							(identity === undefined || !isManagedEndpointReceipt(endpointReceipt, identity))
+						)
+							throw new Error("Historical endpoint receipt does not match its original session outcome.");
+						const retainedEndpoint =
+							endpointReceipt === undefined ? undefined : copyManagedEndpointReceipt(endpointReceipt);
 						if (observation !== undefined) {
 							assertReceiptCurrent();
-							if (!isDeepStrictEqual(observation.identity, identity))
+							if (
+								!isDeepStrictEqual(observation.identity, identity) ||
+								!isDeepStrictEqual(observation.endpointReceipt, retainedEndpoint)
+							)
 								throw new Error("Historical receipt observation is immutable.");
 							const current = locate(this.#authority.entries()).retained;
 							if (!isDeepStrictEqual(current.lifecycle, expected))
 								throw new Error("Historical receipt evidence changed before observation.");
 							return copyManagedLifecycleEvidence(expected);
 						}
-						const result = update(false, identity);
-						observation = { identity };
+						const result = update(false, identity, retainedEndpoint);
+						observation = {
+							identity,
+							...(retainedEndpoint === undefined ? {} : { endpointReceipt: retainedEndpoint }),
+						};
 						return result;
 					} catch (error) {
 						failure ??= { error };

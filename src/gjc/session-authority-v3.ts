@@ -5,6 +5,7 @@ import {
 	hasManagedHistoricalSourceChat,
 	isHistoricalSessionBinding,
 	isManagedCatalogProvisional,
+	isManagedEndpointReceipt,
 	isManagedLateCreateAcknowledgement,
 	isManagedLateLifecycleAcknowledgement,
 	isManagedLifecycleEvidence,
@@ -864,9 +865,10 @@ function validateLifecycleSourceReference(
 ): boolean {
 	const lifecycle = operation.lifecycle;
 	const reference = lifecycle?.sourceProofRef;
-	if (reference === undefined) return true;
+	if (reference === undefined)
+		return lifecycle?.operation !== "session.close" || lifecycle.target.endpointIncarnation === undefined;
 	const source = lifecycle?.source;
-	if (source === undefined || reference.operationId === operation.id) return false;
+	if (lifecycle === undefined || source === undefined || reference.operationId === operation.id) return false;
 	const candidates = journal.filter(candidate => isRecord(candidate) && candidate.id === reference.operationId);
 	if (candidates.length !== 1) return false;
 	const prior = candidates[0]!;
@@ -883,6 +885,14 @@ function validateLifecycleSourceReference(
 		evidence.acknowledged === undefined ||
 		evidence.proven === undefined ||
 		managedLifecycleEvidenceHash(evidence) !== reference.evidenceHash
+	)
+		return false;
+	if (
+		lifecycle.operation === "session.close" &&
+		(evidence.endpointReceipt !== undefined || lifecycle.target.endpointIncarnation !== undefined) &&
+		(!isManagedEndpointReceipt(evidence.endpointReceipt, evidence.acknowledged) ||
+			!isManagedEndpointReceipt(lifecycle.target, evidence.acknowledged) ||
+			!isDeepStrictEqual(lifecycle.target, evidence.endpointReceipt))
 	)
 		return false;
 	return (
@@ -1204,10 +1214,24 @@ function tombstoneRoots(
 			? []
 			: [reassignment.priorTombstone];
 }
-function containsForbiddenLegacyField(value: unknown, path = ""): boolean {
+function containsForbiddenLegacyField(
+	value: unknown,
+	path = "",
+	position?: "late-acknowledgement" | "endpoint-receipt",
+): boolean {
 	if (Array.isArray(value))
 		return value.some((child, index) => containsForbiddenLegacyField(child, `${path}/${index}`));
 	if (!isRecord(value)) return false;
+	const operationPath =
+		/^(?:\/mappings\/\d+(?:\/reassignment\/(?:sourceTombstone|priorTombstone)(?:\/prior)*)?\/journal\/\d+|\/provisionalOperations\/\d+|\/journal\/\d+|\/reassignment\/(?:sourceTombstone|priorTombstone)(?:\/prior)*\/journal\/\d+)?$/.test(
+			path,
+		);
+	const lifecycle =
+		/^(?:\/mappings\/\d+(?:\/reassignment\/(?:sourceTombstone|priorTombstone)(?:\/prior)*)?\/journal\/\d+|\/provisionalOperations\/\d+(?:\/cleanup)?|\/journal\/\d+|\/reassignment\/(?:sourceTombstone|priorTombstone)(?:\/prior)*\/journal\/\d+|\/cleanup)?\/lifecycle$/.test(
+			path,
+		) && isManagedLifecycleEvidence(value)
+			? value
+			: undefined;
 	const savedResume =
 		/^(?:\/mappings\/\d+(?:\/reassignment\/(?:sourceTombstone|priorTombstone)(?:\/prior)*)?\/journal\/\d+|\/provisionalOperations\/\d+|\/journal\/\d+|\/reassignment\/(?:sourceTombstone|priorTombstone)(?:\/prior)*\/journal\/\d+)?\/lifecycle$/.test(
 			path,
@@ -1223,14 +1247,36 @@ function containsForbiddenLegacyField(value: unknown, path = ""): boolean {
 			path,
 		) ||
 		(path === "" && (value.version === 3 || (isNonEmptyString(value.chatId) && isNonEmptyString(value.projectId))));
-	return Object.entries(value).some(
-		([key, child]) =>
-			FORBIDDEN_FIELDS.has(key) ||
+	return Object.entries(value).some(([key, child]) => {
+		let childPosition: typeof position;
+		if (
+			key === "endpointReceipt" &&
+			(lifecycle !== undefined || position === "late-acknowledgement") &&
+			isManagedEndpointReceipt(child)
+		)
+			childPosition = "endpoint-receipt";
+		else if (
+			key === "target" &&
+			lifecycle?.operation === "session.close" &&
+			isManagedEndpointReceipt(child, lifecycle.source)
+		)
+			childPosition = "endpoint-receipt";
+		else if (
+			operationPath &&
+			((key === "lateLifecycleAcknowledgement" &&
+				isManagedLateLifecycleAcknowledgement(child, value as unknown as SessionAuthorityV3Operation)) ||
+				(key === "lateCreateAcknowledgement" &&
+					isManagedLateCreateAcknowledgement(child, value as unknown as SessionAuthorityV3ProvisionalOperation)))
+		)
+			childPosition = "late-acknowledgement";
+		return (
+			(FORBIDDEN_FIELDS.has(key) && !(position === "endpoint-receipt" && key === "endpointIncarnation")) ||
 			["sessionPath", "sessionIdentity", "savedSession"].includes(key) ||
 			((key === "sessionFile" || key === "activeLeaf") && !projection) ||
 			(!(savedResume && (key === "target" || key === "historicalSource")) &&
-				containsForbiddenLegacyField(child, `${path}/${key}`)),
-	);
+				containsForbiddenLegacyField(child, `${path}/${key}`, childPosition))
+		);
+	});
 }
 function canonicalize(value: unknown): unknown {
 	if (Array.isArray(value)) return value.map(canonicalize);

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { NormalizedModelSelection } from "../contracts";
+import { managedEndpointReceiptFromResult } from "../gjc/managed-lifecycle-evidence";
 import { DEFAULT_MANAGED_OPERATION_TIMEOUT_MS, ManagedOperationDeadline } from "../gjc/managed-operation-deadline";
 import {
 	type ManagedSdkAttachment,
@@ -13,6 +14,7 @@ import {
 	GjcTurnCancelledError,
 	type GjcTurnEvent,
 	type GjcTurnResult,
+	type ManagedEndpointReceipt,
 	type ManagedTurnAuthority,
 } from "../gjc/turn-runner";
 
@@ -34,7 +36,10 @@ export interface ManagedLifecycleInput {
 	readonly timeoutMs?: number;
 	readonly signal?: AbortSignal;
 	/** Durable owner acknowledgement, before registration, cancellation handling, or currentness proof. */
-	readonly onAcknowledged?: (authority: ManagedTurnAuthority) => void | Promise<void>;
+	readonly onAcknowledged?: (
+		authority: ManagedTurnAuthority,
+		endpointReceipt?: ManagedEndpointReceipt,
+	) => void | Promise<void>;
 	readonly beforeProof?: () => void | Promise<void>;
 	readonly onInvoking?: () => void | Promise<void>;
 	readonly lifecycleOperation?: {
@@ -221,17 +226,27 @@ export function createManagedSessionOperations(
 			const requestKey = authority.requestKey;
 			const target = lifecycleTarget(operation, input.target);
 			let outcomeObserved = false;
+			let hasValidReceipt = false;
 			const observeOutcome = async (raw: unknown) => {
 				outcomeObserved = true;
 				const outcome = externalOutcome(raw);
 				if (!isLifecycleSuccess(outcome)) return;
 				const assigned = tenantFromLifecycle(authority, outcome, operation, target);
 				if (assigned === undefined) return;
-				await input.onAcknowledged?.({
+				const acknowledged = {
 					...assigned,
 					requestKey,
 					authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
-				} as ManagedTurnAuthority);
+				} as ManagedTurnAuthority;
+				const endpointReceipt =
+					outcome.operation === `session.${operation}`
+						? managedEndpointReceiptFromResult(outcome.result, acknowledged)
+						: undefined;
+				hasValidReceipt = endpointReceipt !== undefined;
+				await input.onAcknowledged?.(
+					acknowledged,
+					endpointReceipt === undefined ? undefined : { ...endpointReceipt },
+				);
 			};
 			const invokeLifecycle = () => {
 				throwIfAborted(input.signal);
@@ -354,6 +369,10 @@ export function createManagedSessionOperations(
 					);
 				deadline.remaining();
 				if (!outcomeObserved) throw new Error("Managed lifecycle outcome was not observed by its durable owner.");
+				if (!hasValidReceipt)
+					throw new ManagedTurnUncertainError(
+						`Managed session.${operation} acknowledgement lacks its original endpoint receipt.`,
+					);
 				await deadline.wait(Promise.resolve(input.beforeProof?.()));
 				try {
 					throwIfAborted(input.signal);

@@ -13,7 +13,12 @@ import type {
 	SessionOperationResult,
 } from "./session-authority-types";
 import { hasOnlyKeys, isNonEmptyString, isRecord, isTimestamp } from "./session-authority-validation-primitives";
-import type { ManagedGenerationProof, ManagedPreparedTurnAuthority, ManagedTurnAuthority } from "./turn-runner";
+import type {
+	ManagedEndpointReceipt,
+	ManagedGenerationProof,
+	ManagedPreparedTurnAuthority,
+	ManagedTurnAuthority,
+} from "./turn-runner";
 
 /** Public saved-session selection receipt, not snapshot or process-incarnation authority. */
 export interface ManagedHistoricalSavedSession {
@@ -52,6 +57,7 @@ export interface ManagedLifecycleEvidence {
 	readonly state: ManagedLifecycleState;
 	readonly recordedAt: string;
 	readonly acknowledged?: ManagedTurnAuthority;
+	readonly endpointReceipt?: ManagedEndpointReceipt;
 	readonly proven?: ManagedGenerationProof;
 	readonly closeAcknowledgement?: {
 		readonly sessionId: string;
@@ -73,6 +79,7 @@ export interface ManagedLateLifecycleAcknowledgement {
 	readonly admissionHash: string;
 	readonly observedAt: string;
 	readonly acknowledged: { readonly sessionId: string; readonly generation: number };
+	readonly endpointReceipt?: ManagedEndpointReceipt;
 }
 
 /** Initial create output retained by its prepared provisional owner, never a binding. */
@@ -81,6 +88,66 @@ export interface ManagedLateCreateAcknowledgement {
 	readonly admissionHash: string;
 	readonly observedAt: string;
 	readonly acknowledged: { readonly sessionId: string; readonly generation: number };
+	readonly endpointReceipt?: ManagedEndpointReceipt;
+}
+
+export function isManagedEndpointReceipt(
+	value: unknown,
+	acknowledged?: Pick<ManagedTurnAuthority, "sessionId" | "generation">,
+): value is ManagedEndpointReceipt {
+	if (
+		!isRecord(value) ||
+		(Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) ||
+		Reflect.ownKeys(value).length !== 3 ||
+		!["sessionId", "endpointGeneration", "endpointIncarnation"].every(field => {
+			const descriptor = Object.getOwnPropertyDescriptor(value, field);
+			return descriptor?.enumerable === true && "value" in descriptor;
+		})
+	)
+		return false;
+	return (
+		isNonEmptyString(value.sessionId) &&
+		positiveInteger(value.endpointGeneration) &&
+		isHash(value.endpointIncarnation) &&
+		value.endpointIncarnation.length === 64 &&
+		(acknowledged === undefined ||
+			(value.sessionId === acknowledged.sessionId && value.endpointGeneration === acknowledged.generation))
+	);
+}
+
+export function copyManagedEndpointReceipt(value: ManagedEndpointReceipt): ManagedEndpointReceipt {
+	if (!isManagedEndpointReceipt(value)) throw new Error("Invalid managed endpoint receipt.");
+	return {
+		sessionId: value.sessionId,
+		endpointGeneration: value.endpointGeneration,
+		endpointIncarnation: value.endpointIncarnation,
+	};
+}
+
+/** Projects only the named fields of an original observed successful lifecycle result. */
+export function managedEndpointReceiptFromResult(
+	result: unknown,
+	acknowledged: Pick<ManagedTurnAuthority, "sessionId" | "generation">,
+): ManagedEndpointReceipt | undefined {
+	if (!isRecord(result)) return undefined;
+	const receipt = {
+		sessionId: Object.getOwnPropertyDescriptor(result, "sessionId")?.value,
+		endpointGeneration: Object.getOwnPropertyDescriptor(result, "endpointGeneration")?.value,
+		endpointIncarnation: Object.getOwnPropertyDescriptor(result, "endpointIncarnation")?.value,
+	};
+	return isManagedEndpointReceipt(receipt, acknowledged) ? copyManagedEndpointReceipt(receipt) : undefined;
+}
+
+/** Requires original create/resume/fork evidence, not effect or routing authorization. */
+export function requireManagedEndpointReceipt(evidence: ManagedLifecycleEvidence): ManagedEndpointReceipt {
+	assertEvidence(evidence);
+	if (
+		!["session.create", "session.resume", "session.fork"].includes(evidence.operation) ||
+		evidence.acknowledged === undefined ||
+		!isManagedEndpointReceipt(evidence.endpointReceipt, evidence.acknowledged)
+	)
+		throw new Error("Managed lifecycle evidence lacks its original endpoint receipt.");
+	return copyManagedEndpointReceipt(evidence.endpointReceipt);
 }
 
 export function managedProvisionalCreateAdmissionHash(operation: ProvisionalSessionOperation): string {
@@ -131,6 +198,7 @@ export function createManagedLateCreateAcknowledgement(
 	admitted: ProvisionalSessionOperation,
 	acknowledged: ManagedTurnAuthority,
 	observedAt = new Date().toISOString(),
+	endpointReceipt?: ManagedEndpointReceipt,
 ): ManagedLateCreateAcknowledgement {
 	const admissionHash = managedProvisionalCreateAdmissionHash(admitted);
 	const evidence = admitted.lifecycle!;
@@ -143,6 +211,7 @@ export function createManagedLateCreateAcknowledgement(
 		admitted.acknowledgedSuccessor !== undefined ||
 		admitted.lateCreateAcknowledgement !== undefined ||
 		!isAuthority(acknowledged) ||
+		(endpointReceipt !== undefined && !isManagedEndpointReceipt(endpointReceipt, acknowledged)) ||
 		!preparedFields.every(field => acknowledged[field] === evidence.preparedAuthority[field]) ||
 		!isTimestamp(observedAt) ||
 		Date.parse(observedAt) < Date.parse(evidence.recordedAt)
@@ -153,6 +222,7 @@ export function createManagedLateCreateAcknowledgement(
 		admissionHash,
 		observedAt,
 		acknowledged: { sessionId: acknowledged.sessionId, generation: acknowledged.generation },
+		...(endpointReceipt === undefined ? {} : { endpointReceipt: copyManagedEndpointReceipt(endpointReceipt) }),
 	};
 }
 
@@ -162,7 +232,7 @@ export function isManagedLateCreateAcknowledgement(
 ): value is ManagedLateCreateAcknowledgement {
 	try {
 		return (
-			hasOnlyKeys(value, ["kind", "admissionHash", "observedAt", "acknowledged"]) &&
+			hasOnlyKeys(value, ["kind", "admissionHash", "observedAt", "acknowledged", "endpointReceipt"]) &&
 			value.kind === "original-provisional-create-success" &&
 			value.admissionHash === managedProvisionalCreateAdmissionHash(operation) &&
 			operation.state === "uncertain" &&
@@ -175,7 +245,12 @@ export function isManagedLateCreateAcknowledgement(
 			Date.parse(value.observedAt) >= Date.parse(operation.lifecycle.recordedAt) &&
 			hasOnlyKeys(value.acknowledged, ["sessionId", "generation"]) &&
 			isNonEmptyString(value.acknowledged.sessionId) &&
-			positiveInteger(value.acknowledged.generation)
+			positiveInteger(value.acknowledged.generation) &&
+			(!Object.hasOwn(value, "endpointReceipt") ||
+				isManagedEndpointReceipt(
+					value.endpointReceipt,
+					value.acknowledged as { sessionId: string; generation: number },
+				))
 		);
 	} catch {
 		return false;
@@ -251,9 +326,12 @@ export function isManagedCatalogProvisional(value: unknown): boolean {
 			: Date.parse(child.startedAt) > Date.parse(evidence.recordedAt)) ||
 		close.proven !== undefined ||
 		close.acknowledged !== undefined ||
-		!hasOnlyKeys(close.target, ["sessionId", "endpointGeneration"]) ||
+		!hasOnlyKeys(close.target, ["sessionId", "endpointGeneration", "endpointIncarnation"]) ||
 		close.target.sessionId !== evidence.acknowledged.sessionId ||
-		close.target.endpointGeneration !== evidence.acknowledged.generation
+		close.target.endpointGeneration !== evidence.acknowledged.generation ||
+		((evidence.endpointReceipt !== undefined || close.target.endpointIncarnation !== undefined) &&
+			(!isManagedEndpointReceipt(close.target, evidence.acknowledged) ||
+				!isDeepStrictEqual(close.target, evidence.endpointReceipt)))
 	)
 		return false;
 	if (child.state === "complete") {
@@ -322,6 +400,7 @@ export function createManagedLateLifecycleAcknowledgement(
 	admitted: SessionOperation,
 	acknowledged: ManagedTurnAuthority,
 	observedAt = new Date().toISOString(),
+	endpointReceipt?: ManagedEndpointReceipt,
 ): ManagedLateLifecycleAcknowledgement {
 	const admissionHash = managedLifecycleAdmissionHash(admitted);
 	const evidence = admitted.lifecycle!;
@@ -332,6 +411,7 @@ export function createManagedLateLifecycleAcknowledgement(
 		admitted.result !== undefined ||
 		admitted.acknowledgedSuccessor !== undefined ||
 		!isAuthority(acknowledged) ||
+		(endpointReceipt !== undefined && !isManagedEndpointReceipt(endpointReceipt, acknowledged)) ||
 		!preparedFields.every(field => acknowledged[field] === evidence.preparedAuthority[field]) ||
 		!matchesPassiveLifecycleTarget(evidence, acknowledged) ||
 		!isTimestamp(observedAt) ||
@@ -343,6 +423,7 @@ export function createManagedLateLifecycleAcknowledgement(
 		admissionHash,
 		observedAt,
 		acknowledged: { sessionId: acknowledged.sessionId, generation: acknowledged.generation },
+		...(endpointReceipt === undefined ? {} : { endpointReceipt: copyManagedEndpointReceipt(endpointReceipt) }),
 	};
 }
 
@@ -352,7 +433,7 @@ export function isManagedLateLifecycleAcknowledgement(
 ): value is ManagedLateLifecycleAcknowledgement {
 	try {
 		return (
-			hasOnlyKeys(value, ["kind", "admissionHash", "observedAt", "acknowledged"]) &&
+			hasOnlyKeys(value, ["kind", "admissionHash", "observedAt", "acknowledged", "endpointReceipt"]) &&
 			value.kind === "original-admission-success" &&
 			isHash(value.admissionHash) &&
 			value.admissionHash === managedLifecycleAdmissionHash(operation) &&
@@ -367,6 +448,11 @@ export function isManagedLateLifecycleAcknowledgement(
 			hasOnlyKeys(value.acknowledged, ["sessionId", "generation"]) &&
 			isNonEmptyString(value.acknowledged.sessionId) &&
 			positiveInteger(value.acknowledged.generation) &&
+			(!Object.hasOwn(value, "endpointReceipt") ||
+				isManagedEndpointReceipt(
+					value.endpointReceipt,
+					value.acknowledged as { sessionId: string; generation: number },
+				)) &&
 			matchesPassiveLifecycleTarget(
 				operation.lifecycle,
 				value.acknowledged as { sessionId: string; generation: number },
@@ -380,7 +466,25 @@ export function isManagedLateLifecycleAcknowledgement(
 export function copyManagedLateLifecycleAcknowledgement(
 	value: ManagedLateLifecycleAcknowledgement,
 ): ManagedLateLifecycleAcknowledgement {
-	return { ...value, acknowledged: { ...value.acknowledged } };
+	return {
+		...value,
+		acknowledged: { ...value.acknowledged },
+		...(value.endpointReceipt === undefined
+			? {}
+			: { endpointReceipt: copyManagedEndpointReceipt(value.endpointReceipt) }),
+	};
+}
+
+export function copyManagedLateCreateAcknowledgement(
+	value: ManagedLateCreateAcknowledgement,
+): ManagedLateCreateAcknowledgement {
+	return {
+		...value,
+		acknowledged: { ...value.acknowledged },
+		...(value.endpointReceipt === undefined
+			? {}
+			: { endpointReceipt: copyManagedEndpointReceipt(value.endpointReceipt) }),
+	};
 }
 
 function matchesPassiveLifecycleTarget(
@@ -711,7 +815,7 @@ type EvidenceInput = Pick<
 	"operation" | "preparedAuthority" | "source" | "historicalSource" | "target" | "payloadHash"
 >;
 type EvidencePatch = Partial<
-	Pick<ManagedLifecycleEvidence, "acknowledged" | "proven" | "retirement" | "closeAcknowledgement">
+	Pick<ManagedLifecycleEvidence, "acknowledged" | "endpointReceipt" | "proven" | "retirement" | "closeAcknowledgement">
 >;
 const preparedFields = [
 	"principalId",
@@ -723,7 +827,7 @@ const preparedFields = [
 	"requestKey",
 ] as const;
 const scopeFields = ["principalId", "projectId", "canonicalWorkspace", "chatId", "leaseId", "epoch"] as const;
-const proofFields = ["acknowledged", "proven", "retirement", "closeAcknowledgement"] as const;
+const proofFields = ["acknowledged", "endpointReceipt", "proven", "retirement", "closeAcknowledgement"] as const;
 const savedTranscriptFields = ["dev", "ino", "size", "mtimeMs", "mtimeNs", "sha256"] as const;
 const identityFields = [
 	"operation",
@@ -805,6 +909,8 @@ export function createManagedRetirementEvidence(
 		)
 	)
 		throw new Error("Managed retirement requires matching persisted active-generation proof.");
+	if (input.operation === "session.close" && !isDeepStrictEqual(input.target, requireManagedEndpointReceipt(prior)))
+		throw new Error("Managed close target must equal its original source endpoint receipt.");
 	const intent = createManagedLifecycleEvidence(input, recordedAt);
 	return copyManagedLifecycleEvidence({
 		...intent,
@@ -849,9 +955,21 @@ export function assertManagedLifecycleEvidenceUpdate(
 			throw new Error(`Immutable managed lifecycle identity changed: ${field}.`);
 	if (Date.parse(next.recordedAt) < Date.parse(current.recordedAt))
 		throw new Error("Managed lifecycle evidence time moved backwards.");
+	if (current.acknowledged !== undefined && !isDeepStrictEqual(current.endpointReceipt, next.endpointReceipt))
+		throw new Error("Managed endpoint receipt presence and absence are sealed by the first acknowledgement.");
+	if (
+		current.endpointReceipt === undefined &&
+		next.endpointReceipt !== undefined &&
+		(current.acknowledged !== undefined || current.state !== "invoking" || next.state !== "acknowledged_unproven")
+	)
+		throw new Error("Managed endpoint receipt must accompany the first lifecycle acknowledgement atomically.");
 	if (current.state === next.state) {
 		if (
-			current.state === "closing" &&
+			(current.state === "closing" ||
+				(current.state === "uncertain" &&
+					current.operation === "session.close" &&
+					current.sourceProofRef !== undefined &&
+					isManagedEndpointReceipt(current.target, current.source))) &&
 			current.closeAcknowledgement === undefined &&
 			next.closeAcknowledgement !== undefined &&
 			Date.parse(next.closeAcknowledgement.observedAt) >= Date.parse(current.recordedAt) &&
@@ -954,6 +1072,11 @@ function assertEvidence(value: unknown): asserts value is ManagedLifecycleEviden
 			throw new Error("Managed bootstrap resume requires an exclusive matching historical source.");
 		validateHistoricalTarget(value.target, prepared, historicalSource);
 		canonicalJson(value.target);
+	} else if (value.operation === "session.close" && value.target.endpointIncarnation !== undefined) {
+		if (!isManagedEndpointReceipt(value.target))
+			throw new Error("Managed close target requires an exact endpoint receipt.");
+		const { endpointIncarnation: _endpointIncarnation, ...target } = value.target;
+		canonicalJson(target, true);
 	} else canonicalJson(value.target, true);
 	if (
 		value.sourceProofRef !== undefined &&
@@ -997,6 +1120,13 @@ function assertEvidence(value: unknown): asserts value is ManagedLifecycleEviden
 				throw new Error("Managed lifecycle acknowledgement changed the exact source generation.");
 		}
 	}
+	if (
+		value.endpointReceipt !== undefined &&
+		(!["session.create", "session.resume", "session.fork"].includes(String(value.operation)) ||
+			!isAuthority(acknowledged) ||
+			!isManagedEndpointReceipt(value.endpointReceipt, acknowledged))
+	)
+		throw new Error("Managed endpoint receipt does not match its original lifecycle acknowledgement.");
 	if (value.proven !== undefined && (!isAuthority(acknowledged) || !isProof(value.proven, acknowledged)))
 		throw new Error("Managed lifecycle proof does not match its acknowledged generation.");
 	const retiringSource = value.operation === "session.close" || value.operation === "session.delete";
@@ -1214,7 +1344,7 @@ function validateTarget(
 		"session.create": ["kind", "path", "cwd", "body", "modelPreset", "readiness", "readinessTimeoutMs"],
 		"session.resume": ["sessionId", "sessionIdOrPrefix", "path", "cwd", "body", "modelPreset", "readinessTimeoutMs"],
 		"session.fork": ["sourceSessionId", "cwd", "body", "modelPreset", "readinessTimeoutMs"],
-		"session.close": ["sessionId", "endpointGeneration"],
+		"session.close": ["sessionId", "endpointGeneration", "endpointIncarnation"],
 		"session.delete": ["sessionId", "cwd"],
 	};
 	if (Object.keys(target).some(key => !allowed[operation].includes(key)))

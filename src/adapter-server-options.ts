@@ -17,7 +17,11 @@ import { assertResolvedAdapterConfig, loadConfiguredProjects, resolveAdapterConf
 import { buildRuntimeHealthChecks, type RuntimeIsolationDiagnostic } from "./adapter-runtime-health";
 import { type AdapterConfig, loadAdapterConfig, type ResolvedAdapterConfig } from "./config";
 import { SESSION_AUTHORITY_MAPPING_FILE } from "./config-env";
-import { isManagedCatalogProvisional, managedLifecycleEvidenceHash } from "./gjc/managed-lifecycle-evidence";
+import {
+	isManagedCatalogProvisional,
+	isManagedEndpointReceipt,
+	managedLifecycleEvidenceHash,
+} from "./gjc/managed-lifecycle-evidence";
 import type { ManagedSdkRuntimeDependency, ManagedSdkTenantFence } from "./gjc/managed-sdk-dependency";
 import {
 	type ManagedSdkAccess,
@@ -43,7 +47,6 @@ import {
 	createManagedV3GenerationStore,
 	DEFAULT_MANAGED_IDLE_TIMEOUT_MS,
 	type ManagedIdleReaper,
-	managedIdleClosePayloadHash,
 } from "./live/gjc-managed-idle-reaper";
 import { createManagedModelReaderFactory } from "./live/gjc-managed-model-reader";
 import { createGjcRoutingLiveGatewayRunner } from "./live/gjc-routing-runner";
@@ -144,10 +147,34 @@ export async function buildResolvedAdapterServerOptions(
 	const managedSdkRuntimeHealth: ManagedSdkRuntimeHealth = {
 		phase: "starting",
 	};
+	const retirementLeaseFailures = new Set<unknown>();
 	let managedSdkRuntimeDisposePromise: Promise<void> | undefined;
 	const disposeManagedSdkRuntime = (): Promise<void> => {
-		if (managedSdkRuntimeDisposePromise === undefined)
-			managedSdkRuntimeDisposePromise = managedSdkRuntime?.dispose() ?? Promise.resolve();
+		if (managedSdkRuntimeDisposePromise === undefined) {
+			const completion = Promise.withResolvers<void>();
+			managedSdkRuntimeDisposePromise = completion.promise;
+			const stops: Promise<unknown>[] = [];
+			for (const stop of [() => managedIdleReaper?.stop(), () => managedSdkRuntime?.dispose()]) {
+				try {
+					stops.push(Promise.resolve(stop()));
+				} catch (error) {
+					stops.push(Promise.reject(error));
+				}
+			}
+			void Promise.allSettled(stops).then(results => {
+				const failures = [
+					...new Set([
+						...results.flatMap(result => (result.status === "rejected" ? [result.reason] : [])),
+						...retirementLeaseFailures,
+					]),
+				];
+				if (failures.length === 0) completion.resolve();
+				else
+					completion.reject(
+						failures.length === 1 ? failures[0] : new AggregateError(failures, "Adapter runtime disposal failed"),
+					);
+			});
+		}
 		return managedSdkRuntimeDisposePromise;
 	};
 	try {
@@ -325,19 +352,40 @@ export async function buildResolvedAdapterServerOptions(
 			>();
 			managedIdleReaper = createManagedIdleReaper({
 				runtime: {
-					closeLifecycleSession: async request => {
-						const authority = mappings.getScoped({
-							principalId: request.tenant.principalId,
-							chatId: request.tenant.chatId,
-						})?.managedAuthority;
-						if (authority === undefined) throw new Error("Managed retirement lost canonical source authority.");
-						const operation = {
-							operationId: request.requestKey,
-							requestKey: request.requestKey,
-							payloadHash: managedIdleClosePayloadHash(authority, request.requestKey),
-						};
+					createProducerScope: () => managedV3Runtime.runtime.createProducerScope(),
+					closeLifecycleSession: async (request, operation, onOutcome) => {
+						const canonical = mappings.operationScoped(request.tenant, operation.operationId);
+						const evidence = canonical?.lifecycle;
+						if (
+							typeof onOutcome !== "function" ||
+							canonical?.kind !== "close" ||
+							canonical.state !== "pending" ||
+							evidence?.state !== "closing" ||
+							evidence.operation !== "session.close" ||
+							evidence.sourceProofRef === undefined ||
+							evidence.closeAcknowledgement !== undefined ||
+							canonical.id !== operation.operationId ||
+							canonical.detail !== operation.payloadHash ||
+							evidence.payloadHash !== operation.payloadHash ||
+							evidence.requestKey !== operation.requestKey ||
+							request.requestKey !== operation.requestKey ||
+							!isDeepStrictEqual(evidence.actor, request.actor) ||
+							!isManagedEndpointReceipt(request.target, request.tenant) ||
+							!isDeepStrictEqual(evidence.target, request.target) ||
+							evidence.source === undefined ||
+							managedTenantIdentity(evidence.source) !== managedTenantIdentity(request.tenant)
+						)
+							throw new Error("Managed retirement does not match its original canonical projection.");
+						const source = mappings.operationScoped(request.tenant, evidence.sourceProofRef.operationId);
+						if (
+							source?.state !== "complete" ||
+							source.lifecycle === undefined ||
+							managedLifecycleEvidenceHash(source.lifecycle) !== evidence.sourceProofRef.evidenceHash ||
+							!isDeepStrictEqual(source.lifecycle.endpointReceipt, request.target)
+						)
+							throw new Error("Managed retirement lost its original source receipt.");
 						retirementOperations.set(managedTenantIdentity(request.tenant), operation);
-						return managedV3Runtime.runtime.retireLifecycleSession(request.tenant, request, operation);
+						return managedV3Runtime.runtime.retireLifecycleSession(request.tenant, request, operation, onOutcome);
 					},
 					reconcile: () => managedV3Runtime.runtime.reconcile(),
 					generationStatus: key => {
@@ -390,8 +438,28 @@ export async function buildResolvedAdapterServerOptions(
 						}
 						const identity = managedTenantIdentity(key);
 						retirementLeases.set(identity, lease);
+						let renewal: Promise<void> | undefined;
+						let renewalFailure: { error: unknown } | undefined;
+						let heartbeatStopped = false;
+						const heartbeat = setInterval(() => {
+							if (heartbeatStopped || renewal !== undefined || renewalFailure !== undefined) return;
+							renewal = lease
+								.renew(workspaceLeaseDurationMs)
+								.then(
+									() => undefined,
+									error => {
+										renewalFailure = { error };
+										retirementLeaseFailures.add(error);
+									},
+								)
+								.finally(() => {
+									renewal = undefined;
+								});
+						}, workspaceLeaseHeartbeatMs);
+						heartbeat.unref?.();
 						return {
 							assertFence: async () => {
+								if (renewalFailure !== undefined) throw renewalFailure.error;
 								if (
 									!(await assertRetirementOperationFence(
 										key,
@@ -405,9 +473,13 @@ export async function buildResolvedAdapterServerOptions(
 									throw new Error("Managed V3 tenant authority fence was lost.");
 							},
 							release: async () => {
+								heartbeatStopped = true;
+								clearInterval(heartbeat);
+								await renewal;
+								if (renewalFailure !== undefined) throw renewalFailure.error;
+								await lease.release();
 								retirementLeases.delete(identity);
 								retirementOperations.delete(identity);
-								await lease.release();
 							},
 						};
 					},
@@ -516,11 +588,6 @@ export async function buildResolvedAdapterServerOptions(
 		const shutdownCleanup = async (): Promise<void> => {
 			const failures: unknown[] = [];
 			try {
-				await managedIdleReaper?.stop();
-			} catch (error) {
-				failures.push(error);
-			}
-			try {
 				await disposeManagedSdkRuntime();
 			} catch (error) {
 				failures.push(error);
@@ -611,12 +678,8 @@ export async function buildResolvedAdapterServerOptions(
 	} catch (error) {
 		let startupError: unknown = error;
 		let cleanupFailed = false;
-		try {
-			await managedIdleReaper?.stop();
-		} catch (stopError) {
-			cleanupFailed = true;
-			startupError = new AggregateError([startupError, stopError], "Adapter initialization cleanup failed");
-		}
+		const disposing = disposeManagedSdkRuntime();
+		void disposing.catch(() => undefined);
 		try {
 			await routingRunner?.stop?.();
 		} catch (stopError) {
@@ -624,7 +687,7 @@ export async function buildResolvedAdapterServerOptions(
 			startupError = appendStartupCleanupError(startupError, stopError);
 		}
 		try {
-			await disposeManagedSdkRuntime();
+			await disposing;
 		} catch (disposeError) {
 			cleanupFailed = true;
 			startupError = appendStartupCleanupError(startupError, disposeError);
@@ -686,7 +749,7 @@ function createManagedReaderFactory(runtime: ManagedSdkRuntime, timeoutMs: numbe
 			throw new Error("Managed temporary model catalog access requires a workspace lease fence.");
 		throw new ManagedSdkOperationError(
 			"exact_close_authority_unavailable",
-			"SDK 0.16.4 cannot provide exact cleanup authority; temporary catalog creation is prohibited.",
+			"Durable original lifecycle incarnation receipts are not integrated with catalog cleanup; temporary catalog creation is prohibited.",
 		);
 	};
 }

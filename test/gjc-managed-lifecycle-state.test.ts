@@ -292,8 +292,18 @@ function completeLifecycleOperation(
 }
 
 function referencedCloseDocument(): SessionAuthorityV3Document {
+	const endpointReceipt = {
+		sessionId: acknowledged.sessionId,
+		endpointGeneration: acknowledged.generation,
+		endpointIncarnation: "a".repeat(64),
+	};
 	const active = transitionManagedLifecycleEvidence(
-		acknowledgedEvidence(),
+		transitionManagedLifecycleEvidence(
+			transitionManagedLifecycleEvidence(createEvidence(), "invoking", {}, time),
+			"acknowledged_unproven",
+			{ acknowledged, endpointReceipt },
+			later,
+		),
 		"active_generation_proven",
 		{ proven },
 		later,
@@ -308,7 +318,7 @@ function referencedCloseDocument(): SessionAuthorityV3Document {
 			source: closeSource,
 			sourceOperationId: prior.id,
 			sourceEvidence: active,
-			target: { sessionId: closeSource.sessionId, endpointGeneration: closeSource.generation },
+			target: { ...endpointReceipt },
 			payloadHash,
 		},
 		startedAt,
@@ -1367,6 +1377,44 @@ describe("canonical managed lifecycle evidence", () => {
 		expect(isSessionAuthorityV3Document(document)).toBe(true);
 		const parsed = parseSessionAuthorityV3Document(encodeSessionAuthorityV3Document(document));
 		expect(structuredClone(parsed)).toEqual(structuredClone(document));
+	});
+
+	test("original exact close acknowledgement can be appended once without restoring uncertainty", () => {
+		const document = referencedCloseDocument();
+		const closing = document.mappings[0]!.journal[1]!.lifecycle!;
+		const interrupted = transitionManagedLifecycleEvidence(closing, "uncertain", {}, "2026-09-06T14:00:03.000Z");
+		const observedAt = "2026-09-06T14:00:04.000Z";
+		const closeAcknowledgement = {
+			sessionId: closing.source!.sessionId,
+			generation: closing.source!.generation,
+			observedAt,
+		};
+		const observed = transitionManagedLifecycleEvidence(
+			interrupted,
+			"uncertain",
+			{ closeAcknowledgement },
+			observedAt,
+		);
+		expect(observed.state).toBe("uncertain");
+		expect(observed.sourceProofRef).toEqual(closing.sourceProofRef);
+		expect(observed.target).toEqual(closing.target);
+		expect(observed.closeAcknowledgement).toEqual(closeAcknowledgement);
+		expect(transitionManagedLifecycleEvidence(observed, "uncertain", { closeAcknowledgement }, observedAt)).toEqual(
+			observed,
+		);
+		expect(() =>
+			transitionManagedLifecycleEvidence(
+				observed,
+				"uncertain",
+				{ closeAcknowledgement: { ...closeAcknowledgement, observedAt: "2026-09-06T14:00:05.000Z" } },
+				"2026-09-06T14:00:05.000Z",
+			),
+		).toThrow();
+		expect(() => transitionManagedLifecycleEvidence(observed, "active_generation_proven")).toThrow();
+		const { sourceProofRef: _reference, ...unbound } = interrupted;
+		expect(() =>
+			transitionManagedLifecycleEvidence(unbound, "uncertain", { closeAcknowledgement }, observedAt),
+		).toThrow();
 	});
 
 	test("rejects missing, self, wrong-hash, uncompleted and future source proof references", () => {

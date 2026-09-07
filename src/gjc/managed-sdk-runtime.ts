@@ -615,7 +615,11 @@ export class ManagedSdkRuntime {
 		key: TenantSessionKey,
 		request: ManagedLifecycleCloseRequest,
 		operation: ManagedSdkLifecycleOperation,
+		onOutcome: (
+			outcome: Awaited<ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["close"]>>,
+		) => void | Promise<void>,
 	): ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["close"]> {
+		if (typeof onOutcome !== "function") throw new TypeError("Retirement requires its original outcome observer.");
 		const identity = lifecycleOperation(operation);
 		if (request.requestKey !== identity.requestKey)
 			throw new TypeError("Retirement request key does not match its durable operation.");
@@ -629,6 +633,8 @@ export class ManagedSdkRuntime {
 				return this.#lifecycle.close(value);
 			},
 			access,
+			undefined,
+			onOutcome,
 		);
 	}
 
@@ -644,7 +650,7 @@ export class ManagedSdkRuntime {
 		return Promise.reject(
 			new ManagedSdkOperationError(
 				"exact_delete_authority_unavailable",
-				"SDK 0.16.4 public delete has no exact generation/incarnation target; managed delete is prohibited.",
+				"SDK 0.16.6 public delete has no exact generation/incarnation target; managed delete is prohibited.",
 			),
 		);
 	}
@@ -1888,7 +1894,7 @@ function assertLifecycleCloseAuthority(tenant: TenantSessionKey, request: Manage
 			"invalid_close_authority",
 			"Managed close requires a target matching the registered session and exact positive endpointGeneration.",
 		);
-	// SDK 0.16.4 consumes this opaque pair, but its public binding/lifecycle results do not produce it.
+	// Only the original public lifecycle receipt can supply this opaque pair; Router generation proof cannot.
 	if (
 		typeof target.endpointIncarnation !== "string" ||
 		target.endpointIncarnation.length !== 64 ||
@@ -1896,7 +1902,7 @@ function assertLifecycleCloseAuthority(tenant: TenantSessionKey, request: Manage
 	)
 		throw new ManagedSdkOperationError(
 			"exact_close_authority_unavailable",
-			"Managed exact-generation close is unavailable: target.endpointIncarnation must be an opaque lowercase 64-hex value paired with endpointGeneration. SDK 0.16.4 public binding/lifecycle results do not supply it; session-ID-only and generation-only close are prohibited.",
+			"Managed exact-generation close is unavailable: target.endpointIncarnation must be an opaque lowercase 64-hex value paired with endpointGeneration from the original public lifecycle receipt. Missing persisted incarnation authority cannot be recovered from Router generation proof; session-ID-only and generation-only close are prohibited.",
 		);
 }
 

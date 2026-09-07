@@ -5,14 +5,15 @@ import { join } from "node:path";
 import { setImmediate } from "node:timers/promises";
 import { isDeepStrictEqual } from "node:util";
 import { lifecycle } from "@gajae-code/coding-agent/sdk";
+import { requireManagedEndpointReceipt } from "../src/gjc/managed-lifecycle-evidence";
 import { type ManagedSdkAttachment, ManagedSdkRuntime } from "../src/gjc/managed-sdk-runtime";
 import { routeGjcTurn } from "../src/gjc/session-turn-router";
 import { SessionV3FileBackedMappingStore } from "../src/gjc/session-v3-file-backed-mapping-store";
 import { createManagedGjcTurnRunner } from "../src/live/gjc-managed-turn-runner";
 import { apiKey, providerResponse, writeLocalProviderConfig } from "./gjc-release-compat-fixtures";
 
-// This probe owns a fresh workspace exclusively. Session-only cleanup below is
-// deliberately NOT evidence of production replacement-race-safe close.
+// This probe owns a fresh workspace exclusively. Cleanup uses its persisted
+// original public lifecycle receipt, not a refreshed session-only identity.
 const root = await mkdtemp(join(tmpdir(), "gjc-managed-route-compat-"));
 const workspace = join(root, "workspace");
 const agentDir = join(workspace, ".gjc", "agent");
@@ -105,7 +106,7 @@ const report: Record<string, unknown> = {
 	startedAt,
 	limitations: [
 		"Hermetic provider and exclusively owned probe workspace; no browser.",
-		"Session-only isolated cleanup does not prove production replacement-race-safe close; SDK issue #5345 remains open.",
+		"Persisted original receipt cleanup is isolated; full production reaper/catalog ownership and uncertain recovery require separate verification.",
 	],
 };
 const errors: unknown[] = [];
@@ -197,6 +198,10 @@ try {
 	report.replayedAfterStoreReopen = true;
 	report.replayedImmutableEvents = true;
 	report.lifecycleCreates = lifecycleCreates;
+	const originalEvidence = mappings.operationScoped(scope, "managed-compat-ingress")?.lifecycle;
+	if (originalEvidence === undefined) throw new Error("Reopened canonical source lost lifecycle evidence.");
+	requireManagedEndpointReceipt(originalEvidence);
+	report.originalEndpointReceiptReopened = true;
 } catch (error) {
 	errors.push(error);
 } finally {
@@ -242,18 +247,25 @@ if (errors.length > 0) throw new AggregateError(errors, "Managed routing compati
 
 async function cleanupIsolatedSession(authority: Parameters<ManagedSdkRuntime["generationStatus"]>[0] | undefined) {
 	if (authority === undefined) throw new Error("Probe has no exact known session identity for cleanup.");
+	const evidence =
+		mappings.operationScoped(scope, "managed-compat-ingress")?.lifecycle ??
+		mappings.provisionalOperationScoped(scope, "managed-compat-ingress")?.lifecycle;
+	if (evidence === undefined) throw new Error("Probe cleanup lost original durable lifecycle evidence.");
+	const endpointReceipt = requireManagedEndpointReceipt(evidence);
+	if (endpointReceipt.sessionId !== authority.sessionId || endpointReceipt.endpointGeneration !== authority.generation)
+		throw new Error("Persisted endpoint receipt conflicts with the cleanup owner.");
 	const acknowledgement = await service.close({
 		actor: { id: scope.principalId, namespace: "managed-compat" },
 		capability: "session.close",
 		requestKey: "isolated-cleanup",
-		target: { sessionId: authority.sessionId },
+		target: { ...endpointReceipt },
 	});
 	if (!acknowledgement.ok || acknowledgement.result.sessionId !== authority.sessionId)
 		throw new Error("Isolated public cleanup failed or acknowledged a different session.");
 	await runtime.reconcile();
 	const retirement = await runtime.generationStatus(authority);
 	if (retirement.status !== "retired") throw new Error("Isolated cleanup retirement is unproven.");
-	return { acknowledgement, retirement };
+	return { acknowledgement, retirement, originalEndpointReceiptUsed: true };
 }
 
 function errorRecord(error: unknown): Record<string, unknown> {

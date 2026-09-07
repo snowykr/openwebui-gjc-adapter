@@ -218,11 +218,11 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime, turnTimeo
 							beforeDispatch();
 							return owner.onInvoking();
 						},
-						onAcknowledged: async acknowledged => {
+						onAcknowledged: async (acknowledged, endpointReceipt) => {
 							if (creating && acknowledged.sessionId === authority.sessionId)
 								throw new Error("Managed session.new returned the source session.");
 							if (!creating) assertResumedExactAuthority({ tenant: acknowledged }, owner.source);
-							await owner.onAcknowledged(acknowledged);
+							await owner.onAcknowledged(acknowledged, endpointReceipt);
 						},
 						beforeProof: async () => {
 							beforeDispatch();

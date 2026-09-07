@@ -26,6 +26,12 @@ type ResumeRequest =
 	| { kind: "external"; request: Parameters<lifecycle.AgentDirSessionLifecycleService["resumeExternal"]>[0] }
 	| { kind: "exact"; request: Parameters<lifecycle.AgentDirSessionLifecycleService["resume"]>[0] };
 
+type PublicLifecycleIdentity = {
+	readonly sessionId: string;
+	readonly generation: number;
+	readonly incarnation: string;
+};
+
 // A separate adapter/client process, not a simulated SDK response or broker restart.
 if (process.argv[2] === "--replay") {
 	const agentDir = process.argv[3];
@@ -59,11 +65,11 @@ async function probe(): Promise<void> {
 		startedAt: new Date().toISOString(),
 		limitations: [
 			"Exclusive hermetic workspace; no production bootstrap admission or migration journal proof.",
-			"Session-ID-only cleanup is allowed only in this exclusively owned probe; not replacement-safe close proof (#5345).",
+			"Cleanup consumes original public lifecycle generation/incarnation pairs; adapter durable close-receipt integration remains separate.",
 			"A new client process is not a broker/storage crash. Cached outcomes here cannot establish every interrupted invocation window.",
 		],
 	};
-	let identity: { sessionId: string; generation: number } | undefined;
+	let identity: PublicLifecycleIdentity | undefined;
 	let live = false;
 	const observe = async (name: string, action: () => Promise<unknown>): Promise<unknown> => {
 		budget.remaining();
@@ -79,7 +85,11 @@ async function probe(): Promise<void> {
 				actor,
 				capability: "session.close",
 				requestKey,
-				target: { sessionId: identity!.sessionId },
+				target: {
+					sessionId: identity!.sessionId,
+					endpointGeneration: identity!.generation,
+					endpointIncarnation: identity!.incarnation,
+				},
 				timeoutMs: budget.remaining(),
 			}),
 		);
@@ -250,8 +260,7 @@ async function probe(): Promise<void> {
 				throw new Error("Cached replay reactivated a retired generation.");
 			report.retiredReplayDoesNotReinvokeSession = true;
 			if (process.argv.includes("--replacement")) {
-				// This mode reproduces an upstream contract gap. Passing this probe is
-				// evidence of the unsafe behavior, never a production recovery gate.
+				// Verify the released snapshot/replay fence without treating it as full crash recovery.
 				if (request.kind !== "exact") throw new Error("Replacement probe requires --exact.");
 				const replacement: ResumeRequest = {
 					kind: "exact",
@@ -270,8 +279,25 @@ async function probe(): Promise<void> {
 				const newOutcome = await observe("resume.mismatching-public-snapshot", () =>
 					invokeResume(publicLifecycle(workspace), replacement),
 				);
-				const nextIdentity = exactIdentity(externalOutcome(newOutcome), "session.resume", identity.sessionId);
-				report.suppliedSnapshotHashEnforced = false;
+				const denied = externalOutcome(newOutcome);
+				if (
+					!isRecord(denied) ||
+					denied.ok !== false ||
+					!isRecord(denied.error) ||
+					denied.error.code !== "invalid_input"
+				)
+					throw new Error("Mismatched saved snapshot was not rejected before resume.");
+				report.suppliedSnapshotHashEnforced = true;
+				const originalIdentity = identity;
+				const independent = await observe("resume.independent-replacement", () =>
+					invokeResume(publicLifecycle(workspace), {
+						kind: "exact",
+						request: { ...request.request, requestKey: "valid-independent-replacement" },
+					}),
+				);
+				const nextIdentity = exactIdentity(externalOutcome(independent), "session.resume", identity.sessionId);
+				if (nextIdentity.incarnation === originalIdentity.incarnation)
+					throw new Error("Independent replacement reused the original incarnation.");
 				report.numericGenerationReused = nextIdentity.generation === identity.generation;
 				identity = nextIdentity;
 				live = true;
@@ -279,10 +305,41 @@ async function probe(): Promise<void> {
 				const oldKey = await observe("resume.old-key-after-independent-replacement", () =>
 					replayInChild(agentDir, request, budget),
 				);
-				exactIdentity(externalOutcome(oldKey), "session.resume", identity.sessionId);
-				report.oldKeyNowAcknowledgesReplacement = true;
+				const stale = externalOutcome(oldKey);
+				if (
+					!isRecord(stale) ||
+					stale.ok !== false ||
+					!isRecord(stale.error) ||
+					stale.error.code !== "endpoint_stale"
+				)
+					throw new Error("Original request key acknowledged a replacement incarnation.");
+				report.oldKeyNowAcknowledgesReplacement = false;
+				const staleClose = await observe("close.original-incarnation-after-replacement", () =>
+					publicLifecycle(workspace).close({
+						actor,
+						capability: "session.close",
+						requestKey: "stale-original-close",
+						target: {
+							sessionId: originalIdentity.sessionId,
+							endpointGeneration: originalIdentity.generation,
+							endpointIncarnation: originalIdentity.incarnation,
+						},
+						timeoutMs: budget.remaining(),
+					}),
+				);
+				if (
+					!isRecord(staleClose) ||
+					staleClose.ok !== false ||
+					!isRecord(staleClose.error) ||
+					staleClose.error.code !== "endpoint_stale"
+				)
+					throw new Error("Stale close did not reject the original incarnation.");
+				const replacementClient = await budget.wait(connectFor(workspace, identity.sessionId, identity.generation));
+				if (!replacementClient.attachment.isCurrent()) throw new Error("Stale close affected the replacement.");
+				report.staleClosePreservesReplacement = true;
 				report.originalIncarnationRecoveryProven = false;
-				report.verdict = "blocked: snapshot precondition and original-incarnation replay are not enforced";
+				report.verdict =
+					"passed: snapshot, replay and stale-close fences; full uncertain recovery remains unproven";
 				await close("close-independent-replacement");
 			}
 		}
@@ -327,7 +384,7 @@ async function bootstrapProbe(
 	principalId: string,
 	budget: ManagedOperationDeadline,
 	observations: { name: string; value: unknown }[],
-	acknowledge: (identity: { sessionId: string; generation: number }) => void,
+	acknowledge: (identity: PublicLifecycleIdentity) => void,
 ): Promise<void> {
 	const stateRoot = join(root, "adapter-state");
 	await mkdir(stateRoot, { recursive: true });
@@ -420,6 +477,7 @@ async function bootstrapProbe(
 	let runtime: ManagedSdkRuntime | undefined;
 	let initialGraph: SessionAuthorityV3Document | undefined;
 	let attempt: AdapterManagedBootstrapAttempt | undefined;
+	let originalEndpoint: PublicLifecycleIdentity | undefined;
 	try {
 		projectStore = new SqliteProjectRegistrationStore(join(stateRoot, "projects.sqlite"));
 		const registry = new UserWorkspaceRegistry({ stateRoot });
@@ -477,8 +535,10 @@ async function bootstrapProbe(
 									outcome.ok &&
 									outcome.result.sessionId === sessionId &&
 									Number.isSafeInteger(outcome.result.endpointGeneration)
-								)
-									acknowledge({ sessionId, generation: outcome.result.endpointGeneration! });
+								) {
+									originalEndpoint = exactIdentity(outcome, "session.resume", sessionId);
+									acknowledge(originalEndpoint);
+								}
 								return outcome;
 							};
 							return service;
@@ -503,6 +563,12 @@ async function bootstrapProbe(
 				record.journal[0].result.managedAuthority !== undefined ||
 				record.journal[0].result.historicalBinding === undefined ||
 				record.journal.at(-1)?.lifecycle?.state !== "active_generation_proven" ||
+				originalEndpoint === undefined ||
+				!isDeepStrictEqual(record.journal.at(-1)?.lifecycle?.endpointReceipt, {
+					sessionId: originalEndpoint.sessionId,
+					endpointGeneration: originalEndpoint.generation,
+					endpointIncarnation: originalEndpoint.incarnation,
+				}) ||
 				record.managedAuthority.canonicalWorkspace !== workspace ||
 				projectStore.getProject("probe-project")?.cwd !== sourceRoot ||
 				!admissionReleased ||
@@ -519,6 +585,7 @@ async function bootstrapProbe(
 					unscopedOwnerResolved: unscoped,
 					postStageAdmissionReleased: admissionReleased,
 					registeredWorkspaceAdmission: true,
+					originalEndpointReceiptPreserved: true,
 					sourceProjectUnchanged: projectStore.getProject("probe-project")?.cwd === sourceRoot,
 					bootstrapRuntimeStopped: true,
 					migrationOperationCount: record.journal.length - 1,
@@ -556,11 +623,7 @@ async function replayInChild(
 	}
 }
 
-function exactIdentity(
-	value: unknown,
-	operation: string,
-	expectedSessionId?: string,
-): { sessionId: string; generation: number } {
+function exactIdentity(value: unknown, operation: string, expectedSessionId?: string): PublicLifecycleIdentity {
 	if (
 		!isRecord(value) ||
 		value.ok !== true ||
@@ -569,10 +632,16 @@ function exactIdentity(
 		typeof value.result.sessionId !== "string" ||
 		!Number.isSafeInteger(value.result.endpointGeneration) ||
 		(value.result.endpointGeneration as number) <= 0 ||
+		typeof value.result.endpointIncarnation !== "string" ||
+		!/^[0-9a-f]{64}$/.test(value.result.endpointIncarnation) ||
 		(expectedSessionId !== undefined && value.result.sessionId !== expectedSessionId)
 	)
-		throw new Error(`${operation} did not acknowledge the exact identity and positive generation.`);
-	return { sessionId: value.result.sessionId, generation: value.result.endpointGeneration as number };
+		throw new Error(`${operation} did not acknowledge the exact identity, positive generation and incarnation.`);
+	return {
+		sessionId: value.result.sessionId,
+		generation: value.result.endpointGeneration as number,
+		incarnation: value.result.endpointIncarnation,
+	};
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

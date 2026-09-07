@@ -1,7 +1,10 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import type { ManagedSdkAttachment, ManagedSdkRuntime, TenantSessionKey } from "../src/gjc/managed-sdk-runtime";
-import type { ManagedTurnAuthority } from "../src/gjc/turn-runner";
+import type { ManagedEndpointReceipt, ManagedTurnAuthority } from "../src/gjc/turn-runner";
+import type { LiveGatewayRunnerInput } from "../src/live/chat-completions";
 import { createManagedSessionOperations, ManagedTurnUncertainError } from "../src/live/gjc-managed-session-operations";
+import { createManagedGjcTurnRunner } from "../src/live/gjc-managed-turn-runner";
+import { controlOperationHash, lifecycleControlRequestKey } from "../src/live/gjc-routing-publication";
 
 const authority: ManagedTurnAuthority = {
 	principalId: "principal-1",
@@ -44,6 +47,118 @@ describe("managed session operations", () => {
 			release.resolve();
 			await new Promise(resolve => setTimeout(resolve, 0));
 			expect(fake.acquireTimeouts).toEqual([]);
+			expect(fake.requests).toEqual([]);
+		},
+	);
+
+	test.each(["create", "startManagedSession"] as const)(
+		"runner %s forwards the original endpoint receipt before its proof hook",
+		async method => {
+			const fake = new FakeRuntime();
+			const endpointReceipt = { ...lifecycleSuccess().result, endpointIncarnation: "a".repeat(64) };
+			fake.lifecycleOutcome = { ok: true, operation: "session.create", result: endpointReceipt };
+			const runner = createManagedGjcTurnRunner(fake.runtime);
+			const failure = new Error("proof admission denied");
+			const captured: (ManagedEndpointReceipt | undefined)[] = [];
+			const input = {
+				cwd: authority.canonicalWorkspace,
+				sessionRoot: "/sessions",
+				projectId: authority.projectId,
+				chatId: authority.chatId,
+				userMessageId: "message-create",
+				text: "prompt",
+				preparedManagedAuthority: withoutIdentity(),
+				onLifecycleAcknowledged: (acknowledged: ManagedTurnAuthority, receipt?: ManagedEndpointReceipt) => {
+					expect(acknowledged).toMatchObject(authority);
+					captured.push(receipt);
+				},
+				beforeLifecycleProof: () => {
+					expect(captured).toEqual([endpointReceipt]);
+					throw failure;
+				},
+			};
+			await expect(
+				method === "create"
+					? runner.create(input)
+					: runner.startManagedSession(
+							input,
+							async () => undefined,
+							async () => undefined,
+						),
+			).rejects.toBe(failure);
+			expect(captured[0]).not.toBe(endpointReceipt);
+			expect(fake.registered).toEqual([]);
+			expect(fake.requests).toEqual([]);
+		},
+	);
+
+	test.each(["session.new", "session.resume"] as const)(
+		"runner runControl forwards %s endpoint receipts to its durable owner before proof",
+		async operation => {
+			const fake = new FakeRuntime();
+			const input: LiveGatewayRunnerInput = {
+				project: {
+					id: authority.projectId,
+					name: "Project",
+					cwd: authority.canonicalWorkspace,
+					allowedRoot: "/workspace",
+					createdAt: new Date("2026-07-08T00:00:00.000Z"),
+				},
+				prompt: "control",
+				chatId: authority.chatId,
+				messageId: "message-control",
+				userMessageId: "message-control",
+				userMessageParentId: null,
+				continued: true,
+				ownerUserId: authority.principalId,
+				control: operation === "session.new" ? { operation } : { operation, sessionId: authority.sessionId },
+			};
+			const lifecycleOperation = operation === "session.new" ? "session.create" : "session.resume";
+			const payloadHash = controlOperationHash(input);
+			const requestKey = lifecycleControlRequestKey(authority, lifecycleOperation, input.userMessageId, payloadHash);
+			const endpointReceipt = {
+				sessionId: operation === "session.new" ? "session-successor" : authority.sessionId,
+				endpointGeneration: authority.generation,
+				endpointIncarnation: "a".repeat(64),
+			};
+			fake.lifecycleOutcome = { ok: true, operation: lifecycleOperation, result: endpointReceipt };
+			const failure = new Error("proof admission denied");
+			const captured: (ManagedEndpointReceipt | undefined)[] = [];
+			await expect(
+				createManagedGjcTurnRunner(fake.runtime).runControl!(
+					input,
+					{
+						principalId: authority.principalId,
+						projectId: authority.projectId,
+						chatId: authority.chatId,
+						sessionId: authority.sessionId,
+						rawFrameCursor: 0,
+						eventCursor: 0,
+						operationId: input.userMessageId,
+						managedAuthority: authority,
+					},
+					{} as never,
+					undefined,
+					undefined,
+					{
+						operation: lifecycleOperation,
+						source: { ...authority, requestKey },
+						preparedAuthority: { ...withoutIdentity(), requestKey },
+						lifecycleOperation: { operationId: input.userMessageId, requestKey, payloadHash },
+						onInvoking: () => undefined,
+						onAcknowledged: (acknowledged, receipt) => {
+							expect(acknowledged.sessionId).toBe(endpointReceipt.sessionId);
+							captured.push(receipt);
+						},
+						beforeProof: () => {
+							expect(captured).toEqual([endpointReceipt]);
+							throw failure;
+						},
+					},
+				),
+			).rejects.toBe(failure);
+			expect(captured[0]).not.toBe(endpointReceipt);
+			expect(fake.registered).toEqual([]);
 			expect(fake.requests).toEqual([]);
 		},
 	);
@@ -159,21 +274,221 @@ describe("managed session operations", () => {
 		expect(fake.externalTimeouts[0]).toBeLessThanOrEqual(500);
 	});
 
-	test("retains failed durable acknowledgement without registration or cleanup effects", async () => {
-		const fake = new FakeRuntime();
-		const failure = new Error("ack fsync failed");
-		await expect(
-			createManagedSessionOperations(fake.runtime).create({
-				authority: withoutIdentity(),
-				target: { path: authority.canonicalWorkspace },
-				onAcknowledged: () => {
-					throw failure;
-				},
-			}),
-		).rejects.toBe(failure);
-		expect(fake.registered).toHaveLength(0);
-		expect(fake.lifecycle).toHaveLength(0);
-	});
+	test.each(["create", "resume", "fork"] as const)(
+		"%s acknowledges a detached original endpoint receipt before proof without changing routing authority",
+		async operation => {
+			const fake = new FakeRuntime();
+			const expected = {
+				sessionId: authority.sessionId,
+				endpointGeneration: authority.generation,
+				endpointIncarnation: "a".repeat(64),
+			};
+			const rawResult = { ...expected, privateMetadata: { source: "sdk" } };
+			fake.lifecycleOutcome = { ok: true, operation: `session.${operation}`, result: rawResult };
+			const operations = createManagedSessionOperations(fake.runtime);
+			const receipts: ManagedEndpointReceipt[] = [];
+			for (let invocation = 0; invocation < 2; invocation++) {
+				const result = await operations[operation]({
+					authority: operation === "create" ? withoutIdentity() : authority,
+					target: {
+						path: authority.canonicalWorkspace,
+						sessionIdOrPrefix: authority.sessionId,
+						sourceSessionId: authority.sessionId,
+						cwd: authority.canonicalWorkspace,
+					},
+					onAcknowledged: (acknowledged, endpointReceipt) => {
+						expect(acknowledged).toMatchObject(authority);
+						expect(acknowledged).not.toHaveProperty("endpointReceipt");
+						expect(acknowledged).not.toHaveProperty("endpointIncarnation");
+						expect(endpointReceipt).toEqual(expected);
+						expect(endpointReceipt).not.toBe(rawResult);
+						expect(fake.registered).toHaveLength(invocation);
+						if (endpointReceipt === undefined) throw new Error("Original endpoint receipt is required.");
+						receipts.push(endpointReceipt);
+						if (invocation === 0) {
+							Reflect.set(endpointReceipt, "sessionId", "caller-session");
+							Reflect.set(endpointReceipt, "endpointGeneration", 99);
+							Reflect.set(endpointReceipt, "endpointIncarnation", "caller-incarnation");
+						}
+					},
+					beforeProof: () => {
+						expect(receipts).toHaveLength(invocation + 1);
+						expect(rawResult).toEqual({ ...expected, privateMetadata: { source: "sdk" } });
+					},
+				});
+				expect(result.tenant).toMatchObject(authority);
+				expect(result.tenant).not.toHaveProperty("endpointIncarnation");
+				expect(result).not.toHaveProperty("endpointReceipt");
+			}
+			expect(receipts[0]).not.toBe(receipts[1]);
+			expect(receipts[1]).toEqual(expected);
+		},
+	);
+
+	test.each(["create", "resume", "fork"] as const)(
+		"%s retains generation acknowledgement but denies proof when the original endpoint receipt is unavailable",
+		async operation => {
+			for (const fields of [
+				{},
+				{ endpointIncarnation: "" },
+				{ endpointIncarnation: " " },
+				{ endpointIncarnation: null },
+				{ endpointIncarnation: 7 },
+				{ endpointIncarnation: "not-a-hash" },
+				{ endpointIncarnation: "a".repeat(64), operation: undefined },
+				{ endpointIncarnation: "a".repeat(64), operation: "session.close" },
+			]) {
+				const fake = new FakeRuntime();
+				const { operation: override, ...resultFields } = fields as Record<string, unknown>;
+				fake.lifecycleOutcome = {
+					ok: true,
+					operation: "operation" in fields ? override : `session.${operation}`,
+					result: { sessionId: authority.sessionId, endpointGeneration: authority.generation, ...resultFields },
+				};
+				const acknowledgements: ManagedTurnAuthority[] = [];
+				let persistenceCompleted = false;
+				let proved = false;
+				const error = await createManagedSessionOperations(fake.runtime)
+					[operation]({
+						authority: operation === "create" ? withoutIdentity() : authority,
+						lifecycleOperation: {
+							operationId: "lifecycle-operation",
+							requestKey: authority.requestKey,
+							payloadHash: "a".repeat(64),
+						},
+						target: {
+							path: authority.canonicalWorkspace,
+							sessionIdOrPrefix: authority.sessionId,
+							sourceSessionId: authority.sessionId,
+							cwd: authority.canonicalWorkspace,
+						},
+						onAcknowledged: async (acknowledged, endpointReceipt) => {
+							acknowledgements.push(acknowledged);
+							expect(endpointReceipt).toBeUndefined();
+							await Promise.resolve();
+							persistenceCompleted = true;
+						},
+						beforeProof: () => {
+							proved = true;
+						},
+					})
+					.catch(error => error);
+				expect(error).toBeInstanceOf(ManagedTurnUncertainError);
+				expect(error.message).toContain("original endpoint receipt");
+				expect(persistenceCompleted).toBe(true);
+				expect(acknowledgements).toHaveLength(1);
+				expect(acknowledgements[0]).toMatchObject(authority);
+				expect(proved).toBe(false);
+				expect(fake.registered).toEqual([]);
+				expect(fake.observedOutcomeCount).toBe(1);
+				expect(fake.acquireTimeouts).toEqual([]);
+				expect(fake.lifecycle.filter(call => call.operation === "close")).toEqual([]);
+			}
+		},
+	);
+
+	test.each(["create", "resume", "fork"] as const)(
+		"%s cannot repair missing original receipt authority from its acknowledgement callback",
+		async operation => {
+			const fake = new FakeRuntime();
+			const controller = new AbortController();
+			const rawResult: Record<string, unknown> = {
+				sessionId: authority.sessionId,
+				endpointGeneration: authority.generation,
+			};
+			fake.lifecycleOutcome = { ok: true, operation: `session.${operation}`, result: rawResult };
+			const acknowledgements: ManagedTurnAuthority[] = [];
+			let proved = false;
+			await expect(
+				createManagedSessionOperations(fake.runtime)[operation]({
+					authority: operation === "create" ? withoutIdentity() : authority,
+					signal: controller.signal,
+					target: {
+						path: authority.canonicalWorkspace,
+						sessionIdOrPrefix: authority.sessionId,
+						sourceSessionId: authority.sessionId,
+						cwd: authority.canonicalWorkspace,
+					},
+					onAcknowledged: (acknowledged, endpointReceipt) => {
+						acknowledgements.push(acknowledged);
+						expect(endpointReceipt).toBeUndefined();
+						rawResult.endpointIncarnation = "a".repeat(64);
+						controller.abort();
+					},
+					beforeProof: () => {
+						proved = true;
+					},
+				}),
+			).rejects.toBeInstanceOf(ManagedTurnUncertainError);
+			expect(acknowledgements).toHaveLength(1);
+			expect(acknowledgements[0]).toMatchObject(authority);
+			expect(rawResult.endpointIncarnation).toBe("a".repeat(64));
+			expect(proved).toBe(false);
+			expect(fake.registered).toEqual([]);
+			expect(fake.acquireTimeouts).toEqual([]);
+			expect(fake.lifecycle.filter(call => call.operation === "close")).toEqual([]);
+		},
+	);
+
+	test.each(["create", "resume", "fork"] as const)(
+		"%s never acknowledges an endpoint pair from a failed original outcome",
+		async operation => {
+			const fake = new FakeRuntime();
+			fake.lifecycleOutcome = {
+				ok: false,
+				operation: `session.${operation}`,
+				result: { ...lifecycleSuccess().result, endpointIncarnation: "a".repeat(64) },
+			};
+			let acknowledged = false;
+			await expect(
+				createManagedSessionOperations(fake.runtime)[operation]({
+					authority: operation === "create" ? withoutIdentity() : authority,
+					target: {
+						path: authority.canonicalWorkspace,
+						sessionIdOrPrefix: authority.sessionId,
+						sourceSessionId: authority.sessionId,
+						cwd: authority.canonicalWorkspace,
+					},
+					onAcknowledged: () => {
+						acknowledged = true;
+					},
+				}),
+			).rejects.toThrow();
+			expect(acknowledged).toBe(false);
+			expect(fake.registered).toEqual([]);
+		},
+	);
+
+	test.each([false, true])(
+		"retains failed durable acknowledgement with receipt=%s without proof or cleanup",
+		async hasReceipt => {
+			const fake = new FakeRuntime();
+			const failure = new Error("ack fsync failed");
+			const endpointReceipt = { ...lifecycleSuccess().result, endpointIncarnation: "a".repeat(64) };
+			fake.lifecycleOutcome = {
+				ok: true,
+				operation: "session.create",
+				result: hasReceipt
+					? endpointReceipt
+					: { sessionId: authority.sessionId, endpointGeneration: authority.generation },
+			};
+			await expect(
+				createManagedSessionOperations(fake.runtime).create({
+					authority: withoutIdentity(),
+					target: { path: authority.canonicalWorkspace },
+					onAcknowledged: (acknowledged, receipt) => {
+						expect(acknowledged).toMatchObject(authority);
+						expect(receipt).toEqual(hasReceipt ? endpointReceipt : undefined);
+						expect(receipt).not.toBe(endpointReceipt);
+						throw failure;
+					},
+				}),
+			).rejects.toBe(failure);
+			expect(fake.registered).toHaveLength(0);
+			expect(fake.observedOutcomeCount).toBe(0);
+			expect(fake.lifecycle).toHaveLength(0);
+		},
+	);
 
 	test.each([25, 180_000])(
 		"external create and resume keep a %ims logical deadline out of readiness",
@@ -194,20 +509,45 @@ describe("managed session operations", () => {
 		},
 	);
 
-	test("times out lifecycle invocation and never registers a late result", async () => {
-		const fake = new FakeRuntime();
-		const gate = deferred<ReturnType<typeof lifecycleSuccess>>();
-		fake.createPreparedExternalLifecycleSession = async () => gate.promise;
-		await expect(
-			createManagedSessionOperations(fake.runtime, 25).create({
-				authority: withoutIdentity(),
-				target: { path: authority.canonicalWorkspace },
-			}),
-		).rejects.toMatchObject({ code: "timeout" });
-		gate.resolve(lifecycleSuccess());
-		await new Promise(resolve => setTimeout(resolve, 0));
-		expect(fake.registered).toHaveLength(0);
-	});
+	test.each(["create", "resume", "fork"] as const)(
+		"%s acknowledges the original late endpoint receipt after timeout and abort without proof or registration",
+		async operation => {
+			const fake = new FakeRuntime();
+			const gate = deferred<Record<string, unknown>>();
+			const acknowledged = deferred<ManagedEndpointReceipt | undefined>();
+			const controller = new AbortController();
+			const endpointReceipt = { ...lifecycleSuccess().result, endpointIncarnation: "b".repeat(64) };
+			fake.lifecycleOutcome = gate.promise;
+			let proved = false;
+			await expect(
+				createManagedSessionOperations(fake.runtime, 25)[operation]({
+					authority: operation === "create" ? withoutIdentity() : authority,
+					signal: controller.signal,
+					target: {
+						path: authority.canonicalWorkspace,
+						sessionIdOrPrefix: authority.sessionId,
+						sourceSessionId: authority.sessionId,
+						cwd: authority.canonicalWorkspace,
+					},
+					onAcknowledged: (assigned, receipt) => {
+						expect(assigned).toMatchObject(authority);
+						acknowledged.resolve(receipt);
+					},
+					beforeProof: () => {
+						proved = true;
+					},
+				}),
+			).rejects.toMatchObject({ code: "timeout" });
+			controller.abort();
+			gate.resolve({ ok: true, operation: `session.${operation}`, result: endpointReceipt });
+			expect(await acknowledged.promise).toEqual(endpointReceipt);
+			expect(await acknowledged.promise).not.toBe(endpointReceipt);
+			await new Promise(resolve => setTimeout(resolve, 0));
+			expect(proved).toBe(false);
+			expect(fake.registered).toHaveLength(0);
+			expect(fake.lifecycle.filter(call => call.operation === "close")).toEqual([]);
+		},
+	);
 
 	test("requires retired exact generation for close or delete and fences unproven retirement", async () => {
 		const fake = new FakeRuntime();
@@ -448,11 +788,13 @@ class FakeRuntime {
 	readonly externalLifecycle: { operation: string; request: Record<string, unknown> }[] = [];
 	readonly externalTimeouts: (number | undefined)[] = [];
 	readonly lifecycle: { operation: string; request: Record<string, unknown> }[] = [];
+	observedOutcomeCount = 0;
 	readonly requests: Record<string, unknown>[] = [];
 	readonly registered: unknown[] = [];
 	readonly subscriptions: ((frame: unknown) => Promise<void>)[] = [];
 	status: "retired" | "current" | "unknown" = "current";
-	retirementOutcome: Record<string, unknown> = lifecycleSuccess();
+	retirementOutcome: Record<string, unknown> = { ok: true, result: { sessionId: authority.sessionId } };
+	lifecycleOutcome: Record<string, unknown> | Promise<Record<string, unknown>> | undefined;
 	rejectTenant = false;
 	repeatCursor = false;
 	queryHandler: ((frame: Record<string, unknown>, page: number) => Promise<Record<string, unknown>>) | undefined;
@@ -508,8 +850,9 @@ class FakeRuntime {
 	) {
 		this.externalTimeouts.push(timeoutMs);
 		this.externalLifecycle.push({ operation: "create", request });
-		const outcome = lifecycleSuccess();
+		const outcome = await (this.lifecycleOutcome ?? lifecycleSuccess());
 		await onOutcome?.(outcome);
+		this.observedOutcomeCount++;
 		return outcome;
 	}
 	async resumeExternalLifecycleSession(
@@ -520,8 +863,9 @@ class FakeRuntime {
 	) {
 		this.externalTimeouts.push(timeoutMs);
 		this.externalLifecycle.push({ operation: "resume", request });
-		const outcome = { kind: "result", outcome: lifecycleSuccess() };
+		const outcome = { kind: "result", outcome: await (this.lifecycleOutcome ?? lifecycleSuccess("session.resume")) };
 		await onOutcome?.(outcome);
+		this.observedOutcomeCount++;
 		return outcome;
 	}
 	async request(
@@ -631,8 +975,9 @@ class FakeRuntime {
 		onOutcome?: (outcome: unknown) => void | Promise<void>,
 	) {
 		this.lifecycle.push({ operation: "fork", request });
-		const outcome = lifecycleSuccess();
+		const outcome = await (this.lifecycleOutcome ?? lifecycleSuccess("session.fork"));
 		await onOutcome?.(outcome);
+		this.observedOutcomeCount++;
 		return outcome;
 	}
 	async closeLifecycleSession(_tenant: unknown, request: Record<string, unknown>) {
@@ -649,8 +994,16 @@ class FakeRuntime {
 	}
 }
 
-function lifecycleSuccess() {
-	return { ok: true as const, result: { sessionId: authority.sessionId, endpointGeneration: authority.generation } };
+function lifecycleSuccess(operation = "session.create") {
+	return {
+		ok: true as const,
+		operation,
+		result: {
+			sessionId: authority.sessionId,
+			endpointGeneration: authority.generation,
+			endpointIncarnation: "a".repeat(64),
+		},
+	};
 }
 function queryResponse(items: readonly unknown[], continuationCursor?: string) {
 	return {

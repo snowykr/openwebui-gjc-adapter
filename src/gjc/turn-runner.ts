@@ -25,6 +25,13 @@ export interface ManagedTurnAuthority {
 	readonly requestKey: string;
 }
 
+/** Original public lifecycle endpoint identity; not Router routing authority. */
+export interface ManagedEndpointReceipt {
+	readonly sessionId: string;
+	readonly endpointGeneration: number;
+	readonly endpointIncarnation: string;
+}
+
 /**
  * Credential-free authority admitted before managed session creation. Session
  * identity and generation are assigned only by the managed lifecycle service.
@@ -74,7 +81,7 @@ export interface ManagedLifecycleControlOwner {
 		readonly payloadHash: string;
 	};
 	onInvoking(): void | Promise<void>;
-	onAcknowledged(authority: ManagedTurnAuthority): void | Promise<void>;
+	onAcknowledged(authority: ManagedTurnAuthority, endpointReceipt?: ManagedEndpointReceipt): void | Promise<void>;
 	beforeProof?(): void | Promise<void>;
 }
 export interface ManagedCloseInput {
@@ -103,7 +110,10 @@ export interface GjcStartNewSessionInput {
 	readonly principalId?: string;
 	readonly preparedManagedAuthority?: ManagedPreparedTurnAuthority;
 	/** Persists assigned lifecycle identity before attachment proof or prompt effects. */
-	readonly onLifecycleAcknowledged?: (authority: ManagedTurnAuthority) => void | Promise<void>;
+	readonly onLifecycleAcknowledged?: (
+		authority: ManagedTurnAuthority,
+		endpointReceipt?: ManagedEndpointReceipt,
+	) => void | Promise<void>;
 	readonly onLifecycleInvoking?: () => void | Promise<void>;
 	/** Renewed effect admission, separate from recording an original late outcome. */
 	readonly beforeLifecycleProof?: () => void | Promise<void>;
