@@ -11,9 +11,11 @@ import {
 	chatRequest,
 	FakeManagedSdkRuntime,
 	managedPreparedAuthority,
+	ownedModelReaderFixture,
 	reserveTcpPort,
 	stopProcess,
 	waitForStartedServer,
+	withModelReaderFixture,
 	writeDirectV3Authority,
 } from "./cli-fixtures";
 
@@ -159,26 +161,28 @@ describe("adapter CLI service", () => {
 		runtime.events = [{ type: "tool_execution_start", id: "tool-1", text: "bash" }];
 		const delivered: LiveGatewayEventDeliveryInput[] = [];
 		const repository = new InMemoryOpenWebUIProjectionRepository();
-		const options = await buildAdapterServerOptionsFromEnv(
-			{
-				...process.env,
-				GJC_OPENWEBUI_MODE: "existing",
-				GJC_OPENWEBUI_BIND_HOST: "127.0.0.1",
-				GJC_OPENWEBUI_BIND_PORT: "8765",
-				GJC_OPENWEBUI_ADAPTER_API_TOKEN: "adapter-token",
-				GJC_OPENWEBUI_OWNER_USER_ID: "owner-test",
-				GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS: workspace,
-				GJC_OPENWEBUI_SESSION_ROOT: sessionRoot,
-				GJC_OPENWEBUI_STATE_PATH: path.join(workspace, "adapter-state"),
-				GJC_OPENWEBUI_PROJECTS: `${projectDirectory}|Demo Project`,
-			},
-			{
-				managedSdkRuntime: runtime,
-				projectionRepository: repository,
-				eventSink: input => {
-					delivered.push(input);
+		const options = await withModelReaderFixture(ownedModelReaderFixture(runtime), () =>
+			buildAdapterServerOptionsFromEnv(
+				{
+					...process.env,
+					GJC_OPENWEBUI_MODE: "existing",
+					GJC_OPENWEBUI_BIND_HOST: "127.0.0.1",
+					GJC_OPENWEBUI_BIND_PORT: "8765",
+					GJC_OPENWEBUI_ADAPTER_API_TOKEN: "adapter-token",
+					GJC_OPENWEBUI_OWNER_USER_ID: "owner-test",
+					GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS: workspace,
+					GJC_OPENWEBUI_SESSION_ROOT: sessionRoot,
+					GJC_OPENWEBUI_STATE_PATH: path.join(workspace, "adapter-state"),
+					GJC_OPENWEBUI_PROJECTS: `${projectDirectory}|Demo Project`,
 				},
-			},
+				{
+					managedSdkRuntime: runtime,
+					projectionRepository: repository,
+					eventSink: input => {
+						delivered.push(input);
+					},
+				},
+			),
 		);
 
 		const handler = createAdapterRequestHandler({ routes: options.routes });
@@ -265,19 +269,21 @@ describe("adapter CLI service", () => {
 		await fs.mkdir(projectDirectory);
 		await writeDirectV3Authority(sessionRoot);
 		const runtime = new FakeManagedSdkRuntime();
-		const options = await buildAdapterServerOptionsFromEnv(
-			{
-				...process.env,
-				GJC_OPENWEBUI_MODE: "existing",
-				GJC_OPENWEBUI_BIND_HOST: "127.0.0.1",
-				GJC_OPENWEBUI_BIND_PORT: "8765",
-				GJC_OPENWEBUI_ADAPTER_API_TOKEN: "adapter-token",
-				GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS: workspace,
-				GJC_OPENWEBUI_SESSION_ROOT: sessionRoot,
-				GJC_OPENWEBUI_STATE_PATH: path.join(workspace, "adapter-state"),
-				GJC_OPENWEBUI_PROJECTS: `${projectDirectory}|Demo Project`,
-			},
-			{ managedSdkRuntime: runtime },
+		const options = await withModelReaderFixture(ownedModelReaderFixture(runtime), () =>
+			buildAdapterServerOptionsFromEnv(
+				{
+					...process.env,
+					GJC_OPENWEBUI_MODE: "existing",
+					GJC_OPENWEBUI_BIND_HOST: "127.0.0.1",
+					GJC_OPENWEBUI_BIND_PORT: "8765",
+					GJC_OPENWEBUI_ADAPTER_API_TOKEN: "adapter-token",
+					GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS: workspace,
+					GJC_OPENWEBUI_SESSION_ROOT: sessionRoot,
+					GJC_OPENWEBUI_STATE_PATH: path.join(workspace, "adapter-state"),
+					GJC_OPENWEBUI_PROJECTS: `${projectDirectory}|Demo Project`,
+				},
+				{ managedSdkRuntime: runtime },
+			),
 		);
 		const handler = createAdapterRequestHandler({ routes: options.routes });
 

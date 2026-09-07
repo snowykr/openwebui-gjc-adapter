@@ -4,11 +4,13 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 import { isAbsolute, join, relative, resolve } from "node:path";
 import type { router } from "@gajae-code/coding-agent/sdk";
 import { buildAdapterServerOptionsFromEnv } from "../../src/adapter-server-options";
-import { ManagedSdkOperationError, ManagedSdkRuntime } from "../../src/gjc/managed-sdk-runtime";
+import { ManagedSdkOperationError, ManagedSdkRuntime, type TenantSessionKey } from "../../src/gjc/managed-sdk-runtime";
 import { encodeSessionAuthorityV3Document, SESSION_AUTHORITY_V3_EPOCH } from "../../src/gjc/session-authority-v3";
 import { createManagedModelReaderFactory } from "../../src/live/gjc-managed-model-reader";
+import type { ModelReaderFactory } from "../../src/live/model-reader";
 import type { ProjectProvider } from "../../src/live/openai-routes";
 import { startAdapterServer } from "../../src/server";
+import { withModelReaderFixture } from "../cli-fixtures";
 
 const observationPath = requireEnv("GJC_SELECTION_OBSERVATIONS");
 const runtimeReceiptPath = requireEnv("GJC_SELECTION_RUNTIME_RECEIPT");
@@ -24,7 +26,8 @@ for (const [name, value] of [
 
 writeCanonicalV3Authority(sessionRoot);
 
-const managedRuntime = createManagedSelectionRuntime(coordinatorUrl);
+const selectionRuntime = createManagedSelectionRuntime(coordinatorUrl);
+const managedRuntime = selectionRuntime.runtime;
 const readerSettlements = new Set<Promise<void>>();
 const readerSettlementFailures: unknown[] = [];
 const registerReaderSettlement = (settled: Promise<void>): void => {
@@ -37,23 +40,29 @@ const registerReaderSettlement = (settled: Promise<void>): void => {
 		},
 	);
 };
-const managedModelReaderFactory = (context: any, signal?: AbortSignal) =>
+// These scenarios exercise selection and projection against an explicitly fixture-owned session.
+// They do not prove production temporary catalog creation or released exact cleanup.
+const managedModelReaderFactory: ModelReaderFactory = (context, signal) =>
 	createManagedModelReaderFactory({
 		runtime: managedRuntime,
 		registerSettlement: settled => {
 			registerReaderSettlement(settled);
 			context?.registerSettlement?.(settled);
 		},
-		temporary: {
-			principalId: context?.principal?.userId ?? "owner-selection",
-			projectId: "openwebui",
-			canonicalWorkspace:
-				context?.workspace?.root ?? join(process.env.HOME ?? process.cwd(), ".gjc", "openwebui", "default-reader"),
-			chatId: "selection-catalog",
-			leaseId: "selection-catalog-lease",
-			epoch: SESSION_AUTHORITY_V3_EPOCH,
-			requestKey: "selection-catalog-request",
-			assertFence: async () => undefined,
+		resolveAttachment: async () => {
+			await context?.lease?.assertFence();
+			return {
+				tenant: selectionRuntime.ownCatalog({
+					principalId: context?.principal.userId ?? "owner-selection",
+					projectId: context?.managedAuthority?.projectId ?? "openwebui",
+					canonicalWorkspace:
+						context?.workspace?.root ??
+						join(process.env.HOME ?? process.cwd(), ".gjc", "openwebui", "default-reader"),
+					chatId: context?.managedAuthority?.chatId ?? "selection-catalog",
+					leaseId: context?.managedAuthority?.leaseId ?? "selection-catalog-lease",
+					epoch: SESSION_AUTHORITY_V3_EPOCH,
+				}),
+			};
 		},
 	})(context, signal);
 
@@ -61,17 +70,19 @@ function record(value: unknown): void {
 	appendFileSync(observationPath, `${JSON.stringify(value)}\n`, "utf8");
 }
 
-const options = await buildAdapterServerOptionsFromEnv(
-	{ ...process.env, GJC_OPENWEBUI_MODE: "existing" },
-	{
-		managedSdkRuntime: managedRuntime,
-		managedSdkTenantFence: authority =>
-			Promise.resolve(
-				authority.epoch === SESSION_AUTHORITY_V3_EPOCH && authority.leaseId === "selection-fixture-lease",
-			),
-		eventSink: input => record({ type: "event", input }),
-		messageSink: input => record({ type: "message", input }),
-	},
+const options = await withModelReaderFixture(managedModelReaderFactory, () =>
+	buildAdapterServerOptionsFromEnv(
+		{ ...process.env, GJC_OPENWEBUI_MODE: "existing" },
+		{
+			managedSdkRuntime: managedRuntime,
+			managedSdkTenantFence: authority =>
+				Promise.resolve(
+					authority.epoch === SESSION_AUTHORITY_V3_EPOCH && authority.leaseId === "selection-fixture-lease",
+				),
+			eventSink: input => record({ type: "event", input }),
+			messageSink: input => record({ type: "message", input }),
+		},
+	),
 );
 writeFileSync(
 	runtimeReceiptPath,
@@ -282,7 +293,7 @@ function writeCanonicalV3Authority(root: string): void {
 	);
 }
 
-function createManagedSelectionRuntime(baseUrl: string): ManagedSdkRuntime {
+function createManagedSelectionRuntime(baseUrl: string) {
 	type SelectionSession = {
 		readonly sessionId: string;
 		readonly generation: number;
@@ -468,7 +479,15 @@ function createManagedSelectionRuntime(baseUrl: string): ManagedSdkRuntime {
 			throw new Error("Selection lifecycle fixture requires the exact tenant close target.");
 		return lifecycle.close(value);
 	};
-	return runtime;
+	return {
+		runtime,
+		ownCatalog(scope: Omit<TenantSessionKey, "sessionId" | "generation">): TenantSessionKey {
+			const session = sessionFor(`selection-catalog-${randomUUID()}`, ++nextGeneration);
+			const tenant = { ...scope, sessionId: session.sessionId, generation: session.generation };
+			runtime.registerTenant(tenant);
+			return tenant;
+		},
+	};
 
 	async function queryCoordinator(
 		session: SelectionSession,

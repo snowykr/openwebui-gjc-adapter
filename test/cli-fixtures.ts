@@ -1,4 +1,5 @@
-import { createHash } from "node:crypto";
+import { spyOn } from "bun:test";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import type { ManagedSdkRuntimeDependency } from "../src/gjc/managed-sdk-dependency";
@@ -26,7 +27,57 @@ import type {
 	ManagedPreparedTurnAuthority,
 	ManagedTurnAuthority,
 } from "../src/gjc/turn-runner";
+import { createManagedModelReaderFactory } from "../src/live/gjc-managed-model-reader";
+import * as routing from "../src/live/gjc-routing-gateway";
+import type { ModelReaderFactory } from "../src/live/model-reader";
 import { lifecycleFixture, managedPreparedAuthority as managedSessionAuthority } from "./gjc-lifecycle-fixtures";
+
+/** Selection-independent scenarios inject only the catalog, retaining the real routing and publication code. */
+export async function withModelReaderFixture<T>(factory: ModelReaderFactory, build: () => Promise<T>): Promise<T> {
+	const create = routing.createGjcRoutingLiveGatewayRunner;
+	const capture = spyOn(routing, "createGjcRoutingLiveGatewayRunner").mockImplementation(input =>
+		create({ ...input, modelReaderFactory: factory }),
+	);
+	try {
+		return await build();
+	} finally {
+		capture.mockRestore();
+	}
+}
+
+/** A test-owned existing session, not public-SDK temporary creation or retirement evidence. */
+export function ownedModelReaderFixture(runtime: FakeManagedSdkRuntime): ModelReaderFactory {
+	return async (context, signal) => {
+		if (context?.workspace === undefined || context.lease === undefined || context.registerSettlement === undefined)
+			throw new Error("Owned catalog fixture requires workspace, lease and settlement authority.");
+		const prepared = context.managedAuthority;
+		if (
+			prepared === undefined ||
+			context.principal.userId !== prepared.principalId ||
+			context.workspace.root !== prepared.canonicalWorkspace
+		)
+			throw new Error("Owned catalog fixture requires matching prepared scope.");
+		const tenant: TenantSessionKey = {
+			principalId: prepared.principalId,
+			projectId: prepared.projectId,
+			chatId: prepared.chatId,
+			canonicalWorkspace: prepared.canonicalWorkspace,
+			leaseId: prepared.leaseId,
+			epoch: prepared.epoch,
+			sessionId: `fixture-catalog-${randomUUID()}`,
+			generation: 1,
+		};
+		return createManagedModelReaderFactory({
+			runtime: runtime as unknown as ManagedSdkRuntime,
+			registerSettlement: context.registerSettlement.bind(context),
+			resolveAttachment: async () => {
+				await context.lease!.assertFence();
+				runtime.registerTenant(tenant);
+				return { tenant };
+			},
+		})(context, signal);
+	};
+}
 
 export async function writeDirectV3Authority(sessionRoot: string): Promise<void> {
 	await mkdir(sessionRoot, { recursive: true });

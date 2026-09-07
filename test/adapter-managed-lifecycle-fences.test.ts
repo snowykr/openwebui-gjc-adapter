@@ -197,6 +197,7 @@ async function fixture(
 		leases,
 		workspace,
 		reaperInput,
+		modelReaderFactory: options.routes!.modelReaderFactory!,
 		async close() {
 			await options.shutdownCleanup?.();
 			await options.runtimeLock.release();
@@ -206,6 +207,55 @@ async function fixture(
 		},
 	};
 }
+
+test("temporary catalog creation rejects missing public exact cleanup before borrowing prepared authority", async () => {
+	const f = await fixture();
+	try {
+		const hash = "a".repeat(64);
+		f.mappings.reserveProvisionalOperationScoped(f.prepared, {
+			id: "ingress",
+			ingressId: "ingress",
+			kind: "create",
+			chatId: f.prepared.chatId,
+			projectId: f.prepared.projectId,
+			detail: hash,
+		});
+		const evidence = createManagedLifecycleEvidence({
+			operation: "session.create",
+			preparedAuthority: f.prepared,
+			payloadHash: hash,
+			target: { kind: "existing_path", path: f.prepared.canonicalWorkspace },
+		});
+		f.mappings.recordLifecycleEvidenceScoped(f.prepared, "ingress", hash, evidence);
+		f.mappings.recordLifecycleEvidenceScoped(
+			f.prepared,
+			"ingress",
+			hash,
+			transitionManagedLifecycleEvidence(evidence, "invoking"),
+		);
+		expect(await f.deps.preparedTenantFence!(f.prepared)).toBe(true);
+		const path = join(f.root, "sessions", "openwebui-session-mappings.json");
+		const bytes = await readFile(path);
+		let registered = 0;
+		await expect(
+			f.modelReaderFactory({
+				principal: { userId: f.prepared.principalId, role: "user" },
+				workspace: f.workspace,
+				managedAuthority: f.prepared,
+				lease: f.lease,
+				registerSettlement: settled => {
+					registered += 1;
+					void settled.catch(() => undefined);
+				},
+			}),
+		).rejects.toMatchObject({ code: "exact_close_authority_unavailable" });
+		expect(registered).toBe(0);
+		expect(f.calls).toEqual([]);
+		expect((await readFile(path)).equals(bytes)).toBe(true);
+	} finally {
+		await f.close();
+	}
+});
 
 test.each(["intent_prepared", "invoking"] as const)(
 	"catalog %s reservation cannot authorize generic prepared creation",

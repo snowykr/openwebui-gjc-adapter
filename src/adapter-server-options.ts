@@ -23,6 +23,7 @@ import {
 	type ManagedSdkAccess,
 	type ManagedSdkCatalogAccess,
 	type ManagedSdkCatalogReference,
+	ManagedSdkOperationError,
 	ManagedSdkRuntime,
 	type ManagedSdkRuntimeDeps,
 	type TenantSessionKey,
@@ -683,16 +684,10 @@ function createManagedReaderFactory(runtime: ManagedSdkRuntime, timeoutMs: numbe
 		}
 		if (context?.lease === undefined)
 			throw new Error("Managed temporary model catalog access requires a workspace lease fence.");
-		const assertFence = context.lease.assertFence.bind(context.lease);
-		return createManagedModelReaderFactory({
-			runtime,
-			registerSettlement,
-			timeoutMs,
-			temporary: {
-				...authority,
-				assertFence,
-			},
-		})(context, signal);
+		throw new ManagedSdkOperationError(
+			"exact_close_authority_unavailable",
+			"SDK 0.16.4 cannot provide exact cleanup authority; temporary catalog creation is prohibited.",
+		);
 	};
 }
 
