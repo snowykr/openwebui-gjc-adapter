@@ -7,6 +7,7 @@ import {
 	lifecycleExactAuthority,
 	lifecyclePreparedAuthority,
 	type ManagedLifecycleEvidence,
+	managedHistoricalPublicationAssociation,
 	transitionManagedLifecycleEvidence,
 } from "./managed-lifecycle-evidence";
 import {
@@ -495,7 +496,15 @@ export class SessionMappingStore {
 		const record = this.authority.get(canonicalScope.key);
 		if (record !== undefined && (!isScopedRecordFor(record, canonicalScope) || isRetiredRecord(record)))
 			return undefined;
-		const operation = this.authority.provisionalOperation(canonicalScope.key, ingressId);
+		const candidates = this.authority
+			.provisionalEntries()
+			.filter(
+				operation =>
+					(operation.id === ingressId || operation.ingressId === ingressId) &&
+					(operation.chatId === canonicalScope.key ||
+						(record !== undefined && managedHistoricalPublicationAssociation(record, operation) !== undefined)),
+			);
+		const operation = candidates.length === 1 ? candidates[0] : undefined;
 		return operation === undefined ? undefined : provisionalOperationForScope(operation, canonicalScope);
 	}
 	reserveProvisionalOperation(
@@ -883,7 +892,15 @@ function assertPrincipalId(principalId: string): void {
 
 function compositeScopeFromRecord(record: SessionAuthorityRecord): SessionMappingScope | undefined {
 	const observation = record.observations?.[SCOPED_MAPPING_OBSERVATION];
-	if (observation === undefined) {
+	if (
+		observation === undefined ||
+		(record.managedAuthority !== undefined &&
+			typeof observation === "object" &&
+			observation !== null &&
+			!Array.isArray(observation) &&
+			!Object.hasOwn(observation, "chatId") &&
+			Reflect.get(observation, "principalId") === record.managedAuthority.principalId)
+	) {
 		const principalId = record.historicalBinding?.principalId ?? record.managedAuthority?.principalId;
 		if (principalId === undefined) return undefined;
 		let key: unknown;
@@ -1295,7 +1312,7 @@ function storedScopeFromRecord(record: SessionAuthorityRecord): SessionMappingSc
 	const principalId = (observation as StoredMappingScope).principalId;
 	const chatId = (observation as StoredMappingScope).chatId;
 	if (typeof principalId !== "string") throw new Error("Session mapping contains invalid scope metadata.");
-	if (chatId === undefined) return { principalId, chatId: record.chatId };
+	if (chatId === undefined) return compositeScopeFromRecord(record) ?? { principalId, chatId: record.chatId };
 	if (typeof chatId !== "string" || canonicalSessionMappingKey(principalId, chatId) !== record.chatId)
 		throw new Error("Session mapping contains an invalid canonical scope key.");
 	return { principalId, chatId };

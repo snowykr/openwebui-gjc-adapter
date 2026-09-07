@@ -6,7 +6,12 @@ import {
 	isManagedLifecycleState,
 	type ManagedLifecycleState,
 } from "./managed-lifecycle-state";
-import type { HistoricalSessionBinding } from "./session-authority-types";
+import type {
+	HistoricalSessionBinding,
+	ProvisionalSessionOperation,
+	SessionOperation,
+	SessionOperationResult,
+} from "./session-authority-types";
 import { hasOnlyKeys, isNonEmptyString, isRecord, isTimestamp } from "./session-authority-validation-primitives";
 import type { ManagedGenerationProof, ManagedPreparedTurnAuthority, ManagedTurnAuthority } from "./turn-runner";
 
@@ -60,6 +65,320 @@ export interface ManagedLifecycleEvidence {
 		readonly observedAt: string;
 		readonly evidence: Readonly<Record<string, unknown>>;
 	};
+}
+
+/** Structural view shared by V3 and its inherited in-memory relational validator. */
+export interface ManagedHistoricalAssociationOwner {
+	readonly chatId: string;
+	readonly projectId: string;
+	readonly managedAuthority?: ManagedTurnAuthority;
+	readonly historicalBinding?: HistoricalSessionBinding;
+	readonly journal: readonly SessionOperation[];
+	readonly prior?: ManagedHistoricalAssociationOwner;
+	readonly reassignment?: {
+		readonly sourceTombstone?: ManagedHistoricalAssociationOwner;
+		readonly priorTombstone?: ManagedHistoricalAssociationOwner;
+	};
+}
+
+export interface ManagedHistoricalSourceAssociation {
+	readonly canonicalChatId: string;
+	readonly operationId: string;
+	readonly evidence: ManagedLifecycleEvidence;
+	readonly historicalSource: ManagedHistoricalLifecycleSource;
+}
+
+/** Derives ownership only; never grants runtime authority or rewrites historical identity. */
+export function managedHistoricalSourceAssociation(
+	root: ManagedHistoricalAssociationOwner,
+	history: HistoricalSessionBinding,
+	operation?: SessionOperation,
+): ManagedHistoricalSourceAssociation | undefined {
+	if (!isHistoricalSessionBinding(history)) return undefined;
+	const receipts = historicalSourceReceipts(root).filter(receipt => {
+		const original = receipt.historicalSource.historicalBinding;
+		return history.chatId === original.chatId;
+	});
+	// A second receipt for the same original graph is ambiguity, even if only one pointer fits.
+	if (receipts.length !== 1) return undefined;
+	const receipt = receipts[0]!;
+	const original = receipt.historicalSource.historicalBinding;
+	if (
+		history.provenance.source !== original.provenance.source ||
+		history.provenance.documentHash !== original.provenance.documentHash ||
+		(history.principalId !== undefined && history.principalId !== receipt.evidence.preparedAuthority.principalId) ||
+		(history.projectId === original.projectId &&
+			history.canonicalWorkspace !== undefined &&
+			history.canonicalWorkspace !== receipt.evidence.preparedAuthority.canonicalWorkspace)
+	)
+		return undefined;
+	const prefix = original.provenance.nodeRef.split("/");
+	const pointer = history.provenance.nodeRef.split("/");
+	if (
+		prefix.length !== 3 ||
+		prefix[1] !== "mappings" ||
+		!/^(0|[1-9][0-9]*)$/.test(prefix[2]!) ||
+		!prefix.every((part, index) => part === pointer[index])
+	)
+		return undefined;
+	const suffix = pointer.slice(prefix.length);
+	let owner = receipt.owner;
+	let cursor = 0;
+	if (suffix[0] === "reassignment") {
+		if (suffix[1] !== "sourceTombstone" && suffix[1] !== "priorTombstone") return undefined;
+		const targetPath = [...prefix, ...suffix.slice(0, 2)];
+		let descendant = receipt.owner.reassignment?.[suffix[1]] ?? receipt.owner.prior;
+		if (descendant === undefined || descendant.historicalBinding?.provenance.nodeRef !== targetPath.join("/"))
+			return undefined;
+		cursor = 2;
+		while (suffix[cursor] === "prior") {
+			targetPath.push(suffix[cursor++]!);
+			descendant = descendant.prior;
+			if (descendant === undefined || descendant.historicalBinding?.provenance.nodeRef !== targetPath.join("/"))
+				return undefined;
+		}
+		if (descendant.historicalBinding?.provenance.documentHash !== original.provenance.documentHash) return undefined;
+		owner = descendant;
+	}
+	if (operation === undefined) {
+		if (suffix.length === 0) {
+			if (!isDeepStrictEqual(original, history)) return undefined;
+		} else if (cursor === 0 || cursor !== suffix.length || !isDeepStrictEqual(owner.historicalBinding, history))
+			return undefined;
+	} else {
+		if (
+			suffix[cursor] !== "journal" ||
+			!/^(0|[1-9][0-9]*)$/.test(suffix[cursor + 1] ?? "") ||
+			suffix.length !== cursor + 3
+		)
+			return undefined;
+		const index = Number(suffix[cursor + 1]);
+		if (!Number.isSafeInteger(index) || (owner === receipt.owner && index >= receipt.index)) return undefined;
+		const retained = owner.journal[index];
+		if (retained === undefined || !isDeepStrictEqual(retained, operation)) return undefined;
+		const binding =
+			suffix[cursor + 2] === "result"
+				? retained.result?.historicalBinding
+				: suffix[cursor + 2] === "acknowledgedSuccessor" &&
+						retained.acknowledgedSuccessor !== undefined &&
+						"historicalBinding" in retained.acknowledgedSuccessor
+					? retained.acknowledgedSuccessor.historicalBinding
+					: undefined;
+		if (!isDeepStrictEqual(binding, history) || history.projectId !== owner.projectId) return undefined;
+	}
+	return {
+		canonicalChatId: root.chatId,
+		operationId: receipt.operationId,
+		evidence: receipt.evidence,
+		historicalSource: receipt.historicalSource,
+	};
+}
+
+/** Completed original-key reservations associate only through their exact retained publication. */
+export function managedHistoricalPublicationAssociation(
+	root: ManagedHistoricalAssociationOwner,
+	provisional: ProvisionalSessionOperation,
+): ManagedHistoricalSourceAssociation | undefined {
+	const history = provisional.historicalBinding;
+	if (
+		provisional.state !== "complete" ||
+		provisional.managedAuthority !== undefined ||
+		(history === undefined
+			? provisional.sessionId !== undefined || provisional.result !== undefined
+			: !isHistoricalSessionBinding(history, provisional) ||
+				!/^\/provisionalOperations\/(0|[1-9][0-9]*)$/.test(history.provenance.nodeRef))
+	)
+		return undefined;
+	const matches: ManagedHistoricalSourceAssociation[] = [];
+	for (const owner of historicalOwners(root))
+		for (const published of owner.journal) {
+			const result = published.result;
+			if (
+				published.state !== "complete" ||
+				result?.historicalBinding === undefined ||
+				result.managedAuthority !== undefined ||
+				!isHistoricalSessionBinding(result.historicalBinding, result.mapping) ||
+				result.mapping.operationId !== published.id ||
+				(published.kind !== "prompt" && published.kind !== "create") ||
+				(provisional.kind !== "prompt" && provisional.kind !== "create") ||
+				published.id !== provisional.id ||
+				(published.ingressId ?? published.id) !== (provisional.ingressId ?? provisional.id) ||
+				published.detail !== provisional.detail ||
+				published.startedAt !== provisional.startedAt ||
+				published.completedAt !== provisional.completedAt ||
+				!isDeepStrictEqual(published.lifecycle, provisional.lifecycle) ||
+				(provisional.result !== undefined &&
+					(history === undefined || !matchesHistoricalPublicationResult(provisional.result, result, history))) ||
+				provisional.chatId !== result.mapping.chatId ||
+				provisional.projectId !== result.mapping.projectId ||
+				(provisional.sessionId !== undefined && provisional.sessionId !== result.mapping.sessionId) ||
+				(history !== undefined &&
+					(!compatibleHistoricalPublicationIdentity(history, result.historicalBinding, true) ||
+						history.provenance.source !== result.historicalBinding.provenance.source ||
+						history.provenance.documentHash !== result.historicalBinding.provenance.documentHash))
+			)
+				continue;
+			const association = managedHistoricalSourceAssociation(root, result.historicalBinding, published);
+			if (
+				association !== undefined &&
+				[history, provisional.result?.historicalBinding].every(
+					binding =>
+						binding === undefined ||
+						((binding.principalId === undefined ||
+							binding.principalId === association.evidence.preparedAuthority.principalId) &&
+							(binding.projectId !== association.evidence.preparedAuthority.projectId ||
+								binding.canonicalWorkspace === undefined ||
+								binding.canonicalWorkspace === association.evidence.preparedAuthority.canonicalWorkspace)),
+				)
+			)
+				matches.push(association);
+		}
+	return matches.length === 1 ? matches[0] : undefined;
+}
+
+function matchesHistoricalPublicationResult(
+	provisional: SessionOperationResult,
+	published: SessionOperationResult,
+	reservation: HistoricalSessionBinding,
+): boolean {
+	const history = provisional.historicalBinding;
+	if (
+		provisional.managedAuthority !== undefined ||
+		published.managedAuthority !== undefined ||
+		!isHistoricalSessionBinding(history, provisional.mapping) ||
+		published.historicalBinding === undefined ||
+		history.provenance.nodeRef !== `${reservation.provenance.nodeRef}/result` ||
+		history.provenance.source !== reservation.provenance.source ||
+		history.provenance.documentHash !== reservation.provenance.documentHash ||
+		!compatibleHistoricalPublicationIdentity(reservation, history, true)
+	)
+		return false;
+	// The two original occurrences have different pointers and source-node digests.
+	// Compare their retained content, not those distinct provenance receipts.
+	const {
+		historicalBinding: _provisionalHistory,
+		managedAuthority: _provisionalAuthority,
+		...provisionalPayload
+	} = provisional;
+	const {
+		historicalBinding: _publishedHistory,
+		managedAuthority: _publishedAuthority,
+		...publishedPayload
+	} = published;
+	return (
+		compatibleHistoricalPublicationIdentity(history, published.historicalBinding) &&
+		isDeepStrictEqual(provisionalPayload, publishedPayload)
+	);
+}
+
+function compatibleHistoricalPublicationIdentity(
+	left: HistoricalSessionBinding,
+	right: HistoricalSessionBinding,
+	unassignedReservation = false,
+): boolean {
+	return (
+		(["chatId", "projectId"] as const).every(field => left[field] === right[field]) &&
+		((unassignedReservation && left.sessionId === undefined) || left.sessionId === right.sessionId) &&
+		(["principalId", "canonicalWorkspace"] as const).every(
+			field => left[field] === undefined || right[field] === undefined || left[field] === right[field],
+		)
+	);
+}
+
+/** Whether an original chat is claimed; unresolved reservations must not become orphan aliases. */
+export function hasManagedHistoricalSourceChat(root: ManagedHistoricalAssociationOwner, chatId: string): boolean {
+	return historicalSourceReceipts(root).some(receipt => receipt.historicalSource.historicalBinding.chatId === chatId);
+}
+
+function historicalOwners(root: ManagedHistoricalAssociationOwner): ManagedHistoricalAssociationOwner[] {
+	const owners = [root];
+	const seen = new Set<ManagedHistoricalAssociationOwner>(owners);
+	let current = root.reassignment?.sourceTombstone ?? root.reassignment?.priorTombstone ?? root.prior;
+	while (current !== undefined && !seen.has(current)) {
+		owners.push(current);
+		seen.add(current);
+		current = current.prior;
+	}
+	return owners;
+}
+
+function historicalSourceReceipts(root: ManagedHistoricalAssociationOwner) {
+	const receipts: (ManagedHistoricalSourceAssociation & {
+		owner: ManagedHistoricalAssociationOwner;
+		index: number;
+	})[] = [];
+	if (
+		root.managedAuthority === undefined ||
+		root.historicalBinding !== undefined ||
+		!isAuthority(lifecycleExactAuthority(root.managedAuthority))
+	)
+		return receipts;
+	for (const owner of historicalOwners(root))
+		for (const [index, operation] of owner.journal.entries()) {
+			const evidence = operation.lifecycle;
+			if (
+				operation.kind !== "resume" ||
+				operation.state !== "complete" ||
+				!operation.id.startsWith("migration:resume:") ||
+				operation.id.length === "migration:resume:".length ||
+				!isManagedLifecycleEvidence(evidence) ||
+				evidence.operation !== "session.resume" ||
+				evidence.state !== "active_generation_proven" ||
+				evidence.historicalSource === undefined ||
+				evidence.acknowledged === undefined ||
+				evidence.proven === undefined ||
+				operation.detail !== evidence.payloadHash ||
+				!isTimestamp(operation.startedAt) ||
+				!isTimestamp(operation.completedAt) ||
+				Date.parse(operation.startedAt) > Date.parse(evidence.recordedAt) ||
+				Date.parse(evidence.recordedAt) > Date.parse(operation.completedAt)
+			)
+				continue;
+			const prepared = evidence.preparedAuthority;
+			const canonicalChatId = JSON.stringify([prepared.principalId, prepared.chatId]);
+			const authority = owner.managedAuthority;
+			if (
+				owner.historicalBinding !== undefined ||
+				authority === undefined ||
+				root.chatId !== canonicalChatId ||
+				owner.chatId !== canonicalChatId ||
+				!isAuthority(lifecycleExactAuthority(authority)) ||
+				root.managedAuthority.chatId !== canonicalChatId ||
+				root.managedAuthority.principalId !== prepared.principalId ||
+				authority.chatId !== canonicalChatId ||
+				authority.principalId !== prepared.principalId ||
+				owner.projectId !== prepared.projectId ||
+				authority.projectId !== prepared.projectId ||
+				authority.canonicalWorkspace !== prepared.canonicalWorkspace
+			)
+				continue;
+			if (operation.result !== undefined) {
+				const actual = operation.result.managedAuthority;
+				if (
+					actual === undefined ||
+					operation.result.historicalBinding !== undefined ||
+					operation.result.kind === "close" ||
+					operation.result.mapping.chatId !== canonicalChatId ||
+					operation.result.mapping.projectId !== owner.projectId ||
+					operation.result.mapping.sessionId !== evidence.acknowledged.sessionId ||
+					operation.result.mapping.operationId !== operation.id ||
+					actual.chatId !== canonicalChatId ||
+					!(
+						[...scopeFields.filter(field => field !== "chatId"), "requestKey", "sessionId", "generation"] as const
+					).every(field => actual[field] === evidence.acknowledged![field])
+				)
+					continue;
+			}
+			receipts.push({
+				canonicalChatId,
+				operationId: operation.id,
+				evidence,
+				historicalSource: evidence.historicalSource,
+				owner,
+				index,
+			});
+		}
+	return receipts;
 }
 
 type EvidenceInput = Pick<

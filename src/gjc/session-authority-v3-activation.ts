@@ -526,10 +526,12 @@ function assertBootstrapGraph(initialBytes: Buffer, retainedBytes: Buffer, manif
 			continue;
 		}
 		const { historicalBinding: _history, managedAuthority: _managed, journal, ...fields } = current;
+		const promoted = current.managedAuthority !== undefined;
 		if (
 			!isDeepStrictEqual(
 				{
 					...fields,
+					...(promoted ? { chatId: original.chatId, header: { ...fields.header, chatId: original.chatId } } : {}),
 					historicalBinding: original.historicalBinding,
 					journal: journal.slice(0, original.journal.length),
 				},
@@ -553,6 +555,8 @@ function assertBootstrapGraph(initialBytes: Buffer, retainedBytes: Buffer, manif
 				operation?.state !== "complete" ||
 				evidence?.state !== "active_generation_proven" ||
 				evidence.acknowledged === undefined ||
+				current.chatId !==
+					JSON.stringify([evidence.preparedAuthority.principalId, evidence.preparedAuthority.chatId]) ||
 				!isDeepStrictEqual(current.managedAuthority, {
 					...evidence.acknowledged,
 					chatId: current.chatId,

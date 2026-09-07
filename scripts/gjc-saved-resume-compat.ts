@@ -324,7 +324,8 @@ async function bootstrapProbe(
 	const stateRoot = join(root, "adapter-state");
 	await mkdir(stateRoot);
 	const sourcePath = join(stateRoot, "authority.json");
-	const chatId = JSON.stringify([principalId, "saved-chat"]);
+	const unscoped = process.argv.includes("--bootstrap-unscoped");
+	const chatId = unscoped ? "saved-chat" : JSON.stringify([principalId, "saved-chat"]);
 	const stamp = new Date().toISOString();
 	const terminalHistory = process.argv.includes("--bootstrap-history");
 	const prior = {
@@ -477,6 +478,8 @@ async function bootstrapProbe(
 			const record = document?.mappings[0];
 			if (
 				record?.managedAuthority?.sessionId !== sessionId ||
+				record.chatId !== JSON.stringify([principalId, "saved-chat"]) ||
+				result.store.getScoped({ principalId, chatId: "saved-chat" })?.managedAuthority?.sessionId !== sessionId ||
 				initialGraph === undefined ||
 				!isDeepStrictEqual(record.reassignment, initialGraph.mappings[0]?.reassignment) ||
 				record.journal[0]?.result?.assistantText !== "immutable prior answer" ||
@@ -493,6 +496,7 @@ async function bootstrapProbe(
 					generation: record.managedAuthority.generation,
 					originalResultPreserved: true,
 					terminalReassignmentHistoryPreserved: terminalHistory,
+					unscopedOwnerResolved: unscoped,
 					bootstrapRuntimeStopped: true,
 					migrationOperationCount: record.journal.length - 1,
 				},

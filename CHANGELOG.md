@@ -26,6 +26,7 @@
 
 ### Fixed
 
+- Implemented initial restricted-bootstrap owner resolution: existing principal first, configured administrator only for genuinely unowned history. Atomic promotion uses one canonical live key while exact historical identities remain immutable and attributable through a unique completed bootstrap receipt. Added destination/owner conflicts, completed provisional provenance, ordinary scoped writes/reopen, unchanged prepared retry, and no uncertain redispatch coverage; operator provisioning and original-incarnation recovery remain incomplete.
 - Preserved immutable historical chat/header/result identities in scoped history reads and canonical serialization; only managed live views normalize chat IDs. Kept historical tenant checks and non-serving boundaries, with exact receipt/tombstone assertions across managed writes and reopen.
 - Admitted completed reassignment histories during restricted scoped bootstrap without promoting tombstones or rewriting completed provisional receipts. Unresolved historical effects and unassigned provisionals still block before SDK construction. Made private snapshot replay's local reassignment rollback timestamp deterministic so unchanged base/WAL evidence can reopen its retained historical stage; added a terminal-history public bootstrap probe.
 - Preserved committed branch results when publication later throws or times out, matching other controls. Reopen replays the immutable result without reforking or falsely reporting a failed uncertainty transition.

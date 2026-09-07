@@ -30,6 +30,10 @@ async function fixture(
 		onStop?: () => Promise<void>;
 		timeoutMs?: number;
 		staleAtCommit?: boolean;
+		unscoped?: boolean;
+		configuredOwner?: string;
+		explicitOwner?: string;
+		stopAtPrepared?: boolean;
 		transformSource?: (source: SessionAuthorityV2Document) => SessionAuthorityV2Document;
 	} = {},
 ) {
@@ -37,7 +41,7 @@ async function fixture(
 	const workspace = join(root, "workspace");
 	await mkdir(workspace);
 	const sourcePath = join(root, "authority.json");
-	const chatId = JSON.stringify(["owner", "chat"]);
+	const chatId = options.unscoped ? "chat" : JSON.stringify(["owner", "chat"]);
 	const stamp = "2026-01-01T00:00:00.000Z";
 	const source: SessionAuthorityV2Document = {
 		mappings: options.empty
@@ -55,6 +59,9 @@ async function fixture(
 						operationId: "turn",
 						sessionFile: "/inert/history.jsonl",
 						assistantText: "retained answer",
+						...(options.explicitOwner === undefined
+							? {}
+							: { observations: { __gjcSessionMappingScope: { principalId: options.explicitOwner } } }),
 						journal: [
 							{
 								id: "turn",
@@ -97,6 +104,7 @@ async function fixture(
 	let live = true;
 	let stale = options.stale ?? false;
 	let reconciles = 0;
+	let preparedStopped = false;
 	let runtime!: ManagedSdkRuntime;
 	let deps!: ManagedSdkRuntimeDeps;
 	let initialGraph: SessionAuthorityV3Document | undefined;
@@ -105,7 +113,7 @@ async function fixture(
 	const input: AdapterManagedBootstrapInput = {
 		locations: { agentDir: root, stateRoot: root },
 		sourcePath,
-		configuredOwnerUserId: "owner",
+		configuredOwnerUserId: options.configuredOwner ?? "owner",
 		runtimeLock,
 		timeoutMs: options.timeoutMs ?? 5_000,
 		authority: {
@@ -125,6 +133,15 @@ async function fixture(
 							epoch: "epoch",
 							assertFence: async () => {
 								if (!live) throw new Error("lease revoked");
+								if (
+									options.stopAtPrepared &&
+									!preparedStopped &&
+									initialGraph !== undefined &&
+									evidence()?.state === "intent_prepared"
+								) {
+									preparedStopped = true;
+									throw new Error("interrupted after prepared intent");
+								}
 								if (options.staleAtCommit && reconciles >= 2) {
 									await Promise.resolve();
 									stale = true;
@@ -306,6 +323,214 @@ function withReassignment(
 }
 
 describe("adapter managed bootstrap composition", () => {
+	test.each(["admin", "explicit", "sessionless", "sessionless-result"] as const)(
+		"resolves unscoped %s history with one canonical live key",
+		async variant => {
+			const f = await fixture({
+				unscoped: true,
+				...(variant === "explicit" ? { explicitOwner: "owner", configuredOwner: "different-admin" } : {}),
+				transformSource: source => {
+					const graph = withReassignment(source, "committed");
+					if (variant !== "sessionless" && variant !== "sessionless-result") return graph;
+					const { sessionId: _session, result, ...reservation } = graph.provisionalOperations![0]!;
+					return {
+						...graph,
+						provisionalOperations: [{ ...reservation, ...(variant === "sessionless-result" ? { result } : {}) }],
+					};
+				},
+			});
+			try {
+				const result = await activateAdapterSessionAuthorityV3(f.input);
+				if (result.status === "blocked") throw new Error(JSON.stringify(result.activation));
+				expect(result.status).toBe("activated");
+				const initial = f.initialGraph();
+				const document = parseSessionAuthorityV3Document(await readFile(f.sourcePath))!;
+				const record = document.mappings[0]!;
+				expect(record.chatId).toBe(JSON.stringify(["owner", "chat"]));
+				expect(record.header.chatId).toBe(record.chatId);
+				expect(record.journal.slice(0, -1)).toEqual([...initial.mappings[0]!.journal]);
+				expect(record.reassignment).toEqual(initial.mappings[0]!.reassignment);
+				expect(document.provisionalOperations).toEqual(initial.provisionalOperations);
+				expect(record.journal.at(-1)!.lifecycle!.historicalSource!.historicalBinding).toEqual(
+					initial.mappings[0]!.historicalBinding!,
+				);
+				result.store.close();
+				const store = new V3FileBackedSessionMappingStore(f.sourcePath);
+				try {
+					const scope = { principalId: "owner", chatId: "chat" };
+					const current = store.getScoped(scope)!;
+					expect(current.managedAuthority?.generation).toBe(7);
+					expect(store.getScoped({ principalId: "different-admin", chatId: "chat" })).toBeUndefined();
+					expect(store.provisionalOperationScoped(scope, "turn")).toEqual(document.provisionalOperations[0]!);
+					store.beginOperationScoped(scope, { id: "fresh", kind: "prompt", detail: "fresh-hash" });
+					store.completeOperationWithMappingScoped(
+						scope,
+						"fresh",
+						"fresh-hash",
+						{ ...current, operationId: "fresh", assistantText: "new" },
+						"turn",
+					);
+					const reservation = {
+						id: "publish",
+						ingressId: "publish-alias",
+						kind: "prompt" as const,
+						detail: "publish-hash",
+						chatId: "chat",
+						projectId: "project",
+					};
+					store.reserveProvisionalOperationScoped(scope, reservation);
+					store.publishProvisionalOperationScoped(scope, reservation, {
+						...current,
+						operationId: "publish",
+						assistantText: "published",
+					});
+					expect(() =>
+						store.reserveProvisionalOperationScoped(scope, {
+							id: "turn",
+							kind: "prompt",
+							chatId: "chat",
+							projectId: "project",
+						}),
+					).toThrow();
+					const after = parseSessionAuthorityV3Document(await readFile(f.sourcePath))!;
+					expect(after.mappings).toHaveLength(1);
+					expect(after.mappings[0]!.journal.slice(0, record.journal.length)).toEqual([...record.journal]);
+					expect(after.mappings[0]!.reassignment).toEqual(record.reassignment);
+					expect(after.provisionalOperations[0]).toEqual(document.provisionalOperations[0]!);
+				} finally {
+					store.close();
+				}
+				const reopened = new V3FileBackedSessionMappingStore(f.sourcePath);
+				try {
+					expect(reopened.getScoped({ principalId: "owner", chatId: "chat" })?.assistantText).toBe("published");
+					expect(reopened.provisionalOperationScoped({ principalId: "owner", chatId: "chat" }, "turn")).toEqual(
+						document.provisionalOperations[0]!,
+					);
+					expect(reopened.operationScoped({ principalId: "owner", chatId: "chat" }, "turn")?.result).toEqual(
+						record.journal[0]!.result,
+					);
+				} finally {
+					reopened.close();
+				}
+				expect(f.calls.filter(call => call === "resume")).toHaveLength(1);
+			} finally {
+				await f.cleanup();
+			}
+		},
+	);
+
+	test.each(["occupied", "foreign-owner"] as const)(
+		"blocks %s source scope without public effects",
+		async scenario => {
+			const f = await fixture({
+				unscoped: scenario === "occupied",
+				explicitOwner: scenario === "foreign-owner" ? "foreign" : undefined,
+				transformSource: source => {
+					if (scenario !== "occupied") return source;
+					const original = source.mappings[0]!;
+					const chatId = JSON.stringify(["owner", "chat"]);
+					return {
+						...source,
+						mappings: [
+							...source.mappings,
+							{
+								...original,
+								chatId,
+								sessionId: "other",
+								header: { chatId, projectId: original.projectId, sessionId: "other" },
+								operationId: "other",
+								journal: [],
+							},
+						],
+					};
+				},
+			});
+			try {
+				expect((await activateAdapterSessionAuthorityV3(f.input)).status).toBe("blocked");
+				expect(f.calls).toEqual([]);
+				expect(await readFile(f.sourcePath, "utf8")).toBe(f.original);
+			} finally {
+				await f.cleanup();
+			}
+		},
+	);
+
+	test("uninvoked unscoped intent reuses its original identity and rejects changed owner or lease", async () => {
+		const f = await fixture({ unscoped: true, stopAtPrepared: true });
+		try {
+			await expect(activateAdapterSessionAuthorityV3(f.input)).rejects.toThrow("bootstrap failed");
+			const prepared = f.evidence()!;
+			expect(prepared.state).toBe("intent_prepared");
+			expect(f.calls.filter(call => call === "resume")).toHaveLength(0);
+			expect(
+				(await activateAdapterSessionAuthorityV3({ ...f.input, configuredOwnerUserId: "different-admin" })).status,
+			).toBe("blocked");
+			const resolve = f.input.authority.resolve;
+			expect(
+				(
+					await activateAdapterSessionAuthorityV3({
+						...f.input,
+						authority: {
+							resolve: async (...args) => {
+								const authority = await resolve(...args);
+								return authority === undefined ? undefined : { ...authority, leaseId: "replacement-lease" };
+							},
+						},
+					})
+				).status,
+			).toBe("blocked");
+			expect(f.evidence()).toEqual(prepared);
+			const result = await activateAdapterSessionAuthorityV3(f.input);
+			if (result.status !== "activated") throw new Error("Expected same-intent activation.");
+			result.store.close();
+			expect(f.evidence()?.requestKey).toBe(prepared.requestKey);
+			expect(f.evidence()?.payloadHash).toBe(prepared.payloadHash);
+			expect(f.evidence()?.preparedAuthority).toEqual(prepared.preparedAuthority);
+			expect(f.calls.filter(call => call === "resume")).toHaveLength(1);
+		} finally {
+			await f.cleanup();
+		}
+	});
+
+	test("unscoped uncertain invocation retains source identity and never resumes under a changed admin", async () => {
+		const f = await fixture({ unscoped: true, revokeAfterResume: true });
+		try {
+			await expect(activateAdapterSessionAuthorityV3(f.input)).rejects.toThrow("bootstrap failed");
+			const receipt = f.evidence()!;
+			expect(receipt.state).toBe("uncertain");
+			expect(receipt.acknowledged?.generation).toBe(7);
+			expect(receipt.historicalSource?.historicalBinding.chatId).toBe("chat");
+			expect(receipt.historicalSource?.historicalBinding.principalId).toBeUndefined();
+			const before = f.graph();
+			expect(
+				(await activateAdapterSessionAuthorityV3({ ...f.input, configuredOwnerUserId: "different-admin" })).status,
+			).toBe("blocked");
+			expect(f.evidence()).toEqual(receipt);
+			expect(f.graph().mappings[0]!.journal.at(-1)!.state).toBe("uncertain");
+			expect(f.graph().mappings[0]!.journal.slice(0, -1)).toEqual(before.mappings[0]!.journal.slice(0, -1));
+			const bytes = await readFile(f.stagePath);
+			expect((await activateAdapterSessionAuthorityV3(f.input)).status).toBe("blocked");
+			expect((await readFile(f.stagePath)).equals(bytes)).toBe(true);
+			expect(f.calls.filter(call => call === "resume")).toHaveLength(1);
+		} finally {
+			await f.cleanup();
+		}
+	});
+
+	test.each(["", " owner", "owner\n"])(
+		"blocks missing or invalid configured owner %j before SDK effects",
+		async configuredOwner => {
+			const f = await fixture({ unscoped: true, configuredOwner });
+			try {
+				expect((await activateAdapterSessionAuthorityV3(f.input)).status).toBe("blocked");
+				expect(f.calls).toEqual([]);
+				expect(await readFile(f.sourcePath, "utf8")).toBe(f.original);
+			} finally {
+				await f.cleanup();
+			}
+		},
+	);
+
 	test.each(["committed", "rolled_back", "pending"] as const)(
 		"promotes only the current occurrence with %s reassignment history and no unresolved target",
 		async state => {

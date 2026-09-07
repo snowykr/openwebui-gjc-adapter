@@ -6,9 +6,16 @@ import {
 	createManagedLifecycleEvidence,
 	isManagedLifecycleEvidence,
 	type ManagedHistoricalSavedSession,
+	managedHistoricalPublicationAssociation,
+	managedHistoricalSourceAssociation,
 	transitionManagedLifecycleEvidence,
 } from "../src/gjc/managed-lifecycle-evidence";
-import type { HistoricalSessionBinding } from "../src/gjc/session-authority-types";
+import { isAuthorityDocumentRelationallyValid, isV2Record } from "../src/gjc/session-authority-record-validation";
+import type {
+	HistoricalSessionBinding,
+	SessionAuthorityRecord,
+	SessionAuthorityTombstone,
+} from "../src/gjc/session-authority-types";
 import {
 	encodeSessionAuthorityV3Document,
 	isSessionAuthorityV3Document,
@@ -16,7 +23,9 @@ import {
 	SESSION_AUTHORITY_V3_EPOCH,
 	SESSION_AUTHORITY_V3_KIND,
 	type SessionAuthorityV3Document,
+	type SessionAuthorityV3Mapping,
 	type SessionAuthorityV3Operation,
+	type SessionAuthorityV3Tombstone,
 } from "../src/gjc/session-authority-v3";
 import { SessionV3FileBackedMappingStore } from "../src/gjc/session-v3-file-backed-mapping-store";
 import type {
@@ -279,7 +288,528 @@ function bootstrapGraph() {
 	};
 }
 
+function rekeyedGraph() {
+	const fixture = bootstrapGraph();
+	const ack = transitionManagedLifecycleEvidence(
+		transitionManagedLifecycleEvidence(fixture.lifecycle, "invoking", {}, timestamp),
+		"acknowledged_unproven",
+		{ acknowledged: fixture.acknowledged },
+		timestamp,
+	);
+	const lifecycle = transitionManagedLifecycleEvidence(
+		ack,
+		"active_generation_proven",
+		{ proven: fixture.proof },
+		timestamp,
+	);
+	const receipt: SessionAuthorityV3Operation = {
+		...fixture.operation,
+		id: "migration:resume:original-root",
+		ingressId: "migration:resume:original-root",
+		state: "complete",
+		completedAt: timestamp,
+		lifecycle,
+	};
+	const chatId = JSON.stringify([fixture.prepared.principalId, fixture.prepared.chatId]);
+	const { historicalBinding: _history, ...fields } = fixture.mapping;
+	const root = {
+		...fields,
+		chatId,
+		header: { ...fields.header, chatId },
+		managedAuthority: { ...fixture.acknowledged, chatId, authorityEpoch: SESSION_AUTHORITY_V3_EPOCH },
+		journal: [...fixture.priorJournal, receipt],
+	};
+	const published = fixture.priorJournal[0]!;
+	const result = published.result!;
+	if (result.historicalBinding === undefined) throw new Error("Expected historical result.");
+	const provisional = {
+		id: published.id,
+		kind: "create" as const,
+		state: "complete" as const,
+		startedAt: published.startedAt,
+		completedAt: published.completedAt,
+		...result.mapping,
+		historicalBinding: {
+			...result.historicalBinding,
+			provenance: { ...result.historicalBinding.provenance, nodeRef: "/provisionalOperations/0" },
+		},
+	};
+	const {
+		operationId: _operationId,
+		rawFrameCursor: _rawFrameCursor,
+		eventCursor: _eventCursor,
+		...reservation
+	} = provisional;
+	const document: SessionAuthorityV3Document = {
+		...fixture.document,
+		mappings: [root],
+		provisionalOperations: [reservation],
+	};
+	return { fixture, root, receipt, reservation, document };
+}
+
+function unownedRekeyedGraph(principalId: string) {
+	const base = rekeyedGraph();
+	const removePrincipal = (value: unknown): unknown => {
+		if (Array.isArray(value)) return value.map(removePrincipal);
+		if (value === null || typeof value !== "object") return value;
+		if ("kind" in value && value.kind === "unbound-history")
+			return Object.fromEntries(
+				Object.entries(value)
+					.filter(([key]) => key !== "principalId")
+					.map(([key, child]) => [key, key === "reason" ? "ownership-unresolved" : removePrincipal(child)]),
+			);
+		return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, removePrincipal(child)]));
+	};
+	const history = removePrincipal(base.fixture.document);
+	if (!isSessionAuthorityV3Document(history)) throw new Error("Invalid unowned source fixture.");
+	const original = history.mappings[0]!;
+	const preparedAuthority = { ...base.fixture.prepared, principalId };
+	if (original.historicalBinding === undefined) throw new Error("Missing original binding.");
+	const intent = createManagedLifecycleEvidence(
+		{
+			operation: "session.resume",
+			preparedAuthority,
+			historicalSource: {
+				...base.fixture.lifecycle.historicalSource!,
+				historicalBinding: original.historicalBinding,
+			},
+			target: base.fixture.lifecycle.target,
+			payloadHash: base.fixture.lifecycle.payloadHash,
+		},
+		timestamp,
+	);
+	const acknowledged = { ...base.fixture.acknowledged, principalId };
+	const active = transitionManagedLifecycleEvidence(
+		transitionManagedLifecycleEvidence(
+			transitionManagedLifecycleEvidence(intent, "invoking", {}, timestamp),
+			"acknowledged_unproven",
+			{ acknowledged },
+			timestamp,
+		),
+		"active_generation_proven",
+		{ proven: base.fixture.proof },
+		timestamp,
+	);
+	const chatId = JSON.stringify([principalId, preparedAuthority.chatId]);
+	const { historicalBinding: _history, managedAuthority: _managed, ...fields } = original;
+	const root = {
+		...fields,
+		chatId,
+		header: { ...fields.header, chatId },
+		managedAuthority: { ...acknowledged, chatId, authorityEpoch: SESSION_AUTHORITY_V3_EPOCH },
+		journal: [...original.journal.slice(0, -1), { ...base.receipt, lifecycle: active }],
+	};
+	const { principalId: _principal, ...binding } = base.reservation.historicalBinding;
+	const reservation = {
+		...base.reservation,
+		historicalBinding: { ...binding, reason: "ownership-unresolved" as const },
+	};
+	const document: SessionAuthorityV3Document = {
+		...base.document,
+		mappings: [root],
+		provisionalOperations: [reservation],
+	};
+	return { root, reservation, document };
+}
+
+function inheritedTombstone(value: SessionAuthorityV3Tombstone): SessionAuthorityTombstone {
+	const { version: _version, authorityEpoch: _epoch, prior, ...fields } = value;
+	return { ...fields, version: 2, ...(prior === undefined ? {} : { prior: inheritedTombstone(prior) }) };
+}
+function inheritedRecord(value: SessionAuthorityV3Mapping): SessionAuthorityRecord {
+	const { version: _version, authorityEpoch: _epoch, reassignment, ...fields } = value;
+	if (reassignment === undefined) return { ...fields, version: 2 };
+	const { sourceTombstone, priorTombstone, ...marker } = reassignment;
+	return {
+		...fields,
+		version: 2,
+		reassignment: {
+			...marker,
+			...(sourceTombstone === undefined ? {} : { sourceTombstone: inheritedTombstone(sourceTombstone) }),
+			...(priorTombstone === undefined ? {} : { priorTombstone: inheritedTombstone(priorTombstone) }),
+		},
+	};
+}
+function inheritedValid(document: SessionAuthorityV3Document): boolean {
+	return isAuthorityDocumentRelationallyValid(document.mappings.map(inheritedRecord), document.provisionalOperations);
+}
+
+function resultfulHistoricalReservation(omitOwner = false) {
+	const base = rekeyedGraph();
+	const published = base.root.journal[0]!.result!;
+	if (published.historicalBinding === undefined) throw new Error("Expected historical publication.");
+	const { historicalBinding, managedAuthority: _managed, ...payload } = published;
+	const { principalId: _principal, canonicalWorkspace: _workspace, ...unowned } = historicalBinding;
+	const resultHistory: HistoricalSessionBinding = {
+		...(omitOwner ? { ...unowned, reason: "ownership-unresolved" as const } : historicalBinding),
+		provenance: {
+			...historicalBinding.provenance,
+			nodeRef: "/provisionalOperations/0/result",
+			nodeHash: "e".repeat(64),
+		},
+	};
+	const {
+		principalId: _reservationPrincipal,
+		canonicalWorkspace: _reservationWorkspace,
+		...unownedReservation
+	} = base.reservation.historicalBinding;
+	const reservationHistory: HistoricalSessionBinding = omitOwner
+		? { ...unownedReservation, reason: "ownership-unresolved" }
+		: base.reservation.historicalBinding;
+	const result = { ...structuredClone(payload), historicalBinding: resultHistory };
+	const reservation = { ...base.reservation, historicalBinding: reservationHistory, result };
+	return {
+		...base,
+		published,
+		result,
+		reservation,
+		document: { ...base.document, provisionalOperations: [reservation] },
+	};
+}
+
 describe("session authority v3 full graph", () => {
+	test("associates completed provisional results with distinct immutable occurrence provenance and optional ownership", () => {
+		for (const omitOwner of [false, true]) {
+			const fixture = resultfulHistoricalReservation(omitOwner);
+			const before = JSON.stringify({ published: fixture.published, reservation: fixture.reservation });
+			expect(managedHistoricalPublicationAssociation(fixture.root, fixture.reservation)?.canonicalChatId).toBe(
+				fixture.root.chatId,
+			);
+			expect(isSessionAuthorityV3Document(fixture.document)).toBe(true);
+			expect(inheritedValid(fixture.document)).toBe(true);
+			const decoded = parseSessionAuthorityV3Document(encodeSessionAuthorityV3Document(fixture.document))!;
+			expect(structuredClone(decoded.provisionalOperations[0])).toEqual(structuredClone(fixture.reservation));
+			expect(decoded.provisionalOperations[0]!.result!.historicalBinding!.provenance.nodeRef).toBe(
+				"/provisionalOperations/0/result",
+			);
+			expect(decoded.mappings[0]!.journal[0]!.result!.historicalBinding!.provenance.nodeRef).toBe(
+				"/mappings/0/journal/0/result",
+			);
+			expect(decoded.provisionalOperations[0]!.result!.historicalBinding!.provenance.nodeHash).toBe("e".repeat(64));
+			if (omitOwner) {
+				expect(decoded.provisionalOperations[0]!.historicalBinding!.principalId).toBeUndefined();
+				expect(decoded.provisionalOperations[0]!.result!.historicalBinding!.canonicalWorkspace).toBeUndefined();
+			}
+			expect(JSON.stringify({ published: fixture.published, reservation: fixture.reservation })).toBe(before);
+			const { reassignment, ...retired } = fixture.root;
+			const sourceTombstone = { ...retired, retiredAt: timestamp, prior: reassignment!.sourceTombstone };
+			const next = {
+				...fixture.root,
+				projectId: "later-project",
+				sessionId: "later-session",
+				journal: [],
+				header: { ...fixture.root.header, projectId: "later-project", sessionId: "later-session" },
+				managedAuthority: {
+					...fixture.root.managedAuthority,
+					projectId: "later-project",
+					sessionId: "later-session",
+				},
+				reassignment: {
+					state: "committed" as const,
+					sourceProjectId: fixture.root.projectId,
+					targetProjectId: "later-project",
+					startedAt: timestamp,
+					completedAt: timestamp,
+					sourceTombstone,
+				},
+			};
+			expect(managedHistoricalPublicationAssociation(next, fixture.reservation)?.canonicalChatId).toBe(next.chatId);
+		}
+	});
+
+	test("rejects changed provisional result content, misplaced provenance and defined ownership conflicts", () => {
+		const fixture = resultfulHistoricalReservation();
+		const result = fixture.result;
+		const history = result.historicalBinding;
+		for (const changed of [
+			{ ...result, assistantText: "changed" },
+			{ ...result, events: [] },
+			{ ...result, mapping: { ...result.mapping, rawFrameCursor: result.mapping.rawFrameCursor + 1 } },
+			{ ...result, correlation: { ...result.correlation, commandId: "changed" } },
+			{ ...result, gate: { ...result.gate!, gateId: "changed" } },
+			{ ...result, historicalBinding: { ...history, principalId: "foreign" } },
+			{ ...result, historicalBinding: { ...history, canonicalWorkspace: "/foreign" } },
+			{ ...result, historicalBinding: { ...history, sessionId: "foreign" } },
+			...[
+				"/provisionalOperations/1/result",
+				"/provisionalOperations/0/result/extra",
+				"/mappings/0/journal/0/result",
+			].map(nodeRef => ({
+				...result,
+				historicalBinding: { ...history, provenance: { ...history.provenance, nodeRef } },
+			})),
+			{
+				...result,
+				historicalBinding: { ...history, provenance: { ...history.provenance, documentHash: "f".repeat(64) } },
+			},
+			{ ...result, historicalBinding: { ...history, provenance: { ...history.provenance, nodeHash: "invalid" } } },
+		]) {
+			const reservation = { ...fixture.reservation, result: changed };
+			expect(managedHistoricalPublicationAssociation(fixture.root, reservation)).toBeUndefined();
+			expect(isSessionAuthorityV3Document({ ...fixture.document, provisionalOperations: [reservation] })).toBe(
+				false,
+			);
+			expect(inheritedValid({ ...fixture.document, provisionalOperations: [reservation] })).toBe(false);
+		}
+		const { historicalBinding: _history, ...payload } = result;
+		const managedResult = {
+			...payload,
+			managedAuthority: authority(result.mapping.chatId, result.mapping.projectId, result.mapping.sessionId),
+		};
+		expect(
+			managedHistoricalPublicationAssociation(fixture.root, { ...fixture.reservation, result: managedResult }),
+		).toBeUndefined();
+		const unowned = resultfulHistoricalReservation(true);
+		for (const patch of [{ principalId: "foreign" }, { canonicalWorkspace: "/foreign" }]) {
+			const reservation = {
+				...unowned.reservation,
+				historicalBinding: { ...unowned.reservation.historicalBinding, ...patch },
+				result: { ...unowned.result, historicalBinding: { ...unowned.result.historicalBinding, ...patch } },
+			};
+			expect(managedHistoricalPublicationAssociation(unowned.root, reservation)).toBeUndefined();
+		}
+	});
+
+	test("associates exact unscoped history beneath one canonical live root without rewriting descendants", () => {
+		const { document, root, fixture, reservation } = rekeyedGraph();
+		const before = JSON.stringify(fixture.priorJournal);
+		expect(isSessionAuthorityV3Document(document)).toBe(true);
+		expect(inheritedValid(document)).toBe(true);
+		expect(isV2Record(inheritedRecord(root))).toBe(false);
+		expect(
+			managedHistoricalSourceAssociation(
+				root,
+				fixture.priorJournal[0]!.result!.historicalBinding!,
+				fixture.priorJournal[0],
+			)?.canonicalChatId,
+		).toBe(root.chatId);
+		expect(managedHistoricalPublicationAssociation(root, reservation)?.canonicalChatId).toBe(root.chatId);
+		const decoded = parseSessionAuthorityV3Document(encodeSessionAuthorityV3Document(document))!;
+		expect(structuredClone(decoded)).toEqual(structuredClone(document));
+		expect(decoded.mappings[0]!.journal.slice(0, -1)).toEqual([...fixture.priorJournal]);
+		expect(JSON.stringify(fixture.priorJournal)).toBe(before);
+		expect(decoded.mappings[0]!.journal[0]!.result!.mapping.chatId).toBe("chat-a");
+		expect(decoded.mappings[0]!.reassignment!.sourceTombstone!.chatId).toBe("chat-a");
+		expect(decoded.provisionalOperations[0]!.chatId).toBe("chat-a");
+		const later = {
+			...root,
+			managedAuthority: {
+				...root.managedAuthority,
+				generation: 20,
+				requestKey: "ordinary-turn",
+				leaseId: "new-lease",
+				epoch: "new-epoch",
+			},
+		};
+		expect(isSessionAuthorityV3Document({ ...document, mappings: [later] })).toBe(true);
+	});
+
+	test("requires a unique completed namespaced matching receipt and rejects foreign child provenance", () => {
+		const { document, root, receipt } = rekeyedGraph();
+		const history = root.journal[0]!.result!.historicalBinding!;
+		for (const replacement of [
+			{ ...receipt, id: "ordinary-resume" },
+			{ ...receipt, state: "uncertain" as const, completedAt: undefined },
+			{ ...receipt, lifecycle: undefined },
+			{
+				...receipt,
+				lifecycle: {
+					...receipt.lifecycle!,
+					historicalSource: { ...receipt.lifecycle!.historicalSource!, manifestDigest: "bad" },
+				},
+			},
+		]) {
+			const candidate = {
+				...document,
+				mappings: [{ ...root, journal: [...root.journal.slice(0, -1), replacement] }],
+			};
+			expect(isSessionAuthorityV3Document(candidate)).toBe(false);
+			expect(inheritedValid(candidate)).toBe(false);
+		}
+		for (const journal of [
+			root.journal.slice(0, -1),
+			[...root.journal, { ...receipt, id: "migration:resume:duplicate", ingressId: "migration:resume:duplicate" }],
+		]) {
+			const candidate = { ...document, mappings: [{ ...root, journal }] };
+			expect(isSessionAuthorityV3Document(candidate)).toBe(false);
+			expect(inheritedValid(candidate)).toBe(false);
+		}
+		for (const patch of [
+			{ documentHash: "f".repeat(64) },
+			{ source: "other" },
+			{ nodeRef: "/mappings/00/journal/0/result" },
+			{ nodeRef: "/mappings/01/journal/0/result" },
+			{ nodeRef: "/mappings/1/journal/0/result" },
+			{ nodeRef: "/mappings/0/journal/1/result" },
+			{ nodeRef: "/mappings/0/body/journal/0/result" },
+		]) {
+			const first = root.journal[0]!;
+			const result = {
+				...first.result!,
+				historicalBinding: { ...history, provenance: { ...history.provenance, ...patch } },
+			};
+			const candidate = {
+				...document,
+				mappings: [{ ...root, journal: [{ ...first, result }, ...root.journal.slice(1)] }],
+			};
+			expect(isSessionAuthorityV3Document(candidate)).toBe(false);
+		}
+		const foreign = { ...root, managedAuthority: { ...root.managedAuthority, principalId: "foreign" } };
+		expect(isSessionAuthorityV3Document({ ...document, mappings: [foreign] })).toBe(false);
+		expect(inheritedValid({ ...document, mappings: [foreign] })).toBe(false);
+	});
+
+	test("reserves associated completed provisional aliases and rejects unresolved or ambiguous old-key lookup", () => {
+		const { document, root, reservation, receipt } = rekeyedGraph();
+		for (const operation of [
+			{ ...reservation, state: "uncertain" as const, completedAt: undefined },
+			{ ...reservation, ingressId: "different" },
+			{
+				...reservation,
+				sessionId: "foreign",
+				historicalBinding: { ...reservation.historicalBinding, sessionId: "foreign" },
+			},
+			{
+				...reservation,
+				historicalBinding: {
+					...reservation.historicalBinding,
+					provenance: { ...reservation.historicalBinding.provenance, documentHash: "f".repeat(64) },
+				},
+			},
+		]) {
+			const candidate = { ...document, provisionalOperations: [operation] };
+			expect(isSessionAuthorityV3Document(candidate)).toBe(false);
+			expect(inheritedValid(candidate)).toBe(false);
+		}
+		for (const provisionalOperations of [
+			[reservation, reservation],
+			[
+				reservation,
+				{
+					id: "new",
+					ingressId: reservation.id,
+					kind: "create" as const,
+					state: "pending" as const,
+					startedAt: timestamp,
+					chatId: root.chatId,
+					projectId: root.projectId,
+				},
+			],
+		]) {
+			const candidate = { ...document, provisionalOperations };
+			expect(isSessionAuthorityV3Document(candidate)).toBe(false);
+			expect(inheritedValid(candidate)).toBe(false);
+		}
+		const original = receipt.lifecycle!;
+		const { principalId: _principal, ...unowned } = original.historicalSource!.historicalBinding;
+		const historicalSource = {
+			...original.historicalSource!,
+			historicalBinding: { ...unowned, reason: "ownership-unresolved" as const },
+		};
+		const secondIntent = createManagedLifecycleEvidence(
+			{
+				operation: "session.resume",
+				historicalSource,
+				preparedAuthority: { ...original.preparedAuthority, principalId: "other-owner" },
+				target: original.target,
+				payloadHash: original.payloadHash,
+			},
+			timestamp,
+		);
+		const secondAck = { ...original.acknowledged!, principalId: "other-owner" };
+		const active = transitionManagedLifecycleEvidence(
+			transitionManagedLifecycleEvidence(
+				transitionManagedLifecycleEvidence(secondIntent, "invoking", {}, timestamp),
+				"acknowledged_unproven",
+				{ acknowledged: secondAck },
+				timestamp,
+			),
+			"active_generation_proven",
+			{ proven: original.proven },
+			timestamp,
+		);
+		// Association must not infer a second principal for the retained child's explicit owner.
+		const secondKey = JSON.stringify(["other-owner", "chat-a"]);
+		const second = {
+			...root,
+			chatId: secondKey,
+			header: { ...root.header, chatId: secondKey },
+			managedAuthority: { ...root.managedAuthority, principalId: "other-owner", chatId: secondKey },
+			journal: [...root.journal.slice(0, -1), { ...receipt, lifecycle: active }],
+		};
+		expect(isSessionAuthorityV3Document({ ...document, mappings: [root, second] })).toBe(false);
+		const firstOwner = unownedRekeyedGraph("tenant-a");
+		const otherOwner = unownedRekeyedGraph("tenant-b");
+		expect(isSessionAuthorityV3Document(firstOwner.document)).toBe(true);
+		expect(isSessionAuthorityV3Document(otherOwner.document)).toBe(true);
+		const ambiguous = { ...firstOwner.document, mappings: [firstOwner.root, otherOwner.root] };
+		expect(isSessionAuthorityV3Document(ambiguous)).toBe(false);
+		expect(inheritedValid(ambiguous)).toBe(false);
+	});
+
+	test("inherits the retained receipt through managed source tombstones after later reassignment", () => {
+		const { document, root, reservation } = rekeyedGraph();
+		const { reassignment, ...retiredFields } = root;
+		const sourceTombstone = { ...retiredFields, retiredAt: timestamp, prior: reassignment!.sourceTombstone };
+		const next = {
+			...root,
+			projectId: "project-new",
+			sessionId: "new-session",
+			header: { ...root.header, projectId: "project-new", sessionId: "new-session" },
+			managedAuthority: { ...root.managedAuthority, projectId: "project-new", sessionId: "new-session" },
+			journal: [],
+			reassignment: {
+				state: "committed" as const,
+				sourceProjectId: root.projectId,
+				targetProjectId: "project-new",
+				startedAt: timestamp,
+				completedAt: timestamp,
+				sourceTombstone,
+				priorTombstone: structuredClone(sourceTombstone.prior),
+			},
+		};
+		const candidate: SessionAuthorityV3Document = { ...document, mappings: [next] };
+		expect(isSessionAuthorityV3Document(candidate)).toBe(true);
+		expect(inheritedValid(candidate)).toBe(true);
+		expect(managedHistoricalPublicationAssociation(next, reservation)?.canonicalChatId).toBe(next.chatId);
+		expect(parseSessionAuthorityV3Document(encodeSessionAuthorityV3Document(candidate))).toEqual(candidate);
+	});
+
+	test("does not associate unrelated managed children or post-bootstrap fabricated historical operations", () => {
+		const { document, root } = rekeyedGraph();
+		const first = root.journal[0]!;
+		const { historicalBinding: _history, ...result } = first.result!;
+		const managed = {
+			...first,
+			result: { ...result, managedAuthority: authority("chat-a", root.projectId, result.mapping.sessionId) },
+		};
+		expect(
+			isSessionAuthorityV3Document({
+				...document,
+				mappings: [{ ...root, journal: [managed, ...root.journal.slice(1)] }],
+			}),
+		).toBe(false);
+		const late = {
+			...first,
+			id: "late",
+			result: {
+				...first.result!,
+				mapping: { ...first.result!.mapping, operationId: "late" },
+				historicalBinding: {
+					...first.result!.historicalBinding!,
+					provenance: {
+						...first.result!.historicalBinding!.provenance,
+						nodeRef: `/mappings/0/journal/${root.journal.length}/result`,
+					},
+				},
+			},
+		};
+		expect(
+			isSessionAuthorityV3Document({ ...document, mappings: [{ ...root, journal: [...root.journal, late] }] }),
+		).toBe(false);
+	});
+
 	test("uses the original cutover epoch and rejects obsolete schema authority without rewriting runtime epochs", () => {
 		const value = golden();
 		expect(value.authorityEpoch).toBe("gjc-public-sdk-v015-managed/1");

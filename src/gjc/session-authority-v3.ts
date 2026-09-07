@@ -2,9 +2,13 @@ import { isAbsolute } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { NormalizedModelSelection } from "../contracts";
 import {
+	hasManagedHistoricalSourceChat,
 	isHistoricalSessionBinding,
 	isManagedLifecycleEvidence,
+	type ManagedHistoricalAssociationOwner,
 	type ManagedLifecycleEvidence,
+	managedHistoricalPublicationAssociation,
+	managedHistoricalSourceAssociation,
 	managedLifecycleEvidenceHash,
 } from "./managed-lifecycle-evidence";
 
@@ -238,6 +242,8 @@ export function isSessionAuthorityV3RelationallyValid(
 	const provisionalIdentities = new Set<string>();
 	for (const mapping of document.mappings) {
 		if (mappings.has(mapping.chatId)) return false;
+		if (document.mappings.some(other => other !== mapping && hasManagedHistoricalSourceChat(mapping, other.chatId)))
+			return false;
 		const mappingBinding = bindingIdentity(mapping);
 		const scope = mapping.observations?.__gjcSessionMappingScope;
 		if (
@@ -250,7 +256,7 @@ export function isSessionAuthorityV3RelationallyValid(
 		)
 			return false;
 		mappings.set(mapping.chatId, mapping);
-		if (!validateJournal(mapping, mapping.journal, identities)) return false;
+		if (!validateJournal(mapping, mapping.journal, identities, mapping)) return false;
 		for (const root of tombstoneRoots(mapping.reassignment))
 			for (
 				let tombstone: SessionAuthorityV3Tombstone | undefined = root;
@@ -258,16 +264,31 @@ export function isSessionAuthorityV3RelationallyValid(
 				tombstone = tombstone.prior
 			) {
 				if (
-					tombstone.chatId !== mapping.chatId ||
+					(tombstone.chatId !== mapping.chatId &&
+						(tombstone.historicalBinding === undefined ||
+							managedHistoricalSourceAssociation(mapping, tombstone.historicalBinding) === undefined)) ||
 					!compatibleOwnership(mapping, tombstone, false) ||
 					!validateBinding(tombstone, tombstone)
 				)
 					return false;
-				if (!validateJournal(tombstone, tombstone.journal, identities)) return false;
+				if (!validateJournal(tombstone, tombstone.journal, identities, mapping)) return false;
 			}
 	}
 	for (const provisional of document.provisionalOperations) {
-		const mapping = mappings.get(provisional.chatId);
+		const direct = mappings.get(provisional.chatId);
+		const associated = document.mappings.filter(
+			candidate =>
+				candidate.chatId !== provisional.chatId &&
+				managedHistoricalPublicationAssociation(candidate, provisional) !== undefined,
+		);
+		if (associated.length > 1 || (direct !== undefined && associated.length !== 0)) return false;
+		const mapping = direct ?? associated[0];
+		if (
+			mapping === undefined &&
+			document.mappings.some(candidate => hasManagedHistoricalSourceChat(candidate, provisional.chatId))
+		)
+			return false;
+		const namespace = mapping?.chatId ?? provisional.chatId;
 		if (!validateLifecycleSourceReference(provisional, mapping?.journal ?? [])) return false;
 		if (
 			!validateLifecycleOwner(
@@ -280,7 +301,7 @@ export function isSessionAuthorityV3RelationallyValid(
 		)
 			return false;
 		for (const identifier of operationIdentifiers(provisional)) {
-			const key = `${provisional.chatId}\u0000${identifier}`;
+			const key = `${namespace}\u0000${identifier}`;
 			if (provisionalIdentities.has(key)) return false;
 			provisionalIdentities.add(key);
 		}
@@ -325,7 +346,7 @@ export function isSessionAuthorityV3RelationallyValid(
 			!publicationReceipt
 		)
 			return false;
-		if (!addOperationIdentity(identities, provisional.chatId, provisional) && !publicationReceipt) return false;
+		if (!addOperationIdentity(identities, namespace, provisional) && !publicationReceipt) return false;
 	}
 	return true;
 }
@@ -705,7 +726,10 @@ function isReassignment(value: unknown, mapping: SessionAuthorityV3Mapping): val
 	return (
 		(value.sourceTombstone === undefined ||
 			(isTombstone(value.sourceTombstone) &&
-				value.sourceTombstone.chatId === mapping.chatId &&
+				(value.sourceTombstone.chatId === mapping.chatId ||
+					(value.sourceTombstone.historicalBinding !== undefined &&
+						managedHistoricalSourceAssociation(mapping, value.sourceTombstone.historicalBinding) !==
+							undefined)) &&
 				value.sourceTombstone.projectId === value.sourceProjectId)) &&
 		(value.priorTombstone === undefined || isTombstone(value.priorTombstone))
 	);
@@ -848,6 +872,7 @@ function validateJournal(
 	},
 	journal: readonly SessionAuthorityV3Operation[],
 	identities: Map<string, string>,
+	associationRoot?: ManagedHistoricalAssociationOwner,
 ): boolean {
 	const local = new Set<string>();
 	const ownerBinding = owner.binding ?? bindingIdentity(owner);
@@ -862,7 +887,16 @@ function validateJournal(
 		const successor = operation.acknowledgedSuccessor;
 		if (
 			successor !== undefined &&
-			(!validateBinding(successor, { ...owner, sessionId: successor.sessionId }) ||
+			(!validateBinding(successor, {
+				chatId: bindingIdentity(successor)?.chatId,
+				projectId: owner.projectId,
+				sessionId: successor.sessionId,
+			}) ||
+				(bindingIdentity(successor)?.chatId !== (associationRoot?.chatId ?? owner.chatId) &&
+					(associationRoot === undefined ||
+						successor.historicalBinding === undefined ||
+						managedHistoricalSourceAssociation(associationRoot, successor.historicalBinding, operation) ===
+							undefined)) ||
 				!compatibleBindingOwnership(ownerBinding, bindingIdentity(successor), true))
 		)
 			return false;
@@ -871,14 +905,18 @@ function validateJournal(
 			else local.add(identifier);
 		if (
 			operation.result !== undefined &&
-			(operation.result.mapping.chatId !== owner.chatId ||
+			((operation.result.mapping.chatId !== (associationRoot?.chatId ?? owner.chatId) &&
+				(associationRoot === undefined ||
+					operation.result.historicalBinding === undefined ||
+					managedHistoricalSourceAssociation(associationRoot, operation.result.historicalBinding, operation) ===
+						undefined)) ||
 				operation.result.mapping.projectId !== owner.projectId ||
 				operation.result.mapping.operationId !== operation.id ||
 				!compatibleBindingOwnership(ownerBinding, bindingIdentity(operation.result), true) ||
 				!validateBinding(operation.result, operation.result.mapping))
 		)
 			return false;
-		if (!addOperationIdentity(identities, owner.chatId, operation)) return false;
+		if (!addOperationIdentity(identities, associationRoot?.chatId ?? owner.chatId, operation)) return false;
 	}
 	return true;
 }
@@ -910,6 +948,8 @@ function isCompletedPublicationReceipt(
 	provisional: SessionAuthorityV3ProvisionalOperation,
 ): boolean {
 	if (mapping === undefined || provisional.state !== "complete") return false;
+	if (mapping.chatId !== provisional.chatId)
+		return managedHistoricalPublicationAssociation(mapping, provisional) !== undefined;
 	const matches = (owner: SessionAuthorityV3Mapping | SessionAuthorityV3Tombstone): boolean => {
 		if (owner.chatId !== provisional.chatId || owner.projectId !== provisional.projectId) return false;
 		const operation = owner.journal.find(
@@ -1028,8 +1068,9 @@ function publicationBindingMatches(
 	return (
 		left !== undefined &&
 		right !== undefined &&
-		(["chatId", "projectId", "sessionId", "principalId", "canonicalWorkspace"] as const).every(
-			field => left[field] === right[field],
+		(["chatId", "projectId", "sessionId"] as const).every(field => left[field] === right[field]) &&
+		(["principalId", "canonicalWorkspace"] as const).every(
+			field => left[field] === undefined || right[field] === undefined || left[field] === right[field],
 		)
 	);
 }

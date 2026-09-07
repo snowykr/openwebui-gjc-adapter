@@ -116,12 +116,19 @@ export async function activateAdapterSessionAuthorityV3(
 	};
 	const operationFor = (id: string): SessionAuthorityV3Operation | undefined => {
 		const target = targets.get(id);
-		return target === undefined
-			? undefined
-			: context?.stage
-					.read()
-					.mappings.find(record => record.chatId === target.source.chatId)
-					?.journal.find(operation => operation.id === id);
+		if (target === undefined || context === undefined) return undefined;
+		let found: SessionAuthorityV3Operation | undefined;
+		for (const record of context.stage.read().mappings)
+			for (const operation of record.journal) {
+				if (
+					operation.id !== id ||
+					!isDeepStrictEqual(operation.lifecycle?.historicalSource?.historicalBinding, target.source)
+				)
+					continue;
+				if (found !== undefined) return undefined;
+				found = operation;
+			}
+		return found;
 	};
 	const preparedFence = async (evidence: ManagedLifecycleEvidence): Promise<boolean> => {
 		const source = evidence.historicalSource;
@@ -208,6 +215,7 @@ export async function activateAdapterSessionAuthorityV3(
 					const graph = current.stage.read();
 					if (graph.provisionalOperations.some(operation => operation.state !== "complete")) return;
 					const sessionIds = new Set<string>();
+					const destinations = new Set<string>();
 					// Complete all local source/owner checks before constructing the public runtime.
 					for (const mapping of graph.mappings) {
 						if (mapping.historicalBinding === undefined) {
@@ -216,13 +224,22 @@ export async function activateAdapterSessionAuthorityV3(
 							throw new Error("Retained managed bootstrap proof requires original-incarnation recovery.");
 						}
 						const source = mapping.historicalBinding;
-						const scope = historicalScope(source);
+						const scope = historicalScope(source, input.configuredOwnerUserId);
 						if (
 							scope === undefined ||
 							hasUnresolvedReassignment(mapping.reassignment) ||
 							mapping.observations?.__gjcSessionMappingRetirement !== undefined
 						)
 							return;
+						const destination = JSON.stringify([scope.principalId, scope.chatId]);
+						if (
+							destinations.has(destination) ||
+							graph.mappings.some(item => item !== mapping && item.chatId === destination) ||
+							(destination !== mapping.chatId &&
+								graph.provisionalOperations.some(item => item.chatId === destination))
+						)
+							return;
+						destinations.add(destination);
 						if (sessionIds.has(mapping.sessionId)) return;
 						sessionIds.add(mapping.sessionId);
 						const previous = mapping.journal.find(
@@ -233,6 +250,9 @@ export async function activateAdapterSessionAuthorityV3(
 						if (
 							authority === undefined ||
 							authority.project.id !== mapping.projectId ||
+							!exactScopeString(authority.leaseId) ||
+							!exactScopeString(authority.epoch) ||
+							typeof authority.assertCurrent !== "function" ||
 							!isAbsolute(authority.canonicalWorkspace) ||
 							resolve(authority.canonicalWorkspace) !== authority.canonicalWorkspace ||
 							authority.project.cwd !== authority.canonicalWorkspace ||
@@ -260,7 +280,12 @@ export async function activateAdapterSessionAuthorityV3(
 							requestKey: `migration:resume:${identity}`,
 						};
 						// Receipt identity is immutable; a new lease cannot rewrite an old attempt.
-						if (!(await currentAuthority(prepared))) return;
+						if (
+							prepared.principalId !== scope.principalId ||
+							prepared.chatId !== scope.chatId ||
+							!(await currentAuthority(prepared))
+						)
+							return;
 						targets.set(previous?.id ?? `migration:resume:${identity}`, {
 							source,
 							prepared,
@@ -392,7 +417,6 @@ export async function activateAdapterSessionAuthorityV3(
 		if (activation.status === "blocked") result = { status: "blocked", activation };
 		else {
 			store = new V3FileBackedSessionMappingStore(input.sourcePath, lock);
-			store.setLegacyAdminPrincipalId(input.configuredOwnerUserId);
 			result = { status: "activated", activation, store };
 		}
 	} catch (error) {
@@ -459,23 +483,33 @@ function hasUnresolvedReassignment(reassignment: SessionAuthorityV3Reassignment 
 	return false;
 }
 
-function historicalScope(source: HistoricalSessionBinding): { principalId: string; chatId: string } | undefined {
+function historicalScope(
+	source: HistoricalSessionBinding,
+	configuredOwner: string,
+): { principalId: string; chatId: string } | undefined {
 	if (source.sessionId === undefined) return undefined;
 	try {
 		const key: unknown = JSON.parse(source.chatId);
-		if (
-			Array.isArray(key) &&
-			key.length === 2 &&
-			key.every(value => typeof value === "string" && value.length > 0) &&
-			JSON.stringify(key) === source.chatId &&
-			source.principalId === key[0]
-		)
+		if (Array.isArray(key)) {
+			if (
+				key.length !== 2 ||
+				!key.every(exactScopeString) ||
+				JSON.stringify(key) !== source.chatId ||
+				source.principalId !== key[0]
+			)
+				return undefined;
 			return { principalId: key[0], chatId: key[1] };
+		}
 	} catch {
-		/* An unscoped source must first receive an explicit tenant-scoped history binding. */
+		// Plain legacy chat IDs are not JSON tuples.
 	}
-	// Do not silently re-key a historical graph or infer ownership from session paths.
-	return undefined;
+	const principalId = source.principalId ?? configuredOwner;
+	return exactScopeString(principalId) && exactScopeString(source.chatId)
+		? { principalId, chatId: source.chatId }
+		: undefined;
+}
+function exactScopeString(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0 && value.trim() === value && !/[\p{Cc}]/u.test(value);
 }
 function tenant(value: ManagedPreparedTurnAuthority & { sessionId: string; generation: number }): TenantSessionKey {
 	const { requestKey: _requestKey, ...key } = value;

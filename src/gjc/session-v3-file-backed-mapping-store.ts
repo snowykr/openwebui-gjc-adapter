@@ -15,6 +15,7 @@ import {
 	assertManagedLifecycleEvidenceUpdate,
 	copyManagedLifecycleEvidence,
 	type ManagedLifecycleEvidence,
+	managedHistoricalSourceAssociation,
 	managedLifecycleEvidenceHash,
 } from "./managed-lifecycle-evidence";
 import {
@@ -437,7 +438,20 @@ export class V3FileBackedSessionMappingStore extends SessionMappingStore {
 				throw new Error("Historical bootstrap operation does not match its manifest and namespaced identity.");
 			let updated!: SessionOperation;
 			this.#authority.replaceAuthorityState((records, provisional) => {
-				const index = records.findIndex(record => record.chatId === source.historicalBinding.chatId);
+				const destination = canonicalSessionMappingKey(
+					evidence.preparedAuthority.principalId,
+					evidence.preparedAuthority.chatId,
+				);
+				const candidates = records
+					.map((record, index) => ({ record, index }))
+					.filter(
+						({ record }) =>
+							isDeepStrictEqual(record.historicalBinding, source.historicalBinding) ||
+							(record.chatId === destination &&
+								managedHistoricalSourceAssociation(record, source.historicalBinding)?.operationId ===
+									operationId),
+					);
+				const index = candidates.length === 1 ? candidates[0]!.index : -1;
 				const record = records[index];
 				if (
 					record === undefined ||
@@ -515,11 +529,18 @@ export class V3FileBackedSessionMappingStore extends SessionMappingStore {
 						!isDeepStrictEqual(found!.lifecycle, evidence)
 					)
 						throw new Error("Historical bootstrap promotion requires already persisted exact generation proof.");
+					if (
+						records.some(item => item !== record && item.chatId === destination) ||
+						(destination !== record.chatId && provisional.some(item => item.chatId === destination))
+					)
+						throw new Error("Historical bootstrap destination is already occupied.");
 					updated = { ...updated, state: "complete", completedAt: evidence.recordedAt };
 					const { historicalBinding: _history, ...fields } = replacement;
 					replacement = {
 						...fields,
-						managedAuthority: authorityV3ForDurableChat(evidence.acknowledged, "bootstrap", record.chatId),
+						chatId: destination,
+						header: { ...record.header, chatId: destination },
+						managedAuthority: authorityV3ForDurableChat(evidence.acknowledged, "bootstrap", destination),
 						journal: record.journal.map(operation => (operation.id === operationId ? updated : operation)),
 					};
 				}
