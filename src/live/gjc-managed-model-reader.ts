@@ -115,17 +115,20 @@ class ReaderLifetime {
  * transport credential; model-selection policy remains the sole catalog parser.
  */
 export function createManagedModelReaderFactory(input: CreateManagedModelReaderFactoryInput): ModelReaderFactory {
-	const temporary = input.temporary;
-	input = {
-		...input,
-		...(temporary === undefined
-			? {}
-			: { temporary: { ...temporary, assertFence: temporary.assertFence.bind(temporary) } }),
-	};
 	if (input.resolveAttachment === undefined && input.temporary === undefined)
 		throw new TypeError("A managed model attachment or temporary lifecycle input is required.");
 	if (typeof input.registerSettlement !== "function")
 		throw new TypeError("Managed model reader requires an actual settlement owner.");
+	const temporary = input.temporary;
+	input = {
+		runtime: input.runtime,
+		timeoutMs: input.timeoutMs,
+		registerSettlement: input.registerSettlement.bind(input),
+		...(input.resolveAttachment === undefined ? {} : { resolveAttachment: input.resolveAttachment.bind(input) }),
+		...(temporary === undefined
+			? {}
+			: { temporary: { ...temporary, assertFence: temporary.assertFence.bind(temporary) } }),
+	};
 	return async (context, signal) => {
 		const lease = context?.lease;
 		context =

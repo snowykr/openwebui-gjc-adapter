@@ -161,6 +161,40 @@ describe("managed model reader", () => {
 		},
 	);
 
+	test("retains original factory callback receivers and identities", async () => {
+		const fake = new FakeRuntime();
+		class Input {
+			readonly runtime = fake.runtime;
+			#registrations = 0;
+			#resolutions = 0;
+			registerSettlement(settled: Promise<void>): void {
+				this.#registrations++;
+				fake.registerSettlement(settled);
+			}
+			async resolveAttachment() {
+				this.#resolutions++;
+				return { tenant };
+			}
+			counts() {
+				return [this.#registrations, this.#resolutions];
+			}
+		}
+		const input = new Input();
+		const factory = createManagedModelReaderFactory(input);
+		input.registerSettlement = () => {
+			throw new Error("Replacement settlement owner was used.");
+		};
+		input.resolveAttachment = async () => {
+			throw new Error("Replacement attachment resolver was used.");
+		};
+		const reader = await factory(userContext);
+		expect(await reader.getAvailableModels()).toHaveLength(1);
+		await reader.stop();
+		await fake.settlements[0];
+		expect(input.counts()).toEqual([1, 1]);
+		expect(fake.closed).toBeUndefined();
+	});
+
 	test("temporary failed cleanup rejects registered settlement without borrowing another reader", async () => {
 		const fake = new FakeRuntime();
 		fake.status = "unknown";
