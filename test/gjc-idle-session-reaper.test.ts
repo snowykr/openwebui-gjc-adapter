@@ -21,7 +21,7 @@ import {
 	type ManagedIdleLifecycleRuntime,
 } from "../src/live/gjc-managed-idle-reaper";
 import type { OpenWebUIProjectionRepository } from "../src/openwebui/client";
-import { writeDirectV3Authority } from "./cli-fixtures";
+import { FakeManagedSdkRuntime, writeDirectV3Authority } from "./cli-fixtures";
 
 const project = {
 	id: "project-1",
@@ -40,6 +40,7 @@ const retirementEvidence = {
 } as const;
 
 function managedRuntimeFixture() {
+	const accounting = new FakeManagedSdkRuntime();
 	let state: "new" | "running" | "stopped" = "new";
 	let disposes = 0;
 	const registrations = new Map<string, Record<string, unknown>>();
@@ -55,6 +56,7 @@ function managedRuntimeFixture() {
 			tenant.epoch,
 		]);
 	const runtime = {
+		createProducerScope: () => accounting.createProducerScope(),
 		get state() {
 			return state;
 		},

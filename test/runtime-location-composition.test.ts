@@ -17,6 +17,7 @@ import {
 } from "../src/configure/systemd";
 import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import { buildResolvedInstalledAdapterServerOptions } from "../src/installed-adapter-server-options";
+import { FakeManagedSdkRuntime } from "./cli-fixtures";
 
 const { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync } = fs;
 const { readdirSync, rmSync, symlinkSync, writeFileSync } = fs;
@@ -108,7 +109,9 @@ describe("runtime location composition", () => {
 	test("selects direct V3 mappings and the active managed runtime", async () => {
 		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-v3-runtime-selection-")));
 		const calls: string[] = [];
+		const accounting = new FakeManagedSdkRuntime();
 		const runtime = {
+			createProducerScope: () => accounting.createProducerScope(),
 			state: "new",
 			start: async () => void calls.push("runtime-start"),
 			dispose: async () => void calls.push("runtime-dispose"),

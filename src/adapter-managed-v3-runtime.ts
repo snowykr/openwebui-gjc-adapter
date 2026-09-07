@@ -57,9 +57,10 @@ export function startActiveManagedRuntime(options: StartActiveManagedRuntimeOpti
 
 async function start(options: StartActiveManagedRuntimeOptions): Promise<ActiveManagedV3Runtime> {
 	const deadline = new ManagedOperationDeadline(options.turnTimeoutMs, "V3 runtime startup");
+	const scope = options.runtime.createProducerScope();
 	const step = <T>(action: () => Promise<T>): Promise<T> => {
 		deadline.remaining();
-		return deadline.wait(action());
+		return deadline.wait(scope.run(action));
 	};
 	try {
 		await step(() => options.runtime.start());
@@ -101,6 +102,7 @@ async function start(options: StartActiveManagedRuntimeOptions): Promise<ActiveM
 			},
 		});
 	} catch (error) {
+		void scope.seal().catch(() => undefined);
 		try {
 			await deadline.wait(options.runtime.dispose());
 		} catch (disposeError) {
@@ -109,6 +111,7 @@ async function start(options: StartActiveManagedRuntimeOptions): Promise<ActiveM
 		}
 		throw error;
 	} finally {
+		void scope.seal().catch(() => undefined);
 		deadline.close();
 	}
 }
@@ -170,6 +173,7 @@ function assertOptions(options: StartActiveManagedRuntimeOptions): void {
 		throw new TypeError("Managed turnTimeoutMs must be a positive finite timer-safe integer.");
 	if (
 		options.runtime === undefined ||
+		typeof options.runtime.createProducerScope !== "function" ||
 		typeof options.runtime.start !== "function" ||
 		typeof options.runtime.dispose !== "function" ||
 		typeof options.runtime.reconcile !== "function" ||

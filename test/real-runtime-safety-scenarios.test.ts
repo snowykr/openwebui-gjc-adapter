@@ -10,12 +10,13 @@ import { SqliteProjectRegistrationStore } from "../src/projects/registration-sto
 import type { RegisteredProject } from "../src/projects/registry";
 import { startAdapterServer } from "../src/server";
 import { observeStartup, spawnCli, terminateAndReap } from "./bounded-process-fixtures";
-import { reserveTcpPort } from "./cli-fixtures";
+import { FakeManagedSdkRuntime, reserveTcpPort } from "./cli-fixtures";
 
 const tempDirs: string[] = [];
 const handles: { stop(): Promise<void> }[] = [];
 
 function managedRuntimeFixture() {
+	const accounting = new FakeManagedSdkRuntime();
 	let state: "new" | "running" | "stopped" = "new";
 	const registrations = new Map<string, Record<string, unknown>>();
 	const tenantKey = (tenant: Record<string, unknown>) =>
@@ -30,6 +31,7 @@ function managedRuntimeFixture() {
 			tenant.epoch,
 		]);
 	const runtime = {
+		createProducerScope: () => accounting.createProducerScope(),
 		get state() {
 			return state;
 		},

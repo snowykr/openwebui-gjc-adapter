@@ -11,9 +11,10 @@ import {
 	InMemoryOutboxStore,
 	type OutboxStore,
 } from "../src/state/outbox";
-import { writeDirectV3Authority } from "./cli-fixtures";
+import { FakeManagedSdkRuntime, writeDirectV3Authority } from "./cli-fixtures";
 
 function managedRuntimeFixture() {
+	const accounting = new FakeManagedSdkRuntime();
 	let state: "new" | "running" | "stopped" = "new";
 	let starts = 0;
 	let disposes = 0;
@@ -30,6 +31,7 @@ function managedRuntimeFixture() {
 			tenant.epoch,
 		]);
 	const runtime = {
+		createProducerScope: () => accounting.createProducerScope(),
 		get state() {
 			return state;
 		},

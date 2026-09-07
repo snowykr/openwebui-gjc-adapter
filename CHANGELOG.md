@@ -26,6 +26,7 @@
 
 ### Fixed
 
+- Retained entered external canonical-startup fence work in the runtime's producer accounting. A bounded startup failure cannot release actual runtime disposal before that work settles; sealing the startup scope does not grant late dispatch or recovery authority.
 - Passed the original remaining startup budget into canonical serving reconcile/acquisition/status and bootstrap adoption/commit reconciliation. These nested SDK calls no longer receive a fresh default timeout hidden behind the outer startup race.
 - Preserved uninvoked `cleanup_pending` lifecycle obligations during canonical restart instead of inventing an ambiguous cleanup call. The routing operation remains uncertain and non-serving; interrupted invocations still require reconciliation, with original acknowledgement and request identity retained.
 - Forwarded actual reader settlement registration through normal-user background model selection, retaining workspace exclusion for pending or failed cleanup. This does not supply missing managed catalog authority. Bootstrap late-admission tests now establish invocation before expiring the unchanged deadline.

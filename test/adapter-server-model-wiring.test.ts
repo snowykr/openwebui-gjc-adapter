@@ -7,6 +7,7 @@ import { buildAdapterServerOptions } from "../src/adapter-server-options";
 import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import { SqliteProjectRegistrationStore } from "../src/projects/registration-store";
 import { RuntimeSingletonLock } from "../src/runtime-singleton-lock";
+import { FakeManagedSdkRuntime } from "./cli-fixtures";
 
 async function writeV3Authority(root: string, document: unknown): Promise<void> {
 	const canonicalPath = join(root, "openwebui-session-mappings.json");
@@ -33,6 +34,7 @@ describe("adapter server model wiring", () => {
 			const entered = Promise.withResolvers<void>();
 			const startFailure = new Error("runtime start failed");
 			const stopFailure = new Error("runtime actual disposal failed");
+			const accounting = new FakeManagedSdkRuntime();
 			let disposal: Promise<void> | undefined;
 			const close = spyOn(SqliteProjectRegistrationStore.prototype, "close");
 			const listed = spyOn(SqliteProjectRegistrationStore.prototype, "listProjects");
@@ -62,6 +64,7 @@ describe("adapter server model wiring", () => {
 					},
 					{
 						managedSdkRuntime: {
+							createProducerScope: () => accounting.createProducerScope(),
 							state: "new",
 							start: async () => {
 								throw startFailure;
@@ -111,7 +114,9 @@ describe("adapter server model wiring", () => {
 	test("selects only the managed runner and model reader for an active V3 authority", async () => {
 		const root = await mkdtemp(join(tmpdir(), "gjc-adapter-managed-model-wiring-"));
 		const calls: string[] = [];
+		const accounting = new FakeManagedSdkRuntime();
 		const managedRuntime = {
+			createProducerScope: () => accounting.createProducerScope(),
 			state: "new",
 			start: async () => void calls.push("managed-start"),
 			dispose: async () => void calls.push("managed-dispose"),

@@ -1,6 +1,6 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { startActiveManagedRuntime } from "../src/adapter-managed-v3-runtime";
-import type { ManagedSdkRuntime, TenantSessionKey } from "../src/gjc/managed-sdk-runtime";
+import { ManagedSdkRuntime, type TenantSessionKey } from "../src/gjc/managed-sdk-runtime";
 import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import type { SessionMapping } from "../src/gjc/session-mapping-store";
 import type { SessionV3FileBackedMappingStore } from "../src/gjc/session-v3-file-backed-mapping-store";
@@ -45,7 +45,31 @@ function runtime(status: "current" | "replaced" | "unknown" = "current", current
 	const calls: string[] = [];
 	const registrations: TenantSessionKey[] = [];
 	const attachment = { isCurrent: () => current };
+	const accounting = new ManagedSdkRuntime({
+		agentDir: "/unused-accounting-fixture",
+		deps: {
+			createRouter: () =>
+				new Proxy(
+					{},
+					{
+						get: () => {
+							throw new Error("Accounting Router is not available.");
+						},
+					},
+				) as never,
+			createLifecycleService: () =>
+				new Proxy(
+					{},
+					{
+						get: () => {
+							throw new Error("Accounting lifecycle is not available.");
+						},
+					},
+				) as never,
+		},
+	});
 	const fake = {
+		createProducerScope: () => accounting.createProducerScope(),
 		async start() {
 			calls.push("start");
 		},
@@ -72,6 +96,63 @@ function runtime(status: "current" | "replaced" | "unknown" = "current", current
 }
 
 describe("startActiveManagedRuntime", () => {
+	test.each([false, true])(
+		"actual runtime disposal retains entered external startup fence with rejection=%s",
+		async rejected => {
+			const entered = Promise.withResolvers<void>();
+			const fence = Promise.withResolvers<boolean>();
+			let stops = 0;
+			const attachment = { sessionId: "session-1", generation: 7, isCurrent: () => true };
+			const runtime = new ManagedSdkRuntime({
+				agentDir: "/unused-startup-fixture",
+				deps: {
+					tenantFence: async () => true,
+					createRouter: () =>
+						({
+							start: async () => {},
+							reconcile: async () => {},
+							attachment: () => attachment,
+							generationStatus: async () => ({ status: "current" }),
+							stop: async () => {
+								stops++;
+							},
+						}) as never,
+					createLifecycleService: () => ({}) as never,
+				},
+			});
+			const pending = startActiveManagedRuntime({
+				runtime,
+				mappings: store([mapping()]),
+				turnTimeoutMs: 50,
+				liveTenantFence: async () => {
+					entered.resolve();
+					return fence.promise;
+				},
+			}).catch(error => error);
+			await Promise.race([
+				entered.promise,
+				pending.then(error => {
+					throw error;
+				}),
+			]);
+			expect(await pending).toMatchObject({ code: "timeout" });
+			let disposed = false;
+			const disposal = runtime.dispose().then(() => {
+				disposed = true;
+			});
+			try {
+				await Bun.sleep(20);
+				expect(disposed).toBe(false);
+			} finally {
+				if (rejected) fence.reject(new Error("late external fence failure"));
+				else fence.resolve(true);
+				await disposal;
+			}
+			expect(stops).toBe(1);
+			expect(runtime.state).toBe("stopped");
+		},
+	);
+
 	test("passes remaining startup budget into each runtime proof boundary", async () => {
 		const fake = runtime();
 		const startTime = Date.now();
