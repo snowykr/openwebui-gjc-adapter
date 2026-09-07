@@ -149,7 +149,6 @@ export type ManagedLifecycleCloseRequest = Parameters<
 >[0];
 type LifecycleMethod = "create" | "createExternal" | "resume" | "resumeExternal" | "fork" | "close" | "list";
 interface PendingCall {
-	readonly settled: Promise<void>;
 	interrupt(error: Error): void;
 }
 interface CallBudget {
@@ -177,6 +176,7 @@ export class ManagedSdkRuntime {
 	readonly #historicalResumeFence: ManagedSdkRuntimeDeps["historicalResumeFence"];
 	readonly #drainTimeoutMs: number;
 	readonly #pending = new Set<PendingCall>();
+	readonly #producers = new Set<Promise<unknown>>();
 	readonly #tokens = new WeakMap<
 		ManagedSdkAttachment,
 		{ raw: router.SessionAttachment; registration: TenantSessionKey }
@@ -203,6 +203,7 @@ export class ManagedSdkRuntime {
 	#bootstrapAdmission = false;
 	#startPromise: Promise<void> | undefined;
 	#stopPromise: Promise<void> | undefined;
+	#disposePromise: Promise<void> | undefined;
 	#reconcileTail: Promise<void> = Promise.resolve();
 	#nextSubscriptionId = 1;
 
@@ -548,95 +549,117 @@ export class ManagedSdkRuntime {
 			return Promise.reject(new Error(`Managed SDK runtime cannot start from ${this.#state}.`));
 		this.#state = "starting";
 		this.#bootstrapAdmission = true;
-		this.#startPromise = (async () => {
-			try {
-				await this.#router.start();
-				if (this.#state === "starting") this.#state = "running";
-			} catch (error) {
-				if (this.#state === "starting") this.#state = "failed";
-				throw error;
-			} finally {
-				this.#bootstrapAdmission = false;
-			}
-		})();
+		this.#startPromise = this.#retain(
+			(async () => {
+				try {
+					await this.#router.start();
+					if (this.#state === "starting") this.#state = "running";
+				} catch (error) {
+					if (this.#state === "starting") this.#state = "failed";
+					throw error;
+				} finally {
+					this.#bootstrapAdmission = false;
+				}
+			})(),
+		);
 		return this.#startPromise;
 	}
 
+	/** Bounded shutdown observation; rejection does not prove owned work has settled. */
 	stop(): Promise<void> {
 		if (this.#stopPromise !== undefined) return this.#stopPromise;
-		if (this.#state === "stopped") {
-			this.#stopPromise = Promise.resolve();
-			return this.#stopPromise;
-		}
 		this.#state = "draining";
 		this.#bootstrapAdmission = false;
 		const expiresAt = performance.now() + this.#drainTimeoutMs;
+		let observationFailure: unknown;
 		const remaining = () => {
+			if (observationFailure !== undefined) throw observationFailure;
 			const budget = expiresAt - performance.now();
 			if (budget <= 0)
 				throw new ManagedSdkOperationError("drain_timeout", "Managed runtime shutdown deadline exceeded.");
 			return budget;
 		};
-		this.#stopPromise = (async () => {
-			let drainFailure: unknown;
+		let drainFailure: unknown;
+		const closeAdmission = () => {
+			if (this.#state === "stopped" || this.#state === "failed") return;
+			this.#state = "stopping";
+			this.#clearSubscriptions();
+			const interruption = new ManagedSdkOperationError(
+				"runtime_interrupted",
+				"Managed runtime drain expired; dispatched effects require durable caller reconciliation.",
+			);
+			for (const call of this.#pending) call.interrupt(interruption);
+		};
+		this.#disposePromise = (async () => {
 			try {
 				// Reserve half the same shutdown budget for local Router cleanup.
 				const drainBudget = Math.min(remaining(), this.#drainTimeoutMs / 2);
 				await boundedWait(this.#drain(), drainBudget, "drain_timeout");
 			} catch (error) {
 				drainFailure = error;
-				const interruption = new ManagedSdkOperationError(
-					"runtime_interrupted",
-					"Managed runtime drain expired; dispatched effects require durable caller reconciliation.",
-				);
-				for (const call of this.#pending) call.interrupt(interruption);
 			}
-			this.#state = "stopping";
-			this.#clearSubscriptions();
+			closeAdmission();
 			try {
-				const stopBudget = remaining();
-				await boundedWait(this.#router.stop(), stopBudget, "drain_timeout");
+				// A late start must not revive the Router after stop. Waiting does
+				// not renew permission to initiate stop past the original deadline.
+				await this.#startPromise?.catch(() => undefined);
 				remaining();
-				this.#state = "stopped";
-			} catch (error) {
-				this.#state = "failed";
-				if (drainFailure !== undefined)
-					throw new AggregateError([drainFailure, error], "Managed runtime shutdown failed.");
-				throw error;
+				await this.#router.stop();
+			} finally {
+				// Stop may unblock requests. A race timeout or unsubscribe must
+				// not discard ownership of an already-entered producer.
+				await this.#drain();
 			}
-			if (drainFailure !== undefined) throw drainFailure;
-		})();
+		})().then(
+			() => {
+				this.#state = "stopped";
+			},
+			error => {
+				this.#state = "failed";
+				throw error;
+			},
+		);
+		void this.#disposePromise.catch(() => undefined);
+		this.#stopPromise = boundedWait(
+			this.#disposePromise,
+			Math.max(0, expiresAt - performance.now()),
+			"drain_timeout",
+		).then(
+			() => {
+				remaining();
+				if (drainFailure !== undefined) throw drainFailure;
+			},
+			error => {
+				observationFailure = error;
+				closeAdmission();
+				throw error;
+			},
+		);
+		void this.#stopPromise.catch(() => undefined);
 		return this.#stopPromise;
 	}
 
-	async dispose(): Promise<void> {
-		await this.stop();
+	/** Actual producer quiescence and successful local stop; owners release only after fulfillment. */
+	dispose(): Promise<void> {
+		this.stop();
+		return this.#disposePromise!;
 	}
 
 	async #drain(): Promise<void> {
-		await this.#startPromise?.catch(() => undefined);
-		while (this.#state === "draining") {
-			const tails = [...this.#subscriptions.values()].map(subscription => subscription.tail);
-			await Promise.all([...this.#pending].map(call => call.settled).concat(tails));
-			if (
-				this.#pending.size === 0 &&
-				[...this.#subscriptions.values()].every(subscription => tails.includes(subscription.tail))
-			)
-				return;
-		}
+		while (this.#producers.size > 0) await Promise.allSettled([...this.#producers]);
 	}
 
 	/** Serializes explicit reconciliation without exposing Router implementation state. */
 	reconcile(timeoutMs?: number): Promise<void> {
-		const previous = this.#reconcileTail;
-		const next = this.#track(timeoutMs, async budget => {
-			await previous;
-			budget.remaining();
-			this.#assertOwner();
-			await this.#router.reconcile();
+		return this.#track(timeoutMs, budget => {
+			const next = this.#reconcileTail.then(async () => {
+				budget.remaining();
+				this.#assertOwner();
+				await this.#router.reconcile();
+			});
+			this.#reconcileTail = next.catch(() => undefined);
+			return next;
 		});
-		this.#reconcileTail = next.catch(() => undefined);
-		return next;
 	}
 
 	async acquireAttachment(key: TenantSessionKey, timeoutMs?: number): Promise<ManagedSdkAttachment> {
@@ -1003,27 +1026,33 @@ export class ManagedSdkRuntime {
 				return Math.max(1, Math.floor(remaining));
 			},
 		};
-		const result = Promise.race([
+		const raw = this.#retain(
 			Promise.resolve().then(() => {
 				budget.remaining();
 				this.#assertOwner(bootstrap);
 				return work(budget);
 			}),
-			interrupted,
-		]);
-		const pending: PendingCall = {
-			settled: result.then(
-				() => undefined,
-				() => undefined,
-			),
-			interrupt,
-		};
+		);
+		const result = Promise.race([raw, interrupted]);
+		const pending: PendingCall = { interrupt };
 		this.#pending.add(pending);
+		void raw.then(
+			() => this.#pending.delete(pending),
+			() => this.#pending.delete(pending),
+		);
 		return result.finally(() => {
 			stopped ??= new ManagedSdkOperationError("runtime_interrupted", "Managed SDK call is no longer admitted.");
 			clearTimeout(timer);
-			this.#pending.delete(pending);
 		});
+	}
+
+	#retain<T>(producer: Promise<T>): Promise<T> {
+		this.#producers.add(producer);
+		void producer.then(
+			() => this.#producers.delete(producer),
+			() => this.#producers.delete(producer),
+		);
+		return producer;
 	}
 
 	#isRegistered(key: TenantSessionKey): boolean {
@@ -1104,13 +1133,15 @@ export class ManagedSdkRuntime {
 				subscription.queued -= 1;
 			}
 		};
-		subscription.tail = subscription.tail.then(deliver, async previousError => {
-			if (!subscription.deliveryFailed) {
-				subscription.deliveryFailed = true;
-				subscription.deliveryError = previousError;
-			}
-			await deliver();
-		});
+		subscription.tail = this.#retain(
+			subscription.tail.then(deliver, async previousError => {
+				if (!subscription.deliveryFailed) {
+					subscription.deliveryFailed = true;
+					subscription.deliveryError = previousError;
+				}
+				await deliver();
+			}),
+		);
 	}
 
 	#cleanupSubscription(subscription: FrameSubscription): void {

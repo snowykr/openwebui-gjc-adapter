@@ -1,6 +1,8 @@
 import type { ManagedSdkRuntime, TenantSessionKey } from "./managed-sdk-runtime";
 
-/** Process-owned public Router/lifecycle operations required by adapter composition. */
+/** Process-owned public Router/lifecycle operations required by adapter composition.
+ * dispose fulfills only after raw producers settle and local Router stop succeeds;
+ * a bounded stop result is not a substitute for this ownership-release receipt. */
 export type ManagedSdkRuntimeDependency = Pick<
 	ManagedSdkRuntime,
 	| "state"

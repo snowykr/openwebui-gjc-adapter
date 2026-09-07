@@ -385,6 +385,216 @@ function invokeExternal(
 }
 
 describe("managed SDK runtime", () => {
+	test("waits for raw start before initiating one stop within the original budget", async () => {
+		const startGate = deferred<void>();
+		const f = fixture({ drainTimeoutMs: 1000, start: () => startGate.promise });
+		const started = f.runtime.start();
+		const disposal = f.runtime.dispose();
+		expect(f.calls).toEqual(["start"]);
+		expect(f.runtime.bootstrapAdmissionOpen).toBe(false);
+		await expect(f.runtime.acquireAttachment(tenant)).rejects.toMatchObject({ code: "runtime_interrupted" });
+		startGate.resolve();
+		await started;
+		await disposal;
+		expect(f.calls).toEqual(["start", "stop"]);
+		expect(f.runtime.state).toBe("stopped");
+	});
+
+	test("late raw lifecycle rejection settles cleanup without manufacturing success or another effect", async () => {
+		const entered = deferred<void>();
+		const gate = deferred<void>();
+		const f = fixture({
+			drainTimeoutMs: 50,
+			onMutation: async () => {
+				entered.resolve();
+				await gate.promise;
+			},
+		});
+		f.runtime.registerTenant(tenant);
+		await f.runtime.start();
+		const outcome = f.runtime
+			.closeLifecycleSession(tenant, { ...closeRequest(), timeoutMs: 25 })
+			.catch(error => error);
+		await entered.promise;
+		expect(await outcome).toMatchObject({ code: "timeout" });
+		const disposal = f.runtime.dispose();
+		await expect(f.runtime.stop()).rejects.toMatchObject({ code: "drain_timeout" });
+		expect(f.runtime.state).toBe("stopping");
+		gate.reject(new Error("late public failure"));
+		await disposal;
+		expect(f.runtime.state).toBe("stopped");
+		expect(await outcome).toMatchObject({ code: "timeout" });
+		expect(f.closeCalls).toHaveLength(1);
+	});
+
+	test.each(["reconcile", "proof"] as const)("serializes %s behind a timed-out raw reconciliation", async kind => {
+		const entered = deferred<void>();
+		const gate = deferred<void>();
+		let calls = 0;
+		const f = fixture({
+			reconcile: async () => {
+				if (++calls === 1) {
+					entered.resolve();
+					await gate.promise;
+				}
+			},
+		});
+		f.runtime.registerTenant(tenant);
+		await f.runtime.start();
+		const first = f.runtime.reconcile(25).catch(error => error);
+		await entered.promise;
+		expect(await first).toMatchObject({ code: "timeout" });
+		const next = (timeoutMs: number) =>
+			kind === "reconcile"
+				? f.runtime.reconcile(timeoutMs)
+				: f.runtime.proveLifecycleTenant(tenant, operationIdentity(), timeoutMs);
+		try {
+			await expect(next(25)).rejects.toMatchObject({ code: "timeout" });
+			expect(calls).toBe(1);
+			const admitted = next(5000);
+			gate.resolve();
+			await admitted;
+			expect(calls).toBe(2);
+		} finally {
+			gate.resolve();
+			await f.runtime.dispose();
+		}
+	});
+
+	test.each(["success", "failure"] as const)(
+		"observes late raw Router stop %s independently of its timeout",
+		async outcome => {
+			const gate = deferred<void>();
+			const f = fixture({ drainTimeoutMs: 50, stop: () => gate.promise });
+			await f.runtime.start();
+			const disposal = f.runtime.dispose();
+			const observed = disposal.catch(error => error);
+			let settled = false;
+			void observed.then(() => {
+				settled = true;
+			});
+			await expect(f.runtime.stop()).rejects.toMatchObject({ code: "drain_timeout" });
+			expect(f.runtime.state).toBe("stopping");
+			expect(settled).toBe(false);
+			const failure = new Error("actual Router stop failed");
+			if (outcome === "success") gate.resolve();
+			else gate.reject(failure);
+			expect(await observed).toBe(outcome === "success" ? undefined : failure);
+			expect(f.runtime.state).toBe(outcome === "success" ? "stopped" : "failed");
+			expect(f.runtime.dispose()).toBe(disposal);
+			await expect(f.runtime.stop()).rejects.toMatchObject({ code: "drain_timeout" });
+			expect(f.calls.filter(call => call === "stop")).toHaveLength(1);
+			expect(f.closeCalls).toEqual([]);
+		},
+	);
+
+	test("disposal retains an unsubscribed listener already executing", async () => {
+		const entered = deferred<void>();
+		const gate = deferred<void>();
+		const f = fixture({ drainTimeoutMs: 100 });
+		f.runtime.registerTenant(tenant);
+		await f.runtime.start();
+		const token = await f.runtime.acquireAttachment(tenant);
+		let delivered = 0;
+		const subscription = f.runtime.subscribeFrames(token, "turn", { commandId: "queued-command" }, async () => {
+			delivered += 1;
+			entered.resolve();
+			await gate.promise;
+		});
+		await f.emit(observedFrame(1));
+		await entered.promise;
+		subscription();
+		const disposal = f.runtime.dispose();
+		let settled = false;
+		void disposal.then(() => {
+			settled = true;
+		});
+		try {
+			await expect(f.runtime.stop()).rejects.toMatchObject({ code: "drain_timeout" });
+			await f.emit(observedFrame(2));
+			expect(settled).toBe(false);
+			expect(delivered).toBe(1);
+			gate.resolve();
+			await disposal;
+			expect(f.runtime.state).toBe("stopped");
+		} finally {
+			gate.resolve();
+			await disposal;
+		}
+	});
+
+	test.each(["request", "lifecycle", "authorization", "prepared", "list", "reconcile"] as const)(
+		"disposal retains a timed-out raw %s producer until actual settlement",
+		async kind => {
+			const entered = deferred<void>();
+			const gate = deferred<void>();
+			let blocked = false;
+			const wait = async () => {
+				entered.resolve();
+				await gate.promise;
+			};
+			const f = fixture({
+				drainTimeoutMs: 100,
+				fence: async () => {
+					if (blocked && kind === "authorization") await wait();
+					return true;
+				},
+				preparedFence: async () => {
+					await wait();
+					return true;
+				},
+				request: async () => {
+					await wait();
+					return { ok: true };
+				},
+				onMutation: wait,
+				list: async () => {
+					await wait();
+					return { ok: true, operation: "session.list", result: { indexSeq: 1, sessions: [], warnings: [] } };
+				},
+				reconcile: wait,
+			});
+			f.runtime.registerTenant(tenant);
+			await f.runtime.start();
+			const token = await f.runtime.acquireAttachment(tenant);
+			blocked = true;
+			const pending = (
+				kind === "request"
+					? f.runtime.request(token, {}, { timeoutMs: 25 })
+					: kind === "prepared"
+						? invokeExternal(f.runtime, "prepared", {}, 25)
+						: kind === "list"
+							? f.runtime.listLifecycleSessions(tenant, { ...listRequest(), timeoutMs: 25 })
+							: kind === "reconcile"
+								? f.runtime.reconcile(25)
+								: f.runtime.closeLifecycleSession(tenant, { ...closeRequest(), timeoutMs: 25 })
+			).catch(error => error);
+			await entered.promise;
+			expect(await pending).toMatchObject({ code: "timeout" });
+			const disposal = f.runtime.dispose();
+			let settled = false;
+			void disposal.then(() => {
+				settled = true;
+			});
+			try {
+				await expect(f.runtime.stop()).rejects.toMatchObject({ code: "drain_timeout" });
+				expect(settled).toBe(false);
+				expect(f.runtime.state).toBe("stopping");
+				expect(f.calls.filter(call => call === "stop")).toHaveLength(1);
+				gate.resolve();
+				await disposal;
+				expect(f.runtime.state).toBe("stopped");
+				expect(f.runtime.dispose()).toBe(disposal);
+				if (kind === "authorization") expect(f.closeCalls).toEqual([]);
+				if (kind === "prepared") expect(f.createCalls).toEqual([]);
+				await expect(f.runtime.acquireAttachment(tenant)).rejects.toMatchObject({ code: "runtime_interrupted" });
+			} finally {
+				gate.resolve();
+				await disposal;
+			}
+		},
+	);
+
 	test.each(["acquire", "register", "adopt", "status", "retirement-status"] as const)(
 		"expired %s admission cannot perform late compound proof effects",
 		async mode => {
@@ -2089,7 +2299,7 @@ describe("managed SDK runtime", () => {
 		const f = fixture({ drainTimeoutMs: 15, stop: () => new Promise(() => {}) });
 		await f.runtime.start();
 		await expect(f.runtime.stop()).rejects.toMatchObject({ code: "drain_timeout" });
-		expect(f.runtime.state).toBe("failed");
+		expect(f.runtime.state).toBe("stopping");
 		expect(f.closeCalls).toEqual([]);
 	});
 
@@ -2123,7 +2333,8 @@ describe("managed SDK runtime", () => {
 			now += 700;
 			stopped.resolve();
 			await expect(shutdown).rejects.toMatchObject({ code: "drain_timeout" });
-			expect(f.runtime.state).toBe("failed");
+			await f.runtime.dispose();
+			expect(f.runtime.state).toBe("stopped");
 			expect(f.closeCalls).toEqual([]);
 		} finally {
 			clock.mockRestore();
@@ -2218,11 +2429,29 @@ describe("managed SDK runtime", () => {
 		expect(f.createCalls).toEqual([]);
 	});
 
-	test("bounds stop while Router start or a queued delivery fence never finishes", async () => {
-		const starting = fixture({ drainTimeoutMs: 15, start: () => new Promise(() => {}) });
+	test("bounds stop without overlapping a late start or forgetting a queued delivery", async () => {
+		const startGate = deferred<void>();
+		const starting = fixture({ drainTimeoutMs: 15, start: () => startGate.promise });
 		void starting.runtime.start();
 		await expect(starting.runtime.stop()).rejects.toMatchObject({ code: "drain_timeout" });
-		expect(starting.calls).toEqual(["start", "stop"]);
+		expect(starting.calls).toEqual(["start"]);
+		expect(starting.runtime.state).toBe("stopping");
+		const disposal = starting.runtime.dispose();
+		let settled = false;
+		void disposal.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+		await Promise.resolve();
+		expect(settled).toBe(false);
+		startGate.resolve();
+		await expect(disposal).rejects.toMatchObject({ code: "drain_timeout" });
+		expect(starting.runtime.state).toBe("failed");
+		expect(starting.calls).toEqual(["start"]);
 		let blocked = false;
 		const fence = deferred<boolean>();
 		const f = fixture({ drainTimeoutMs: 15, fence: () => (blocked ? fence.promise : true) });
@@ -2238,6 +2467,7 @@ describe("managed SDK runtime", () => {
 		await expect(f.runtime.stop()).rejects.toMatchObject({ code: "drain_timeout" });
 		fence.resolve(true);
 		await expect(subscription.drain()).rejects.toThrow();
+		await f.runtime.dispose();
 		expect(delivered).toBe(false);
 	});
 

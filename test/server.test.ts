@@ -2,6 +2,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ManagedSdkRuntime } from "../src/gjc/managed-sdk-runtime";
 import { closeIngressId, legacyCloseIngressId, type SessionCloseIngress } from "../src/gjc/session-router";
 import type { LiveGatewayRunner } from "../src/live/chat-completions";
 import type { ModelReaderContext } from "../src/live/model-reader";
@@ -784,7 +785,124 @@ describe("Bun transport configuration", () => {
 		}
 	});
 
-	test("aggregates startup and cleanup failures, including lock release", async () => {
+	test.each(["shutdown", "startup"] as const)("%s retains ownership through late actual Router stop", async phase => {
+		const runtimeRoot = await mkdtemp(join(tmpdir(), "adapter-owned-stop-"));
+		const gate = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		const runtime = new ManagedSdkRuntime({
+			agentDir: runtimeRoot,
+			deps: {
+				drainTimeoutMs: 50,
+				createRouter: () =>
+					({
+						start: async () => {},
+						stop: async () => {
+							entered.resolve();
+							await gate.promise;
+						},
+					}) as never,
+				createLifecycleService: () => ({}) as never,
+			},
+		});
+		await runtime.start();
+		const lock = await RuntimeSingletonLock.acquire(runtimeRoot);
+		const startupError = new Error("serve failed");
+		const serve = spyOn(Bun, "serve").mockImplementation(() => {
+			if (phase === "startup") throw startupError;
+			return { url: new URL("http://adapter.test/"), stop: async () => {} } as never;
+		});
+		try {
+			const start = startAdapterServer({
+				host: "127.0.0.1",
+				port: 0,
+				runtimeRoot,
+				runtimeLock: lock,
+				turnTimeoutMs: 1000,
+				managedSdkRuntime: { runtime, start: false, health: { phase: "ready" }, dispose: () => runtime.dispose() },
+			});
+			const stopping = phase === "startup" ? start.catch(error => error) : (await start).stop();
+			let settled = false;
+			void stopping.then(() => {
+				settled = true;
+			});
+			await entered.promise;
+			await expect(runtime.stop()).rejects.toMatchObject({ code: "drain_timeout" });
+			expect(settled).toBe(false);
+			await expect(RuntimeSingletonLock.acquire(runtimeRoot)).rejects.toThrow("already owned");
+			gate.resolve();
+			expect(await stopping).toBe(phase === "startup" ? startupError : undefined);
+			const replacement = await RuntimeSingletonLock.acquire(runtimeRoot);
+			await replacement.release();
+		} finally {
+			gate.resolve();
+			await runtime.dispose();
+			serve.mockRestore();
+			await rm(runtimeRoot, { recursive: true, force: true });
+		}
+	});
+
+	test.each(["router", "cleanup", "release"] as const)(
+		"shutdown preserves actual %s failure and lock ownership",
+		async phase => {
+			const runtimeRoot = await mkdtemp(join(tmpdir(), "adapter-failed-stop-"));
+			const failure = new Error(`${phase} failed`);
+			const runtime = new ManagedSdkRuntime({
+				agentDir: runtimeRoot,
+				deps: {
+					createRouter: () =>
+						({
+							start: async () => {},
+							stop: async () => {
+								if (phase === "router") throw failure;
+							},
+						}) as never,
+					createLifecycleService: () => ({}) as never,
+				},
+			});
+			await runtime.start();
+			const lock = await RuntimeSingletonLock.acquire(runtimeRoot);
+			const originalRelease = lock.release.bind(lock);
+			const release = spyOn(lock, "release").mockImplementation(async () => {
+				if (phase === "release") throw failure;
+				await originalRelease();
+			});
+			const serve = spyOn(Bun, "serve").mockImplementation(
+				() => ({ url: new URL("http://adapter.test/"), stop: async () => {} }) as never,
+			);
+			try {
+				const handle = await startAdapterServer({
+					host: "127.0.0.1",
+					port: 0,
+					runtimeRoot,
+					runtimeLock: lock,
+					turnTimeoutMs: 1000,
+					managedSdkRuntime: {
+						runtime,
+						start: false,
+						health: { phase: "ready" },
+						dispose: () => runtime.dispose(),
+					},
+					shutdownCleanup: () => {
+						if (phase === "cleanup") throw failure;
+					},
+				});
+				const stopping = handle.stop();
+				expect(handle.stop()).toBe(stopping);
+				const error = await stopping.catch(error => error);
+				expect(error).toBeInstanceOf(AggregateError);
+				expect(error.errors).toEqual([failure]);
+				expect(release).toHaveBeenCalledTimes(phase === "release" ? 1 : 0);
+				await expect(RuntimeSingletonLock.acquire(runtimeRoot)).rejects.toThrow("already owned");
+			} finally {
+				release.mockRestore();
+				serve.mockRestore();
+				await originalRelease();
+				await rm(runtimeRoot, { recursive: true, force: true });
+			}
+		},
+	);
+
+	test("aggregates startup cleanup failures without releasing unproven ownership", async () => {
 		const runtimeRoot = await mkdtemp(join(tmpdir(), "openwebui-gjc-adapter-server-"));
 		const startupFailure = new Error("serve initialization failed");
 		const runnerFailure = new Error("runner cleanup failed");
@@ -823,8 +941,10 @@ describe("Bun transport configuration", () => {
 			);
 			expect(failure).toBeInstanceOf(AggregateError);
 			if (!(failure instanceof AggregateError)) throw new TypeError("expected aggregate startup cleanup failure");
-			expect(failure.errors).toEqual([startupFailure, runnerFailure, cleanupFailure, releaseFailure]);
+			expect(failure.errors).toEqual([startupFailure, runnerFailure, cleanupFailure]);
 			expect(stopCalls).toBe(1);
+			expect(release).not.toHaveBeenCalled();
+			await expect(RuntimeSingletonLock.acquire(runtimeRoot)).rejects.toThrow("already owned");
 		} finally {
 			release.mockRestore();
 			serve.mockRestore();

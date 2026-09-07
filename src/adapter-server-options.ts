@@ -502,7 +502,7 @@ export async function buildResolvedAdapterServerOptions(
 			} catch (error) {
 				failures.push(error);
 			}
-			if (internalStore) {
+			if (internalStore && failures.length === 0) {
 				try {
 					projectStore?.close();
 				} catch (error) {
@@ -587,32 +587,39 @@ export async function buildResolvedAdapterServerOptions(
 		return options;
 	} catch (error) {
 		let startupError: unknown = error;
+		let cleanupFailed = false;
 		try {
 			await managedIdleReaper?.stop();
 		} catch (stopError) {
+			cleanupFailed = true;
 			startupError = new AggregateError([startupError, stopError], "Adapter initialization cleanup failed");
 		}
 		try {
 			await routingRunner?.stop?.();
 		} catch (stopError) {
+			cleanupFailed = true;
 			startupError = appendStartupCleanupError(startupError, stopError);
 		}
 		try {
 			await disposeManagedSdkRuntime();
 		} catch (disposeError) {
+			cleanupFailed = true;
 			startupError = appendStartupCleanupError(startupError, disposeError);
 		}
-		if (internalStore && projectStore !== undefined) {
+		if (!cleanupFailed && internalStore && projectStore !== undefined) {
 			try {
 				projectStore.close();
 			} catch (closeError) {
+				cleanupFailed = true;
 				startupError = appendStartupCleanupError(startupError, closeError);
 			}
 		}
-		try {
-			await lock.release();
-		} catch (releaseError) {
-			startupError = appendStartupCleanupError(startupError, releaseError);
+		if (!cleanupFailed) {
+			try {
+				await lock.release();
+			} catch (releaseError) {
+				startupError = appendStartupCleanupError(startupError, releaseError);
+			}
 		}
 		throw startupError;
 	}

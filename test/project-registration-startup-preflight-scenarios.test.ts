@@ -96,7 +96,7 @@ test("lifecycle aggregates an existing startup cause with an internal store clos
 	for (const mock of [realpath, close]) mock.mockRestore();
 	expect(await fixture.openFileDescriptors(context.databasePath)).toEqual([]);
 });
-test("lifecycle aggregates internal cleanup and lock-release failures without replacing startup", async () => {
+test("lifecycle retains singleton ownership when internal cleanup fails", async () => {
 	const context = await makeContext("internal-close-and-release-failures");
 	const missing = path.join(context.root, "missing");
 	const primary = new Error("primary realpath failure");
@@ -111,11 +111,31 @@ test("lifecycle aggregates internal cleanup and lock-release failures without re
 	const release = spyOn(RuntimeSingletonLock.prototype, "release").mockRejectedValue(releaseFailure);
 	try {
 		await expect(buildOptions(runtimeEnv(context.root, missing))).rejects.toBe(primary);
-		expect(primary.cause).toBeInstanceOf(AggregateError);
-		if (!(primary.cause instanceof AggregateError)) throw new TypeError("expected aggregate startup cleanup cause");
-		expect(primary.cause.errors).toEqual([secondary, releaseFailure]);
+		expect(primary.cause).toBe(secondary);
+		expect(close).toHaveBeenCalledTimes(1);
+		expect(release).not.toHaveBeenCalled();
+		await expect(RuntimeSingletonLock.acquire(path.join(context.root, "state"))).rejects.toThrow("already owned");
+	} finally {
+		for (const mock of [realpath, close, release]) mock.mockRestore();
+	}
+});
+test("lifecycle preserves lock-release failure after successful internal cleanup", async () => {
+	const context = await makeContext("internal-release-failure");
+	const missing = path.join(context.root, "missing");
+	const primary = new Error("primary realpath failure");
+	const releaseFailure = new Error("lock release failure");
+	const originalRealpath = fs.realpath;
+	const realpath = spyOn(fs, "realpath");
+	for (let index = 0; index < 5; index += 1) realpath.mockImplementationOnce(originalRealpath);
+	realpath.mockRejectedValueOnce(primary);
+	const close = spyOn(RegistrationStore.prototype, "close");
+	const release = spyOn(RuntimeSingletonLock.prototype, "release").mockRejectedValue(releaseFailure);
+	try {
+		await expect(buildOptions(runtimeEnv(context.root, missing))).rejects.toBe(primary);
+		expect(primary.cause).toBe(releaseFailure);
 		expect(close).toHaveBeenCalledTimes(1);
 		expect(release).toHaveBeenCalledTimes(1);
+		await expect(RuntimeSingletonLock.acquire(path.join(context.root, "state"))).rejects.toThrow("already owned");
 	} finally {
 		for (const mock of [realpath, close, release]) mock.mockRestore();
 	}

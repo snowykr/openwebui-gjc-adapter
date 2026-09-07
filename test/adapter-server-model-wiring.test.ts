@@ -1,10 +1,12 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildAdapterServerOptions } from "../src/adapter-server-options";
 import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
+import { SqliteProjectRegistrationStore } from "../src/projects/registration-store";
+import { RuntimeSingletonLock } from "../src/runtime-singleton-lock";
 
 async function writeV3Authority(root: string, document: unknown): Promise<void> {
 	const canonicalPath = join(root, "openwebui-session-mappings.json");
@@ -23,6 +25,89 @@ async function writeV3Authority(root: string, document: unknown): Promise<void> 
 }
 
 describe("adapter server model wiring", () => {
+	test.each(["success", "failure"] as const)(
+		"startup waits for actual disposal %s before releasing local ownership",
+		async outcome => {
+			const root = await mkdtemp(join(tmpdir(), "adapter-startup-disposal-"));
+			const gate = Promise.withResolvers<void>();
+			const entered = Promise.withResolvers<void>();
+			const startFailure = new Error("runtime start failed");
+			const stopFailure = new Error("runtime actual disposal failed");
+			let disposal: Promise<void> | undefined;
+			const close = spyOn(SqliteProjectRegistrationStore.prototype, "close");
+			const listed = spyOn(SqliteProjectRegistrationStore.prototype, "listProjects");
+			const statePath = join(root, "state");
+			try {
+				const sessionRoot = join(root, "sessions");
+				await mkdir(sessionRoot);
+				await writeV3Authority(sessionRoot, {
+					kind: "openwebui-gjc-session-authority",
+					version: 3,
+					authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+					mappings: [],
+					provisionalOperations: [],
+				});
+				const pending = buildAdapterServerOptions(
+					{
+						mode: "existing",
+						bindHost: "127.0.0.1",
+						bindPort: 8765,
+						openWebUIBaseUrl: "http://127.0.0.1:3000",
+						allowedProjectRoots: [],
+						projects: [],
+						statePath,
+						sessionRoot,
+						gjcCommand: "/unused",
+						turnTimeoutMs: 1000,
+					},
+					{
+						managedSdkRuntime: {
+							state: "new",
+							start: async () => {
+								throw startFailure;
+							},
+							dispose: () => {
+								disposal ??= gate.promise;
+								entered.resolve();
+								return disposal;
+							},
+							reconcile: async () => {},
+							registerTenant: () => {},
+							acquireAttachment: async () => {},
+							generationStatus: async () => {},
+						} as never,
+					},
+				).catch(error => error);
+				await entered.promise;
+				const closedAtCleanup = close.mock.calls.length;
+				await expect(RuntimeSingletonLock.acquire(statePath)).rejects.toThrow("already owned");
+				if (outcome === "success") gate.resolve();
+				else gate.reject(stopFailure);
+				const error = await pending;
+				if (outcome === "success") {
+					expect(error).toBe(startFailure);
+					expect(close.mock.calls.length).toBe(closedAtCleanup + 1);
+					const replacement = await RuntimeSingletonLock.acquire(statePath);
+					await replacement.release();
+				} else {
+					expect(error).toBeInstanceOf(AggregateError);
+					expect(error.errors).toContain(stopFailure);
+					expect(close.mock.calls.length).toBe(closedAtCleanup);
+					await expect(RuntimeSingletonLock.acquire(statePath)).rejects.toThrow("already owned");
+				}
+			} finally {
+				gate.resolve();
+				const closed = new Set(close.mock.contexts);
+				const stores = new Set(listed.mock.contexts);
+				close.mockRestore();
+				listed.mockRestore();
+				for (const store of stores)
+					if (store instanceof SqliteProjectRegistrationStore && !closed.has(store)) store.close();
+				await rm(root, { recursive: true, force: true });
+			}
+		},
+	);
+
 	test("selects only the managed runner and model reader for an active V3 authority", async () => {
 		const root = await mkdtemp(join(tmpdir(), "gjc-adapter-managed-model-wiring-"));
 		const calls: string[] = [];

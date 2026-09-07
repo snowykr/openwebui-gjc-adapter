@@ -82,10 +82,12 @@ export async function startAdapterServer(options: AdapterServerOptions): Promise
 			} catch (error) {
 				failures.push(error);
 			}
-			try {
-				await lock.release();
-			} catch (error) {
-				failures.push(error);
+			if (failures.length === 0) {
+				try {
+					await lock.release();
+				} catch (error) {
+					failures.push(error);
+				}
 			}
 			if (failures.length > 0) throw new AggregateError(failures, "Server cleanup failed");
 		};
@@ -113,10 +115,12 @@ export async function startAdapterServer(options: AdapterServerOptions): Promise
 		} catch (cleanupError) {
 			failures.push(cleanupError);
 		}
-		try {
-			await lock.release();
-		} catch (releaseError) {
-			failures.push(releaseError);
+		if (failures.length === 1) {
+			try {
+				await lock.release();
+			} catch (releaseError) {
+				failures.push(releaseError);
+			}
 		}
 		if (failures.length > 1) throw new AggregateError(failures, "Server initialization cleanup failed");
 		throw error;
