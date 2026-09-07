@@ -117,7 +117,14 @@ describe("real canonical model selection scenarios", () => {
 			expect(afterMatch.gateResponses).toBe(beforeMismatch.coordinator.gateResponses + 1);
 			expect(afterMatch.setterAttempts).toBe(beforeMismatch.coordinator.setterAttempts);
 			expect(afterMatch.promptCount).toBe(beforeMismatch.coordinator.promptCount);
+		} finally {
+			await harness.stop();
+		}
+	}, 20_000);
 
+	test("rejects a missing gate model binding after restart without unrelated unfinished creates", async () => {
+		const harness = await RealSelectionHarness.start();
+		try {
 			harness.coordinator.emitGateOnNextPrompt();
 			expect(await harness.chat(LOW_MODEL_ID, { id: "gate-missing" })).toMatchObject({ status: 200 });
 			await expect(access(path.join(harness.root, "state", "openwebui-projection-outbox.json"))).rejects.toThrow();

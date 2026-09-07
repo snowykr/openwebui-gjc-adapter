@@ -26,6 +26,68 @@ async function writeV3Authority(root: string, document: unknown): Promise<void> 
 }
 
 describe("adapter server model wiring", () => {
+	test.each(["pending", "uncertain", "conflict"] as const)(
+		"unassigned %s provisional blocks SDK construction before serving startup",
+		async state => {
+			const root = await mkdtemp(join(tmpdir(), "adapter-provisional-admission-"));
+			let constructed = false;
+			try {
+				const sessionRoot = join(root, "sessions");
+				await mkdir(sessionRoot);
+				await writeV3Authority(sessionRoot, {
+					kind: "openwebui-gjc-session-authority",
+					version: 3,
+					authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+					mappings: [],
+					provisionalOperations: [
+						{
+							id: "catalog-create",
+							ingressId: "catalog-create",
+							kind: "create",
+							state,
+							chatId: '["owner","chat"]',
+							projectId: "project",
+							startedAt: "2026-08-24T00:00:00.000Z",
+						},
+					],
+				});
+				let options: Awaited<ReturnType<typeof buildAdapterServerOptions>> | undefined;
+				let failure: unknown;
+				try {
+					options = await buildAdapterServerOptions(
+						{
+							mode: "existing",
+							bindHost: "127.0.0.1",
+							bindPort: 8765,
+							openWebUIBaseUrl: "http://127.0.0.1:3000",
+							allowedProjectRoots: [],
+							projects: [],
+							statePath: join(root, "state"),
+							sessionRoot,
+							gjcCommand: "/unused",
+							turnTimeoutMs: 1000,
+						},
+						{
+							createManagedSdkRuntime: () => {
+								constructed = true;
+								return new FakeManagedSdkRuntime();
+							},
+						},
+					);
+				} catch (error) {
+					failure = error;
+				} finally {
+					await options?.shutdownCleanup?.();
+				}
+				expect(constructed).toBe(false);
+				expect(failure).toBeInstanceOf(Error);
+				expect((failure as Error).message).toContain("unfinished provisional");
+			} finally {
+				await rm(root, { recursive: true, force: true });
+			}
+		},
+	);
+
 	test.each(["success", "failure"] as const)(
 		"startup waits for actual disposal %s before releasing local ownership",
 		async outcome => {
@@ -111,61 +173,76 @@ describe("adapter server model wiring", () => {
 		},
 	);
 
-	test("selects only the managed runner and model reader for an active V3 authority", async () => {
-		const root = await mkdtemp(join(tmpdir(), "gjc-adapter-managed-model-wiring-"));
-		const calls: string[] = [];
-		const accounting = new FakeManagedSdkRuntime();
-		const managedRuntime = {
-			createProducerScope: () => accounting.createProducerScope(),
-			state: "new",
-			start: async () => void calls.push("managed-start"),
-			dispose: async () => void calls.push("managed-dispose"),
-			reconcile: async () => undefined,
-			registerTenant: () => undefined,
-			acquireAttachment: async () => undefined,
-			generationStatus: async () => ({ status: "current" as const }),
-		};
-		try {
-			const sessionRoot = join(root, "sessions");
-			await mkdir(sessionRoot, { recursive: true });
-			await writeV3Authority(sessionRoot, {
-				kind: "openwebui-gjc-session-authority",
-				version: 3,
-				authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
-				mappings: [],
-				provisionalOperations: [],
-			});
-			const options = await buildAdapterServerOptions(
-				{
-					mode: "existing",
-					bindHost: "127.0.0.1",
-					bindPort: 8765,
-					openWebUIBaseUrl: "http://127.0.0.1:3000",
-					allowedProjectRoots: [],
-					projects: [],
-					statePath: join(root, "state"),
-					sessionRoot,
-					gjcCommand: "/not-used-for-managed-v3",
-					turnTimeoutMs: 240_000,
-				},
-				{ managedSdkRuntime: managedRuntime as never },
-			);
+	test.each([false, true])(
+		"selects only managed dependencies with completed provisional history=%s",
+		async history => {
+			const root = await mkdtemp(join(tmpdir(), "gjc-adapter-managed-model-wiring-"));
+			const calls: string[] = [];
+			const accounting = new FakeManagedSdkRuntime();
+			const managedRuntime = {
+				createProducerScope: () => accounting.createProducerScope(),
+				state: "new",
+				start: async () => void calls.push("managed-start"),
+				dispose: async () => void calls.push("managed-dispose"),
+				reconcile: async () => undefined,
+				registerTenant: () => undefined,
+				acquireAttachment: async () => undefined,
+				generationStatus: async () => ({ status: "current" as const }),
+			};
+			try {
+				const sessionRoot = join(root, "sessions");
+				await mkdir(sessionRoot, { recursive: true });
+				await writeV3Authority(sessionRoot, {
+					kind: "openwebui-gjc-session-authority",
+					version: 3,
+					authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+					mappings: [],
+					provisionalOperations: history
+						? [
+								{
+									id: "completed",
+									kind: "create",
+									state: "complete",
+									chatId: '["owner","chat"]',
+									projectId: "project",
+									startedAt: "2026-08-24T00:00:00.000Z",
+									completedAt: "2026-08-24T00:00:00.000Z",
+								},
+							]
+						: [],
+				});
+				const options = await buildAdapterServerOptions(
+					{
+						mode: "existing",
+						bindHost: "127.0.0.1",
+						bindPort: 8765,
+						openWebUIBaseUrl: "http://127.0.0.1:3000",
+						allowedProjectRoots: [],
+						projects: [],
+						statePath: join(root, "state"),
+						sessionRoot,
+						gjcCommand: "/not-used-for-managed-v3",
+						turnTimeoutMs: 240_000,
+					},
+					{ managedSdkRuntime: managedRuntime as never },
+				);
 
-			expect(options.routes?.runner).toBeDefined();
-			const selectedModelReaderFactory = options.routes?.modelReaderFactory;
-			expect(selectedModelReaderFactory).toBeDefined();
-			expect(options.turnTimeoutMs).toBe(240_000);
-			expect(options.routes?.neutralWorkspace).toEndWith("/.gjc/openwebui/default-reader");
-			await expect(selectedModelReaderFactory!()).rejects.toThrow(
-				"Managed model catalog access requires explicit tenant or temporary service authority.",
-			);
-			expect(calls).toEqual(["managed-start"]);
-			await options.shutdownCleanup?.();
-			expect(calls).toEqual(["managed-start", "managed-dispose"]);
-		} finally {
-			await rm(root, { recursive: true, force: true });
-		}
-	});
+				expect(options.routes?.runner).toBeDefined();
+				const selectedModelReaderFactory = options.routes?.modelReaderFactory;
+				expect(selectedModelReaderFactory).toBeDefined();
+				expect(options.turnTimeoutMs).toBe(240_000);
+				expect(options.routes?.neutralWorkspace).toEndWith("/.gjc/openwebui/default-reader");
+				await expect(selectedModelReaderFactory!()).rejects.toThrow(
+					"Managed model catalog access requires explicit tenant or temporary service authority.",
+				);
+				expect(calls).toEqual(["managed-start"]);
+				await options.shutdownCleanup?.();
+				expect(calls).toEqual(["managed-start", "managed-dispose"]);
+			} finally {
+				await rm(root, { recursive: true, force: true });
+			}
+		},
+	);
 
 	test("fails closed for malformed V3 authority before startup effects", async () => {
 		const root = await mkdtemp(join(tmpdir(), "gjc-adapter-malformed-v3-"));

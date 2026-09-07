@@ -575,6 +575,8 @@ export class V3FileBackedSessionMappingStore extends SessionMappingStore {
 				.some(operation => operation.historicalBinding !== undefined && operation.state !== "complete")
 		)
 			throw new Error("Canonical V3 contains unbound history requiring restricted bootstrap.");
+		if (this.#authority.provisionalEntries().some(operation => operation.state !== "complete"))
+			throw new Error("Canonical V3 contains unfinished provisional operations requiring reconciliation.");
 	}
 	close(): void {
 		this.#authority.close();

@@ -172,6 +172,7 @@ export async function buildResolvedAdapterServerOptions(
 			projectStore.listLinkedProjects().map(project => project.id),
 		);
 		const mappings = new V3FileBackedSessionMappingStore(mappingStorePath);
+		mappings.assertServingReady();
 		const retirementLeases = new Map<string, WorkspaceLease>();
 		const retirementFence = async (
 			key: TenantSessionKey,
