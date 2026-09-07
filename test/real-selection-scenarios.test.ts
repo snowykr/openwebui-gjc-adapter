@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { access } from "node:fs/promises";
 import * as path from "node:path";
+import { isManagedLifecycleEvidence } from "../src/gjc/managed-lifecycle-evidence";
+import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import { canonicalSessionMappingKey } from "../src/gjc/session-mapping-store";
 import { LOW_MODEL_ID, MEDIUM_MODEL_ID, OFF_MODEL_ID } from "./model-selection-fixtures";
 import { expectNoDeliveryMutation, expectSelectionError } from "./real-selection-expectations";
@@ -58,8 +60,8 @@ describe("real canonical model selection scenarios", () => {
 				selection: initial.coordinator.selection,
 				setterAttempts: initial.coordinator.setterAttempts,
 				promptCount: initial.coordinator.promptCount,
-				catalogReads: initial.coordinator.catalogReads + 4,
-				stateReads: initial.coordinator.stateReads + 3,
+				catalogReads: initial.coordinator.catalogReads + 6,
+				stateReads: initial.coordinator.stateReads + 2,
 			});
 			expect(afterReadErrors.projectLookups).toBe(initial.projectLookups + 2);
 			expectNoDeliveryMutation(initial, afterReadErrors);
@@ -115,7 +117,14 @@ describe("real canonical model selection scenarios", () => {
 			expect(afterMatch.gateResponses).toBe(beforeMismatch.coordinator.gateResponses + 1);
 			expect(afterMatch.setterAttempts).toBe(beforeMismatch.coordinator.setterAttempts);
 			expect(afterMatch.promptCount).toBe(beforeMismatch.coordinator.promptCount);
+		} finally {
+			await harness.stop();
+		}
+	}, 20_000);
 
+	test("rejects a missing gate model binding after restart without unrelated unfinished creates", async () => {
+		const harness = await RealSelectionHarness.start();
+		try {
 			harness.coordinator.emitGateOnNextPrompt();
 			expect(await harness.chat(LOW_MODEL_ID, { id: "gate-missing" })).toMatchObject({ status: 200 });
 			await expect(access(path.join(harness.root, "state", "openwebui-projection-outbox.json"))).rejects.toThrow();
@@ -183,11 +192,9 @@ describe("real canonical model selection scenarios", () => {
 			);
 			expect(provisional).toHaveLength(1);
 			const operation = provisional[0] as Record<string, unknown>;
-			const attachment = operation.attachment as Record<string, unknown>;
+			expect(isManagedLifecycleEvidence(operation.lifecycle)).toBe(true);
 			const sessionId = operation.sessionId as string;
-			const workspace = path.join(harness.root, ".gjc", "openwebui", "default-reader");
-			const descriptorStat = attachment.descriptorStat as Record<string, unknown>;
-			expect(attachment.generation).toBe(descriptorStat.mtimeMs);
+			const managedAuthority = operation.managedAuthority as Record<string, unknown>;
 			expect(operation).toMatchObject({
 				id: "user-prompt-failed",
 				ingressId: "user-prompt-failed",
@@ -197,49 +204,60 @@ describe("real canonical model selection scenarios", () => {
 				projectId: "openwebui",
 				detail: expect.stringMatching(/^[a-f0-9]{64}$/),
 			});
-			expect(sessionId).toMatch(/^[0-9a-f-]{36}$/);
+			expect(sessionId).toMatch(/^selection-session-[0-9a-f-]{36}$/);
 			expect(Object.keys(operation).sort()).toEqual([
-				"attachment",
 				"chatId",
 				"detail",
 				"id",
 				"ingressId",
 				"kind",
+				"lifecycle",
+				"managedAuthority",
 				"projectId",
 				"sessionId",
 				"startedAt",
 				"state",
 			]);
-			expect(attachment).toMatchObject({
-				descriptorPath: path.join(workspace, ".gjc", "state", "sdk", `${sessionId}.json`),
-				descriptorStat: {
-					dev: expect.any(Number),
-					ino: expect.any(Number),
-					size: expect.any(Number),
-					mtimeMs: expect.any(Number),
-				},
-				payloadDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
-				expectedSessionId: sessionId,
-				expectedCwd: workspace,
-				tmuxSocket: expect.any(String),
-				tmuxPane: expect.stringMatching(/^%\d+$/),
-				tmuxPanePid: expect.any(Number),
-				tmuxOwnershipTag: expect.stringMatching(/^openwebui-gjc-[0-9a-f-]{36}$/),
-				ownedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+			expect(managedAuthority).toMatchObject({
+				principalId: "owner-selection",
+				projectId: "openwebui",
+				canonicalWorkspace: path.join(harness.root, ".gjc", "openwebui", "default-reader"),
+				chatId: scopedChatId,
+				sessionId,
+				generation: expect.any(Number),
+				leaseId: "selection-fixture-lease",
+				epoch: SESSION_AUTHORITY_V3_EPOCH,
+				requestKey: "user-prompt-failed",
+				authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
 			});
-			expect(Object.keys(attachment).sort()).toEqual([
-				"descriptorPath",
-				"descriptorStat",
-				"expectedCwd",
-				"expectedSessionId",
-				"generation",
-				"ownedAt",
-				"payloadDigest",
-				"tmuxOwnershipTag",
-				"tmuxPane",
-				"tmuxPanePid",
-				"tmuxSocket",
-			]);
+			const logicalAuthority = {
+				principalId: "owner-selection",
+				projectId: "openwebui",
+				canonicalWorkspace: path.join(harness.root, ".gjc", "openwebui", "default-reader"),
+				chatId: "chat-prompt-failed",
+				leaseId: "selection-fixture-lease",
+				epoch: SESSION_AUTHORITY_V3_EPOCH,
+				requestKey: "user-prompt-failed",
+			};
+			expect(operation.lifecycle).toMatchObject({
+				operation: "session.create",
+				actor: { id: logicalAuthority.principalId, namespace: "openwebui-gjc-adapter" },
+				state: "active_generation_proven",
+				requestKey: logicalAuthority.requestKey,
+				requestHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+				payloadHash: operation.detail,
+				preparedAuthority: logicalAuthority,
+				target: { kind: "existing_path", path: logicalAuthority.canonicalWorkspace },
+				acknowledged: { ...logicalAuthority, sessionId, generation: managedAuthority.generation },
+				proven: {
+					kind: "managed-generation",
+					sessionId,
+					generation: managedAuthority.generation,
+					leaseId: logicalAuthority.leaseId,
+					epoch: logicalAuthority.epoch,
+				},
+			});
+			expect(operation.lifecycle).not.toHaveProperty("retirement");
 			expect(JSON.stringify(operation)).not.toMatch(/assistant|PASS|private|TOKEN|\\u0000/);
 			const afterFailure = await harness.effects();
 			expect(afterFailure.coordinator.setterAttempts).toBe(beforeFailure.coordinator.setterAttempts + 2);

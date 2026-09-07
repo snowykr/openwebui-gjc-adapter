@@ -4,8 +4,10 @@ import {
 	constants,
 	copyFileSync,
 	existsSync,
+	fstatSync,
 	fsyncSync,
 	ftruncateSync,
+	lstatSync,
 	mkdirSync,
 	openSync,
 	readFileSync,
@@ -15,7 +17,7 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 
 import { streamEscapedJsonString, streamPlainJson, streamPlainObjectHead } from "../state/outbox-json";
 import { AuthorityMutationLock } from "./session-authority-file";
@@ -98,6 +100,17 @@ export class SessionAuthorityDurabilityError extends Error {
 	}
 }
 
+/** Original immutable snapshot metadata for replaying an exact private base/WAL copy.
+ * Only the original mtime is substituted when checking the copied WAL header;
+ * generation, size, digest and the entire WAL chain still require validation. */
+export interface SessionAuthoritySnapshotReplay {
+	readonly sourcePath: string;
+	readonly baseDigest: string;
+	readonly baseMtimeMs: number;
+	readonly reconciliationTimeMs: number;
+	readonly walDigest: string | null;
+}
+
 export class FileSessionAuthority extends SessionAuthority {
 	#baseIdentity: BaseIdentity | undefined = undefined;
 	#walIdentity: WalIdentity | undefined = undefined;
@@ -119,10 +132,28 @@ export class FileSessionAuthority extends SessionAuthority {
 	constructor(
 		private readonly filePath: string,
 		lock?: ReturnType<typeof AuthorityMutationLock.acquire>,
+		private readonly snapshotReplay?: SessionAuthoritySnapshotReplay,
 	) {
 		super();
 		const held = lock ?? AuthorityMutationLock.acquire(this.filePath);
 		try {
+			held.assertHeld(this.filePath);
+			if (
+				snapshotReplay !== undefined &&
+				(resolve(snapshotReplay.sourcePath) === resolve(filePath) ||
+					!Number.isFinite(snapshotReplay.baseMtimeMs) ||
+					snapshotReplay.baseMtimeMs < 0 ||
+					!Number.isFinite(snapshotReplay.reconciliationTimeMs) ||
+					snapshotReplay.reconciliationTimeMs < snapshotReplay.baseMtimeMs ||
+					!existsSync(filePath) ||
+					(snapshotReplay.walDigest !== null) !== existsSync(this.walPath))
+			)
+				throw new SessionAuthorityLoadError(filePath, "snapshot replay requires a distinct private base/WAL pair");
+			if (snapshotReplay !== undefined) {
+				assertPrivateReplayCopy(filePath, snapshotReplay.sourcePath, snapshotReplay.baseDigest);
+				if (snapshotReplay.walDigest !== null)
+					assertPrivateReplayCopy(this.walPath, `${snapshotReplay.sourcePath}.wal`, snapshotReplay.walDigest);
+			}
 			if (!existsSync(this.filePath)) {
 				this.#baseIdentity = undefined;
 				this.#walIdentity = undefined;
@@ -130,20 +161,28 @@ export class FileSessionAuthority extends SessionAuthority {
 				return;
 			}
 			this.load();
+			if (snapshotReplay !== undefined && this.#baseIdentity?.digest !== snapshotReplay.baseDigest)
+				throw new SessionAuthorityLoadError(filePath, "private base does not match its immutable snapshot");
 			// Capture the ORIGINAL base size before any recovery compaction below:
 			// a pending operation, trailing WAL garbage, or an oversized WAL can
 			// shrink the file, and the oversized decision and its health diagnostic
 			// must still reflect the pre-compaction document.
 			const originalBaseBytes = statIdentity(this.filePath)?.size ?? 0;
 			let trailingGarbage = false;
-			if (existsSync(this.walPath)) trailingGarbage = this.replayWal().trailingGarbage;
+			if (existsSync(this.walPath)) trailingGarbage = this.replayWal(snapshotReplay).trailingGarbage;
 			const pendingOperations = this.hasPendingOperations();
-			const needsRecovery = trailingGarbage || this.walOversized() || pendingOperations;
+			// Snapshot copies have different file stats from their original WAL
+			// binding. Compact the verified private pair without discarding history
+			// before handing it back to ordinary store callers.
+			const needsRecovery =
+				snapshotReplay !== undefined || trailingGarbage || this.walOversized() || pendingOperations;
 			const oversizedNotNormalized =
 				originalBaseBytes > AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES && !this.#normalized;
 			let bootRewrote = false;
 			if (needsRecovery) {
-				if (pendingOperations) super.reconcileRestart(false);
+				// Replaying one immutable snapshot must produce the same graph on
+				// every attempt, including locally rolled-back reassignment markers.
+				if (pendingOperations) super.reconcileRestart(false, snapshotReplay?.reconciliationTimeMs);
 				// Oversized recovery (normalized or legacy): write through the
 				// reference-based writer, never persist()'s entries() deep copy
 				// of every retained event payload. The decision considers the
@@ -249,10 +288,22 @@ export class FileSessionAuthority extends SessionAuthority {
 	): SessionAuthorityRecord {
 		return this.mutate(() => super.beginOperation(chatId, operation));
 	}
+	override discardPendingOperation(
+		chatId: string,
+		operation: Pick<SessionOperation, "id" | "ingressId" | "detail">,
+	): void {
+		return this.mutate(() => super.discardPendingOperation(chatId, operation));
+	}
 	override reserveProvisionalOperation(
 		operation: Omit<ProvisionalSessionOperation, "state" | "startedAt" | "completedAt">,
 	): ProvisionalSessionOperation {
 		return this.mutate(() => super.reserveProvisionalOperation(operation));
+	}
+	override discardPendingProvisionalOperation(
+		chatId: string,
+		operation: Pick<ProvisionalSessionOperation, "id" | "ingressId" | "detail">,
+	): void {
+		return this.mutate(() => super.discardPendingProvisionalOperation(chatId, operation));
 	}
 	override publishProvisionalOperation(
 		operation: Omit<ProvisionalSessionOperation, "state" | "startedAt" | "completedAt">,
@@ -263,7 +314,7 @@ export class FileSessionAuthority extends SessionAuthority {
 	override attachProvisionalOperation(
 		chatId: string,
 		ingressId: string,
-		attachment: Pick<ProvisionalSessionOperation, "sessionId" | "sessionFile" | "attachment">,
+		attachment: Pick<ProvisionalSessionOperation, "sessionId" | "sessionFile" | "attachment" | "managedAuthority">,
 	): ProvisionalSessionOperation {
 		return this.mutate(() => super.attachProvisionalOperation(chatId, ingressId, attachment));
 	}
@@ -538,8 +589,12 @@ export class FileSessionAuthority extends SessionAuthority {
 		// otherwise re-introduce them through the next WAL delta, so every
 		// subsequent mutation would append a large delta and immediately
 		// re-compact.
-		const normalizedMappings = mappings.map(normalizeRecordForPersistence);
-		const normalizedProvisional = provisionalOperations.map(normalizeProvisionalForPersistence);
+		const normalizedMappings =
+			this.snapshotReplay === undefined ? mappings.map(normalizeRecordForPersistence) : mappings;
+		const normalizedProvisional =
+			this.snapshotReplay === undefined
+				? provisionalOperations.map(normalizeProvisionalForPersistence)
+				: provisionalOperations;
 		mkdirSync(dirname(this.filePath), { recursive: true });
 		const temporary = `${this.filePath}.tmp-${process.pid}-${Date.now()}`;
 		const descriptor = openSync(temporary, "wx", 0o600);
@@ -701,7 +756,7 @@ export class FileSessionAuthority extends SessionAuthority {
 				const [chatId, record] = entry.value;
 				if (!firstMapping) writeChunk(",");
 				firstMapping = false;
-				const normalized = normalizeRecordForPersistence(record);
+				const normalized = this.snapshotReplay === undefined ? normalizeRecordForPersistence(record) : record;
 				drainedMappings.push(normalized);
 				streamRecord(normalized, writeChunk);
 				raw.records.delete(chatId);
@@ -713,7 +768,7 @@ export class FileSessionAuthority extends SessionAuthority {
 				const [key, op] = entry.value;
 				if (!firstProv) writeChunk(",");
 				firstProv = false;
-				const normalized = normalizeProvisionalForPersistence(op);
+				const normalized = this.snapshotReplay === undefined ? normalizeProvisionalForPersistence(op) : op;
 				drainedProvisional.push(normalized);
 				streamProvisional(normalized, writeChunk);
 				raw.provisional.delete(key);
@@ -813,7 +868,7 @@ export class FileSessionAuthority extends SessionAuthority {
 			closeSync(directory);
 		}
 	}
-	private replayWal(): { readonly trailingGarbage: boolean } {
+	private replayWal(snapshotReplay?: SessionAuthoritySnapshotReplay): { readonly trailingGarbage: boolean } {
 		const walPath = this.walPath;
 		let contents: string;
 		try {
@@ -821,6 +876,11 @@ export class FileSessionAuthority extends SessionAuthority {
 		} catch (error) {
 			throw new SessionAuthorityLoadError(this.filePath, "authority WAL is unreadable", error);
 		}
+		if (
+			snapshotReplay !== undefined &&
+			createHash("sha256").update(contents).digest("hex") !== snapshotReplay.walDigest
+		)
+			throw new SessionAuthorityLoadError(this.filePath, "private WAL does not match its immutable snapshot");
 		const parts = contents.split("\n");
 		const hasTrailingNewline = parts.length > 0 && parts[parts.length - 1] === "";
 		let lines = parts.filter(line => line.length > 0);
@@ -847,7 +907,11 @@ export class FileSessionAuthority extends SessionAuthority {
 		}
 		if (!isWalHeaderShape(header))
 			throw new SessionAuthorityLoadError(this.filePath, "authority WAL header is malformed");
-		if (!isWalHeaderBoundToBase(header, this.#baseIdentity)) {
+		const replayBase =
+			snapshotReplay === undefined || this.#baseIdentity === undefined
+				? this.#baseIdentity
+				: { ...this.#baseIdentity, mtimeMs: snapshotReplay.baseMtimeMs };
+		if (!isWalHeaderBoundToBase(header, replayBase)) {
 			// A syntactically valid header demonstrably bound to a DIFFERENT base
 			// is a stale WAL (an external base edit wins); only then is deletion
 			// safe.
@@ -1452,6 +1516,42 @@ function sameStatIdentity(
 function walHeader(base: BaseIdentity | undefined): unknown {
 	return { kind: WAL_KIND, version: WAL_VERSION, base, prevHash: WAL_CHAIN_SEED };
 }
+
+function assertPrivateReplayCopy(path: string, sourcePath: string, expectedDigest: string): void {
+	const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+	try {
+		const before = fstatSync(descriptor);
+		const source = lstatSync(sourcePath);
+		if (
+			!before.isFile() ||
+			!source.isFile() ||
+			source.isSymbolicLink() ||
+			(before.dev === source.dev && before.ino === source.ino) ||
+			before.size > 128 * 1024 * 1024
+		)
+			throw new SessionAuthorityLoadError(path, "snapshot replay must not alias original source identity");
+		const contents = readFileSync(descriptor);
+		const after = fstatSync(descriptor),
+			named = lstatSync(path);
+		if (
+			createHash("sha256").update(contents).digest("hex") !== expectedDigest ||
+			!named.isFile() ||
+			named.isSymbolicLink() ||
+			named.dev !== before.dev ||
+			named.ino !== before.ino ||
+			after.size !== before.size ||
+			after.mtimeMs !== before.mtimeMs ||
+			after.ctimeMs !== before.ctimeMs ||
+			named.size !== after.size ||
+			named.mtimeMs !== after.mtimeMs ||
+			named.ctimeMs !== after.ctimeMs
+		)
+			throw new SessionAuthorityLoadError(path, "private copy does not match its immutable snapshot");
+	} finally {
+		closeSync(descriptor);
+	}
+}
+
 function isWalHeaderShape(value: unknown): value is Record<string, unknown> {
 	if (typeof value !== "object" || value === null) return false;
 	const header = value as Record<string, unknown>;

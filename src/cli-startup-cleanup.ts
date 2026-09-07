@@ -7,15 +7,26 @@ export async function cleanupUnstartedAdapter(options: AdapterServerOptions, err
 	} catch (stopError) {
 		failures.push(stopError);
 	}
+	let disposed = false;
 	try {
-		await options.shutdownCleanup?.();
-	} catch (cleanupError) {
-		failures.push(cleanupError);
+		await options.managedSdkRuntime?.dispose();
+		disposed = true;
+	} catch (disposeError) {
+		failures.push(disposeError);
 	}
-	try {
-		await options.runtimeLock.release();
-	} catch (releaseError) {
-		failures.push(releaseError);
+	if (disposed) {
+		try {
+			await options.shutdownCleanup?.();
+		} catch (cleanupError) {
+			failures.push(cleanupError);
+		}
+	}
+	if (failures.length === 1) {
+		try {
+			await options.runtimeLock.release();
+		} catch (releaseError) {
+			failures.push(releaseError);
+		}
 	}
 	if (failures.length > 1) throw new AggregateError(failures, "Configured adapter startup cleanup failed");
 	throw error;

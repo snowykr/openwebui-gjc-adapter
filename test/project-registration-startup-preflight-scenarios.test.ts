@@ -1,9 +1,11 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { throws } from "node:assert/strict";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { buildAdapterServerOptionsFromEnv as buildOptions } from "../src/adapter-server-options";
+import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import { ProjectLinkError as LinkError } from "../src/projects/link-service";
 import { SqliteProjectRegistrationStore as RegistrationStore } from "../src/projects/registration-store";
 import { RuntimeSingletonLock } from "../src/runtime-singleton-lock";
@@ -94,7 +96,7 @@ test("lifecycle aggregates an existing startup cause with an internal store clos
 	for (const mock of [realpath, close]) mock.mockRestore();
 	expect(await fixture.openFileDescriptors(context.databasePath)).toEqual([]);
 });
-test("lifecycle aggregates internal cleanup and lock-release failures without replacing startup", async () => {
+test("lifecycle retains singleton ownership when internal cleanup fails", async () => {
 	const context = await makeContext("internal-close-and-release-failures");
 	const missing = path.join(context.root, "missing");
 	const primary = new Error("primary realpath failure");
@@ -109,11 +111,31 @@ test("lifecycle aggregates internal cleanup and lock-release failures without re
 	const release = spyOn(RuntimeSingletonLock.prototype, "release").mockRejectedValue(releaseFailure);
 	try {
 		await expect(buildOptions(runtimeEnv(context.root, missing))).rejects.toBe(primary);
-		expect(primary.cause).toBeInstanceOf(AggregateError);
-		if (!(primary.cause instanceof AggregateError)) throw new TypeError("expected aggregate startup cleanup cause");
-		expect(primary.cause.errors).toEqual([secondary, releaseFailure]);
+		expect(primary.cause).toBe(secondary);
+		expect(close).toHaveBeenCalledTimes(1);
+		expect(release).not.toHaveBeenCalled();
+		await expect(RuntimeSingletonLock.acquire(path.join(context.root, "state"))).rejects.toThrow("already owned");
+	} finally {
+		for (const mock of [realpath, close, release]) mock.mockRestore();
+	}
+});
+test("lifecycle preserves lock-release failure after successful internal cleanup", async () => {
+	const context = await makeContext("internal-release-failure");
+	const missing = path.join(context.root, "missing");
+	const primary = new Error("primary realpath failure");
+	const releaseFailure = new Error("lock release failure");
+	const originalRealpath = fs.realpath;
+	const realpath = spyOn(fs, "realpath");
+	for (let index = 0; index < 5; index += 1) realpath.mockImplementationOnce(originalRealpath);
+	realpath.mockRejectedValueOnce(primary);
+	const close = spyOn(RegistrationStore.prototype, "close");
+	const release = spyOn(RuntimeSingletonLock.prototype, "release").mockRejectedValue(releaseFailure);
+	try {
+		await expect(buildOptions(runtimeEnv(context.root, missing))).rejects.toBe(primary);
+		expect(primary.cause).toBe(releaseFailure);
 		expect(close).toHaveBeenCalledTimes(1);
 		expect(release).toHaveBeenCalledTimes(1);
+		await expect(RuntimeSingletonLock.acquire(path.join(context.root, "state"))).rejects.toThrow("already owned");
 	} finally {
 		for (const mock of [realpath, close, release]) mock.mockRestore();
 	}
@@ -372,12 +394,37 @@ function rawRow(root: string, overrides: Readonly<Record<string, fixture.SqlValu
 const protectedDomain = (root: string) => path.join(root, "home", ".gjc");
 const sessionRoot = (root: string) => path.join(protectedDomain(root), "openwebui/default-reader/.gjc/sessions");
 async function makeContext(label: string) {
-	const root = await fixture.makeWorkspace(`gjc-preflight-${label}`, ["home"]);
+	const root = await fixture.makeWorkspace(`gjc-preflight-${label}`, ["home", "sessions"]);
+	await writeV3Authority(path.join(root, "sessions"));
 	return { root, databasePath: path.join(root, "state", "adapter-state.sqlite") };
+}
+async function writeV3Authority(root: string): Promise<void> {
+	const canonicalPath = path.join(root, "openwebui-session-mappings.json");
+	const canonical = Buffer.from(
+		`${JSON.stringify({
+			kind: "openwebui-gjc-session-authority",
+			version: 3,
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+			mappings: [],
+			provisionalOperations: [],
+		})}\n`,
+	);
+	await fs.writeFile(canonicalPath, canonical);
+	await fs.writeFile(
+		`${canonicalPath}.v3-active.json`,
+		`${JSON.stringify({
+			kind: "openwebui-gjc-session-authority-active",
+			version: 1,
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+			activationV3Digest: createHash("sha256").update(canonical).digest("hex"),
+			source: { baseDigest: "0".repeat(64), walDigest: "0".repeat(64), walPresent: false },
+		})}\n`,
+	);
 }
 function runtimeEnv(root: string, allowedRoot = root): Record<string, string | undefined> {
 	return Object.assign({}, process.env, {
 		HOME: path.join(root, "home"),
+		GJC_OPENWEBUI_MODE: "existing",
 		GJC_OPENWEBUI_STATE_PATH: path.join(root, "state"),
 		GJC_OPENWEBUI_SESSION_ROOT: path.join(root, "sessions"),
 		GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS: allowedRoot,

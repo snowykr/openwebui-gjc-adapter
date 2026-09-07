@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
-import { constants, readFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -11,6 +11,10 @@ const SAFE_KEY_PATTERN = /^[a-f0-9]{64}$/;
 const PORTABLE_PROCESS_IDENTITY = "portable";
 const OPERATION_PATTERN = /^[a-z][a-z0-9-]{0,63}$/;
 const MAX_CORRELATION_ID_LENGTH = 256;
+const WORKSPACE_LEASE_ID_PREFIX = "wsl.";
+const WORKSPACE_LEASE_ID_VERSION = 1;
+const MAX_WORKSPACE_LEASE_ID_LENGTH = 1_024;
+const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 export const WORKSPACE_LEASE_SCHEMA_VERSION = 1 as const;
 
@@ -61,6 +65,60 @@ export interface WorkspaceLeaseReference {
 	readonly holderId: string;
 	readonly generation: number;
 	readonly operation: WorkspaceLeaseOperation;
+}
+
+/** Returns a stable, credential-free, versioned identifier for one exact lease fence. */
+export function workspaceLeaseId(reference: WorkspaceLeaseReference): string {
+	const normalized = leaseReference(reference);
+	const payload = JSON.stringify({
+		v: WORKSPACE_LEASE_ID_VERSION,
+		safeKey: normalized.safeKey,
+		holderId: normalized.holderId,
+		generation: normalized.generation,
+		operation: normalized.operation,
+	});
+	const identifier = `${WORKSPACE_LEASE_ID_PREFIX}${Buffer.from(payload).toString("base64url")}`;
+	if (identifier.length > MAX_WORKSPACE_LEASE_ID_LENGTH)
+		throw new RangeError("Workspace lease identifier exceeds the maximum length");
+	return identifier;
+}
+
+/** Parses and validates a canonical workspace lease identifier. */
+export function parseWorkspaceLeaseId(identifier: string): WorkspaceLeaseReference {
+	if (
+		typeof identifier !== "string" ||
+		identifier.length > MAX_WORKSPACE_LEASE_ID_LENGTH ||
+		!identifier.startsWith(WORKSPACE_LEASE_ID_PREFIX)
+	) {
+		throw new TypeError("Workspace lease identifier is malformed");
+	}
+	const encoded = identifier.slice(WORKSPACE_LEASE_ID_PREFIX.length);
+	if (!BASE64URL_PATTERN.test(encoded)) throw new TypeError("Workspace lease identifier is malformed");
+
+	let value: unknown;
+	try {
+		value = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+	} catch {
+		throw new TypeError("Workspace lease identifier is malformed");
+	}
+	if (!isRecord(value)) throw new TypeError("Workspace lease identifier payload is invalid");
+	const keys = Object.keys(value);
+	const expectedKeys = ["v", "safeKey", "holderId", "generation", "operation"];
+	if (
+		keys.length !== expectedKeys.length ||
+		expectedKeys.some(key => !Object.hasOwn(value, key)) ||
+		value.v !== WORKSPACE_LEASE_ID_VERSION
+	) {
+		throw new TypeError("Workspace lease identifier payload is invalid");
+	}
+	const reference = leaseReference({
+		safeKey: value.safeKey as string,
+		holderId: value.holderId as string,
+		generation: value.generation as number,
+		operation: value.operation as WorkspaceLeaseOperation,
+	});
+	if (workspaceLeaseId(reference) !== identifier) throw new TypeError("Workspace lease identifier is not canonical");
+	return Object.freeze(reference);
 }
 
 export interface WorkspaceLeaseRenewOptions extends WorkspaceLeaseReference {
@@ -220,6 +278,37 @@ export class WorkspaceLeaseManager {
 			if (leaseOrSafeKey instanceof WorkspaceLease) leaseOrSafeKey.updateFromManager(current);
 			return { ...current };
 		});
+	}
+
+	/** Read-only final commit check; never yields or renews the lease. */
+	assertFenceSync(reference: WorkspaceLeaseReference): WorkspaceLeaseRecord {
+		const lockPath = this.lockPath(reference.safeKey);
+		const descriptor = openSync(lockPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+		try {
+			const before = fstatSync(descriptor);
+			if (!before.isFile() || before.size > 16 * 1024) throw new Error("Invalid workspace lease commit record.");
+			const current = parseRecord(JSON.parse(readFileSync(descriptor, "utf8")), lockPath);
+			const after = fstatSync(descriptor),
+				named = lstatSync(lockPath);
+			if (
+				!named.isFile() ||
+				named.isSymbolicLink() ||
+				named.dev !== before.dev ||
+				named.ino !== before.ino ||
+				after.size !== before.size ||
+				after.mtimeMs !== before.mtimeMs ||
+				after.ctimeMs !== before.ctimeMs ||
+				named.size !== after.size ||
+				named.mtimeMs !== after.mtimeMs ||
+				named.ctimeMs !== after.ctimeMs
+			)
+				throw new Error("Workspace lease changed during commit validation.");
+			assertCurrentFence(current, reference, this.readClock(current.observedAt), "commit");
+			if (current.cleanupPending) throw new Error("Workspace cleanup is pending at commit.");
+			return current;
+		} finally {
+			closeSync(descriptor);
+		}
 	}
 
 	async release(lease: WorkspaceLease | WorkspaceLeaseReference): Promise<void>;
@@ -410,6 +499,16 @@ export class WorkspaceLease {
 		return this.#record.operation;
 	}
 
+	/** Immutable, credential-free handle for the currently held lease fence. */
+	get reference(): WorkspaceLeaseReference {
+		return Object.freeze({
+			safeKey: this.#safeKey,
+			holderId: this.#record.holderId,
+			generation: this.#record.generation,
+			operation: this.#record.operation,
+		});
+	}
+
 	get leaseExpiresAt(): number {
 		return this.#record.leaseExpiresAt;
 	}
@@ -446,6 +545,11 @@ export class WorkspaceLease {
 	async assertFence(): Promise<WorkspaceLeaseRecord> {
 		if (this.#released) throw new Error("Workspace lease has been released");
 		return this.#manager.assertFence(this);
+	}
+
+	assertFenceSync(): void {
+		if (this.#released) throw new Error("Workspace lease has been released");
+		this.#manager.assertFenceSync(this.reference);
 	}
 
 	async release(): Promise<void> {

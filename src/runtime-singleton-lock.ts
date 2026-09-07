@@ -1,6 +1,6 @@
-import { constants } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, realpathSync } from "node:fs";
 import { lstat, open, readFile, realpath, unlink } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 
 interface LockOwner {
 	readonly pid: number;
@@ -21,6 +21,7 @@ const PORTABLE_PROCESS_IDENTITY = "portable";
 export class RuntimeSingletonLock {
 	readonly #path: string;
 	readonly #owner: LockOwner;
+	#identity: { readonly device: number; readonly inode: number } | undefined;
 	#released = false;
 
 	private constructor(root: string, owner: LockOwner) {
@@ -51,10 +52,72 @@ export class RuntimeSingletonLock {
 		throw new Error("Unable to recover a stale adapter runtime lock safely");
 	}
 
+	async assertHeld(): Promise<void> {
+		if (this.#released) throw new Error("Adapter runtime lock has been released.");
+		const snapshot = await readSnapshot(this.#path);
+		if (
+			!sameOwner(snapshot.owner, this.#owner) ||
+			snapshot.device !== this.#identity?.device ||
+			snapshot.inode !== this.#identity.inode
+		)
+			throw new Error("Adapter runtime lock ownership changed.");
+		const named = await lstat(this.#path);
+		if (!named.isFile() || named.isSymbolicLink() || named.dev !== snapshot.device || named.ino !== snapshot.inode)
+			throw new Error("Adapter runtime lock identity changed.");
+	}
+
+	async assertOwnsPath(path: string): Promise<void> {
+		const parent = await realpath(dirname(path));
+		const scope = relative(dirname(this.#path), parent);
+		if (scope === ".." || scope.startsWith("../") || isAbsolute(scope))
+			throw new Error("Adapter runtime lock does not own the requested authority path.");
+		await this.assertHeld();
+	}
+
+	/** Final passive-receipt storage fence; identical owner and file identity, without yielding. */
+	assertOwnsPathSync(path: string): void {
+		const scope = relative(dirname(this.#path), realpathSync(dirname(path)));
+		if (scope === ".." || scope.startsWith("../") || isAbsolute(scope))
+			throw new Error("Adapter runtime lock does not own the requested authority path.");
+		if (this.#released) throw new Error("Adapter runtime lock has been released.");
+		const descriptor = openSync(this.#path, constants.O_RDONLY | constants.O_NOFOLLOW);
+		try {
+			const before = fstatSync(descriptor);
+			if (!before.isFile() || before.size > 16 * 1024)
+				throw new Error("Adapter runtime lock must be a regular non-symlink file");
+			const owner: unknown = JSON.parse(readFileSync(descriptor, "utf8"));
+			const after = fstatSync(descriptor),
+				named = lstatSync(this.#path);
+			if (
+				!isOwner(owner) ||
+				!sameOwner(owner, this.#owner) ||
+				before.dev !== this.#identity?.device ||
+				before.ino !== this.#identity.inode ||
+				!named.isFile() ||
+				named.isSymbolicLink() ||
+				named.dev !== before.dev ||
+				named.ino !== before.ino ||
+				after.size !== before.size ||
+				after.mtimeMs !== before.mtimeMs ||
+				after.ctimeMs !== before.ctimeMs ||
+				named.size !== after.size ||
+				named.mtimeMs !== after.mtimeMs ||
+				named.ctimeMs !== after.ctimeMs
+			)
+				throw new Error("Adapter runtime lock changed while checking ownership");
+		} finally {
+			closeSync(descriptor);
+		}
+	}
+
 	async release(): Promise<void> {
 		if (this.#released) return;
 		const snapshot = await readSnapshot(this.#path);
-		if (!sameOwner(snapshot.owner, this.#owner))
+		if (
+			!sameOwner(snapshot.owner, this.#owner) ||
+			snapshot.device !== this.#identity?.device ||
+			snapshot.inode !== this.#identity.inode
+		)
 			throw new Error("Adapter runtime lock ownership changed before shutdown");
 		await removeSnapshot(this.#path, snapshot);
 		this.#released = true;
@@ -65,6 +128,8 @@ export class RuntimeSingletonLock {
 		try {
 			await file.writeFile(`${JSON.stringify(this.#owner)}\n`);
 			await file.sync();
+			const stat = await file.stat();
+			this.#identity = { device: stat.dev, inode: stat.ino };
 		} finally {
 			await file.close();
 		}
@@ -130,7 +195,7 @@ async function readSnapshot(file: string): Promise<LockSnapshot> {
 	const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
 	try {
 		const status = await handle.stat();
-		if (!status.isFile() || status.isSymbolicLink())
+		if (!status.isFile() || status.isSymbolicLink() || status.size > 16 * 1024)
 			throw new Error("Adapter runtime lock must be a regular non-symlink file");
 		let parsed: unknown;
 		try {
@@ -139,6 +204,21 @@ async function readSnapshot(file: string): Promise<LockSnapshot> {
 			throw new Error("Adapter runtime lock metadata is invalid");
 		}
 		if (!isOwner(parsed)) throw new Error("Adapter runtime lock metadata is invalid");
+		const after = await handle.stat();
+		const named = await lstat(file);
+		if (
+			!named.isFile() ||
+			named.isSymbolicLink() ||
+			named.dev !== status.dev ||
+			named.ino !== status.ino ||
+			after.size !== status.size ||
+			after.mtimeMs !== status.mtimeMs ||
+			after.ctimeMs !== status.ctimeMs ||
+			named.size !== after.size ||
+			named.mtimeMs !== after.mtimeMs ||
+			named.ctimeMs !== after.ctimeMs
+		)
+			throw new Error("Adapter runtime lock changed while checking ownership");
 		return { owner: parsed, device: status.dev, inode: status.ino };
 	} finally {
 		await handle.close();

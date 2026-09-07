@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalSessionMappingKey, SessionAuthority } from "../src/gjc/session-authority";
+import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import { appendJournal } from "../src/gjc/session-operation-codec";
 import { FileBackedSessionMappingStore, type SessionMapping, SessionMappingStore } from "../src/gjc/session-router";
 
@@ -96,6 +97,41 @@ function fileHarness(): StoreHarness {
 }
 
 describe("session mapping store authority conformance", () => {
+	test("rejects managed principal or chat substitution before scoped authority mutation", () => {
+		const store = new SessionMappingStore();
+		const scope = { principalId: "user-a", chatId: "chat-1" };
+		const managedAuthority = {
+			principalId: scope.principalId,
+			chatId: scope.chatId,
+			projectId: "project-1",
+			canonicalWorkspace: "/workspace/a",
+			sessionId: "session-1",
+			generation: 1,
+			leaseId: "lease-a",
+			epoch: SESSION_AUTHORITY_V3_EPOCH,
+			requestKey: "request-a",
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+		};
+		const valid: SessionMapping = { ...mapping(), attachment: undefined, managedAuthority };
+		store.setScoped(scope, valid);
+		const original = store.getScoped(scope);
+		for (const replacement of [{ principalId: "user-b" }, { chatId: "chat-foreign" }]) {
+			const foreign = { ...managedAuthority, ...replacement };
+			expect(() => store.setScoped(scope, { ...valid, managedAuthority: foreign })).toThrow("scope");
+			expect(() =>
+				store.reserveProvisionalOperationScoped(scope, {
+					id: "foreign",
+					kind: "create",
+					chatId: scope.chatId,
+					projectId: "project-1",
+					sessionId: "session-1",
+					managedAuthority: foreign,
+				}),
+			).toThrow("scope");
+			expect(store.getScoped(scope)).toEqual(original);
+			expect(store.provisionalOperationScoped(scope, "foreign")).toBeUndefined();
+		}
+	});
 	describe("project reassignment", () => {
 		for (const createHarness of [memoryHarness, fileHarness]) {
 			test(`${createHarness.name} commits only the exact target and retains source operation authority`, () => {

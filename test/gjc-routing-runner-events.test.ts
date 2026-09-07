@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import { SessionMappingStore } from "../src/gjc/session-router";
 import type {
 	GjcContinueSessionInput,
@@ -6,13 +7,15 @@ import type {
 	GjcSessionState,
 	GjcSessionStateInput,
 	GjcStartNewSessionInput,
-	GjcSwitchSessionInput,
 	GjcTurnResult,
 	GjcTurnRunner,
+	ManagedGenerationProof,
+	ManagedPreparedTurnAuthority,
+	ManagedTurnAuthority,
 } from "../src/gjc/turn-runner";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
 import type { RegisteredProject } from "../src/projects/registry";
-import { attachmentProof, lifecycleFixture } from "./gjc-lifecycle-fixtures";
+import { lifecycleFixture, managedPreparedAuthority } from "./gjc-lifecycle-fixtures";
 import { staticModelReaderFactory } from "./model-selection-fixtures";
 
 class FakeGjcTurnRunner implements GjcTurnRunner {
@@ -24,28 +27,52 @@ class FakeGjcTurnRunner implements GjcTurnRunner {
 		eventCursor: 3,
 	};
 
-	async startNewSession<T>(
-		input: GjcStartNewSessionInput,
+	async startManagedSession<T>(
+		input: GjcStartNewSessionInput & { readonly preparedManagedAuthority: ManagedPreparedTurnAuthority },
 		publish: (
 			result: GjcSessionAddress & GjcTurnResult,
 			lifecycle: ReturnType<typeof lifecycleFixture>,
 		) => Promise<T>,
+		beforePrompt: (
+			address: GjcSessionAddress,
+			proof: ManagedGenerationProof,
+			lifecycle: ReturnType<typeof lifecycleFixture>,
+		) => Promise<void>,
 	): Promise<T> {
+		await input.onLifecycleInvoking?.();
+		const authority = {
+			...input.preparedManagedAuthority,
+			sessionId: "session-1",
+			generation: 1,
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+		} as ManagedTurnAuthority & { readonly authorityEpoch: typeof SESSION_AUTHORITY_V3_EPOCH };
+		await input.onLifecycleAcknowledged?.(authority);
 		const result = {
 			cwd: input.cwd,
 			sessionRoot: input.sessionRoot,
 			projectId: input.projectId,
 			chatId: input.chatId,
-			sessionId: "session-1",
+			sessionId: authority.sessionId,
 			text: `new:${input.text}`,
 			events: this.events,
 			sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
 			activeLeaf: "leaf-1",
 			rawFrameCursor: 7,
 			eventCursor: 3,
+			managedProof: {
+				kind: "managed-generation" as const,
+				sessionId: authority.sessionId,
+				generation: authority.generation,
+				leaseId: authority.leaseId,
+				epoch: authority.epoch,
+			},
+			managedAuthority: authority,
 			...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
 		};
-		return await publish({ ...result, attachment: attachmentProof(result) }, lifecycleFixture(result));
+		const lifecycle = lifecycleFixture(result, authority);
+		await beforePrompt(result, result.managedProof, lifecycle);
+		for (const event of this.events) await input.observer?.(event);
+		return await publish(result, lifecycle);
 	}
 
 	async continueSession(input: GjcContinueSessionInput): Promise<GjcTurnResult> {
@@ -59,8 +86,6 @@ class FakeGjcTurnRunner implements GjcTurnRunner {
 			...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
 		};
 	}
-
-	async switchSession(_input: GjcSwitchSessionInput): Promise<void> {}
 
 	async getState(_input: GjcSessionStateInput): Promise<GjcSessionState> {
 		return this.state;
@@ -88,6 +113,13 @@ describe("createGjcRoutingLiveGatewayRunner event projection", () => {
 			messageId: "assistant-1",
 			userMessageId: "user-1",
 			userMessageParentId: null,
+			ownerUserId: "owner-test",
+			preparedManagedAuthority: managedPreparedAuthority({
+				projectId: project.id,
+				canonicalWorkspace: project.cwd,
+				chatId: "chat-1",
+				requestKey: "user-1",
+			}),
 			continued: false,
 			requestedModelId: "gjc",
 		});
@@ -144,6 +176,13 @@ describe("createGjcRoutingLiveGatewayRunner event projection", () => {
 			messageId: "assistant-1",
 			userMessageId: "user-1",
 			userMessageParentId: null,
+			ownerUserId: "owner-test",
+			preparedManagedAuthority: managedPreparedAuthority({
+				projectId: project.id,
+				canonicalWorkspace: project.cwd,
+				chatId: "chat-1",
+				requestKey: "user-1",
+			}),
 			continued: false,
 			requestedModelId: "gjc",
 		});
@@ -198,6 +237,13 @@ describe("createGjcRoutingLiveGatewayRunner event projection", () => {
 			messageId: "assistant-1",
 			userMessageId: "user-1",
 			userMessageParentId: null,
+			ownerUserId: "owner-test",
+			preparedManagedAuthority: managedPreparedAuthority({
+				projectId: project.id,
+				canonicalWorkspace: project.cwd,
+				chatId: "chat-1",
+				requestKey: "user-1",
+			}),
 			continued: false,
 			requestedModelId: "gjc",
 		});

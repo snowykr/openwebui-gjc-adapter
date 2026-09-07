@@ -1,3 +1,4 @@
+import type { ManagedSdkRuntimeDependency } from "./gjc/managed-sdk-dependency";
 import type { AdapterHealthCheck, AdapterReadinessOptions } from "./health";
 import type { AdapterRouteDependencies } from "./live/openai-routes";
 import type { RuntimeSingletonLock } from "./runtime-singleton-lock";
@@ -14,12 +15,30 @@ export interface AdapterServerOptions {
 	port: number;
 	runtimeRoot: string;
 	runtimeLock: RuntimeSingletonLock;
+	managedSdkRuntime?: ManagedSdkRuntimeOwnership;
+	/**
+	 * Releases runtime-dependent resources only after actual managed runtime disposal succeeds
+	 * (or when no runtime is owned), before singleton release. A bounded stop is not disposal.
+	 * Disposal rejection skips this callback; any cleanup failure retains singleton ownership.
+	 */
 	shutdownCleanup?: () => void | Promise<void>;
 	checks?: readonly AdapterHealthCheck[];
 	readiness?: AdapterReadinessOptions;
 	runtime?: AdapterRuntimeConfig;
 	routes?: AdapterRouteDependencies;
 	turnTimeoutMs: number;
+}
+
+export interface ManagedSdkRuntimeOwnership {
+	readonly runtime: ManagedSdkRuntimeDependency;
+	readonly start: boolean;
+	readonly health: ManagedSdkRuntimeHealth;
+	dispose(): Promise<void>;
+}
+
+export interface ManagedSdkRuntimeHealth {
+	phase: "not_started" | "starting" | "ready" | "degraded";
+	reason?: string;
 }
 export interface AdapterServerHandle {
 	url: string;
@@ -29,6 +48,7 @@ export interface AdapterServerHandle {
 export async function startAdapterServer(options: AdapterServerOptions): Promise<AdapterServerHandle> {
 	const lock = options.runtimeLock;
 	try {
+		await startManagedSdkRuntime(options.managedSdkRuntime);
 		const idleTimeout = idleTimeoutSeconds(options.turnTimeoutMs);
 		const server = Bun.serve({
 			hostname: options.host,
@@ -43,22 +63,40 @@ export async function startAdapterServer(options: AdapterServerOptions): Promise
 		});
 		let shutdownPromise: Promise<void> | undefined;
 		const shutdown = async (): Promise<void> => {
-			const shutdowns = await Promise.allSettled([
-				Promise.resolve().then(() => server.stop()),
-				Promise.resolve().then(() => options.routes?.runner.stop?.()),
-			]);
-			const failures = shutdowns
-				.filter((result): result is PromiseRejectedResult => result.status === "rejected")
-				.map(result => result.reason);
+			const failures: unknown[] = [];
+			const concurrentStops: Promise<unknown>[] = [];
 			try {
-				await options.shutdownCleanup?.();
+				concurrentStops.push(Promise.resolve(server.stop()));
 			} catch (error) {
 				failures.push(error);
 			}
 			try {
-				await lock.release();
+				concurrentStops.push(Promise.resolve(options.routes?.runner.stop?.()));
 			} catch (error) {
 				failures.push(error);
+			}
+			for (const result of await Promise.allSettled(concurrentStops))
+				if (result.status === "rejected") failures.push(result.reason);
+			let disposed = false;
+			try {
+				await options.managedSdkRuntime?.dispose();
+				disposed = true;
+			} catch (error) {
+				failures.push(error);
+			}
+			if (disposed) {
+				try {
+					await options.shutdownCleanup?.();
+				} catch (error) {
+					failures.push(error);
+				}
+			}
+			if (failures.length === 0) {
+				try {
+					await lock.release();
+				} catch (error) {
+					failures.push(error);
+				}
 			}
 			if (failures.length > 0) throw new AggregateError(failures, "Server cleanup failed");
 		};
@@ -76,18 +114,43 @@ export async function startAdapterServer(options: AdapterServerOptions): Promise
 		} catch (stopError) {
 			failures.push(stopError);
 		}
+		let disposed = false;
 		try {
-			await options.shutdownCleanup?.();
-		} catch (cleanupError) {
-			failures.push(cleanupError);
+			await options.managedSdkRuntime?.dispose();
+			disposed = true;
+		} catch (disposeError) {
+			failures.push(disposeError);
 		}
-		try {
-			await lock.release();
-		} catch (releaseError) {
-			failures.push(releaseError);
+		if (disposed) {
+			try {
+				await options.shutdownCleanup?.();
+			} catch (cleanupError) {
+				failures.push(cleanupError);
+			}
+		}
+		if (failures.length === 1) {
+			try {
+				await lock.release();
+			} catch (releaseError) {
+				failures.push(releaseError);
+			}
 		}
 		if (failures.length > 1) throw new AggregateError(failures, "Server initialization cleanup failed");
 		throw error;
+	}
+}
+
+async function startManagedSdkRuntime(ownership: ManagedSdkRuntimeOwnership | undefined): Promise<void> {
+	if (ownership === undefined || !ownership.start) return;
+	ownership.health.phase = "starting";
+	delete ownership.health.reason;
+	try {
+		await ownership.runtime.start();
+		await ownership.runtime.reconcile();
+		ownership.health.phase = "ready";
+	} catch {
+		ownership.health.phase = "degraded";
+		ownership.health.reason = "Managed SDK runtime bootstrap or reconciliation failed.";
 	}
 }
 function idleTimeoutSeconds(turnTimeoutMs: number): number {

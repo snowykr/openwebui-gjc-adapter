@@ -1,4 +1,4 @@
-import { copyEvents } from "./session-authority-copy";
+import { copyEvents, copyManagedAuthority } from "./session-authority-copy";
 import type { SessionMapping } from "./session-mapping-store";
 import { copyAttachment } from "./session-operation-codec";
 
@@ -8,6 +8,9 @@ export function copySessionMapping(mapping: SessionMapping): SessionMapping {
 		chatId: mapping.chatId,
 		projectId: mapping.projectId,
 		sessionId: mapping.sessionId,
+		...(mapping.managedAuthority === undefined
+			? {}
+			: { managedAuthority: copyManagedAuthority(mapping.managedAuthority) }),
 		...(mapping.sessionFile === undefined ? {} : { sessionFile: mapping.sessionFile }),
 		...(mapping.activeLeaf === undefined ? {} : { activeLeaf: mapping.activeLeaf }),
 		rawFrameCursor: mapping.rawFrameCursor,

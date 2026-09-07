@@ -41,17 +41,6 @@ export class RealSelectionHarness {
 		try {
 			port = await cli.reserveTcpPort();
 			coordinator = new RealSelectionCoordinator({ catalogMode: options.catalogMode ?? "capabilities" });
-			await writeFile(
-				path.join(root, "gjc-sdk-fixture.json"),
-				JSON.stringify({
-					GJC_SDK_FIXTURE_CLI_TRANSCRIPT: path.join(root, "sdk-cli-transcript.jsonl"),
-					GJC_SDK_FIXTURE_ENDPOINT_URL: coordinator.sdkUrl,
-					GJC_SDK_FIXTURE_ENDPOINT_TOKEN: coordinator.sdkToken,
-					GJC_SDK_FIXTURE_SESSION_ID: "selection-session",
-					GJC_SDK_FIXTURE_DYNAMIC_AUTHORITY: "1",
-				}),
-				"utf8",
-			);
 			child = spawnServer(root, port, coordinator, options);
 			const harness = new RealSelectionHarness(root, port, child, coordinator);
 			await cli.waitForStartedServer(child, `${harness.baseUrl}/healthz`);
@@ -331,10 +320,6 @@ export class RealSelectionHarness {
 	}
 }
 
-function selectionFixturePath(): string {
-	return path.join(process.cwd(), "test/fixtures/gjc-sdk-interactive-cli-session-fixture.ts");
-}
-
 function serverFixturePath(): string {
 	return path.join(process.cwd(), "test/fixtures/selection-adapter-server.ts");
 }
@@ -365,12 +350,8 @@ function spawnServer(
 			GJC_OPENWEBUI_TURN_TIMEOUT_MS: String(DEFAULT_TURN_TIMEOUT_MS),
 			GJC_OPENWEBUI_STATE_PATH: path.join(root, "state"),
 			GJC_OPENWEBUI_SESSION_ROOT: path.join(root, "sessions"),
-			GJC_OPENWEBUI_GJC_COMMAND: selectionFixturePath(),
-			GJC_SDK_FIXTURE_CLI_TRANSCRIPT: path.join(root, "sdk-cli-transcript.jsonl"),
-			GJC_SDK_FIXTURE_ENDPOINT_URL: coordinator.sdkUrl,
-			GJC_SDK_FIXTURE_ENDPOINT_TOKEN: coordinator.sdkToken,
-			GJC_SDK_FIXTURE_SESSION_ID: "selection-session",
-			GJC_SDK_FIXTURE_DYNAMIC_AUTHORITY: "1",
+			GJC_OPENWEBUI_GJC_COMMAND: "managed-router-selection-fixture",
+			GJC_SELECTION_COORDINATOR_URL: coordinator.url,
 			GJC_SELECTION_OBSERVATIONS: path.join(root, "selection-observations.jsonl"),
 			GJC_SELECTION_RUNTIME_RECEIPT: path.join(root, "selection-runtime-receipt.json"),
 			...(options.failStartup ? { GJC_SELECTION_FAIL_STARTUP: "1" } : {}),

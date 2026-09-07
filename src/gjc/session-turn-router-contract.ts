@@ -1,7 +1,14 @@
 import type { NormalizedModelSelection } from "../contracts";
 import type { RegisteredProject } from "../projects/registry";
 import type { SessionMapping, SessionMappingStore } from "./session-mapping-store";
-import type { GjcTurnEvent, GjcTurnEventObserver, GjcTurnResult, GjcTurnRunner } from "./turn-runner";
+import type {
+	GjcTurnEvent,
+	GjcTurnEventObserver,
+	GjcTurnResult,
+	GjcTurnRunner,
+	ManagedPreparedTurnAuthority,
+	ManagedTurnAuthority,
+} from "./turn-runner";
 
 export interface RouteGjcTurnInput {
 	readonly project: RegisteredProject;
@@ -11,10 +18,15 @@ export interface RouteGjcTurnInput {
 	readonly text: string;
 	readonly runner: GjcTurnRunner;
 	readonly mappings: SessionMappingStore;
+	readonly principalId?: string;
+	readonly preparedManagedAuthority?: ManagedPreparedTurnAuthority;
+	/** Persisted authority for an existing managed mapping; never synthesized from prepared authority. */
+	readonly managedAuthority?: ManagedTurnAuthority;
 	readonly modelSelection?: NormalizedModelSelection;
 	readonly projectAssistantText?: (result: GjcTurnResult) => string;
 	readonly afterPublish?: (result: RouteGjcTurnResult) => void;
 	readonly onObservedTurn?: GjcTurnEventObserver;
+	readonly signal?: AbortSignal;
 }
 
 export interface RouteGjcTurnResult {

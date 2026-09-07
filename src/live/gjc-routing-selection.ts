@@ -1,5 +1,5 @@
 import type { NormalizedModelSelection } from "../contracts";
-import { SdkV3OperationError } from "../gjc/sdk-v3-protocol";
+import { ManagedSdkOperationError } from "../gjc/managed-sdk-runtime";
 import { normalizeModelSelection, type SessionMapping } from "../gjc/session-router";
 import type { GjcTurnRunner } from "../gjc/turn-runner";
 import type { LiveGatewayRunnerInput, LiveGatewayRunnerResult } from "./chat-completions";
@@ -37,18 +37,24 @@ export async function resolveNormalSelection(
 	turn: LiveGatewayRunnerInput,
 	requestedModelId: string,
 ): Promise<NormalizedModelSelection> {
-	const createReader =
-		input.modelReaderFactory === undefined
-			? input.createNeutralModelReader === undefined
-				? undefined
-				: () => input.createNeutralModelReader?.(turn)
-			: () => input.modelReaderFactory?.(turn.modelReaderContext);
+	let createReader: ((signal?: AbortSignal) => Promise<ModelReader | undefined>) | undefined;
+	if (input.modelReaderFactory !== undefined) {
+		createReader = async (signal?: AbortSignal) =>
+			await input.modelReaderFactory?.(
+				turn.modelReaderContext === undefined || signal === undefined
+					? turn.modelReaderContext
+					: { ...turn.modelReaderContext, signal },
+				signal,
+			);
+	} else if (input.createNeutralModelReader !== undefined) {
+		createReader = async () => input.createNeutralModelReader?.(turn);
+	}
 	if (createReader === undefined) throw new TypeError("GJC model selection reader is unavailable");
-	return createModelSelectionPolicy(async () => {
-		const reader = await createReader();
+	return createModelSelectionPolicy(async (_context, signal) => {
+		const reader = await createReader(signal);
 		if (reader === undefined) throw new TypeError("GJC model selection reader is unavailable");
 		return reader;
-	}).resolve(requestedModelId);
+	}).resolve(requestedModelId, turn.signal);
 }
 
 export async function replayWithLifecyclePublication<T>(
@@ -66,8 +72,6 @@ export async function replayWithLifecyclePublication<T>(
 			projectId: mapping.projectId,
 			chatId: mapping.chatId,
 			sessionId: mapping.sessionId,
-			sessionFile: mapping.sessionFile,
-			recoveryAttachment: mapping.attachment,
 		},
 		async () => effect(),
 	);
@@ -81,7 +85,7 @@ export function withCanonicalModel(
 }
 
 export function isModelSelectionApplyFailure(error: unknown): boolean {
-	if (error instanceof SdkV3OperationError)
+	if (error instanceof ManagedSdkOperationError)
 		return ["model_set_failed", "thinking_set_failed", "invalid_result"].includes(error.code);
 	return (
 		typeof error === "object" && error !== null && Reflect.get(error, "command") === "set_default_model_selection"

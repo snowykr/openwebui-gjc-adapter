@@ -1,0 +1,2843 @@
+import { describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+	createManagedLateCreateAcknowledgement,
+	createManagedLateLifecycleAcknowledgement,
+	createManagedLifecycleEvidence,
+	isManagedCatalogProvisional,
+	isManagedLifecycleEvidence,
+	lifecycleExactAuthority,
+	lifecyclePreparedAuthority,
+	type ManagedHistoricalSavedSession,
+	managedHistoricalPublicationAssociation,
+	managedHistoricalSourceAssociation,
+	managedLifecycleAdmissionHash,
+	managedLifecycleEvidenceHash,
+	managedProvisionalCreateAdmissionHash,
+	transitionManagedLifecycleEvidence,
+} from "../src/gjc/managed-lifecycle-evidence";
+import { scopedSessionMappingStore } from "../src/gjc/scoped-session-mapping-store";
+import { copyOperation, copyProvisionalOperation } from "../src/gjc/session-authority-copy";
+import { AuthorityMutationLock } from "../src/gjc/session-authority-file";
+import { isAuthorityDocumentRelationallyValid, isV2Record } from "../src/gjc/session-authority-record-validation";
+import type {
+	HistoricalSessionBinding,
+	ProvisionalSessionOperation,
+	SessionAuthorityRecord,
+	SessionAuthorityTombstone,
+} from "../src/gjc/session-authority-types";
+import {
+	encodeSessionAuthorityV3Document,
+	isSessionAuthorityV3Document,
+	parseSessionAuthorityV3Document,
+	SESSION_AUTHORITY_V3_EPOCH,
+	SESSION_AUTHORITY_V3_KIND,
+	type SessionAuthorityV3Document,
+	type SessionAuthorityV3Mapping,
+	type SessionAuthorityV3Operation,
+	type SessionAuthorityV3Tombstone,
+} from "../src/gjc/session-authority-v3";
+import { SessionV3FileBackedMappingStore } from "../src/gjc/session-v3-file-backed-mapping-store";
+import type {
+	ManagedGenerationProof,
+	ManagedPreparedTurnAuthority,
+	ManagedTurnAuthority,
+} from "../src/gjc/turn-runner";
+
+const timestamp = "2026-08-24T00:00:00.000Z";
+
+function authority(chatId: string, projectId: string, sessionId: string, generation = 1) {
+	return {
+		authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+		principalId: "tenant-a",
+		projectId,
+		canonicalWorkspace: "/srv/projects/a",
+		chatId,
+		sessionId,
+		generation,
+		leaseId: `lease-${generation}`,
+		epoch: `runtime-${generation}`,
+		requestKey: `request-${generation}`,
+	};
+}
+
+function mapping(projectId = "project-a", sessionId = "session-current") {
+	const chatId = "chat-a";
+	const completed = {
+		id: "turn-1",
+		kind: "prompt",
+		state: "complete",
+		startedAt: timestamp,
+		completedAt: timestamp,
+		result: {
+			kind: "turn",
+			assistantText: "answer",
+			managedAuthority: authority(chatId, projectId, sessionId),
+			events: [{ type: "message", id: "event-1", payload: { durable: true } }],
+			mapping: { chatId, projectId, sessionId, rawFrameCursor: 4, eventCursor: 2, operationId: "turn-1" },
+			correlation: { chatId, projectId, operationId: "turn-1" },
+			gate: { gateId: "gate-1", commandId: "command-1", turnId: "turn-1", sessionId },
+		},
+	};
+	const tombstone = {
+		version: 3,
+		authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+		chatId,
+		projectId: "project-old",
+		sessionId: "session-old",
+		createdAt: timestamp,
+		header: { chatId, projectId: "project-old", sessionId: "session-old" },
+		rawFrameCursor: 1,
+		eventCursor: 1,
+		operationId: "old-turn",
+		observations: { source: "retired" },
+		managedAuthority: authority(chatId, "project-old", "session-old", 2),
+		journal: [],
+		retiredAt: timestamp,
+		prior: {
+			version: 3,
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+			chatId,
+			projectId: "project-older",
+			sessionId: "session-older",
+			createdAt: timestamp,
+			header: { chatId, projectId: "project-older", sessionId: "session-older" },
+			rawFrameCursor: 0,
+			eventCursor: 0,
+			operationId: "older-turn",
+			managedAuthority: authority(chatId, "project-older", "session-older", 3),
+			journal: [],
+			retiredAt: timestamp,
+		},
+	};
+	return {
+		version: 3,
+		authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+		chatId,
+		projectId,
+		sessionId,
+		createdAt: timestamp,
+		header: { chatId, projectId, sessionId },
+		rawFrameCursor: 4,
+		eventCursor: 2,
+		operationId: "turn-1",
+		assistantText: "answer",
+		events: [{ type: "message", text: "answer" }],
+		observations: { source: "golden" },
+		managedAuthority: authority(chatId, projectId, sessionId),
+		journal: [
+			completed,
+			{
+				id: "create-next",
+				kind: "create",
+				state: "uncertain",
+				startedAt: timestamp,
+				acknowledgedSuccessor: {
+					sessionId: "session-next",
+					managedAuthority: authority(chatId, projectId, "session-next", 4),
+				},
+			},
+		],
+		reassignment: {
+			state: "committed",
+			sourceProjectId: "project-old",
+			targetProjectId: projectId,
+			startedAt: timestamp,
+			completedAt: timestamp,
+			sourceTombstone: tombstone,
+		},
+	};
+}
+
+function golden() {
+	return {
+		kind: SESSION_AUTHORITY_V3_KIND,
+		version: 3,
+		authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+		mappings: [mapping()],
+		provisionalOperations: [
+			{
+				id: "provisional-1",
+				kind: "prompt",
+				state: "pending",
+				startedAt: timestamp,
+				chatId: "chat-b",
+				projectId: "project-b",
+				sessionId: "session-b",
+				managedAuthority: authority("chat-b", "project-b", "session-b", 5),
+			},
+		],
+	};
+}
+
+function clonedGolden(): Record<string, any> {
+	return JSON.parse(JSON.stringify(golden()));
+}
+
+function historical(
+	chat: string,
+	projectId: string,
+	sessionId: string | undefined,
+	nodeRef: string,
+): HistoricalSessionBinding {
+	return {
+		kind: "unbound-history",
+		chatId: chat,
+		projectId,
+		...(sessionId === undefined ? {} : { sessionId }),
+		principalId: "tenant-a",
+		canonicalWorkspace: "/srv/projects/a",
+		reason: "generation-unproven",
+		provenance: { source: "v2", documentHash: "a".repeat(64), nodeHash: "b".repeat(64), nodeRef },
+	};
+}
+function historicalGolden(): unknown {
+	const convert = (value: unknown, nodeRef: string): unknown => {
+		if (Array.isArray(value)) return value.map((child, index) => convert(child, `${nodeRef}/${index}`));
+		if (value === null || typeof value !== "object") return value;
+		const entries = Object.entries(value);
+		const raw = entries.find(([key]) => key === "managedAuthority")?.[1];
+		const projection: Record<string, unknown> = Object.fromEntries(
+			entries
+				.filter(([key]) => key !== "managedAuthority")
+				.map(([key, child]) => [key, convert(child, `${nodeRef}/${key}`)]),
+		);
+		if (raw !== undefined && raw !== null && typeof raw === "object") {
+			const chat = Reflect.get(raw, "chatId");
+			const projectId = Reflect.get(raw, "projectId");
+			const sessionId = Reflect.get(raw, "sessionId");
+			if (typeof chat !== "string" || typeof projectId !== "string" || typeof sessionId !== "string")
+				throw new Error("Bad fixture identity.");
+			projection.historicalBinding = historical(chat, projectId, sessionId, nodeRef);
+		}
+		return projection;
+	};
+	return convert(golden(), "");
+}
+
+function bootstrapGraph() {
+	const document = historicalGolden();
+	if (!isSessionAuthorityV3Document(document)) throw new Error("Historical fixture must be valid V3.");
+	const root = document.mappings[0]!;
+	if (root.historicalBinding === undefined) throw new Error("Expected unbound fixture.");
+	const { canonicalWorkspace: _workspace, ...originalBinding } = root.historicalBinding;
+	const historicalBinding: HistoricalSessionBinding = { ...originalBinding, reason: "ownership-unresolved" };
+	const prepared: ManagedPreparedTurnAuthority = {
+		principalId: "tenant-a",
+		projectId: root.projectId,
+		canonicalWorkspace: "/srv/projects/a",
+		chatId: root.chatId,
+		leaseId: "bootstrap-lease",
+		epoch: "bootstrap-epoch",
+		requestKey: "manifest-occurrence-key",
+	};
+	const savedSession: ManagedHistoricalSavedSession = {
+		id: root.sessionId,
+		path: "/srv/projects/a/.gjc/sessions/saved.jsonl",
+		identity: {
+			dev: "66306",
+			ino: "1481656",
+			size: 3671,
+			mtimeMs: 1788717200450,
+			mtimeNs: "1788717200450003321",
+			sha256: "b".repeat(64),
+			nlink: "1",
+			ctimeNs: "1788717200450003321",
+		},
+	};
+	const { nlink: _nlink, ctimeNs: _ctimeNs, ...sessionIdentity } = savedSession.identity;
+	const lifecycle = createManagedLifecycleEvidence(
+		{
+			operation: "session.resume",
+			preparedAuthority: prepared,
+			historicalSource: {
+				kind: "bootstrap-history",
+				manifestDigest: "c".repeat(64),
+				historicalBinding,
+				savedSession,
+			},
+			target: {
+				sessionId: root.sessionId,
+				cwd: prepared.canonicalWorkspace,
+				sessionPath: savedSession.path,
+				sessionIdentity,
+			},
+			payloadHash: "d".repeat(64),
+		},
+		timestamp,
+	);
+	const operation: SessionAuthorityV3Operation = {
+		id: "bootstrap-operation",
+		kind: "resume",
+		state: "pending",
+		startedAt: timestamp,
+		detail: lifecycle.payloadHash,
+		lifecycle,
+	};
+	const { managedAuthority: _managedAuthority, historicalBinding: _historicalBinding, ...rootFields } = root;
+	const mapping = { ...rootFields, historicalBinding, journal: [...root.journal, operation] };
+	const graph: SessionAuthorityV3Document = { ...document, mappings: [mapping] };
+	const acknowledged: ManagedTurnAuthority = { ...prepared, sessionId: root.sessionId, generation: 19 };
+	const proof: ManagedGenerationProof = {
+		kind: "managed-generation",
+		sessionId: acknowledged.sessionId,
+		generation: acknowledged.generation,
+		leaseId: acknowledged.leaseId,
+		epoch: acknowledged.epoch,
+	};
+	return {
+		document: graph,
+		mapping,
+		operation,
+		lifecycle,
+		prepared,
+		acknowledged,
+		proof,
+		historicalBinding,
+		priorJournal: structuredClone(root.journal),
+	};
+}
+
+function rekeyedGraph() {
+	const fixture = bootstrapGraph();
+	const ack = transitionManagedLifecycleEvidence(
+		transitionManagedLifecycleEvidence(fixture.lifecycle, "invoking", {}, timestamp),
+		"acknowledged_unproven",
+		{ acknowledged: fixture.acknowledged },
+		timestamp,
+	);
+	const lifecycle = transitionManagedLifecycleEvidence(
+		ack,
+		"active_generation_proven",
+		{ proven: fixture.proof },
+		timestamp,
+	);
+	const receipt: SessionAuthorityV3Operation = {
+		...fixture.operation,
+		id: "migration:resume:original-root",
+		ingressId: "migration:resume:original-root",
+		state: "complete",
+		completedAt: timestamp,
+		lifecycle,
+	};
+	const chatId = JSON.stringify([fixture.prepared.principalId, fixture.prepared.chatId]);
+	const { historicalBinding: _history, ...fields } = fixture.mapping;
+	const root = {
+		...fields,
+		chatId,
+		header: { ...fields.header, chatId },
+		managedAuthority: { ...fixture.acknowledged, chatId, authorityEpoch: SESSION_AUTHORITY_V3_EPOCH },
+		journal: [...fixture.priorJournal, receipt],
+	};
+	const published = fixture.priorJournal[0]!;
+	const result = published.result!;
+	if (result.historicalBinding === undefined) throw new Error("Expected historical result.");
+	const provisional = {
+		id: published.id,
+		kind: "create" as const,
+		state: "complete" as const,
+		startedAt: published.startedAt,
+		completedAt: published.completedAt,
+		...result.mapping,
+		historicalBinding: {
+			...result.historicalBinding,
+			provenance: { ...result.historicalBinding.provenance, nodeRef: "/provisionalOperations/0" },
+		},
+	};
+	const {
+		operationId: _operationId,
+		rawFrameCursor: _rawFrameCursor,
+		eventCursor: _eventCursor,
+		...reservation
+	} = provisional;
+	const document: SessionAuthorityV3Document = {
+		...fixture.document,
+		mappings: [root],
+		provisionalOperations: [reservation],
+	};
+	return { fixture, root, receipt, reservation, document };
+}
+
+function unownedRekeyedGraph(principalId: string) {
+	const base = rekeyedGraph();
+	const removePrincipal = (value: unknown): unknown => {
+		if (Array.isArray(value)) return value.map(removePrincipal);
+		if (value === null || typeof value !== "object") return value;
+		if ("kind" in value && value.kind === "unbound-history")
+			return Object.fromEntries(
+				Object.entries(value)
+					.filter(([key]) => key !== "principalId")
+					.map(([key, child]) => [key, key === "reason" ? "ownership-unresolved" : removePrincipal(child)]),
+			);
+		return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, removePrincipal(child)]));
+	};
+	const history = removePrincipal(base.fixture.document);
+	if (!isSessionAuthorityV3Document(history)) throw new Error("Invalid unowned source fixture.");
+	const original = history.mappings[0]!;
+	const preparedAuthority = { ...base.fixture.prepared, principalId };
+	if (original.historicalBinding === undefined) throw new Error("Missing original binding.");
+	const intent = createManagedLifecycleEvidence(
+		{
+			operation: "session.resume",
+			preparedAuthority,
+			historicalSource: {
+				...base.fixture.lifecycle.historicalSource!,
+				historicalBinding: original.historicalBinding,
+			},
+			target: base.fixture.lifecycle.target,
+			payloadHash: base.fixture.lifecycle.payloadHash,
+		},
+		timestamp,
+	);
+	const acknowledged = { ...base.fixture.acknowledged, principalId };
+	const active = transitionManagedLifecycleEvidence(
+		transitionManagedLifecycleEvidence(
+			transitionManagedLifecycleEvidence(intent, "invoking", {}, timestamp),
+			"acknowledged_unproven",
+			{ acknowledged },
+			timestamp,
+		),
+		"active_generation_proven",
+		{ proven: base.fixture.proof },
+		timestamp,
+	);
+	const chatId = JSON.stringify([principalId, preparedAuthority.chatId]);
+	const { historicalBinding: _history, managedAuthority: _managed, ...fields } = original;
+	const root = {
+		...fields,
+		chatId,
+		header: { ...fields.header, chatId },
+		managedAuthority: { ...acknowledged, chatId, authorityEpoch: SESSION_AUTHORITY_V3_EPOCH },
+		journal: [...original.journal.slice(0, -1), { ...base.receipt, lifecycle: active }],
+	};
+	const { principalId: _principal, ...binding } = base.reservation.historicalBinding;
+	const reservation = {
+		...base.reservation,
+		historicalBinding: { ...binding, reason: "ownership-unresolved" as const },
+	};
+	const document: SessionAuthorityV3Document = {
+		...base.document,
+		mappings: [root],
+		provisionalOperations: [reservation],
+	};
+	return { root, reservation, document };
+}
+
+function inheritedTombstone(value: SessionAuthorityV3Tombstone): SessionAuthorityTombstone {
+	const { version: _version, authorityEpoch: _epoch, prior, ...fields } = value;
+	return { ...fields, version: 2, ...(prior === undefined ? {} : { prior: inheritedTombstone(prior) }) };
+}
+function inheritedRecord(value: SessionAuthorityV3Mapping): SessionAuthorityRecord {
+	const { version: _version, authorityEpoch: _epoch, reassignment, ...fields } = value;
+	if (reassignment === undefined) return { ...fields, version: 2 };
+	const { sourceTombstone, priorTombstone, ...marker } = reassignment;
+	return {
+		...fields,
+		version: 2,
+		reassignment: {
+			...marker,
+			...(sourceTombstone === undefined ? {} : { sourceTombstone: inheritedTombstone(sourceTombstone) }),
+			...(priorTombstone === undefined ? {} : { priorTombstone: inheritedTombstone(priorTombstone) }),
+		},
+	};
+}
+function inheritedValid(document: SessionAuthorityV3Document): boolean {
+	return isAuthorityDocumentRelationallyValid(document.mappings.map(inheritedRecord), document.provisionalOperations);
+}
+
+function resultfulHistoricalReservation(omitOwner = false) {
+	const base = rekeyedGraph();
+	const published = base.root.journal[0]!.result!;
+	if (published.historicalBinding === undefined) throw new Error("Expected historical publication.");
+	const { historicalBinding, managedAuthority: _managed, ...payload } = published;
+	const { principalId: _principal, canonicalWorkspace: _workspace, ...unowned } = historicalBinding;
+	const resultHistory: HistoricalSessionBinding = {
+		...(omitOwner ? { ...unowned, reason: "ownership-unresolved" as const } : historicalBinding),
+		provenance: {
+			...historicalBinding.provenance,
+			nodeRef: "/provisionalOperations/0/result",
+			nodeHash: "e".repeat(64),
+		},
+	};
+	const {
+		principalId: _reservationPrincipal,
+		canonicalWorkspace: _reservationWorkspace,
+		...unownedReservation
+	} = base.reservation.historicalBinding;
+	const reservationHistory: HistoricalSessionBinding = omitOwner
+		? { ...unownedReservation, reason: "ownership-unresolved" }
+		: base.reservation.historicalBinding;
+	const result = { ...structuredClone(payload), historicalBinding: resultHistory };
+	const reservation = { ...base.reservation, historicalBinding: reservationHistory, result };
+	return {
+		...base,
+		published,
+		result,
+		reservation,
+		document: { ...base.document, provisionalOperations: [reservation] },
+	};
+}
+
+function passiveReceiptFixture(kind: "create" | "branch" | "resume" = "branch") {
+	const document = clonedGolden();
+	const root = document.mappings[0];
+	const source = lifecycleExactAuthority(root.managedAuthority);
+	const prepared = { ...lifecyclePreparedAuthority(source), requestKey: "late-request" };
+	const evidence = transitionManagedLifecycleEvidence(
+		createManagedLifecycleEvidence(
+			{
+				operation: kind === "create" ? "session.create" : kind === "resume" ? "session.resume" : "session.fork",
+				source,
+				preparedAuthority: prepared,
+				payloadHash: "a".repeat(64),
+				target:
+					kind === "create"
+						? { kind: "existing_path", path: source.canonicalWorkspace }
+						: kind === "resume"
+							? { sessionIdOrPrefix: source.sessionId, path: source.canonicalWorkspace }
+							: { sourceSessionId: source.sessionId, cwd: source.canonicalWorkspace },
+			},
+			timestamp,
+		),
+		"invoking",
+		{},
+		timestamp,
+	);
+	const admitted: SessionAuthorityV3Operation = {
+		id: "late-operation",
+		ingressId: "late-ingress",
+		kind,
+		state: "pending",
+		startedAt: timestamp,
+		detail: evidence.payloadHash,
+		lifecycle: evidence,
+	};
+	const acknowledged = {
+		...prepared,
+		sessionId: kind === "resume" ? source.sessionId : "late-successor",
+		generation: kind === "resume" ? source.generation : 9,
+	};
+	const receipt = createManagedLateLifecycleAcknowledgement(admitted, acknowledged, "2026-08-24T00:00:02.000Z");
+	const uncertain: SessionAuthorityV3Operation = {
+		...admitted,
+		state: "uncertain",
+		lifecycle: transitionManagedLifecycleEvidence(evidence, "uncertain", {}, "2026-08-24T00:00:01.000Z"),
+		lateLifecycleAcknowledgement: receipt,
+	};
+	root.journal = [...root.journal.slice(0, 1), uncertain];
+	return { document, admitted, acknowledged, receipt, uncertain };
+}
+
+describe("session authority v3 full graph", () => {
+	function catalogFixture() {
+		const root = mkdtempSync(join(tmpdir(), "gjc-catalog-owner-"));
+		const path = join(root, "authority.json");
+		writeFileSync(
+			path,
+			encodeSessionAuthorityV3Document({
+				kind: SESSION_AUTHORITY_V3_KIND,
+				version: 3,
+				authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+				mappings: [],
+				provisionalOperations: [],
+			}),
+		);
+		const store = new SessionV3FileBackedMappingStore(path);
+		const prepared = lifecyclePreparedAuthority(authority("catalog-chat", "project-a", "unused"));
+		const scope = { principalId: prepared.principalId, chatId: prepared.chatId };
+		const reserved = store.reserveManagedCatalogScoped(scope, {
+			operationId: "catalog-create",
+			prepared,
+			payloadHash: "c".repeat(64),
+		});
+		const advance = (state: Parameters<typeof transitionManagedLifecycleEvidence>[1], patch = {}) => {
+			const current = store.provisionalOperationScoped(scope, reserved.id)!;
+			return store.advanceManagedCatalogScoped(
+				scope,
+				reserved,
+				managedLifecycleEvidenceHash(current.lifecycle!),
+				transitionManagedLifecycleEvidence(current.lifecycle!, state, patch),
+			);
+		};
+		const acknowledge = (proven = false, withReceipt = true) => {
+			const admitted = advance("invoking");
+			const acknowledged = { ...prepared, sessionId: "catalog-created", generation: 8 };
+			advance("acknowledged_unproven", {
+				acknowledged,
+				...(withReceipt
+					? {
+							endpointReceipt: {
+								sessionId: acknowledged.sessionId,
+								endpointGeneration: acknowledged.generation,
+								endpointIncarnation: "a".repeat(64),
+							},
+						}
+					: {}),
+			});
+			if (proven)
+				advance("active_generation_proven", {
+					proven: {
+						kind: "managed-generation",
+						sessionId: acknowledged.sessionId,
+						generation: acknowledged.generation,
+						leaseId: prepared.leaseId,
+						epoch: prepared.epoch,
+					},
+				});
+			return { admitted, acknowledged };
+		};
+		let cleanupOwner: ProvisionalSessionOperation;
+		const cleanup = () => {
+			const current = store.provisionalOperationScoped(scope, reserved.id)!;
+			cleanupOwner = store.reserveManagedCatalogCleanupScoped(
+				scope,
+				reserved,
+				managedLifecycleEvidenceHash(current.lifecycle!),
+				{
+					operationId: "catalog-close",
+					requestKey: "catalog-close-request",
+					payloadHash: "d".repeat(64),
+				},
+			);
+			return cleanupOwner;
+		};
+		const advanceCleanup = (state: Parameters<typeof transitionManagedLifecycleEvidence>[1], patch = {}) => {
+			const current = store.provisionalOperationScoped(scope, reserved.id)!;
+			return store.advanceManagedCatalogCleanupScoped(
+				scope,
+				cleanupOwner,
+				managedLifecycleEvidenceHash(current.cleanup!.lifecycle),
+				transitionManagedLifecycleEvidence(current.cleanup!.lifecycle, state, patch),
+			);
+		};
+		return {
+			root,
+			path,
+			store,
+			prepared,
+			scope,
+			reserved,
+			advance,
+			acknowledge,
+			cleanup,
+			advanceCleanup,
+			close: () => {
+				store.close();
+				rmSync(root, { recursive: true, force: true });
+			},
+		};
+	}
+
+	test.each([false, true])(
+		"catalog missing endpoint receipt denies cleanup without mutation with proof=%s",
+		proven => {
+			const f = catalogFixture();
+			try {
+				f.acknowledge(proven, false);
+				const parent = f.store.provisionalOperationScoped(f.scope, f.reserved.id)!;
+				const bytes = readFileSync(f.path),
+					inode = statSync(f.path).ino;
+				expect(() => f.cleanup()).toThrow("original endpoint receipt");
+				expect(f.store.provisionalOperationScoped(f.scope, f.reserved.id)).toEqual(parent);
+				expect(f.store.provisionalOperationScoped(f.scope, f.reserved.id)!.cleanup).toBeUndefined();
+				expect(readFileSync(f.path).equals(bytes)).toBe(true);
+				expect(statSync(f.path).ino).toBe(inode);
+				expect(parseSessionAuthorityV3Document(bytes)!.provisionalOperations[0]!.lifecycle!.state).toBe(
+					proven ? "active_generation_proven" : "acknowledged_unproven",
+				);
+				f.store.close();
+				const reopened = new SessionV3FileBackedMappingStore(f.path);
+				try {
+					const retained = reopened.provisionalOperationScoped(f.scope, f.reserved.id)!;
+					expect(retained.lifecycle!.endpointReceipt).toBeUndefined();
+					expect(retained.cleanup).toBeUndefined();
+				} finally {
+					reopened.close();
+				}
+			} finally {
+				f.close();
+			}
+		},
+	);
+
+	test.each([false, true])(
+		"catalog cleanup copies the original endpoint pair and binds its relational hash with proof=%s",
+		proven => {
+			const f = catalogFixture();
+			try {
+				f.acknowledge(proven);
+				const parent = f.store.provisionalOperationScoped(f.scope, f.reserved.id)!;
+				const endpointReceipt = structuredClone(parent.lifecycle!.endpointReceipt!);
+				Object.assign(parent.lifecycle!.endpointReceipt!, { endpointIncarnation: "b".repeat(64) });
+				const reserved = f.cleanup();
+				expect(reserved.cleanup!.lifecycle.target).toEqual({ ...endpointReceipt });
+				expect(reserved.lifecycle!.endpointReceipt).toEqual(endpointReceipt);
+				const document = parseSessionAuthorityV3Document(readFileSync(f.path))!;
+				expect(inheritedValid(document)).toBe(true);
+				const original = document.provisionalOperations[0]!;
+				const child = original.cleanup!;
+				const forgedIntent = createManagedLifecycleEvidence(
+					{
+						operation: "session.close",
+						preparedAuthority: child.lifecycle.preparedAuthority,
+						source: child.lifecycle.source,
+						payloadHash: child.lifecycle.payloadHash,
+						target: { ...child.lifecycle.target, endpointIncarnation: "b".repeat(64) },
+					},
+					child.lifecycle.recordedAt,
+				);
+				expect(isManagedLifecycleEvidence(forgedIntent)).toBe(true);
+				for (const lifecycle of [forgedIntent, { ...child.lifecycle, requestHash: "f".repeat(64) }]) {
+					const invalid = {
+						...document,
+						provisionalOperations: [{ ...original, cleanup: { ...child, lifecycle } }],
+					};
+					expect(isSessionAuthorityV3Document(invalid)).toBe(false);
+					expect(parseSessionAuthorityV3Document(JSON.stringify(invalid))).toBeUndefined();
+					expect(inheritedValid(invalid)).toBe(false);
+				}
+				// Historical generation-only cleanup remains readable, not new reservation authority.
+				const { endpointReceipt: _receipt, ...historicalParent } = original.lifecycle!;
+				const historicalChild = createManagedLifecycleEvidence(
+					{
+						operation: "session.close",
+						preparedAuthority: child.lifecycle.preparedAuthority,
+						source: child.lifecycle.source,
+						payloadHash: child.lifecycle.payloadHash,
+						target: {
+							sessionId: endpointReceipt.sessionId,
+							endpointGeneration: endpointReceipt.endpointGeneration,
+						},
+					},
+					child.lifecycle.recordedAt,
+				);
+				const historicalDocument = {
+					...document,
+					provisionalOperations: [
+						{ ...original, lifecycle: historicalParent, cleanup: { ...child, lifecycle: historicalChild } },
+					],
+				};
+				expect(parseSessionAuthorityV3Document(JSON.stringify(historicalDocument))).toEqual(historicalDocument);
+				expect(inheritedValid(historicalDocument)).toBe(true);
+				const bytes = readFileSync(f.path);
+				Object.assign(reserved.cleanup!.lifecycle.target, { endpointIncarnation: "c".repeat(64) });
+				expect(f.store.provisionalOperationScoped(f.scope, f.reserved.id)!.cleanup!.lifecycle.target).toEqual({
+					...endpointReceipt,
+				});
+				expect(readFileSync(f.path).equals(bytes)).toBe(true);
+				f.store.close();
+				const reopened = new SessionV3FileBackedMappingStore(f.path);
+				try {
+					const retained = reopened.provisionalOperationScoped(f.scope, f.reserved.id)!;
+					expect(retained.lifecycle!.endpointReceipt).toEqual(endpointReceipt);
+					expect(retained.cleanup!.lifecycle.target).toEqual({ ...endpointReceipt });
+					expect(retained.cleanup!.lifecycle.requestHash).toBe(child.lifecycle.requestHash);
+					expect(reopened.getScoped(f.scope)).toBeUndefined();
+				} finally {
+					reopened.close();
+				}
+			} finally {
+				f.close();
+			}
+		},
+	);
+
+	test.each([false, true])(
+		"catalog retirement atomically completes both owners without publication with proof=%s",
+		proven => {
+			const f = catalogFixture();
+			try {
+				const { acknowledged } = f.acknowledge(proven);
+				const reserved = f.cleanup();
+				const originalParent = reserved.lifecycle!;
+				f.advanceCleanup("invoking");
+				const closeAcknowledgement = {
+					sessionId: acknowledged.sessionId,
+					generation: acknowledged.generation,
+					observedAt: new Date().toISOString(),
+				};
+				const ack = f.advanceCleanup("acknowledged_unproven", { closeAcknowledgement });
+				expect(ack.lifecycle).toEqual(originalParent);
+				const retirement = {
+					sessionId: acknowledged.sessionId,
+					generation: acknowledged.generation,
+					acknowledgedSessionId: acknowledged.sessionId,
+					observedAt: new Date().toISOString(),
+					evidence: {
+						source: "session_index",
+						event: "host_unregistered",
+						observedIndexSeq: 3,
+						evidenceIndexSeq: 3,
+					},
+				};
+				const completed = f.advanceCleanup("retired", { retirement });
+				expect(completed.state).toBe("complete");
+				expect(completed.lifecycle!.state).toBe("retired");
+				expect(completed.cleanup!.state).toBe("complete");
+				expect(completed.cleanup!.lifecycle.retirement).toEqual(completed.lifecycle!.retirement);
+				expect(completed.cleanup!.lifecycle.closeAcknowledgement).toEqual(closeAcknowledgement);
+				expect(completed.cleanup!.lifecycle.requestHash).toBe(reserved.cleanup!.lifecycle.requestHash);
+				expect(completed.lifecycle!.requestHash).toBe(originalParent.requestHash);
+				expect(completed.result).toBeUndefined();
+				expect(completed.sessionId).toBeUndefined();
+				expect(f.store.getScoped(f.scope)).toBeUndefined();
+				const bytes = readFileSync(f.path);
+				const inode = statSync(f.path).ino;
+				expect(f.advanceCleanup("retired")).toEqual(completed);
+				expect(readFileSync(f.path).equals(bytes)).toBe(true);
+				expect(statSync(f.path).ino).toBe(inode);
+				f.store.close();
+				const reopened = new SessionV3FileBackedMappingStore(f.path);
+				try {
+					expect(reopened.provisionalOperationScoped(f.scope, f.reserved.id)).toEqual(completed);
+					expect(() => reopened.assertServingReady()).not.toThrow();
+					expect(reopened.getScoped(f.scope)).toBeUndefined();
+				} finally {
+					reopened.close();
+				}
+			} finally {
+				f.close();
+			}
+		},
+	);
+
+	test.each([false, true])(
+		"catalog cleanup excludes competing mutation and unsupported retry with proof=%s",
+		proven => {
+			const f = catalogFixture();
+			try {
+				const { acknowledged } = f.acknowledge(proven);
+				const reserved = f.cleanup();
+				const before = readFileSync(f.path);
+				expect(() => f.cleanup()).toThrow("original acknowledged");
+				expect(() =>
+					f.advance(proven ? "closing" : "active_generation_proven", {
+						proven: {
+							kind: "managed-generation",
+							sessionId: acknowledged.sessionId,
+							generation: acknowledged.generation,
+							leaseId: f.prepared.leaseId,
+							epoch: f.prepared.epoch,
+						},
+					}),
+				).toThrow("create evidence changed");
+				expect(() => f.store.discardPendingProvisionalOperationScoped(f.scope, f.reserved)).toThrow(
+					"requires reconciliation",
+				);
+				expect(() => f.store.transitionProvisionalOperationScoped(f.scope, f.reserved.id, "uncertain")).toThrow(
+					"operation-scoped owner",
+				);
+				expect(readFileSync(f.path).equals(before)).toBe(true);
+				f.advanceCleanup("invoking");
+				const uncertain = f.advanceCleanup("uncertain");
+				expect(uncertain.state).toBe("uncertain");
+				expect(uncertain.cleanup!.state).toBe("uncertain");
+				expect(uncertain.lifecycle!.state).toBe(proven ? "uncertain" : "cleanup_uncertain");
+				expect(uncertain.cleanup!.lifecycle.requestHash).toBe(reserved.cleanup!.lifecycle.requestHash);
+				expect(() =>
+					f.advanceCleanup("acknowledged_unproven", {
+						closeAcknowledgement: {
+							sessionId: acknowledged.sessionId,
+							generation: acknowledged.generation,
+							observedAt: new Date().toISOString(),
+						},
+					}),
+				).toThrow("fresh public request-bound evidence");
+				expect(() => f.advanceCleanup("terminal_failure")).toThrow("not-applied evidence");
+				expect(() => f.cleanup()).toThrow("original acknowledged");
+			} finally {
+				f.close();
+			}
+		},
+	);
+
+	test("catalog cleanup updates bind the distinct original close reservation and fresh observation", () => {
+		const f = catalogFixture();
+		try {
+			const { acknowledged } = f.acknowledge();
+			const owner = f.cleanup();
+			const invoking = f.advanceCleanup("invoking");
+			const current = invoking.cleanup!.lifecycle;
+			const hash = managedLifecycleEvidenceHash(current);
+			const bytes = readFileSync(f.path);
+			const inode = statSync(f.path).ino;
+			for (const admitted of [
+				f.reserved,
+				{ ...owner, cleanup: { ...owner.cleanup!, id: "other-close" } },
+				{ ...owner, cleanup: { ...owner.cleanup!, ingressId: "other-ingress" } },
+				{
+					...owner,
+					lifecycle: { ...owner.lifecycle!, preparedAuthority: { ...f.prepared, leaseId: "foreign-lease" } },
+				},
+			]) {
+				expect(() => f.store.advanceManagedCatalogCleanupScoped(f.scope, admitted, hash, current)).toThrow();
+			}
+			expect(() =>
+				f.store.advanceManagedCatalogCleanupScoped({ ...f.scope, principalId: "foreign" }, owner, hash, current),
+			).toThrow();
+			expect(() =>
+				f.store.advanceManagedCatalogCleanupScoped(
+					f.scope,
+					owner,
+					managedLifecycleEvidenceHash(owner.cleanup!.lifecycle),
+					current,
+				),
+			).toThrow("changed before mutation");
+			const staleAck = transitionManagedLifecycleEvidence(current, "acknowledged_unproven", {
+				closeAcknowledgement: {
+					sessionId: acknowledged.sessionId,
+					generation: acknowledged.generation,
+					observedAt: timestamp,
+				},
+			});
+			expect(() => f.store.advanceManagedCatalogCleanupScoped(f.scope, owner, hash, staleAck)).toThrow(
+				"predates its original invocation",
+			);
+			expect(readFileSync(f.path).equals(bytes)).toBe(true);
+			expect(statSync(f.path).ino).toBe(inode);
+		} finally {
+			f.close();
+		}
+	});
+
+	test("catalog local cancellation completes only before invocation and persists nonserving history", () => {
+		const f = catalogFixture();
+		try {
+			const completed = f.advance("terminal_failure");
+			expect(completed.state).toBe("complete");
+			expect(completed.cleanup).toBeUndefined();
+			expect(completed.result).toBeUndefined();
+			const document = parseSessionAuthorityV3Document(readFileSync(f.path))!;
+			expect(inheritedValid(document)).toBe(true);
+			const invalid = {
+				...document,
+				provisionalOperations: [
+					{ ...document.provisionalOperations[0]!, state: "pending", completedAt: undefined },
+				],
+			};
+			expect(isSessionAuthorityV3Document(invalid)).toBe(false);
+			expect(() => f.cleanup()).toThrow("original acknowledged");
+			f.store.close();
+			const reopened = new SessionV3FileBackedMappingStore(f.path);
+			try {
+				expect(() => reopened.assertServingReady()).not.toThrow();
+				expect(reopened.provisionalOperationScoped(f.scope, f.reserved.id)).toEqual(completed);
+			} finally {
+				reopened.close();
+			}
+		} finally {
+			f.close();
+		}
+	});
+
+	test("reopened prepared catalog create cannot admit an invocation", () => {
+		const f = catalogFixture();
+		try {
+			f.store.close();
+			const reopened = new SessionV3FileBackedMappingStore(f.path);
+			try {
+				const retained = reopened.provisionalOperationScoped(f.scope, f.reserved.id)!;
+				expect(retained.state).toBe("uncertain");
+				expect(retained.lifecycle!.state).toBe("intent_prepared");
+				const bytes = readFileSync(f.path),
+					inode = statSync(f.path).ino;
+				expect(() =>
+					reopened.advanceManagedCatalogScoped(
+						f.scope,
+						f.reserved,
+						managedLifecycleEvidenceHash(retained.lifecycle!),
+						transitionManagedLifecycleEvidence(retained.lifecycle!, "invoking"),
+					),
+				).toThrow("pending original admission");
+				expect(
+					reopened.advanceManagedCatalogScoped(
+						f.scope,
+						f.reserved,
+						managedLifecycleEvidenceHash(retained.lifecycle!),
+						retained.lifecycle!,
+					),
+				).toEqual(retained);
+				expect(readFileSync(f.path).equals(bytes)).toBe(true);
+				expect(statSync(f.path).ino).toBe(inode);
+			} finally {
+				reopened.close();
+			}
+		} finally {
+			f.close();
+		}
+	});
+
+	test.each([
+		[false, "intent_prepared"],
+		[true, "intent_prepared"],
+		[false, "invoking"],
+		[true, "invoking"],
+		[false, "acknowledged_unproven"],
+		[true, "acknowledged_unproven"],
+	] as const)(
+		"catalog cleanup retains independent request identity without serving binding proof=%s state=%s",
+		(proven, state) => {
+			const f = catalogFixture();
+			try {
+				const { acknowledged } = f.acknowledge(proven);
+				let pending = f.cleanup();
+				if (state !== "intent_prepared") pending = f.advanceCleanup("invoking");
+				if (state === "acknowledged_unproven")
+					pending = f.advanceCleanup(state, {
+						closeAcknowledgement: {
+							sessionId: acknowledged.sessionId,
+							generation: acknowledged.generation,
+							observedAt: new Date().toISOString(),
+						},
+					});
+				expect(isManagedCatalogProvisional(pending)).toBe(true);
+				expect(pending.lifecycle!.state).toBe(proven ? "closing" : "acknowledged_unproven");
+				expect(pending.cleanup!.lifecycle.state).toBe(state);
+				expect(pending.cleanup!.lifecycle.source).toEqual(acknowledged);
+				expect(pending.cleanup!.lifecycle.requestKey).not.toBe(pending.lifecycle!.requestKey);
+				expect(pending.sessionId).toBeUndefined();
+				expect(pending.managedAuthority).toBeUndefined();
+				expect(pending.result).toBeUndefined();
+				expect(f.store.getScoped(f.scope)).toBeUndefined();
+				const bytes = readFileSync(f.path);
+				const copied = copyProvisionalOperation(pending);
+				Object.assign(copied.cleanup!.lifecycle.source!, { generation: 99 });
+				expect(pending.cleanup!.lifecycle.source!.generation).toBe(8);
+				expect(() =>
+					f.store.attachProvisionalOperationScoped(f.scope, f.reserved.id, {
+						sessionId: acknowledged.sessionId,
+						managedAuthority: acknowledged,
+					}),
+				).toThrow("cannot attach");
+				expect(() =>
+					f.store.recordLifecycleEvidenceScoped(f.scope, f.reserved.id, pending.detail!, pending.lifecycle!),
+				).toThrow("operation-scoped owner");
+				expect(readFileSync(f.path).equals(bytes)).toBe(true);
+				f.store.close();
+				const reopened = new SessionV3FileBackedMappingStore(f.path);
+				const retained = reopened.provisionalOperationScoped(f.scope, f.reserved.id)!;
+				expect(retained.state).toBe("uncertain");
+				expect(retained.cleanup!.state).toBe("uncertain");
+				expect(retained.cleanup!.lifecycle).toEqual(
+					state === "intent_prepared"
+						? pending.cleanup!.lifecycle
+						: transitionManagedLifecycleEvidence(
+								pending.cleanup!.lifecycle,
+								"uncertain",
+								{},
+								pending.cleanup!.lifecycle.recordedAt,
+							),
+				);
+				expect(retained.lifecycle!.state).toBe("uncertain");
+				expect(() => reopened.assertServingReady()).toThrow("unfinished provisional");
+				if (state === "intent_prepared") {
+					const bytes = readFileSync(f.path),
+						inode = statSync(f.path).ino;
+					expect(() =>
+						reopened.advanceManagedCatalogCleanupScoped(
+							f.scope,
+							pending,
+							managedLifecycleEvidenceHash(retained.cleanup!.lifecycle),
+							transitionManagedLifecycleEvidence(retained.cleanup!.lifecycle, "invoking"),
+						),
+					).toThrow("pending original admission");
+					expect(
+						reopened.advanceManagedCatalogCleanupScoped(
+							f.scope,
+							pending,
+							managedLifecycleEvidenceHash(retained.cleanup!.lifecycle),
+							retained.cleanup!.lifecycle,
+						),
+					).toEqual(retained);
+					expect(readFileSync(f.path).equals(bytes)).toBe(true);
+					expect(statSync(f.path).ino).toBe(inode);
+				}
+				expect(() =>
+					reopened.reserveManagedCatalogCleanupScoped(
+						f.scope,
+						f.reserved,
+						managedLifecycleEvidenceHash(retained.lifecycle!),
+						{
+							operationId: "retry-close",
+							requestKey: "retry-key",
+							payloadHash: "e".repeat(64),
+						},
+					),
+				).toThrow("original acknowledged");
+				reopened.close();
+			} finally {
+				f.close();
+			}
+		},
+	);
+
+	test("catalog passive create receipt is purpose-bound and cannot own cleanup or publication", () => {
+		const f = catalogFixture();
+		try {
+			const admitted = f.advance("invoking");
+			const acknowledged = { ...f.prepared, sessionId: "late-created", generation: 3 };
+			const { purpose: _purpose, ...ordinary } = admitted;
+			expect(managedProvisionalCreateAdmissionHash(admitted)).not.toBe(
+				managedProvisionalCreateAdmissionHash(ordinary),
+			);
+			f.advance("uncertain");
+			const receipt = createManagedLateCreateAcknowledgement(admitted, acknowledged);
+			f.store.recordLateCreateAcknowledgementScoped(f.scope, admitted, receipt);
+			const retained = f.store.provisionalOperationScoped(f.scope, f.reserved.id)!;
+			expect(retained.lateCreateAcknowledgement).toEqual(receipt);
+			expect(retained.cleanup).toBeUndefined();
+			expect(() => f.cleanup()).toThrow("original acknowledged");
+			expect(() =>
+				f.store.publishProvisionalOperationScoped(f.scope, f.reserved, {
+					chatId: f.scope.chatId,
+					principalId: f.scope.principalId,
+					projectId: f.prepared.projectId,
+					sessionId: acknowledged.sessionId,
+					managedAuthority: acknowledged,
+					rawFrameCursor: 0,
+					eventCursor: 0,
+					operationId: f.reserved.id,
+				}),
+			).toThrow("cannot publish");
+			expect(f.store.getScoped(f.scope)).toBeUndefined();
+		} finally {
+			f.close();
+		}
+	});
+
+	test("catalog cleanup schema rejects foreign source, aliases, forged completion and ordinary owners", () => {
+		const f = catalogFixture();
+		try {
+			f.acknowledge(true);
+			f.cleanup();
+			const document = parseSessionAuthorityV3Document(readFileSync(f.path))!;
+			const original = document.provisionalOperations[0]!;
+			expect(inheritedValid(document)).toBe(true);
+			for (const patch of [
+				{ purpose: undefined },
+				{ purpose: "other" },
+				{ state: "complete", completedAt: new Date().toISOString() },
+				{ sessionId: "catalog-created" },
+				{ result: {} },
+				{ lateCreateAcknowledgement: {} },
+				{ cleanup: { ...original.cleanup, id: original.id } },
+				{ cleanup: { ...original.cleanup, ingressId: original.ingressId } },
+				{ cleanup: { ...original.cleanup, result: {} } },
+				{
+					cleanup: {
+						...original.cleanup,
+						lifecycle: {
+							...original.cleanup!.lifecycle,
+							source: { ...original.cleanup!.lifecycle.source, generation: 99 },
+						},
+					},
+				},
+				{ cleanup: { ...original.cleanup, startedAt: "2099-01-01T00:00:00.000Z" } },
+			]) {
+				const invalid = { ...document, provisionalOperations: [{ ...original, ...patch }] };
+				expect(isSessionAuthorityV3Document(invalid)).toBe(false);
+				expect(parseSessionAuthorityV3Document(JSON.stringify(invalid))).toBeUndefined();
+				expect(inheritedValid(invalid as SessionAuthorityV3Document)).toBe(false);
+			}
+			const duplicate = { ...original, id: "second", ingressId: "second" };
+			expect(isSessionAuthorityV3Document({ ...document, provisionalOperations: [original, duplicate] })).toBe(
+				false,
+			);
+			const before = readFileSync(f.path);
+			expect(() =>
+				f.store.reserveProvisionalOperationScoped(f.scope, {
+					id: "catalog-close",
+					ingressId: "other",
+					kind: "create",
+					chatId: f.scope.chatId,
+					projectId: f.prepared.projectId,
+				}),
+			).toThrow();
+			expect(readFileSync(f.path).equals(before)).toBe(true);
+		} finally {
+			f.close();
+		}
+	});
+
+	function initialCreateReceiptFixture() {
+		const prepared = lifecyclePreparedAuthority(authority("chat-a", "project-a", "unused"));
+		const lifecycle = transitionManagedLifecycleEvidence(
+			createManagedLifecycleEvidence(
+				{
+					operation: "session.create",
+					preparedAuthority: prepared,
+					payloadHash: "a".repeat(64),
+					target: { kind: "existing_path", path: prepared.canonicalWorkspace },
+				},
+				timestamp,
+			),
+			"invoking",
+			{},
+			timestamp,
+		);
+		const admitted: ProvisionalSessionOperation = {
+			id: "initial-create",
+			ingressId: "initial-ingress",
+			kind: "create",
+			state: "pending",
+			startedAt: timestamp,
+			chatId: "chat-a",
+			projectId: "project-a",
+			detail: lifecycle.payloadHash,
+			lifecycle,
+		};
+		const acknowledged = { ...prepared, sessionId: "original-created", generation: 7 };
+		const receipt = createManagedLateCreateAcknowledgement(admitted, acknowledged, "2026-08-24T00:00:02.000Z");
+		const uncertain: ProvisionalSessionOperation = {
+			...admitted,
+			chatId: JSON.stringify([prepared.principalId, prepared.chatId]),
+			state: "uncertain",
+			lifecycle: transitionManagedLifecycleEvidence(lifecycle, "uncertain", {}, "2026-08-24T00:00:01.000Z"),
+		};
+		const document = {
+			kind: SESSION_AUTHORITY_V3_KIND,
+			version: 3 as const,
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+			mappings: [],
+			provisionalOperations: [uncertain],
+		};
+		return {
+			admitted,
+			acknowledged,
+			receipt,
+			uncertain,
+			document,
+			scope: { principalId: prepared.principalId, chatId: prepared.chatId },
+		};
+	}
+
+	test("initial create passive observation is canonical provisional-only and never a binding", () => {
+		const f = initialCreateReceiptFixture();
+		const retained = { ...f.uncertain, lateCreateAcknowledgement: f.receipt };
+		const document = { ...f.document, provisionalOperations: [retained] };
+		expect(isSessionAuthorityV3Document(document)).toBe(true);
+		if (!isSessionAuthorityV3Document(document)) throw new Error("Invalid initial create receipt fixture");
+		expect(parseSessionAuthorityV3Document(JSON.stringify(document))).toEqual(document);
+		expect(managedProvisionalCreateAdmissionHash(f.admitted)).toBe(managedProvisionalCreateAdmissionHash(retained));
+		const copied = copyProvisionalOperation(retained);
+		Object.assign(copied.lateCreateAcknowledgement!.acknowledged, { generation: 99 });
+		expect(retained.lateCreateAcknowledgement!.acknowledged.generation).toBe(7);
+		for (const patch of [
+			{ chatId: "chat-a" },
+			{ projectId: "foreign" },
+			{ kind: "resume" },
+			{ state: "pending" },
+			{ sessionId: "original-created" },
+			{ managedAuthority: f.acknowledged },
+			{ historicalBinding: clonedGolden().mappings[0].reassignment.sourceTombstone.historicalBinding ?? {} },
+			{ sessionFile: "/saved/session.jsonl" },
+			{ result: {} },
+			{ acknowledgedSuccessor: {} },
+			{ lifecycle: { ...retained.lifecycle, source: f.acknowledged } },
+			{ lifecycle: { ...retained.lifecycle, acknowledged: f.acknowledged } },
+			{ lateLifecycleAcknowledgement: f.receipt },
+			{ lateCreateAcknowledgement: { ...f.receipt, admissionHash: "b".repeat(64) } },
+			{ lateCreateAcknowledgement: { ...f.receipt, acknowledged: { sessionId: "created", generation: 0 } } },
+			{ lateCreateAcknowledgement: { ...f.receipt, observedAt: timestamp } },
+		])
+			expect(isSessionAuthorityV3Document({ ...document, provisionalOperations: [{ ...retained, ...patch }] })).toBe(
+				false,
+			);
+		const root = clonedGolden().mappings[0];
+		expect(
+			isSessionAuthorityV3Document({
+				...document,
+				mappings: [{ ...root, journal: [{ ...f.admitted, lateCreateAcknowledgement: f.receipt }] }],
+				provisionalOperations: [],
+			}),
+		).toBe(false);
+		for (const patch of [
+			{ generation: 0 },
+			{ principalId: "foreign" },
+			{ leaseId: "foreign" },
+			{ requestKey: "other" },
+		])
+			expect(() =>
+				createManagedLateCreateAcknowledgement(f.admitted, { ...f.acknowledged, ...patch }, f.receipt.observedAt),
+			).toThrow("original invocation");
+	});
+
+	test.each([false, true])(
+		"initial create passive storage is scoped immutable durable and failure atomic with endpoint=%s",
+		withReceipt => {
+			const f = initialCreateReceiptFixture();
+			// Synthetic original-result receipts exercise persistence, not live SDK endpoint authority.
+			const endpointReceipt = {
+				sessionId: f.acknowledged.sessionId,
+				endpointGeneration: f.acknowledged.generation,
+				endpointIncarnation: "a".repeat(64),
+			};
+			f.receipt = createManagedLateCreateAcknowledgement(
+				f.admitted,
+				f.acknowledged,
+				f.receipt.observedAt,
+				withReceipt ? endpointReceipt : undefined,
+			);
+			const originalReceipt = structuredClone(f.receipt);
+			const conflicts = [
+				createManagedLateCreateAcknowledgement(f.admitted, f.acknowledged, f.receipt.observedAt, {
+					...endpointReceipt,
+					endpointIncarnation: "b".repeat(64),
+				}),
+				...(withReceipt
+					? [createManagedLateCreateAcknowledgement(f.admitted, f.acknowledged, f.receipt.observedAt)]
+					: []),
+			];
+			const root = mkdtempSync(join(tmpdir(), "gjc-late-initial-create-"));
+			const path = join(root, "authority.json");
+			writeFileSync(path, JSON.stringify(f.document));
+			let store = new SessionV3FileBackedMappingStore(path);
+			try {
+				const scoped = scopedSessionMappingStore(store, f.scope.principalId, f.scope.chatId);
+				const before = readFileSync(path);
+				const lock = AuthorityMutationLock.acquire(path);
+				try {
+					expect(() => scoped.recordLateCreateAcknowledgement(f.scope.chatId, f.admitted, f.receipt)).toThrow();
+				} finally {
+					lock.release();
+				}
+				expect(readFileSync(path).equals(before)).toBe(true);
+				expect(() =>
+					store.recordLateCreateAcknowledgementScoped(
+						{ ...f.scope, principalId: "foreign" },
+						f.admitted,
+						f.receipt,
+					),
+				).toThrow("admitted owner");
+				const absent = { ...f.admitted, id: "absent", ingressId: "absent" };
+				expect(() =>
+					scoped.recordLateCreateAcknowledgement(
+						f.scope.chatId,
+						absent,
+						createManagedLateCreateAcknowledgement(absent, f.acknowledged, f.receipt.observedAt),
+					),
+				).toThrow("one retained provisional");
+				const changed = { ...f.admitted, startedAt: "2026-08-23T00:00:00.000Z" };
+				expect(() =>
+					scoped.recordLateCreateAcknowledgement(
+						f.scope.chatId,
+						changed,
+						createManagedLateCreateAcknowledgement(changed, f.acknowledged, f.receipt.observedAt),
+					),
+				).toThrow("retained reservation");
+				expect(() =>
+					scoped.recordLateCreateAcknowledgement(
+						f.scope.chatId,
+						{ ...f.admitted, lifecycle: { ...f.admitted.lifecycle!, recordedAt: "2026-08-24T00:00:03.000Z" } },
+						f.receipt,
+					),
+				).toThrow("original invocation");
+				expect(readFileSync(path).equals(before)).toBe(true);
+				scoped.recordLateCreateAcknowledgement(f.scope.chatId, f.admitted, f.receipt);
+				const bytes = readFileSync(path),
+					inode = statSync(path).ino;
+				scoped.recordLateCreateAcknowledgement(f.scope.chatId, f.admitted, f.receipt);
+				expect(readFileSync(path).equals(bytes)).toBe(true);
+				expect(statSync(path).ino).toBe(inode);
+				for (const patch of [
+					{ observedAt: "2026-08-24T00:00:03.000Z" },
+					{
+						acknowledged: { sessionId: "replacement", generation: 8 },
+						...(withReceipt
+							? { endpointReceipt: { ...endpointReceipt, sessionId: "replacement", endpointGeneration: 8 } }
+							: {}),
+					},
+				]) {
+					expect(() =>
+						scoped.recordLateCreateAcknowledgement(f.scope.chatId, f.admitted, { ...f.receipt, ...patch }),
+					).toThrow("immutable");
+					expect(readFileSync(path).equals(bytes)).toBe(true);
+				}
+				for (const conflict of conflicts) {
+					expect(() => store.recordLateCreateAcknowledgementScoped(f.scope, f.admitted, conflict)).toThrow(
+						"immutable",
+					);
+					expect(readFileSync(path).equals(bytes)).toBe(true);
+				}
+				const returned = store.provisionalOperationScoped(f.scope, f.admitted.id)!.lateCreateAcknowledgement!;
+				expect(returned).toEqual(originalReceipt);
+				if (withReceipt) {
+					Object.assign(f.receipt.endpointReceipt!, { endpointIncarnation: "c".repeat(64) });
+					Object.assign(returned.endpointReceipt!, { endpointIncarnation: "d".repeat(64) });
+				}
+				expect(store.provisionalOperationScoped(f.scope, f.admitted.id)!.lateCreateAcknowledgement).toEqual(
+					originalReceipt,
+				);
+				Object.assign(f.receipt.acknowledged, { generation: 99 });
+				store.close();
+				store = new SessionV3FileBackedMappingStore(path);
+				const retained = store.provisionalOperationScoped(f.scope, f.admitted.id)!;
+				expect(retained.lateCreateAcknowledgement).toEqual(originalReceipt);
+				for (const conflict of conflicts) {
+					expect(() => store.recordLateCreateAcknowledgementScoped(f.scope, f.admitted, conflict)).toThrow(
+						"immutable",
+					);
+					expect(readFileSync(path).equals(bytes)).toBe(true);
+				}
+				if (withReceipt) {
+					Object.assign(retained.lateCreateAcknowledgement!.endpointReceipt!, {
+						endpointIncarnation: "e".repeat(64),
+					});
+					expect(store.provisionalOperationScoped(f.scope, f.admitted.id)!.lateCreateAcknowledgement).toEqual(
+						originalReceipt,
+					);
+				}
+				expect(retained.lateCreateAcknowledgement!.acknowledged.generation).toBe(7);
+				expect(retained.lifecycle).toEqual(f.uncertain.lifecycle);
+				expect(retained.sessionId).toBeUndefined();
+				expect(retained.managedAuthority).toBeUndefined();
+				expect(store.getScoped(f.scope)).toBeUndefined();
+				expect(readFileSync(path).equals(bytes)).toBe(true);
+			} finally {
+				store.close();
+				rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
+
+	test("selected resume passive receipt cannot substitute another session or generation", () => {
+		const f = passiveReceiptFixture("resume");
+		for (const patch of [{ sessionId: "other" }, { generation: f.acknowledged.generation + 1 }]) {
+			expect(() =>
+				createManagedLateLifecycleAcknowledgement(
+					f.admitted,
+					{ ...f.acknowledged, ...patch },
+					f.receipt.observedAt,
+				),
+			).toThrow("original invocation");
+			const document = structuredClone(f.document);
+			document.mappings[0].journal.at(-1).lateLifecycleAcknowledgement.acknowledged = {
+				...f.receipt.acknowledged,
+				...patch,
+			};
+			expect(isSessionAuthorityV3Document(document)).toBe(false);
+		}
+	});
+
+	test.each([false, true])("rejects passive receipts on provisional operations with bound=%s", bound => {
+		const f = passiveReceiptFixture();
+		const provisional = {
+			...f.uncertain,
+			chatId: "chat-a",
+			projectId: "project-a",
+			...(bound ? { sessionId: "session-current", managedAuthority: f.document.mappings[0].managedAuthority } : {}),
+		};
+		const document = { ...f.document, mappings: [], provisionalOperations: [provisional] };
+		expect(isSessionAuthorityV3Document(document)).toBe(false);
+		delete provisional.lateLifecycleAcknowledgement;
+		expect(isSessionAuthorityV3Document(document)).toBe(true);
+	});
+
+	test("captures once inside a retained prior tombstone with its canonical mirror", () => {
+		const f = passiveReceiptFixture();
+		const root = f.document.mappings[0];
+		const scope = { principalId: "tenant-a", chatId: "chat-a" };
+		const key = JSON.stringify([scope.principalId, scope.chatId]);
+		const late = { ...f.uncertain };
+		delete late.lateLifecycleAcknowledgement;
+		const prior = {
+			...root.reassignment.sourceTombstone.prior,
+			projectId: "project-a",
+			chatId: key,
+			sessionId: "session-current",
+			header: { chatId: key, projectId: "project-a", sessionId: "session-current" },
+			managedAuthority: { ...root.managedAuthority, chatId: key },
+			journal: [late],
+		};
+		const old = {
+			...root.reassignment.sourceTombstone,
+			chatId: key,
+			header: { ...root.reassignment.sourceTombstone.header, chatId: key },
+			managedAuthority: { ...root.reassignment.sourceTombstone.managedAuthority, chatId: key },
+			prior,
+		};
+		Object.assign(root, {
+			chatId: key,
+			header: { ...root.header, chatId: key },
+			managedAuthority: { ...root.managedAuthority, chatId: key },
+			journal: [],
+		});
+		root.reassignment.sourceTombstone = old;
+		root.reassignment.priorTombstone = structuredClone(prior);
+		f.document.provisionalOperations = [];
+		expect(isSessionAuthorityV3Document(f.document)).toBe(true);
+		const temporary = mkdtempSync(join(tmpdir(), "gjc-late-receipt-mirror-"));
+		const path = join(temporary, "authority.json");
+		let store: SessionV3FileBackedMappingStore | undefined;
+		try {
+			writeFileSync(
+				path,
+				encodeSessionAuthorityV3Document(parseSessionAuthorityV3Document(JSON.stringify(f.document))!),
+			);
+			store = new SessionV3FileBackedMappingStore(path);
+			store.recordLateLifecycleAcknowledgementScoped(scope, f.admitted, f.receipt);
+			const bytes = readFileSync(path),
+				inode = statSync(path).ino;
+			store.recordLateLifecycleAcknowledgementScoped(scope, f.admitted, f.receipt);
+			expect(readFileSync(path).equals(bytes)).toBe(true);
+			expect(statSync(path).ino).toBe(inode);
+			store.close();
+			store = new SessionV3FileBackedMappingStore(path);
+			const graph = parseSessionAuthorityV3Document(readFileSync(path, "utf8"))!.mappings[0]!.reassignment!;
+			expect(graph.priorTombstone).toEqual(graph.sourceTombstone!.prior);
+			expect(graph.priorTombstone!.journal[0]!.lateLifecycleAcknowledgement).toEqual(f.receipt);
+			expect(graph.priorTombstone!.journal[0]!.lifecycle).toEqual(f.uncertain.lifecycle);
+		} finally {
+			store?.close();
+			rmSync(temporary, { recursive: true, force: true });
+		}
+	});
+
+	test.each([false, true])(
+		"atomic late receipt capture is scoped, write-once, copy-isolated and replay-inert with endpoint=%s",
+		withReceipt => {
+			const f = passiveReceiptFixture();
+			const endpointReceipt = {
+				sessionId: f.acknowledged.sessionId,
+				endpointGeneration: f.acknowledged.generation,
+				endpointIncarnation: "a".repeat(64),
+			};
+			f.receipt = createManagedLateLifecycleAcknowledgement(
+				f.admitted,
+				f.acknowledged,
+				f.receipt.observedAt,
+				withReceipt ? endpointReceipt : undefined,
+			);
+			const originalReceipt = structuredClone(f.receipt);
+			const conflicts = [
+				createManagedLateLifecycleAcknowledgement(f.admitted, f.acknowledged, f.receipt.observedAt, {
+					...endpointReceipt,
+					endpointIncarnation: "b".repeat(64),
+				}),
+				...(withReceipt
+					? [createManagedLateLifecycleAcknowledgement(f.admitted, f.acknowledged, f.receipt.observedAt)]
+					: []),
+			];
+			const scope = { principalId: "tenant-a", chatId: "chat-a" };
+			const root = f.document.mappings[0];
+			const key = JSON.stringify([scope.principalId, scope.chatId]);
+			root.chatId = key;
+			root.header.chatId = key;
+			root.managedAuthority.chatId = key;
+			root.journal = [{ ...f.uncertain }];
+			delete root.journal[0].lateLifecycleAcknowledgement;
+			delete root.reassignment;
+			f.document.provisionalOperations = [];
+			const temporary = mkdtempSync(join(tmpdir(), "gjc-atomic-late-receipt-"));
+			const path = join(temporary, "authority.json");
+			let store: SessionV3FileBackedMappingStore | undefined;
+			try {
+				writeFileSync(
+					path,
+					encodeSessionAuthorityV3Document(parseSessionAuthorityV3Document(JSON.stringify(f.document))!),
+				);
+				store = new SessionV3FileBackedMappingStore(path);
+				const scoped = scopedSessionMappingStore(store, scope.principalId, scope.chatId);
+				const before = readFileSync(path);
+				const lock = AuthorityMutationLock.acquire(path);
+				try {
+					expect(() => scoped.recordLateLifecycleAcknowledgement(scope.chatId, f.admitted, f.receipt)).toThrow();
+				} finally {
+					lock.release();
+				}
+				expect(readFileSync(path).equals(before)).toBe(true);
+				expect(() =>
+					store!.recordLateLifecycleAcknowledgementScoped(
+						{ ...scope, principalId: "foreign" },
+						f.admitted,
+						f.receipt,
+					),
+				).toThrow("admitted owner");
+				const replacement = { ...f.admitted, id: "replacement", ingressId: "replacement" };
+				const replacementReceipt = createManagedLateLifecycleAcknowledgement(
+					replacement,
+					f.acknowledged,
+					f.receipt.observedAt,
+				);
+				expect(() =>
+					scoped.recordLateLifecycleAcknowledgement(scope.chatId, replacement, replacementReceipt),
+				).toThrow("one retained reservation");
+				expect(readFileSync(path).equals(before)).toBe(true);
+				const laterInvocation = {
+					...f.admitted,
+					lifecycle: { ...f.admitted.lifecycle!, recordedAt: "2026-08-24T00:00:03.000Z" },
+				};
+				expect(() => scoped.recordLateLifecycleAcknowledgement(scope.chatId, laterInvocation, f.receipt)).toThrow(
+					"original invocation",
+				);
+				expect(readFileSync(path).equals(before)).toBe(true);
+				scoped.recordLateLifecycleAcknowledgement(scope.chatId, f.admitted, f.receipt);
+				const committed = readFileSync(path),
+					identity = statSync(path).ino;
+				scoped.recordLateLifecycleAcknowledgement(scope.chatId, f.admitted, f.receipt);
+				expect(readFileSync(path).equals(committed)).toBe(true);
+				expect(statSync(path).ino).toBe(identity);
+				for (const patch of [
+					{ observedAt: "2026-08-24T00:00:03.000Z" },
+					{ acknowledged: { ...f.receipt.acknowledged, generation: 10 } },
+					{ admissionHash: "b".repeat(64) },
+				]) {
+					expect(() =>
+						scoped.recordLateLifecycleAcknowledgement(scope.chatId, f.admitted, { ...f.receipt, ...patch }),
+					).toThrow();
+					expect(readFileSync(path).equals(committed)).toBe(true);
+				}
+				for (const conflict of conflicts) {
+					expect(() => store!.recordLateLifecycleAcknowledgementScoped(scope, f.admitted, conflict)).toThrow(
+						"immutable",
+					);
+					expect(readFileSync(path).equals(committed)).toBe(true);
+				}
+				const returned = store.operationScoped(scope, f.admitted.id)!.lateLifecycleAcknowledgement!;
+				expect(returned).toEqual(originalReceipt);
+				if (withReceipt) {
+					Object.assign(f.receipt.endpointReceipt!, { endpointIncarnation: "c".repeat(64) });
+					Object.assign(returned.endpointReceipt!, { endpointIncarnation: "d".repeat(64) });
+				}
+				expect(store.operationScoped(scope, f.admitted.id)!.lateLifecycleAcknowledgement).toEqual(originalReceipt);
+				Object.assign(f.receipt.acknowledged, { generation: 99 });
+				expect(
+					scoped.operation(scope.chatId, f.admitted.id)!.lateLifecycleAcknowledgement!.acknowledged.generation,
+				).toBe(9);
+				store.close();
+				store = new SessionV3FileBackedMappingStore(path);
+				const operation = store.operationScoped(scope, f.admitted.id)!;
+				expect(operation.lateLifecycleAcknowledgement).toEqual(originalReceipt);
+				for (const conflict of conflicts) {
+					expect(() => store!.recordLateLifecycleAcknowledgementScoped(scope, f.admitted, conflict)).toThrow(
+						"immutable",
+					);
+					expect(readFileSync(path).equals(committed)).toBe(true);
+				}
+				if (withReceipt) {
+					Object.assign(operation.lateLifecycleAcknowledgement!.endpointReceipt!, {
+						endpointIncarnation: "e".repeat(64),
+					});
+					expect(store.operationScoped(scope, f.admitted.id)!.lateLifecycleAcknowledgement).toEqual(
+						originalReceipt,
+					);
+				}
+				expect(readFileSync(path).equals(committed)).toBe(true);
+				expect(operation.lifecycle).toEqual(f.uncertain.lifecycle);
+				expect(operation.lateLifecycleAcknowledgement!.acknowledged.generation).toBe(9);
+				expect(operation.acknowledgedSuccessor).toBeUndefined();
+				expect(operation.result).toBeUndefined();
+				expect(store.getScoped(scope)!.sessionId).toBe(f.admitted.lifecycle!.source!.sessionId);
+			} finally {
+				store?.close();
+				rmSync(temporary, { recursive: true, force: true });
+			}
+		},
+	);
+
+	test.each(["create", "branch", "resume"] as const)(
+		"passive %s receipt preserves exact admission without granting successor proof",
+		kind => {
+			const f = passiveReceiptFixture(kind);
+			expect(isSessionAuthorityV3Document(f.document)).toBe(true);
+			expect(managedLifecycleAdmissionHash(f.admitted)).toBe(managedLifecycleAdmissionHash(f.uncertain));
+			expect(managedLifecycleEvidenceHash(f.admitted.lifecycle!)).not.toBe(
+				managedLifecycleEvidenceHash(f.uncertain.lifecycle!),
+			);
+			const validated = parseSessionAuthorityV3Document(JSON.stringify(f.document))!;
+			const parsed = parseSessionAuthorityV3Document(encodeSessionAuthorityV3Document(validated))!;
+			const operation = parsed.mappings[0]!.journal.at(-1)!;
+			expect(operation.lateLifecycleAcknowledgement).toEqual(f.receipt);
+			expect(operation.lifecycle!.state).toBe("uncertain");
+			expect(operation.lifecycle!.acknowledged).toBeUndefined();
+			expect(operation.acknowledgedSuccessor).toBeUndefined();
+			expect(operation.result).toBeUndefined();
+			expect(() =>
+				transitionManagedLifecycleEvidence(operation.lifecycle!, "acknowledged_unproven", {
+					acknowledged: f.acknowledged,
+				}),
+			).toThrow("Uncertain lifecycle recovery");
+			expect(() =>
+				transitionManagedLifecycleEvidence(operation.lifecycle!, "uncertain", { acknowledged: f.acknowledged }),
+			).toThrow("exact duplicate");
+		},
+	);
+
+	test("passive receipt admission hash binds every original reservation and source identity", () => {
+		const f = passiveReceiptFixture();
+		for (const patch of [{ id: "other" }, { ingressId: "other" }, { startedAt: "2026-08-23T00:00:00.000Z" }])
+			expect(managedLifecycleAdmissionHash({ ...f.admitted, ...patch })).not.toBe(f.receipt.admissionHash);
+		for (const patch of [{ sessionId: "other" }, { generation: 33 }, { requestKey: "other" }]) {
+			const source = { ...f.admitted.lifecycle!.source!, ...patch };
+			const evidence = transitionManagedLifecycleEvidence(
+				createManagedLifecycleEvidence(
+					{
+						operation: "session.fork",
+						source,
+						preparedAuthority: f.admitted.lifecycle!.preparedAuthority,
+						payloadHash: f.admitted.detail!,
+						target: { sourceSessionId: source.sessionId, cwd: source.canonicalWorkspace },
+					},
+					timestamp,
+				),
+				"invoking",
+				{},
+				timestamp,
+			);
+			expect(managedLifecycleAdmissionHash({ ...f.admitted, lifecycle: evidence })).not.toBe(
+				f.receipt.admissionHash,
+			);
+		}
+		for (const field of [
+			"principalId",
+			"projectId",
+			"canonicalWorkspace",
+			"chatId",
+			"leaseId",
+			"epoch",
+			"requestKey",
+		] as const)
+			expect(() =>
+				createManagedLateLifecycleAcknowledgement(f.admitted, { ...f.acknowledged, [field]: "/foreign" }),
+			).toThrow("original invocation");
+	});
+
+	test("passive receipt decoder rejects substituted identity, proof, and terminal state", () => {
+		const f = passiveReceiptFixture();
+		const patches = [
+			{ admissionHash: "b".repeat(64) },
+			{ kind: "recovery-success" },
+			{ observedAt: timestamp },
+			{ acknowledged: { sessionId: "", generation: 9 } },
+			{ acknowledged: { sessionId: f.admitted.lifecycle!.source!.sessionId, generation: 9 } },
+			{ acknowledged: { sessionId: "late-successor", generation: 0 } },
+			{ acknowledged: { sessionId: "late-successor", generation: 1.5 } },
+			{ acknowledged: { sessionId: "late-successor", generation: 9, leaseId: "unexpected" } },
+			{ extra: true },
+		];
+		for (const patch of patches) {
+			const document = structuredClone(f.document);
+			document.mappings[0].journal.at(-1).lateLifecycleAcknowledgement = { ...f.receipt, ...patch };
+			expect(isSessionAuthorityV3Document(document)).toBe(false);
+		}
+		for (const patch of [
+			{ state: "pending" },
+			{ state: "complete", completedAt: f.receipt.observedAt },
+			{ state: "conflict" },
+			{ id: "replaced" },
+			{ lifecycle: undefined },
+			{
+				acknowledgedSuccessor: {
+					sessionId: f.acknowledged.sessionId,
+					managedAuthority: { ...f.acknowledged, authorityEpoch: SESSION_AUTHORITY_V3_EPOCH },
+				},
+			},
+		]) {
+			const document = structuredClone(f.document);
+			Object.assign(document.mappings[0].journal.at(-1), patch);
+			expect(isSessionAuthorityV3Document(document)).toBe(false);
+		}
+	});
+
+	test("passive observation survives deep copies, canonical writes and reopen without lifecycle mutation", () => {
+		const f = passiveReceiptFixture();
+		const copied = copyOperation(f.uncertain);
+		Object.assign(copied.lateLifecycleAcknowledgement!.acknowledged, { sessionId: "mutated-copy" });
+		expect(f.uncertain.lateLifecycleAcknowledgement!.acknowledged.sessionId).toBe("late-successor");
+		const root = mkdtempSync(join(tmpdir(), "gjc-passive-late-receipt-"));
+		const path = join(root, "authority.json");
+		let store: SessionV3FileBackedMappingStore | undefined;
+		try {
+			writeFileSync(
+				path,
+				encodeSessionAuthorityV3Document(parseSessionAuthorityV3Document(JSON.stringify(f.document))!),
+			);
+			store = new SessionV3FileBackedMappingStore(path);
+			const observed = store.operation("chat-a", "late-operation")!;
+			expect(observed.lateLifecycleAcknowledgement).toEqual(f.receipt);
+			Object.assign(observed.lateLifecycleAcknowledgement!.acknowledged, { generation: 44 });
+			store.beginOperation("chat-a", { id: "unrelated", kind: "prompt", detail: "unrelated" });
+			store.close();
+			store = new SessionV3FileBackedMappingStore(path);
+			expect(store.operation("chat-a", "late-operation")!.lateLifecycleAcknowledgement).toEqual(f.receipt);
+			expect(store.operation("chat-a", "late-operation")!.lifecycle).toEqual(f.uncertain.lifecycle);
+			expect(store.get("chat-a")!.sessionId).toBe(f.admitted.lifecycle!.source!.sessionId);
+		} finally {
+			store?.close();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("associates completed provisional results with distinct immutable occurrence provenance and optional ownership", () => {
+		for (const omitOwner of [false, true]) {
+			const fixture = resultfulHistoricalReservation(omitOwner);
+			const before = JSON.stringify({ published: fixture.published, reservation: fixture.reservation });
+			expect(managedHistoricalPublicationAssociation(fixture.root, fixture.reservation)?.canonicalChatId).toBe(
+				fixture.root.chatId,
+			);
+			expect(isSessionAuthorityV3Document(fixture.document)).toBe(true);
+			expect(inheritedValid(fixture.document)).toBe(true);
+			const decoded = parseSessionAuthorityV3Document(encodeSessionAuthorityV3Document(fixture.document))!;
+			expect(structuredClone(decoded.provisionalOperations[0])).toEqual(structuredClone(fixture.reservation));
+			expect(decoded.provisionalOperations[0]!.result!.historicalBinding!.provenance.nodeRef).toBe(
+				"/provisionalOperations/0/result",
+			);
+			expect(decoded.mappings[0]!.journal[0]!.result!.historicalBinding!.provenance.nodeRef).toBe(
+				"/mappings/0/journal/0/result",
+			);
+			expect(decoded.provisionalOperations[0]!.result!.historicalBinding!.provenance.nodeHash).toBe("e".repeat(64));
+			if (omitOwner) {
+				expect(decoded.provisionalOperations[0]!.historicalBinding!.principalId).toBeUndefined();
+				expect(decoded.provisionalOperations[0]!.result!.historicalBinding!.canonicalWorkspace).toBeUndefined();
+			}
+			expect(JSON.stringify({ published: fixture.published, reservation: fixture.reservation })).toBe(before);
+			const { reassignment, ...retired } = fixture.root;
+			const sourceTombstone = { ...retired, retiredAt: timestamp, prior: reassignment!.sourceTombstone };
+			const next = {
+				...fixture.root,
+				projectId: "later-project",
+				sessionId: "later-session",
+				journal: [],
+				header: { ...fixture.root.header, projectId: "later-project", sessionId: "later-session" },
+				managedAuthority: {
+					...fixture.root.managedAuthority,
+					projectId: "later-project",
+					sessionId: "later-session",
+				},
+				reassignment: {
+					state: "committed" as const,
+					sourceProjectId: fixture.root.projectId,
+					targetProjectId: "later-project",
+					startedAt: timestamp,
+					completedAt: timestamp,
+					sourceTombstone,
+				},
+			};
+			expect(managedHistoricalPublicationAssociation(next, fixture.reservation)?.canonicalChatId).toBe(next.chatId);
+		}
+	});
+
+	test("rejects changed provisional result content, misplaced provenance and defined ownership conflicts", () => {
+		const fixture = resultfulHistoricalReservation();
+		const result = fixture.result;
+		const history = result.historicalBinding;
+		for (const changed of [
+			{ ...result, assistantText: "changed" },
+			{ ...result, events: [] },
+			{ ...result, mapping: { ...result.mapping, rawFrameCursor: result.mapping.rawFrameCursor + 1 } },
+			{ ...result, correlation: { ...result.correlation, commandId: "changed" } },
+			{ ...result, gate: { ...result.gate!, gateId: "changed" } },
+			{ ...result, historicalBinding: { ...history, principalId: "foreign" } },
+			{ ...result, historicalBinding: { ...history, canonicalWorkspace: "/foreign" } },
+			{ ...result, historicalBinding: { ...history, sessionId: "foreign" } },
+			...[
+				"/provisionalOperations/1/result",
+				"/provisionalOperations/0/result/extra",
+				"/mappings/0/journal/0/result",
+			].map(nodeRef => ({
+				...result,
+				historicalBinding: { ...history, provenance: { ...history.provenance, nodeRef } },
+			})),
+			{
+				...result,
+				historicalBinding: { ...history, provenance: { ...history.provenance, documentHash: "f".repeat(64) } },
+			},
+			{ ...result, historicalBinding: { ...history, provenance: { ...history.provenance, nodeHash: "invalid" } } },
+		]) {
+			const reservation = { ...fixture.reservation, result: changed };
+			expect(managedHistoricalPublicationAssociation(fixture.root, reservation)).toBeUndefined();
+			expect(isSessionAuthorityV3Document({ ...fixture.document, provisionalOperations: [reservation] })).toBe(
+				false,
+			);
+			expect(inheritedValid({ ...fixture.document, provisionalOperations: [reservation] })).toBe(false);
+		}
+		const { historicalBinding: _history, ...payload } = result;
+		const managedResult = {
+			...payload,
+			managedAuthority: authority(result.mapping.chatId, result.mapping.projectId, result.mapping.sessionId),
+		};
+		expect(
+			managedHistoricalPublicationAssociation(fixture.root, { ...fixture.reservation, result: managedResult }),
+		).toBeUndefined();
+		const unowned = resultfulHistoricalReservation(true);
+		for (const patch of [{ principalId: "foreign" }, { canonicalWorkspace: "/foreign" }]) {
+			const reservation = {
+				...unowned.reservation,
+				historicalBinding: { ...unowned.reservation.historicalBinding, ...patch },
+				result: { ...unowned.result, historicalBinding: { ...unowned.result.historicalBinding, ...patch } },
+			};
+			expect(managedHistoricalPublicationAssociation(unowned.root, reservation)).toBeUndefined();
+		}
+	});
+
+	test("associates exact unscoped history beneath one canonical live root without rewriting descendants", () => {
+		const { document, root, fixture, reservation } = rekeyedGraph();
+		const before = JSON.stringify(fixture.priorJournal);
+		expect(isSessionAuthorityV3Document(document)).toBe(true);
+		expect(inheritedValid(document)).toBe(true);
+		expect(isV2Record(inheritedRecord(root))).toBe(false);
+		expect(
+			managedHistoricalSourceAssociation(
+				root,
+				fixture.priorJournal[0]!.result!.historicalBinding!,
+				fixture.priorJournal[0],
+			)?.canonicalChatId,
+		).toBe(root.chatId);
+		expect(managedHistoricalPublicationAssociation(root, reservation)?.canonicalChatId).toBe(root.chatId);
+		const decoded = parseSessionAuthorityV3Document(encodeSessionAuthorityV3Document(document))!;
+		expect(structuredClone(decoded)).toEqual(structuredClone(document));
+		expect(decoded.mappings[0]!.journal.slice(0, -1)).toEqual([...fixture.priorJournal]);
+		expect(JSON.stringify(fixture.priorJournal)).toBe(before);
+		expect(decoded.mappings[0]!.journal[0]!.result!.mapping.chatId).toBe("chat-a");
+		expect(decoded.mappings[0]!.reassignment!.sourceTombstone!.chatId).toBe("chat-a");
+		expect(decoded.provisionalOperations[0]!.chatId).toBe("chat-a");
+		const later = {
+			...root,
+			managedAuthority: {
+				...root.managedAuthority,
+				generation: 20,
+				requestKey: "ordinary-turn",
+				leaseId: "new-lease",
+				epoch: "new-epoch",
+			},
+		};
+		expect(isSessionAuthorityV3Document({ ...document, mappings: [later] })).toBe(true);
+	});
+
+	test("requires a unique completed namespaced matching receipt and rejects foreign child provenance", () => {
+		const { document, root, receipt } = rekeyedGraph();
+		const history = root.journal[0]!.result!.historicalBinding!;
+		for (const replacement of [
+			{ ...receipt, id: "ordinary-resume" },
+			{ ...receipt, state: "uncertain" as const, completedAt: undefined },
+			{ ...receipt, lifecycle: undefined },
+			{
+				...receipt,
+				lifecycle: {
+					...receipt.lifecycle!,
+					historicalSource: { ...receipt.lifecycle!.historicalSource!, manifestDigest: "bad" },
+				},
+			},
+		]) {
+			const candidate = {
+				...document,
+				mappings: [{ ...root, journal: [...root.journal.slice(0, -1), replacement] }],
+			};
+			expect(isSessionAuthorityV3Document(candidate)).toBe(false);
+			expect(inheritedValid(candidate)).toBe(false);
+		}
+		for (const journal of [
+			root.journal.slice(0, -1),
+			[...root.journal, { ...receipt, id: "migration:resume:duplicate", ingressId: "migration:resume:duplicate" }],
+		]) {
+			const candidate = { ...document, mappings: [{ ...root, journal }] };
+			expect(isSessionAuthorityV3Document(candidate)).toBe(false);
+			expect(inheritedValid(candidate)).toBe(false);
+		}
+		for (const patch of [
+			{ documentHash: "f".repeat(64) },
+			{ source: "other" },
+			{ nodeRef: "/mappings/00/journal/0/result" },
+			{ nodeRef: "/mappings/01/journal/0/result" },
+			{ nodeRef: "/mappings/1/journal/0/result" },
+			{ nodeRef: "/mappings/0/journal/1/result" },
+			{ nodeRef: "/mappings/0/body/journal/0/result" },
+		]) {
+			const first = root.journal[0]!;
+			const result = {
+				...first.result!,
+				historicalBinding: { ...history, provenance: { ...history.provenance, ...patch } },
+			};
+			const candidate = {
+				...document,
+				mappings: [{ ...root, journal: [{ ...first, result }, ...root.journal.slice(1)] }],
+			};
+			expect(isSessionAuthorityV3Document(candidate)).toBe(false);
+		}
+		const foreign = { ...root, managedAuthority: { ...root.managedAuthority, principalId: "foreign" } };
+		expect(isSessionAuthorityV3Document({ ...document, mappings: [foreign] })).toBe(false);
+		expect(inheritedValid({ ...document, mappings: [foreign] })).toBe(false);
+	});
+
+	test("reserves associated completed provisional aliases and rejects unresolved or ambiguous old-key lookup", () => {
+		const { document, root, reservation, receipt } = rekeyedGraph();
+		for (const operation of [
+			{ ...reservation, state: "uncertain" as const, completedAt: undefined },
+			{ ...reservation, ingressId: "different" },
+			{
+				...reservation,
+				sessionId: "foreign",
+				historicalBinding: { ...reservation.historicalBinding, sessionId: "foreign" },
+			},
+			{
+				...reservation,
+				historicalBinding: {
+					...reservation.historicalBinding,
+					provenance: { ...reservation.historicalBinding.provenance, documentHash: "f".repeat(64) },
+				},
+			},
+		]) {
+			const candidate = { ...document, provisionalOperations: [operation] };
+			expect(isSessionAuthorityV3Document(candidate)).toBe(false);
+			expect(inheritedValid(candidate)).toBe(false);
+		}
+		for (const provisionalOperations of [
+			[reservation, reservation],
+			[
+				reservation,
+				{
+					id: "new",
+					ingressId: reservation.id,
+					kind: "create" as const,
+					state: "pending" as const,
+					startedAt: timestamp,
+					chatId: root.chatId,
+					projectId: root.projectId,
+				},
+			],
+		]) {
+			const candidate = { ...document, provisionalOperations };
+			expect(isSessionAuthorityV3Document(candidate)).toBe(false);
+			expect(inheritedValid(candidate)).toBe(false);
+		}
+		const original = receipt.lifecycle!;
+		const { principalId: _principal, ...unowned } = original.historicalSource!.historicalBinding;
+		const historicalSource = {
+			...original.historicalSource!,
+			historicalBinding: { ...unowned, reason: "ownership-unresolved" as const },
+		};
+		const secondIntent = createManagedLifecycleEvidence(
+			{
+				operation: "session.resume",
+				historicalSource,
+				preparedAuthority: { ...original.preparedAuthority, principalId: "other-owner" },
+				target: original.target,
+				payloadHash: original.payloadHash,
+			},
+			timestamp,
+		);
+		const secondAck = { ...original.acknowledged!, principalId: "other-owner" };
+		const active = transitionManagedLifecycleEvidence(
+			transitionManagedLifecycleEvidence(
+				transitionManagedLifecycleEvidence(secondIntent, "invoking", {}, timestamp),
+				"acknowledged_unproven",
+				{ acknowledged: secondAck },
+				timestamp,
+			),
+			"active_generation_proven",
+			{ proven: original.proven },
+			timestamp,
+		);
+		// Association must not infer a second principal for the retained child's explicit owner.
+		const secondKey = JSON.stringify(["other-owner", "chat-a"]);
+		const second = {
+			...root,
+			chatId: secondKey,
+			header: { ...root.header, chatId: secondKey },
+			managedAuthority: { ...root.managedAuthority, principalId: "other-owner", chatId: secondKey },
+			journal: [...root.journal.slice(0, -1), { ...receipt, lifecycle: active }],
+		};
+		expect(isSessionAuthorityV3Document({ ...document, mappings: [root, second] })).toBe(false);
+		const firstOwner = unownedRekeyedGraph("tenant-a");
+		const otherOwner = unownedRekeyedGraph("tenant-b");
+		expect(isSessionAuthorityV3Document(firstOwner.document)).toBe(true);
+		expect(isSessionAuthorityV3Document(otherOwner.document)).toBe(true);
+		const ambiguous = { ...firstOwner.document, mappings: [firstOwner.root, otherOwner.root] };
+		expect(isSessionAuthorityV3Document(ambiguous)).toBe(false);
+		expect(inheritedValid(ambiguous)).toBe(false);
+	});
+
+	test("inherits the retained receipt through managed source tombstones after later reassignment", () => {
+		const { document, root, reservation } = rekeyedGraph();
+		const { reassignment, ...retiredFields } = root;
+		const sourceTombstone = { ...retiredFields, retiredAt: timestamp, prior: reassignment!.sourceTombstone };
+		const next = {
+			...root,
+			projectId: "project-new",
+			sessionId: "new-session",
+			header: { ...root.header, projectId: "project-new", sessionId: "new-session" },
+			managedAuthority: { ...root.managedAuthority, projectId: "project-new", sessionId: "new-session" },
+			journal: [],
+			reassignment: {
+				state: "committed" as const,
+				sourceProjectId: root.projectId,
+				targetProjectId: "project-new",
+				startedAt: timestamp,
+				completedAt: timestamp,
+				sourceTombstone,
+				priorTombstone: structuredClone(sourceTombstone.prior),
+			},
+		};
+		const candidate: SessionAuthorityV3Document = { ...document, mappings: [next] };
+		expect(isSessionAuthorityV3Document(candidate)).toBe(true);
+		expect(inheritedValid(candidate)).toBe(true);
+		expect(managedHistoricalPublicationAssociation(next, reservation)?.canonicalChatId).toBe(next.chatId);
+		expect(parseSessionAuthorityV3Document(encodeSessionAuthorityV3Document(candidate))).toEqual(candidate);
+	});
+
+	test("does not associate unrelated managed children or post-bootstrap fabricated historical operations", () => {
+		const { document, root } = rekeyedGraph();
+		const first = root.journal[0]!;
+		const { historicalBinding: _history, ...result } = first.result!;
+		const managed = {
+			...first,
+			result: { ...result, managedAuthority: authority("chat-a", root.projectId, result.mapping.sessionId) },
+		};
+		expect(
+			isSessionAuthorityV3Document({
+				...document,
+				mappings: [{ ...root, journal: [managed, ...root.journal.slice(1)] }],
+			}),
+		).toBe(false);
+		const late = {
+			...first,
+			id: "late",
+			result: {
+				...first.result!,
+				mapping: { ...first.result!.mapping, operationId: "late" },
+				historicalBinding: {
+					...first.result!.historicalBinding!,
+					provenance: {
+						...first.result!.historicalBinding!.provenance,
+						nodeRef: `/mappings/0/journal/${root.journal.length}/result`,
+					},
+				},
+			},
+		};
+		expect(
+			isSessionAuthorityV3Document({ ...document, mappings: [{ ...root, journal: [...root.journal, late] }] }),
+		).toBe(false);
+	});
+
+	test("uses the original cutover epoch and rejects obsolete schema authority without rewriting runtime epochs", () => {
+		const value = golden();
+		expect(value.authorityEpoch).toBe("gjc-public-sdk-v015-managed/1");
+		const parsed = parseSessionAuthorityV3Document(JSON.stringify(value))!;
+		expect(parsed.mappings[0]!.managedAuthority?.epoch).toBe("runtime-1");
+		const obsolete = { ...value, authorityEpoch: "managed/1" };
+		expect(parseSessionAuthorityV3Document(JSON.stringify(obsolete))).toBeUndefined();
+		const nested = clonedGolden();
+		nested.mappings[0].managedAuthority.authorityEpoch = "managed/1";
+		expect(parseSessionAuthorityV3Document(JSON.stringify(nested))).toBeUndefined();
+	});
+
+	test("ordinary store reopen retains bootstrap request identity and historical results without serving", () => {
+		const root = mkdtempSync(join(tmpdir(), "gjc-v3-bootstrap-evidence-"));
+		const path = join(root, "authority.json");
+		try {
+			const fixture = bootstrapGraph();
+			const invoking = transitionManagedLifecycleEvidence(fixture.lifecycle, "invoking", {}, timestamp);
+			const ack = transitionManagedLifecycleEvidence(
+				invoking,
+				"acknowledged_unproven",
+				{ acknowledged: fixture.acknowledged },
+				timestamp,
+			);
+			const active = transitionManagedLifecycleEvidence(
+				ack,
+				"active_generation_proven",
+				{ proven: fixture.proof },
+				timestamp,
+			);
+			for (const lifecycle of [fixture.lifecycle, invoking, ack, active]) {
+				const document = {
+					...fixture.document,
+					mappings: [
+						{ ...fixture.mapping, journal: [...fixture.priorJournal, { ...fixture.operation, lifecycle }] },
+					],
+				};
+				writeFileSync(path, encodeSessionAuthorityV3Document(document));
+				const store = new SessionV3FileBackedMappingStore(path);
+				expect(store.get(fixture.mapping.chatId)).toBeUndefined();
+				expect(() => store.assertServingReady()).toThrow("unbound history");
+				store.close();
+				const recovered = parseSessionAuthorityV3Document(readFileSync(path, "utf8"))!;
+				const operation = recovered.mappings[0]!.journal.at(-1)!;
+				expect(operation.state).toBe("uncertain");
+				expect(operation.lifecycle?.requestKey).toBe(lifecycle.requestKey);
+				expect(operation.lifecycle?.requestHash).toBe(lifecycle.requestHash);
+				expect(operation.lifecycle?.historicalSource).toEqual(lifecycle.historicalSource);
+				expect(operation.lifecycle?.acknowledged).toEqual(lifecycle.acknowledged);
+				expect(operation.lifecycle?.proven).toEqual(lifecycle.proven);
+				expect(recovered.mappings[0]!.journal[0]).toEqual(fixture.priorJournal[0]);
+			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("round-trips pending bootstrap acknowledgement and proof without promoting historical graph authority", () => {
+		const fixture = bootstrapGraph();
+		const invoking = transitionManagedLifecycleEvidence(fixture.lifecycle, "invoking", {}, timestamp);
+		const ack = transitionManagedLifecycleEvidence(
+			invoking,
+			"acknowledged_unproven",
+			{ acknowledged: fixture.acknowledged },
+			timestamp,
+		);
+		const active = transitionManagedLifecycleEvidence(
+			ack,
+			"active_generation_proven",
+			{ proven: fixture.proof },
+			timestamp,
+		);
+		for (const lifecycle of [fixture.lifecycle, invoking, ack, active]) {
+			const document = {
+				...fixture.document,
+				mappings: [{ ...fixture.mapping, journal: [...fixture.priorJournal, { ...fixture.operation, lifecycle }] }],
+			};
+			expect(isManagedLifecycleEvidence(lifecycle)).toBe(true);
+			expect(isSessionAuthorityV3Document(document)).toBe(true);
+			const replayed = parseSessionAuthorityV3Document(encodeSessionAuthorityV3Document(document))!;
+			expect(structuredClone(replayed)).toEqual(structuredClone(document));
+			expect(replayed.mappings[0]!.managedAuthority).toBeUndefined();
+			expect(replayed.mappings[0]!.historicalBinding).toEqual(fixture.historicalBinding);
+			expect(replayed.mappings[0]!.journal.slice(0, -1)).toEqual([...fixture.priorJournal]);
+		}
+	});
+
+	test("permits bootstrap success result only after promotion while preserving original historical results", () => {
+		const fixture = bootstrapGraph();
+		const ack = transitionManagedLifecycleEvidence(
+			transitionManagedLifecycleEvidence(fixture.lifecycle, "invoking", {}, timestamp),
+			"acknowledged_unproven",
+			{ acknowledged: fixture.acknowledged },
+			timestamp,
+		);
+		const active = transitionManagedLifecycleEvidence(
+			ack,
+			"active_generation_proven",
+			{ proven: fixture.proof },
+			timestamp,
+		);
+		const managedAuthority = { ...fixture.acknowledged, authorityEpoch: SESSION_AUTHORITY_V3_EPOCH };
+		const completed: SessionAuthorityV3Operation = {
+			...fixture.operation,
+			state: "complete",
+			completedAt: timestamp,
+			lifecycle: active,
+			result: {
+				kind: "control",
+				assistantText: "resumed",
+				managedAuthority,
+				mapping: {
+					chatId: fixture.mapping.chatId,
+					projectId: fixture.mapping.projectId,
+					sessionId: fixture.mapping.sessionId,
+					operationId: fixture.operation.id,
+					rawFrameCursor: 4,
+					eventCursor: 2,
+				},
+			},
+		};
+		expect(
+			isSessionAuthorityV3Document({
+				...fixture.document,
+				mappings: [{ ...fixture.mapping, journal: [...fixture.priorJournal, completed] }],
+			}),
+		).toBe(false);
+		const { historicalBinding: _historical, ...fields } = fixture.mapping;
+		const promoted = { ...fields, managedAuthority, journal: [...fixture.priorJournal, completed] };
+		const document: SessionAuthorityV3Document = { ...fixture.document, mappings: [promoted] };
+		expect(isSessionAuthorityV3Document(document)).toBe(true);
+		const reopened = parseSessionAuthorityV3Document(encodeSessionAuthorityV3Document(document))!;
+		expect(structuredClone(reopened)).toEqual(structuredClone(document));
+		expect(reopened.mappings[0]!.journal[0]!.result!.managedAuthority).toBeUndefined();
+		expect(reopened.mappings[0]!.journal[0]!.result!.historicalBinding).toBeDefined();
+		expect(reopened.mappings[0]!.journal.at(-1)!.lifecycle!.historicalSource).toEqual(active.historicalSource);
+		for (const patch of [{ principalId: "foreign" }, { canonicalWorkspace: "/foreign" }])
+			expect(
+				isSessionAuthorityV3Document({
+					...document,
+					mappings: [{ ...promoted, managedAuthority: { ...managedAuthority, ...patch } }],
+				}),
+			).toBe(false);
+	});
+
+	test("rejects bootstrap evidence coupled to another historical occurrence or unresolved owner container", () => {
+		const fixture = bootstrapGraph();
+		for (const provenance of [
+			{ ...fixture.historicalBinding.provenance, nodeRef: "/mappings/1" },
+			{ ...fixture.historicalBinding.provenance, documentHash: "f".repeat(64) },
+			{ ...fixture.historicalBinding.provenance, nodeHash: "f".repeat(64) },
+		]) {
+			const lifecycle = createManagedLifecycleEvidence(
+				{
+					operation: "session.resume",
+					preparedAuthority: fixture.prepared,
+					historicalSource: {
+						...fixture.lifecycle.historicalSource!,
+						historicalBinding: { ...fixture.historicalBinding, provenance },
+					},
+					target: fixture.lifecycle.target,
+					payloadHash: fixture.lifecycle.payloadHash,
+				},
+				timestamp,
+			);
+			expect(isManagedLifecycleEvidence(lifecycle)).toBe(true);
+			expect(
+				isSessionAuthorityV3Document({
+					...fixture.document,
+					mappings: [
+						{ ...fixture.mapping, journal: [...fixture.priorJournal, { ...fixture.operation, lifecycle }] },
+					],
+				}),
+			).toBe(false);
+		}
+		const { principalId: _principal, ...unowned } = fixture.historicalBinding;
+		const historicalBinding: HistoricalSessionBinding = { ...unowned, reason: "ownership-unresolved" };
+		const lifecycle = createManagedLifecycleEvidence(
+			{
+				operation: "session.resume",
+				preparedAuthority: fixture.prepared,
+				historicalSource: { ...fixture.lifecycle.historicalSource!, historicalBinding },
+				target: fixture.lifecycle.target,
+				payloadHash: fixture.lifecycle.payloadHash,
+			},
+			timestamp,
+		);
+		const mapping = {
+			...fixture.mapping,
+			historicalBinding,
+			journal: [...fixture.priorJournal, { ...fixture.operation, lifecycle }],
+		};
+		expect(isSessionAuthorityV3Document({ ...fixture.document, mappings: [mapping] })).toBe(true);
+		const orphan = { ...fixture.operation, chatId: fixture.mapping.chatId, projectId: fixture.mapping.projectId };
+		expect(isSessionAuthorityV3Document({ ...fixture.document, mappings: [], provisionalOperations: [orphan] })).toBe(
+			false,
+		);
+	});
+
+	test("retains scoped historical provisional bootstrap evidence without canonicalizing its logical acknowledgement", () => {
+		const fixture = bootstrapGraph();
+		const chatId = JSON.stringify([fixture.prepared.principalId, fixture.prepared.chatId]);
+		const historicalBinding = {
+			...fixture.historicalBinding,
+			chatId,
+			provenance: { ...fixture.historicalBinding.provenance, nodeRef: "/provisionalOperations/0" },
+		};
+		const intent = createManagedLifecycleEvidence(
+			{
+				operation: "session.resume",
+				preparedAuthority: fixture.prepared,
+				historicalSource: { ...fixture.lifecycle.historicalSource!, historicalBinding },
+				target: fixture.lifecycle.target,
+				payloadHash: fixture.lifecycle.payloadHash,
+			},
+			timestamp,
+		);
+		const ack = transitionManagedLifecycleEvidence(
+			transitionManagedLifecycleEvidence(intent, "invoking", {}, timestamp),
+			"acknowledged_unproven",
+			{ acknowledged: fixture.acknowledged },
+			timestamp,
+		);
+		const active = transitionManagedLifecycleEvidence(
+			ack,
+			"active_generation_proven",
+			{ proven: fixture.proof },
+			timestamp,
+		);
+		for (const lifecycle of [intent, ack, active]) {
+			const document: SessionAuthorityV3Document = {
+				...fixture.document,
+				mappings: [],
+				provisionalOperations: [
+					{
+						...fixture.operation,
+						chatId,
+						projectId: fixture.mapping.projectId,
+						sessionId: fixture.mapping.sessionId,
+						historicalBinding,
+						lifecycle,
+					},
+				],
+			};
+			expect(isSessionAuthorityV3Document(document)).toBe(true);
+			const decoded = parseSessionAuthorityV3Document(encodeSessionAuthorityV3Document(document))!;
+			expect(structuredClone(decoded)).toEqual(structuredClone(document));
+			expect(decoded.provisionalOperations[0]!.lifecycle!.historicalSource!.historicalBinding.chatId).toBe(chatId);
+			if (lifecycle.acknowledged !== undefined)
+				expect(decoded.provisionalOperations[0]!.lifecycle!.acknowledged!.chatId).toBe(fixture.prepared.chatId);
+		}
+	});
+
+	test("allows public saved selection fields only in validated bootstrap lifecycle positions", () => {
+		const fixture = bootstrapGraph();
+		expect(isSessionAuthorityV3Document(fixture.document)).toBe(true);
+		for (const field of ["sessionPath", "sessionIdentity", "savedSession"]) {
+			const value =
+				field === "savedSession"
+					? fixture.lifecycle.historicalSource!.savedSession
+					: fixture.lifecycle.target[field];
+			expect(
+				isSessionAuthorityV3Document({
+					...fixture.document,
+					mappings: [{ ...fixture.mapping, observations: { [field]: value } }],
+				}),
+			).toBe(false);
+		}
+		expect(
+			isSessionAuthorityV3Document({
+				...fixture.document,
+				mappings: [{ ...fixture.mapping, observations: { lifecycle: fixture.lifecycle } }],
+			}),
+		).toBe(false);
+		const changed = {
+			...fixture.operation,
+			lifecycle: {
+				...fixture.lifecycle,
+				historicalSource: {
+					...fixture.lifecycle.historicalSource!,
+					savedSession: { ...fixture.lifecycle.historicalSource!.savedSession, path: "/foreign/saved.jsonl" },
+				},
+			},
+		};
+		expect(
+			isSessionAuthorityV3Document({
+				...fixture.document,
+				mappings: [{ ...fixture.mapping, journal: [...fixture.priorJournal, changed] }],
+			}),
+		).toBe(false);
+	});
+
+	test("round-trips generation-free ordinary history at every identity occurrence", () => {
+		const value = historicalGolden();
+		expect(isSessionAuthorityV3Document(value)).toBe(true);
+		if (!isSessionAuthorityV3Document(value)) throw new Error("Historical fixture must be valid V3.");
+		const parsed = parseSessionAuthorityV3Document(encodeSessionAuthorityV3Document(value))!;
+		expect(parsed).toEqual(value);
+		expect(parsed.mappings[0]!.managedAuthority).toBeUndefined();
+		expect(parsed.mappings[0]!.journal[0]!.result!.historicalBinding?.sessionId).toBe("session-current");
+		expect(parsed.mappings[0]!.journal[1]!.acknowledgedSuccessor!.historicalBinding?.sessionId).toBe("session-next");
+		expect(parsed.mappings[0]!.reassignment!.sourceTombstone!.prior!.historicalBinding?.sessionId).toBe(
+			"session-older",
+		);
+		expect(parsed.provisionalOperations[0]!.historicalBinding?.sessionId).toBe("session-b");
+	});
+
+	test("rejects simultaneous bindings and forged authority fields on unbound history", () => {
+		const raw = historicalGolden();
+		if (!isSessionAuthorityV3Document(raw)) throw new Error("Historical fixture must be valid V3.");
+		for (const patch of [{ generation: 0 }, { generation: 9 }, { leaseId: "invented" }, { requestKey: "invented" }]) {
+			const candidate = {
+				...raw,
+				mappings: [
+					{ ...raw.mappings[0]!, historicalBinding: { ...raw.mappings[0]!.historicalBinding!, ...patch } },
+				],
+			};
+			expect(isSessionAuthorityV3Document(candidate)).toBe(false);
+		}
+		expect(
+			isSessionAuthorityV3Document({
+				...raw,
+				mappings: [{ ...raw.mappings[0]!, managedAuthority: authority("chat-a", "project-a", "session-current") }],
+			}),
+		).toBe(false);
+		const bound = golden();
+		expect(
+			isSessionAuthorityV3Document({
+				...bound,
+				mappings: [
+					{ ...bound.mappings[0], managedAuthority: { ...bound.mappings[0].managedAuthority, generation: 0 } },
+				],
+			}),
+		).toBe(false);
+	});
+
+	test("allows inert projection fields only at declared graph locations", () => {
+		const value = historicalGolden();
+		if (!isSessionAuthorityV3Document(value)) throw new Error("Historical fixture must be valid V3.");
+		const root = value.mappings[0]!;
+		const result = root.journal[0]!.result!;
+		const projected = {
+			...value,
+			mappings: [
+				{
+					...root,
+					sessionFile: "/projection/current.jsonl",
+					activeLeaf: "leaf",
+					journal: [
+						{
+							...root.journal[0]!,
+							result: {
+								...result,
+								mapping: { ...result.mapping, sessionFile: "/projection/replay.jsonl", activeLeaf: "old-leaf" },
+							},
+						},
+						...root.journal.slice(1),
+					],
+				},
+			],
+		};
+		expect(isSessionAuthorityV3Document(projected)).toBe(true);
+		expect(
+			isSessionAuthorityV3Document({
+				...projected,
+				mappings: [{ ...projected.mappings[0], observations: { sessionFile: "/hidden" } }],
+			}),
+		).toBe(false);
+		expect(
+			isSessionAuthorityV3Document({
+				...projected,
+				mappings: [{ ...projected.mappings[0], events: [{ type: "event", payload: { descriptor: "private" } }] }],
+			}),
+		).toBe(false);
+	});
+
+	test("rejects scoped foreign historical ownership and lifecycle claims on unbound nodes", () => {
+		const scoped = JSON.stringify(["tenant-a", "chat-a"]);
+		const binding = historical(scoped, "project-a", "session-a", "/provisionalOperations/0");
+		const provisional = {
+			id: "reserve",
+			kind: "create",
+			state: "uncertain",
+			startedAt: timestamp,
+			chatId: scoped,
+			projectId: "project-a",
+			sessionId: "session-a",
+			historicalBinding: binding,
+		};
+		const document = {
+			kind: SESSION_AUTHORITY_V3_KIND,
+			version: 3,
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+			mappings: [],
+			provisionalOperations: [provisional],
+		};
+		expect(isSessionAuthorityV3Document(document)).toBe(true);
+		expect(
+			isSessionAuthorityV3Document({
+				...document,
+				provisionalOperations: [{ ...provisional, historicalBinding: { ...binding, principalId: "foreign" } }],
+			}),
+		).toBe(false);
+		const prepared = {
+			principalId: "tenant-a",
+			projectId: "project-a",
+			canonicalWorkspace: "/srv/projects/a",
+			chatId: "chat-a",
+			leaseId: "lease",
+			epoch: "epoch",
+			requestKey: "create",
+		};
+		const lifecycle = createManagedLifecycleEvidence(
+			{
+				operation: "session.create",
+				preparedAuthority: prepared,
+				target: { cwd: prepared.canonicalWorkspace },
+				payloadHash: "a".repeat(64),
+			},
+			timestamp,
+		);
+		expect(
+			isSessionAuthorityV3Document({
+				...document,
+				provisionalOperations: [{ ...provisional, detail: lifecycle.payloadHash, lifecycle }],
+			}),
+		).toBe(false);
+	});
+	test("opens the golden graph and preserves runtime epochs across mutation and reopen", () => {
+		const root = mkdtempSync(join(tmpdir(), "gjc-v3-golden-store-"));
+		const file = join(root, "authority.json");
+		writeFileSync(file, JSON.stringify(golden()));
+		let store: SessionV3FileBackedMappingStore | undefined;
+		try {
+			store = new SessionV3FileBackedMappingStore(file);
+			store.beginOperation("chat-a", { id: "next-prompt", kind: "prompt", detail: "hash" });
+			store.close();
+			store = new SessionV3FileBackedMappingStore(file);
+			expect(store.operation("chat-a", "next-prompt")?.state).toBe("uncertain");
+			const persisted = parseSessionAuthorityV3Document(readFileSync(file, "utf8"))!;
+			expect(persisted.mappings[0].managedAuthority?.epoch).toBe("runtime-1");
+			expect(persisted.mappings[0].journal[0].result).toEqual(
+				parseSessionAuthorityV3Document(JSON.stringify(golden()))!.mappings[0].journal[0].result,
+			);
+			expect(persisted.mappings[0].journal[1].acknowledgedSuccessor?.managedAuthority?.epoch).toBe("runtime-4");
+			expect(persisted.mappings[0].reassignment?.sourceTombstone?.prior?.managedAuthority?.epoch).toBe("runtime-3");
+			expect(persisted.provisionalOperations[0].managedAuthority?.epoch).toBe("runtime-5");
+		} finally {
+			store?.close();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("round-trips the golden graph without dropping replay, gate, successor, provisional, or recursive tombstone evidence", () => {
+		const parsed = parseSessionAuthorityV3Document(JSON.stringify(golden()));
+		expect(parsed).toBeDefined();
+		const replayed = parseSessionAuthorityV3Document(encodeSessionAuthorityV3Document(parsed!));
+		expect(replayed).toEqual(parsed);
+		expect(replayed!.mappings[0]!.journal[0]!.result!.gate!.gateId).toBe("gate-1");
+		expect(replayed!.mappings[0]!.journal[1]!.acknowledgedSuccessor!.sessionId).toBe("session-next");
+		expect(replayed!.mappings[0]!.reassignment!.sourceTombstone!.prior!.projectId).toBe("project-older");
+		expect(replayed!.provisionalOperations[0]!.managedAuthority!.generation).toBe(5);
+	});
+
+	test("encodes deterministic bytes independent of source key order", () => {
+		const first = parseSessionAuthorityV3Document(JSON.stringify(golden()))!;
+		const source = golden();
+		const second = parseSessionAuthorityV3Document(
+			JSON.stringify({
+				provisionalOperations: source.provisionalOperations,
+				mappings: source.mappings,
+				authorityEpoch: source.authorityEpoch,
+				version: source.version,
+				kind: source.kind,
+			}),
+		)!;
+		expect(encodeSessionAuthorityV3Document(first)).toBe(encodeSessionAuthorityV3Document(second));
+	});
+
+	test("rejects malformed scalar authority, model selection, and nested credential data", () => {
+		for (const patch of [{ generation: 0 }, { generation: 1.5 }, { requestKey: "" }, { token: "secret" }]) {
+			const value = clonedGolden();
+			Object.assign(value.mappings[0].managedAuthority, patch);
+			expect(parseSessionAuthorityV3Document(JSON.stringify(value))).toBeUndefined();
+		}
+		for (const patch of [
+			{ modelSelection: { provider: "provider", modelId: "model", thinkingLevel: "invalid" } },
+			{ events: [{ type: "message", payload: { token: "secret" } }] },
+			{ operationId: "" },
+		]) {
+			const value = clonedGolden();
+			Object.assign(value.mappings[0], patch);
+			expect(parseSessionAuthorityV3Document(JSON.stringify(value))).toBeUndefined();
+		}
+	});
+
+	test("canonical decoding detaches model selection and nested event history", () => {
+		const source = {
+			...golden(),
+			mappings: [{ ...mapping(), modelSelection: { provider: "provider", modelId: "model", thinkingLevel: "low" } }],
+		};
+		const before = JSON.stringify(source);
+		const parsed = parseSessionAuthorityV3Document(before)!;
+		expect(parsed).toBeDefined();
+		expect(encodeSessionAuthorityV3Document(parsed)).toBe(
+			encodeSessionAuthorityV3Document(parseSessionAuthorityV3Document(before)!),
+		);
+		Reflect.set(parsed.mappings[0]!.modelSelection!, "modelId", "changed");
+		Reflect.set(parsed.mappings[0]!.journal[0]!.result!.events![0]!.payload!, "durable", false);
+		expect(JSON.stringify(source)).toBe(before);
+		expect(encodeSessionAuthorityV3Document(parsed)).not.toBe(
+			encodeSessionAuthorityV3Document(parseSessionAuthorityV3Document(before)!),
+		);
+	});
+
+	test("rejects malformed relational identities and tenant authority mismatches", () => {
+		const wrongResult = clonedGolden();
+		wrongResult.mappings[0].journal[0].result.mapping.operationId = "other";
+		expect(isSessionAuthorityV3Document(wrongResult)).toBeFalse();
+		const wrongTenant = clonedGolden();
+		wrongTenant.mappings[0].managedAuthority.projectId = "other-project";
+		expect(isSessionAuthorityV3Document(wrongTenant)).toBeFalse();
+		const duplicate = clonedGolden();
+		duplicate.provisionalOperations.push({
+			...duplicate.provisionalOperations[0],
+			id: "provisional-2",
+			ingressId: "provisional-1",
+		});
+		expect(isSessionAuthorityV3Document(duplicate)).toBeFalse();
+	});
+
+	test("rejects legacy attachment credentials at any graph depth and missing managed authority", () => {
+		for (const mutate of [
+			(value: Record<string, any>) => {
+				value.mappings[0].attachment = { descriptorPath: "/secret" };
+			},
+			(value: Record<string, any>) => {
+				value.mappings[0].journal[0].result.mapping.tmuxPane = "%1";
+			},
+			(value: Record<string, any>) => {
+				value.mappings[0].reassignment.sourceTombstone.prior.managedAuthority.descriptorPath = "/legacy";
+			},
+			(value: Record<string, any>) => {
+				delete value.provisionalOperations[0].managedAuthority;
+			},
+		]) {
+			const value = clonedGolden();
+			mutate(value);
+			expect(parseSessionAuthorityV3Document(JSON.stringify(value))).toBeUndefined();
+		}
+	});
+
+	test("rejects a foreign principal throughout an owned managed graph", () => {
+		for (const mutate of [
+			(value: Record<string, any>) => {
+				value.mappings[0].journal[0].result.managedAuthority.principalId = "tenant-b";
+			},
+			(value: Record<string, any>) => {
+				value.mappings[0].journal[1].acknowledgedSuccessor.managedAuthority.principalId = "tenant-b";
+			},
+			(value: Record<string, any>) => {
+				value.mappings[0].reassignment.sourceTombstone.managedAuthority.principalId = "tenant-b";
+			},
+			(value: Record<string, any>) => {
+				value.mappings[0].reassignment.sourceTombstone.prior.managedAuthority.principalId = "tenant-b";
+			},
+			(value: Record<string, any>) => {
+				value.provisionalOperations = [
+					{
+						id: "foreign-reservation",
+						kind: "create",
+						state: "pending",
+						startedAt: timestamp,
+						chatId: "chat-a",
+						projectId: "project-a",
+						sessionId: "session-next",
+						managedAuthority: { ...authority("chat-a", "project-a", "session-next"), principalId: "tenant-b" },
+					},
+				];
+			},
+			(value: Record<string, any>) => {
+				value.mappings[0].observations.__gjcSessionMappingScope = { principalId: "tenant-b" };
+			},
+		]) {
+			const document = clonedGolden();
+			mutate(document);
+			expect(parseSessionAuthorityV3Document(JSON.stringify(document))).toBeUndefined();
+		}
+	});
+
+	test("rejects a foreign reservation-only authority and nested results or successors on reopen", () => {
+		const chatId = JSON.stringify(["tenant-a", "chat-a"]);
+		const bound = authority(chatId, "project-a", "reserved");
+		const root = mkdtempSync(join(tmpdir(), "gjc-v3-reservation-ownership-"));
+		const file = join(root, "authority.json");
+		const base = {
+			kind: SESSION_AUTHORITY_V3_KIND,
+			version: 3,
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+			mappings: [],
+			provisionalOperations: [
+				{
+					id: "reserve",
+					kind: "create",
+					state: "pending",
+					startedAt: timestamp,
+					chatId,
+					projectId: "project-a",
+					sessionId: "reserved",
+					managedAuthority: bound,
+				},
+			],
+		};
+		try {
+			writeFileSync(file, JSON.stringify(base));
+			const valid = new SessionV3FileBackedMappingStore(file);
+			expect(
+				valid.provisionalOperationScoped({ principalId: "tenant-a", chatId: "chat-a" }, "reserve")?.managedAuthority
+					?.principalId,
+			).toBe("tenant-a");
+			valid.close();
+			for (const scenario of [
+				"owner",
+				"successor-principal",
+				"successor-workspace",
+				"result-principal",
+				"result-workspace",
+			]) {
+				const value: Record<string, any> = structuredClone(base);
+				const operation = value.provisionalOperations[0];
+				if (scenario === "owner") operation.managedAuthority.principalId = "tenant-b";
+				else if (scenario.startsWith("successor"))
+					operation.acknowledgedSuccessor = {
+						sessionId: "next",
+						managedAuthority: {
+							...bound,
+							sessionId: "next",
+							...(scenario.endsWith("principal")
+								? { principalId: "tenant-b" }
+								: { canonicalWorkspace: "/foreign" }),
+						},
+					};
+				else {
+					operation.state = "complete";
+					operation.completedAt = timestamp;
+					operation.result = {
+						kind: "control",
+						assistantText: "",
+						managedAuthority: {
+							...bound,
+							...(scenario.endsWith("principal")
+								? { principalId: "tenant-b" }
+								: { canonicalWorkspace: "/foreign" }),
+						},
+						mapping: {
+							chatId,
+							projectId: "project-a",
+							sessionId: "reserved",
+							operationId: "reserve",
+							rawFrameCursor: 0,
+							eventCursor: 0,
+						},
+					};
+				}
+				writeFileSync(file, JSON.stringify(value));
+				expect(parseSessionAuthorityV3Document(JSON.stringify(value))).toBeUndefined();
+				expect(() => new SessionV3FileBackedMappingStore(file)).toThrow("not strict V3");
+			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("requires duplicate prior tombstone storage to match validated retained history", () => {
+		const value = clonedGolden();
+		value.mappings[0].reassignment.priorTombstone = structuredClone(
+			value.mappings[0].reassignment.sourceTombstone.prior,
+		);
+		expect(parseSessionAuthorityV3Document(JSON.stringify(value))).toBeDefined();
+		for (const mutate of [
+			(prior: Record<string, any>) => {
+				prior.managedAuthority.principalId = "foreign";
+			},
+			(prior: Record<string, any>) => {
+				prior.events = [{ type: "message", text: "forged history" }];
+			},
+			(prior: Record<string, any>) => {
+				prior.journal = [{ id: "forged", kind: "prompt", state: "pending", startedAt: timestamp }];
+			},
+		]) {
+			const corrupt = structuredClone(value);
+			mutate(corrupt.mappings[0].reassignment.priorTombstone);
+			expect(parseSessionAuthorityV3Document(JSON.stringify(corrupt))).toBeUndefined();
+		}
+	});
+
+	test("rejects a foreign successor workspace in a scoped reservation before persistence", () => {
+		const root = mkdtempSync(join(tmpdir(), "gjc-v3-provisional-successor-"));
+		const file = join(root, "authority.json");
+		const store = new SessionV3FileBackedMappingStore(file);
+		const scope = { principalId: "tenant-a", chatId: "chat-a" };
+		const bound = authority(scope.chatId, "project-a", "reserved");
+		try {
+			for (const canonicalWorkspace of ["/foreign", bound.canonicalWorkspace]) {
+				const operation = {
+					id: "reserve",
+					kind: "create" as const,
+					chatId: scope.chatId,
+					projectId: "project-a",
+					sessionId: "reserved",
+					managedAuthority: bound,
+					acknowledgedSuccessor: {
+						sessionId: "next",
+						managedAuthority: { ...bound, sessionId: "next", canonicalWorkspace },
+					},
+				};
+				if (canonicalWorkspace === "/foreign") {
+					expect(() => store.reserveProvisionalOperationScoped(scope, operation as never)).toThrow();
+					expect(store.provisionalOperationScoped(scope, operation.id)).toBeUndefined();
+				} else {
+					store.reserveProvisionalOperationScoped(scope, operation as never);
+					expect(parseSessionAuthorityV3Document(readFileSync(file, "utf8"))).toBeDefined();
+				}
+			}
+		} finally {
+			store.close();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+});

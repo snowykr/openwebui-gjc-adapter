@@ -227,6 +227,7 @@ describe("CLI module boundaries", () => {
 	test("pins config outputs diagnostics and validation message order", () => {
 		// Given: stable environment inputs spanning project and artifact parsing.
 		const config = loadAdapterConfig({
+			GJC_OPENWEBUI_MODE: "existing",
 			GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS: "/allowed",
 			GJC_OPENWEBUI_ARTIFACT_BASE_URL: "https://artifacts.test/base/",
 			GJC_OPENWEBUI_PROJECTS: "/repo|Demo|folder-1|/sessions",
@@ -238,6 +239,7 @@ describe("CLI module boundaries", () => {
 
 		// Then: defaults, parsed bytes, diagnostics, and errors remain exact.
 		expect(config).toEqual({
+			mode: "existing",
 			bindHost: "127.0.0.1",
 			bindPort: 8765,
 			openWebUIBaseUrl: "http://localhost:8080",
@@ -269,12 +271,12 @@ describe("CLI module boundaries", () => {
 				"GJC_OPENWEBUI_API_TOKEN is not set; OpenWebUI API calls are not authenticated.",
 			],
 		});
-		expect(() => loadAdapterConfig({ GJC_OPENWEBUI_PROJECTS: "|" })).toThrow(
+		expect(() => loadAdapterConfig({ GJC_OPENWEBUI_MODE: "existing", GJC_OPENWEBUI_PROJECTS: "|" })).toThrow(
 			"GJC_OPENWEBUI_PROJECTS entry 1 must include a non-empty cwd",
 		);
-		expect(() => loadAdapterConfig({ GJC_OPENWEBUI_ARTIFACT_BASE_URL: "not-a-url" })).toThrow(
-			"GJC_OPENWEBUI_ARTIFACT_BASE_URL must be a valid URL",
-		);
+		expect(() =>
+			loadAdapterConfig({ GJC_OPENWEBUI_MODE: "existing", GJC_OPENWEBUI_ARTIFACT_BASE_URL: "not-a-url" }),
+		).toThrow("GJC_OPENWEBUI_ARTIFACT_BASE_URL must be a valid URL");
 	});
 
 	test("requires exactly the two planned extraction modules", () => {
@@ -300,6 +302,64 @@ describe("CLI module boundaries", () => {
 
 		// Then: the facade remains reviewable without compressed lines.
 		expect(cliLines).toBeLessThanOrEqual(250);
+	});
+	test("does not publish the retired public SDK contract facade", () => {
+		const manifest = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")) as {
+			exports: Record<string, unknown>;
+		};
+		const publicEntrypoint = readFileSync(join(ROOT, "src", "index.ts"), "utf8");
+
+		expect(publicEntrypoint).not.toContain('export * from "./gjc/public-sdk-contract"');
+		expect(manifest.exports["./gjc/public-sdk-contract"]).toBeUndefined();
+	});
+	test("delivery surfaces exclude retired transports and private lifecycle exports", () => {
+		const manifest = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
+		const files = ["src", "test", ".github/workflows"].flatMap(directory =>
+			readdirSync(join(ROOT, directory), { recursive: true, withFileTypes: true })
+				.filter(entry => entry.isFile() && /\.(?:ts|json|ya?ml)$/.test(entry.name))
+				.map(entry => join(entry.parentPath, entry.name)),
+		);
+		files.push(join(ROOT, "package.json"), join(ROOT, "tsconfig.json"));
+		const legacy = ["r", "pc"].join("");
+		const forbidden = [
+			new RegExp(`\\b${legacy}(?:[-_](?:client|runner|frames|workflow|errors))\\b`, "i"),
+			new RegExp(`\\b(?:parse|create)${["R", "pc"].join("")}\\w*\\b`),
+			new RegExp(`--mode\\s+${legacy}\\b`, "i"),
+			new RegExp(
+				`\\b(?:private[-_\\s]+daemon|daemon\\/(?:runtime|control)|${["broker", "_hello"].join("")})\\b`,
+				"i",
+			),
+			new RegExp(
+				`from\\s+["'](?:${["@gajae-code", "bridge-client"].join("/")}|@gajae-code/coding-agent/sdk/(?:client|acp|broker))`,
+			),
+		];
+		expect(files.filter(file => forbidden.some(pattern => pattern.test(readFileSync(file, "utf8"))))).toEqual([]);
+		const sourceNames = files
+			.filter(file => file.startsWith(join(ROOT, "src")))
+			.map(file => file.slice(ROOT.length + 1));
+		expect(
+			sourceNames.filter(file =>
+				/\/(?:public-sdk-|sdk-v3-|cli-lifecycle-|gjc-public-sdk-|tmux-ownership)/.test(file),
+			),
+		).toEqual([]);
+		for (const module of [`${legacy}-client-transport`, `${legacy}-client-runner`, `${legacy}-runner`, "sdk-v3-cli"])
+			expect(existsSync(join(ROOT, "src/gjc", `${module}.ts`))).toBe(false);
+		for (const module of [
+			"managed-bootstrap",
+			"managed-authority-activation",
+			"managed-authority-file-storage",
+			"managed-session-authority",
+		])
+			expect(existsSync(join(ROOT, "src/gjc", `${module}.ts`))).toBe(false);
+		const entrypoint = readFileSync(join(ROOT, "src/index.ts"), "utf8");
+		for (const module of ["session-frames", "turn-runner", "cli-lifecycle-backend", "tmux-ownership"])
+			expect(entrypoint).not.toContain(`./gjc/${module}`);
+		expect(manifest.exports["./gjc/*"]).toBeNull();
+		expect(manifest.dependencies["@gajae-code/coding-agent"]).toBe("0.16.6");
+		expect(manifest.dependencies[["@gajae-code", "bridge-client"].join("/")]).toBeUndefined();
+		expect(manifest.patchedDependencies).toBeUndefined();
+		for (const version of ["0.10.0", "0.11.6", "0.12.7", "0.12.8"])
+			expect(existsSync(join(ROOT, "patches", `@gajae-code%2Fcoding-agent@${version}.patch`))).toBe(false);
 	});
 	test("pins explicit live package exports and blocks internal live modules", () => {
 		const manifest = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")) as {
@@ -341,6 +401,12 @@ describe("CLI module boundaries", () => {
 			await expect(import(path)).rejects.toThrow();
 	});
 
+	test("package resolution blocks managed SDK internals despite the root wildcard", () => {
+		for (const path of ["gjc/managed-sdk-runtime", "gjc/session-authority-v3", "gjc/managed-operation-deadline"])
+			expect(() => import.meta.resolve(`openwebui-gjc-adapter/${path}`)).toThrow();
+		expect(import.meta.resolve("openwebui-gjc-adapter/cli")).toContain("/src/cli.ts");
+	});
+
 	test("keeps the live routing type graph below the runner facade", () => {
 		const selectionSource = readFileSync(join(ROOT, "src/live/gjc-routing-selection.ts"), "utf8");
 		const gatewaySource = readFileSync(join(ROOT, "src/live/gjc-routing-gateway.ts"), "utf8");
@@ -360,6 +426,23 @@ describe("CLI module boundaries", () => {
 		});
 	});
 
+	test("uses only direct V3 managed startup composition", () => {
+		const source = readFileSync(join(ROOT, "src", "adapter-server-options.ts"), "utf8");
+		expect(source).toContain("assertDirectV3Authority(mappingStorePath)");
+		expect(source).toContain("new V3FileBackedSessionMappingStore(mappingStorePath)");
+		expect(source).toContain("const turnRunner = activeManagedV3Runtime.runner");
+		expect(source).toContain("createManagedReaderFactory(activeManagedV3Runtime.runtime, config.turnTimeoutMs)");
+		for (const retired of [
+			"dependencies.turnRunner",
+			"dependencies.modelReaderFactory",
+			"createPublicSdkGjcTurnRunner",
+			"createModelReaderFactory",
+			"createPublicSdkModelAttachmentResolver",
+			"resolveLegacySessionAuthoritySourcePaths",
+		])
+			expect(source).not.toContain(retired);
+	});
+
 	test("enforces the exact acyclic CLI import graph", async () => {
 		// Given: extraction modules that may not yet exist during architecture RED.
 		if (CLI_MODULES.some(file => !existsSync(join(ROOT, "src", file)))) return;
@@ -370,12 +453,6 @@ describe("CLI module boundaries", () => {
 		const installedSource = readFileSync(join(ROOT, "src", CLI_MODULES[1]), "utf8");
 		const serverSource = readFileSync(join(ROOT, "src", "server-bootstrap.ts"), "utf8");
 		const runtimeSingletonLockSource = readFileSync(join(ROOT, "src", "runtime-singleton-lock.ts"), "utf8");
-		const runnerSource = readFileSync(join(ROOT, "src/live/gjc-routing-runner.ts"), "utf8");
-		const publicSdkRunnerSource = readFileSync(join(ROOT, "src/live/gjc-public-sdk-runner.ts"), "utf8");
-		const publicSdkSessionAttachmentSource = readFileSync(
-			join(ROOT, "src/live/gjc-public-sdk-session-attachment.ts"),
-			"utf8",
-		);
 		const deploymentSource = readFileSync(join(ROOT, "src/configure/deployment-artifacts.ts"), "utf8");
 		const cliImports = relativeImports(cliSource);
 		const baseImports = relativeImports(baseSource);
@@ -405,17 +482,13 @@ describe("CLI module boundaries", () => {
 				/\/?(?:adapter|router|cli)(?:[-/]|$)/.test(importPath),
 			),
 			resolvedServerChain:
-				baseSource.includes("buildResolvedAdapterServerOptions(config, dependencies, {") &&
-				baseSource.includes(
-					"sessionAuthorityMigrationSourcePaths: resolveLegacySessionAuthoritySourcePaths(env)",
-				) &&
+				baseSource.includes("return buildResolvedAdapterServerOptions(config, dependencies);") &&
 				cliSource.includes("buildResolvedInstalledAdapterServerOptions(config)") &&
 				installedSource.includes("buildResolvedAdapterServerOptions(config") &&
-				baseSource.includes("createPublicSdkGjcTurnRunner({") &&
-				runnerSource.includes('from "./gjc-public-sdk-runner"') &&
-				publicSdkRunnerSource.includes('from "./gjc-public-sdk-session-ops"') &&
-				publicSdkSessionAttachmentSource.includes("new CliLifecycleBackend(") &&
-				publicSdkSessionAttachmentSource.includes("new PublicSdkSessionClient()"),
+				baseSource.includes("assertDirectV3Authority(mappingStorePath)") &&
+				baseSource.includes("new V3FileBackedSessionMappingStore(mappingStorePath)") &&
+				baseSource.includes("const turnRunner = activeManagedV3Runtime.runner") &&
+				!baseSource.includes("createPublicSdkGjcTurnRunner"),
 			resolvedDeploymentChain:
 				deploymentSource.includes("renderResolvedManagedCompose({") &&
 				deploymentSource.includes("renderResolvedSystemdComposeUnit({") &&

@@ -1,5 +1,6 @@
 import { isAbsolute } from "node:path";
 import type { NormalizedModelSelection } from "../contracts";
+import type { ManagedSessionOperation } from "./session-authority-copy";
 import type {
 	SessionAttachmentProof,
 	SessionOperation,
@@ -53,22 +54,54 @@ export function isOperation(value: unknown): value is SessionOperation {
 		: value.completedAt === undefined && value.result === undefined;
 }
 export function requiresUncertainAcknowledgedSuccessorCompletionReconciliation(
-	operation: SessionOperation,
+	operation: SessionOperation | ManagedSessionOperation,
 	state: SessionOperationState,
 	detail: string | undefined,
 	result: SessionOperationResult | undefined,
 ): boolean {
+	if (state !== "complete") return false;
+	const successor = operation.acknowledgedSuccessor;
+	if (
+		operation.state !== "complete" &&
+		(result?.historicalBinding !== undefined ||
+			operation.result?.historicalBinding !== undefined ||
+			(successor !== undefined && "historicalBinding" in successor && successor.historicalBinding !== undefined))
+	)
+		return true;
+	if (operation.state !== "uncertain") return false;
+	if (
+		(operation.kind !== "create" && operation.kind !== "branch") ||
+		successor === undefined ||
+		detail !== operation.detail ||
+		result?.kind !== "control" ||
+		result.mapping.operationId !== operation.id ||
+		result.mapping.sessionId !== successor.sessionId
+	)
+		return true;
+	if ("managedAuthority" in successor) {
+		const expected = successor.managedAuthority;
+		const actual = result.managedAuthority;
+		return (
+			expected === undefined ||
+			actual === undefined ||
+			actual.generation !== expected.generation ||
+			![
+				"principalId",
+				"projectId",
+				"canonicalWorkspace",
+				"chatId",
+				"sessionId",
+				"leaseId",
+				"epoch",
+				"requestKey",
+			].every(key => Reflect.get(actual, key) === Reflect.get(expected, key))
+		);
+	}
+	if (!("attachment" in successor)) return true;
 	return (
-		operation.state === "uncertain" &&
-		state === "complete" &&
-		(operation.kind !== "create" ||
-			operation.acknowledgedSuccessor === undefined ||
-			detail !== operation.detail ||
-			result?.kind !== "control" ||
-			result.mapping.operationId !== operation.id ||
-			result.mapping.sessionId !== operation.acknowledgedSuccessor.sessionId ||
-			result.mapping.sessionFile === undefined ||
-			JSON.stringify(result.mapping.attachment) !== JSON.stringify(operation.acknowledgedSuccessor.attachment))
+		operation.kind !== "create" ||
+		result.mapping.sessionFile === undefined ||
+		JSON.stringify(result.mapping.attachment) !== JSON.stringify(successor.attachment)
 	);
 }
 
@@ -173,7 +206,7 @@ function isSha256HexDigest(value: unknown): value is string {
 }
 function isOperationResult(value: unknown): value is SessionOperationResult {
 	if (
-		!hasOnlyKeys(value, ["kind", "assistantText", "events", "mapping", "correlation", "gate"]) ||
+		!hasOnlyKeys(value, ["kind", "assistantText", "managedAuthority", "events", "mapping", "correlation", "gate"]) ||
 		(value.kind !== "turn" && value.kind !== "control" && value.kind !== "close") ||
 		typeof value.assistantText !== "string" ||
 		(value.events !== undefined && (!Array.isArray(value.events) || !value.events.every(isEvent))) ||
@@ -220,6 +253,14 @@ function isOperationResult(value: unknown): value is SessionOperationResult {
 		(!isAttachmentProof(mapping.attachment) || mapping.attachment.expectedSessionId !== mapping.sessionId)
 	)
 		return false;
+	if (
+		value.managedAuthority !== undefined &&
+		!isManagedAuthority(
+			value.managedAuthority,
+			mapping as Readonly<{ chatId: string; projectId: string; sessionId: string }>,
+		)
+	)
+		return false;
 	return value.kind === "close"
 		? isRecord(value.correlation) &&
 				value.correlation.closeStatus === "closed" &&
@@ -228,4 +269,34 @@ function isOperationResult(value: unknown): value is SessionOperationResult {
 				Object.keys(value.correlation).every(key => key === "closeStatus" || key === "mappingOperationId")
 		: value.correlation === undefined ||
 				(isRecord(value.correlation) && Object.values(value.correlation).every(isNonEmptyString));
+}
+function isManagedAuthority(
+	value: unknown,
+	mapping: Readonly<{ chatId: string; projectId: string; sessionId: string }>,
+): boolean {
+	return (
+		isRecord(value) &&
+		hasOnlyKeys(value, [
+			"principalId",
+			"projectId",
+			"canonicalWorkspace",
+			"chatId",
+			"sessionId",
+			"generation",
+			"leaseId",
+			"epoch",
+			"requestKey",
+		]) &&
+		isNonEmptyString(value.principalId) &&
+		value.projectId === mapping.projectId &&
+		isNonEmptyString(value.canonicalWorkspace) &&
+		isAbsolute(value.canonicalWorkspace) &&
+		value.chatId === mapping.chatId &&
+		value.sessionId === mapping.sessionId &&
+		isNonnegativeSafeInteger(value.generation) &&
+		value.generation > 0 &&
+		isNonEmptyString(value.leaseId) &&
+		isNonEmptyString(value.epoch) &&
+		isNonEmptyString(value.requestKey)
+	);
 }

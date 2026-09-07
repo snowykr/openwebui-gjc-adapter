@@ -1,3 +1,4 @@
+import type { ManagedPreparedTurnAuthority } from "../gjc/turn-runner";
 import type { OpenWebUIOwnerContext, OpenWebUIPrincipal } from "../openwebui/auth";
 import type { OpenWebUIProjectionRepository } from "../openwebui/client";
 import type { OpenWebUIMessageEvent } from "../openwebui/events";
@@ -18,9 +19,8 @@ export type OpenWebUIControl =
 	/** Attached lifecycle operations remain on the public session controller. */
 	| { readonly operation: "session.new" }
 	| {
-			readonly operation: "session.resume" | "session.switch";
+			readonly operation: "session.resume";
 			readonly sessionId: string;
-			readonly sessionFile: string;
 	  }
 	| { readonly operation: "unsupported"; readonly surface: string };
 
@@ -36,12 +36,15 @@ export interface LiveGatewayRunnerInput {
 	/** Authenticated OpenWebUI owner bound by the request handler for branch controls. */
 	/** Authenticated OpenWebUI principal bound by the request handler for branch controls. */
 	readonly ownerUserId?: string;
+	/** Generation-free managed authority admitted with the current workspace lease. */
+	readonly preparedManagedAuthority?: ManagedPreparedTurnAuthority;
 	/** Principal/workspace/lease scope for model selection during this turn. */
 	readonly modelReaderContext?: import("./model-reader").ModelReaderContext;
 	/** Message lineage supplied by OpenWebUI for the regenerated message. */
 	readonly messageMetadata?: Readonly<Record<string, unknown>>;
 	readonly control?: OpenWebUIControl;
 	readonly onLiveEvents?: (events: readonly OpenWebUIMessageEvent[]) => Promise<void> | void;
+	readonly signal?: AbortSignal;
 }
 
 export type LiveGatewayRunnerResult =
@@ -61,6 +64,7 @@ export type LiveGatewayRunnerResult =
 	  };
 
 export interface LiveGatewayRunner {
+	readonly supportsManagedSessions?: boolean;
 	stop?(): void | Promise<void>;
 	run(input: LiveGatewayRunnerInput): Promise<LiveGatewayRunnerResult> | LiveGatewayRunnerResult;
 }
@@ -122,4 +126,5 @@ export interface HandleChatCompletionsInput {
 	/** Maximum same-process normal-user admission queue depth. */
 	readonly workspaceAdmissionQueueLimit?: number;
 	readonly workspaceLeaseHeartbeatMs?: number;
+	readonly signal?: AbortSignal;
 }

@@ -137,7 +137,7 @@ export class SessionAuthority {
 	attachProvisionalOperation(
 		chatId: string,
 		ingressId: string,
-		attachment: Pick<ProvisionalSessionOperation, "sessionId" | "sessionFile" | "attachment">,
+		attachment: Pick<ProvisionalSessionOperation, "sessionId" | "sessionFile" | "attachment" | "managedAuthority">,
 	): ProvisionalSessionOperation {
 		return this.#journal.attach(chatId, ingressId, attachment);
 	}
@@ -158,6 +158,15 @@ export class SessionAuthority {
 	): SessionOperation {
 		return this.#journal.acknowledge(chatId, operationId, operationHash, successor);
 	}
+	discardPendingOperation(chatId: string, operation: Pick<SessionOperation, "id" | "ingressId" | "detail">): void {
+		this.#journal.discardPendingOperation(chatId, operation);
+	}
+	discardPendingProvisionalOperation(
+		chatId: string,
+		operation: Pick<ProvisionalSessionOperation, "id" | "ingressId" | "detail">,
+	): void {
+		this.#journal.discardPendingProvisionalOperation(chatId, operation);
+	}
 	transitionOperation(
 		chatId: string,
 		operationId: string,
@@ -177,8 +186,8 @@ export class SessionAuthority {
 		this.transitionOperation(chatId, operationId, "complete", detail, result);
 		return this.upsert(mapping);
 	}
-	reconcileRestart(copyResults = true): readonly SessionAuthorityRecord[] {
-		return this.#journal.reconcile(copyResults);
+	reconcileRestart(copyResults = true, observedAt?: number): readonly SessionAuthorityRecord[] {
+		return this.#journal.reconcile(copyResults, observedAt);
 	}
 	protected takeDirtyRecords(): readonly SessionAuthorityRecord[] {
 		return this.#journal.takeDirtyRecords();

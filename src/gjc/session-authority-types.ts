@@ -1,7 +1,35 @@
 import type { NormalizedModelSelection } from "../contracts";
-import type { GjcTurnEvent } from "./turn-runner";
+import type {
+	ManagedLateCreateAcknowledgement,
+	ManagedLateLifecycleAcknowledgement,
+	ManagedLifecycleEvidence,
+} from "./managed-lifecycle-evidence";
+import type { GjcTurnEvent, ManagedTurnAuthority } from "./turn-runner";
 
 export const SESSION_AUTHORITY_VERSION = 2 as const;
+
+/** Occurrence-specific inert history; never authorizes attachment or lifecycle effects. */
+export interface HistoricalSessionBinding {
+	readonly kind: "unbound-history";
+	readonly chatId: string;
+	readonly projectId: string;
+	readonly sessionId?: string;
+	readonly principalId?: string;
+	readonly canonicalWorkspace?: string;
+	readonly reason: "generation-unproven" | "ownership-unresolved";
+	readonly provenance: {
+		readonly source: "v2";
+		readonly documentHash: string;
+		readonly nodeRef: string;
+		readonly nodeHash: string;
+	};
+}
+
+export type SessionAuthorityBinding =
+	| { readonly managedAuthority?: ManagedTurnAuthority; readonly historicalBinding?: never }
+	| { readonly managedAuthority?: never; readonly historicalBinding: HistoricalSessionBinding };
+
+export type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
 
 export class SessionAuthorityLoadError extends Error {
 	constructor(
@@ -54,10 +82,14 @@ export type EndpointSessionAttachmentProof = Omit<
 	"tmuxSocket" | "tmuxPane" | "tmuxPanePid" | "tmuxOwnershipTag" | "ownedAt"
 >;
 
-export interface AcknowledgedSuccessor {
-	readonly sessionId: string;
-	readonly attachment: EndpointSessionAttachmentProof;
-}
+export type AcknowledgedSuccessor =
+	| { readonly sessionId: string; readonly attachment: EndpointSessionAttachmentProof }
+	| { readonly sessionId: string; readonly managedAuthority: ManagedTurnAuthority; readonly historicalBinding?: never }
+	| {
+			readonly sessionId: string;
+			readonly managedAuthority?: never;
+			readonly historicalBinding: HistoricalSessionBinding;
+	  };
 
 export interface SessionOperationGateBinding {
 	readonly gateId: string;
@@ -66,7 +98,7 @@ export interface SessionOperationGateBinding {
 	readonly sessionId?: string;
 }
 
-export interface SessionOperationResult {
+export type SessionOperationResult = SessionAuthorityBinding & {
 	readonly kind: "turn" | "control" | "close";
 	readonly assistantText: string;
 	readonly events?: readonly GjcTurnEvent[];
@@ -87,7 +119,7 @@ export interface SessionOperationResult {
 	 * of a superseded gate can still recompute the durable request hash even
 	 * after the gate event itself is no longer retained on the record. */
 	readonly gate?: SessionOperationGateBinding;
-}
+};
 
 export interface SessionOperation {
 	readonly id: string;
@@ -99,9 +131,23 @@ export interface SessionOperation {
 	readonly detail?: string;
 	readonly result?: SessionOperationResult;
 	readonly acknowledgedSuccessor?: AcknowledgedSuccessor;
+	readonly lifecycle?: ManagedLifecycleEvidence;
+	readonly lateLifecycleAcknowledgement?: ManagedLateLifecycleAcknowledgement;
 }
 export type SessionProjectReassignmentState = "pending" | "rolled_back" | "committed";
 export type ProjectReassignmentState = SessionProjectReassignmentState;
+
+/** A catalog close has its own immutable request identity, never a serving result. */
+export interface CatalogCleanupOperation {
+	readonly id: string;
+	readonly ingressId: string;
+	readonly kind: "close";
+	readonly state: SessionOperationState;
+	readonly startedAt: string;
+	readonly completedAt?: string;
+	readonly detail: string;
+	readonly lifecycle: ManagedLifecycleEvidence;
+}
 
 export interface SessionAuthorityTargetIdentity {
 	readonly id: string;
@@ -110,7 +156,7 @@ export interface SessionAuthorityTargetIdentity {
 	readonly detail?: string;
 }
 
-export interface SessionAuthorityTombstone {
+export type SessionAuthorityTombstone = SessionAuthorityBinding & {
 	readonly version: typeof SESSION_AUTHORITY_VERSION;
 	readonly chatId: string;
 	readonly projectId: string;
@@ -130,7 +176,7 @@ export interface SessionAuthorityTombstone {
 	readonly journal: readonly SessionOperation[];
 	readonly retiredAt: string;
 	readonly prior?: SessionAuthorityTombstone;
-}
+};
 
 export interface SessionAuthorityReassignment {
 	readonly state: SessionProjectReassignmentState;
@@ -146,16 +192,21 @@ export interface SessionAuthorityReassignment {
 
 /** A mapping's reassignment marker is intentionally optional for v2 documents. */
 
-export interface ProvisionalSessionOperation extends SessionOperation {
-	readonly chatId: string;
-	readonly projectId: string;
-	readonly sessionId?: string;
-	readonly sessionFile?: string;
-	readonly attachment?: SessionAttachmentProof;
-}
+export type ProvisionalSessionOperation = SessionOperation &
+	SessionAuthorityBinding & {
+		readonly chatId: string;
+		readonly projectId: string;
+		readonly purpose?: "model-catalog";
+		readonly cleanup?: CatalogCleanupOperation;
+		readonly lateCreateAcknowledgement?: ManagedLateCreateAcknowledgement;
+		readonly sessionId?: string;
+		readonly sessionFile?: string;
+		readonly activeLeaf?: string;
+		readonly attachment?: SessionAttachmentProof;
+	};
 
 /** The mapping identity header is deliberately separate from replaceable observations. */
-export interface SessionAuthorityRecord {
+export type SessionAuthorityRecord = SessionAuthorityBinding & {
 	readonly version: typeof SESSION_AUTHORITY_VERSION;
 	readonly chatId: string;
 	readonly projectId: string;
@@ -174,9 +225,12 @@ export interface SessionAuthorityRecord {
 	readonly attachment?: SessionAttachmentProof;
 	readonly journal: readonly SessionOperation[];
 	readonly reassignment?: SessionAuthorityReassignment;
-}
+};
 
-export type SessionAuthorityInput = Omit<SessionAuthorityRecord, "version" | "createdAt" | "header" | "journal"> &
+export type SessionAuthorityInput = DistributiveOmit<
+	SessionAuthorityRecord,
+	"version" | "createdAt" | "header" | "journal"
+> &
 	Partial<Pick<SessionAuthorityRecord, "createdAt" | "journal" | "header" | "version">>;
 export const SESSION_AUTHORITY_MIGRATION_VERSION = 1 as const;
 

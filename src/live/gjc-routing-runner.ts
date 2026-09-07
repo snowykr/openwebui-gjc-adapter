@@ -1,5 +1,3 @@
-export { createPublicSdkModelAttachmentResolver } from "./gjc-model-attachment-resolver";
-export { type CreatePublicSdkGjcTurnRunnerInput, createPublicSdkGjcTurnRunner } from "./gjc-public-sdk-runner";
 export {
 	type CreateGjcRoutingLiveGatewayRunnerInput,
 	createGjcRoutingLiveGatewayRunner,

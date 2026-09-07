@@ -22,11 +22,14 @@ export function controlFromMetadata(metadata: Record<string, unknown> | undefine
 	}
 	if (operation === "branch" || operation === "session.new") return { operation };
 	if (
-		(operation === "session.resume" || operation === "session.switch") &&
+		operation === "session.resume" &&
 		typeof control.sessionId === "string" &&
-		typeof control.sessionFile === "string"
+		control.sessionId.length > 0 &&
+		control.sessionId.trim() === control.sessionId &&
+		!/[\x00-\x1f\x7f]/.test(control.sessionId) &&
+		Object.keys(control).every(field => field === "operation" || field === "sessionId")
 	) {
-		return { operation, sessionId: control.sessionId, sessionFile: control.sessionFile };
+		return { operation, sessionId: control.sessionId };
 	}
 	return { operation: "unsupported", surface: typeof operation === "string" ? operation : "invalid" };
 }

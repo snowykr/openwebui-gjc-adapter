@@ -1,21 +1,36 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { buildAdapterServerOptionsFromEnv } from "../src/cli";
+import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
 import { GJC_OPENWEBUI_PROMPT_HINTS } from "../src/openwebui/prompt-hints";
-import { FakeGjcTurnRunner } from "./cli-fixtures";
+import { FakeManagedSdkRuntime } from "./cli-fixtures";
 
 describe("adapter CLI prompt hints", () => {
 	test("seeds OpenWebUI prompt hints during CLI startup when API auth is configured", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-cli-prompts-"));
 		const fixture = startPromptServer();
+		const accounting = new FakeManagedSdkRuntime();
+		const managedRuntime = {
+			createProducerScope: () => accounting.createProducerScope(),
+			state: "new",
+			start: async () => undefined,
+			dispose: async () => undefined,
+			reconcile: async () => undefined,
+			registerTenant: () => undefined,
+			acquireAttachment: async () => undefined,
+			generationStatus: async () => ({ status: "current" as const }),
+		};
 
 		try {
+			await writeV3Authority(path.join(workspace, "sessions"));
 			await buildAdapterServerOptionsFromEnv(
 				{
 					...process.env,
+					GJC_OPENWEBUI_MODE: "existing",
 					GJC_OPENWEBUI_BASE_URL: fixture.baseUrl,
 					GJC_OPENWEBUI_API_TOKEN: "openwebui-token",
 					GJC_OPENWEBUI_ADAPTER_API_TOKEN: "adapter-token",
@@ -25,7 +40,7 @@ describe("adapter CLI prompt hints", () => {
 					GJC_OPENWEBUI_STATE_PATH: path.join(workspace, "state"),
 				},
 				{
-					turnRunner: new FakeGjcTurnRunner(),
+					managedSdkRuntime: managedRuntime as never,
 					projectionRepository: new InMemoryOpenWebUIProjectionRepository(),
 				},
 			);
@@ -45,6 +60,31 @@ describe("adapter CLI prompt hints", () => {
 		}
 	});
 });
+
+async function writeV3Authority(root: string): Promise<void> {
+	await fs.mkdir(root, { recursive: true });
+	const canonicalPath = path.join(root, "openwebui-session-mappings.json");
+	const canonical = Buffer.from(
+		`${JSON.stringify({
+			kind: "openwebui-gjc-session-authority",
+			version: 3,
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+			mappings: [],
+			provisionalOperations: [],
+		})}\n`,
+	);
+	await fs.writeFile(canonicalPath, canonical);
+	await fs.writeFile(
+		`${canonicalPath}.v3-active.json`,
+		`${JSON.stringify({
+			kind: "openwebui-gjc-session-authority-active",
+			version: 1,
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+			activationV3Digest: createHash("sha256").update(canonical).digest("hex"),
+			source: { baseDigest: "0".repeat(64), walDigest: "0".repeat(64), walPresent: false },
+		})}\n`,
+	);
+}
 
 interface RecordedPromptRequest {
 	readonly method: string;

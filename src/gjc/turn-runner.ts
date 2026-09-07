@@ -12,18 +12,89 @@ import type { SessionAttachmentProof } from "./session-authority";
 import type { AcknowledgedSuccessor } from "./session-authority-types";
 import type { SessionMapping } from "./session-mapping-store";
 
+/** Complete, durable authority required before a managed SDK operation can cross process ownership. */
+export interface ManagedTurnAuthority {
+	readonly principalId: string;
+	readonly projectId: string;
+	readonly canonicalWorkspace: string;
+	readonly chatId: string;
+	readonly sessionId: string;
+	readonly generation: number;
+	readonly leaseId: string;
+	readonly epoch: string;
+	readonly requestKey: string;
+}
+
+/** Original public lifecycle endpoint identity; not Router routing authority. */
+export interface ManagedEndpointReceipt {
+	readonly sessionId: string;
+	readonly endpointGeneration: number;
+	readonly endpointIncarnation: string;
+}
+
+/**
+ * Credential-free authority admitted before managed session creation. Session
+ * identity and generation are assigned only by the managed lifecycle service.
+ */
+export interface ManagedPreparedTurnAuthority {
+	readonly principalId: string;
+	readonly projectId: string;
+	readonly canonicalWorkspace: string;
+	readonly chatId: string;
+	readonly leaseId: string;
+	readonly epoch: string;
+	readonly requestKey: string;
+}
+
+/** Durable managed authority proof; unlike legacy proof it contains no descriptor or terminal identity. */
+export interface ManagedGenerationProof {
+	readonly kind: "managed-generation";
+	readonly sessionId: string;
+	readonly generation: number;
+	readonly leaseId: string;
+	readonly epoch: string;
+}
+
+/** Explicit managed variants prevent legacy inputs from being mistaken for tenant-authorized traffic. */
+export type ManagedContinueSessionInput = GjcContinueSessionInput & { readonly authority: ManagedTurnAuthority };
+export type ManagedStartNewSessionInput = GjcStartNewSessionInput & {
+	readonly authority: ManagedPreparedTurnAuthority;
+};
+export type ManagedSessionStateInput = GjcSessionStateInput & { readonly authority: ManagedTurnAuthority };
+export type ManagedRespondWorkflowGateInput = GjcRespondWorkflowGateInput & {
+	readonly authority: ManagedTurnAuthority;
+};
+export type ManagedCancelTurnInput = GjcCancelTurnInput & { readonly authority: ManagedTurnAuthority };
+export interface ManagedLifecycleControlInput {
+	readonly authority: ManagedTurnAuthority;
+	readonly operation: "session.create" | "session.resume" | "session.close" | "session.delete";
+}
+
+/** Durable owner hooks for a single canonical create/resume control operation. */
+export interface ManagedLifecycleControlOwner {
+	readonly operation: "session.create" | "session.resume";
+	readonly source: ManagedTurnAuthority;
+	readonly preparedAuthority: ManagedPreparedTurnAuthority;
+	readonly lifecycleOperation: {
+		readonly operationId: string;
+		readonly requestKey: string;
+		readonly payloadHash: string;
+	};
+	onInvoking(): void | Promise<void>;
+	onAcknowledged(authority: ManagedTurnAuthority, endpointReceipt?: ManagedEndpointReceipt): void | Promise<void>;
+	beforeProof?(): void | Promise<void>;
+}
+export interface ManagedCloseInput {
+	readonly authority: ManagedTurnAuthority;
+}
+
 export type GjcTurnEventObserver = (event: GjcTurnEvent) => Promise<void> | void;
 export type {
-	GjcLifecycleOwner,
 	GjcLifecyclePublicationAddress,
 	GjcLifecycleScoped,
-	GjcLifecycleTestBarrierEvidence,
-	GjcLifecycleTestBarrierHook,
-	GjcLifecycleTestBarrierPhase,
 	GjcLifecycleTransaction,
 	GjcSessionAddress,
 } from "./lifecycle-transaction";
-export { GjcCloseReceipt } from "./lifecycle-transaction";
 
 export interface GjcStartNewSessionInput {
 	readonly cwd: string;
@@ -35,10 +106,30 @@ export interface GjcStartNewSessionInput {
 	readonly text: string;
 	readonly modelSelection?: NormalizedModelSelection;
 	readonly observer?: GjcTurnEventObserver;
+	readonly signal?: AbortSignal;
+	readonly principalId?: string;
+	readonly preparedManagedAuthority?: ManagedPreparedTurnAuthority;
+	/** Persists assigned lifecycle identity before attachment proof or prompt effects. */
+	readonly onLifecycleAcknowledged?: (
+		authority: ManagedTurnAuthority,
+		endpointReceipt?: ManagedEndpointReceipt,
+	) => void | Promise<void>;
+	readonly onLifecycleInvoking?: () => void | Promise<void>;
+	/** Renewed effect admission, separate from recording an original late outcome. */
+	readonly beforeLifecycleProof?: () => void | Promise<void>;
+	readonly lifecycleOperation?: {
+		readonly operationId: string;
+		readonly requestKey: string;
+		readonly payloadHash: string;
+	};
 }
 
 export interface GjcContinueSessionInput extends GjcSessionAddress, GjcLifecycleScoped {
 	readonly userMessageId: string;
+	/** Remaining budget when continuation is part of a larger managed operation. */
+	readonly timeoutMs?: number;
+	/** Additional caller fence at dispatch; runtime authorization remains mandatory. */
+	readonly beforeDispatch?: () => void;
 	readonly parentId?: string;
 	readonly text: string;
 	readonly sessionFile?: string;
@@ -49,16 +140,17 @@ export interface GjcContinueSessionInput extends GjcSessionAddress, GjcLifecycle
 	readonly operationId: string;
 	readonly modelSelection?: NormalizedModelSelection;
 	readonly observer?: GjcTurnEventObserver;
-}
-
-export interface GjcSwitchSessionInput extends GjcSessionAddress, GjcLifecycleScoped {
-	readonly sessionFile?: string;
-	readonly recoveryAttachment?: SessionAttachmentProof;
+	readonly signal?: AbortSignal;
+	readonly principalId?: string;
+	/** Persisted managed authority. It is distinct from new-session prepared authority. */
+	readonly managedAuthority?: ManagedTurnAuthority;
+	readonly onDispatch?: () => void;
 }
 
 export interface GjcSessionStateInput extends GjcSessionAddress, GjcLifecycleScoped {
 	readonly sessionFile?: string;
 	readonly recoveryAttachment?: SessionAttachmentProof;
+	readonly managedAuthority?: ManagedTurnAuthority;
 }
 
 export interface GjcRespondWorkflowGateInput extends GjcSessionAddress, GjcLifecycleScoped {
@@ -76,6 +168,10 @@ export interface GjcRespondWorkflowGateInput extends GjcSessionAddress, GjcLifec
 	readonly operationId: string;
 	readonly gateCorrelation?: GjcWorkflowGateCorrelation;
 	readonly observer?: GjcTurnEventObserver;
+	readonly signal?: AbortSignal;
+	readonly principalId?: string;
+	readonly managedAuthority?: ManagedTurnAuthority;
+	readonly onDispatch?: () => void;
 }
 
 export interface GjcWorkflowGateCorrelation {
@@ -90,6 +186,8 @@ export interface GjcSessionState {
 	readonly rawFrameCursor: number;
 	readonly eventCursor: number;
 	readonly attachment?: SessionAttachmentProof;
+	readonly managedProof?: ManagedGenerationProof;
+	readonly managedAuthority?: ManagedTurnAuthority;
 }
 
 export interface GjcTurnEvent {
@@ -97,6 +195,24 @@ export interface GjcTurnEvent {
 	readonly text?: string;
 	readonly id?: string;
 	readonly payload?: Readonly<Record<string, unknown>>;
+}
+
+export interface GjcCancelTurnInput {
+	readonly projectId: string;
+	readonly chatId: string;
+	readonly sessionId?: string;
+	readonly operationId?: string;
+	readonly principalId?: string;
+	readonly managedAuthority?: ManagedTurnAuthority;
+}
+
+export class GjcTurnCancelledError extends Error {
+	readonly code = "gjc_turn_cancelled";
+
+	constructor() {
+		super("GJC turn was cancelled.");
+		this.name = "GjcTurnCancelledError";
+	}
 }
 
 export interface GjcTurnResult {
@@ -108,6 +224,8 @@ export interface GjcTurnResult {
 	readonly eventCursor: number;
 	readonly modelSelection?: NormalizedModelSelection;
 	readonly attachment?: SessionAttachmentProof;
+	readonly managedProof?: ManagedGenerationProof;
+	readonly managedAuthority?: ManagedTurnAuthority;
 }
 export interface GjcControlResult {
 	readonly result?: GjcTurnResult;
@@ -118,29 +236,23 @@ export interface GjcControlResult {
 
 export interface GjcTurnRunner {
 	stop?(): void;
-	resolveSessionRoot?(cwd: string): string;
-	discardSessionAttachment?(cwd: string, sessionId: string): void;
+	cancelTurn?(input: GjcCancelTurnInput): void | Promise<void>;
+	clearTurnCancellation?(input: GjcCancelTurnInput): void;
 	withLifecyclePublication?<T>(
 		address: GjcLifecyclePublicationAddress,
 		effect: (lifecycle: GjcLifecycleTransaction) => Promise<T>,
 	): Promise<T>;
-	/** Runs a close-only lifecycle transaction without recovering or attaching a dropped cache entry. */
-	withLifecycleClosePreflight?<T>(
-		address: GjcLifecyclePublicationAddress,
-		effect: (lifecycle: GjcLifecycleTransaction) => Promise<T>,
-	): Promise<T>;
-	startNewSession<T>(
-		input: GjcStartNewSessionInput,
+	startManagedSession?<T>(
+		input: GjcStartNewSessionInput & { readonly preparedManagedAuthority: ManagedPreparedTurnAuthority },
 		publish: (result: GjcSessionAddress & GjcTurnResult, lifecycle: GjcLifecycleTransaction) => Promise<T>,
 		beforePrompt: (
 			address: GjcSessionAddress,
-			attachment: SessionAttachmentProof,
+			proof: ManagedGenerationProof,
 			lifecycle: GjcLifecycleTransaction,
 		) => Promise<void>,
 		onFailure?: (lifecycle: GjcLifecycleTransaction, error: unknown) => Promise<void>,
 	): Promise<T>;
 	continueSession(input: GjcContinueSessionInput): Promise<GjcTurnResult>;
-	switchSession(input: GjcSwitchSessionInput): Promise<void>;
 	getState(input: GjcSessionStateInput): Promise<GjcSessionState>;
 	getAvailableModels?(input: GjcSessionStateInput): Promise<readonly unknown[]>;
 	respondWorkflowGate?(input: GjcRespondWorkflowGateInput): Promise<GjcTurnResult>;
@@ -151,6 +263,13 @@ export interface GjcTurnRunner {
 		mapping: SessionMapping,
 		lifecycle: GjcLifecycleTransaction,
 		onAcknowledgedSuccessor?: (successor: AcknowledgedSuccessor) => Promise<void> | void,
+		onDispatch?: () => void,
+		lifecycleOwner?: ManagedLifecycleControlOwner,
+		execution?: {
+			readonly timeoutMs: number;
+			/** Synchronous outer-owner fence, additional to runtime tenant authorization. */
+			readonly beforeDispatch: () => void;
+		},
 	): Promise<GjcControlResult>;
 }
 

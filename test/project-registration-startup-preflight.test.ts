@@ -1,10 +1,11 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, spyOn, test } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { buildAdapterServerOptionsFromEnv } from "../src/adapter-server-options";
+import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
-import { FakeGjcTurnRunner } from "./cli-fixtures";
 import * as fixture from "./project-registration-startup-preflight-fixtures";
 
 const NAMES = `id name open_webui_folder_name cwd open_webui_folder_id allowed_root
@@ -17,6 +18,91 @@ const CURRENT: readonly fixture.RawColumn[] = NAMES.map(name => ({ name, definit
 const LEGACY = CURRENT.toSpliced(4, 0, { name: "model_id", definition: definition("model_id") });
 const PROTECTED = "Project paths must not overlap protected GJC runtime paths.";
 const INCOMPATIBLE = "Project registration database is incompatible.";
+
+function managedRuntimeFixture() {
+	let starts = 0;
+	let state: "new" | "running" | "stopped" = "new";
+	const registrations = new Map<string, Record<string, unknown>>();
+	const tenantKey = (tenant: Record<string, unknown>) =>
+		JSON.stringify([
+			tenant.principalId,
+			tenant.projectId,
+			tenant.canonicalWorkspace,
+			tenant.chatId,
+			tenant.sessionId,
+			tenant.generation,
+			tenant.leaseId,
+			tenant.epoch,
+		]);
+	const runtime = {
+		get state() {
+			return state;
+		},
+		async start() {
+			starts += 1;
+			state = "running";
+		},
+		async dispose() {
+			state = "stopped";
+		},
+		async reconcile() {},
+		registerTenant(tenant: Record<string, unknown>) {
+			registrations.set(tenantKey(tenant), tenant);
+		},
+		async acquireAttachment(tenant: Record<string, unknown>) {
+			const key = tenantKey(tenant);
+			if (!registrations.has(key)) throw new Error("Managed fixture tenant is not registered.");
+			return {
+				tenant,
+				generation: tenant.generation,
+				isCurrent: () => state === "running" && registrations.has(key),
+			};
+		},
+		async generationStatus() {
+			return { status: "current" as const };
+		},
+		async request() {
+			return { ok: true };
+		},
+		subscribeFrames() {
+			return () => undefined;
+		},
+		async createLifecycleSession(tenant: Record<string, unknown>) {
+			return {
+				ok: true as const,
+				operation: "session.create" as const,
+				result: { sessionId: tenant.sessionId ?? "managed-session", endpointGeneration: tenant.generation ?? 1 },
+			};
+		},
+		async resumeLifecycleSession(tenant: Record<string, unknown>) {
+			return {
+				ok: true as const,
+				operation: "session.resume" as const,
+				result: { sessionId: tenant.sessionId ?? "managed-session", endpointGeneration: tenant.generation ?? 1 },
+			};
+		},
+		async closeLifecycleSession(tenant: Record<string, unknown>) {
+			return {
+				ok: true as const,
+				operation: "session.close" as const,
+				result: { sessionId: tenant.sessionId ?? "managed-session", endpointGeneration: tenant.generation ?? 1 },
+			};
+		},
+		async deleteLifecycleSession(tenant: Record<string, unknown>) {
+			return {
+				ok: true as const,
+				operation: "session.delete" as const,
+				result: { sessionId: tenant.sessionId ?? "managed-session", endpointGeneration: tenant.generation ?? 1 },
+			};
+		},
+	};
+	return {
+		runtime: runtime as never,
+		get starts() {
+			return starts;
+		},
+	};
+}
 
 afterEach(fixture.removeWorkspaces);
 
@@ -176,19 +262,19 @@ async function filesystemCase(kind: string) {
 async function expectRejected(context: Context, message: string, label = message) {
 	const before = await fixture.snapshotSourceFamily(context.databasePath);
 	const repository = new InMemoryOpenWebUIProjectionRepository();
-	const runner = new FakeGjcTurnRunner();
+	const managedSdkRuntime = managedRuntimeFixture();
 	const writes = [
 		...(["upsertFolder", "upsertChat", "replaceChatMessages"] as const).map(method => spyOn(repository, method)),
 		spyOn(Bun, "serve"),
 	];
 	const error = await buildAdapterServerOptionsFromEnv(runtimeEnv(context.root), {
 		projectionRepository: repository,
-		turnRunner: runner,
+		managedSdkRuntime: managedSdkRuntime.runtime,
 	}).catch(value => value);
 	if (!(error instanceof Error)) throw new Error("Expected operation to fail.");
 	expect([error.name, error.message]).toEqual([message === PROTECTED ? "ProjectLinkError" : "Error", message]);
 	if (message === PROTECTED) expect(error).toHaveProperty("code", "invalid_project_link");
-	expect([...writes.map(write => write.mock.calls.length), runner.starts.length]).toEqual([0, 0, 0, 0, 0]);
+	expect([...writes.map(write => write.mock.calls.length), managedSdkRuntime.starts]).toEqual([0, 0, 0, 0, 0]);
 	for (const write of writes) write.mockRestore();
 	expect(await fixture.snapshotSourceFamily(context.databasePath), label).toEqual(before);
 }
@@ -255,13 +341,38 @@ function protectedPaths(root: string): readonly [string, string, string, string]
 	return [domain, path.join(domain, "agent"), reader, path.join(reader, ".gjc/sessions")];
 }
 async function makeContext(label: string): Promise<Context> {
-	const root = await fixture.makeWorkspace(`gjc-preflight-${label}`, ["home", "state"]);
+	const root = await fixture.makeWorkspace(`gjc-preflight-${label}`, ["home", "state", "sessions"]);
+	await writeV3Authority(path.join(root, "sessions"));
 	return { root, databasePath: path.join(root, "state", "adapter-state.sqlite") };
+}
+async function writeV3Authority(root: string): Promise<void> {
+	const canonicalPath = path.join(root, "openwebui-session-mappings.json");
+	const canonical = Buffer.from(
+		`${JSON.stringify({
+			kind: "openwebui-gjc-session-authority",
+			version: 3,
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+			mappings: [],
+			provisionalOperations: [],
+		})}\n`,
+	);
+	await fs.writeFile(canonicalPath, canonical);
+	await fs.writeFile(
+		`${canonicalPath}.v3-active.json`,
+		`${JSON.stringify({
+			kind: "openwebui-gjc-session-authority-active",
+			version: 1,
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+			activationV3Digest: createHash("sha256").update(canonical).digest("hex"),
+			source: { baseDigest: "0".repeat(64), walDigest: "0".repeat(64), walPresent: false },
+		})}\n`,
+	);
 }
 function runtimeEnv(root: string): Record<string, string | undefined> {
 	return {
 		...process.env,
 		HOME: path.join(root, "home"),
+		GJC_OPENWEBUI_MODE: "existing",
 		GJC_OPENWEBUI_STATE_PATH: path.join(root, "state"),
 		GJC_OPENWEBUI_SESSION_ROOT: path.join(root, "sessions"),
 		GJC_OPENWEBUI_ALLOWED_PROJECT_ROOTS: root,

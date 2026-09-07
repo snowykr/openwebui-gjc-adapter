@@ -1,17 +1,99 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { buildAdapterServerOptionsFromEnv } from "../src/adapter-server-options";
+import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import { ProjectLinkError } from "../src/projects/link-service";
 import { SqliteProjectRegistrationStore } from "../src/projects/registration-store";
 import type { RegisteredProject } from "../src/projects/registry";
 import { startAdapterServer } from "../src/server";
 import { observeStartup, spawnCli, terminateAndReap } from "./bounded-process-fixtures";
-import { FakeGjcTurnRunner, reserveTcpPort } from "./cli-fixtures";
+import { FakeManagedSdkRuntime, reserveTcpPort } from "./cli-fixtures";
 
 const tempDirs: string[] = [];
 const handles: { stop(): Promise<void> }[] = [];
+
+function managedRuntimeFixture() {
+	const accounting = new FakeManagedSdkRuntime();
+	let state: "new" | "running" | "stopped" = "new";
+	const registrations = new Map<string, Record<string, unknown>>();
+	const tenantKey = (tenant: Record<string, unknown>) =>
+		JSON.stringify([
+			tenant.principalId,
+			tenant.projectId,
+			tenant.canonicalWorkspace,
+			tenant.chatId,
+			tenant.sessionId,
+			tenant.generation,
+			tenant.leaseId,
+			tenant.epoch,
+		]);
+	const runtime = {
+		createProducerScope: () => accounting.createProducerScope(),
+		get state() {
+			return state;
+		},
+		async start() {
+			state = "running";
+		},
+		async dispose() {
+			state = "stopped";
+		},
+		async reconcile() {},
+		registerTenant(tenant: Record<string, unknown>) {
+			registrations.set(tenantKey(tenant), tenant);
+		},
+		async acquireAttachment(tenant: Record<string, unknown>) {
+			const key = tenantKey(tenant);
+			if (!registrations.has(key)) throw new Error("Managed fixture tenant is not registered.");
+			return {
+				tenant,
+				generation: tenant.generation,
+				isCurrent: () => state === "running" && registrations.has(key),
+			};
+		},
+		async generationStatus() {
+			return { status: "current" as const };
+		},
+		async request() {
+			return { ok: true };
+		},
+		subscribeFrames() {
+			return () => undefined;
+		},
+		async createLifecycleSession(tenant: Record<string, unknown>) {
+			return {
+				ok: true as const,
+				operation: "session.create" as const,
+				result: { sessionId: tenant.sessionId ?? "managed-session", endpointGeneration: tenant.generation ?? 1 },
+			};
+		},
+		async resumeLifecycleSession(tenant: Record<string, unknown>) {
+			return {
+				ok: true as const,
+				operation: "session.resume" as const,
+				result: { sessionId: tenant.sessionId ?? "managed-session", endpointGeneration: tenant.generation ?? 1 },
+			};
+		},
+		async closeLifecycleSession(tenant: Record<string, unknown>) {
+			return {
+				ok: true as const,
+				operation: "session.close" as const,
+				result: { sessionId: tenant.sessionId ?? "managed-session", endpointGeneration: tenant.generation ?? 1 },
+			};
+		},
+		async deleteLifecycleSession(tenant: Record<string, unknown>) {
+			return {
+				ok: true as const,
+				operation: "session.delete" as const,
+				result: { sessionId: tenant.sessionId ?? "managed-session", endpointGeneration: tenant.generation ?? 1 },
+			};
+		},
+	};
+	return runtime as never;
+}
 
 afterEach(async () => {
 	await Promise.all(handles.splice(0).map(handle => handle.stop()));
@@ -25,6 +107,7 @@ describe("real runtime project safety scenarios", () => {
 			const workspace = await createWorkspace(`stale-${status}`);
 			const port = await reserveTcpPort();
 			const env = runtimeEnv(workspace, port);
+			await writeV3Authority(path.join(workspace, "sessions"));
 			const databasePath = path.join(workspace, "state", "adapter-state.sqlite");
 			const store = new SqliteProjectRegistrationStore(databasePath);
 			const protectedPath = path.join(workspace, "home", ".gjc");
@@ -75,11 +158,12 @@ describe("real runtime project safety scenarios", () => {
 		await fs.mkdir(unsafeProject, { recursive: true });
 		const store = new SqliteProjectRegistrationStore(path.join(workspace, "state", "adapter-state.sqlite"));
 		const env = runtimeEnv(workspace, await reserveTcpPort(), `${safeProject}|Safe;${unsafeProject}|Unsafe`);
+		await writeV3Authority(path.join(workspace, "sessions"));
 
 		// When: startup parses and admits the configured seed batch.
 		const failure = await captureProjectLinkError(
 			buildAdapterServerOptionsFromEnv(env, {
-				turnRunner: new FakeGjcTurnRunner(),
+				managedSdkRuntime: managedRuntimeFixture(),
 				projectRegistrationStore: store,
 			}),
 		);
@@ -95,8 +179,9 @@ describe("real runtime project safety scenarios", () => {
 		const workspace = await createWorkspace("loopback");
 		const port = await reserveTcpPort();
 		const store = new SqliteProjectRegistrationStore(path.join(workspace, "state", "adapter-state.sqlite"));
+		await writeV3Authority(path.join(workspace, "sessions"));
 		const options = await buildAdapterServerOptionsFromEnv(runtimeEnv(workspace, port), {
-			turnRunner: new FakeGjcTurnRunner(),
+			managedSdkRuntime: managedRuntimeFixture(),
 			projectRegistrationStore: store,
 		});
 		const handle = await startAdapterServer(options);
@@ -200,6 +285,7 @@ async function createWorkspace(label: string): Promise<string> {
 function runtimeEnv(workspace: string, port: number, projects = ""): Record<string, string | undefined> {
 	return {
 		HOME: path.join(workspace, "home"),
+		GJC_OPENWEBUI_MODE: "existing",
 		GJC_OPENWEBUI_BIND_HOST: "127.0.0.1",
 		GJC_OPENWEBUI_BIND_PORT: String(port),
 		GJC_OPENWEBUI_ADAPTER_API_TOKEN: "adapter-token",
@@ -209,6 +295,31 @@ function runtimeEnv(workspace: string, port: number, projects = ""): Record<stri
 		GJC_OPENWEBUI_STATE_PATH: path.join(workspace, "state"),
 		GJC_OPENWEBUI_PROJECTS: projects,
 	};
+}
+
+async function writeV3Authority(root: string): Promise<void> {
+	await fs.mkdir(root, { recursive: true });
+	const canonicalPath = path.join(root, "openwebui-session-mappings.json");
+	const canonical = Buffer.from(
+		`${JSON.stringify({
+			kind: "openwebui-gjc-session-authority",
+			version: 3,
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+			mappings: [],
+			provisionalOperations: [],
+		})}\n`,
+	);
+	await fs.writeFile(canonicalPath, canonical);
+	await fs.writeFile(
+		`${canonicalPath}.v3-active.json`,
+		`${JSON.stringify({
+			kind: "openwebui-gjc-session-authority-active",
+			version: 1,
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+			activationV3Digest: createHash("sha256").update(canonical).digest("hex"),
+			source: { baseDigest: "0".repeat(64), walDigest: "0".repeat(64), walPresent: false },
+		})}\n`,
+	);
 }
 
 function projectRecord(id: string, cwd: string, allowedRoot: string): RegisteredProject {

@@ -3,7 +3,7 @@ import { operationResult } from "../src/gjc/session-operation-codec";
 import { SessionMappingStore } from "../src/gjc/session-router";
 
 describe("session operation codec", () => {
-	test("operationResult binds an empty event array while the stored record keeps its events", () => {
+	test("operationResult preserves replay events independently of later mapping events", () => {
 		const mappings = new SessionMappingStore();
 		const mapping = {
 			chatId: "chat-1",
@@ -13,18 +13,27 @@ describe("session operation codec", () => {
 			eventCursor: 2,
 			operationId: "op-1",
 			assistantText: "done",
-			events: [{ type: "tool_start", id: "tool-1" }],
+			events: [{ type: "tool_start", id: "tool-1", payload: { args: { value: "original" } } }],
 		};
 		mappings.set({ ...mapping, operationId: "bootstrap" });
 		mappings.beginOperation("chat-1", { id: "op-1", kind: "prompt", detail: "request" });
 		mappings.completeOperationWithMapping("chat-1", "op-1", "request", mapping, "turn");
 
-		expect(mappings.operation("chat-1", "op-1")?.result?.events).toEqual([]);
-		expect(mappings.get("chat-1")?.events).toEqual([{ type: "tool_start", id: "tool-1" }]);
+		const expected = structuredClone(mapping.events);
+		mapping.events[0]!.payload.args.value = "mutated input";
+		expect(mappings.operation("chat-1", "op-1")?.result?.events).toEqual(expected);
+		expect(mappings.get("chat-1")?.events).toEqual(expected);
 		expect(mappings.get("chat-1")?.assistantText).toBe("done");
+		mappings.upsert({ ...mapping, operationId: "op-2", events: [{ type: "message", id: "later" }] });
+		expect(mappings.operation("chat-1", "op-1")?.result?.events).toEqual(expected);
+		const copied = mappings.operation("chat-1", "op-1")?.result?.events?.[0]?.payload;
+		if (copied === undefined) throw new Error("expected copied replay payload");
+		(copied.args as { value: string }).value = "mutated read";
+		expect(mappings.operation("chat-1", "op-1")?.result?.events).toEqual(expected);
 	});
 
-	test("operationResult retains the immutable mapping fields and assistant text", () => {
+	test("operationResult retains mapping, assistant text, and a deep copy of replay payloads", () => {
+		const events = [{ type: "tool_start", id: "tool-1", payload: { args: { value: "original" } } }];
 		const result = operationResult("turn", {
 			chatId: "chat-1",
 			projectId: "project-1",
@@ -33,13 +42,13 @@ describe("session operation codec", () => {
 			eventCursor: 2,
 			operationId: "op-1",
 			assistantText: "done",
-			events: [{ type: "tool_start", id: "tool-1" }],
+			events,
 		});
 
 		expect(result).toMatchObject({
 			kind: "turn",
 			assistantText: "done",
-			events: [],
+			events,
 			mapping: {
 				chatId: "chat-1",
 				projectId: "project-1",
@@ -49,7 +58,13 @@ describe("session operation codec", () => {
 				operationId: "op-1",
 			},
 		});
-		expect(JSON.stringify(result)).not.toContain("tool_start");
+		expect(result.events).not.toBe(events);
+		events[0]!.payload.args.value = "mutated input";
+		expect(result.events?.[0]?.payload).toEqual({ args: { value: "original" } });
+		const payload = result.events?.[0]?.payload;
+		if (payload === undefined) throw new Error("expected replay payload");
+		(payload.args as { value: string }).value = "mutated result";
+		expect(events[0]!.payload.args.value).toBe("mutated input");
 	});
 
 	test("operationResult binds a compact gate identity without the gate payload", () => {

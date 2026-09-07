@@ -1,10 +1,16 @@
 import { describe, expect, it } from "bun:test";
-import { handleChatCompletions, LiveGatewayUnavailableError } from "../src/live/chat-completions";
+import {
+	acquireWorkspaceAdmission,
+	handleChatCompletions,
+	LiveGatewayUnavailableError,
+} from "../src/live/chat-completions";
 import { encodeChatCompletionSse } from "../src/live/chat-response-format";
 import { asyncIterableBody } from "../src/live/openai-routes";
 import type { OpenAIChatCompletionRequest } from "../src/live/openai-types";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import type { RegisteredProject } from "../src/projects/registry";
+import type { WorkspaceLease } from "../src/security/workspace-lease";
+import { staticModelReaderFactory } from "./model-selection-fixtures";
 
 const project: RegisteredProject = {
 	id: "demo",
@@ -292,5 +298,232 @@ describe("live OpenAI-compatible chat completion errors", () => {
 				},
 			},
 		});
+	});
+	it.each([false, true])(
+		"late acquired lease cancellation retains cleanup ownership with release failure=%s",
+		async failedRelease => {
+			const controller = new AbortController();
+			let acquireStarted!: () => void;
+			const acquireStartedPromise = new Promise<void>(resolve => {
+				acquireStarted = resolve;
+			});
+			let finishAcquire!: () => void;
+			const acquireGate = new Promise<void>(resolve => {
+				finishAcquire = resolve;
+			});
+			let releases = 0;
+			let lease!: WorkspaceLease;
+			lease = {
+				renew: async () => lease,
+				assertFence: async () => {},
+				release: async () => {
+					releases += 1;
+					if (failedRelease) throw new Error("late release failure");
+				},
+			} as unknown as WorkspaceLease;
+			const manager = {
+				async acquire() {
+					acquireStarted();
+					await acquireGate;
+					return lease;
+				},
+			};
+			const pending = handleChatCompletions({
+				request,
+				headers: { ...chatHeaders, "X-OpenWebUI-User-Id": "normal-1" },
+				projects: [project],
+				owner,
+				neutralWorkspace: "/tmp",
+				workspaceRegistry: {
+					open: async userId => ({
+						userId,
+						safeKey: "a".repeat(64),
+						root: "/tmp",
+						sessionRoot: "/tmp/.gjc/sessions",
+					}),
+				},
+				workspaceLeaseManager: manager,
+				runner: {
+					run() {
+						throw new Error("The runner must not start after cancellation.");
+					},
+				},
+				signal: controller.signal,
+			});
+			await acquireStartedPromise;
+			controller.abort();
+			finishAcquire();
+			await expect(pending).rejects.toMatchObject({
+				name: failedRelease ? "GjcTurnCancelledError" : "WorkspaceAdmissionCancelledError",
+			});
+			expect(releases).toBe(1);
+			let granted = false;
+			await acquireWorkspaceAdmission(manager, "a".repeat(64), 50, 8).then(
+				release => {
+					granted = true;
+					release();
+				},
+				() => undefined,
+			);
+			expect(granted).toBe(!failedRelease);
+		},
+	);
+	it("failed chat lease release cannot admit another same-workspace operation", async () => {
+		const safeKey = "b".repeat(64);
+		let releases = 0;
+		const lease = {
+			renew: async () => lease,
+			assertFence: async () => {},
+			reference: { safeKey, holderId: "chat-owner", generation: 1, operation: "turn" },
+			release: async () => {
+				releases += 1;
+				throw new Error("release storage failure");
+			},
+		} as unknown as WorkspaceLease;
+		const manager = { acquire: async () => lease };
+		const result = await handleChatCompletions({
+			request,
+			headers: { ...chatHeaders, "X-OpenWebUI-User-Id": "normal-1" },
+			projects: [project],
+			owner,
+			neutralWorkspace: "/tmp",
+			workspaceRegistry: {
+				open: async userId => ({ userId, safeKey, root: "/tmp", sessionRoot: "/tmp/.gjc/sessions" }),
+			},
+			workspaceLeaseManager: manager,
+			runner: { run: async () => ({ content: "completed" }) },
+		});
+		expect(result.ok).toBe(false);
+		expect(releases).toBe(1);
+		let granted = false;
+		await acquireWorkspaceAdmission(manager, safeKey, 50, 8).then(
+			release => {
+				granted = true;
+				release();
+			},
+			() => undefined,
+		);
+		expect(granted).toBe(false);
+	});
+	it.each(["success", "late-failure", "early-failure"] as const)(
+		"background catalog settlement %s preserves workspace ownership",
+		async outcome => {
+			const safeKey = "e".repeat(64);
+			const settlement = Promise.withResolvers<void>();
+			const released = Promise.withResolvers<void>();
+			let releases = 0;
+			let registered = false;
+			const lease = {
+				renew: async () => lease,
+				assertFence: async () => {},
+				reference: { safeKey, holderId: "background-owner", generation: 1, operation: "turn" },
+				release: async () => {
+					releases++;
+					released.resolve();
+				},
+			} as unknown as WorkspaceLease;
+			const manager = { acquire: async () => lease };
+			const reader = staticModelReaderFactory();
+			const result = await handleChatCompletions({
+				request,
+				headers: { ...chatHeaders, "X-OpenWebUI-User-Id": "normal-1", "X-OpenWebUI-Task": "title" },
+				projects: [project],
+				owner,
+				workspaceRegistry: {
+					open: async userId => ({ userId, safeKey, root: "/tmp", sessionRoot: "/tmp/.gjc/sessions" }),
+				},
+				workspaceLeaseManager: manager,
+				modelReaderFactory: async (context, signal) => {
+					expect(context?.principal.userId).toBe("normal-1");
+					expect(context?.workspace?.safeKey).toBe(safeKey);
+					context!.registerSettlement!(settlement.promise);
+					registered = true;
+					if (outcome === "early-failure") settlement.reject(new Error("early cleanup failure"));
+					return reader(context, signal);
+				},
+				runner: {
+					run: () => {
+						throw new Error("Background tasks must not invoke a turn.");
+					},
+				},
+			});
+			expect(registered).toBe(true);
+			expect(result).toMatchObject({ ok: false, status: 503 });
+			expect(releases).toBe(0);
+			await expect(acquireWorkspaceAdmission(manager, safeKey, 30, 8)).rejects.toThrow();
+			if (outcome === "success") {
+				settlement.resolve();
+				await released.promise;
+				const release = await acquireWorkspaceAdmission(manager, safeKey, 1000, 8);
+				release();
+				expect(releases).toBe(1);
+			} else {
+				if (outcome === "late-failure") settlement.reject(new Error("late cleanup failure"));
+				await expect(acquireWorkspaceAdmission(manager, safeKey, 30, 8)).rejects.toThrow();
+				expect(releases).toBe(0);
+			}
+		},
+	);
+	it.each([false, true])("chat settlement failure=%s retains lease until actual cleanup", async failed => {
+		const safeKey = "d".repeat(64);
+		const settlement = Promise.withResolvers<void>(),
+			released = Promise.withResolvers<void>();
+		let releases = 0;
+		const lease = {
+			renew: async () => lease,
+			assertFence: async () => {},
+			reference: { safeKey, holderId: "owner", generation: 1, operation: "turn" },
+			release: async () => {
+				releases += 1;
+				released.resolve();
+			},
+		} as unknown as WorkspaceLease;
+		const manager = { acquire: async () => lease };
+		const result = await handleChatCompletions({
+			request,
+			headers: { ...chatHeaders, "X-OpenWebUI-User-Id": "normal-1" },
+			projects: [project],
+			owner,
+			neutralWorkspace: "/tmp",
+			workspaceRegistry: {
+				open: async userId => ({ userId, safeKey, root: "/tmp", sessionRoot: "/tmp/.gjc/sessions" }),
+			},
+			workspaceLeaseManager: manager,
+			runner: {
+				run: async input => {
+					input.modelReaderContext!.registerSettlement!(settlement.promise);
+					return { content: "complete" };
+				},
+			},
+		});
+		expect(result.ok).toBe(false);
+		expect(releases).toBe(0);
+		let admitted = false;
+		await acquireWorkspaceAdmission(manager, safeKey, 30, 8).then(
+			release => {
+				admitted = true;
+				release();
+			},
+			() => undefined,
+		);
+		expect(admitted).toBe(false);
+		if (failed) {
+			settlement.reject(new Error("cleanup failed"));
+			await acquireWorkspaceAdmission(manager, safeKey, 30, 8).then(
+				release => {
+					admitted = true;
+					release();
+				},
+				() => undefined,
+			);
+			expect(admitted).toBe(false);
+			expect(releases).toBe(0);
+		} else {
+			settlement.resolve();
+			await released.promise;
+			const release = await acquireWorkspaceAdmission(manager, safeKey, 1000, 8);
+			release();
+			expect(releases).toBe(1);
+		}
 	});
 });

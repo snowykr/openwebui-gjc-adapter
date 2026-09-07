@@ -11,18 +11,6 @@ export const DEFAULT_TURN_TIMEOUT_MS = 180_000;
 export const SESSION_AUTHORITY_MAPPING_FILE = "openwebui-session-mappings.json";
 export type AdapterRuntimeMode = "managed" | "existing";
 
-export function resolveLegacySessionAuthoritySourcePaths(
-	env: Readonly<Record<string, string | undefined>>,
-	mode: AdapterRuntimeMode = "existing",
-): readonly string[] {
-	const candidates: string[] = [];
-	const configuredSessionRoot = env.GJC_OPENWEBUI_SESSION_ROOT?.trim();
-	if (mode === "existing" && (configuredSessionRoot === undefined || configuredSessionRoot.length === 0))
-		candidates.push(join(process.cwd(), SESSION_AUTHORITY_MAPPING_FILE));
-	if (mode === "managed") candidates.push(join("/run/gjc-session", SESSION_AUTHORITY_MAPPING_FILE));
-	return Object.freeze(candidates);
-}
-
 export function resolveTurnTimeoutMs(env: Readonly<Record<string, string | undefined>>): number {
 	return parsePositiveInteger(
 		env.GJC_OPENWEBUI_TURN_TIMEOUT_MS,
@@ -111,6 +99,9 @@ function parseProjectEntry(entry: string, entryNumber: number): AdapterProjectCo
 }
 
 export function loadAdapterConfig(env: Record<string, string | undefined> = process.env): ResolvedAdapterConfig {
+	const mode = env.GJC_OPENWEBUI_MODE;
+	if (mode !== "managed" && mode !== "existing")
+		throw new Error("GJC_OPENWEBUI_MODE must be exactly managed or existing");
 	const artifactBaseUrl = env.GJC_OPENWEBUI_ARTIFACT_BASE_URL?.trim() || undefined;
 	const adapterApiToken = env.GJC_OPENWEBUI_ADAPTER_API_TOKEN?.trim() || undefined;
 	const openWebUIApiToken = env.GJC_OPENWEBUI_API_TOKEN?.trim() || undefined;
@@ -118,17 +109,21 @@ export function loadAdapterConfig(env: Record<string, string | undefined> = proc
 	const openWebUIAdminPassword = env.GJC_OPENWEBUI_ADMIN_PASSWORD?.trim() || undefined;
 	const ownerUserId = env.GJC_OPENWEBUI_OWNER_USER_ID?.trim() || undefined;
 	const serviceHome = env.HOME ?? process.env.HOME;
-	const runtimeLocations = resolveGjcRuntimeLocations({
-		mode: "existing",
-		...(serviceHome === undefined ? {} : { serviceHome }),
-		environment: env,
-	});
+	const runtimeLocations =
+		mode === "managed"
+			? resolveGjcRuntimeLocations({ mode })
+			: resolveGjcRuntimeLocations({
+					mode,
+					...(serviceHome === undefined ? {} : { serviceHome }),
+					environment: env,
+				});
 	const statePath = requireNonEmptyString(
 		env.GJC_OPENWEBUI_STATE_PATH,
 		DEFAULT_STATE_PATH,
 		"GJC_OPENWEBUI_STATE_PATH",
 	);
 	return Object.freeze({
+		mode,
 		bindHost: requireNonEmptyString(env.GJC_OPENWEBUI_BIND_HOST, DEFAULT_BIND_HOST, "GJC_OPENWEBUI_BIND_HOST"),
 		bindPort: parsePort(env.GJC_OPENWEBUI_BIND_PORT),
 		...(adapterApiToken === undefined ? {} : { adapterApiToken }),

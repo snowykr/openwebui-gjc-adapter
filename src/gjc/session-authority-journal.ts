@@ -1,9 +1,13 @@
+import { isDeepStrictEqual } from "node:util";
+import { isManagedCatalogProvisional } from "./managed-lifecycle-evidence";
 import {
 	copy,
 	copyAcknowledgedSuccessor,
+	copyEvents,
 	copyOperation,
 	copyOperationResult,
 	copyProvisionalOperation,
+	copySessionAuthorityBinding,
 	copyTombstone,
 } from "./session-authority-copy";
 import {
@@ -16,7 +20,9 @@ import { reconcileSessionAuthority } from "./session-authority-reconciliation";
 import { isAuthorityDocumentRelationallyValid } from "./session-authority-record-validation";
 import type {
 	AcknowledgedSuccessor,
+	DistributiveOmit,
 	ProvisionalSessionOperation,
+	SessionAuthorityBinding,
 	SessionAuthorityInput,
 	SessionAuthorityRecord,
 	SessionAuthorityTargetIdentity,
@@ -149,7 +155,6 @@ export class SessionAuthorityJournal {
 				this.setProvisional(key, {
 					...provisional,
 					state: "uncertain",
-					detail: "project reassignment rolled back; external effect evidence retained",
 				});
 		}
 		const next = {
@@ -273,6 +278,7 @@ export class SessionAuthorityJournal {
 	reserve(
 		operation: Omit<ProvisionalSessionOperation, "state" | "startedAt" | "completedAt">,
 	): ProvisionalSessionOperation {
+		assertExclusiveProvisionalBinding(operation);
 		const record = this.records.get(operation.chatId);
 		const reassignment = record?.reassignment;
 		const ingressId = operation.ingressId ?? operation.id;
@@ -302,7 +308,13 @@ export class SessionAuthorityJournal {
 			throw new Error(`Session operation ${ingressId} requires reconciliation.`);
 		}
 		assertReservableIdentity(operation, journalFor(record), [...this.provisional.values()]);
-		const next = { ...operation, state: "pending" as const, startedAt: new Date().toISOString() };
+		const { managedAuthority: _managedAuthority, historicalBinding: _historicalBinding, ...fields } = operation;
+		const next = copyProvisionalOperation({
+			...fields,
+			...copySessionAuthorityBinding(operation),
+			state: "pending",
+			startedAt: new Date().toISOString(),
+		});
 		this.setProvisional(key, next);
 		return copyProvisionalOperation(next);
 	}
@@ -310,6 +322,7 @@ export class SessionAuthorityJournal {
 		operation: Omit<ProvisionalSessionOperation, "state" | "startedAt" | "completedAt">,
 		mapping: SessionAuthorityInput,
 	): SessionAuthorityRecord {
+		assertExclusiveProvisionalBinding(operation);
 		const record = this.records.get(operation.chatId),
 			reassignment = record?.reassignment,
 			ingressId = operation.ingressId ?? operation.id,
@@ -327,16 +340,27 @@ export class SessionAuthorityJournal {
 		const reserved = assertPublishableIdentity(operation, this.provisional.get(key), journalFor(record), [
 			...this.provisional.values(),
 		]);
+		if (
+			operation.historicalBinding !== undefined ||
+			record?.historicalBinding !== undefined ||
+			reserved.historicalBinding !== undefined ||
+			mapping.historicalBinding !== undefined ||
+			(reserved.acknowledgedSuccessor !== undefined &&
+				"historicalBinding" in reserved.acknowledgedSuccessor &&
+				reserved.acknowledgedSuccessor.historicalBinding !== undefined)
+		)
+			throw new Error(`Session operation ${ingressId} requires reconciliation.`);
 		const completedAt = new Date().toISOString();
 		const journalOperation: SessionOperation = {
 			id: operation.id,
-			kind: "prompt",
+			kind: reserved.lifecycle === undefined ? "prompt" : "create",
 			state: "complete",
 			ingressId: operation.ingressId,
 			detail: operation.detail,
 			startedAt: reserved.startedAt,
 			completedAt,
 			result: operationResult("turn", mapping),
+			...(reserved.lifecycle === undefined ? {} : { lifecycle: structuredClone(reserved.lifecycle) }),
 		};
 		if (reassignment?.state === "pending" && mapping.projectId === reassignment.targetProjectId) {
 			const target = createAuthorityIdentity({ ...mapping, journal: [journalOperation] });
@@ -367,8 +391,22 @@ export class SessionAuthorityJournal {
 		const key = provisionalKey(chatId, ingressId),
 			current = this.provisional.get(key);
 		if (current === undefined) throw new Error(`Unknown provisional session operation ${ingressId}.`);
-		if (current.state === "complete" && state !== "complete")
-			throw new Error("Completed session operations are immutable.");
+		if (current.state === "complete") {
+			if (state !== "complete" || (detail !== undefined && detail !== current.detail))
+				throw new Error("Completed session operations are immutable.");
+			return copyProvisionalOperation(current);
+		}
+		if (current.purpose !== undefined)
+			throw new Error("Catalog lifecycle evidence requires its original operation-scoped owner.");
+		if (
+			state === "complete" &&
+			(current.historicalBinding !== undefined ||
+				current.result?.historicalBinding !== undefined ||
+				(current.acknowledgedSuccessor !== undefined &&
+					"historicalBinding" in current.acknowledgedSuccessor &&
+					current.acknowledgedSuccessor.historicalBinding !== undefined))
+		)
+			throw new Error(`Session operation ${ingressId} requires reconciliation.`);
 		const next = {
 			...current,
 			state,
@@ -381,21 +419,47 @@ export class SessionAuthorityJournal {
 	attach(
 		chatId: string,
 		ingressId: string,
-		attachment: Pick<ProvisionalSessionOperation, "sessionId" | "sessionFile" | "attachment">,
+		attachment: SessionAuthorityBinding &
+			Pick<ProvisionalSessionOperation, "sessionId" | "sessionFile" | "activeLeaf" | "attachment">,
 	): ProvisionalSessionOperation {
 		const key = provisionalKey(chatId, ingressId),
 			current = this.provisional.get(key);
 		if (current === undefined || current.state !== "pending")
 			throw new Error(`Session operation ${ingressId} requires reconciliation.`);
-		if (
-			attachment.sessionId === undefined ||
-			attachment.attachment?.tmuxSocket === undefined ||
-			attachment.attachment.tmuxPane === undefined ||
-			attachment.attachment.tmuxPanePid === undefined ||
-			attachment.attachment.tmuxOwnershipTag === undefined
-		)
+		if (current.purpose !== undefined) throw new Error("Catalog provisionals cannot attach serving authority.");
+		if (current.historicalBinding !== undefined || attachment.historicalBinding !== undefined)
+			throw new Error("Historical session authority requires an explicit proven binding transaction.");
+		const legacyValid =
+			attachment.attachment?.tmuxSocket !== undefined &&
+			attachment.attachment.tmuxPane !== undefined &&
+			attachment.attachment.tmuxPanePid !== undefined &&
+			attachment.attachment.tmuxOwnershipTag !== undefined;
+		const managed = attachment.managedAuthority;
+		const managedValid =
+			managed !== undefined &&
+			managed.chatId === current.chatId &&
+			managed.projectId === current.projectId &&
+			managed.sessionId === attachment.sessionId &&
+			Number.isSafeInteger(managed.generation) &&
+			managed.generation > 0 &&
+			[managed.principalId, managed.canonicalWorkspace, managed.leaseId, managed.epoch, managed.requestKey].every(
+				value => typeof value === "string" && value.length > 0,
+			);
+		if (attachment.sessionId === undefined || legacyValid === managedValid)
 			throw new Error("Provisional session authority requires an exact endpoint and owned-pane proof.");
-		const next = { ...current, ...attachment };
+		if (current.managedAuthority !== undefined && !isDeepStrictEqual(current.managedAuthority, managed))
+			throw new Error("Provisional managed authority cannot be replaced by ordinary attachment.");
+		const { managedAuthority: _currentManaged, historicalBinding: _currentHistorical, ...currentFields } = current;
+		const {
+			managedAuthority: _attachedManaged,
+			historicalBinding: _attachedHistorical,
+			...attachmentFields
+		} = attachment;
+		const next = copyProvisionalOperation({
+			...currentFields,
+			...attachmentFields,
+			...copySessionAuthorityBinding(attachment),
+		});
 		this.setProvisional(key, next);
 		return copyProvisionalOperation(next);
 	}
@@ -417,7 +481,7 @@ export class SessionAuthorityJournal {
 		}
 		if (record.reassignment?.state === "pending")
 			throw new Error(`Session authority for chat ${chatId} has a pending project reassignment.`);
-		assertBeginableIdentity(operation, [...this.provisional.values()]);
+		assertBeginableIdentity(chatId, operation, [...this.provisional.values()]);
 		const next = {
 			...record,
 			journal: [...record.journal, { ...operation, state: "pending" as const, startedAt: new Date().toISOString() }],
@@ -453,6 +517,52 @@ export class SessionAuthorityJournal {
 		this.setRecord(chatId, { ...record, journal });
 		return copyOperation(journal[index]!);
 	}
+	discardPendingOperation(chatId: string, operation: Pick<SessionOperation, "id" | "ingressId" | "detail">): void {
+		const record = this.require(chatId);
+		const index = record.journal.findIndex(
+			candidate =>
+				candidate.id === operation.id ||
+				(operation.ingressId !== undefined && candidate.ingressId === operation.ingressId),
+		);
+		const current = record.journal[index];
+		if (
+			current === undefined ||
+			operation.detail === undefined ||
+			current.id !== operation.id ||
+			current.ingressId !== operation.ingressId ||
+			current.detail !== operation.detail ||
+			current.state !== "pending" ||
+			current.acknowledgedSuccessor !== undefined ||
+			(current.lifecycle !== undefined && current.lifecycle.state !== "intent_prepared")
+		)
+			throw new Error(`Session operation ${operation.id} requires reconciliation.`);
+		const journal = record.journal.filter((_, candidateIndex) => candidateIndex !== index);
+		this.setRecord(chatId, { ...record, journal });
+	}
+	discardPendingProvisionalOperation(
+		chatId: string,
+		operation: Pick<ProvisionalSessionOperation, "id" | "ingressId" | "detail">,
+	): void {
+		const current = [...this.provisional.values()].find(
+			candidate =>
+				candidate.chatId === chatId && candidate.id === operation.id && candidate.ingressId === operation.ingressId,
+		);
+		if (
+			current === undefined ||
+			operation.detail === undefined ||
+			current.detail !== operation.detail ||
+			current.state !== "pending" ||
+			current.acknowledgedSuccessor !== undefined ||
+			(current.lifecycle !== undefined && current.lifecycle.state !== "intent_prepared")
+		)
+			throw new Error(`Session operation ${operation.id} requires reconciliation.`);
+		const key = provisionalKey(current.chatId, current.ingressId ?? current.id);
+		this.provisional.delete(key);
+		this.#dirtyProvisional.add(key);
+		// WAL deltas are additive. Force a compacted rewrite so the deletion is
+		// durable instead of being resurrected when an older WAL is replayed.
+		this.#forceCompaction = true;
+	}
 	transition(
 		chatId: string,
 		operationId: string,
@@ -466,10 +576,19 @@ export class SessionAuthorityJournal {
 			),
 			current = record.journal[index];
 		if (current === undefined) throw new Error(`Unknown session operation ${operationId}.`);
+		if (record.historicalBinding !== undefined && current.state !== "complete" && state === "complete")
+			throw new Error(`Session operation ${operationId} requires reconciliation.`);
 		if (requiresUncertainAcknowledgedSuccessorCompletionReconciliation(current, state, detail, result))
 			throw new Error(`Session operation ${operationId} requires reconciliation.`);
-		if (current.state === "complete" && state !== "complete")
-			throw new Error("Completed session operations are immutable.");
+		if (current.state === "complete") {
+			if (
+				state !== "complete" ||
+				(detail !== undefined && detail !== current.detail) ||
+				(result !== undefined && !isDeepStrictEqual(result, current.result))
+			)
+				throw new Error("Completed session operations are immutable.");
+			return copy(record);
+		}
 		if (state === "complete" && result === undefined && current.result === undefined)
 			throw new Error("Completed session operations require an immutable result binding.");
 		if (state !== "complete" && result !== undefined)
@@ -487,13 +606,14 @@ export class SessionAuthorityJournal {
 		this.setRecord(chatId, next);
 		return copy(next);
 	}
-	reconcile(copyResults = true): readonly SessionAuthorityRecord[] {
+	reconcile(copyResults = true, observedAt?: number): readonly SessionAuthorityRecord[] {
 		return reconcileSessionAuthority(
 			this.records,
 			this.provisional,
 			this.#dirtyRecords,
 			this.#dirtyProvisional,
 			copyResults,
+			observedAt,
 		);
 	}
 	replace(records: Iterable<SessionAuthorityRecord>, provisional: Iterable<ProvisionalSessionOperation> = []): void {
@@ -588,13 +708,23 @@ export class SessionAuthorityJournal {
 		}
 	}
 	private setProvisional(key: string, operation: ProvisionalSessionOperation): void {
+		if (!isManagedCatalogProvisional(operation)) throw new Error("Invalid canonical catalog provisional.");
 		const prior = this.provisional.get(key);
+		if (prior !== undefined && prior.purpose !== operation.purpose)
+			throw new Error("Canonical provisional purpose is immutable.");
 		this.provisional.set(key, operation);
 		if (prior !== operation && !(prior !== undefined && JSON.stringify(prior) === JSON.stringify(operation))) {
 			this.#dirtyProvisional.add(key);
 		}
 	}
 }
+function assertExclusiveProvisionalBinding(
+	operation: Omit<ProvisionalSessionOperation, "state" | "startedAt" | "completedAt">,
+): asserts operation is DistributiveOmit<ProvisionalSessionOperation, "state" | "startedAt" | "completedAt"> {
+	if (operation.managedAuthority !== undefined && operation.historicalBinding !== undefined)
+		throw new Error("Session authority bindings are mutually exclusive.");
+}
+
 function journalFor(record: SessionAuthorityRecord | undefined): readonly SessionOperation[] {
 	if (record === undefined) return [];
 	const journal = [...record.journal];
@@ -662,16 +792,23 @@ function assertTargetIdentity(target: SessionAuthorityTargetIdentity): void {
 }
 
 function toTombstone(record: SessionAuthorityRecord, retiredAt: string): SessionAuthorityTombstone {
-	const { reassignment: _reassignment, events: _events, ...source } = record;
+	const {
+		reassignment: _reassignment,
+		managedAuthority: _managedAuthority,
+		historicalBinding: _historicalBinding,
+		...source
+	} = record;
 	return {
 		...source,
+		...copySessionAuthorityBinding(record),
 		header: { ...source.header },
+		...(source.events === undefined ? {} : { events: copyEvents(source.events) }),
 		...(source.modelSelection === undefined ? {} : { modelSelection: { ...source.modelSelection } }),
 		observations: source.observations === undefined ? undefined : structuredClone(source.observations),
 		...(source.attachment === undefined
 			? {}
 			: { attachment: { ...source.attachment, descriptorStat: { ...source.attachment.descriptorStat } } }),
-		journal: source.journal.map(copyOperation),
+		journal: source.journal.map(operation => copyOperation(operation)),
 		...(record.reassignment?.priorTombstone === undefined
 			? {}
 			: { prior: copyTombstone(record.reassignment.priorTombstone) }),

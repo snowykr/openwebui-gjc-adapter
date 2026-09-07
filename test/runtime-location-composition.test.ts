@@ -1,4 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,9 +15,11 @@ import {
 	renderResolvedExistingSystemdUnit,
 	renderResolvedSystemdComposeUnit,
 } from "../src/configure/systemd";
+import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import { buildResolvedInstalledAdapterServerOptions } from "../src/installed-adapter-server-options";
+import { FakeManagedSdkRuntime } from "./cli-fixtures";
 
-const { lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync } = fs;
+const { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync } = fs;
 const { readdirSync, rmSync, symlinkSync, writeFileSync } = fs;
 
 function managedConfig(): InstalledConfig {
@@ -55,7 +58,139 @@ function recorded<T>(calls: string[], name: string, result: T): T {
 	return result;
 }
 
+function resolvedBuilderConfig(root: string) {
+	const runtimeLocations = resolveGjcRuntimeLocations({ mode: "existing", serviceHome: root });
+	return {
+		mode: "existing" as const,
+		bindHost: "127.0.0.1",
+		bindPort: 0,
+		openWebUIBaseUrl: "http://localhost:8080",
+		statePath: join(root, "state"),
+		gjcCommand: "gjc",
+		gjcConfigDirName: runtimeLocations.childEnvironment.GJC_CONFIG_DIR,
+		gjcCodingAgentDir: runtimeLocations.agentDir,
+		runtimeLocations,
+		turnTimeoutMs: 60_000,
+		sessionRoot: join(root, "sessions"),
+		allowedProjectRoots: [root],
+		projects: [],
+	};
+}
+
+function writeV3Activation(canonicalPath: string, digestOverride?: string): void {
+	const authority = Buffer.from(
+		`${JSON.stringify({
+			kind: "openwebui-gjc-session-authority",
+			version: 3,
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+			mappings: [],
+			provisionalOperations: [],
+		})}\n`,
+	);
+	writeFileSync(canonicalPath, authority);
+	const activationV3Digest = digestOverride ?? createHash("sha256").update(authority).digest("hex");
+	writeFileSync(
+		`${canonicalPath}.v3-active.json`,
+		`${JSON.stringify({
+			kind: "openwebui-gjc-session-authority-active",
+			version: 1,
+			authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+			activationV3Digest,
+			source: {
+				baseDigest: "0".repeat(64),
+				walDigest: "0".repeat(64),
+				walPresent: false,
+			},
+		})}\n`,
+	);
+}
+
 describe("runtime location composition", () => {
+	test("selects direct V3 mappings and the active managed runtime", async () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "gjc-v3-runtime-selection-")));
+		const calls: string[] = [];
+		const accounting = new FakeManagedSdkRuntime();
+		const runtime = {
+			createProducerScope: () => accounting.createProducerScope(),
+			state: "new",
+			start: async () => void calls.push("runtime-start"),
+			dispose: async () => void calls.push("runtime-dispose"),
+			reconcile: async () => undefined,
+			registerTenant: () => undefined,
+			acquireAttachment: async () => undefined,
+			generationStatus: async () => ({ status: "current" }),
+		};
+		try {
+			const config = resolvedBuilderConfig(root);
+			mkdirSync(config.sessionRoot);
+			writeV3Activation(join(config.sessionRoot, "openwebui-session-mappings.json"));
+			const options = await buildResolvedAdapterServerOptions(config, { managedSdkRuntime: runtime as never });
+
+			const selectedMappings = options.routes?.mappings;
+			expect(selectedMappings).not.toBeUndefined();
+			expect(selectedMappings!.constructor.name).toBe("V3FileBackedSessionMappingStore");
+			expect(options.routes?.runner).not.toBeUndefined();
+			expect(options.managedSdkRuntime?.runtime).toBe(runtime as never);
+			expect(calls).toEqual(["runtime-start"]);
+			await options.shutdownCleanup?.();
+			expect(calls).toEqual(["runtime-start", "runtime-dispose"]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects absent, V2, malformed, unmarked, malformed-marker, and obsolete-epoch authorities before effects", async () => {
+		for (const kind of [
+			"absent",
+			"v2",
+			"malformed",
+			"unmarked",
+			"malformed-marker",
+			"obsolete-epoch",
+			"obsolete-marker",
+		] as const) {
+			const root = realpathSync(mkdtempSync(join(tmpdir(), `gjc-v3-runtime-blocked-${kind}-`)));
+			const calls: string[] = [];
+			const runtime = {
+				state: "new",
+				start: async () => void calls.push("runtime-start"),
+				dispose: async () => void calls.push("runtime-dispose"),
+				reconcile: async () => undefined,
+				registerTenant: () => undefined,
+				acquireAttachment: async () => undefined,
+				generationStatus: async () => ({ status: "current" }),
+			};
+			try {
+				const config = resolvedBuilderConfig(root);
+				mkdirSync(config.sessionRoot);
+				const canonicalPath = join(config.sessionRoot, "openwebui-session-mappings.json");
+				if (kind === "absent") {
+					// No canonical authority or marker is present.
+				} else if (kind === "v2")
+					writeFileSync(canonicalPath, '{"kind":"openwebui-gjc-session-authority","version":2,"mappings":[]}\n');
+				else if (kind === "malformed") writeFileSync(canonicalPath, "{malformed\n");
+				else {
+					writeV3Activation(canonicalPath);
+					if (kind === "unmarked") rmSync(`${canonicalPath}.v3-active.json`);
+					if (kind === "malformed-marker") writeFileSync(`${canonicalPath}.v3-active.json`, "{\n");
+					if (kind === "obsolete-epoch" || kind === "obsolete-marker") {
+						const target = kind === "obsolete-epoch" ? canonicalPath : `${canonicalPath}.v3-active.json`;
+						const document = JSON.parse(readFileSync(target, "utf8"));
+						document.authorityEpoch = "managed/1";
+						writeFileSync(target, JSON.stringify(document));
+					}
+				}
+				await expect(
+					buildResolvedAdapterServerOptions(config, { managedSdkRuntime: runtime as never }),
+				).rejects.toThrow("Canonical session authority activation is blocked.");
+				expect(calls).toEqual([]);
+				expect(existsSync(config.statePath)).toBeFalse();
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		}
+	});
+
 	test("required builder and renderer seams reject omitted resolved locations", async () => {
 		const message = "resolved runtime locations are required";
 

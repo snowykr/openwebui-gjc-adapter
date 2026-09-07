@@ -15,7 +15,8 @@ import { InMemoryOpenWebUIProjectionRepository } from "../src/openwebui/client";
 import { buildOpenWebUIStatusEvent } from "../src/openwebui/events";
 import type { RegisteredProject } from "../src/projects/registry";
 import { WorkspaceLeaseManager } from "../src/security/workspace-lease";
-import { attachmentProof, lifecycleFixture } from "./gjc-lifecycle-fixtures";
+import { createAdapterRequestHandler } from "../src/server";
+import { lifecycleFixture, managedPreparedAuthority } from "./gjc-lifecycle-fixtures";
 import { staticModelReaderFactory } from "./model-selection-fixtures";
 
 const project: RegisteredProject = {
@@ -226,6 +227,55 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 			await rm(root, { recursive: true, force: true });
 		}
 	});
+	it("maps cancellation during file preparation to HTTP 499 instead of attachment failure", async () => {
+		const controller = new AbortController();
+		let resolverStarted!: () => void;
+		const started = new Promise<void>(resolve => {
+			resolverStarted = resolve;
+		});
+		let releaseResolver!: () => void;
+		const resolverGate = new Promise<void>(resolve => {
+			releaseResolver = resolve;
+		});
+		const handler = createAdapterRequestHandler({
+			routes: {
+				projects: [projectWithFolder],
+				owner,
+				projectContextRepository: await demoRepository(),
+				runner: {
+					run() {
+						throw new Error("The runner must not start after cancellation.");
+					},
+				},
+				fileContextResolver: async () => {
+					resolverStarted();
+					await resolverGate;
+					throw new Error("attachment preparation failed after cancellation");
+				},
+			},
+		});
+		const response = handler(
+			new Request("http://adapter.test/v1/chat/completions", {
+				method: "POST",
+				headers: completionHeaders("assistant-http-file-cancel", "owner-1"),
+				signal: controller.signal,
+				body: JSON.stringify({
+					model: "gjc",
+					messages: [
+						{
+							role: "user",
+							content:
+								'<attached_files>\n<file type="file" url="file-1" name="notes.txt"/>\n</attached_files>\nRead it.',
+						},
+					],
+				}),
+			}),
+		);
+		await started;
+		controller.abort();
+		releaseResolver();
+		expect((await response).status).toBe(499);
+	});
 	it("rejects a concurrent normal turn before invoking the runner and releases the first turn", async () => {
 		const root = await mkdtemp(join(tmpdir(), "gjc-workspace-lease-concurrency-"));
 		const workspace = join(root, "workspace");
@@ -245,6 +295,7 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 			started = resolve;
 		});
 		let releaseFirst!: () => void;
+		const secondAbort = new AbortController();
 		try {
 			const runner = {
 				run() {
@@ -275,17 +326,137 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 				owner,
 				workspaceRegistry,
 				workspaceLeaseManager,
+				signal: secondAbort.signal,
+				workspaceAdmissionQueueLimit: 2,
+				runner,
+			});
+			await Promise.resolve();
+			expect(runnerCalls).toBe(1);
+			secondAbort.abort();
+			const secondCancelled = expect(second).rejects.toMatchObject({
+				name: "WorkspaceAdmissionCancelledError",
+			});
+			const third = handleChatCompletions({
+				request: { model: "gjc", messages: [{ role: "user", content: "third" }] },
+				headers: { ...chatHeaders, "X-OpenWebUI-User-Id": "normal-1", "X-OpenWebUI-Message-Id": "assistant-3" },
+				projects: [project],
+				owner,
+				workspaceRegistry,
+				workspaceLeaseManager,
+				workspaceAdmissionQueueLimit: 2,
 				runner,
 			});
 			await Promise.resolve();
 			expect(runnerCalls).toBe(1);
 			releaseFirst();
 			expect((await first).ok).toBe(true);
-			expect((await second).ok).toBe(true);
+			await secondCancelled;
+			expect((await third).ok).toBe(true);
 			expect(runnerCalls).toBe(2);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
+	});
+
+	it("maps an aborted queued admission to the existing HTTP 499 response", async () => {
+		const root = await mkdtemp(join(tmpdir(), "gjc-workspace-admission-http-cancel-"));
+		const workspace = join(root, "workspace");
+		const safeKey = "c".repeat(64);
+		const workspaceRegistry = {
+			open: async (userId: string) => ({
+				userId,
+				safeKey,
+				root: workspace,
+				sessionRoot: join(workspace, ".gjc", "sessions"),
+			}),
+		};
+		const workspaceLeaseManager = new WorkspaceLeaseManager({ stateRoot: root });
+		let runnerCalls = 0;
+		let started!: () => void;
+		const startedPromise = new Promise<void>(resolve => {
+			started = resolve;
+		});
+		let releaseFirst!: () => void;
+		try {
+			const runner = {
+				run() {
+					runnerCalls += 1;
+					if (runnerCalls === 1)
+						return new Promise<LiveGatewayRunnerResult>(resolve => {
+							releaseFirst = () => resolve({ content: "first", model: "gjc/anthropic/claude-sonnet-4:low" });
+							started();
+						});
+					return { content: "unexpected", model: "gjc/anthropic/claude-sonnet-4:low" };
+				},
+			};
+			const handler = createAdapterRequestHandler({
+				routes: { projects: [project], owner, runner, workspaceRegistry, workspaceLeaseManager },
+			});
+			const first = handler(
+				new Request("http://adapter.test/v1/chat/completions", {
+					method: "POST",
+					headers: completionHeaders("assistant-http-1", "normal-1"),
+					body: JSON.stringify({ model: "gjc", messages: [{ role: "user", content: "first" }] }),
+				}),
+			);
+			await startedPromise;
+			const controller = new AbortController();
+			const second = handler(
+				new Request("http://adapter.test/v1/chat/completions", {
+					method: "POST",
+					headers: completionHeaders("assistant-http-2", "normal-1"),
+					signal: controller.signal,
+					body: JSON.stringify({ model: "gjc", messages: [{ role: "user", content: "second" }] }),
+				}),
+			);
+			await Promise.resolve();
+			expect(runnerCalls).toBe(1);
+			controller.abort();
+			expect((await second).status).toBe(499);
+			releaseFirst();
+			expect((await first).status).toBe(200);
+			expect(runnerCalls).toBe(1);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("maps an abort after final assistant delivery to HTTP 499 instead of 200", async () => {
+		let releaseDelivery!: () => void;
+		let deliveryStarted!: () => void;
+		const started = new Promise<void>(resolve => {
+			deliveryStarted = resolve;
+		});
+		const delivery = new Promise<void>(resolve => {
+			releaseDelivery = resolve;
+		});
+		const controller = new AbortController();
+		const handler = createAdapterRequestHandler({
+			routes: {
+				projects: [projectWithFolder],
+				owner,
+				runner: {
+					run: () => ({ content: "done", model: "gjc/anthropic/claude-sonnet-4:low" }),
+				},
+				projectContextRepository: await demoRepository(),
+				messageSink: async () => {
+					deliveryStarted();
+					await delivery;
+				},
+			},
+		});
+		const response = handler(
+			new Request("http://adapter.test/v1/chat/completions", {
+				method: "POST",
+				headers: completionHeaders("assistant-http-effect-cancel", "owner-1"),
+				signal: controller.signal,
+				body: JSON.stringify({ model: "gjc", messages: [{ role: "user", content: "complete" }] }),
+			}),
+		);
+		await started;
+		controller.abort();
+		releaseDelivery();
+		expect((await response).status).toBe(499);
 	});
 
 	it("keeps the durable workspace lease outside the workspace and releases it on stream abandon and completion", async () => {
@@ -369,9 +540,29 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 			};
 		});
 		const turnRunner: GjcTurnRunner = {
-			async startNewSession(input, publish, beforePrompt) {
+			async startManagedSession(input, publish, beforePrompt) {
+				const prepared = input.preparedManagedAuthority;
+				if (
+					prepared === undefined ||
+					prepared.principalId !== input.principalId ||
+					prepared.projectId !== input.projectId ||
+					prepared.canonicalWorkspace !== input.cwd ||
+					prepared.chatId !== input.chatId ||
+					prepared.requestKey !== input.userMessageId ||
+					![prepared.principalId, prepared.leaseId, prepared.epoch, prepared.requestKey].every(
+						value => typeof value === "string" && value.trim().length > 0,
+					)
+				)
+					throw new Error("Lease lifecycle fixture requires exact prepared managed authority.");
+				await input.onLifecycleInvoking?.();
 				runnerCalls += 1;
 				const first = runnerCalls === 1;
+				const managedAuthority = managedPreparedAuthority({
+					...prepared,
+					sessionId: `session-${runnerCalls}`,
+					generation: 1,
+				});
+				await input.onLifecycleAcknowledged?.(managedAuthority);
 				const address = {
 					cwd: input.cwd,
 					sessionRoot: input.sessionRoot,
@@ -386,30 +577,27 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 					eventCursor: 1,
 					...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
 				};
-				const attachment = {
-					...attachmentProof(address),
-					tmuxSocket: "/tmp/tmux.sock",
-					tmuxPane: "%1",
-					tmuxPanePid: 1,
-					tmuxOwnershipTag: "owner",
-					ownedAt: "2026-07-19T00:00:00.000Z",
+				const managedProof = {
+					kind: "managed-generation" as const,
+					sessionId: managedAuthority.sessionId,
+					generation: managedAuthority.generation,
+					leaseId: managedAuthority.leaseId,
+					epoch: managedAuthority.epoch,
 				};
-				const lifecycle = lifecycleFixture(address);
-				const attachedAddress = { ...address, attachment };
-				await beforePrompt(attachedAddress, attachment, lifecycle);
+				const lifecycle = lifecycleFixture(address, managedAuthority);
+				await beforePrompt(address, managedProof, lifecycle);
 				await input.observer?.({
 					type: "message_update",
 					payload: { assistantMessageEvent: { type: "text_delta", delta: "working" } },
 				});
 				if (first) await firstTurn;
-				return publish({ ...address, attachment }, lifecycle);
+				return publish({ ...address, managedAuthority, managedProof }, lifecycle);
 			},
 			async continueSession(_input) {
 				throw new Error("Unexpected mapped-session continuation in lease lifecycle test.");
 			},
-			async switchSession(_input) {},
-			async getState(_input) {
-				return { rawFrameCursor: 1, eventCursor: 1 };
+			async getState() {
+				throw new Error("Unexpected mapped-session state read in lease lifecycle test.");
 			},
 		};
 		const runner = createGjcRoutingLiveGatewayRunner({
@@ -428,6 +616,7 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 			"X-OpenWebUI-Chat-Id": "chat-routed-1",
 			"X-OpenWebUI-Message-Id": "assistant-routed-1",
 			"X-OpenWebUI-User-Message-Id": "user-routed-1",
+			"X-OpenWebUI-User-Message-Parent-Id": "",
 		};
 		try {
 			const firstResult = await handleChatCompletions({
@@ -708,6 +897,17 @@ describe("live OpenAI-compatible OpenWebUI file context", () => {
 		}
 	});
 });
+
+function completionHeaders(messageId: string, userId: string): Record<string, string> {
+	return {
+		"content-type": "application/json",
+		"X-OpenWebUI-Chat-Id": "chat-1",
+		"X-OpenWebUI-Message-Id": messageId,
+		"X-OpenWebUI-User-Message-Id": `user-${messageId}`,
+		"X-OpenWebUI-User-Message-Parent-Id": "",
+		"X-OpenWebUI-User-Id": userId,
+	};
+}
 
 async function demoRepository(): Promise<InMemoryOpenWebUIProjectionRepository> {
 	const repository = new InMemoryOpenWebUIProjectionRepository();

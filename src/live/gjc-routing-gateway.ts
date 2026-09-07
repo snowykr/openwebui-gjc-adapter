@@ -1,12 +1,13 @@
+import { resolve } from "node:path";
 import type { NormalizedModelSelection } from "../contracts";
+import { scopedSessionMappingStore } from "../gjc/scoped-session-mapping-store";
 import {
 	type RouteGjcTurnResult,
 	routeGjcTurn,
 	type SessionMapping,
 	type SessionMappingStore,
 } from "../gjc/session-router";
-import { scopedSessionMappingStore } from "../gjc/session-turn-router";
-import type { GjcLifecycleTestBarrierHook } from "../gjc/turn-runner";
+import type { ManagedPreparedTurnAuthority, ManagedTurnAuthority } from "../gjc/turn-runner";
 import { projectPendingWorkflowGateMessage } from "../projection/workflow-gates";
 import type { OutboxStore } from "../state/outbox";
 import type { LiveGatewayRunner, LiveGatewayRunnerInput, LiveGatewayRunnerResult } from "./chat-completions";
@@ -40,12 +41,12 @@ export interface CreateGjcRoutingLiveGatewayRunnerInput {
 	readonly mappings: SessionMappingStore;
 	readonly outbox?: OutboxStore;
 	readonly ownerUserId?: string;
+	readonly turnTimeoutMs?: number;
 	readonly requestedModelId?: (turn: LiveGatewayRunnerInput) => string;
 	readonly createNeutralModelReader?: (
 		turn: LiveGatewayRunnerInput,
 	) => NeutralModelReader | Promise<NeutralModelReader>;
 	readonly modelReaderFactory?: ModelReaderFactory;
-	/** Test-only synchronization point; it never receives endpoint credentials. */ readonly testBarrierHook?: GjcLifecycleTestBarrierHook;
 }
 
 export type NeutralModelReader = ModelReader;
@@ -61,6 +62,7 @@ export function createGjcRoutingLiveGatewayRunner(
 	input: CreateGjcRoutingLiveGatewayRunnerInput,
 ): GjcRoutingLiveGatewayRunner {
 	return {
+		supportsManagedSessions: input.turnRunner.startManagedSession !== undefined,
 		async stop(): Promise<void> {
 			await input.turnRunner.stop?.();
 		},
@@ -72,6 +74,20 @@ export function createGjcRoutingLiveGatewayRunner(
 					? input.mappings
 					: scopedSessionMappingStore(input.mappings, principalId, turn.chatId);
 			let existing = scopedMappings.get(turn.chatId);
+			// Admission occurs before routing can resolve an existing chat mapping. A
+			// new-turn authority therefore accompanies continuations too; it is never
+			// valid for an existing mapping and must not shadow its persisted proof.
+			if (existing?.projectId === turn.project.id && turn.preparedManagedAuthority !== undefined)
+				turn = { ...turn, preparedManagedAuthority: undefined };
+			if (turn.preparedManagedAuthority !== undefined) {
+				if (existing?.projectId === turn.project.id)
+					throw new Error("Prepared managed authority is valid only for a new managed turn.");
+				assertPreparedManagedAuthorityForGateway(turn, turn.preparedManagedAuthority);
+			}
+			// A persisted managed authority is all-or-nothing. Legacy mappings are deliberately
+			// separate; once a mapping declares managed routing, missing tenant facts fail closed.
+			const managedAuthority =
+				existing?.projectId !== turn.project.id ? undefined : managedAuthorityForGateway(turn, existing);
 			const priorProvisional = scopedMappings.provisionalOperation(turn.chatId, turn.userMessageId);
 			if (
 				priorProvisional !== undefined &&
@@ -113,6 +129,23 @@ export function createGjcRoutingLiveGatewayRunner(
 			};
 			const replayedOperation = await replayRoutingOperation(input, turn);
 			if (replayedOperation !== null) return replayedOperation;
+			if (
+				existing !== undefined &&
+				scopedMappings
+					.operations(turn.chatId)
+					.some(
+						operation =>
+							operation.kind === "close" &&
+							(operation.state === "pending" ||
+								operation.state === "uncertain" ||
+								(operation.state === "complete" &&
+									operation.result?.kind === "close" &&
+									operation.result.correlation?.closeStatus === "closed" &&
+									operation.result.mapping.sessionId === existing.sessionId &&
+									operation.result.managedAuthority?.generation === existing.managedAuthority?.generation)),
+					)
+			)
+				throw new Error("Managed session retirement requires reconciliation before new routing.");
 
 			const requestedModelId = turn.requestedModelId ?? input.requestedModelId?.(turn);
 			if (
@@ -147,8 +180,6 @@ export function createGjcRoutingLiveGatewayRunner(
 					projectId: boundMapping.projectId,
 					chatId: boundMapping.chatId,
 					sessionId: boundMapping.sessionId,
-					sessionFile: boundMapping.sessionFile,
-					recoveryAttachment: boundMapping.attachment,
 				};
 				if (turn.onLiveEvents === undefined) {
 					gateReplyResult = await input.turnRunner.withLifecyclePublication(gateAddress, lifecycle =>
@@ -236,8 +267,14 @@ export function createGjcRoutingLiveGatewayRunner(
 				}
 			}
 			if (gateReplyResult !== null) return withCanonicalModel(gateReplyResult, boundSelection);
+			const modelReaderTurn =
+				requestedModelId === undefined || managedAuthority === undefined
+					? turn
+					: { ...turn, modelReaderContext: managedModelReaderContextForGateway(turn, managedAuthority) };
 			const modelSelection =
-				requestedModelId === undefined ? undefined : await resolveNormalSelection(input, turn, requestedModelId);
+				requestedModelId === undefined
+					? undefined
+					: await resolveNormalSelection(input, modelReaderTurn, requestedModelId);
 
 			if (turn.onLiveEvents === undefined) beginReassignment();
 			if (turn.onLiveEvents === undefined) {
@@ -258,6 +295,11 @@ export function createGjcRoutingLiveGatewayRunner(
 						},
 						afterPublish: routed =>
 							ensureProjectionRows(input.outbox, routed.mapping, projectionOwnerUserId, principalId),
+						...(turn.signal === undefined ? {} : { signal: turn.signal }),
+						...(turn.preparedManagedAuthority === undefined
+							? {}
+							: { preparedManagedAuthority: turn.preparedManagedAuthority }),
+						...(managedAuthority === undefined ? {} : { managedAuthority }),
 						...(modelSelection === undefined ? {} : { modelSelection }),
 					});
 					reassignmentStarted = false;
@@ -310,6 +352,11 @@ export function createGjcRoutingLiveGatewayRunner(
 				},
 				afterPublish: routed =>
 					ensureProjectionRows(input.outbox, routed.mapping, projectionOwnerUserId, principalId),
+				...(turn.signal === undefined ? {} : { signal: turn.signal }),
+				...(turn.preparedManagedAuthority === undefined
+					? {}
+					: { preparedManagedAuthority: turn.preparedManagedAuthority }),
+				...(managedAuthority === undefined ? {} : { managedAuthority }),
 				onObservedTurn: async event => {
 					if (event.type !== "agent_failed") markActivityStarted();
 					if (isNativeLifecycleEvent(event.type)) observedNativeLifecycle = true;
@@ -388,6 +435,74 @@ export function createGjcRoutingLiveGatewayRunner(
 			return withCanonicalModel({ chunks: queue, abandon: () => backgroundRoute }, modelSelection);
 		},
 	};
+}
+
+/** Parses only durable mapping authority; it never manufactures a principal, generation, lease, or epoch. */
+export function managedAuthorityForGateway(
+	turn: LiveGatewayRunnerInput,
+	mapping: SessionMapping,
+): ManagedTurnAuthority | undefined {
+	const raw = Reflect.get(mapping as object, "managedAuthority");
+	if (raw === undefined) return undefined;
+	if (typeof raw !== "object" || raw === null) throw new Error("Managed session mapping authority is malformed.");
+	const authority = raw as Partial<ManagedTurnAuthority>;
+	if (
+		authority.principalId !== principalIdForTurn(turn) ||
+		authority.projectId !== turn.project.id ||
+		authority.canonicalWorkspace !== resolve(turn.project.cwd) ||
+		authority.chatId !== turn.chatId ||
+		authority.sessionId !== mapping.sessionId ||
+		typeof authority.requestKey !== "string" ||
+		authority.requestKey.length === 0 ||
+		typeof authority.generation !== "number" ||
+		!Number.isSafeInteger(authority.generation) ||
+		authority.generation <= 0 ||
+		typeof authority.leaseId !== "string" ||
+		authority.leaseId.length === 0 ||
+		typeof authority.epoch !== "string" ||
+		authority.epoch.length === 0
+	)
+		throw new Error("Managed session mapping lacks exact principal, generation, lease, epoch, or request authority.");
+	return authority as ManagedTurnAuthority;
+}
+
+/** Adds only persisted, identity-checked tenant authority to continuation catalog reads. */
+function managedModelReaderContextForGateway(
+	turn: LiveGatewayRunnerInput,
+	authority: ManagedTurnAuthority,
+): NonNullable<LiveGatewayRunnerInput["modelReaderContext"]> {
+	const context = turn.modelReaderContext;
+	if (
+		context === undefined ||
+		context.principal.userId !== authority.principalId ||
+		context.principal.role !== "user" ||
+		context.workspace === undefined ||
+		resolve(context.workspace.root) !== authority.canonicalWorkspace ||
+		context.lease === undefined
+	)
+		throw new Error("Managed continuation model reader lacks exact principal, workspace, and lease authority.");
+	return { ...context, managedAuthority: authority };
+}
+
+/** Validates admission-derived authority without inventing a session generation. */
+export function assertPreparedManagedAuthorityForGateway(
+	turn: LiveGatewayRunnerInput,
+	authority: ManagedPreparedTurnAuthority,
+): void {
+	if (
+		authority.principalId !== principalIdForTurn(turn) ||
+		authority.projectId !== turn.project.id ||
+		authority.canonicalWorkspace !== resolve(turn.project.cwd) ||
+		authority.chatId !== turn.chatId ||
+		authority.requestKey !== turn.userMessageId ||
+		typeof authority.leaseId !== "string" ||
+		authority.leaseId.length === 0 ||
+		typeof authority.epoch !== "string" ||
+		authority.epoch.length === 0
+	)
+		throw new Error(
+			"Prepared managed authority lacks exact principal, project, workspace, chat, lease, epoch, or request authority.",
+		);
 }
 
 function isSameProject(mapping: SessionMapping | undefined, turn: LiveGatewayRunnerInput): mapping is SessionMapping {

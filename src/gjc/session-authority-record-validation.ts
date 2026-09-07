@@ -1,4 +1,11 @@
 import { isAbsolute } from "node:path";
+import {
+	hasManagedHistoricalSourceChat,
+	isManagedCatalogProvisional,
+	type ManagedHistoricalAssociationOwner,
+	managedHistoricalPublicationAssociation,
+	managedHistoricalSourceAssociation,
+} from "./managed-lifecycle-evidence";
 import { operationIdentity } from "./session-authority-operation-identity";
 import {
 	isAttachmentProof,
@@ -10,8 +17,10 @@ import type {
 	ProvisionalSessionOperation,
 	SessionAuthorityRecord,
 	SessionAuthorityTombstone,
+	SessionOperation,
 } from "./session-authority-types";
 import { SESSION_AUTHORITY_VERSION } from "./session-authority-types";
+import { isHistoricalSessionBinding, SESSION_AUTHORITY_V3_EPOCH } from "./session-authority-v3";
 import {
 	hasOnlyKeys,
 	isJsonValue,
@@ -21,6 +30,7 @@ import {
 	isTimestamp,
 } from "./session-authority-validation-primitives";
 import { operationIdentifiers } from "./session-operation-codec";
+import type { ManagedTurnAuthority } from "./turn-runner";
 
 export function isV2Record(value: unknown): value is SessionAuthorityRecord {
 	if (
@@ -41,6 +51,7 @@ export function isV2Record(value: unknown): value is SessionAuthorityRecord {
 			"modelSelection",
 			"observations",
 			"attachment",
+			"managedAuthority",
 			"journal",
 			"reassignment",
 		]) ||
@@ -76,6 +87,12 @@ export function isV2Record(value: unknown): value is SessionAuthorityRecord {
 		(value.modelSelection === undefined || isNormalizedModelSelection(value.modelSelection)) &&
 		(value.attachment === undefined ||
 			(isAttachmentProof(value.attachment) && value.attachment.expectedSessionId === value.sessionId)) &&
+		(value.managedAuthority === undefined ||
+			isManagedTurnAuthority(value.managedAuthority, {
+				chatId: value.chatId as string,
+				projectId: value.projectId as string,
+				sessionId: value.sessionId as string,
+			})) &&
 		value.journal.every(isOperation) &&
 		(value.reassignment === undefined ||
 			isReassignment(value.reassignment, { chatId: value.chatId as string, projectId: value.projectId as string }))
@@ -98,6 +115,7 @@ export function isProvisionalOperation(value: unknown): value is ProvisionalSess
 			"sessionId",
 			"sessionFile",
 			"attachment",
+			"managedAuthority",
 		]) ||
 		!isNonEmptyString(value.chatId) ||
 		!isNonEmptyString(value.projectId)
@@ -111,12 +129,23 @@ export function isProvisionalOperation(value: unknown): value is ProvisionalSess
 		(!isAttachmentProof(value.attachment) || value.attachment.expectedSessionId !== value.sessionId)
 	)
 		return false;
+	if (
+		value.managedAuthority !== undefined &&
+		(!isManagedTurnAuthority(value.managedAuthority, {
+			chatId: value.chatId,
+			projectId: value.projectId,
+			sessionId: value.sessionId,
+		}) ||
+			value.sessionId === undefined)
+	)
+		return false;
 	const {
 		chatId: _chatId,
 		projectId: _projectId,
 		sessionId: _sessionId,
 		sessionFile: _sessionFile,
 		attachment: _attachment,
+		managedAuthority: _managedAuthority,
 		...operation
 	} = value;
 	return isOperation(operation);
@@ -136,15 +165,26 @@ export function isAuthorityDocumentRelationallyValid(
 		chatIds.add(mapping.chatId);
 		projectsByChatId.set(mapping.chatId, mapping.projectId);
 		mappingByChatId.set(mapping.chatId, mapping);
-		if (!hasUniqueJournalIdentities(mapping) || !hasConsistentOperationResults(mapping)) return false;
+		if (!hasUniqueJournalIdentities(mapping) || !hasConsistentOperationResults(mapping, mapping)) return false;
 		for (const operation of mapping.journal)
 			for (const identifier of operationIdentifiers(operation))
 				if (!addIdentity(identities, mapping.chatId, identifier, operationIdentity(operation))) return false;
 		for (const root of reassignmentTombstoneRoots(mapping.reassignment)) {
 			let tombstone: SessionAuthorityTombstone | undefined = root;
 			while (tombstone !== undefined) {
-				if (tombstone.chatId !== mapping.chatId) return false;
-				if (!hasUniqueTombstoneIdentities(tombstone) || !hasConsistentTombstoneResults(tombstone)) return false;
+				if (
+					tombstone.historicalBinding !== undefined &&
+					!isHistoricalSessionBinding(tombstone.historicalBinding, tombstone)
+				)
+					return false;
+				if (
+					tombstone.chatId !== mapping.chatId &&
+					(tombstone.historicalBinding === undefined ||
+						managedHistoricalSourceAssociation(mapping, tombstone.historicalBinding) === undefined)
+				)
+					return false;
+				if (!hasUniqueTombstoneIdentities(tombstone) || !hasConsistentTombstoneResults(tombstone, mapping))
+					return false;
 				for (const operation of tombstone.journal)
 					for (const identifier of operationIdentifiers(operation))
 						if (!addIdentity(identities, mapping.chatId, identifier, operationIdentity(operation))) return false;
@@ -152,9 +192,30 @@ export function isAuthorityDocumentRelationallyValid(
 			}
 		}
 	}
+	const allMappings = [...mappingByChatId.values()];
+	if (
+		allMappings.some(root =>
+			allMappings.some(other => other !== root && hasManagedHistoricalSourceChat(root, other.chatId)),
+		)
+	)
+		return false;
 	for (const operation of provisionalOperations) {
-		const mapping = mappingByChatId.get(operation.chatId);
-		const activeProject = projectsByChatId.get(operation.chatId);
+		if (!isManagedCatalogProvisional(operation)) return false;
+		const direct = mappingByChatId.get(operation.chatId);
+		const associated = [...mappingByChatId.values()].filter(
+			candidate =>
+				candidate.chatId !== operation.chatId &&
+				managedHistoricalPublicationAssociation(candidate, operation) !== undefined,
+		);
+		if (associated.length > 1 || (direct !== undefined && associated.length !== 0)) return false;
+		const mapping = direct ?? associated[0];
+		if (
+			mapping === undefined &&
+			[...mappingByChatId.values()].some(candidate => hasManagedHistoricalSourceChat(candidate, operation.chatId))
+		)
+			return false;
+		const namespace = mapping?.chatId ?? operation.chatId;
+		const activeProject = projectsByChatId.get(namespace);
 		const reassignment = mapping?.reassignment;
 		if (activeProject !== undefined && activeProject !== operation.projectId) {
 			const matchesReassignmentTarget =
@@ -178,12 +239,19 @@ export function isAuthorityDocumentRelationallyValid(
 		}
 		const identity = operationIdentity(operation);
 		for (const identifier of operationIdentifiers(operation)) {
-			const key = `${operation.chatId}\u0000${identifier}`,
+			const key = `${namespace}\u0000${identifier}`,
 				prior = identities.get(key);
 			if (provisionalIdentities.has(key) || (prior !== undefined && prior !== identity)) return false;
 			provisionalIdentities.add(key);
 			identities.set(key, identity);
 		}
+		if (operation.cleanup !== undefined)
+			for (const identifier of operationIdentifiers(operation.cleanup)) {
+				const key = `${namespace}\u0000${identifier}`;
+				if (provisionalIdentities.has(key) || identities.has(key)) return false;
+				provisionalIdentities.add(key);
+				identities.set(key, operationIdentity(operation.cleanup));
+			}
 	}
 	return true;
 }
@@ -199,25 +267,99 @@ function hasUniqueJournalIdentities(mapping: SessionAuthorityRecord): boolean {
 	return true;
 }
 
-function hasConsistentOperationResults(mapping: SessionAuthorityRecord): boolean {
+function hasConsistentOperationResults(
+	mapping: SessionAuthorityRecord,
+	root: ManagedHistoricalAssociationOwner,
+): boolean {
 	return mapping.journal.every(operation => {
+		if (!hasConsistentSuccessor(mapping, operation, root)) return false;
 		if (operation.result === undefined) return true;
 		const resultMapping = operation.result.mapping;
 		if (
-			resultMapping.chatId !== mapping.chatId ||
+			(resultMapping.chatId !== root.chatId &&
+				(operation.result.historicalBinding === undefined ||
+					managedHistoricalSourceAssociation(root, operation.result.historicalBinding, operation) ===
+						undefined)) ||
 			resultMapping.projectId !== mapping.projectId ||
+			!hasConsistentResultSession(mapping, operation) ||
 			resultMapping.operationId !== operation.id
 		)
 			return false;
 		const correlation = operation.result.correlation;
 		return (
 			correlation === undefined ||
-			((correlation.chatId === undefined || correlation.chatId === mapping.chatId) &&
+			((correlation.chatId === undefined || correlation.chatId === resultMapping.chatId) &&
 				(correlation.projectId === undefined || correlation.projectId === mapping.projectId) &&
 				(correlation.operationId === undefined || correlation.operationId === operation.id))
 		);
 	});
 }
+
+function hasConsistentSuccessor(
+	owner: ManagedHistoricalAssociationOwner,
+	operation: SessionOperation,
+	root: ManagedHistoricalAssociationOwner,
+): boolean {
+	const successor = operation.acknowledgedSuccessor;
+	if (successor === undefined || "attachment" in successor) return true;
+	if (successor.historicalBinding !== undefined) {
+		const history = successor.historicalBinding;
+		return (
+			isHistoricalSessionBinding(history, {
+				chatId: history.chatId,
+				projectId: owner.projectId,
+				sessionId: successor.sessionId,
+			}) &&
+			(history.chatId === root.chatId ||
+				managedHistoricalSourceAssociation(root, history, operation) !== undefined) &&
+			(owner.managedAuthority === undefined ||
+				((history.principalId === undefined || history.principalId === owner.managedAuthority.principalId) &&
+					(history.canonicalWorkspace === undefined ||
+						history.canonicalWorkspace === owner.managedAuthority.canonicalWorkspace)))
+		);
+	}
+	return (
+		successor.managedAuthority !== undefined &&
+		successor.managedAuthority.chatId === root.chatId &&
+		isManagedTurnAuthority(successor.managedAuthority, {
+			chatId: owner.chatId,
+			projectId: owner.projectId,
+			sessionId: successor.sessionId,
+		}) &&
+		(owner.managedAuthority === undefined ||
+			(successor.managedAuthority.principalId === owner.managedAuthority.principalId &&
+				successor.managedAuthority.canonicalWorkspace === owner.managedAuthority.canonicalWorkspace))
+	);
+}
+
+function hasConsistentResultSession(
+	owner: Pick<SessionAuthorityRecord, "chatId" | "projectId" | "sessionId" | "managedAuthority">,
+	operation: SessionOperation,
+): boolean {
+	const result = operation.result;
+	if (result === undefined) return true;
+	if (result.historicalBinding !== undefined) {
+		const history = result.historicalBinding;
+		return (
+			operation.state === "complete" &&
+			isHistoricalSessionBinding(history, result.mapping) &&
+			(owner.managedAuthority === undefined ||
+				((history.principalId === undefined || history.principalId === owner.managedAuthority.principalId) &&
+					(history.canonicalWorkspace === undefined ||
+						history.canonicalWorkspace === owner.managedAuthority.canonicalWorkspace)))
+		);
+	}
+	const authority = result.managedAuthority;
+	if (authority === undefined) return result.mapping.sessionId === owner.sessionId;
+	return (
+		operation.state === "complete" &&
+		owner.managedAuthority !== undefined &&
+		authority.principalId === owner.managedAuthority.principalId &&
+		authority.canonicalWorkspace === owner.managedAuthority.canonicalWorkspace &&
+		isManagedTurnAuthority(authority, result.mapping)
+	);
+}
+
 function isReassignment(value: unknown, record: Pick<SessionAuthorityRecord, "chatId" | "projectId">): boolean {
 	if (
 		!isRecord(value) ||
@@ -289,6 +431,7 @@ function isTombstone(value: unknown): value is SessionAuthorityTombstone {
 			"modelSelection",
 			"observations",
 			"attachment",
+			"managedAuthority",
 			"journal",
 			"retiredAt",
 			"prior",
@@ -314,11 +457,50 @@ function isTombstone(value: unknown): value is SessionAuthorityTombstone {
 		(value.modelSelection !== undefined && !isNormalizedModelSelection(value.modelSelection)) ||
 		(value.attachment !== undefined &&
 			(!isAttachmentProof(value.attachment) || value.attachment.expectedSessionId !== value.sessionId)) ||
+		(value.managedAuthority !== undefined &&
+			!isManagedTurnAuthority(value.managedAuthority, {
+				chatId: value.chatId as string,
+				projectId: value.projectId as string,
+				sessionId: value.sessionId as string,
+			})) ||
 		!value.journal.every(isOperation) ||
 		(value.prior !== undefined && !isTombstone(value.prior))
 	)
 		return false;
 	return true;
+}
+
+function isManagedTurnAuthority(
+	value: unknown,
+	identity: Readonly<{ chatId: string; projectId: string; sessionId: string | undefined }>,
+): value is ManagedTurnAuthority {
+	return (
+		isRecord(value) &&
+		hasOnlyKeys(value, [
+			"authorityEpoch",
+			"principalId",
+			"projectId",
+			"canonicalWorkspace",
+			"chatId",
+			"sessionId",
+			"generation",
+			"leaseId",
+			"epoch",
+			"requestKey",
+		]) &&
+		(value.authorityEpoch === undefined || value.authorityEpoch === SESSION_AUTHORITY_V3_EPOCH) &&
+		isNonEmptyString(value.principalId) &&
+		value.projectId === identity.projectId &&
+		isNonEmptyString(value.canonicalWorkspace) &&
+		isAbsolute(value.canonicalWorkspace) &&
+		value.chatId === identity.chatId &&
+		value.sessionId === identity.sessionId &&
+		isNonnegativeSafeInteger(value.generation) &&
+		value.generation > 0 &&
+		isNonEmptyString(value.leaseId) &&
+		isNonEmptyString(value.epoch) &&
+		isNonEmptyString(value.requestKey)
+	);
 }
 
 function addIdentity(identities: Map<string, string>, chatId: string, identifier: string, identity: string): boolean {
@@ -351,13 +533,21 @@ function hasUniqueTombstoneIdentities(tombstone: SessionAuthorityTombstone): boo
 	return true;
 }
 
-function hasConsistentTombstoneResults(tombstone: SessionAuthorityTombstone): boolean {
+function hasConsistentTombstoneResults(
+	tombstone: SessionAuthorityTombstone,
+	root: ManagedHistoricalAssociationOwner,
+): boolean {
 	return tombstone.journal.every(operation => {
+		if (!hasConsistentSuccessor(tombstone, operation, root)) return false;
 		if (operation.result === undefined) return true;
 		const resultMapping = operation.result.mapping;
 		return (
-			resultMapping.chatId === tombstone.chatId &&
+			(resultMapping.chatId === root.chatId ||
+				(operation.result.historicalBinding !== undefined &&
+					managedHistoricalSourceAssociation(root, operation.result.historicalBinding, operation) !==
+						undefined)) &&
 			resultMapping.projectId === tombstone.projectId &&
+			hasConsistentResultSession(tombstone, operation) &&
 			resultMapping.operationId === operation.id
 		);
 	});

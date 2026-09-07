@@ -1,6 +1,9 @@
+import { randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import * as path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { createAdapterSessionCloser } from "./adapter-close-options";
+import { type ActiveManagedV3Runtime, startActiveManagedRuntime } from "./adapter-managed-v3-runtime";
 import {
 	buildOpenWebUIPrincipalClientFactory,
 	buildOpenWebUIPrincipalEventSinkFactory,
@@ -13,27 +16,41 @@ import {
 import { assertResolvedAdapterConfig, loadConfiguredProjects, resolveAdapterConfig } from "./adapter-project-options";
 import { buildRuntimeHealthChecks, type RuntimeIsolationDiagnostic } from "./adapter-runtime-health";
 import { type AdapterConfig, loadAdapterConfig, type ResolvedAdapterConfig } from "./config";
-import { resolveLegacySessionAuthoritySourcePaths, SESSION_AUTHORITY_MAPPING_FILE } from "./config-env";
-import { preflightSessionAuthorityMigrationCandidates } from "./gjc/session-authority-migration";
+import { SESSION_AUTHORITY_MAPPING_FILE } from "./config-env";
+import {
+	isManagedCatalogProvisional,
+	isManagedEndpointReceipt,
+	managedLifecycleEvidenceHash,
+} from "./gjc/managed-lifecycle-evidence";
+import type { ManagedSdkRuntimeDependency, ManagedSdkTenantFence } from "./gjc/managed-sdk-dependency";
+import {
+	type ManagedSdkAccess,
+	type ManagedSdkCatalogAccess,
+	type ManagedSdkCatalogReference,
+	ManagedSdkOperationError,
+	ManagedSdkRuntime,
+	type ManagedSdkRuntimeDeps,
+	type TenantSessionKey,
+} from "./gjc/managed-sdk-runtime";
+import { probeSessionAuthorityEpoch } from "./gjc/session-authority-epoch";
+import { SESSION_AUTHORITY_V3_EPOCH } from "./gjc/session-authority-v3";
+import { readSessionAuthorityV3ActiveMarker } from "./gjc/session-authority-v3-activation";
 import { loadGjcSessionFile } from "./gjc/session-loader";
-import { FileBackedSessionMappingStore, type SessionMapping, SessionMappingStore } from "./gjc/session-router";
-import type { GjcCloseReceipt } from "./gjc/turn-runner";
+import type { SessionMapping, SessionMappingStore } from "./gjc/session-router";
+import { V3FileBackedSessionMappingStore } from "./gjc/session-v3-file-backed-mapping-store";
+import type { ManagedPreparedTurnAuthority, ManagedTurnAuthority } from "./gjc/turn-runner";
 import type { LiveGatewayEventSink, LiveGatewayMessageSink } from "./live/chat-completions";
+import { acquireWorkspaceAdmission } from "./live/chat-completions";
 import type { LiveGatewayFileContextResolver } from "./live/file-contexts";
-import { createGjcIdleSessionReaper } from "./live/gjc-idle-session-reaper";
 import {
-	createGjcRoutingLiveGatewayRunner,
-	createPublicSdkGjcTurnRunner,
-	createPublicSdkModelAttachmentResolver,
-	type GjcSessionTurnRunner,
-} from "./live/gjc-routing-runner";
-import {
-	createModelReaderFactory,
-	type ModelReaderFactory,
-	type PublicSdkAttachmentResolver,
-	type PublicSdkSessionPortFactory,
-	resolveGjcCliPath,
-} from "./live/model-reader";
+	createManagedIdleReaper,
+	createManagedV3GenerationStore,
+	DEFAULT_MANAGED_IDLE_TIMEOUT_MS,
+	type ManagedIdleReaper,
+} from "./live/gjc-managed-idle-reaper";
+import { createManagedModelReaderFactory } from "./live/gjc-managed-model-reader";
+import { createGjcRoutingLiveGatewayRunner } from "./live/gjc-routing-runner";
+import type { ModelReaderFactory } from "./live/model-reader";
 import {
 	createProjectionOperationApplier,
 	type PrincipalProjectionSynchronizerInput,
@@ -51,8 +68,13 @@ import { RuntimeSingletonLock } from "./runtime-singleton-lock";
 import { resolveAllowedRoots } from "./security/paths";
 import { createUserWorkspaceRegistry } from "./security/user-workspace";
 import { createWorkspaceCleanupService, type WorkspaceCleanupAuthorityCoordinator } from "./security/workspace-cleanup";
-import { createWorkspaceLeaseManager } from "./security/workspace-lease";
-import { type AdapterServerHandle, type AdapterServerOptions, startAdapterServer } from "./server";
+import { createWorkspaceLeaseManager, parseWorkspaceLeaseId, type WorkspaceLease } from "./security/workspace-lease";
+import {
+	type AdapterServerHandle,
+	type AdapterServerOptions,
+	type ManagedSdkRuntimeHealth,
+	startAdapterServer,
+} from "./server";
 import { FileBackedOutboxStore, type OutboxStore } from "./state/outbox";
 import { type ProjectionOperationApplier, reconcilePendingOperations } from "./state/reconciler";
 
@@ -63,29 +85,25 @@ const SESSION_MAPPING_STORE_FILE = SESSION_AUTHORITY_MAPPING_FILE;
 const PROJECTION_OUTBOX_STORE_FILE = "openwebui-projection-outbox.json";
 
 export interface BuildAdapterServerOptionsDependencies {
-	readonly turnRunner?: GjcSessionTurnRunner;
-	readonly mappings?: SessionMappingStore;
+	/** Test seam for the one process-owned managed runtime. */
+	readonly managedSdkRuntime?: ManagedSdkRuntimeDependency;
+	/** Test seam; retains the production purpose fences while replacing public SDK transports. */
+	readonly createManagedSdkRuntime?: (agentDir: string, deps: ManagedSdkRuntimeDeps) => ManagedSdkRuntimeDependency;
+	/** Exact managed tenant lease/epoch fence. */
+	readonly managedSdkTenantFence?: ManagedSdkTenantFence;
 	readonly eventSink?: LiveGatewayEventSink;
 	readonly messageSink?: LiveGatewayMessageSink;
 	readonly fileContextResolver?: LiveGatewayFileContextResolver;
 	readonly projectionRepository?: OpenWebUIProjectionRepository;
 	readonly projectRegistrationStore?: SqliteProjectRegistrationStore;
-	readonly modelReaderFactory?: ModelReaderFactory;
 	readonly outbox?: OutboxStore;
 	readonly projectionOperationApplier?: ProjectionOperationApplier;
-	readonly resolveModelAttachment?: PublicSdkAttachmentResolver;
-	readonly sessionPortFactory?: PublicSdkSessionPortFactory;
-	/** Must destroy only a pane whose ownership has been proven for this mapping. */
-	readonly fallbackCloseSession?: (mapping: SessionMapping, cause: unknown) => Promise<SessionCloseResult>;
-	/** Post-ack proof must observe endpoint disappearance and the persisted owned pane/process; it must never kill. */
-	readonly proveClosedSession?: (mapping: SessionMapping, receipt: GjcCloseReceipt) => Promise<SessionCloseResult>;
 	/** Retires every principal-owned session authority only after proven close. */
 	readonly authorityCoordinator?: WorkspaceCleanupAuthorityCoordinator;
 }
 
 interface BuildAdapterServerOptionsBehavior {
 	readonly deferOpenWebUIInitialization?: boolean;
-	readonly sessionAuthorityMigrationSourcePaths?: readonly string[];
 }
 
 export async function buildAdapterServerOptionsFromEnv(
@@ -93,9 +111,7 @@ export async function buildAdapterServerOptionsFromEnv(
 	dependencies: BuildAdapterServerOptionsDependencies = {},
 ): Promise<AdapterServerOptions> {
 	const config = loadAdapterConfig(env);
-	return buildResolvedAdapterServerOptions(config, dependencies, {
-		sessionAuthorityMigrationSourcePaths: resolveLegacySessionAuthoritySourcePaths(env),
-	});
+	return buildResolvedAdapterServerOptions(config, dependencies);
 }
 
 export async function buildAdapterServerOptions(
@@ -112,6 +128,10 @@ export async function buildResolvedAdapterServerOptions(
 	behavior: BuildAdapterServerOptionsBehavior = {},
 ): Promise<AdapterServerOptions> {
 	assertResolvedAdapterConfig(config);
+	const mappingStorePath = path.join(config.sessionRoot, SESSION_MAPPING_STORE_FILE);
+	// This is intentionally the first filesystem operation: no state directory,
+	// lock, database, store, outbox, or runtime may exist before direct V3 proof.
+	assertDirectV3Authority(mappingStorePath);
 	const protectedProjectRoots = config.mode === "managed" ? [config.statePath] : [];
 	const allowedSessionRoots = config.mode === "managed" ? [config.sessionRoot] : [];
 	await mkdir(config.statePath, { recursive: true });
@@ -119,8 +139,44 @@ export async function buildResolvedAdapterServerOptions(
 	const internalStore = dependencies.projectRegistrationStore === undefined;
 	const databasePath = path.join(config.statePath, "adapter-state.sqlite");
 	let projectStore: SqliteProjectRegistrationStore | undefined;
-	let idleSessionReaper: ReturnType<typeof createGjcIdleSessionReaper> | undefined;
+	let managedIdleReaper: ManagedIdleReaper | undefined;
 	let routingRunner: ReturnType<typeof createGjcRoutingLiveGatewayRunner> | undefined;
+	let activeManagedV3Runtime: ActiveManagedV3Runtime | undefined;
+	let managedSdkRuntime: ManagedSdkRuntimeDependency | undefined;
+	let managedSdkTenantFence: ManagedSdkTenantFence | undefined;
+	const managedSdkRuntimeHealth: ManagedSdkRuntimeHealth = {
+		phase: "starting",
+	};
+	const retirementLeaseFailures = new Set<unknown>();
+	let managedSdkRuntimeDisposePromise: Promise<void> | undefined;
+	const disposeManagedSdkRuntime = (): Promise<void> => {
+		if (managedSdkRuntimeDisposePromise === undefined) {
+			const completion = Promise.withResolvers<void>();
+			managedSdkRuntimeDisposePromise = completion.promise;
+			const stops: Promise<unknown>[] = [];
+			for (const stop of [() => managedIdleReaper?.stop(), () => managedSdkRuntime?.dispose()]) {
+				try {
+					stops.push(Promise.resolve(stop()));
+				} catch (error) {
+					stops.push(Promise.reject(error));
+				}
+			}
+			void Promise.allSettled(stops).then(results => {
+				const failures = [
+					...new Set([
+						...results.flatMap(result => (result.status === "rejected" ? [result.reason] : [])),
+						...retirementLeaseFailures,
+					]),
+				];
+				if (failures.length === 0) completion.resolve();
+				else
+					completion.reject(
+						failures.length === 1 ? failures[0] : new AggregateError(failures, "Adapter runtime disposal failed"),
+					);
+			});
+		}
+		return managedSdkRuntimeDisposePromise;
+	};
 	try {
 		const isolationDiagnostics: RuntimeIsolationDiagnostic[] = [];
 		if (internalStore)
@@ -144,36 +200,104 @@ export async function buildResolvedAdapterServerOptions(
 		const workspaceLeaseManager = createWorkspaceLeaseManager({ stateRoot: config.statePath });
 		const workspaceLeaseDurationMs = workspaceLeaseDuration(config.turnTimeoutMs);
 		const workspaceLeaseHeartbeatMs = workspaceLeaseHeartbeat(workspaceLeaseDurationMs);
-		const mappingStorePath = path.join(config.sessionRoot, SESSION_MAPPING_STORE_FILE);
-		if (dependencies.mappings === undefined && owner.ownerUserId.length > 0) {
-			const sourcePaths =
-				behavior.sessionAuthorityMigrationSourcePaths ??
-				(config.mode === "managed" ? [path.join("/run/gjc-session", SESSION_MAPPING_STORE_FILE)] : []);
-			const migration = preflightSessionAuthorityMigrationCandidates({
-				candidateSourcePaths: sourcePaths,
-				destinationPath: mappingStorePath,
-				stateRoot: config.statePath,
-				adminPrincipalId: owner.ownerUserId,
-			});
-			if (migration.status === "degraded")
-				throw new Error(
-					`Session authority migration is degraded: ${migration.reason ?? "operator reconciliation is required"}`,
+		const previouslyLinkedProjectIdsBeforeConfiguredSeed = new Set(
+			projectStore.listLinkedProjects().map(project => project.id),
+		);
+		const mappings = new V3FileBackedSessionMappingStore(mappingStorePath);
+		mappings.assertServingReady();
+		const retirementLeases = new Map<string, WorkspaceLease>();
+		const retirementFence = async (
+			key: TenantSessionKey,
+			access: Extract<ManagedSdkAccess, { kind: "retirement" }>,
+		) => {
+			const lease = retirementLeases.get(managedTenantIdentity(key));
+			if (lease === undefined) return false;
+			const operation = mappings.operationScoped(
+				{ principalId: key.principalId, chatId: key.chatId },
+				access.operationId,
+			);
+			if (
+				operation?.kind !== "close" ||
+				operation.state !== "pending" ||
+				operation.lifecycle?.state !== "closing" ||
+				operation.lifecycle.sourceProofRef === undefined ||
+				operation.lifecycle.requestKey !== access.requestKey ||
+				operation.detail !== access.payloadHash ||
+				operation.lifecycle.payloadHash !== access.payloadHash ||
+				operation.lifecycle.source === undefined ||
+				managedTenantIdentity(operation.lifecycle.source) !== managedTenantIdentity(key)
+			)
+				return false;
+			return assertRetirementOperationFence(
+				key,
+				lease,
+				mappings,
+				workspaceRegistry,
+				projectStore,
+				workspaceLeaseManager,
+			);
+		};
+		const liveTenantFence =
+			dependencies.managedSdkTenantFence ??
+			(key =>
+				assertActiveManagedV3TenantFence(key, mappings, workspaceRegistry, projectStore, workspaceLeaseManager));
+		const managedRuntimeDeps: ManagedSdkRuntimeDeps = {
+			catalogFence: async (reference, key, access) => {
+				if (!assertCatalogManagedTenantFence(reference, key, access, mappings, projectStore, workspaceLeaseManager))
+					return false;
+				try {
+					const lease = parseWorkspaceLeaseId(key.leaseId);
+					const workspace = await workspaceRegistry.resolveBySafeKey(lease.safeKey);
+					return (
+						workspace?.userId === key.principalId &&
+						path.resolve(workspace.root) === key.canonicalWorkspace &&
+						assertCatalogManagedTenantFence(reference, key, access, mappings, projectStore, workspaceLeaseManager)
+					);
+				} catch {
+					return false;
+				}
+			},
+			catalogFenceSync: (reference, key, access) =>
+				assertCatalogManagedTenantFence(reference, key, access, mappings, projectStore, workspaceLeaseManager),
+			tenantFence: async (key, access) => {
+				if (access.kind === "retirement") return retirementFence(key, access);
+				if (hasManagedRetirementBarrier(key, mappings)) return false;
+				if (access.kind === "active" && (await liveTenantFence(key))) return true;
+				return assertStagedManagedTenantFence(
+					key,
+					access,
+					mappings,
+					workspaceRegistry,
+					projectStore,
+					workspaceLeaseManager,
 				);
-			isolationDiagnostics.push({
-				name: "session-authority-migration",
-				status: "ok",
-				detail: `Session authority migration ${migration.status}.`,
+			},
+			preparedTenantFence: authority =>
+				assertPreparedManagedTenantFence(
+					authority,
+					workspaceRegistry,
+					projectStore,
+					workspaceLeaseManager,
+					mappings,
+				),
+		};
+		const runtime =
+			dependencies.managedSdkRuntime ??
+			dependencies.createManagedSdkRuntime?.(config.runtimeLocations.agentDir, managedRuntimeDeps) ??
+			new ManagedSdkRuntime({
+				agentDir: config.runtimeLocations.agentDir,
+				deps: managedRuntimeDeps,
 			});
-		}
-		const mappings = dependencies.mappings ?? new FileBackedSessionMappingStore(mappingStorePath);
-		if (mappings instanceof FileBackedSessionMappingStore && mappings.bootCompaction !== undefined) {
-			isolationDiagnostics.push({
-				name: "session-authority-compaction",
-				status: "ok",
-				detail: `Session authority compacted from ${mappings.bootCompaction.beforeBytes} to ${mappings.bootCompaction.afterBytes} bytes.`,
-			});
-		}
-		if (mappings instanceof SessionMappingStore) mappings.setLegacyAdminPrincipalId(owner.ownerUserId);
+		managedSdkRuntime = runtime;
+		activeManagedV3Runtime = await startActiveManagedRuntime({
+			mappings,
+			runtime: runtime as ManagedSdkRuntime,
+			turnTimeoutMs: config.turnTimeoutMs,
+			liveTenantFence,
+		});
+		managedSdkRuntime = activeManagedV3Runtime.runtime;
+		managedSdkTenantFence = activeManagedV3Runtime.tenantFence;
+		managedSdkRuntimeHealth.phase = "ready";
 		const runtimeAdminClientFactory = buildOpenWebUIRuntimeAdminClientFactory(config);
 		const principalClientFactory = buildOpenWebUIPrincipalClientFactory(config, workspaceRegistry);
 		const runtimeAdminClient =
@@ -189,33 +313,26 @@ export async function buildResolvedAdapterServerOptions(
 			(projectionRepository === undefined
 				? undefined
 				: new FileBackedOutboxStore(path.join(config.statePath, PROJECTION_OUTBOX_STORE_FILE)));
-		const cliPath = resolveGjcCliPath(config.gjcCommand);
-		const turnRunner =
-			dependencies.turnRunner ??
-			createPublicSdkGjcTurnRunner({
-				cliPath,
-				runtimeLocations: config.runtimeLocations,
-				turnTimeoutMs: config.turnTimeoutMs,
-				sessionPortFactory: dependencies.sessionPortFactory,
-			});
-		const modelReaderFactory =
-			dependencies.modelReaderFactory ??
-			createModelReaderFactory({
-				cliPath,
-				runtimeLocations: config.runtimeLocations,
-				resolveAttachment:
-					dependencies.resolveModelAttachment ??
-					createPublicSdkModelAttachmentResolver({
-						cliPath,
-						cwd: config.runtimeLocations.readerWorkspace,
-						childEnvironment: config.runtimeLocations.childEnvironment,
-					}),
-				sessionPortFactory: dependencies.sessionPortFactory,
-			});
-		const closeSession = createAdapterSessionCloser(config, cliPath, { ...dependencies, turnRunner }, mappings);
+		if (
+			activeManagedV3Runtime === undefined ||
+			managedSdkRuntime === undefined ||
+			managedSdkTenantFence === undefined
+		)
+			throw new Error("Canonical V3 authority requires active managed runtime dependencies.");
+		const turnRunner = activeManagedV3Runtime.runner;
+		const modelReaderFactory = createManagedReaderFactory(activeManagedV3Runtime.runtime, config.turnTimeoutMs);
+		const closeSession = createAdapterSessionCloser(
+			{
+				...dependencies,
+				...(managedSdkRuntime === undefined ? {} : { managedSdkRuntime }),
+				...(managedSdkTenantFence === undefined ? {} : { managedSdkTenantFence }),
+			},
+			mappings,
+		);
 		const baseRoutingRunner = createGjcRoutingLiveGatewayRunner({
 			turnRunner,
 			mappings,
+			turnTimeoutMs: config.turnTimeoutMs,
 			ownerUserId: owner.ownerUserId,
 			modelReaderFactory,
 			...(outbox === undefined ? {} : { outbox }),
@@ -224,25 +341,155 @@ export async function buildResolvedAdapterServerOptions(
 		const workspaceAuthorityCoordinator =
 			dependencies.authorityCoordinator ??
 			(closeSession === undefined ? undefined : createWorkspaceAuthorityCoordinator(mappings, closeSession));
-		if (closeSession !== undefined) {
-			idleSessionReaper = createGjcIdleSessionReaper({
-				runner: baseRoutingRunner,
-				mappings,
-				closeSession,
-				...(turnRunner.discardSessionAttachment === undefined
-					? {}
-					: {
-							discardSessionAttachment: (cwd, sessionId) =>
-								turnRunner.discardSessionAttachment?.(cwd, sessionId),
-						}),
-				workspaceRegistry,
-				workspaceLeaseManager,
-				workspaceLeaseDurationMs,
-				...(owner.ownerUserId.trim().length === 0 ? {} : { adminPrincipalId: owner.ownerUserId }),
+		if (activeManagedV3Runtime !== undefined) {
+			const managedV3Runtime = activeManagedV3Runtime;
+			const v3Mappings = mappings;
+			if (v3Mappings === undefined) throw new Error("Managed V3 idle reaper requires a session mapping store.");
+			const managedRecords = createManagedV3GenerationStore(v3Mappings);
+			const retirementOperations = new Map<
+				string,
+				{ operationId: string; requestKey: string; payloadHash: string }
+			>();
+			managedIdleReaper = createManagedIdleReaper({
+				runtime: {
+					createProducerScope: () => managedV3Runtime.runtime.createProducerScope(),
+					closeLifecycleSession: async (request, operation, onOutcome) => {
+						const canonical = mappings.operationScoped(request.tenant, operation.operationId);
+						const evidence = canonical?.lifecycle;
+						if (
+							typeof onOutcome !== "function" ||
+							canonical?.kind !== "close" ||
+							canonical.state !== "pending" ||
+							evidence?.state !== "closing" ||
+							evidence.operation !== "session.close" ||
+							evidence.sourceProofRef === undefined ||
+							evidence.closeAcknowledgement !== undefined ||
+							canonical.id !== operation.operationId ||
+							canonical.detail !== operation.payloadHash ||
+							evidence.payloadHash !== operation.payloadHash ||
+							evidence.requestKey !== operation.requestKey ||
+							request.requestKey !== operation.requestKey ||
+							!isDeepStrictEqual(evidence.actor, request.actor) ||
+							!isManagedEndpointReceipt(request.target, request.tenant) ||
+							!isDeepStrictEqual(evidence.target, request.target) ||
+							evidence.source === undefined ||
+							managedTenantIdentity(evidence.source) !== managedTenantIdentity(request.tenant)
+						)
+							throw new Error("Managed retirement does not match its original canonical projection.");
+						const source = mappings.operationScoped(request.tenant, evidence.sourceProofRef.operationId);
+						if (
+							source?.state !== "complete" ||
+							source.lifecycle === undefined ||
+							managedLifecycleEvidenceHash(source.lifecycle) !== evidence.sourceProofRef.evidenceHash ||
+							!isDeepStrictEqual(source.lifecycle.endpointReceipt, request.target)
+						)
+							throw new Error("Managed retirement lost its original source receipt.");
+						retirementOperations.set(managedTenantIdentity(request.tenant), operation);
+						return managedV3Runtime.runtime.retireLifecycleSession(request.tenant, request, operation, onOutcome);
+					},
+					reconcile: () => managedV3Runtime.runtime.reconcile(),
+					generationStatus: key => {
+						const operation = retirementOperations.get(managedTenantIdentity(key));
+						if (operation === undefined) throw new Error("Managed retirement lacks its operation authorization.");
+						return managedV3Runtime.runtime.retirementGenerationStatus(key, operation);
+					},
+				},
+				records: managedRecords,
+				admission: {
+					acquire: async key => {
+						try {
+							const lease = parseWorkspaceLeaseId(key.leaseId);
+							return await acquireWorkspaceAdmission(
+								workspaceLeaseManager,
+								lease.safeKey,
+								workspaceLeaseDurationMs,
+								32,
+							);
+						} catch {
+							return undefined;
+						}
+					},
+				},
+				leases: {
+					acquire: async key => {
+						let reference: ReturnType<typeof parseWorkspaceLeaseId>;
+						try {
+							reference = parseWorkspaceLeaseId(key.leaseId);
+						} catch {
+							return undefined;
+						}
+						const workspace = await workspaceRegistry.resolveBySafeKey(reference.safeKey).catch(() => undefined);
+						if (
+							workspace === undefined ||
+							workspace.userId !== key.principalId ||
+							path.resolve(workspace.root) !== key.canonicalWorkspace
+						)
+							return undefined;
+						let lease: WorkspaceLease;
+						try {
+							lease = await workspaceLeaseManager.acquire({
+								safeKey: reference.safeKey,
+								holderId: `gjc-managed-idle-reaper-${process.pid}-${randomUUID()}`,
+								operation: "reaper",
+								leaseDurationMs: workspaceLeaseDurationMs,
+							});
+						} catch {
+							return undefined;
+						}
+						const identity = managedTenantIdentity(key);
+						retirementLeases.set(identity, lease);
+						let renewal: Promise<void> | undefined;
+						let renewalFailure: { error: unknown } | undefined;
+						let heartbeatStopped = false;
+						const heartbeat = setInterval(() => {
+							if (heartbeatStopped || renewal !== undefined || renewalFailure !== undefined) return;
+							renewal = lease
+								.renew(workspaceLeaseDurationMs)
+								.then(
+									() => undefined,
+									error => {
+										renewalFailure = { error };
+										retirementLeaseFailures.add(error);
+									},
+								)
+								.finally(() => {
+									renewal = undefined;
+								});
+						}, workspaceLeaseHeartbeatMs);
+						heartbeat.unref?.();
+						return {
+							assertFence: async () => {
+								if (renewalFailure !== undefined) throw renewalFailure.error;
+								if (
+									!(await assertRetirementOperationFence(
+										key,
+										lease,
+										mappings,
+										workspaceRegistry,
+										projectStore,
+										workspaceLeaseManager,
+									))
+								)
+									throw new Error("Managed V3 tenant authority fence was lost.");
+							},
+							release: async () => {
+								heartbeatStopped = true;
+								clearInterval(heartbeat);
+								await renewal;
+								if (renewalFailure !== undefined) throw renewalFailure.error;
+								await lease.release();
+								retirementLeases.delete(identity);
+								retirementOperations.delete(identity);
+							},
+						};
+					},
+				},
+				idleTimeoutMs: DEFAULT_MANAGED_IDLE_TIMEOUT_MS,
+				pollIntervalMs: DEFAULT_MANAGED_IDLE_TIMEOUT_MS,
 			});
 		}
-		const runner = idleSessionReaper?.runner ?? baseRoutingRunner;
-		const closeSessionForRoutes = idleSessionReaper?.closeSession ?? closeSession;
+		const runner = baseRoutingRunner;
+		const closeSessionForRoutes = closeSession;
 		const projectLinkService = new ProjectLinkService({
 			allowedRoots,
 			store: projectStore,
@@ -255,7 +502,7 @@ export async function buildResolvedAdapterServerOptions(
 			runtimeLocations: config.runtimeLocations,
 			...(closeSessionForRoutes === undefined ? {} : { closeSession: closeSessionForRoutes }),
 		});
-		const previouslyLinkedProjectIds = new Set(projectLinkService.listLinkedProjects().map(project => project.id));
+		const previouslyLinkedProjectIds = previouslyLinkedProjectIdsBeforeConfiguredSeed;
 		await projectLinkService.seedConfiguredProjects(projects);
 		const projectionSynchronizer: ProjectionSessionSynchronizer = {
 			syncLinkedProject: projectLinkService.syncLinkedProject.bind(projectLinkService),
@@ -338,18 +585,57 @@ export async function buildResolvedAdapterServerOptions(
 						authorityCoordinator: workspaceAuthorityCoordinator,
 						...(owner.ownerUserId.trim().length === 0 ? {} : { adminPrincipalId: owner.ownerUserId }),
 					});
-		const shutdownCleanup = internalStore
-			? () => {
+		const shutdownCleanup = async (): Promise<void> => {
+			const failures: unknown[] = [];
+			try {
+				await disposeManagedSdkRuntime();
+			} catch (error) {
+				failures.push(error);
+			}
+			if (internalStore && failures.length === 0) {
+				try {
 					projectStore?.close();
+				} catch (error) {
+					failures.push(error);
 				}
-			: undefined;
+			}
+			if (failures.length > 0) throw new AggregateError(failures, "Adapter shutdown cleanup failed");
+		};
 		const options = {
 			host: config.bindHost,
 			port: config.bindPort,
 			runtimeRoot: config.statePath,
 			runtimeLock: lock,
 			turnTimeoutMs: config.turnTimeoutMs,
-			checks: buildRuntimeHealthChecks(config, isolationDiagnostics),
+			checks: [
+				...buildRuntimeHealthChecks(config, isolationDiagnostics),
+				{
+					name: "managed-sdk-runtime",
+					get status() {
+						return managedSdkRuntimeHealth.phase === "ready" ? "ok" : "degraded";
+					},
+					get detail() {
+						return managedSdkRuntimeHealth.reason ?? `Managed SDK runtime is ${managedSdkRuntimeHealth.phase}.`;
+					},
+				},
+				{
+					name: "managed-idle-reaper",
+					get status() {
+						return managedIdleReaper?.lastPollFailure === undefined ? "ok" : "degraded";
+					},
+					get detail() {
+						return managedIdleReaper?.lastPollFailure === undefined
+							? "Managed idle reaper has no recorded polling failure."
+							: "Managed idle retirement requires reconciliation after polling failure.";
+					},
+				},
+			],
+			managedSdkRuntime: {
+				runtime: managedSdkRuntime,
+				start: false,
+				health: managedSdkRuntimeHealth,
+				dispose: disposeManagedSdkRuntime,
+			},
 			routes: {
 				projects: [...projectLinkService.listLinkedProjects()],
 				projectProvider: async () => {
@@ -386,31 +672,357 @@ export async function buildResolvedAdapterServerOptions(
 				...(messageSink === undefined ? {} : { messageSink }),
 				...(fileContextResolver === undefined ? {} : { fileContextResolver }),
 			},
-			...(shutdownCleanup === undefined ? {} : { shutdownCleanup }),
+			shutdownCleanup,
 		};
 		return options;
 	} catch (error) {
 		let startupError: unknown = error;
+		let cleanupFailed = false;
+		const disposing = disposeManagedSdkRuntime();
+		void disposing.catch(() => undefined);
 		try {
-			await (idleSessionReaper?.stop() ?? routingRunner?.stop?.());
+			await routingRunner?.stop?.();
 		} catch (stopError) {
-			startupError = new AggregateError([startupError, stopError], "Adapter initialization cleanup failed");
+			cleanupFailed = true;
+			startupError = appendStartupCleanupError(startupError, stopError);
 		}
-		if (internalStore && projectStore !== undefined) {
+		try {
+			await disposing;
+		} catch (disposeError) {
+			cleanupFailed = true;
+			startupError = appendStartupCleanupError(startupError, disposeError);
+		}
+		if (!cleanupFailed && internalStore && projectStore !== undefined) {
 			try {
 				projectStore.close();
 			} catch (closeError) {
+				cleanupFailed = true;
 				startupError = appendStartupCleanupError(startupError, closeError);
 			}
 		}
-		try {
-			await lock.release();
-		} catch (releaseError) {
-			startupError = appendStartupCleanupError(startupError, releaseError);
+		if (!cleanupFailed) {
+			try {
+				await lock.release();
+			} catch (releaseError) {
+				startupError = appendStartupCleanupError(startupError, releaseError);
+			}
 		}
 		throw startupError;
 	}
 }
+
+function assertDirectV3Authority(canonicalPath: string): void {
+	const authority = probeSessionAuthorityEpoch(canonicalPath);
+	if (authority.status !== "v3") throw new Error("Canonical session authority activation is blocked.");
+	const marker = readSessionAuthorityV3ActiveMarker(canonicalPath);
+	if (marker === undefined) throw new Error("Canonical session authority activation is blocked.");
+}
+
+function createManagedReaderFactory(runtime: ManagedSdkRuntime, timeoutMs: number): ModelReaderFactory {
+	return async (context, signal) => {
+		if (context?.managedAuthority === undefined)
+			throw new Error("Managed model catalog access requires explicit tenant or temporary service authority.");
+		if (typeof context.registerSettlement !== "function")
+			throw new Error("Managed model catalog access requires an actual settlement owner.");
+		const registerSettlement = context.registerSettlement.bind(context);
+		const authority = { ...context.managedAuthority };
+		if (isManagedTurnAuthority(authority)) {
+			return createManagedModelReaderFactory({
+				runtime,
+				registerSettlement,
+				timeoutMs,
+				resolveAttachment: async () => ({
+					tenant: {
+						principalId: authority.principalId,
+						projectId: authority.projectId,
+						canonicalWorkspace: authority.canonicalWorkspace,
+						chatId: authority.chatId,
+						sessionId: authority.sessionId,
+						generation: authority.generation,
+						leaseId: authority.leaseId,
+						epoch: authority.epoch,
+					},
+				}),
+			})(context, signal);
+		}
+		if (context?.lease === undefined)
+			throw new Error("Managed temporary model catalog access requires a workspace lease fence.");
+		throw new ManagedSdkOperationError(
+			"exact_close_authority_unavailable",
+			"Durable original lifecycle incarnation receipts are not integrated with catalog cleanup; temporary catalog creation is prohibited.",
+		);
+	};
+}
+
+function isManagedTurnAuthority(
+	authority: ManagedTurnAuthority | ManagedPreparedTurnAuthority,
+): authority is ManagedTurnAuthority {
+	return (
+		"sessionId" in authority &&
+		typeof authority.sessionId === "string" &&
+		authority.sessionId.length > 0 &&
+		typeof authority.generation === "number" &&
+		Number.isSafeInteger(authority.generation) &&
+		authority.generation > 0
+	);
+}
+
+async function assertActiveManagedV3TenantFence(
+	key: TenantSessionKey,
+	mappings: SessionMappingStore | undefined,
+	workspaceRegistry: ReturnType<typeof createUserWorkspaceRegistry>,
+	projectStore: SqliteProjectRegistrationStore | undefined,
+	workspaceLeaseManager: ReturnType<typeof createWorkspaceLeaseManager>,
+): Promise<boolean> {
+	try {
+		if (
+			mappings === undefined ||
+			key.epoch !== SESSION_AUTHORITY_V3_EPOCH ||
+			hasManagedRetirementBarrier(key, mappings)
+		)
+			return false;
+		const lease = parseWorkspaceLeaseId(key.leaseId);
+		const workspace = await workspaceRegistry.resolveBySafeKey(lease.safeKey);
+		const project = projectStore?.getProject(key.projectId);
+		const mapping = mappings?.getScoped({ principalId: key.principalId, chatId: key.chatId });
+		const authority = mapping?.managedAuthority;
+		if (
+			workspace === undefined ||
+			workspace.userId !== key.principalId ||
+			path.resolve(workspace.root) !== key.canonicalWorkspace ||
+			project?.id !== key.projectId ||
+			project.status !== "linked" ||
+			(mappings !== undefined &&
+				(mapping?.principalId !== key.principalId ||
+					mapping.projectId !== key.projectId ||
+					mapping.sessionId !== key.sessionId ||
+					authority === undefined ||
+					authority.principalId !== key.principalId ||
+					authority.projectId !== key.projectId ||
+					authority.canonicalWorkspace !== key.canonicalWorkspace ||
+					authority.chatId !== key.chatId ||
+					authority.sessionId !== key.sessionId ||
+					authority.generation !== key.generation ||
+					authority.leaseId !== key.leaseId ||
+					authority.epoch !== key.epoch))
+		)
+			return false;
+		await workspaceLeaseManager.assertFence(lease);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function assertPreparedManagedTenantFence(
+	authority: ManagedPreparedTurnAuthority,
+	workspaceRegistry: ReturnType<typeof createUserWorkspaceRegistry>,
+	projectStore: SqliteProjectRegistrationStore | undefined,
+	workspaceLeaseManager: ReturnType<typeof createWorkspaceLeaseManager>,
+	mappings: SessionMappingStore,
+): Promise<boolean> {
+	try {
+		const lease = parseWorkspaceLeaseId(authority.leaseId);
+		const workspace = await workspaceRegistry.resolveBySafeKey(lease.safeKey);
+		const project = projectStore?.getProject(authority.projectId);
+		if (
+			workspace?.userId !== authority.principalId ||
+			path.resolve(workspace.root) !== authority.canonicalWorkspace ||
+			project?.status !== "linked" ||
+			authority.epoch !== SESSION_AUTHORITY_V3_EPOCH ||
+			!authority.chatId ||
+			!authority.requestKey
+		)
+			return false;
+		const operations = mappings.lifecycleOperationsScoped({
+			principalId: authority.principalId,
+			chatId: authority.chatId,
+		});
+		if (
+			!operations.some(operation => {
+				const lifecycle = operation.lifecycle;
+				return (
+					!("purpose" in operation && operation.purpose === "model-catalog") &&
+					lifecycle !== undefined &&
+					operation.state === "pending" &&
+					(lifecycle.state === "intent_prepared" || lifecycle.state === "invoking") &&
+					lifecycle.requestKey === authority.requestKey &&
+					lifecycle.payloadHash === operation.detail &&
+					Object.entries(lifecycle.preparedAuthority).every(
+						([field, value]) => Reflect.get(authority, field) === value,
+					)
+				);
+			})
+		)
+			return false;
+		await workspaceLeaseManager.assertFence(lease);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function assertCatalogManagedTenantFence(
+	reference: ManagedSdkCatalogReference,
+	key: TenantSessionKey,
+	access: ManagedSdkCatalogAccess,
+	mappings: V3FileBackedSessionMappingStore,
+	projectStore: SqliteProjectRegistrationStore | undefined,
+	workspaceLeaseManager: ReturnType<typeof createWorkspaceLeaseManager>,
+): boolean {
+	try {
+		const original = reference.original;
+		if (
+			!isManagedCatalogProvisional(original) ||
+			original.purpose !== "model-catalog" ||
+			original.state !== "pending" ||
+			original.lifecycle?.state !== "intent_prepared" ||
+			original.cleanup !== undefined ||
+			original.lateCreateAcknowledgement !== undefined ||
+			key.epoch !== SESSION_AUTHORITY_V3_EPOCH ||
+			projectStore?.getProject(key.projectId)?.status !== "linked" ||
+			(access.kind !== "proof" &&
+				(access.kind !== "query" ||
+					!["models.list/current", "providers.list/active", "session.state"].includes(access.name)))
+		)
+			return false;
+		const current = mappings.catalogProvisionalSnapshot(key, original.id);
+		const evidence = current?.lifecycle;
+		if (
+			current === undefined ||
+			current.state !== "pending" ||
+			current.cleanup !== undefined ||
+			current.lateCreateAcknowledgement !== undefined ||
+			evidence === undefined ||
+			evidence.state !== (access.kind === "proof" ? "acknowledged_unproven" : "active_generation_proven") ||
+			managedLifecycleEvidenceHash(evidence) !== reference.expectedLifecycleHash ||
+			current.id !== original.id ||
+			current.ingressId !== original.ingressId ||
+			current.startedAt !== original.startedAt ||
+			current.projectId !== original.projectId ||
+			current.detail !== original.detail ||
+			!isDeepStrictEqual(evidence.preparedAuthority, original.lifecycle!.preparedAuthority) ||
+			evidence.requestHash !== original.lifecycle!.requestHash ||
+			!isDeepStrictEqual(evidence.target, original.lifecycle!.target) ||
+			evidence.acknowledged === undefined ||
+			!Object.entries(key).every(([field, value]) => Reflect.get(evidence.acknowledged!, field) === value)
+		)
+			return false;
+		workspaceLeaseManager.assertFenceSync(parseWorkspaceLeaseId(key.leaseId));
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function assertStagedManagedTenantFence(
+	key: TenantSessionKey,
+	access: ManagedSdkAccess,
+	mappings: SessionMappingStore,
+	workspaceRegistry: ReturnType<typeof createUserWorkspaceRegistry>,
+	projectStore: SqliteProjectRegistrationStore | undefined,
+	workspaceLeaseManager: ReturnType<typeof createWorkspaceLeaseManager>,
+): Promise<boolean> {
+	if (access.kind === "retirement") return false;
+	try {
+		const scope = { principalId: key.principalId, chatId: key.chatId };
+		const operations = mappings.lifecycleOperationsScoped(scope);
+		const candidates = operations.filter(operation => {
+			const lifecycle = operation.lifecycle;
+			if (
+				("purpose" in operation && operation.purpose === "model-catalog") ||
+				operation.state !== "pending" ||
+				lifecycle === undefined ||
+				lifecycle.payloadHash !== operation.detail ||
+				lifecycle.acknowledged === undefined
+			)
+				return false;
+			if (
+				access.kind === "adoption-proof" &&
+				(operation.id !== access.operationId ||
+					lifecycle.requestKey !== access.requestKey ||
+					lifecycle.payloadHash !== access.payloadHash)
+			)
+				return false;
+			if (
+				access.kind === "active"
+					? lifecycle.state !== "active_generation_proven"
+					: lifecycle.state !== "acknowledged_unproven"
+			)
+				return false;
+			return Object.entries(key).every(([field, value]) => Reflect.get(lifecycle.acknowledged!, field) === value);
+		});
+		if (candidates.length !== 1) return false;
+		const lease = parseWorkspaceLeaseId(key.leaseId);
+		const workspace = await workspaceRegistry.resolveBySafeKey(lease.safeKey);
+		if (
+			workspace?.userId !== key.principalId ||
+			path.resolve(workspace.root) !== key.canonicalWorkspace ||
+			projectStore?.getProject(key.projectId)?.status !== "linked" ||
+			key.epoch !== SESSION_AUTHORITY_V3_EPOCH
+		)
+			return false;
+		await workspaceLeaseManager.assertFence(lease);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function managedTenantIdentity(key: TenantSessionKey): string {
+	return JSON.stringify([
+		key.principalId,
+		key.projectId,
+		key.canonicalWorkspace,
+		key.chatId,
+		key.sessionId,
+		key.generation,
+		key.leaseId,
+		key.epoch,
+	]);
+}
+
+function hasManagedRetirementBarrier(key: TenantSessionKey, mappings: SessionMappingStore): boolean {
+	return mappings.operationsScoped({ principalId: key.principalId, chatId: key.chatId }).some(operation => {
+		if (operation.kind !== "close") return false;
+		if (operation.state === "pending" || operation.state === "uncertain") return true;
+		const retired = operation.result?.managedAuthority;
+		return (
+			operation.state === "complete" &&
+			retired !== undefined &&
+			managedTenantIdentity(retired) === managedTenantIdentity(key)
+		);
+	});
+}
+
+async function assertRetirementOperationFence(
+	key: TenantSessionKey,
+	lease: WorkspaceLease,
+	mappings: SessionMappingStore,
+	workspaceRegistry: ReturnType<typeof createUserWorkspaceRegistry>,
+	projectStore: SqliteProjectRegistrationStore | undefined,
+	workspaceLeaseManager: ReturnType<typeof createWorkspaceLeaseManager>,
+): Promise<boolean> {
+	try {
+		const historic = parseWorkspaceLeaseId(key.leaseId);
+		if (lease.safeKey !== historic.safeKey || lease.operation !== "reaper") return false;
+		const workspace = await workspaceRegistry.resolveBySafeKey(lease.safeKey);
+		const authority = mappings.getScoped({ principalId: key.principalId, chatId: key.chatId })?.managedAuthority;
+		if (
+			workspace?.userId !== key.principalId ||
+			path.resolve(workspace.root) !== key.canonicalWorkspace ||
+			projectStore?.getProject(key.projectId)?.status !== "linked" ||
+			authority === undefined ||
+			managedTenantIdentity(authority) !== managedTenantIdentity(key)
+		)
+			return false;
+		await workspaceLeaseManager.assertFence(lease);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 async function replayPrincipalProjection(
 	input: PrincipalProjectionSynchronizerInput,
 	principalClient: OpenWebUIPrincipalClient,
@@ -493,12 +1105,66 @@ function createWorkspaceAuthorityCoordinator(
 				if (result.status !== "closed")
 					throw new Error(`Workspace cleanup could not close session authority for chat ${mapping.chatId}`);
 				await assertFence();
-				mappings.retireScoped({ principalId, chatId: mapping.chatId });
+				const scope = { principalId, chatId: mapping.chatId };
+				if (isCanonicalManagedV3Mapping(mapping)) {
+					const current = mappings.getScoped(scope);
+					if (current === undefined || !sameCanonicalManagedV3Authority(current, mapping))
+						throw new Error(
+							`Workspace cleanup found a changed canonical V3 generation for chat ${mapping.chatId}`,
+						);
+				}
+				mappings.retireScoped(scope);
 				await assertFence();
 			}
 		},
 	};
 }
+
+function isCanonicalManagedV3Mapping(mapping: SessionMapping): boolean {
+	const authority = mapping.managedAuthority as
+		| (ManagedTurnAuthority & { readonly authorityEpoch?: unknown })
+		| undefined;
+	return (
+		authority !== undefined &&
+		authority.authorityEpoch === SESSION_AUTHORITY_V3_EPOCH &&
+		authority.chatId === mapping.chatId &&
+		authority.projectId === mapping.projectId &&
+		authority.sessionId === mapping.sessionId &&
+		mapping.principalId === authority.principalId
+	);
+}
+
+function sameCanonicalManagedV3Authority(left: SessionMapping, right: SessionMapping): boolean {
+	const leftAuthority = left.managedAuthority as
+		| (ManagedTurnAuthority & { readonly authorityEpoch?: unknown })
+		| undefined;
+	const rightAuthority = right.managedAuthority as
+		| (ManagedTurnAuthority & { readonly authorityEpoch?: unknown })
+		| undefined;
+	if (
+		leftAuthority === undefined ||
+		rightAuthority === undefined ||
+		leftAuthority.authorityEpoch !== SESSION_AUTHORITY_V3_EPOCH ||
+		rightAuthority.authorityEpoch !== SESSION_AUTHORITY_V3_EPOCH
+	)
+		return false;
+	return (
+		left.chatId === right.chatId &&
+		left.projectId === right.projectId &&
+		left.sessionId === right.sessionId &&
+		left.principalId === right.principalId &&
+		leftAuthority.principalId === rightAuthority.principalId &&
+		leftAuthority.projectId === rightAuthority.projectId &&
+		leftAuthority.canonicalWorkspace === rightAuthority.canonicalWorkspace &&
+		leftAuthority.chatId === rightAuthority.chatId &&
+		leftAuthority.sessionId === rightAuthority.sessionId &&
+		leftAuthority.generation === rightAuthority.generation &&
+		leftAuthority.leaseId === rightAuthority.leaseId &&
+		leftAuthority.epoch === rightAuthority.epoch &&
+		leftAuthority.requestKey === rightAuthority.requestKey
+	);
+}
+
 function appendStartupCleanupError(startupError: unknown, cleanupError: unknown): unknown {
 	if (!(startupError instanceof Error))
 		return new AggregateError([startupError, cleanupError], "Startup failure cleanup failed");

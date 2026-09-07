@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { SessionMappingStore } from "../src/gjc/session-router";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
+import { managedPreparedAuthority } from "./gjc-lifecycle-fixtures";
 import { FakeGjcTurnRunner, project } from "./gjc-routing-runner-fixtures";
 import { staticModelReaderFactory } from "./model-selection-fixtures";
 
@@ -104,6 +105,13 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 			messageId: "assistant-1",
 			userMessageId: "user-1",
 			userMessageParentId: null,
+			ownerUserId: "owner-test",
+			preparedManagedAuthority: managedPreparedAuthority({
+				projectId: project.id,
+				canonicalWorkspace: project.cwd,
+				chatId: "chat-1",
+				requestKey: "user-1",
+			}),
 			continued: false,
 			requestedModelId: "gjc",
 			onLiveEvents: events => {
@@ -174,6 +182,13 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 			messageId: "assistant-lease-abort",
 			userMessageId: "user-lease-abort",
 			userMessageParentId: null,
+			ownerUserId: "owner-test",
+			preparedManagedAuthority: managedPreparedAuthority({
+				projectId: project.id,
+				canonicalWorkspace: project.cwd,
+				chatId: "chat-lease-abort",
+				requestKey: "user-lease-abort",
+			}),
 			continued: false,
 			requestedModelId: "gjc",
 			onLiveEvents: async () => {
@@ -209,6 +224,13 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 				messageId: "assistant-failed",
 				userMessageId: "user-failed",
 				userMessageParentId: null,
+				ownerUserId: "owner-test",
+				preparedManagedAuthority: managedPreparedAuthority({
+					projectId: project.id,
+					canonicalWorkspace: project.cwd,
+					chatId: "chat-failed",
+					requestKey: "user-failed",
+				}),
 				continued: false,
 				requestedModelId: "gjc",
 				onLiveEvents: events => {
@@ -218,7 +240,7 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 		).rejects.toThrow("GJC prompt failed");
 		expect(liveEvents).toEqual([]);
 	});
-	test("preserves artifact fallback events after observing a terminal frame", async () => {
+	test("preserves late result events before projecting terminal completion", async () => {
 		const turnRunner = new FakeGjcTurnRunner();
 		turnRunner.observedEvents = [{ type: "agent_start" }, { type: "agent_end" }];
 		turnRunner.events = [
@@ -238,10 +260,17 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 		const result = await runner.run({
 			project,
 			prompt: "hello",
-			chatId: "chat-artifact-fallback",
-			messageId: "assistant-artifact-fallback",
-			userMessageId: "user-artifact-fallback",
+			chatId: "chat-late-events",
+			messageId: "assistant-late-events",
+			userMessageId: "user-late-events",
 			userMessageParentId: null,
+			ownerUserId: "owner-test",
+			preparedManagedAuthority: managedPreparedAuthority({
+				projectId: project.id,
+				canonicalWorkspace: project.cwd,
+				chatId: "chat-late-events",
+				requestKey: "user-late-events",
+			}),
 			continued: false,
 			requestedModelId: "gjc",
 			onLiveEvents: events => {
@@ -266,6 +295,7 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 		"streams native text deltas from %s before terminal persistence completes",
 		async field => {
 			const turnRunner = new FakeGjcTurnRunner();
+			observeManagedEventsBeforeCompletion(turnRunner);
 			let release!: () => void;
 			turnRunner.completionBarrier = new Promise<void>(resolve => {
 				release = resolve;
@@ -289,6 +319,13 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 				messageId: "assistant-stream",
 				userMessageId: "user-stream",
 				userMessageParentId: null,
+				ownerUserId: "owner-test",
+				preparedManagedAuthority: managedPreparedAuthority({
+					projectId: project.id,
+					canonicalWorkspace: project.cwd,
+					chatId: "chat-stream",
+					requestKey: "user-stream",
+				}),
 				continued: false,
 				requestedModelId: "gjc",
 				onLiveEvents: () => undefined,
@@ -313,24 +350,28 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 	);
 	test("fails a streaming reassignment when rollback persistence fails", async () => {
 		class RollbackFailingMappings extends SessionMappingStore {
-			override rollbackProjectReassignment(): void {
+			override rollbackProjectReassignmentScoped(): void {
 				throw new Error("rollback persistence failed");
 			}
 		}
 
 		const mappings = new RollbackFailingMappings();
-		mappings.set({
-			chatId: "chat-stream-rollback",
-			projectId: project.id,
-			sessionId: "session-a",
-			sessionFile: "/workspace/project/.gjc/sessions/session-a.jsonl",
-			operationId: "operation-a",
-			rawFrameCursor: 1,
-			eventCursor: 1,
-		});
+		mappings.setScoped(
+			{ principalId: "owner-test", chatId: "chat-stream-rollback" },
+			{
+				chatId: "chat-stream-rollback",
+				projectId: project.id,
+				sessionId: "session-a",
+				managedAuthority: managedPreparedAuthority({ chatId: "chat-stream-rollback", sessionId: "session-a" }),
+				operationId: "operation-a",
+				rawFrameCursor: 1,
+				eventCursor: 1,
+			},
+		);
 		const turnRunner = new FakeGjcTurnRunner();
 		turnRunner.observedEvents = [{ type: "assistant", text: "starting" }];
 		turnRunner.completionError = new Error("destination failed");
+		observeManagedEventsBeforeCompletion(turnRunner);
 		const result = await createGjcRoutingLiveGatewayRunner({
 			turnRunner,
 			mappings,
@@ -342,6 +383,13 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 			messageId: "assistant-b",
 			userMessageId: "operation-b",
 			userMessageParentId: "operation-a",
+			ownerUserId: "owner-test",
+			preparedManagedAuthority: managedPreparedAuthority({
+				projectId: "project-b",
+				canonicalWorkspace: "/workspace/project-b",
+				chatId: "chat-stream-rollback",
+				requestKey: "operation-b",
+			}),
 			continued: true,
 			requestedModelId: "gjc",
 			onLiveEvents: () => undefined,
@@ -353,6 +401,20 @@ describe("createGjcRoutingLiveGatewayRunner session event projection", () => {
 		);
 	});
 });
+
+function observeManagedEventsBeforeCompletion(turnRunner: FakeGjcTurnRunner): void {
+	const originalStartManagedSession = turnRunner.startManagedSession.bind(turnRunner);
+	turnRunner.startManagedSession = async (input, publish, beforePrompt) => {
+		for (const event of turnRunner.observedEvents ?? turnRunner.events) await input.observer?.(event);
+		const observedEvents = turnRunner.observedEvents;
+		turnRunner.observedEvents = [];
+		try {
+			return await originalStartManagedSession(input, publish, beforePrompt);
+		} finally {
+			turnRunner.observedEvents = observedEvents;
+		}
+	};
+}
 
 function status(description: string, done?: boolean, frameKind?: string) {
 	return expect.objectContaining({

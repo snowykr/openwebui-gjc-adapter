@@ -1,23 +1,30 @@
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { NormalizedModelSelection } from "../src/contracts";
-import { SessionAuthorityLoadError } from "../src/gjc/session-authority";
-import {
-	FileBackedSessionMappingStore,
-	SessionFileBoundaryError,
-	SessionMappingStore,
-} from "../src/gjc/session-router";
+import { isManagedLifecycleEvidence } from "../src/gjc/managed-lifecycle-evidence";
+import type { ManagedSdkRuntime } from "../src/gjc/managed-sdk-runtime";
+import { scopedSessionMappingStore } from "../src/gjc/scoped-session-mapping-store";
+import { canonicalSessionMappingKey, SessionAuthorityLoadError } from "../src/gjc/session-authority";
+import { FileBackedSessionMappingStore, type SessionMappingStore } from "../src/gjc/session-router";
+import { V3FileBackedSessionMappingStore } from "../src/gjc/session-v3-file-backed-mapping-store";
 import type {
 	GjcLifecycleTransaction,
+	GjcRespondWorkflowGateInput,
 	GjcSessionAddress,
 	GjcStartNewSessionInput,
 	GjcTurnResult,
+	ManagedGenerationProof,
+	ManagedPreparedTurnAuthority,
 } from "../src/gjc/turn-runner";
+import { GjcTurnCancelledError } from "../src/gjc/turn-runner";
+import { createManagedGjcTurnRunner } from "../src/live/gjc-managed-turn-runner";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-runner";
 import { projectTurnEvents, synthesizeProjectionRows } from "../src/live/workflow-gate-projection";
+import { handleWorkflowGateReply } from "../src/live/workflow-gate-turns";
 import { InMemoryOutboxStore } from "../src/state/outbox";
+import { lifecycleFixture, managedPreparedAuthority } from "./gjc-lifecycle-fixtures";
 import {
 	decisionWorkflowGateEvent,
 	deepInterviewWorkflowGateEvent,
@@ -25,11 +32,49 @@ import {
 	project,
 } from "./gjc-routing-runner-fixtures";
 
+const ownerUserId = "owner-test";
+const roots: string[] = [];
+afterEach(() => {
+	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+function managedMappingStore(): V3FileBackedSessionMappingStore {
+	const root = mkdtempSync(join(tmpdir(), "gjc-gate-v3-"));
+	roots.push(root);
+	return new V3FileBackedSessionMappingStore(join(root, "mappings.json"));
+}
+
+class PreDispatchCancellationWorkflowGateRunner extends FakeGjcTurnRunner {
+	#first = true;
+
+	constructor(private readonly cancelBeforeDispatch: () => void) {
+		super();
+	}
+
+	async respondWorkflowGate(input: GjcRespondWorkflowGateInput): Promise<GjcTurnResult> {
+		if (this.#first) {
+			this.#first = false;
+			this.gateResponses.push(input);
+			this.cancelBeforeDispatch();
+			throw new GjcTurnCancelledError();
+		}
+		return await super.respondWorkflowGate(input);
+	}
+}
+
+class DispatchedErrorWorkflowGateRunner extends FakeGjcTurnRunner {
+	async respondWorkflowGate(input: GjcRespondWorkflowGateInput): Promise<GjcTurnResult> {
+		this.gateResponses.push(input);
+		input.onDispatch?.();
+		throw new Error("workflow gate failed after dispatch");
+	}
+}
+
 describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 	test("surfaces workflow gate options as the assistant message", async () => {
 		const turnRunner = new FakeGjcTurnRunner();
 		turnRunner.events = [deepInterviewWorkflowGateEvent];
-		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings: new SessionMappingStore() });
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings: managedMappingStore() });
 
 		const result = await runner.run({
 			project,
@@ -38,6 +83,13 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 			messageId: "assistant-1",
 			userMessageId: "user-1",
 			userMessageParentId: null,
+			ownerUserId: "owner-test",
+			preparedManagedAuthority: managedPreparedAuthority({
+				projectId: project.id,
+				canonicalWorkspace: project.cwd,
+				chatId: "chat-1",
+				requestKey: "user-1",
+			}),
 			continued: false,
 		});
 
@@ -65,10 +117,384 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 				gateCorrelation: { commandId: "command-1", turnId: "turn-1", sessionId: "session-1" },
 			},
 		]);
-		expect(mappings.get("chat-1")?.attachment).toMatchObject({
-			expectedSessionId: "session-1",
-			expectedCwd: project.cwd,
+		expect(mappings.get("chat-1")?.managedAuthority).toMatchObject({
+			principalId: ownerUserId,
+			sessionId: "session-1",
+			canonicalWorkspace: project.cwd,
 		});
+		for (const field of ["sessionFile", "recoveryAttachment", "activeLeaf"])
+			expect(turnRunner.gateResponses[0]).not.toHaveProperty(field);
+		expect(mappings.get("chat-1")?.attachment).toBeUndefined();
+	});
+	test("cleans up a pre-aborted workflow gate reply so the same message can retry", async () => {
+		const turnRunner = new FakeGjcTurnRunner();
+		const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent);
+		const cancellations: unknown[] = [];
+		const cleared: unknown[] = [];
+		turnRunner.cancelTurn = cancellation => cancellations.push(cancellation);
+		Object.assign(turnRunner, {
+			clearTurnCancellation: (cancellation: unknown) => cleared.push(cancellation),
+		});
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings });
+		const controller = new AbortController();
+		controller.abort();
+
+		await expect(runner.run({ ...replyInput("1"), signal: controller.signal })).rejects.toMatchObject({
+			name: "GjcTurnCancelledError",
+		});
+		expect(cancellations).toHaveLength(0);
+		expect(cleared).toHaveLength(1);
+		expect(cleared[0]).toMatchObject({
+			principalId: ownerUserId,
+			projectId: project.id,
+			chatId: "chat-1",
+			sessionId: "session-1",
+			operationId: "user-2",
+			managedAuthority: managedPreparedAuthority(),
+		});
+		expect(mappings.operation("chat-1", "user-2")).toBeUndefined();
+		expect(turnRunner.gateResponses).toHaveLength(0);
+
+		await expect(runner.run(replyInput("1"))).resolves.toEqual({ content: "workflow gate accepted" });
+		expect(turnRunner.gateResponses).toHaveLength(1);
+	});
+	test("discards a workflow gate cancelled after begin but before SDK dispatch so the same ID can retry", async () => {
+		const controller = new AbortController();
+		const turnRunner = new PreDispatchCancellationWorkflowGateRunner(() => controller.abort());
+		const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent);
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings });
+
+		await expect(runner.run({ ...replyInput("1"), signal: controller.signal })).rejects.toMatchObject({
+			name: "GjcTurnCancelledError",
+		});
+		expect(mappings.operation("chat-1", "user-2")).toBeUndefined();
+
+		await expect(runner.run(replyInput("1"))).resolves.toEqual({ content: "workflow gate accepted" });
+		expect(mappings.operation("chat-1", "user-2")).toMatchObject({ state: "complete" });
+	});
+	test("does not send a terminal abort before gate dispatch and retries the same message", async () => {
+		const authority = managedPreparedAuthority();
+		let cancellation = new AbortController();
+		let answerCalls = 0;
+		let abortCalls = 0;
+		let subscriptionsClosed = 0;
+		const requests: Record<string, unknown>[] = [];
+		const currentAttachment = { tenant: authority, generation: authority.generation, isCurrent: () => true };
+		const runtime = {
+			state: "running",
+			async reconcile() {},
+			async acquireAttachment() {
+				return currentAttachment;
+			},
+			prepareFrameSubscription(
+				_attachment: unknown,
+				operation: string,
+				listener: Parameters<ManagedSdkRuntime["prepareFrameSubscription"]>[2],
+			) {
+				let active = true;
+				let delivery = Promise.resolve();
+				return Object.assign(
+					() => {
+						if (!active) return;
+						active = false;
+						subscriptionsClosed += 1;
+					},
+					{
+						bind(correlation: Parameters<ReturnType<ManagedSdkRuntime["prepareFrameSubscription"]>["bind"]>[0]) {
+							if (answerCalls !== 2) return;
+							delivery = Promise.resolve().then(async () => {
+								if (!active) return;
+								await listener({
+									tenant: authority,
+									operation,
+									correlation,
+									frame: {
+										name: "event",
+										body: { type: "agent_end", finalText: "accepted" },
+										...correlation,
+										sessionId: authority.sessionId,
+										generation: authority.generation,
+										seq: 1,
+									},
+								});
+							});
+						},
+						async drain() {
+							await delivery;
+						},
+					},
+				);
+			},
+			async request(
+				_attachment: unknown,
+				frame: Record<string, unknown>,
+				options?: { beforeDispatch?: () => void; onDispatch?: () => void },
+			) {
+				if (frame.type === "query_request")
+					return { type: "query_response", ok: true, page: { items: [], complete: true } };
+				if (frame.operation === "workflow.gate_answer") {
+					answerCalls += 1;
+					if (answerCalls === 1) cancellation.abort();
+				}
+				options?.beforeDispatch?.();
+				requests.push(frame);
+				options?.onDispatch?.();
+				if (frame.operation === "turn.abort") abortCalls += 1;
+				if (frame.operation === "workflow.gate_answer" && answerCalls === 3) cancellation.abort();
+				return {
+					type: "control_response",
+					ok: true,
+					result: { commandId: "command-1", turnId: "turn-1", accepted: true },
+				};
+			},
+		} as unknown as ManagedSdkRuntime;
+		const turnRunner = createManagedGjcTurnRunner(runtime);
+		const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent);
+		const outbox = new InMemoryOutboxStore();
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings, outbox });
+		const answer = (userMessageId = "user-2") =>
+			runner.run({ ...replyInput("1"), userMessageId, signal: cancellation.signal });
+		await expect(answer()).rejects.toMatchObject({
+			name: "GjcTurnCancelledError",
+		});
+		expect(abortCalls).toBe(0);
+		expect(requests).toHaveLength(0);
+		expect(mappings.operation("chat-1", "user-2")).toBeUndefined();
+		expect(outbox.listPending()).toHaveLength(0);
+		cancellation = new AbortController();
+		await expect(answer()).resolves.toMatchObject({ content: "accepted" });
+		expect(answerCalls).toBe(2);
+		expect(abortCalls).toBe(0);
+		expect(mappings.operation("chat-1", "user-2")?.state).toBe("complete");
+		mappings.upsert({
+			...requiredMapping(mappings),
+			events: [deepInterviewWorkflowGateEvent],
+		});
+		const beforeCancellation = requiredMapping(mappings);
+		const rowsBeforeCancellation = outbox.listPending();
+		await expect(answer("user-3")).rejects.toMatchObject({
+			name: "GjcTurnCancelledError",
+		});
+		expect(abortCalls).toBe(1);
+		expect(requests.map(frame => frame.operation)).toEqual([
+			"workflow.gate_answer",
+			"workflow.gate_answer",
+			"turn.abort",
+		]);
+		expect(requests[0]).toMatchObject({
+			idempotencyKey: "chat-1:user-2",
+			input: { id: "gate-deep-1", response: { selected: ["JWT"] }, expectedSessionId: authority.sessionId },
+		});
+		expect(subscriptionsClosed).toBe(3);
+		expect(mappings.operation("chat-1", "user-3")?.state).toBe("uncertain");
+		expect(mappings.operation("chat-1", "user-3")?.result).toBeUndefined();
+		expect(requiredMapping(mappings)).toEqual(beforeCancellation);
+		expect(outbox.listPending()).toEqual(rowsBeforeCancellation);
+	});
+	test("retains uncertain workflow gate authority when an SDK dispatch was acknowledged before an error", async () => {
+		const turnRunner = new DispatchedErrorWorkflowGateRunner();
+		const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent);
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings });
+
+		await expect(runner.run(replyInput("1"))).rejects.toThrow("workflow gate failed after dispatch");
+		expect(mappings.operation("chat-1", "user-2")).toMatchObject({
+			state: "uncertain",
+			id: "user-2",
+		});
+	});
+	test("requires complete mapped managed tenant authority before dispatch", async () => {
+		const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent);
+		const mapping = requiredMapping(mappings);
+		const authority = managedPreparedAuthority();
+		for (const managedAuthority of [
+			undefined,
+			{ ...authority, principalId: "foreign-owner" },
+			{ ...authority, projectId: "foreign-project" },
+			{ ...authority, canonicalWorkspace: "/foreign/workspace" },
+			{ ...authority, chatId: "foreign-chat" },
+			{ ...authority, sessionId: "foreign-session" },
+			{ ...authority, generation: 0 },
+			{ ...authority, generation: 1.5 },
+			{ ...authority, leaseId: "" },
+			{ ...authority, epoch: "" },
+			{ ...authority, requestKey: " " },
+		]) {
+			const turnRunner = new FakeGjcTurnRunner();
+			await expect(
+				handleWorkflowGateReply(
+					{ turnRunner, mappings },
+					replyInput("1"),
+					{ ...mapping, managedAuthority },
+					gateLifecycle(mapping),
+				),
+			).rejects.toThrow("exact principal, workspace, and session authority");
+			expect(turnRunner.gateResponses).toHaveLength(0);
+			expect(mappings.operation("chat-1", "user-2")).toBeUndefined();
+		}
+		const turnRunner = new FakeGjcTurnRunner();
+		await expect(
+			handleWorkflowGateReply(
+				{ turnRunner, mappings },
+				{ ...replyInput("1"), ownerUserId: undefined },
+				mapping,
+				gateLifecycle(mapping),
+			),
+		).rejects.toThrow("exact principal, workspace, and session authority");
+		expect(turnRunner.gateResponses).toHaveLength(0);
+	});
+	test("requires managed lifecycle publication before dispatch without a legacy fallback", async () => {
+		const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent);
+		const mapping = requiredMapping(mappings);
+		const turnRunner = new FakeGjcTurnRunner();
+		await expect(
+			handleWorkflowGateReply({ turnRunner, mappings }, replyInput("1"), mapping, {
+				...gateLifecycle(mapping),
+				publishManaged: undefined,
+			} as unknown as GjcLifecycleTransaction),
+		).rejects.toThrow("requires managed lifecycle publication");
+		expect(turnRunner.gateResponses).toHaveLength(0);
+		expect(mappings.operation("chat-1", "user-2")).toBeUndefined();
+	});
+	test("rejects foreign gate correlation before managed dispatch", async () => {
+		const mappings = pendingGateMappings({
+			...deepInterviewWorkflowGateEvent,
+			payload: { ...deepInterviewWorkflowGateEvent.payload, sessionId: "foreign-session" },
+		});
+		const turnRunner = new FakeGjcTurnRunner();
+		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings });
+		await expect(runner.run(replyInput("1"))).rejects.toThrow("correlation does not match");
+		expect(turnRunner.gateResponses).toHaveLength(0);
+		expect(mappings.operation("chat-1", "user-2")).toBeUndefined();
+	});
+	test("rejects missing or changed managed result authority and proof without publishing", async () => {
+		const authority = managedPreparedAuthority();
+		const proof: ManagedGenerationProof = {
+			kind: "managed-generation",
+			sessionId: authority.sessionId,
+			generation: authority.generation,
+			leaseId: authority.leaseId,
+			epoch: authority.epoch,
+		};
+		const changes: Partial<GjcTurnResult>[] = [
+			{ managedAuthority: undefined },
+			{ managedProof: undefined },
+			...(
+				[
+					["principalId", "foreign-owner"],
+					["projectId", "foreign-project"],
+					["canonicalWorkspace", "/foreign/workspace"],
+					["chatId", "foreign-chat"],
+					["sessionId", "foreign-session"],
+					["generation", 2],
+					["leaseId", "foreign-lease"],
+					["epoch", "foreign-epoch"],
+					["requestKey", ""],
+					["requestKey", "foreign-request"],
+				] as const
+			).map(([field, value]) => ({ managedAuthority: { ...authority, [field]: value } })),
+			...(
+				[
+					["sessionId", "foreign-session"],
+					["generation", 2],
+					["leaseId", "foreign-lease"],
+					["epoch", "foreign-epoch"],
+				] as const
+			).map(([field, value]) => ({ managedProof: { ...proof, [field]: value } })),
+		];
+		for (const change of changes) {
+			const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent);
+			const mapping = requiredMapping(mappings);
+			class ChangedResultRunner extends FakeGjcTurnRunner {
+				async respondWorkflowGate(input: GjcRespondWorkflowGateInput): Promise<GjcTurnResult> {
+					return { ...(await super.respondWorkflowGate(input)), ...change };
+				}
+			}
+			const turnRunner = new ChangedResultRunner();
+			const outbox = new InMemoryOutboxStore();
+			let publicationCalls = 0;
+			const lifecycle: GjcLifecycleTransaction = {
+				...gateLifecycle(mapping),
+				async publishManaged() {
+					publicationCalls += 1;
+					throw new Error("invalid publication");
+				},
+			};
+			await expect(
+				handleWorkflowGateReply({ turnRunner, mappings, outbox }, replyInput("1"), mapping, lifecycle),
+			).rejects.toThrow("matching current managed authority and proof");
+			expect(publicationCalls).toBe(0);
+			expect(requiredMapping(mappings)).toEqual(mapping);
+			expect(mappings.operation("chat-1", "user-2")?.state).toBe("uncertain");
+			expect(outbox.listPending()).toHaveLength(0);
+		}
+	});
+	test("uses managed publication exclusively for a matching result", async () => {
+		const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent);
+		const mapping = requiredMapping(mappings);
+		const fixture = gateLifecycle(mapping);
+		let managedPublications = 0;
+		const lifecycle: GjcLifecycleTransaction = {
+			...fixture,
+			async publishManaged(proof, write) {
+				managedPublications += 1;
+				return await fixture.publishManaged!(proof, write);
+			},
+		};
+		await expect(
+			handleWorkflowGateReply(
+				{ turnRunner: new FakeGjcTurnRunner(), mappings },
+				replyInput("1"),
+				mapping,
+				lifecycle,
+			),
+		).resolves.toEqual({ content: "workflow gate accepted" });
+		expect(managedPublications).toBe(1);
+		expect(mappings.operation("chat-1", "user-2")?.state).toBe("complete");
+	});
+	test("accepts result authority bound to the current gate ingress without changing its generation", async () => {
+		const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent);
+		const mapping = requiredMapping(mappings);
+		class IngressBoundResultRunner extends FakeGjcTurnRunner {
+			async respondWorkflowGate(input: GjcRespondWorkflowGateInput): Promise<GjcTurnResult> {
+				const result = await super.respondWorkflowGate(input);
+				return { ...result, managedAuthority: managedPreparedAuthority({ requestKey: input.userMessageId }) };
+			}
+		}
+		await expect(
+			handleWorkflowGateReply(
+				{ turnRunner: new IngressBoundResultRunner(), mappings },
+				replyInput("1"),
+				mapping,
+				gateLifecycle(mapping),
+			),
+		).resolves.toEqual({ content: "workflow gate accepted" });
+		expect(requiredMapping(mappings).managedAuthority).toEqual(managedPreparedAuthority({ requestKey: "user-2" }));
+	});
+	test("does not publish a dispatched gate when cancellation arrives at publication", async () => {
+		const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent);
+		const mapping = requiredMapping(mappings);
+		const cancellation = new AbortController();
+		const outbox = new InMemoryOutboxStore();
+		const turnRunner = new FakeGjcTurnRunner();
+		const lifecycle: GjcLifecycleTransaction = {
+			...gateLifecycle(mapping),
+			async publishManaged(_proof, write) {
+				cancellation.abort();
+				return write();
+			},
+		};
+		await expect(
+			handleWorkflowGateReply(
+				{ turnRunner, mappings, outbox },
+				{ ...replyInput("1"), signal: cancellation.signal },
+				mapping,
+				lifecycle,
+			),
+		).rejects.toMatchObject({ name: "GjcTurnCancelledError" });
+		expect(turnRunner.gateResponses).toHaveLength(1);
+		expect(requiredMapping(mappings)).toEqual(mapping);
+		expect(mappings.operation("chat-1", "user-2")?.state).toBe("uncertain");
+		expect(outbox.listPending()).toHaveLength(0);
 	});
 	test("bounds oversized gate fields before projecting the gate label", () => {
 		// projectPendingWorkflowGateMessage() concatenates the prompt and every
@@ -291,8 +717,15 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 		const adminPrincipalId = "admin-1";
 		const seed = pendingGateMappings(deepInterviewWorkflowGateEvent);
 		const seedMapping = requiredMapping(seed);
-		const mappings = new FileBackedSessionMappingStore(mappingFile);
-		mappings.setScoped({ principalId, chatId: "chat-1" }, { ...seedMapping, principalId });
+		const mappings = new V3FileBackedSessionMappingStore(mappingFile);
+		mappings.setScoped(
+			{ principalId, chatId: "chat-1" },
+			{
+				...seedMapping,
+				principalId,
+				managedAuthority: managedPreparedAuthority({ principalId }),
+			},
+		);
 		const turn = { ...replyInput("1"), ownerUserId: principalId };
 		const outbox = new InMemoryOutboxStore();
 		try {
@@ -308,7 +741,7 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 				{ operationId: `${turn.userMessageId}:event`, principalId, ownerUserId: principalId },
 			]);
 
-			const restartedMappings = new FileBackedSessionMappingStore(mappingFile);
+			const restartedMappings = new V3FileBackedSessionMappingStore(mappingFile);
 			const synthesized = new InMemoryOutboxStore();
 			synthesizeProjectionRows(synthesized, restartedMappings, adminPrincipalId, adminPrincipalId);
 			expect(synthesized.listPending()).toMatchObject([
@@ -411,22 +844,23 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 		const root = mkdtempSync(join(tmpdir(), "gjc-cold-gate-"));
 		try {
 			const filePath = join(root, "mappings.json");
-			const first = new FileBackedSessionMappingStore(filePath);
-			for (const mapping of pendingGateMappings(deepInterviewWorkflowGateEvent).entries()) first.set(mapping);
+			const first = new V3FileBackedSessionMappingStore(filePath);
+			for (const mapping of pendingGateMappings(deepInterviewWorkflowGateEvent).entries())
+				first.setScoped({ principalId: ownerUserId, chatId: mapping.chatId }, mapping);
 			const turnRunner = new FakeGjcTurnRunner();
 			const resumed = createGjcRoutingLiveGatewayRunner({
 				turnRunner,
-				mappings: new FileBackedSessionMappingStore(filePath),
+				mappings: new V3FileBackedSessionMappingStore(filePath),
 			});
 
 			await expect(resumed.run(replyInput("1"))).resolves.toEqual({ content: "workflow gate accepted" });
-			expect(turnRunner.starts).toHaveLength(0);
+			expect(turnRunner.managedStarts).toHaveLength(0);
 			expect(turnRunner.continues).toHaveLength(0);
 			expect(turnRunner.gateResponses).toMatchObject([
 				{
 					gateId: "gate-deep-1",
 					sessionId: "session-1",
-					sessionFile: "/workspace/project/.gjc/sessions/session-1.jsonl",
+					managedAuthority: managedPreparedAuthority(),
 					gateCorrelation: { commandId: "command-1", turnId: "turn-1", sessionId: "session-1" },
 				},
 			]);
@@ -445,13 +879,19 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 		expect(turnRunner.continues).toHaveLength(0);
 	});
 
-	test("rejects workflow gate replies when the stored session file is outside the project session root", async () => {
+	test("rejects a workflow gate bound to a different canonical workspace before dispatch", async () => {
 		const turnRunner = new FakeGjcTurnRunner();
-		const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent, "/tmp/outside-session.jsonl");
-		const runner = createGjcRoutingLiveGatewayRunner({ turnRunner, mappings });
-
-		await expect(runner.run(replyInput("1"))).rejects.toBeInstanceOf(SessionFileBoundaryError);
+		const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent);
+		const mapping = requiredMapping(mappings);
+		const foreign = {
+			...mapping,
+			managedAuthority: managedPreparedAuthority({ canonicalWorkspace: "/tmp/foreign" }),
+		};
+		await expect(
+			handleWorkflowGateReply({ turnRunner, mappings }, replyInput("1"), foreign, gateLifecycle(mapping)),
+		).rejects.toThrow("exact principal, workspace, and session authority");
 		expect(turnRunner.gateResponses).toHaveLength(0);
+		expect(mappings.operation("chat-1", "user-2")).toBeUndefined();
 	});
 
 	test("routes numbered approval gate replies as structured decisions", async () => {
@@ -491,7 +931,7 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 		});
 		expect(readerCount).toBe(0);
 		expect(turnRunner.gateResponses).toHaveLength(0);
-		expect(turnRunner.starts).toHaveLength(0);
+		expect(turnRunner.managedStarts).toHaveLength(0);
 	});
 
 	test("rejects pending missing or mismatched bindings without mutable reads or writes", async () => {
@@ -500,7 +940,7 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 			{ provider: "openai", modelId: "gpt-5", thinkingLevel: "high" },
 		] as const) {
 			const turnRunner = new FakeGjcTurnRunner();
-			const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent, undefined, modelSelection ?? null);
+			const mappings = pendingGateMappings(deepInterviewWorkflowGateEvent, modelSelection ?? null);
 			const before = requiredMapping(mappings);
 			let readerCount = 0;
 			const runner = createGjcRoutingLiveGatewayRunner({
@@ -550,26 +990,40 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 	});
 
 	for (const failure of ["setter", "prompt"] as const) {
-		test(`keeps file-backed bytes and outbox unchanged after selected ${failure} failure`, async () => {
+		test(`keeps V3 mappings and outbox unchanged with an uncertain receipt after selected ${failure} failure`, async () => {
 			const root = mkdtempSync(join(tmpdir(), `gjc-${failure}-failure-`));
 			try {
 				const filePath = join(root, "mappings.json");
-				const mappings = new FileBackedSessionMappingStore(filePath);
-				mappings.set({ ...baseMapping("seed-chat"), operationId: "seed-user" });
-				const before = readAuthorityMerged(filePath);
+				const mappings = new V3FileBackedSessionMappingStore(filePath);
+				mappings.setScoped(
+					{ principalId: ownerUserId, chatId: "seed-chat" },
+					{ ...baseMapping("seed-chat"), operationId: "seed-user" },
+				);
+				const before = JSON.parse(readFileSync(filePath, "utf8"));
 				class FailingStartFakeGjcTurnRunner extends FakeGjcTurnRunner {
-					async startNewSession<T>(
-						input: GjcStartNewSessionInput,
+					async startManagedSession<T>(
+						input: GjcStartNewSessionInput & { readonly preparedManagedAuthority: ManagedPreparedTurnAuthority },
 						publish: (
 							result: GjcSessionAddress & GjcTurnResult,
 							lifecycle: GjcLifecycleTransaction,
 						) => Promise<T>,
+						beforePrompt: (
+							address: GjcSessionAddress,
+							proof: ManagedGenerationProof,
+							lifecycle: GjcLifecycleTransaction,
+						) => Promise<void>,
 					): Promise<T> {
-						if (failure === "setter") throw new Error(`${failure} failed`);
-						return await super.startNewSession(input, async (result, lifecycle) => {
-							if (failure === "prompt") throw new Error(`${failure} failed`);
-							return await publish(result, lifecycle);
-						});
+						return await super.startManagedSession(
+							input,
+							async (result, lifecycle) => {
+								if (failure === "prompt") throw new Error(`${failure} failed`);
+								return await publish(result, lifecycle);
+							},
+							async (address, proof, lifecycle) => {
+								if (failure === "setter") throw new Error(`${failure} failed`);
+								await beforePrompt(address, proof, lifecycle);
+							},
+						);
 					}
 				}
 				const turnRunner = new FailingStartFakeGjcTurnRunner();
@@ -582,38 +1036,88 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 					createNeutralModelReader: selectedReader,
 				});
 
-				await expect(runner.run({ ...replyInput("hello"), chatId: "failed-chat" })).rejects.toThrow(
-					`${failure} failed`,
-				);
-				expect(mappings.get("failed-chat")).toBeUndefined();
-				const document = readAuthorityMerged(filePath) as {
+				await expect(
+					runner.run({
+						...replyInput("hello"),
+						chatId: "failed-chat",
+						preparedManagedAuthority: managedPreparedAuthority({ chatId: "failed-chat", requestKey: "user-2" }),
+					}),
+				).rejects.toThrow(`${failure} failed`);
+				expect(mappings.getScoped({ principalId: ownerUserId, chatId: "failed-chat" })).toBeUndefined();
+				const document = JSON.parse(readFileSync(filePath, "utf8")) as {
 					readonly mappings: readonly { readonly chatId?: unknown }[];
 					readonly provisionalOperations: readonly Record<string, unknown>[];
 				};
 				expect(document.mappings).toEqual(
 					(before as { readonly mappings: readonly { readonly chatId?: unknown }[] }).mappings,
 				);
-				expect(document.mappings.some(mapping => mapping.chatId === "failed-chat")).toBeFalse();
+				const failedChatKey = canonicalSessionMappingKey(ownerUserId, "failed-chat");
+				expect(document.mappings.some(mapping => mapping.chatId === failedChatKey)).toBeFalse();
 				expect(document.provisionalOperations).toHaveLength(1);
+				expect(isManagedLifecycleEvidence(document.provisionalOperations[0]!.lifecycle)).toBe(true);
 				expect(document.provisionalOperations[0]).toMatchObject({
 					id: "user-2",
 					ingressId: "user-2",
 					kind: "create",
 					state: "uncertain",
-					chatId: "failed-chat",
+					chatId: failedChatKey,
 					projectId: "project",
 					detail: expect.stringMatching(/^[a-f0-9]{64}$/),
 				});
-				expect(Object.keys(document.provisionalOperations[0] ?? {}).sort()).toEqual([
-					"chatId",
-					"detail",
-					"id",
-					"ingressId",
-					"kind",
-					"projectId",
-					"startedAt",
-					"state",
-				]);
+				expect(Object.keys(document.provisionalOperations[0] ?? {}).sort()).toEqual(
+					[
+						"chatId",
+						"detail",
+						"id",
+						"ingressId",
+						"kind",
+						"lifecycle",
+						"managedAuthority",
+						"projectId",
+						"sessionId",
+						"startedAt",
+						"state",
+					].sort(),
+				);
+				expect(document.provisionalOperations[0]).toMatchObject({
+					sessionId: "session-1",
+					managedAuthority: managedPreparedAuthority({ chatId: failedChatKey, requestKey: "user-2" }),
+				});
+				const failedOperation = document.provisionalOperations[0]!;
+				const preparedAuthority = {
+					principalId: ownerUserId,
+					projectId: "project",
+					canonicalWorkspace: project.cwd,
+					chatId: "failed-chat",
+					leaseId: "lease-1",
+					epoch: "epoch-1",
+					requestKey: "user-2",
+				};
+				expect(failedOperation.lifecycle).toMatchObject({
+					operation: "session.create",
+					actor: { id: ownerUserId, namespace: "openwebui-gjc-adapter" },
+					state: failure === "prompt" ? "active_generation_proven" : "uncertain",
+					requestKey: "user-2",
+					requestHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+					payloadHash: failedOperation.detail,
+					preparedAuthority,
+					target: { kind: "existing_path", path: project.cwd },
+					acknowledged: { ...preparedAuthority, sessionId: "session-1", generation: 1 },
+				});
+				if (failure === "prompt")
+					expect(failedOperation.lifecycle).toMatchObject({
+						proven: {
+							kind: "managed-generation",
+							sessionId: "session-1",
+							generation: 1,
+							leaseId: "lease-1",
+							epoch: "epoch-1",
+						},
+					});
+				else expect(failedOperation.lifecycle).not.toHaveProperty("proven");
+				expect(failedOperation.lifecycle).not.toHaveProperty("retirement");
+				expect(turnRunner.managedStarts).toHaveLength(1);
+				expect(JSON.stringify(document)).not.toMatch(/descriptor|sessionFile|attachment/);
 				expect(JSON.stringify(document.provisionalOperations[0])).not.toMatch(/assistant|hello/);
 				expect(outbox.listPending()).toHaveLength(0);
 			} finally {
@@ -621,40 +1125,32 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 			}
 		});
 	}
-	test("loads a v2 document without provisional operations until its next mutation", () => {
-		const root = mkdtempSync(join(tmpdir(), "gjc-v2-provisional-"));
+	test("reloads V3 with no provisional operations and rejects a malformed provisional collection", () => {
+		const root = mkdtempSync(join(tmpdir(), "gjc-v3-provisional-"));
 		try {
 			const filePath = join(root, "mappings.json");
-			const mapping = {
-				...baseMapping("legacy-chat"),
-				version: 2,
-				createdAt: "2026-01-01T00:00:00.000Z",
-				header: { chatId: "legacy-chat", projectId: project.id, sessionId: "session-1" },
-				journal: [],
-			};
-			const legacy = `${JSON.stringify(
-				{ kind: "openwebui-gjc-session-authority", version: 2, mappings: [mapping] },
-				null,
-				2,
-			)}\n`;
-			writeFileSync(filePath, legacy, "utf8");
-
-			const mappings = new FileBackedSessionMappingStore(filePath);
-			expect(mappings.get("legacy-chat")).toMatchObject({ chatId: "legacy-chat" });
-			expect(readFileSync(filePath, "utf8")).toBe(legacy);
-
-			mappings.set({ ...baseMapping("next-chat"), operationId: "next-user" });
-			expect(readAuthorityMerged(filePath)).toMatchObject({
+			const scope = { principalId: ownerUserId, chatId: "seed-chat" };
+			new V3FileBackedSessionMappingStore(filePath).setScoped(scope, baseMapping("seed-chat"));
+			const before = readFileSync(filePath, "utf8");
+			const mappings = new V3FileBackedSessionMappingStore(filePath);
+			expect(mappings.getScoped(scope)).toMatchObject({ chatId: "seed-chat" });
+			expect(readFileSync(filePath, "utf8")).toBe(before);
+			mappings.setScoped(
+				{ principalId: ownerUserId, chatId: "next-chat" },
+				{ ...baseMapping("next-chat"), operationId: "next-user" },
+			);
+			expect(JSON.parse(readFileSync(filePath, "utf8"))).toMatchObject({
+				version: 3,
 				provisionalOperations: [],
 			});
 
-			writeFileSync(filePath, JSON.stringify({ ...JSON.parse(legacy), provisionalOperations: {} }), "utf8");
-			expect(() => new FileBackedSessionMappingStore(filePath)).toThrow(SessionAuthorityLoadError);
+			writeFileSync(filePath, JSON.stringify({ ...JSON.parse(before), provisionalOperations: {} }), "utf8");
+			expect(() => new V3FileBackedSessionMappingStore(filePath)).toThrow(SessionAuthorityLoadError);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
 	});
-	test("quarantines a legacy authority before writing v2 state", () => {
+	test("quarantines untrusted legacy authority instead of admitting a workflow gate mapping", () => {
 		const root = mkdtempSync(join(tmpdir(), "gjc-v2-quarantine-"));
 		try {
 			const filePath = join(root, "mappings.json");
@@ -666,74 +1162,27 @@ describe("createGjcRoutingLiveGatewayRunner workflow gates", () => {
 			const quarantines = readdirSync(root).filter(name => name.startsWith("mappings.json.legacy-"));
 			expect(quarantines).toHaveLength(1);
 			expect(readFileSync(join(root, quarantines[0]!), "utf8")).toBe(legacy);
-
-			mappings.set({ ...baseMapping("new-chat"), operationId: "new-user" });
-			expect(JSON.parse(readFileSync(filePath, "utf8"))).toMatchObject({
-				kind: "openwebui-gjc-session-authority",
-				version: 2,
-			});
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
 	});
 });
 
-function readAuthorityMerged(filePath: string): any {
-	const base = JSON.parse(readFileSync(filePath, "utf8"));
-	const walPath = `${filePath}.wal`;
-	let walBytes: string;
-	try {
-		walBytes = readFileSync(walPath, "utf8");
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return base;
-		throw error;
-	}
-	const lines = walBytes.split("\n").filter(line => line.length > 0);
-	if (lines.length === 0) return base;
-	let header: any;
-	try {
-		header = JSON.parse(lines[0]!);
-	} catch {
-		return base;
-	}
-	const baseStat = statSync(filePath);
-	if (header?.base?.size !== baseStat.size || header?.base?.mtimeMs !== baseStat.mtimeMs) return base;
-	const records = new Map<string, any>();
-	const provisional = new Map<string, any>();
-	for (const record of base.mappings ?? []) records.set(record.chatId, record);
-	for (const operation of base.provisionalOperations ?? [])
-		provisional.set(JSON.stringify([operation.chatId, operation.ingressId ?? operation.id]), operation);
-	for (const line of lines.slice(1)) {
-		let delta: any;
-		try {
-			delta = JSON.parse(line);
-		} catch {
-			continue;
-		}
-		if (delta?.kind !== "openwebui-gjc-session-authority-wal") continue;
-		for (const record of delta.records ?? []) records.set(record.chatId, record);
-		for (const item of delta.provisional ?? [])
-			if (item?.key !== undefined) provisional.set(item.key, item.operation);
-	}
-	return { ...base, mappings: [...records.values()], provisionalOperations: [...provisional.values()] };
-}
-
 function pendingGateMappings(
 	event: unknown,
-	sessionFile = "/workspace/project/.gjc/sessions/session-1.jsonl",
 	modelSelection: NormalizedModelSelection | null = {
 		provider: "anthropic",
 		modelId: "claude-sonnet-4",
 		thinkingLevel: "medium",
 	},
 ) {
-	const mappings = new SessionMappingStore();
+	const mappings = scopedSessionMappingStore(managedMappingStore(), ownerUserId, "chat-1");
 	mappings.set({
+		principalId: ownerUserId,
 		chatId: "chat-1",
 		projectId: project.id,
 		sessionId: "session-1",
-		sessionFile,
-		activeLeaf: "leaf-1",
+		managedAuthority: managedPreparedAuthority(),
 		rawFrameCursor: 7,
 		eventCursor: 3,
 		operationId: "user-1",
@@ -758,19 +1207,35 @@ function replyInput(prompt: string) {
 		messageId: "assistant-2",
 		userMessageId: "user-2",
 		userMessageParentId: "user-1",
+		ownerUserId,
 		continued: true,
 	};
 }
 
 function baseMapping(chatId: string) {
 	return {
+		principalId: ownerUserId,
 		chatId,
 		projectId: project.id,
 		sessionId: "session-1",
+		managedAuthority: managedPreparedAuthority({ chatId }),
 		rawFrameCursor: 0,
 		eventCursor: 0,
 		operationId: "user-1",
 	};
+}
+
+function gateLifecycle(mapping: ReturnType<typeof requiredMapping>): GjcLifecycleTransaction {
+	return lifecycleFixture(
+		{
+			cwd: project.cwd,
+			sessionRoot: `${project.cwd}/.gjc/sessions`,
+			projectId: mapping.projectId,
+			chatId: mapping.chatId,
+			sessionId: mapping.sessionId,
+		},
+		mapping.managedAuthority,
+	);
 }
 
 function selectedReader() {

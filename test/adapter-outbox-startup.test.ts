@@ -3,8 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildAdapterServerOptions } from "../src/adapter-server-options";
-import { AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES } from "../src/gjc/session-authority-persistence";
-import { FileBackedSessionMappingStore, SessionMappingStore } from "../src/gjc/session-router";
+import { SessionMappingStore } from "../src/gjc/session-router";
 import { synthesizeProjectionRows } from "../src/live/workflow-gate-projection";
 import {
 	buildProjectionPayloadHash,
@@ -12,20 +11,104 @@ import {
 	InMemoryOutboxStore,
 	type OutboxStore,
 } from "../src/state/outbox";
-import { FakeGjcTurnRunner } from "./cli-fixtures";
-import { staticModelReaderFactory } from "./model-selection-fixtures";
+import { FakeManagedSdkRuntime, writeDirectV3Authority } from "./cli-fixtures";
 
-function oversizedAuthorityJson(): string {
+function managedRuntimeFixture() {
+	const accounting = new FakeManagedSdkRuntime();
+	let state: "new" | "running" | "stopped" = "new";
+	let starts = 0;
+	let disposes = 0;
+	const registrations = new Map<string, Record<string, unknown>>();
+	const tenantKey = (tenant: Record<string, unknown>) =>
+		JSON.stringify([
+			tenant.principalId,
+			tenant.projectId,
+			tenant.canonicalWorkspace,
+			tenant.chatId,
+			tenant.sessionId,
+			tenant.generation,
+			tenant.leaseId,
+			tenant.epoch,
+		]);
+	const runtime = {
+		createProducerScope: () => accounting.createProducerScope(),
+		get state() {
+			return state;
+		},
+		async start() {
+			starts += 1;
+			state = "running";
+		},
+		async dispose() {
+			disposes += 1;
+			state = "stopped";
+		},
+		async reconcile() {},
+		registerTenant(tenant: Record<string, unknown>) {
+			registrations.set(tenantKey(tenant), tenant);
+		},
+		async acquireAttachment(tenant: Record<string, unknown>) {
+			const key = tenantKey(tenant);
+			if (!registrations.has(key)) throw new Error("Managed fixture tenant is not registered.");
+			return {
+				tenant,
+				generation: tenant.generation,
+				isCurrent: () => state === "running" && registrations.has(key),
+			};
+		},
+		async generationStatus() {
+			return { status: "current" as const };
+		},
+		async request() {
+			return { ok: true };
+		},
+		subscribeFrames() {
+			return () => undefined;
+		},
+		async createLifecycleSession(tenant: Record<string, unknown>) {
+			return {
+				ok: true as const,
+				operation: "session.create" as const,
+				result: { sessionId: tenant.sessionId ?? "managed-session", endpointGeneration: tenant.generation ?? 1 },
+			};
+		},
+		async resumeLifecycleSession(tenant: Record<string, unknown>) {
+			return {
+				ok: true as const,
+				operation: "session.resume" as const,
+				result: { sessionId: tenant.sessionId ?? "managed-session", endpointGeneration: tenant.generation ?? 1 },
+			};
+		},
+		async closeLifecycleSession(tenant: Record<string, unknown>) {
+			return {
+				ok: true as const,
+				operation: "session.close" as const,
+				result: { sessionId: tenant.sessionId ?? "managed-session", endpointGeneration: tenant.generation ?? 1 },
+			};
+		},
+		async deleteLifecycleSession(tenant: Record<string, unknown>) {
+			return {
+				ok: true as const,
+				operation: "session.delete" as const,
+				result: { sessionId: tenant.sessionId ?? "managed-session", endpointGeneration: tenant.generation ?? 1 },
+			};
+		},
+	};
+	return {
+		runtime: runtime as never,
+		get starts() {
+			return starts;
+		},
+		get disposes() {
+			return disposes;
+		},
+	};
+}
+
+function legacyAuthorityJson(): string {
 	const timestamp = "2026-08-03T00:00:00.000Z";
 	const chatId = "chat-1";
-	const chunk = "x".repeat(512 * 1024);
-	// Well above AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES; the size is dominated
-	// by journal-result events that the boot compaction drops.
-	const events = Array.from({ length: 140 }, (_, index) => ({
-		type: "assistant" as const,
-		text: `event-${index}`,
-		payload: { transcript: `${chunk}-${index}` },
-	}));
+	const events = [{ type: "assistant" as const, text: "legacy event", payload: { transcript: "legacy" } }];
 	const mapping = {
 		version: 2,
 		chatId,
@@ -86,6 +169,8 @@ describe("projection outbox startup reconciliation", () => {
 		const root = await mkdtemp(join(tmpdir(), "gjc-adapter-outbox-startup-"));
 		const outbox = new InMemoryOutboxStore();
 		enqueuePendingOperation(outbox);
+		await writeDirectV3Authority(join(root, "sessions"));
+		const managedSdkRuntime = managedRuntimeFixture();
 		const originalError = console.error;
 		const errors: string[] = [];
 		console.error = (...args: unknown[]) => errors.push(args.join(" "));
@@ -106,8 +191,7 @@ describe("projection outbox startup reconciliation", () => {
 				},
 				{
 					outbox,
-					turnRunner: new FakeGjcTurnRunner(),
-					modelReaderFactory: staticModelReaderFactory(),
+					managedSdkRuntime: managedSdkRuntime.runtime,
 					projectionOperationApplier: () => {
 						throw new Error("remote projection unavailable");
 					},
@@ -135,6 +219,9 @@ describe("projection outbox startup reconciliation", () => {
 		const outboxPath = join(root, "projection-outbox.json");
 		const persisted = new FileBackedOutboxStore(outboxPath);
 		enqueuePendingOperation(persisted);
+		await writeDirectV3Authority(join(root, "sessions"));
+		const failedRuntime = managedRuntimeFixture();
+		const healthyRuntime = managedRuntimeFixture();
 		const config = {
 			mode: "existing" as const,
 			bindHost: "127.0.0.1",
@@ -151,8 +238,7 @@ describe("projection outbox startup reconciliation", () => {
 		try {
 			failedOptions = await buildAdapterServerOptions(config, {
 				outbox: new FileBackedOutboxStore(outboxPath),
-				turnRunner: new FakeGjcTurnRunner(),
-				modelReaderFactory: staticModelReaderFactory(),
+				managedSdkRuntime: failedRuntime.runtime,
 				projectionOperationApplier: () => {
 					throw new Error("temporary projection outage");
 				},
@@ -173,8 +259,7 @@ describe("projection outbox startup reconciliation", () => {
 		try {
 			healthyOptions = await buildAdapterServerOptions(config, {
 				outbox: new FileBackedOutboxStore(outboxPath),
-				turnRunner: new FakeGjcTurnRunner(),
-				modelReaderFactory: staticModelReaderFactory(),
+				managedSdkRuntime: healthyRuntime.runtime,
 				projectionOperationApplier: operation => {
 					replayed.push(operation.operationId);
 				},
@@ -192,18 +277,15 @@ describe("projection outbox startup reconciliation", () => {
 		});
 		await rm(root, { force: true, recursive: true });
 	});
-	test("reports a one-time boot compaction of an oversized session authority", async () => {
-		const root = await mkdtemp(join(tmpdir(), "gjc-adapter-authority-compaction-"));
-		const authorityPath = join(root, "sessions", "mappings.json");
-		let options: Awaited<ReturnType<typeof buildAdapterServerOptions>> | undefined;
+	test("rejects a V2 authority without migration or compaction side effects", async () => {
+		const root = await mkdtemp(join(tmpdir(), "gjc-adapter-authority-v2-rejection-"));
+		const authorityPath = join(root, "sessions", "openwebui-session-mappings.json");
+		await mkdir(join(root, "sessions"), { recursive: true });
+		await writeFile(authorityPath, legacyAuthorityJson());
+		const before = await Bun.file(authorityPath).text();
 		try {
-			await mkdir(join(root, "sessions"), { recursive: true });
-			await writeFile(authorityPath, oversizedAuthorityJson());
-			const mappings = new FileBackedSessionMappingStore(authorityPath);
-			expect(mappings.bootCompaction).toBeDefined();
-			expect(mappings.bootCompaction?.beforeBytes).toBeGreaterThan(AUTHORITY_BOOT_COMPACTION_THRESHOLD_BYTES);
-			options = await buildAdapterServerOptions(
-				{
+			await expect(
+				buildAdapterServerOptions({
 					mode: "existing",
 					bindHost: "127.0.0.1",
 					bindPort: 8765,
@@ -214,30 +296,18 @@ describe("projection outbox startup reconciliation", () => {
 					sessionRoot: join(root, "sessions"),
 					gjcCommand: "/opt/gjc",
 					turnTimeoutMs: 240_000,
-				},
-				{
-					mappings,
-					turnRunner: new FakeGjcTurnRunner(),
-					modelReaderFactory: staticModelReaderFactory(),
-				},
-				{ deferOpenWebUIInitialization: true },
-			);
-			expect(options.checks).toContainEqual(
-				expect.objectContaining({
-					name: "session-authority-compaction",
-					status: "ok",
-					detail: expect.stringMatching(/^Session authority compacted from \d+ to \d+ bytes\.$/),
 				}),
-			);
+			).rejects.toThrow("Canonical session authority activation is blocked.");
+			expect(await Bun.file(authorityPath).text()).toBe(before);
+			expect(await Bun.file(join(root, "state")).exists()).toBe(false);
 		} finally {
-			await options?.shutdownCleanup?.();
-			await options?.runtimeLock.release();
 			await rm(root, { force: true, recursive: true });
 		}
 	});
 	test("skips unsupported normal-principal projection rows instead of retrying them forever", async () => {
 		const root = await mkdtemp(join(tmpdir(), "gjc-adapter-outbox-normal-skip-"));
 		try {
+			await writeDirectV3Authority(join(root, "sessions"));
 			const mappings = new SessionMappingStore();
 			const mapping = {
 				principalId: "normal-user",
@@ -278,9 +348,7 @@ describe("projection outbox startup reconciliation", () => {
 					},
 					{
 						outbox,
-						mappings,
-						turnRunner: new FakeGjcTurnRunner(),
-						modelReaderFactory: staticModelReaderFactory(),
+						managedSdkRuntime: managedRuntimeFixture().runtime,
 					},
 					{ deferOpenWebUIInitialization: true },
 				);

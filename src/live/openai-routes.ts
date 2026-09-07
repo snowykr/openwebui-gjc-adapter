@@ -156,8 +156,10 @@ export async function handleOpenAIChatCompletionsRequest(
 			workspaceLeaseDurationMs: routes.workspaceLeaseDurationMs,
 			workspaceLeaseHeartbeatMs: routes.workspaceLeaseHeartbeatMs,
 			principal,
+			signal: request.signal,
 		});
 	} catch (error) {
+		if (request.signal.aborted) return new Response(null, { status: 499 });
 		if (error instanceof ModelSelectionError) return modelSelectionErrorResponse(error);
 		console.error("GJC live runner failed:", sanitizeRunnerError(error));
 		return jsonResponse(

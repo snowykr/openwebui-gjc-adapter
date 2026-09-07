@@ -1,0 +1,107 @@
+{
+  "kind": "managed-routing-api-package-test-report",
+  "startedAt": "2026-09-06T17:07:19.881Z",
+  "limitations": [
+    "Hermetic provider and exclusively owned probe workspace; no browser.",
+    "Session-only isolated cleanup does not prove production replacement-race-safe close; SDK issue #5345 remains open.",
+    "This probe verifies managed prompt completion and immutable replay after store reopen, not every workflow-gate or cancellation path.",
+    "Explicit hermetic tenant allowlist; not production operation-lease or restricted activation proof."
+  ],
+  "withheldBeforeProviderResponse": true,
+  "acknowledgement": {
+    "type": "control_response",
+    "id": "03c20d6b-2bf2-4b52-9b52-5745f71a476a",
+    "ok": true,
+    "result": {
+      "commandId": "32ba0042-c758-438f-bc5f-5032c808b247",
+      "turnId": "f4c488a4-7246-44db-8f93-27b858ea1cc7",
+      "accepted": true
+    }
+  },
+  "result": {
+    "text": "compatibility-ok\n\nThere is nothing left to do.",
+    "events": [
+      "agent_start",
+      "agent_end"
+    ],
+    "generation": 1
+  },
+  "replayedWithoutDispatch": true,
+  "replayedAfterStoreReopen": true,
+  "replayedImmutableEvents": true,
+  "lifecycleCreates": 1,
+  "cleanup": {
+    "acknowledgement": {
+      "ok": true,
+      "operation": "session.close",
+      "result": {
+        "sessionId": "c4909667-1844-4c0a-bbbc-04d66e62578e",
+        "note": "Endpoint close was unreachable; sent SIGTERM to the durably identified session process."
+      }
+    },
+    "retirement": {
+      "status": "retired",
+      "evidence": {
+        "source": "session_index",
+        "observedIndexSeq": 3,
+        "evidenceIndexSeq": 3,
+        "event": "host_unregistered"
+      }
+    }
+  },
+  "routerStopped": true,
+  "finishedAt": "2026-09-06T17:07:26.166Z",
+  "responses": [
+    {
+      "operation": "model.set",
+      "response": {
+        "type": "control_response",
+        "id": "56d1641d-7027-4fb9-9798-aa8a3ffe9d10",
+        "ok": true,
+        "result": {
+          "provider": "compat-local",
+          "modelId": "hermetic-model",
+          "thinkingLevel": "off"
+        }
+      }
+    },
+    {
+      "operation": "thinking.set",
+      "response": {
+        "type": "control_response",
+        "id": "a720f74d-ee6d-44aa-955b-6d0128ae4752",
+        "ok": true,
+        "result": {
+          "changed": true
+        }
+      }
+    },
+    {
+      "operation": "workflow.gates.list",
+      "response": {
+        "type": "query_response",
+        "id": "946bc398-f687-4e2b-a66d-6e003f6c4cce",
+        "ok": true,
+        "page": {
+          "items": [],
+          "complete": true,
+          "revision": "1"
+        }
+      }
+    },
+    {
+      "operation": "turn.prompt",
+      "response": {
+        "type": "control_response",
+        "id": "03c20d6b-2bf2-4b52-9b52-5745f71a476a",
+        "ok": true,
+        "result": {
+          "commandId": "32ba0042-c758-438f-bc5f-5032c808b247",
+          "turnId": "f4c488a4-7246-44db-8f93-27b858ea1cc7",
+          "accepted": true
+        }
+      }
+    }
+  ],
+  "errors": []
+}

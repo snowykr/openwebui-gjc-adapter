@@ -8,27 +8,21 @@ import { SqliteProjectRegistrationStore } from "../src/projects/registration-sto
 import { registerProjectDirectory } from "../src/projects/registry";
 import { resolveAllowedRoots } from "../src/security/paths";
 import { createAdapterRequestHandler } from "../src/server";
-import { chatRequest, FakeGjcTurnRunner } from "./cli-fixtures";
-import { staticModelReaderFactory } from "./model-selection-fixtures";
-import { messageEntry, writeSessionFile } from "./session-sync-fixtures";
+import { FakeManagedSdkRuntime, writeDirectV3Authority } from "./cli-fixtures";
 
 describe("adapter CLI project reconciliation", () => {
 	test("does not unlink a first-start env project with a configured folder id before sync creates it", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-cli-reconcile-"));
 		const projectDirectory = path.join(workspace, "Configured Folder");
-		const sessionDirectory = path.join(projectDirectory, ".gjc", "sessions");
-		await fs.mkdir(sessionDirectory, { recursive: true });
-		await writeSessionFile(path.join(sessionDirectory, "session-import.jsonl"), {
-			header: { id: "session-import", title: "Configured Folder Import", cwd: projectDirectory },
-			entries: [messageEntry("user-import", null, "user", "load me")],
-		});
+		await fs.mkdir(projectDirectory);
+		await writeDirectV3Authority(path.join(workspace, "state"));
 		const repository = new InMemoryOpenWebUIProjectionRepository();
 		const store = new SqliteProjectRegistrationStore(":memory:");
 
 		const options = await buildAdapterServerOptionsFromEnv(
 			envFor(workspace, `${projectDirectory}|Configured Folder|configured-folder`),
 			{
-				turnRunner: new FakeGjcTurnRunner(),
+				managedSdkRuntime: new FakeManagedSdkRuntime(),
 				projectionRepository: repository,
 				projectRegistrationStore: store,
 			},
@@ -42,22 +36,13 @@ describe("adapter CLI project reconciliation", () => {
 		expect(await repository.getFolder("owner-test", "configured-folder")).toMatchObject({
 			id: "configured-folder",
 		});
-		expect(
-			await repository.getChat("owner-test", "gjc-project-configured-folder-session-session-import"),
-		).toMatchObject({
-			title: "Configured Folder Import",
-		});
 	});
 
-	test("hides a project during model and project-list requests after its OpenWebUI folder is deleted", async () => {
+	test("hides a project during project-list requests after its OpenWebUI folder is deleted", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-cli-reconcile-"));
 		const projectDirectory = path.join(workspace, "Deleted During Runtime");
-		const sessionDirectory = path.join(projectDirectory, ".gjc", "sessions");
-		await fs.mkdir(sessionDirectory, { recursive: true });
-		await writeSessionFile(path.join(sessionDirectory, "session-import.jsonl"), {
-			header: { id: "session-import", title: "Runtime Delete Import", cwd: projectDirectory },
-			entries: [messageEntry("user-import", null, "user", "load me")],
-		});
+		await fs.mkdir(projectDirectory);
+		await writeDirectV3Authority(path.join(workspace, "state"));
 		const allowedRoots = await resolveAllowedRoots([workspace]);
 		const project = await registerProjectDirectory(
 			{
@@ -77,10 +62,9 @@ describe("adapter CLI project reconciliation", () => {
 			metadata: { gjc_adapter: { projectId: "deleted-during-runtime" } },
 		});
 		const options = await buildAdapterServerOptionsFromEnv(envFor(workspace, ""), {
-			turnRunner: new FakeGjcTurnRunner(),
+			managedSdkRuntime: new FakeManagedSdkRuntime(),
 			projectionRepository: repository,
 			projectRegistrationStore: store,
-			modelReaderFactory: staticModelReaderFactory(),
 		});
 		const routes = options.routes;
 		if (routes === undefined) throw new Error("expected route dependencies");
@@ -93,13 +77,17 @@ describe("adapter CLI project reconciliation", () => {
 		const projectListResponse = await handler(projectListRequest());
 		const projectList = await projectListResponse.json();
 
-		expect(projectListText(projectList)).toContain("unlinked: deleted-during-runtime");
+		expect(projectListResponse.status).toBe(200);
+		expect(projectList).toMatchObject({
+			projects: [{ id: "deleted-during-runtime", status: "unlinked" }],
+		});
 		expect(store.getProject("deleted-during-runtime")).toMatchObject({ status: "unlinked" });
 	});
 	test("keeps serving when startup linked-project projection is temporarily unavailable", async () => {
 		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-adapter-cli-reconcile-"));
 		const projectDirectory = path.join(workspace, "Unavailable Projection");
-		await fs.mkdir(path.join(projectDirectory, ".gjc", "sessions"), { recursive: true });
+		await fs.mkdir(projectDirectory);
+		await writeDirectV3Authority(path.join(workspace, "state"));
 		const allowedRoots = await resolveAllowedRoots([workspace]);
 		const project = await registerProjectDirectory(
 			{ cwd: projectDirectory, name: "Unavailable Projection", openWebUIFolderId: "unavailable-folder" },
@@ -139,10 +127,9 @@ describe("adapter CLI project reconciliation", () => {
 		let retriedProjects: readonly unknown[] | undefined;
 		try {
 			options = await buildAdapterServerOptionsFromEnv(envFor(workspace, ""), {
-				turnRunner: new FakeGjcTurnRunner(),
+				managedSdkRuntime: new FakeManagedSdkRuntime(),
 				projectionRepository: repository,
 				projectRegistrationStore: store,
-				modelReaderFactory: staticModelReaderFactory(),
 			});
 			projectionAvailable = true;
 			const projectProvider = options.routes?.projectProvider;
@@ -170,6 +157,7 @@ describe("adapter CLI project reconciliation", () => {
 function envFor(workspace: string, projects: string): Record<string, string | undefined> {
 	return {
 		...process.env,
+		GJC_OPENWEBUI_MODE: "existing",
 		GJC_OPENWEBUI_BIND_HOST: "127.0.0.1",
 		GJC_OPENWEBUI_BIND_PORT: "8765",
 		GJC_OPENWEBUI_ADAPTER_API_TOKEN: "adapter-token",
@@ -182,21 +170,8 @@ function envFor(workspace: string, projects: string): Record<string, string | un
 }
 
 function projectListRequest(): Request {
-	const source = chatRequest();
-	return new Request(source.url, {
-		method: "POST",
-		headers: source.headers,
-		body: JSON.stringify({ model: "gjc", messages: [{ role: "user", content: "/gjc project list" }] }),
+	return new Request("http://adapter.test/admin/projects", {
+		method: "GET",
+		headers: { authorization: "Bearer adapter-token", "X-OpenWebUI-User-Id": "owner-test" },
 	});
-}
-
-function projectListText(value: unknown): string {
-	if (!isRecord(value) || !Array.isArray(value.choices)) return "";
-	const first = value.choices[0];
-	if (!isRecord(first) || !isRecord(first.message) || typeof first.message.content !== "string") return "";
-	return first.message.content;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }

@@ -75,6 +75,7 @@ export async function handleOpenAIModelsRequest(
 			principal,
 			workspace,
 			lease: { assertFence: () => admission.assertFence() },
+			registerSettlement: settled => admission.registerSettlement(settled),
 			correlationId: `models:${randomUUID()}`,
 		};
 		const scopedModelReaderFactory = () => routes.modelReaderFactory!(context);
@@ -178,6 +179,9 @@ function modelsWorkspaceLeaseErrorResponse(): Response {
 class ModelsWorkspaceLeaseError extends Error {}
 
 class ModelsWorkspaceLeaseAdmission {
+	readonly #settlements = new Set<Promise<void>>();
+	#settlementFailed = false;
+	#finishing = false;
 	#lease: WorkspaceLease;
 	readonly #durationMs: number;
 	readonly #heartbeat: ReturnType<typeof setInterval>;
@@ -206,12 +210,36 @@ class ModelsWorkspaceLeaseAdmission {
 		if (this.#failure) throw new ModelsWorkspaceLeaseError();
 	}
 
+	registerSettlement(settled: Promise<void>): void {
+		if (this.#finishing) throw new Error("Workspace settlement admission is closed.");
+		this.#settlements.add(settled);
+		void settled.then(
+			() => this.#settlements.delete(settled),
+			() => {
+				this.#settlementFailed = true;
+				this.#settlements.delete(settled);
+			},
+		);
+	}
+
 	async finish(): Promise<boolean> {
-		if (this.#finishPromise === undefined) this.#finishPromise = this.#finish();
+		if (this.#finishPromise === undefined) {
+			this.#finishing = true;
+			if (this.#settlements.size > 0) {
+				void Promise.allSettled([...this.#settlements])
+					.then(() => this.#finish())
+					.catch(() => {
+						this.#settlementFailed = true;
+					});
+				this.#finishPromise = Promise.resolve(false);
+			} else this.#finishPromise = this.#finish();
+		}
 		return this.#finishPromise;
 	}
 
 	async #finish(): Promise<boolean> {
+		if (this.#settlementFailed) return false;
+		let released = false;
 		try {
 			this.#stopping = true;
 			clearInterval(this.#heartbeat);
@@ -225,14 +253,17 @@ class ModelsWorkspaceLeaseAdmission {
 			}
 			try {
 				await this.#lease.release();
+				released = true;
 			} catch {
 				healthy = false;
 			}
 			return healthy && !this.#failure;
 		} finally {
-			const releaseAdmission = this.#releaseAdmission;
-			this.#releaseAdmission = undefined;
-			releaseAdmission?.();
+			if (released) {
+				const releaseAdmission = this.#releaseAdmission;
+				this.#releaseAdmission = undefined;
+				releaseAdmission?.();
+			}
 		}
 	}
 

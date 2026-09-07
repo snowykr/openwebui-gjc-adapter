@@ -19,14 +19,7 @@ import { getProjectSessionRoot } from "./turn-runner";
 export class SessionFileBoundaryError extends Error {
 	override readonly name = "SessionFileBoundaryError";
 }
-/**
- * A no-follow descriptor held across a descriptor-dependent effect.
- *
- * The child is deliberately given `canonicalPath`, not a parent-process descriptor path:
- * tmux does not prove inherited descriptor ownership.  A pathname replacement
- * after launch is therefore reported as uncertain and the exactly-owned pane is
- * cleaned up.
- */
+/** A no-follow file descriptor for reading and revalidating a selected historical transcript. */
 export interface OpenedRegularSessionFile {
 	readonly canonicalPath: string;
 	readonly descriptor: number;
@@ -62,7 +55,7 @@ export function openAbsoluteRegularSessionFile(sessionFile: string): OpenedRegul
 
 /**
  * Proves both the held descriptor and the originally selected name still identify one regular file.
- * Call immediately before launch and again after launch before any prompt is injected.
+ * Revalidate before and after a path-dependent read to reject pathname replacement.
  */
 export function revalidateOpenedRegularSessionFile(opened: OpenedRegularSessionFile): void {
 	const held = fstatSync(opened.descriptor);
