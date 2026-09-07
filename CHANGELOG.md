@@ -26,6 +26,7 @@
 
 ### Fixed
 
+- Captured model-reader factory inputs, resolved tenant identity, caller context, and original fence callbacks before asynchronous admission. Caller mutation cannot substitute a principal, workspace, runtime, lease callback, or cancellation signal; live cancellation and original lease receivers remain intact. This does not supply temporary catalog cleanup or recovery authority.
 - Kept same-process workspace admission held when chat or model-catalog lease release fails, preventing queued work from treating failed cleanup as successful release. Raw catalog settlement and cross-process cleanup recovery remain separate work.
 - Retained late initial-create success under its exact prepared provisional reservation without adding a session binding or weakening uncertainty. Added strict provisional-only decoding, immutable atomic persistence, original callback ownership, and separate proof admission. Reused the canonical scoped-store helper after removing a stale duplicate from turn routing. Unpublished cleanup and original-incarnation recovery remain unresolved.
 - Extended passive late receipt capture to selected `session.resume`, requiring the original exact session and generation while preserving uncertainty, immutable callback ownership, and blocked recovery. No historical bootstrap or provisional observation authority is added.

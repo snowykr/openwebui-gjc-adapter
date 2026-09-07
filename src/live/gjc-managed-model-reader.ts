@@ -45,9 +45,29 @@ export class ManagedModelReaderUnavailableError extends Error {
  * transport credential; model-selection policy remains the sole catalog parser.
  */
 export function createManagedModelReaderFactory(input: CreateManagedModelReaderFactoryInput): ModelReaderFactory {
+	const temporary = input.temporary;
+	input = {
+		...input,
+		...(temporary === undefined
+			? {}
+			: { temporary: { ...temporary, assertFence: temporary.assertFence.bind(temporary) } }),
+	};
 	if (input.resolveAttachment === undefined && input.temporary === undefined)
 		throw new TypeError("A managed model attachment or temporary lifecycle input is required.");
 	return async (context, signal) => {
+		const lease = context?.lease;
+		context =
+			context === undefined
+				? undefined
+				: {
+						...context,
+						principal: { ...context.principal },
+						...(context.workspace === undefined ? {} : { workspace: { ...context.workspace } }),
+						...(context.managedAuthority === undefined
+							? {}
+							: { managedAuthority: { ...context.managedAuthority } }),
+						...(lease === undefined ? {} : { lease: { assertFence: lease.assertFence.bind(lease) } }),
+					};
 		const effectiveSignal = signal ?? context?.signal;
 		throwIfAborted(effectiveSignal);
 		const deadline = new ManagedOperationDeadline(input.timeoutMs, "model catalog");
@@ -59,9 +79,10 @@ export function createManagedModelReaderFactory(input: CreateManagedModelReaderF
 				const resolved = await deadline.wait(
 					awaitWithAbort(input.resolveAttachment(effectiveSignal), effectiveSignal),
 				);
-				assertPrincipal(context, resolved.tenant.principalId);
-				await assertReaderContext(context, effectiveSignal, resolved.tenant.canonicalWorkspace, deadline);
-				const attachment = await acquire(input.runtime, resolved.tenant, deadline, effectiveSignal);
+				const tenant = { ...resolved.tenant };
+				assertPrincipal(context, tenant.principalId);
+				await assertReaderContext(context, effectiveSignal, tenant.canonicalWorkspace, deadline);
+				const attachment = await acquire(input.runtime, tenant, deadline, effectiveSignal);
 				throwIfAborted(effectiveSignal);
 				return new ManagedModelReader(
 					input.runtime,
@@ -69,7 +90,7 @@ export function createManagedModelReaderFactory(input: CreateManagedModelReaderF
 					undefined,
 					effectiveSignal,
 					deadline,
-					async signal => await assertReaderContext(context, signal, resolved.tenant.canonicalWorkspace, deadline),
+					async signal => await assertReaderContext(context, signal, tenant.canonicalWorkspace, deadline),
 				);
 			}
 			return await createTemporaryReader(input.runtime, input.temporary!, deadline, context, effectiveSignal);

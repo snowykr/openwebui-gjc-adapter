@@ -40,6 +40,105 @@ const userContext = {
 };
 
 describe("managed model reader", () => {
+	test.each(["success", "fence-failure", "cancelled"] as const)(
+		"retains original existing-reader scope and callbacks after caller mutation with %s",
+		async mode => {
+			const fake = new FakeRuntime();
+			const entered = Promise.withResolvers<void>(),
+				released = Promise.withResolvers<void>();
+			const controller = new AbortController();
+			let originalChecks = 0,
+				replacementChecks = 0;
+			class Lease {
+				#owned = true;
+				async assertFence() {
+					expect(this.#owned).toBe(true);
+					originalChecks += 1;
+					if (originalChecks === 2) {
+						entered.resolve();
+						await released.promise;
+					}
+					if (mode === "fence-failure" && originalChecks > 1) throw new Error("original fence revoked");
+				}
+			}
+			const lease = new Lease();
+			const context = {
+				...userContext,
+				principal: { ...userContext.principal },
+				workspace: { ...userContext.workspace },
+				lease,
+				signal: controller.signal,
+			};
+			const resolved = { tenant: { ...tenant } };
+			const input = { runtime: fake.runtime, timeoutMs: 1000, resolveAttachment: async () => resolved };
+			const pending = createManagedModelReaderFactory(input)(context);
+			const observed = pending.catch(error => error);
+			await entered.promise;
+			const replacement = async () => {
+				replacementChecks += 1;
+			};
+			Object.assign(input, { resolveAttachment: replacement, runtime: new FakeRuntime().runtime, timeoutMs: 60000 });
+			Object.assign(context.principal, { userId: "foreign" });
+			Object.assign(context.workspace, { userId: "foreign", root: "/foreign" });
+			Object.assign(context, { signal: new AbortController().signal, lease: { assertFence: replacement } });
+			Object.assign(lease, { assertFence: replacement });
+			Object.assign(resolved.tenant, { principalId: "foreign", canonicalWorkspace: "/foreign", generation: 99 });
+			if (mode === "cancelled") controller.abort();
+			released.resolve();
+			const outcome = await observed;
+			if (mode === "success") {
+				expect(await outcome.getAvailableModels()).toHaveLength(1);
+				await outcome.stop();
+				expect(fake.acquired).toEqual([tenant]);
+				expect(originalChecks).toBeGreaterThan(2);
+			} else {
+				expect(outcome).toBeInstanceOf(
+					mode === "cancelled" ? GjcTurnCancelledError : ManagedModelReaderUnavailableError,
+				);
+				expect(fake.acquired).toHaveLength(0);
+			}
+			expect(replacementChecks).toBe(0);
+		},
+	);
+
+	test("retains original temporary authority and fence after caller mutation", async () => {
+		const fake = new FakeRuntime();
+		const entered = Promise.withResolvers<void>(),
+			released = Promise.withResolvers<void>();
+		let checks = 0,
+			replacementChecks = 0;
+		const original = {
+			...temporary,
+			assertFence: async () => {
+				checks += 1;
+				if (checks === 1) {
+					entered.resolve();
+					await released.promise;
+				}
+			},
+		};
+		const input = { runtime: fake.runtime, timeoutMs: 1000, temporary: original };
+		const pending = createManagedModelReaderFactory(input)();
+		await entered.promise;
+		Object.assign(original, {
+			principalId: "foreign",
+			canonicalWorkspace: "/foreign",
+			requestKey: "replacement",
+			assertFence: async () => {
+				replacementChecks += 1;
+			},
+		});
+		Object.assign(input, { temporary: { ...original }, runtime: new FakeRuntime().runtime });
+		released.resolve();
+		const reader = await pending;
+		expect(await reader.getAvailableModels()).toHaveLength(1);
+		await reader.stop();
+		expect(fake.created?.requestKey).toBe(temporary.requestKey);
+		expect(fake.registered[0]?.principalId).toBe(tenant.principalId);
+		expect(checks).toBeGreaterThan(1);
+		expect(replacementChecks).toBe(0);
+	});
+
 	test.each(["context", "resolver", "reconcile", "acquire"] as const)(
 		"bounds existing-reader %s admission without later work after release",
 		async phase => {

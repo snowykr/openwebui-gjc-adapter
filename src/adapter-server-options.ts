@@ -634,9 +634,9 @@ function assertDirectV3Authority(canonicalPath: string): void {
 
 function createManagedReaderFactory(runtime: ManagedSdkRuntime, timeoutMs: number): ModelReaderFactory {
 	return async (context, signal) => {
-		const authority = context?.managedAuthority;
-		if (authority === undefined)
+		if (context?.managedAuthority === undefined)
 			throw new Error("Managed model catalog access requires explicit tenant or temporary service authority.");
+		const authority = { ...context.managedAuthority };
 		if (isManagedTurnAuthority(authority)) {
 			return createManagedModelReaderFactory({
 				runtime,
@@ -657,12 +657,13 @@ function createManagedReaderFactory(runtime: ManagedSdkRuntime, timeoutMs: numbe
 		}
 		if (context?.lease === undefined)
 			throw new Error("Managed temporary model catalog access requires a workspace lease fence.");
+		const assertFence = context.lease.assertFence.bind(context.lease);
 		return createManagedModelReaderFactory({
 			runtime,
 			timeoutMs,
 			temporary: {
 				...authority,
-				assertFence: () => context.lease!.assertFence(),
+				assertFence,
 			},
 		})(context, signal);
 	};
