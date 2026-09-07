@@ -212,6 +212,7 @@ class ModelsWorkspaceLeaseAdmission {
 	}
 
 	async #finish(): Promise<boolean> {
+		let released = false;
 		try {
 			this.#stopping = true;
 			clearInterval(this.#heartbeat);
@@ -225,14 +226,17 @@ class ModelsWorkspaceLeaseAdmission {
 			}
 			try {
 				await this.#lease.release();
+				released = true;
 			} catch {
 				healthy = false;
 			}
 			return healthy && !this.#failure;
 		} finally {
-			const releaseAdmission = this.#releaseAdmission;
-			this.#releaseAdmission = undefined;
-			releaseAdmission?.();
+			if (released) {
+				const releaseAdmission = this.#releaseAdmission;
+				this.#releaseAdmission = undefined;
+				releaseAdmission?.();
+			}
 		}
 	}
 

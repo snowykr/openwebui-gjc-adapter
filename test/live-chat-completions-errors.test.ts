@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { handleChatCompletions, LiveGatewayUnavailableError } from "../src/live/chat-completions";
+import {
+	acquireWorkspaceAdmission,
+	handleChatCompletions,
+	LiveGatewayUnavailableError,
+} from "../src/live/chat-completions";
 import { encodeChatCompletionSse } from "../src/live/chat-response-format";
 import { asyncIterableBody } from "../src/live/openai-routes";
 import type { OpenAIChatCompletionRequest } from "../src/live/openai-types";
@@ -346,5 +350,42 @@ describe("live OpenAI-compatible chat completion errors", () => {
 		finishAcquire();
 		await expect(pending).rejects.toMatchObject({ name: "WorkspaceAdmissionCancelledError" });
 		expect(releases).toBe(1);
+	});
+	it("failed chat lease release cannot admit another same-workspace operation", async () => {
+		const safeKey = "b".repeat(64);
+		let releases = 0;
+		const lease = {
+			renew: async () => lease,
+			assertFence: async () => {},
+			reference: { safeKey, holderId: "chat-owner", generation: 1, operation: "turn" },
+			release: async () => {
+				releases += 1;
+				throw new Error("release storage failure");
+			},
+		} as unknown as WorkspaceLease;
+		const manager = { acquire: async () => lease };
+		const result = await handleChatCompletions({
+			request,
+			headers: { ...chatHeaders, "X-OpenWebUI-User-Id": "normal-1" },
+			projects: [project],
+			owner,
+			neutralWorkspace: "/tmp",
+			workspaceRegistry: {
+				open: async userId => ({ userId, safeKey, root: "/tmp", sessionRoot: "/tmp/.gjc/sessions" }),
+			},
+			workspaceLeaseManager: manager,
+			runner: { run: async () => ({ content: "completed" }) },
+		});
+		expect(result.ok).toBe(false);
+		expect(releases).toBe(1);
+		let granted = false;
+		await acquireWorkspaceAdmission(manager, safeKey, 50, 8).then(
+			release => {
+				granted = true;
+				release();
+			},
+			() => undefined,
+		);
+		expect(granted).toBe(false);
 	});
 });

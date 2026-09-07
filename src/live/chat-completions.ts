@@ -489,6 +489,7 @@ class WorkspaceLeaseAdmission {
 	}
 
 	async #finish(): Promise<boolean> {
+		let released = false;
 		try {
 			this.#stopping = true;
 			if (this.#heartbeat !== undefined) clearInterval(this.#heartbeat);
@@ -502,14 +503,17 @@ class WorkspaceLeaseAdmission {
 			}
 			try {
 				await this.#lease.release();
+				released = true;
 			} catch {
 				healthy = false;
 			}
 			return healthy && !this.#failure;
 		} finally {
-			const releaseAdmission = this.#releaseAdmission;
-			this.#releaseAdmission = undefined;
-			releaseAdmission?.();
+			if (released) {
+				const releaseAdmission = this.#releaseAdmission;
+				this.#releaseAdmission = undefined;
+				releaseAdmission?.();
+			}
 		}
 	}
 
