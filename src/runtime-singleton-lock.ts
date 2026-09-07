@@ -1,4 +1,4 @@
-import { constants } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, realpathSync } from "node:fs";
 import { lstat, open, readFile, realpath, unlink } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative } from "node:path";
 
@@ -72,6 +72,42 @@ export class RuntimeSingletonLock {
 		if (scope === ".." || scope.startsWith("../") || isAbsolute(scope))
 			throw new Error("Adapter runtime lock does not own the requested authority path.");
 		await this.assertHeld();
+	}
+
+	/** Final passive-receipt storage fence; identical owner and file identity, without yielding. */
+	assertOwnsPathSync(path: string): void {
+		const scope = relative(dirname(this.#path), realpathSync(dirname(path)));
+		if (scope === ".." || scope.startsWith("../") || isAbsolute(scope))
+			throw new Error("Adapter runtime lock does not own the requested authority path.");
+		if (this.#released) throw new Error("Adapter runtime lock has been released.");
+		const descriptor = openSync(this.#path, constants.O_RDONLY | constants.O_NOFOLLOW);
+		try {
+			const before = fstatSync(descriptor);
+			if (!before.isFile() || before.size > 16 * 1024)
+				throw new Error("Adapter runtime lock must be a regular non-symlink file");
+			const owner: unknown = JSON.parse(readFileSync(descriptor, "utf8"));
+			const after = fstatSync(descriptor),
+				named = lstatSync(this.#path);
+			if (
+				!isOwner(owner) ||
+				!sameOwner(owner, this.#owner) ||
+				before.dev !== this.#identity?.device ||
+				before.ino !== this.#identity.inode ||
+				!named.isFile() ||
+				named.isSymbolicLink() ||
+				named.dev !== before.dev ||
+				named.ino !== before.ino ||
+				after.size !== before.size ||
+				after.mtimeMs !== before.mtimeMs ||
+				after.ctimeMs !== before.ctimeMs ||
+				named.size !== after.size ||
+				named.mtimeMs !== after.mtimeMs ||
+				named.ctimeMs !== after.ctimeMs
+			)
+				throw new Error("Adapter runtime lock changed while checking ownership");
+		} finally {
+			closeSync(descriptor);
+		}
 	}
 
 	async release(): Promise<void> {

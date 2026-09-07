@@ -55,10 +55,16 @@ export class AuthorityMutationLock {
 	}
 
 	assertHeld(authorityPath: string): void {
+		this.assertOwned(authorityPath);
+		if (this.record.leaseExpiresAt <= Date.now())
+			throw new Error("Session authority mutation lease ownership was lost.");
+	}
+
+	/** Retained exclusion only; never authorizes a new effect or canonical activation after expiry. */
+	assertOwned(authorityPath: string): void {
 		if (this.#released || this.path !== `${resolve(authorityPath)}.lock`)
 			throw new Error("Session authority mutation lease does not own the requested path.");
-		if (!this.ownsLock() || this.record.leaseExpiresAt <= Date.now())
-			throw new Error("Session authority mutation lease ownership was lost.");
+		if (!this.ownsLock()) throw new Error("Session authority mutation lease ownership was lost.");
 	}
 
 	release(): void {

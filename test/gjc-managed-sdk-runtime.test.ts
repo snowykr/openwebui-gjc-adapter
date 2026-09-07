@@ -234,6 +234,7 @@ function fixture(
 	const resumeCalls: ResumeRequest[] = [];
 	const listCalls: ListRequest[] = [];
 	const historicalResumeCalls: HistoricalResumeRequest[] = [];
+	const historicalOutcomes: Awaited<ReturnType<LifecycleService["resume"]>>[] = [];
 	const statusCalls: Array<{ sessionId: string; generation: number }> = [];
 	const routerRequests: Array<{
 		sessionId: string;
@@ -385,6 +386,10 @@ function fixture(
 		resumeCalls,
 		listCalls,
 		historicalResumeCalls,
+		historicalOutcomes,
+		observeHistoricalOutcome: (outcome: Awaited<ReturnType<LifecycleService["resume"]>>) => {
+			historicalOutcomes.push(outcome);
+		},
 		statusCalls,
 		routerRequests,
 		replaceAttachment() {
@@ -2096,7 +2101,12 @@ describe("managed SDK runtime", () => {
 			target: { cwd: tenant.canonicalWorkspace, resolveSessionId: tenant.sessionId },
 		});
 		expect(selectionFences).toBe(2);
-		const outcome = await f.runtime.resumeHistoricalSession("migration:resume:attempt-1", evidence, 500);
+		const outcome = await f.runtime.resumeHistoricalSession(
+			"migration:resume:attempt-1",
+			evidence,
+			f.observeHistoricalOutcome,
+			500,
+		);
 		expect(outcome).toEqual({
 			ok: true,
 			operation: "session.resume",
@@ -2147,7 +2157,11 @@ describe("managed SDK runtime", () => {
 				"selection authority fence",
 			);
 			await expect(
-				f.runtime.resumeHistoricalSession("migration:resume:attempt-1", historicalEvidence()),
+				f.runtime.resumeHistoricalSession(
+					"migration:resume:attempt-1",
+					historicalEvidence(),
+					f.observeHistoricalOutcome,
+				),
 			).rejects.toThrow("resume authority fence");
 			expect(f.listCalls).toEqual([]);
 			expect(f.historicalResumeCalls).toEqual([]);
@@ -2268,14 +2282,22 @@ describe("managed SDK runtime", () => {
 		])
 			await expect(f.runtime.selectHistoricalSession(selection)).rejects.toThrow("selection authority fence");
 		await expect(
-			f.runtime.resumeHistoricalSession("migration:resume:attempt-2", historicalEvidence()),
+			f.runtime.resumeHistoricalSession(
+				"migration:resume:attempt-2",
+				historicalEvidence(),
+				f.observeHistoricalOutcome,
+			),
 		).rejects.toThrow("resume authority fence");
 		for (const patch of [
 			{ payloadHash: "f".repeat(64) },
 			{ historicalSource: { ...historicalEvidence().historicalSource!, manifestDigest: "f".repeat(64) } },
 		])
 			await expect(
-				f.runtime.resumeHistoricalSession("migration:resume:attempt-1", { ...historicalEvidence(), ...patch }),
+				f.runtime.resumeHistoricalSession(
+					"migration:resume:attempt-1",
+					{ ...historicalEvidence(), ...patch },
+					f.observeHistoricalOutcome,
+				),
 			).rejects.toThrow("resume authority fence");
 		expect(f.listCalls).toEqual([]);
 		expect(f.historicalResumeCalls).toEqual([]);
@@ -2380,7 +2402,12 @@ describe("managed SDK runtime", () => {
 			const pending =
 				mode === "selection"
 					? f.runtime.selectHistoricalSession(historicalSelection(), 15)
-					: f.runtime.resumeHistoricalSession("migration:resume:attempt-1", historicalEvidence(), 15);
+					: f.runtime.resumeHistoricalSession(
+							"migration:resume:attempt-1",
+							historicalEvidence(),
+							f.observeHistoricalOutcome,
+							15,
+						);
 			const failure = pending.catch(error => error);
 			await entered.promise;
 			expect(await failure).toMatchObject({ code: "timeout" });
@@ -2406,7 +2433,11 @@ describe("managed SDK runtime", () => {
 			const pending = (
 				mode === "selection"
 					? f.runtime.selectHistoricalSession(historicalSelection())
-					: f.runtime.resumeHistoricalSession("migration:resume:attempt-1", historicalEvidence())
+					: f.runtime.resumeHistoricalSession(
+							"migration:resume:attempt-1",
+							historicalEvidence(),
+							f.observeHistoricalOutcome,
+						)
 			).catch(error => error);
 			await entered.promise;
 			const stopped = f.runtime.stop();
@@ -2489,7 +2520,9 @@ describe("managed SDK runtime", () => {
 			" migration:resume:attempt-1",
 			"migration:resume:attempt-1\n",
 		])
-			await expect(f.runtime.resumeHistoricalSession(id, historicalEvidence())).rejects.toThrow();
+			await expect(
+				f.runtime.resumeHistoricalSession(id, historicalEvidence(), f.observeHistoricalOutcome),
+			).rejects.toThrow();
 		const mutations: Array<(value: ReturnType<typeof historicalEvidence>) => void> = [
 			value => {
 				Reflect.set(value, "state", "intent_prepared");
@@ -2541,7 +2574,9 @@ describe("managed SDK runtime", () => {
 		for (const mutate of mutations) {
 			const value = historicalEvidence();
 			mutate(value);
-			await expect(f.runtime.resumeHistoricalSession("migration:resume:attempt-1", value)).rejects.toThrow();
+			await expect(
+				f.runtime.resumeHistoricalSession("migration:resume:attempt-1", value, f.observeHistoricalOutcome),
+			).rejects.toThrow();
 		}
 		expect(fences).toBe(0);
 		expect(f.historicalResumeCalls).toEqual([]);
@@ -2572,7 +2607,12 @@ describe("managed SDK runtime", () => {
 			historicalResume: async () => outcome,
 		});
 		await f.runtime.start();
-		const pending = f.runtime.resumeHistoricalSession("migration:resume:attempt-1", evidence, 500);
+		const pending = f.runtime.resumeHistoricalSession(
+			"migration:resume:attempt-1",
+			evidence,
+			f.observeHistoricalOutcome,
+			500,
+		);
 		await entered.promise;
 		Reflect.set(evidence.target, "sessionPath", "/foreign");
 		Reflect.set(evidence.preparedAuthority, "leaseId", "foreign");
@@ -2603,11 +2643,19 @@ describe("managed SDK runtime", () => {
 			},
 		});
 		await f.runtime.start();
-		await expect(f.runtime.resumeHistoricalSession("migration:resume:attempt-1", historicalEvidence())).rejects.toBe(
-			failure,
-		);
 		await expect(
-			f.runtime.resumeHistoricalSession("migration:resume:attempt-1", historicalEvidence()),
+			f.runtime.resumeHistoricalSession(
+				"migration:resume:attempt-1",
+				historicalEvidence(),
+				f.observeHistoricalOutcome,
+			),
+		).rejects.toBe(failure);
+		await expect(
+			f.runtime.resumeHistoricalSession(
+				"migration:resume:attempt-1",
+				historicalEvidence(),
+				f.observeHistoricalOutcome,
+			),
 		).rejects.toThrow("resume authority fence");
 		expect(f.historicalResumeCalls).toHaveLength(1);
 		expect(f.calls).toEqual(["start"]);
@@ -2628,7 +2676,11 @@ describe("managed SDK runtime", () => {
 			const pending = (
 				mode === "selection"
 					? f.runtime.selectHistoricalSession(historicalSelection())
-					: f.runtime.resumeHistoricalSession("migration:resume:attempt-1", historicalEvidence())
+					: f.runtime.resumeHistoricalSession(
+							"migration:resume:attempt-1",
+							historicalEvidence(),
+							f.observeHistoricalOutcome,
+						)
 			).catch(error => error);
 			await entered.promise;
 			expect(f.listCalls).toEqual([]);
@@ -2657,7 +2709,13 @@ describe("managed SDK runtime", () => {
 			historicalResume: async () => outcome,
 		});
 		await f.runtime.start();
-		expect(await f.runtime.resumeHistoricalSession("migration:resume:attempt-1", historicalEvidence())).toBe(outcome);
+		expect(
+			await f.runtime.resumeHistoricalSession(
+				"migration:resume:attempt-1",
+				historicalEvidence(),
+				f.observeHistoricalOutcome,
+			),
+		).toBe(outcome);
 		expect(fences).toBe(1);
 		expect(f.historicalResumeCalls).toHaveLength(1);
 		expect(f.calls).toEqual(["start"]);
@@ -2680,7 +2738,7 @@ describe("managed SDK runtime", () => {
 		});
 		await f.runtime.start();
 		const failure = f.runtime
-			.resumeHistoricalSession("migration:resume:attempt-1", historicalEvidence(), 15)
+			.resumeHistoricalSession("migration:resume:attempt-1", historicalEvidence(), f.observeHistoricalOutcome, 15)
 			.catch(error => error);
 		await entered.promise;
 		expect(await failure).toMatchObject({ code: "timeout" });
@@ -2694,7 +2752,105 @@ describe("managed SDK runtime", () => {
 		expect(f.historicalResumeCalls).toHaveLength(1);
 		expect(f.calls).toEqual(["start"]);
 		await expect(f.runtime.acquireAttachment(tenant)).rejects.toThrow("not registered");
+		expect(f.historicalOutcomes).toEqual([
+			{ ok: true, operation: "session.resume", result: { sessionId: tenant.sessionId, endpointGeneration: 1 } },
+		]);
 		await f.runtime.stop();
+	});
+
+	test.each(["success", "failure"] as const)(
+		"historical raw %s observer stays owned after timeout and shutdown",
+		async mode => {
+			const entered = deferred<void>();
+			const observed = deferred<void>();
+			const release = deferred<Awaited<ReturnType<LifecycleService["resume"]>>>();
+			const persist = deferred<void>();
+			const persistenceError = new Error("original receipt write failed");
+			let fences = 0;
+			const f = fixture({
+				historicalResumeFence: () => {
+					fences += 1;
+					return fences === 1;
+				},
+				historicalResume: () => {
+					entered.resolve();
+					return release.promise;
+				},
+			});
+			await f.runtime.start();
+			const scope = f.runtime.createProducerScope();
+			const pending = scope
+				.run(() =>
+					f.runtime.resumeHistoricalSession(
+						"migration:resume:attempt-1",
+						historicalEvidence(),
+						async value => {
+							f.observeHistoricalOutcome(value);
+							observed.resolve();
+							await persist.promise;
+						},
+						15,
+					),
+				)
+				.catch(error => error);
+			await entered.promise;
+			expect(await pending).toMatchObject({ code: "timeout" });
+			const scopeSettled = scope.seal();
+			const disposed = f.runtime.dispose();
+			let completed = false;
+			void disposed.then(
+				() => {
+					completed = true;
+				},
+				() => {
+					completed = true;
+				},
+			);
+			const outcome: Awaited<ReturnType<LifecycleService["resume"]>> = {
+				ok: true,
+				operation: "session.resume",
+				result: { sessionId: tenant.sessionId, endpointGeneration: 7 },
+			};
+			release.resolve(outcome);
+			await observed.promise;
+			expect(completed).toBe(false);
+			expect(f.historicalOutcomes).toEqual([outcome]);
+			expect(f.historicalOutcomes[0]).not.toBe(outcome);
+			expect(f.historicalOutcomes[0]!.ok && f.historicalOutcomes[0]!.result).not.toBe(outcome.result);
+			expect(fences).toBe(1);
+			if (mode === "success") {
+				persist.resolve();
+				await scopeSettled;
+				await disposed;
+			} else {
+				persist.reject(persistenceError);
+				await expect(scopeSettled).rejects.toThrow("persistence failed");
+				await expect(disposed).rejects.toThrow("persistence failed");
+			}
+			expect(f.historicalResumeCalls).toHaveLength(1);
+			expect(f.calls).not.toContain("reconcile");
+			expect(f.closeCalls).toEqual([]);
+		},
+	);
+
+	test("historical resume rejects a missing original observer before any admission", async () => {
+		let fences = 0;
+		const f = fixture({
+			historicalResumeFence: () => {
+				fences += 1;
+				return true;
+			},
+		});
+		await f.runtime.start();
+		await expect(
+			Reflect.apply(f.runtime.resumeHistoricalSession, f.runtime, [
+				"migration:resume:attempt-1",
+				historicalEvidence(),
+			]),
+		).rejects.toThrow("original outcome observer");
+		expect(fences).toBe(0);
+		expect(f.historicalResumeCalls).toEqual([]);
+		await f.runtime.dispose();
 	});
 
 	test("purpose-only grants prove identity and retirement but never authorize active traffic", async () => {

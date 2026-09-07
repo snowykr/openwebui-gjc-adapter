@@ -90,6 +90,8 @@ Completed reassignment/provisional receipts remain historical; only the current 
 
 The internal bootstrap attempt exposes a budget-bounded `result` separately from `settled`, which succeeds only after pending admission, local Router stop, owned admission-resource release, and mutation-lock release. A timed-out result cannot authorize releasing the outer runtime lock. Optional admission runs once after all offline candidates validate in the reopened historical stage; repeated authority resolution never acquires a replacement lease. The public bootstrap probe now acquires its migration lease at that post-stage boundary. This is not yet production operator admission or a serving handoff: expiring a migration lease at command exit would invalidate the persisted live lease, and the original-incarnation recovery limitation remains.
 
+Original historical resume outcomes are captured inside the tracked SDK producer, before renewed proof or deadline checks. The same live invocation retains its staged journal and storage exclusions until acknowledgement/uncertainty persistence settles, even after its bounded result expires. A receipt can outlive effect admission but cannot renew it: no late adoption, publication, cleanup or retry follows. Replaced source snapshots, stage identity, manifest or lock ownership reject actual settlement; expired-but-identically-owned storage exclusion permits only this passive write. A reopened or already-uncertain invocation cannot obtain that receipt handle. This is not cross-process recovery, released original-incarnation proof, or a serving handoff.
+
 ## CLI first-install configuration
 
 Choose the route before running a command:

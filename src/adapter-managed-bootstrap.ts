@@ -107,6 +107,22 @@ export interface AdapterManagedBootstrapAttempt {
 export function startAdapterSessionAuthorityV3Activation(
 	input: AdapterManagedBootstrapInput,
 ): AdapterManagedBootstrapAttempt {
+	const authority = input.authority;
+	const admission = input.admission;
+	input = Object.freeze({
+		...input,
+		locations: Object.freeze({ ...input.locations }),
+		authority: Object.freeze({ resolve: authority.resolve.bind(authority) }),
+		...(admission === undefined
+			? {}
+			: {
+					admission: Object.freeze({
+						admit: admission.admit.bind(admission),
+						release: admission.release.bind(admission),
+					}),
+				}),
+		...(input.createRuntime === undefined ? {} : { createRuntime: input.createRuntime.bind(input) }),
+	});
 	for (const path of [input.locations.agentDir, input.locations.stateRoot, input.sourcePath])
 		if (!isAbsolute(path) || resolve(path) !== path)
 			throw new TypeError("Bootstrap paths must be canonical absolute paths.");
@@ -411,44 +427,55 @@ async function activate(
 							await step(() => current.stage.begin(target.operationId, evidence!));
 						}
 						const dispatched = transitionManagedLifecycleEvidence(evidence, "invoking");
-						await step(() =>
+						const invocation = await step(() =>
 							current.stage.advance(target.operationId, managedLifecycleEvidenceHash(evidence!), dispatched),
 						);
+						const scope = runtime!.createProducerScope();
+						const receipt = current.stage.retainInvocation(invocation);
+						let ack: ManagedLifecycleEvidence | undefined;
 						invoking.add(target.operationId);
 						try {
-							const outcome = await step(() =>
-								runtime!.resumeHistoricalSession(target.operationId, dispatched, deadline.remaining()),
+							await step(() =>
+								scope.run(() =>
+									runtime!.resumeHistoricalSession(
+										target.operationId,
+										dispatched,
+										outcome => {
+											const valid =
+												outcome.ok === true &&
+												outcome.operation === "session.resume" &&
+												outcome.result.sessionId ===
+													dispatched.historicalSource!.historicalBinding.sessionId &&
+												Number.isSafeInteger(outcome.result.endpointGeneration) &&
+												outcome.result.endpointGeneration! > 0;
+											const observed = receipt.observe(
+												valid
+													? {
+															sessionId: outcome.result.sessionId,
+															generation: outcome.result.endpointGeneration!,
+														}
+													: undefined,
+											);
+											if (valid) ack = observed;
+										},
+										deadline.remaining(),
+									),
+								),
 							);
-							if (
-								!outcome.ok ||
-								outcome.operation !== "session.resume" ||
-								outcome.result.sessionId !== target.source.sessionId ||
-								!Number.isSafeInteger(outcome.result.endpointGeneration) ||
-								outcome.result.endpointGeneration! <= 0
-							)
+							if (ack?.acknowledged === undefined)
 								throw new Error(
 									"Historical resume did not acknowledge the exact session and positive generation.",
 								);
-							const acknowledged = {
-								...target.prepared,
-								sessionId: outcome.result.sessionId,
-								generation: outcome.result.endpointGeneration!,
-							};
-							const ack = transitionManagedLifecycleEvidence(dispatched, "acknowledged_unproven", {
-								acknowledged,
-							});
-							// No resolve, registration, proof, or fresh external fence precedes this write.
-							await step(() =>
-								current.stage.advance(target.operationId, managedLifecycleEvidenceHash(dispatched), ack),
-							);
+							const acknowledgedEvidence = ack;
+							const acknowledged = ack.acknowledged;
 							const key = tenant(acknowledged);
 							const attachment = await step(() =>
 								runtime!.proveLifecycleTenant(
 									key,
 									{
 										operationId: target.operationId,
-										requestKey: ack.requestKey,
-										payloadHash: ack.payloadHash,
+										requestKey: acknowledgedEvidence.requestKey,
+										payloadHash: acknowledgedEvidence.payloadHash,
 									},
 									deadline.remaining(),
 								),
@@ -469,34 +496,24 @@ async function activate(
 								},
 							});
 							await step(() =>
-								current.stage.advance(target.operationId, managedLifecycleEvidenceHash(ack), active),
+								current.stage.advance(
+									target.operationId,
+									managedLifecycleEvidenceHash(acknowledgedEvidence),
+									active,
+								),
 							);
 							await step(() =>
 								current.stage.promote(target.operationId, managedLifecycleEvidenceHash(active), active),
 							);
 							proven.set(target.operationId, { prepared: target.prepared, attachment });
-						} catch (error) {
-							const retained = operationFor(target.operationId)?.lifecycle;
-							if (retained?.state === "invoking" || retained?.state === "acknowledged_unproven") {
-								try {
-									const uncertain = transitionManagedLifecycleEvidence(retained, "uncertain");
-									await step(() =>
-										current.stage.advance(
-											target.operationId,
-											managedLifecycleEvidenceHash(retained),
-											uncertain,
-										),
-									);
-								} catch (persistenceError) {
-									throw new AggregateError(
-										[error, persistenceError],
-										"Bootstrap failure and uncertainty persistence failed.",
-									);
-								}
-							}
-							throw error;
 						} finally {
 							invoking.delete(target.operationId);
+							// Passive finalization stays below all result races and retains the stage until raw work ends.
+							try {
+								await scope.seal();
+							} finally {
+								receipt.finish();
+							}
 						}
 					}
 				},

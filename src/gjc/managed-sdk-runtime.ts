@@ -421,8 +421,13 @@ export class ManagedSdkRuntime {
 	async resumeHistoricalSession(
 		operationId: string,
 		evidence: ManagedLifecycleEvidence,
+		onOutcome: (
+			outcome: Awaited<ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["resume"]>>,
+		) => void | Promise<void>,
 		timeoutMs?: number,
 	): ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["resume"]> {
+		if (typeof onOutcome !== "function")
+			throw new TypeError("Historical resume requires its original outcome observer.");
 		const value = freezeHistoricalInput(copyManagedLifecycleEvidence(evidence));
 		if (
 			!exactHistoricalString(operationId) ||
@@ -457,13 +462,23 @@ export class ManagedSdkRuntime {
 			budget.remaining();
 			this.#assertOwner();
 			// No post-effect fence, attachment proof or retry may delay the owner's durable acknowledgement.
-			return this.#lifecycle.resume({
+			const result = await this.#lifecycle.resume({
 				actor: value.actor,
 				capability: "session.resume",
 				requestKey: value.requestKey,
 				target,
 				timeoutMs: budget.remaining(),
 			});
+			try {
+				await onOutcome(structuredClone(result));
+			} catch (error) {
+				this.#producerContext.getStore()?.persistenceFailed(error);
+				this.#outcomePersistenceFailure ??= new Error("Original lifecycle outcome persistence failed.", {
+					cause: error,
+				});
+				throw error;
+			}
+			return result;
 		});
 	}
 

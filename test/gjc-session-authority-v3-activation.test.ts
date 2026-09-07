@@ -179,6 +179,67 @@ async function fixture() {
 }
 
 describe("session authority V3 activation", () => {
+	test("original receipt snapshots its invocation, duplicates without writes, and cannot authorize recovery", async () => {
+		const f = await historicalFixture();
+		const lock = AuthorityMutationLock.acquire(f.canonicalPath);
+		let stagedPath = "";
+		const run = (bootstrap: NonNullable<SessionAuthorityV3ActivationOptions["bootstrap"]>) =>
+			startSessionAuthorityV3Activation({
+				canonicalPath: f.canonicalPath,
+				stagingRoot: join(f.root, "private"),
+				runtimeLock: f.runtimeLock,
+				mutationLock: lock,
+				bootstrapTenantFence: () => true,
+				beforeBootstrapCommit: async () => () => {},
+				bootstrap,
+			});
+		try {
+			const attempt = run(async context => {
+				stagedPath = context.stagedPath;
+				const intent = bootstrapEvidence(context);
+				const id = "migration:resume:session";
+				const prepared = await context.stage.begin(id, intent);
+				expect(() => context.stage.retainInvocation(prepared)).toThrow("live attempt");
+				const invoked = await context.stage.advance(
+					id,
+					managedLifecycleEvidenceHash(intent),
+					transitionManagedLifecycleEvidence(intent, "invoking"),
+				);
+				const receipt = context.stage.retainInvocation(invoked);
+				expect(() => context.stage.retainInvocation(invoked)).toThrow("live attempt");
+				Reflect.set(invoked, "id", "foreign");
+				Reflect.set(invoked.lifecycle!.preparedAuthority, "leaseId", "foreign");
+				const observed = { sessionId: "session", generation: 7 };
+				const ack = receipt.observe(observed);
+				expect(ack.state).toBe("acknowledged_unproven");
+				expect(ack.acknowledged?.leaseId).toBe("lease");
+				observed.generation = 99;
+				Reflect.set(ack, "state", "retired");
+				const before = await readFile(stagedPath),
+					identity = await stat(stagedPath);
+				expect(receipt.observe({ sessionId: "session", generation: 7 }).state).toBe("acknowledged_unproven");
+				expect((await readFile(stagedPath)).equals(before)).toBe(true);
+				expect((await stat(stagedPath)).ino).toBe(identity.ino);
+				receipt.finish();
+				expect(() => receipt.observe({ sessionId: "session", generation: 7 })).toThrow("closed");
+				expect(context.stage.read().mappings[0]!.journal.at(-1)!.lifecycle?.state).toBe("uncertain");
+			});
+			expect((await attempt.result).status).toBe("blocked");
+			await attempt.settled;
+			const resumed = run(async context => {
+				const retained = context.stage.read().mappings[0]!.journal.at(-1)!;
+				expect(() => context.stage.retainInvocation(retained)).toThrow("live attempt");
+			});
+			expect((await resumed.result).status).toBe("blocked");
+			await resumed.settled;
+			expect((await readFile(f.canonicalPath)).equals(f.original)).toBe(true);
+			expect(await Bun.file(`${f.canonicalPath}.v3-active.json`).exists()).toBe(false);
+		} finally {
+			lock.release();
+			await f.cleanup();
+		}
+	});
+
 	test("explicit mutation duration covers long activation without renewal and still expires", async () => {
 		const f = await fixture();
 		const started = Date.now();
@@ -191,6 +252,8 @@ describe("session authority V3 activation", () => {
 			expect((await readFile(`${f.canonicalPath}.lock`)).equals(before)).toBe(true);
 			now.mockReturnValue(started + 60_000);
 			expect(() => lock.assertHeld(f.canonicalPath)).toThrow("ownership was lost");
+			lock.assertOwned(f.canonicalPath);
+			expect(() => lock.assertOwned(join(f.root, "foreign.json"))).toThrow("does not own");
 			expect(() => AuthorityMutationLock.acquire(f.canonicalPath)).toThrow();
 			expect((await readFile(`${f.canonicalPath}.lock`)).equals(before)).toBe(true);
 		} finally {

@@ -104,6 +104,8 @@ const bootstrapAccess = new WeakMap<
 		readonly manifestDigest: string;
 		readonly check: () => Promise<void>;
 		readonly checkSync: () => void;
+		readonly receiptCheck: () => void;
+		readonly retainReceipt: (completion: Promise<void>) => void;
 		readonly tenantFence: NonNullable<SessionAuthorityV3ActivationOptions["bootstrapTenantFence"]>;
 	}
 >();
@@ -133,6 +135,36 @@ export async function assertBootstrapOperation(
 	if (!(await owner.tenantFence(structuredClone(evidence))))
 		throw new Error("Historical bootstrap operation lease or tenant fence was lost.");
 	await assertBootstrapAccess(access, path);
+}
+
+/** Issued only during live admission; retained solely for the original invocation's passive writes. */
+export function retainBootstrapReceipt(access: SessionAuthorityV3BootstrapAccess, path: string) {
+	assertBootstrapAccessCurrent(access, path);
+	const owner = bootstrapAccess.get(access)!;
+	const completion = Promise.withResolvers<void>();
+	let released = false;
+	owner.retainReceipt(completion.promise);
+	return Object.freeze({
+		assertCurrent: () => {
+			if (released) throw new Error("Historical receipt ownership is closed.");
+			owner.receiptCheck();
+		},
+		admitted: () => {
+			if (released || bootstrapAccess.get(access) !== owner) return false;
+			try {
+				owner.checkSync();
+				return true;
+			} catch {
+				return false;
+			}
+		},
+		release: (failure?: { readonly error: unknown }) => {
+			if (released) return;
+			released = true;
+			if (failure === undefined) completion.resolve();
+			else completion.reject(failure.error);
+		},
+	});
 }
 
 export interface SessionAuthorityV3ActiveMarker {
@@ -170,8 +202,22 @@ export function startSessionAuthorityV3Activation(options: SessionAuthorityV3Act
 	readonly result: Promise<SessionAuthorityV3ActivationResult>;
 	readonly settled: Promise<void>;
 } {
+	options = Object.freeze({
+		...options,
+		...(options.bindings === undefined ? {} : { bindings: structuredClone(options.bindings) }),
+		...(options.bootstrap === undefined ? {} : { bootstrap: options.bootstrap.bind(options) }),
+		...(options.bootstrapTenantFence === undefined
+			? {}
+			: { bootstrapTenantFence: options.bootstrapTenantFence.bind(options) }),
+		...(options.beforeBootstrapCommit === undefined
+			? {}
+			: { beforeBootstrapCommit: options.beforeBootstrapCommit.bind(options) }),
+		...(options.resolveBindings === undefined ? {} : { resolveBindings: options.resolveBindings.bind(options) }),
+		...(options.afterBoundary === undefined ? {} : { afterBoundary: options.afterBoundary.bind(options) }),
+	});
 	const deadline = new ManagedOperationDeadline(options.timeoutMs, "authority activation");
 	const producers = new Set<Promise<unknown>>();
+	const receiptFailures: unknown[] = [];
 	const track = <T>(promise: Promise<T>): Promise<T> => {
 		producers.add(promise);
 		void promise.then(
@@ -181,14 +227,23 @@ export function startSessionAuthorityV3Activation(options: SessionAuthorityV3Act
 		return promise;
 	};
 	const wait = <T>(promise: Promise<T>): Promise<T> => deadline.wait(track(promise));
-	const work = track(activateUnderDeadline(options, deadline, wait));
+	const retainReceipt = (receipt: Promise<void>) => {
+		track(receipt);
+		void receipt.catch(error => {
+			receiptFailures.push(error);
+		});
+	};
+	const work = track(activateUnderDeadline(options, deadline, wait, retainReceipt));
 	const result = deadline.wait(work).finally(() => deadline.close());
 	const settled = result
 		.catch(() => undefined)
 		.then(async () => {
 			while (producers.size > 0) await Promise.allSettled([...producers]);
+			if (receiptFailures.length > 0)
+				throw new AggregateError(receiptFailures, "Historical receipt persistence failed.");
 		});
 	void result.catch(() => undefined);
+	void settled.catch(() => undefined);
 	return Object.freeze({ result, settled });
 }
 
@@ -196,6 +251,7 @@ async function activateUnderDeadline(
 	options: SessionAuthorityV3ActivationOptions,
 	deadline: ManagedOperationDeadline,
 	wait: <T>(promise: Promise<T>) => Promise<T>,
+	retainReceipt: (receipt: Promise<void>) => void,
 ): Promise<SessionAuthorityV3ActivationResult> {
 	const canonicalPath = resolve(options.canonicalPath);
 	if (options.bootstrap !== undefined && (options.bindings !== undefined || options.resolveBindings !== undefined))
@@ -331,11 +387,61 @@ async function activateUnderDeadline(
 		};
 	const historicalIdentity = fileIdentity(historicalPath);
 	const bootstrapStore = new V3FileBackedSessionMappingStore(historicalPath);
+	const receipts = new Set<Promise<void>>();
+	const receiptCheckpoint = readRegular(join(root, "historical-stage.json"), 16 * 1024, "historical stage checkpoint");
+	const receiptManifestIdentity = fileIdentity(join(root, "source-manifest.json"));
+	const receiptCheckpointIdentity = fileIdentity(join(root, "historical-stage.json"));
+	const receiptManifest: ImmutableSourceManifest = JSON.parse(
+		readRegular(join(root, "source-manifest.json"), 16 * 1024, "immutable source manifest").toString("utf8"),
+	);
+	const receiptCheck = () => {
+		options.runtimeLock.assertOwnsPathSync(canonicalPath);
+		options.mutationLock.assertOwned(canonicalPath);
+		if (
+			!matchesFileIdentity(join(root, "source-manifest.json"), receiptManifestIdentity) ||
+			!matchesFileIdentity(join(root, "historical-stage.json"), receiptCheckpointIdentity) ||
+			!canonicalSnapshotMatches(canonicalPath, snapshot) ||
+			digest(readRegular(join(root, "source-manifest.json"), 16 * 1024, "immutable source manifest")) !==
+				manifestDigest ||
+			!readRegular(join(root, "historical-stage.json"), 16 * 1024, "historical stage checkpoint").equals(
+				receiptCheckpoint,
+			)
+		)
+			throw new Error("Historical receipt source ownership changed.");
+		if (
+			!matchesFileIdentity(join(root, "source.v2.json"), receiptManifest.snapshots.base) ||
+			!matchesFileIdentity(join(root, "source.v2.absence.json"), receiptManifest.snapshots.absence) ||
+			digest(readRegular(join(root, "source.v2.json"), MAX_AUTHORITY_BYTES, "immutable source base")) !==
+				snapshot.baseDigest ||
+			digest(readRegular(join(root, "source.v2.absence.json"), 16 * 1024, "immutable WAL presence evidence")) !==
+				receiptManifest.snapshots.absenceDigest ||
+			(receiptManifest.snapshots.wal === null
+				? lstatSync(join(root, "source.v2.wal"), { throwIfNoEntry: false }) !== undefined
+				: !matchesFileIdentity(join(root, "source.v2.wal"), receiptManifest.snapshots.wal) ||
+					digest(readRegular(join(root, "source.v2.wal"), MAX_WAL_BYTES, "immutable source WAL")) !==
+						snapshot.walDigest)
+		)
+			throw new Error("Historical receipt immutable snapshot changed.");
+		assertBootstrapGraph(
+			initialHistoricalBytes,
+			readRegular(historicalPath, MAX_AUTHORITY_BYTES, "retained bootstrap graph"),
+			manifestDigest,
+		);
+	};
 	const access = Object.freeze({}) as SessionAuthorityV3BootstrapAccess;
 	bootstrapAccess.set(access, {
 		path: historicalPath,
 		manifestDigest,
 		check: assertBootstrapCurrent,
+		receiptCheck,
+		retainReceipt: receipt => {
+			receipts.add(receipt);
+			retainReceipt(receipt);
+			void receipt.then(
+				() => receipts.delete(receipt),
+				() => receipts.delete(receipt),
+			);
+		},
 		tenantFence: options.bootstrapTenantFence ?? (() => false),
 		checkSync: () => {
 			deadline.remaining();
@@ -366,6 +472,7 @@ async function activateUnderDeadline(
 					: await wait(Promise.resolve(options.resolveBindings(decodedDocument, context)));
 	} finally {
 		bootstrapAccess.delete(access);
+		while (receipts.size > 0) await Promise.allSettled([...receipts]);
 		bootstrapStore.close();
 	}
 	await assertLocks();

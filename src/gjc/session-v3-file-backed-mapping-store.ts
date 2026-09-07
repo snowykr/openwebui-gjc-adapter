@@ -2,6 +2,7 @@ import {
 	closeSync,
 	existsSync,
 	fsyncSync,
+	lstatSync,
 	mkdirSync,
 	openSync,
 	readFileSync,
@@ -17,6 +18,7 @@ import {
 	type ManagedLifecycleEvidence,
 	managedHistoricalSourceAssociation,
 	managedLifecycleEvidenceHash,
+	transitionManagedLifecycleEvidence,
 } from "./managed-lifecycle-evidence";
 import {
 	canonicalSessionMappingKey,
@@ -57,6 +59,7 @@ import {
 	assertBootstrapAccess,
 	assertBootstrapAccessCurrent,
 	assertBootstrapOperation,
+	retainBootstrapReceipt,
 	type SessionAuthorityV3BootstrapAccess,
 } from "./session-authority-v3-activation";
 import { SessionMappingStore } from "./session-mapping-memory-store";
@@ -64,6 +67,8 @@ import type { ManagedTurnAuthority } from "./turn-runner";
 
 export interface SessionAuthorityV3BootstrapStage {
 	read(): SessionAuthorityV3Document;
+	/** Original, live invocation only. This handle grants no proof, retry, promotion or new effect. */
+	retainInvocation(operation: SessionOperation): SessionAuthorityV3InvocationReceipt;
 	begin(operationId: string, evidence: ManagedLifecycleEvidence): Promise<SessionOperation>;
 	advance(
 		operationId: string,
@@ -72,6 +77,12 @@ export interface SessionAuthorityV3BootstrapStage {
 	): Promise<SessionOperation>;
 	/** Promotes only persisted active-generation proof; remote proof belongs to the restricted coordinator. */
 	promote(operationId: string, expectedEvidenceHash: string, evidence: ManagedLifecycleEvidence): Promise<void>;
+}
+
+export interface SessionAuthorityV3InvocationReceipt {
+	observe(identity: { readonly sessionId: string; readonly generation: number } | undefined): ManagedLifecycleEvidence;
+	/** Called only after the raw invocation and its observation have settled. */
+	finish(): void;
 }
 
 /** Canonical V3 authority storage. This deliberately has no V2 compatibility,
@@ -432,6 +443,171 @@ export class V3FileBackedSessionMappingStore extends SessionMappingStore {
 		const path = this.#authority.filePath;
 		const assertCurrent = () => assertBootstrapAccessCurrent(access, path);
 		assertCurrent();
+		const issuedReceipts = new Set<string>();
+		const admittedInvocations = new Map<string, SessionOperation>();
+		let stageIdentity = lstatSync(path, { bigint: true });
+		const assertStageIdentity = () => {
+			const current = lstatSync(path, { bigint: true });
+			if (
+				!current.isFile() ||
+				current.isSymbolicLink() ||
+				current.dev !== stageIdentity.dev ||
+				current.ino !== stageIdentity.ino ||
+				current.size !== stageIdentity.size ||
+				current.mtimeNs !== stageIdentity.mtimeNs ||
+				current.ctimeNs !== stageIdentity.ctimeNs
+			)
+				throw new Error("Historical receipt staged authority identity changed.");
+		};
+		const retainInvocation = (operation: SessionOperation): SessionAuthorityV3InvocationReceipt => {
+			assertCurrent();
+			const original = structuredClone(operation);
+			if (!isDeepStrictEqual(admittedInvocations.get(original.id), original))
+				throw new Error("Historical receipt requires this live attempt's original invocation.");
+			assertStageIdentity();
+			const initial = original.lifecycle;
+			if (
+				(original.state !== "pending" && original.state !== "uncertain") ||
+				initial?.state !== "invoking" ||
+				initial.operation !== "session.resume" ||
+				initial.historicalSource === undefined ||
+				initial.acknowledged !== undefined ||
+				issuedReceipts.has(original.id)
+			)
+				throw new Error("Historical receipt requires one original pending invocation.");
+			const source = initial.historicalSource;
+			const locate = (records: readonly SessionAuthorityRecord[]) => {
+				const candidates = records.filter(
+					record =>
+						isDeepStrictEqual(record.historicalBinding, source.historicalBinding) ||
+						managedHistoricalSourceAssociation(record, source.historicalBinding)?.operationId === original.id,
+				);
+				const record = candidates.length === 1 ? candidates[0] : undefined;
+				const retained = record?.journal.find(item => item.id === original.id);
+				if (
+					record === undefined ||
+					retained === undefined ||
+					retained.ingressId !== original.ingressId ||
+					retained.startedAt !== original.startedAt ||
+					retained.kind !== original.kind ||
+					retained.detail !== original.detail ||
+					retained.lifecycle?.requestHash !== initial.requestHash ||
+					!isDeepStrictEqual(retained.lifecycle.preparedAuthority, initial.preparedAuthority) ||
+					!isDeepStrictEqual(retained.lifecycle.historicalSource, source) ||
+					!isDeepStrictEqual(retained.lifecycle.target, initial.target)
+				)
+					throw new Error("Historical receipt original owner changed.");
+				return { record, retained };
+			};
+			const retained = locate(this.#authority.entries()).retained;
+			if (!isDeepStrictEqual(retained, original))
+				throw new Error("Historical receipt invocation changed before admission.");
+			const owner = retainBootstrapReceipt(access, path);
+			admittedInvocations.delete(original.id);
+			issuedReceipts.add(original.id);
+			let expected = initial;
+			let observation: { identity: { sessionId: string; generation: number } | undefined } | undefined;
+			let failure: { error: unknown } | undefined;
+			let finished = false;
+			const assertReceiptCurrent = () => {
+				owner.assertCurrent();
+				assertStageIdentity();
+			};
+			const update = (
+				finish: boolean,
+				identity?: { sessionId: string; generation: number },
+			): ManagedLifecycleEvidence => {
+				let updated!: ManagedLifecycleEvidence;
+				this.#authority.replaceAuthorityState((records, provisional) => {
+					const { record, retained: current } = locate(records);
+					const evidence = current.lifecycle!;
+					if (
+						finish &&
+						evidence.state === "active_generation_proven" &&
+						expected.state === "acknowledged_unproven" &&
+						isDeepStrictEqual(evidence.acknowledged, expected.acknowledged)
+					) {
+						assertManagedLifecycleEvidenceUpdate(expected, evidence);
+						updated = evidence;
+						return { records, provisional };
+					}
+					if (current.state !== original.state || !isDeepStrictEqual(evidence, expected))
+						throw new Error("Historical receipt evidence changed before observation.");
+					updated = evidence;
+					if (!finish && identity !== undefined) {
+						updated = transitionManagedLifecycleEvidence(evidence, "acknowledged_unproven", {
+							acknowledged: { ...initial.preparedAuthority, ...identity },
+						});
+					}
+					if ((finish || identity === undefined || !owner.admitted()) && updated.state !== "uncertain")
+						updated = transitionManagedLifecycleEvidence(updated, "uncertain");
+					if (isDeepStrictEqual(updated, evidence)) return { records, provisional };
+					return {
+						records: records.map(item =>
+							item === record
+								? {
+										...record,
+										journal: record.journal.map(item =>
+											item === current ? { ...item, lifecycle: updated } : item,
+										),
+									}
+								: item,
+						),
+						provisional,
+					};
+				}, assertReceiptCurrent);
+				stageIdentity = lstatSync(path, { bigint: true });
+				expected = copyManagedLifecycleEvidence(updated);
+				return copyManagedLifecycleEvidence(updated);
+			};
+			return Object.freeze({
+				observe: (value: { readonly sessionId: string; readonly generation: number } | undefined) => {
+					if (finished) throw new Error("Historical receipt ownership is closed.");
+					try {
+						const identity = value === undefined ? undefined : structuredClone(value);
+						if (
+							identity !== undefined &&
+							(Object.keys(identity).some(key => key !== "sessionId" && key !== "generation") ||
+								identity.sessionId !== source.historicalBinding.sessionId ||
+								!Number.isSafeInteger(identity.generation) ||
+								identity.generation <= 0)
+						)
+							throw new Error("Historical receipt does not match its original session outcome.");
+						if (observation !== undefined) {
+							assertReceiptCurrent();
+							if (!isDeepStrictEqual(observation.identity, identity))
+								throw new Error("Historical receipt observation is immutable.");
+							const current = locate(this.#authority.entries()).retained;
+							if (!isDeepStrictEqual(current.lifecycle, expected))
+								throw new Error("Historical receipt evidence changed before observation.");
+							return copyManagedLifecycleEvidence(expected);
+						}
+						const result = update(false, identity);
+						observation = { identity };
+						return result;
+					} catch (error) {
+						failure ??= { error };
+						throw error;
+					}
+				},
+				finish: () => {
+					if (finished) {
+						if (failure !== undefined) throw failure.error;
+						return;
+					}
+					try {
+						if (failure !== undefined) throw failure.error;
+						update(true);
+					} catch (error) {
+						failure ??= { error };
+						throw error;
+					} finally {
+						finished = true;
+						owner.release(failure);
+					}
+				},
+			});
+		};
 		const mutate = async (
 			kind: "begin" | "advance" | "promote",
 			operationId: string,
@@ -455,6 +631,7 @@ export class V3FileBackedSessionMappingStore extends SessionMappingStore {
 			)
 				throw new Error("Historical bootstrap operation does not match its manifest and namespaced identity.");
 			let updated!: SessionOperation;
+			let admitted = false;
 			this.#authority.replaceAuthorityState((records, provisional) => {
 				const destination = canonicalSessionMappingKey(
 					evidence.preparedAuthority.principalId,
@@ -530,6 +707,7 @@ export class V3FileBackedSessionMappingStore extends SessionMappingStore {
 					if (acknowledgement && found.lifecycle.state !== "invoking")
 						throw new Error("Bootstrap acknowledgement requires this attempt's durable invocation.");
 					assertManagedLifecycleEvidenceUpdate(found.lifecycle, evidence);
+					admitted = found.lifecycle.state === "intent_prepared" && evidence.state === "invoking";
 					updated = { ...found, lifecycle: evidence };
 				}
 				let replacement: SessionAuthorityRecord = {
@@ -564,9 +742,12 @@ export class V3FileBackedSessionMappingStore extends SessionMappingStore {
 				}
 				return { records: records.map((item, offset) => (offset === index ? replacement : item)), provisional };
 			}, assertCurrent);
+			stageIdentity = lstatSync(path, { bigint: true });
+			if (admitted) admittedInvocations.set(operationId, structuredClone(updated));
 			return structuredClone(updated);
 		};
 		return Object.freeze({
+			retainInvocation,
 			read: () => {
 				assertCurrent();
 				const document = parseSessionAuthorityV3Document(readFileSync(path));

@@ -1,10 +1,10 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import * as filesystem from "node:fs/promises";
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { lifecycle, router } from "@gajae-code/coding-agent/sdk";
 import {
 	type AdapterManagedBootstrapInput,
@@ -331,6 +331,136 @@ function withReassignment(
 }
 
 describe("adapter managed bootstrap composition", () => {
+	test("bootstrap snapshots caller paths, owner callbacks and original receipt scope before admission", async () => {
+		const f = await fixture({
+			onResume: () => {
+				Reflect.set(f.input, "sourcePath", join(f.root, "foreign-authority.json"));
+				Reflect.set(f.input.locations, "stateRoot", join(f.root, "foreign-state"));
+				Reflect.set(f.input, "configuredOwnerUserId", "foreign");
+				Reflect.set(f.input.authority, "resolve", () => {
+					throw new Error("mutated resolver");
+				});
+			},
+		});
+		try {
+			const attempt = startAdapterSessionAuthorityV3Activation(f.input);
+			const result = await attempt.result;
+			await attempt.settled;
+			expect(result.status).toBe("activated");
+			if (result.status === "activated") result.store.close();
+			expect(f.evidence()?.acknowledged?.generation).toBe(7);
+			expect(f.evidence()?.preparedAuthority.principalId).toBe("owner");
+			expect(await Bun.file(join(f.root, "foreign-authority.json")).exists()).toBe(false);
+			expect(f.calls.filter(call => call === "resume")).toHaveLength(1);
+		} finally {
+			await f.cleanup();
+		}
+	});
+
+	test.each(["success", "failure"] as const)(
+		"late historical %s retains ownership until original raw observation settles",
+		async outcome => {
+			const gate = Promise.withResolvers<void>();
+			const entered = Promise.withResolvers<void>();
+			const f = await fixture({ timeoutMs: 1000, resumeGate: gate.promise, onResume: () => entered.resolve() });
+			const attempt = startAdapterSessionAuthorityV3Activation(f.input);
+			let settled = false;
+			void attempt.settled.then(
+				() => {
+					settled = true;
+				},
+				() => {
+					settled = true;
+				},
+			);
+			try {
+				await entered.promise;
+				await expect(attempt.result).rejects.toThrow("bootstrap failed");
+				expect(settled).toBe(false);
+				expect(f.evidence()?.state).toBe("invoking");
+				expect(await Bun.file(`${f.sourcePath}.lock`).exists()).toBe(true);
+				await expect(RuntimeSingletonLock.acquire(f.root)).rejects.toThrow("already owned");
+				if (outcome === "success") gate.resolve();
+				else gate.reject(new Error("lost original outcome"));
+				await attempt.settled;
+				expect(f.evidence()?.state).toBe("uncertain");
+				expect(f.evidence()?.acknowledged?.generation).toBe(outcome === "success" ? 7 : undefined);
+				expect(f.calls.filter(call => call === "resume")).toHaveLength(1);
+				expect(f.calls).not.toContain("reconcile");
+				expect(await Bun.file(`${f.sourcePath}.lock`).exists()).toBe(false);
+				expect(await readFile(f.sourcePath, "utf8")).toBe(f.original);
+				expect(await Bun.file(`${f.sourcePath}.v3-active.json`).exists()).toBe(false);
+			} finally {
+				gate.resolve();
+				await f.cleanup();
+			}
+		},
+	);
+
+	test.each(["stage", "manifest", "checkpoint", "snapshot", "canonical", "mutation-lock", "runtime-lock"] as const)(
+		"original receipt rejects replaced %s and actual settlement retains exclusion",
+		async changed => {
+			let replaced = "";
+			const f = await fixture({
+				onResume: () => {
+					replaced =
+						changed === "stage"
+							? f.stagePath
+							: changed === "canonical"
+								? f.sourcePath
+								: changed === "mutation-lock"
+									? `${f.sourcePath}.lock`
+									: changed === "runtime-lock"
+										? join(f.root, ".openwebui-gjc-adapter.lock")
+										: join(
+												dirname(f.stagePath),
+												changed === "snapshot"
+													? "source.v2.json"
+													: changed === "checkpoint"
+														? "historical-stage.json"
+														: "source-manifest.json",
+											);
+					const bytes = readFileSync(replaced);
+					renameSync(replaced, `${replaced}.retained`);
+					writeFileSync(replaced, bytes);
+				},
+			});
+			try {
+				const attempt = startAdapterSessionAuthorityV3Activation(f.input);
+				await expect(attempt.result).rejects.toThrow("bootstrap failed");
+				await expect(attempt.settled).rejects.toThrow();
+				expect(f.evidence()?.acknowledged).toBeUndefined();
+				expect(f.calls.filter(call => call === "resume")).toHaveLength(1);
+				expect(f.calls).not.toContain("reconcile");
+				expect(await Bun.file(`${f.sourcePath}.lock`).exists()).toBe(true);
+				expect(await Bun.file(`${f.sourcePath}.v3-active.json`).exists()).toBe(false);
+			} finally {
+				if (replaced !== "") renameSync(`${replaced}.retained`, replaced);
+				await expect(f.cleanup()).rejects.toThrow("persistence failed");
+			}
+		},
+	);
+
+	test("original historical outcome remains durable when its invocation exhausts the bootstrap budget", async () => {
+		const started = Date.now();
+		const clock = spyOn(Date, "now").mockReturnValue(started);
+		const f = await fixture({ timeoutMs: 1000, onResume: () => clock.mockReturnValue(started + 1001) });
+		try {
+			const attempt = startAdapterSessionAuthorityV3Activation(f.input);
+			await expect(attempt.result).rejects.toThrow("bootstrap failed");
+			await attempt.settled;
+			expect(f.evidence()?.acknowledged?.generation).toBe(7);
+			expect(f.evidence()?.state).toBe("uncertain");
+			expect(f.calls.filter(call => call === "resume")).toHaveLength(1);
+			expect(f.calls).not.toContain("reconcile");
+			expect(await readFile(f.sourcePath, "utf8")).toBe(f.original);
+			expect(await Bun.file(`${f.sourcePath}.v3-active.json`).exists()).toBe(false);
+		} finally {
+			clock.mockRestore();
+			await f.cleanup();
+		}
+	});
+
 	test("passes the original remaining budget into adoption proof and commit reconciliation", async () => {
 		const started = Date.now();
 		const clock = spyOn(Date, "now").mockReturnValue(started);
@@ -1205,7 +1335,11 @@ describe("adapter managed bootstrap composition", () => {
 			expect(f.calls.filter(call => call === "resume")).toHaveLength(1);
 			expect(f.evidence()?.state).toBe("active_generation_proven");
 			const operation = f.graph().mappings[0]!.journal.at(-1)!;
-			await expect(f.runtime().resumeHistoricalSession(operation.id, operation.lifecycle!)).rejects.toThrow();
+			await expect(
+				f.runtime().resumeHistoricalSession(operation.id, operation.lifecycle!, () => {
+					throw new Error("Stopped runtime must not observe a new outcome");
+				}),
+			).rejects.toThrow();
 			expect(f.calls.filter(call => call === "resume")).toHaveLength(1);
 			expect(f.runtime().state).toBe("stopped");
 			result.store.close();
