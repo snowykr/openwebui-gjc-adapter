@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { isAbsolute, resolve } from "node:path";
 import { lifecycle, router } from "@gajae-code/coding-agent/sdk";
 import {
@@ -118,6 +119,92 @@ export interface ManagedSdkRuntimeOptions {
 	readonly deps?: ManagedSdkRuntimeDeps;
 }
 
+/** Accounting only: sealing revokes new work, settlement never grants tenant authority. */
+export interface ManagedSdkProducerScope {
+	run<T>(work: () => Promise<T>): Promise<T>;
+	drain(): Promise<void>;
+	seal(): Promise<void>;
+	readonly settled: Promise<void>;
+}
+
+class ProducerScope implements ManagedSdkProducerScope {
+	readonly #producers = new Set<Promise<unknown>>();
+	readonly #completion = Promise.withResolvers<void>();
+	readonly settled = this.#completion.promise;
+	#sealed = false;
+	#finished = false;
+	#persistenceFailure: { readonly error: unknown } | undefined;
+
+	constructor(
+		private readonly context: AsyncLocalStorage<ProducerScope>,
+		private readonly retainGlobal: (producer: Promise<unknown>) => void,
+		private readonly assertAdmission: () => void,
+	) {
+		void this.settled.catch(() => undefined);
+	}
+
+	run<T>(work: () => Promise<T>): Promise<T> {
+		this.assertOpen();
+		this.assertAdmission();
+		const previous = this.context.getStore();
+		if (previous !== undefined && previous !== this)
+			throw new Error("Managed producer scopes cannot cross ownership boundaries.");
+		const owned = Promise.withResolvers<T>();
+		this.retain(owned.promise);
+		this.retainGlobal(owned.promise);
+		this.context.run(this, () => {
+			try {
+				const producer = work();
+				if (producer === this.settled) throw new Error("Managed producer scope cannot own its settlement.");
+				owned.resolve(producer);
+			} catch (error) {
+				owned.reject(error);
+			}
+		});
+		return owned.promise;
+	}
+
+	assertOpen(): void {
+		if (this.#sealed) throw new Error("Managed producer scope is sealed.");
+	}
+
+	retain<T>(producer: Promise<T>): Promise<T> {
+		if (this.#finished || producer === this.settled)
+			throw new Error("Managed producer scope cannot retain work after settlement.");
+		this.#producers.add(producer);
+		const settled = () => {
+			this.#producers.delete(producer);
+			this.#finish();
+		};
+		void producer.then(settled, settled);
+		return producer;
+	}
+
+	persistenceFailed(error: unknown): void {
+		this.#persistenceFailure ??= { error };
+	}
+
+	async drain(): Promise<void> {
+		while (this.#producers.size > 0) await Promise.allSettled([...this.#producers]);
+	}
+
+	seal(): Promise<void> {
+		this.#sealed = true;
+		this.#finish();
+		return this.settled;
+	}
+
+	#finish(): void {
+		if (!this.#sealed || this.#finished || this.#producers.size !== 0) return;
+		this.#finished = true;
+		if (this.#persistenceFailure === undefined) this.#completion.resolve();
+		else
+			this.#completion.reject(
+				new Error("Original lifecycle outcome persistence failed.", { cause: this.#persistenceFailure.error }),
+			);
+	}
+}
+
 interface FrameSubscription {
 	readonly id: number;
 	readonly tenant: TenantSessionKey;
@@ -177,6 +264,7 @@ export class ManagedSdkRuntime {
 	readonly #drainTimeoutMs: number;
 	readonly #pending = new Set<PendingCall>();
 	readonly #producers = new Set<Promise<unknown>>();
+	readonly #producerContext = new AsyncLocalStorage<ProducerScope>();
 	readonly #tokens = new WeakMap<
 		ManagedSdkAttachment,
 		{ raw: router.SessionAttachment; registration: TenantSessionKey }
@@ -236,6 +324,19 @@ export class ManagedSdkRuntime {
 
 	get bootstrapAdmissionOpen(): boolean {
 		return this.#bootstrapAdmission;
+	}
+
+	createProducerScope(): ManagedSdkProducerScope {
+		return new ProducerScope(
+			this.#producerContext,
+			producer => {
+				this.#retain(producer);
+			},
+			() => {
+				if (["draining", "stopping", "stopped", "failed"].includes(this.#state))
+					throw new ManagedSdkOperationError("runtime_interrupted", "Managed runtime scope admission is closed.");
+			},
+		);
 	}
 
 	async selectHistoricalSession(
@@ -914,6 +1015,7 @@ export class ManagedSdkRuntime {
 				try {
 					await onOutcome(structuredClone(result));
 				} catch (error) {
+					this.#producerContext.getStore()?.persistenceFailed(error);
 					this.#outcomePersistenceFailure ??= new Error("Original lifecycle outcome persistence failed.", {
 						cause: error,
 					});
@@ -965,6 +1067,7 @@ export class ManagedSdkRuntime {
 				try {
 					await onOutcome(structuredClone(result));
 				} catch (error) {
+					this.#producerContext.getStore()?.persistenceFailed(error);
 					this.#outcomePersistenceFailure ??= new Error("Original lifecycle outcome persistence failed.", {
 						cause: error,
 					});
@@ -1035,8 +1138,10 @@ export class ManagedSdkRuntime {
 	}
 
 	#track<T>(timeout: unknown, work: (budget: CallBudget) => Promise<T>, bootstrap = false): Promise<T> {
+		const owner = this.#producerContext.getStore();
 		let timeoutMs: number;
 		try {
+			owner?.assertOpen();
 			this.#assertOwner(bootstrap);
 			timeoutMs = finiteTimeout(timeout, DEFAULT_OPERATION_TIMEOUT_MS);
 		} catch (error) {
@@ -1064,6 +1169,7 @@ export class ManagedSdkRuntime {
 		);
 		const budget: CallBudget = {
 			remaining: () => {
+				owner?.assertOpen();
 				if (stopped !== undefined) throw stopped;
 				const remaining = expires - performance.now();
 				if (remaining <= 0)
@@ -1077,6 +1183,7 @@ export class ManagedSdkRuntime {
 				this.#assertOwner(bootstrap);
 				return work(budget);
 			}),
+			owner,
 		);
 		const result = Promise.race([raw, interrupted]);
 		const pending: PendingCall = { interrupt };
@@ -1091,7 +1198,8 @@ export class ManagedSdkRuntime {
 		});
 	}
 
-	#retain<T>(producer: Promise<T>): Promise<T> {
+	#retain<T>(producer: Promise<T>, owner?: ProducerScope): Promise<T> {
+		owner?.retain(producer);
 		this.#producers.add(producer);
 		void producer.then(
 			() => this.#producers.delete(producer),

@@ -18,6 +18,8 @@ export interface ModelReaderContext {
 	readonly workspace?: UserWorkspace;
 	/** Lease fence proving exclusive access to the workspace. Required for normal-user readers. */
 	readonly lease?: { readonly assertFence: () => Promise<unknown> };
+	/** Registers actual cleanup settlement before managed reader effects start. */
+	readonly registerSettlement?: (settled: Promise<void>) => void;
 	readonly correlationId?: string;
 	/** Request cancellation propagated through model preparation. */
 	readonly signal?: AbortSignal;

@@ -1,6 +1,11 @@
 import { resolve } from "node:path";
 import { ManagedOperationDeadline } from "../gjc/managed-operation-deadline";
-import type { ManagedSdkAttachment, ManagedSdkRuntime, TenantSessionKey } from "../gjc/managed-sdk-runtime";
+import type {
+	ManagedSdkAttachment,
+	ManagedSdkProducerScope,
+	ManagedSdkRuntime,
+	TenantSessionKey,
+} from "../gjc/managed-sdk-runtime";
 import { GjcTurnCancelledError } from "../gjc/turn-runner";
 import { collectManagedQueryPages } from "./gjc-managed-session-operations";
 import type { ModelReader, ModelReaderContext, ModelReaderFactory } from "./model-reader";
@@ -25,6 +30,7 @@ export interface ManagedTemporaryModelReaderInput {
 
 export interface CreateManagedModelReaderFactoryInput {
 	readonly runtime: ManagedSdkRuntime;
+	readonly registerSettlement: (settled: Promise<void>) => void;
 	/** One budget from factory admission through all queries and final disposal. */
 	readonly timeoutMs?: number;
 	/** Resolves an already-owned exact tenant/generation attachment. */
@@ -37,6 +43,70 @@ export class ManagedModelReaderUnavailableError extends Error {
 	constructor(message = "Managed GJC model reader is unavailable", options?: ErrorOptions) {
 		super(message, options);
 		this.name = "ManagedModelReaderUnavailableError";
+	}
+}
+
+class ReaderLifetime {
+	readonly #scope: ManagedSdkProducerScope;
+	readonly #completion = Promise.withResolvers<void>();
+	#finish: Promise<void> | undefined;
+	#cleanupRequired = false;
+
+	constructor(runtime: ManagedSdkRuntime, register: (settled: Promise<void>) => void) {
+		this.#scope = runtime.createProducerScope();
+		void this.#completion.promise.catch(() => undefined);
+		try {
+			register(this.#completion.promise);
+		} catch (error) {
+			void this.#scope.seal();
+			this.#completion.reject(error);
+			throw error;
+		}
+	}
+
+	run<T>(work: () => Promise<T>): Promise<T> {
+		return this.#scope.run(work);
+	}
+	get settled(): Promise<void> {
+		return this.#completion.promise;
+	}
+	requireCleanup(): void {
+		this.#cleanupRequired = true;
+	}
+	cleanupComplete(): void {
+		this.#cleanupRequired = false;
+	}
+	finish(deadline: ManagedOperationDeadline, cleanup: () => Promise<void>): Promise<void> {
+		if (this.#finish !== undefined) return this.#finish;
+		const cleaning = (async () => {
+			await deadline.wait(this.#scope.drain());
+			deadline.remaining();
+			return this.run(cleanup);
+		})();
+		const settle = async (cleanupFailure?: { error: unknown }) => {
+			const failures: unknown[] = [];
+			try {
+				await this.#scope.seal();
+			} catch (error) {
+				failures.push(error);
+			}
+			if (this.#cleanupRequired)
+				failures.push(
+					new Error(
+						"Temporary model-reader cleanup remains unproven.",
+						cleanupFailure === undefined ? undefined : { cause: cleanupFailure.error },
+					),
+				);
+			if (failures.length > 0)
+				this.#completion.reject(new AggregateError(failures, "Managed model-reader settlement failed."));
+			else this.#completion.resolve();
+		};
+		void cleaning.then(
+			() => settle(),
+			error => settle({ error }),
+		);
+		this.#finish = cleaning;
+		return this.#finish;
 	}
 }
 
@@ -54,6 +124,8 @@ export function createManagedModelReaderFactory(input: CreateManagedModelReaderF
 	};
 	if (input.resolveAttachment === undefined && input.temporary === undefined)
 		throw new TypeError("A managed model attachment or temporary lifecycle input is required.");
+	if (typeof input.registerSettlement !== "function")
+		throw new TypeError("Managed model reader requires an actual settlement owner.");
 	return async (context, signal) => {
 		const lease = context?.lease;
 		context =
@@ -71,31 +143,53 @@ export function createManagedModelReaderFactory(input: CreateManagedModelReaderF
 		const effectiveSignal = signal ?? context?.signal;
 		throwIfAborted(effectiveSignal);
 		const deadline = new ManagedOperationDeadline(input.timeoutMs, "model catalog");
+		const lifetime = new ReaderLifetime(input.runtime, input.registerSettlement);
 		try {
-			await assertReaderContext(context, effectiveSignal, input.temporary?.canonicalWorkspace, deadline);
-			if (input.resolveAttachment !== undefined) {
-				deadline.remaining();
-				throwIfAborted(effectiveSignal);
-				const resolved = await deadline.wait(
-					awaitWithAbort(input.resolveAttachment(effectiveSignal), effectiveSignal),
-				);
-				const tenant = { ...resolved.tenant };
-				assertPrincipal(context, tenant.principalId);
-				await assertReaderContext(context, effectiveSignal, tenant.canonicalWorkspace, deadline);
-				const attachment = await acquire(input.runtime, tenant, deadline, effectiveSignal);
-				throwIfAborted(effectiveSignal);
-				return new ManagedModelReader(
-					input.runtime,
-					attachment,
-					undefined,
+			return await lifetime.run(async () => {
+				await assertReaderContext(
+					context,
 					effectiveSignal,
+					input.temporary?.canonicalWorkspace,
 					deadline,
-					async signal => await assertReaderContext(context, signal, tenant.canonicalWorkspace, deadline),
+					lifetime,
 				);
-			}
-			return await createTemporaryReader(input.runtime, input.temporary!, deadline, context, effectiveSignal);
+				if (input.resolveAttachment !== undefined) {
+					deadline.remaining();
+					throwIfAborted(effectiveSignal);
+					const resolved = await deadline.wait(
+						awaitWithAbort(
+							lifetime.run(() => input.resolveAttachment!(effectiveSignal)),
+							effectiveSignal,
+						),
+					);
+					const tenant = { ...resolved.tenant };
+					assertPrincipal(context, tenant.principalId);
+					await assertReaderContext(context, effectiveSignal, tenant.canonicalWorkspace, deadline, lifetime);
+					const attachment = await acquire(input.runtime, tenant, deadline, lifetime, effectiveSignal);
+					throwIfAborted(effectiveSignal);
+					return new ManagedModelReader(
+						input.runtime,
+						attachment,
+						undefined,
+						effectiveSignal,
+						deadline,
+						async signal =>
+							await assertReaderContext(context, signal, tenant.canonicalWorkspace, deadline, lifetime),
+						lifetime,
+					);
+				}
+				return await createTemporaryReader(
+					input.runtime,
+					input.temporary!,
+					deadline,
+					lifetime,
+					context,
+					effectiveSignal,
+				);
+			});
 		} catch (error) {
 			deadline.close();
+			void lifetime.finish(deadline, async () => {}).catch(() => undefined);
 			throw error;
 		}
 	};
@@ -105,26 +199,30 @@ async function createTemporaryReader(
 	runtime: ManagedSdkRuntime,
 	input: ManagedTemporaryModelReaderInput,
 	deadline: ManagedOperationDeadline,
+	lifetime: ReaderLifetime,
 	context?: ModelReaderContext,
 	signal?: AbortSignal,
 ): Promise<ModelReader> {
 	assertTemporaryInput(input);
 	assertPrincipal(context, input.principalId);
-	await assertTemporaryFence(input, context, deadline, signal);
+	await assertTemporaryFence(input, context, deadline, lifetime, signal);
 	const actor = { namespace: "openwebui-gjc-adapter", id: input.principalId };
 	throwIfAborted(signal);
 	const timeoutMs = deadline.remaining();
+	lifetime.requireCleanup();
 	// Observe an admitted mutation within the original budget even after cancellation.
 	const result = await deadline.wait(
-		runtime.createPreparedExternalLifecycleSession(
-			input,
-			{
-				actor,
-				capability: "session.create",
-				requestKey: input.requestKey,
-				target: { kind: "existing_path", path: input.canonicalWorkspace },
-			},
-			timeoutMs,
+		lifetime.run(() =>
+			runtime.createPreparedExternalLifecycleSession(
+				input,
+				{
+					actor,
+					capability: "session.create",
+					requestKey: input.requestKey,
+					target: { kind: "existing_path", path: input.canonicalWorkspace },
+				},
+				timeoutMs,
+			),
 		),
 	);
 	const tenant = tenantFromCreate(input, result);
@@ -132,12 +230,15 @@ async function createTemporaryReader(
 		throw new ManagedModelReaderUnavailableError("Managed catalog session creation was not acknowledged.");
 	try {
 		throwIfAborted(signal);
-		await assertTemporaryFence(input, context, deadline, signal);
+		await assertTemporaryFence(input, context, deadline, lifetime, signal);
 		throwIfAborted(signal);
 		const attachment = await deadline.wait(
-			awaitWithAbort(runtime.registerLifecycleTenant(tenant, deadline.remaining()), signal),
+			awaitWithAbort(
+				lifetime.run(() => runtime.registerLifecycleTenant(tenant, deadline.remaining())),
+				signal,
+			),
 		);
-		await assertTemporaryFence(input, context, deadline, signal);
+		await assertTemporaryFence(input, context, deadline, lifetime, signal);
 		throwIfAborted(signal);
 		return new ManagedModelReader(
 			runtime,
@@ -145,12 +246,14 @@ async function createTemporaryReader(
 			tenant,
 			signal,
 			deadline,
-			async signal => await assertTemporaryFence(input, context, deadline, signal),
+			async signal => await assertTemporaryFence(input, context, deadline, lifetime, signal),
+			lifetime,
 		);
 	} catch (error) {
 		try {
-			await assertTemporaryFence(input, context, deadline);
-			await closeAndProveRetired(runtime, tenant, deadline);
+			await assertTemporaryFence(input, context, deadline, lifetime);
+			await closeAndProveRetired(runtime, tenant, deadline, lifetime);
+			lifetime.cleanupComplete();
 		} catch (cleanup) {
 			throw new AggregateError([error, cleanup], "Managed catalog session acquisition and cleanup failed.");
 		}
@@ -162,12 +265,23 @@ async function acquire(
 	runtime: ManagedSdkRuntime,
 	tenant: TenantSessionKey,
 	deadline: ManagedOperationDeadline,
+	lifetime: ReaderLifetime,
 	signal?: AbortSignal,
 ): Promise<ManagedSdkAttachment> {
 	throwIfAborted(signal);
-	await deadline.wait(awaitWithAbort(runtime.reconcile(deadline.remaining()), signal));
+	await deadline.wait(
+		awaitWithAbort(
+			lifetime.run(() => runtime.reconcile(deadline.remaining())),
+			signal,
+		),
+	);
 	throwIfAborted(signal);
-	return await deadline.wait(awaitWithAbort(runtime.acquireAttachment(tenant, deadline.remaining()), signal));
+	return await deadline.wait(
+		awaitWithAbort(
+			lifetime.run(() => runtime.acquireAttachment(tenant, deadline.remaining())),
+			signal,
+		),
+	);
 }
 
 class ManagedModelReader implements ModelReader {
@@ -181,6 +295,7 @@ class ManagedModelReader implements ModelReader {
 		private readonly signal: AbortSignal | undefined,
 		private readonly deadline: ManagedOperationDeadline,
 		private readonly fence: (signal?: AbortSignal) => Promise<void>,
+		private readonly lifetime: ReaderLifetime,
 	) {}
 
 	getAvailableModels(): Promise<readonly unknown[]> {
@@ -200,50 +315,26 @@ class ManagedModelReader implements ModelReader {
 		if (this.#stopPromise !== undefined) return this.#stopPromise;
 		this.#stopped = true;
 		const deadline = this.deadline;
-		this.#stopPromise = (async () => {
-			try {
+		this.#stopPromise = this.lifetime
+			.finish(deadline, async () => {
 				deadline.remaining();
 				await deadline.wait(this.fence());
-				if (this.temporary !== undefined) await closeAndProveRetired(this.runtime, this.temporary, deadline);
-			} finally {
-				deadline.close();
-			}
-		})();
+				if (this.temporary !== undefined) {
+					await closeAndProveRetired(this.runtime, this.temporary, deadline, this.lifetime);
+					this.lifetime.cleanupComplete();
+				}
+			})
+			.then(() => deadline.wait(this.lifetime.settled))
+			.finally(() => deadline.close());
 		return this.#stopPromise;
 	}
 
 	private async query(
 		name: "models.list/current" | "providers.list/active" | "session.state",
 	): Promise<readonly unknown[]> {
-		throwIfAborted(this.signal);
 		if (this.#stopped) throw new ManagedModelReaderUnavailableError("Managed catalog reader is stopped.");
-		const deadline = this.deadline;
-		const assertCurrent = () => {
-			deadline.remaining();
-			throwIfAborted(this.signal);
-			if (this.#stopped || !this.attachment.isCurrent())
-				throw new ManagedModelReaderUnavailableError("Managed catalog reader lost its current attachment.");
-		};
 		try {
-			return await awaitWithAbort(
-				collectManagedQueryPages(name, deadline, async cursor => {
-					assertCurrent();
-					await deadline.wait(this.fence(this.signal));
-					assertCurrent();
-					const frame = await deadline.wait(
-						this.runtime.request(
-							this.attachment,
-							{ type: "query_request", query: name, input: {}, ...(cursor === undefined ? {} : { cursor }) },
-							{ timeoutMs: deadline.remaining(), beforeDispatch: assertCurrent },
-						),
-					);
-					assertCurrent();
-					await deadline.wait(this.fence(this.signal));
-					assertCurrent();
-					return frame;
-				}),
-				this.signal,
-			);
+			return await this.lifetime.run(() => this.queryOwned(name));
 		} catch (error) {
 			if (this.temporary !== undefined) {
 				try {
@@ -255,25 +346,63 @@ class ManagedModelReader implements ModelReader {
 			throw error;
 		}
 	}
+
+	private async queryOwned(
+		name: "models.list/current" | "providers.list/active" | "session.state",
+	): Promise<readonly unknown[]> {
+		throwIfAborted(this.signal);
+		if (this.#stopped) throw new ManagedModelReaderUnavailableError("Managed catalog reader is stopped.");
+		const deadline = this.deadline;
+		const assertCurrent = () => {
+			deadline.remaining();
+			throwIfAborted(this.signal);
+			if (this.#stopped || !this.attachment.isCurrent())
+				throw new ManagedModelReaderUnavailableError("Managed catalog reader lost its current attachment.");
+		};
+		return await awaitWithAbort(
+			collectManagedQueryPages(name, deadline, async cursor => {
+				assertCurrent();
+				await deadline.wait(this.fence(this.signal));
+				assertCurrent();
+				const frame = await deadline.wait(
+					this.lifetime.run(() =>
+						this.runtime.request(
+							this.attachment,
+							{ type: "query_request", query: name, input: {}, ...(cursor === undefined ? {} : { cursor }) },
+							{ timeoutMs: deadline.remaining(), beforeDispatch: assertCurrent },
+						),
+					),
+				);
+				assertCurrent();
+				await deadline.wait(this.fence(this.signal));
+				assertCurrent();
+				return frame;
+			}),
+			this.signal,
+		);
+	}
 }
 
 async function closeAndProveRetired(
 	runtime: ManagedSdkRuntime,
 	tenant: TenantSessionKey,
 	deadline: ManagedOperationDeadline,
+	lifetime: ReaderLifetime,
 ): Promise<void> {
 	let closeError: unknown;
 	try {
 		const remaining = deadline.remaining();
 		const outcome = await deadline.wait(
-			runtime.closeLifecycleSession({
-				tenant,
-				actor: { namespace: "openwebui-gjc-adapter", id: tenant.principalId },
-				capability: "session.close",
-				requestKey: `${tenant.sessionId}:${tenant.generation}:catalog-close`,
-				target: { sessionId: tenant.sessionId, endpointGeneration: tenant.generation },
-				timeoutMs: remaining,
-			}),
+			lifetime.run(() =>
+				runtime.closeLifecycleSession({
+					tenant,
+					actor: { namespace: "openwebui-gjc-adapter", id: tenant.principalId },
+					capability: "session.close",
+					requestKey: `${tenant.sessionId}:${tenant.generation}:catalog-close`,
+					target: { sessionId: tenant.sessionId, endpointGeneration: tenant.generation },
+					timeoutMs: remaining,
+				}),
+			),
 		);
 		if (!isSuccess(outcome) || !isRecord(outcome.result) || outcome.result.sessionId !== tenant.sessionId)
 			closeError = new ManagedModelReaderUnavailableError("Managed catalog session close was not acknowledged.");
@@ -281,8 +410,8 @@ async function closeAndProveRetired(
 		closeError = error;
 	}
 	try {
-		await deadline.wait(runtime.reconcile(deadline.remaining()));
-		const status = await deadline.wait(runtime.generationStatus(tenant, deadline.remaining()));
+		await deadline.wait(lifetime.run(() => runtime.reconcile(deadline.remaining())));
+		const status = await deadline.wait(lifetime.run(() => runtime.generationStatus(tenant, deadline.remaining())));
 		if (status.status !== "retired")
 			throw new ManagedModelReaderUnavailableError("Exact managed catalog generation retirement is not proven.");
 		deadline.remaining();
@@ -353,15 +482,26 @@ async function assertTemporaryFence(
 	input: ManagedTemporaryModelReaderInput,
 	context: ModelReaderContext | undefined,
 	deadline: ManagedOperationDeadline,
+	lifetime: ReaderLifetime,
 	signal?: AbortSignal,
 ): Promise<void> {
 	throwIfAborted(signal);
 	deadline.remaining();
-	await deadline.wait(awaitWithAbort(input.assertFence(), signal));
+	await deadline.wait(
+		awaitWithAbort(
+			lifetime.run(() => input.assertFence()),
+			signal,
+		),
+	);
 	throwIfAborted(signal);
 	if (context?.lease !== undefined) {
 		deadline.remaining();
-		await deadline.wait(awaitWithAbort(context.lease.assertFence(), signal));
+		await deadline.wait(
+			awaitWithAbort(
+				lifetime.run(() => context.lease!.assertFence()),
+				signal,
+			),
+		);
 	}
 }
 async function assertReaderContext(
@@ -369,6 +509,7 @@ async function assertReaderContext(
 	signal: AbortSignal | undefined,
 	canonicalWorkspace: string | undefined,
 	deadline: ManagedOperationDeadline,
+	lifetime: ReaderLifetime,
 ): Promise<void> {
 	throwIfAborted(signal);
 	if (context === undefined) return;
@@ -384,7 +525,12 @@ async function assertReaderContext(
 		throw new ManagedModelReaderUnavailableError("Managed model reader authority escaped its tenant workspace.");
 	try {
 		deadline.remaining();
-		await deadline.wait(awaitWithAbort(context.lease.assertFence(), signal));
+		await deadline.wait(
+			awaitWithAbort(
+				lifetime.run(() => context.lease!.assertFence()),
+				signal,
+			),
+		);
 	} catch (error) {
 		if (error instanceof GjcTurnCancelledError) throw error;
 		throw new ManagedModelReaderUnavailableError("The normal-user workspace lease is no longer valid.", {

@@ -14,6 +14,11 @@ import {
 	type TenantSessionKey,
 } from "../src/gjc/managed-sdk-runtime";
 import type { ManagedPreparedTurnAuthority } from "../src/gjc/turn-runner";
+import { acquireWorkspaceAdmission } from "../src/live/chat-completions";
+import { createManagedModelReaderFactory } from "../src/live/gjc-managed-model-reader";
+import type { ModelReaderContext } from "../src/live/model-reader";
+import { handleOpenAIModelsRequest } from "../src/live/openai-models-route";
+import type { AdapterRouteDependencies } from "../src/live/openai-routes";
 
 type LifecycleService = ReturnType<typeof lifecycle.createSessionLifecycleService>;
 type CloseRequest = Parameters<LifecycleService["close"]>[0];
@@ -385,6 +390,221 @@ function invokeExternal(
 }
 
 describe("managed SDK runtime", () => {
+	test("runtime disposal retains finite local scope producers but not idle scope lifetime", async () => {
+		const f = fixture({ drainTimeoutMs: 50 });
+		await f.runtime.start();
+		const idle = f.runtime.createProducerScope(),
+			active = f.runtime.createProducerScope();
+		const gate = deferred<void>();
+		const local = active.run(() => gate.promise);
+		const timers: (() => void)[] = [];
+		const nativeSetTimeout = globalThis.setTimeout;
+		const timer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void) => {
+			timers.push(callback);
+			const handle = nativeSetTimeout(() => {}, 0);
+			clearTimeout(handle);
+			return handle;
+		}) as typeof setTimeout);
+		const clock = spyOn(performance, "now").mockReturnValue(performance.now());
+		let disposed = false;
+		try {
+			const disposal = f.runtime.dispose().then(() => {
+				disposed = true;
+			});
+			timers[0]!();
+			for (let i = 0; i < 30 && !f.calls.includes("stop"); i++) await Promise.resolve();
+			expect(f.calls).toContain("stop");
+			timers[1]!();
+			await expect(f.runtime.stop()).rejects.toMatchObject({ code: "drain_timeout" });
+			expect(disposed).toBe(false);
+			gate.resolve();
+			await local;
+			await disposal;
+			expect(disposed).toBe(true);
+			expect(() => idle.run(async () => undefined)).toThrow("scope admission is closed");
+			await active.seal();
+			await idle.seal();
+		} finally {
+			gate.resolve();
+			timer.mockRestore();
+			clock.mockRestore();
+		}
+	});
+
+	test("actual catalog route retains workspace lease through timed-out raw SDK response", async () => {
+		const entered = deferred<void>(),
+			response = deferred<Record<string, unknown>>(),
+			released = deferred<void>();
+		let releases = 0;
+		const f = fixture({
+			request: async () => {
+				entered.resolve();
+				return response.promise;
+			},
+		});
+		f.runtime.registerTenant(tenant);
+		await f.runtime.start();
+		const safeKey = "e".repeat(64);
+		const lease = {
+			renew: async () => lease,
+			assertFence: async () => {},
+			release: async () => {
+				releases += 1;
+				released.resolve();
+			},
+		};
+		const manager = { acquire: async () => lease };
+		const routes = {
+			owner: { ownerUserId: "admin", singleOwnerLocalMode: false },
+			workspaceRegistry: {
+				open: async () => ({
+					userId: tenant.principalId,
+					safeKey,
+					root: tenant.canonicalWorkspace,
+					sessionRoot: `${tenant.canonicalWorkspace}/.gjc/sessions`,
+				}),
+			},
+			workspaceLeaseManager: manager,
+			modelReaderFactory: (context: ModelReaderContext) =>
+				createManagedModelReaderFactory({
+					runtime: f.runtime,
+					timeoutMs: 100,
+					registerSettlement: context.registerSettlement!,
+					resolveAttachment: async () => ({ tenant }),
+				})(context),
+		} as unknown as AdapterRouteDependencies;
+		try {
+			const request = handleOpenAIModelsRequest(routes, { userId: tenant.principalId, role: "user" });
+			await entered.promise;
+			expect((await request).status).toBe(503);
+			expect(releases).toBe(0);
+			let admitted = false;
+			await acquireWorkspaceAdmission(manager, safeKey, 30, 8).then(
+				release => {
+					admitted = true;
+					release();
+				},
+				() => undefined,
+			);
+			expect(admitted).toBe(false);
+			response.resolve({ type: "query_response", ok: true, page: { items: [], complete: true } });
+			await released.promise;
+			const release = await acquireWorkspaceAdmission(manager, safeKey, 1000, 8);
+			release();
+			expect(releases).toBe(1);
+			expect(f.calls.filter(call => call === "request")).toHaveLength(1);
+			expect(f.calls).not.toContain("stop");
+		} finally {
+			response.resolve({ ok: true });
+			await f.runtime.dispose();
+		}
+	});
+
+	test("producer scope waits for its timed-out raw request without stopping unrelated work", async () => {
+		const entered = deferred<void>(),
+			response = deferred<Record<string, unknown>>();
+		let requests = 0;
+		const f = fixture({
+			request: () => {
+				requests += 1;
+				if (requests === 1) {
+					entered.resolve();
+					return response.promise;
+				}
+				return Promise.resolve({ ok: true });
+			},
+		});
+		f.runtime.registerTenant(tenant);
+		await f.runtime.start();
+		const attachment = await f.runtime.acquireAttachment(tenant);
+		const scope = f.runtime.createProducerScope(),
+			other = f.runtime.createProducerScope();
+		let settled = false;
+		void scope.settled.then(() => {
+			settled = true;
+		});
+		const first = scope.run(() => f.runtime.request(attachment, { type: "query_request" }, { timeoutMs: 30 }));
+		await entered.promise;
+		await expect(first).rejects.toMatchObject({ code: "timeout" });
+		expect(scope.seal()).toBe(scope.settled);
+		expect(scope.seal()).toBe(scope.settled);
+		expect(settled).toBe(false);
+		await other.run(() => f.runtime.request(attachment, { type: "query_request" }, { timeoutMs: 100 }));
+		await other.seal();
+		expect(settled).toBe(false);
+		expect(f.calls).not.toContain("stop");
+		response.resolve({ ok: true });
+		await scope.settled;
+		expect(settled).toBe(true);
+		expect(() => scope.run(async () => undefined)).toThrow("sealed");
+		await f.runtime.dispose();
+	});
+
+	test.each([false, true])(
+		"scope retains original late acknowledgement and local persistence failure=%s",
+		async failed => {
+			const entered = deferred<void>(),
+				response = deferred<void>();
+			const f = fixture({
+				onMutation: async () => {
+					entered.resolve();
+					await response.promise;
+				},
+			});
+			await f.runtime.start();
+			const scope = f.runtime.createProducerScope();
+			let captured = 0;
+			const call = scope.run(() =>
+				f.runtime.createPreparedExternalLifecycleSession(preparedAuthority(), createRequest(), 30, () => {
+					captured += 1;
+					if (failed) throw undefined;
+				}),
+			);
+			await entered.promise;
+			await expect(call).rejects.toMatchObject({ code: "timeout" });
+			scope.seal();
+			const other = f.runtime.createProducerScope();
+			await other.run(async () => undefined);
+			await other.seal();
+			response.resolve();
+			if (failed) {
+				await expect(scope.settled).rejects.toThrow("Original lifecycle outcome persistence failed");
+				await expect(f.runtime.dispose()).rejects.toThrow("Original lifecycle outcome persistence failed");
+			} else {
+				await scope.settled;
+				await f.runtime.dispose();
+			}
+			expect(captured).toBe(1);
+		},
+	);
+
+	test("sealing rejects nested effects but retains admitted local continuations", async () => {
+		const f = fixture();
+		await f.runtime.start();
+		const scope = f.runtime.createProducerScope(),
+			other = f.runtime.createProducerScope();
+		const entered = deferred<void>(),
+			release = deferred<void>();
+		const work = scope.run(async () => {
+			expect(() => other.run(async () => undefined)).toThrow("ownership");
+			entered.resolve();
+			await release.promise;
+			await f.runtime.reconcile();
+		});
+		await entered.promise;
+		let settled = false;
+		void scope.seal().then(() => {
+			settled = true;
+		});
+		expect(settled).toBe(false);
+		release.resolve();
+		await expect(work).rejects.toThrow("sealed");
+		await scope.settled;
+		expect(f.calls).toEqual(["start"]);
+		await other.seal();
+		await f.runtime.dispose();
+	});
+
 	test("waits for raw start before initiating one stop within the original budget", async () => {
 		const startGate = deferred<void>();
 		const f = fixture({ drainTimeoutMs: 1000, start: () => startGate.promise });
@@ -403,8 +623,12 @@ describe("managed SDK runtime", () => {
 	test("late raw lifecycle rejection settles cleanup without manufacturing success or another effect", async () => {
 		const entered = deferred<void>();
 		const gate = deferred<void>();
+		const stopEntered = deferred<void>();
 		const f = fixture({
 			drainTimeoutMs: 50,
+			stop: async () => {
+				stopEntered.resolve();
+			},
 			onMutation: async () => {
 				entered.resolve();
 				await gate.promise;
@@ -417,14 +641,34 @@ describe("managed SDK runtime", () => {
 			.catch(error => error);
 		await entered.promise;
 		expect(await outcome).toMatchObject({ code: "timeout" });
-		const disposal = f.runtime.dispose();
-		await expect(f.runtime.stop()).rejects.toMatchObject({ code: "drain_timeout" });
-		expect(f.runtime.state).toBe("stopping");
-		gate.reject(new Error("late public failure"));
-		await disposal;
-		expect(f.runtime.state).toBe("stopped");
-		expect(await outcome).toMatchObject({ code: "timeout" });
-		expect(f.closeCalls).toHaveLength(1);
+		const timers: (() => void)[] = [];
+		const nativeSetTimeout = globalThis.setTimeout;
+		const timer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void) => {
+			timers.push(callback);
+			const handle = nativeSetTimeout(() => {}, 0);
+			clearTimeout(handle);
+			return handle;
+		}) as typeof setTimeout);
+		const now = performance.now();
+		const clock = spyOn(performance, "now").mockReturnValue(now);
+		try {
+			const disposal = f.runtime.dispose();
+			expect(timers).toHaveLength(2);
+			timers[0]!();
+			await stopEntered.promise;
+			timers[1]!();
+			await expect(f.runtime.stop()).rejects.toMatchObject({ code: "drain_timeout" });
+			expect(f.calls).toContain("stop");
+			expect(f.runtime.state).toBe("stopping");
+			gate.reject(new Error("late public failure"));
+			await disposal;
+			expect(f.runtime.state).toBe("stopped");
+			expect(await outcome).toMatchObject({ code: "timeout" });
+			expect(f.closeCalls).toHaveLength(1);
+		} finally {
+			timer.mockRestore();
+			clock.mockRestore();
+		}
 	});
 
 	test.each(["reconcile", "proof"] as const)("serializes %s behind a timed-out raw reconciliation", async kind => {

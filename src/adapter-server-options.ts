@@ -636,10 +636,14 @@ function createManagedReaderFactory(runtime: ManagedSdkRuntime, timeoutMs: numbe
 	return async (context, signal) => {
 		if (context?.managedAuthority === undefined)
 			throw new Error("Managed model catalog access requires explicit tenant or temporary service authority.");
+		if (typeof context.registerSettlement !== "function")
+			throw new Error("Managed model catalog access requires an actual settlement owner.");
+		const registerSettlement = context.registerSettlement.bind(context);
 		const authority = { ...context.managedAuthority };
 		if (isManagedTurnAuthority(authority)) {
 			return createManagedModelReaderFactory({
 				runtime,
+				registerSettlement,
 				timeoutMs,
 				resolveAttachment: async () => ({
 					tenant: {
@@ -660,6 +664,7 @@ function createManagedReaderFactory(runtime: ManagedSdkRuntime, timeoutMs: numbe
 		const assertFence = context.lease.assertFence.bind(context.lease);
 		return createManagedModelReaderFactory({
 			runtime,
+			registerSettlement,
 			timeoutMs,
 			temporary: {
 				...authority,

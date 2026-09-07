@@ -25,9 +25,25 @@ for (const [name, value] of [
 writeCanonicalV3Authority(sessionRoot);
 
 const managedRuntime = createManagedSelectionRuntime(coordinatorUrl);
+const readerSettlements = new Set<Promise<void>>();
+const readerSettlementFailures: unknown[] = [];
+const registerReaderSettlement = (settled: Promise<void>): void => {
+	readerSettlements.add(settled);
+	void settled.then(
+		() => readerSettlements.delete(settled),
+		error => {
+			readerSettlements.delete(settled);
+			readerSettlementFailures.push(error);
+		},
+	);
+};
 const managedModelReaderFactory = (context: any, signal?: AbortSignal) =>
 	createManagedModelReaderFactory({
 		runtime: managedRuntime,
+		registerSettlement: settled => {
+			registerReaderSettlement(settled);
+			context?.registerSettlement?.(settled);
+		},
 		temporary: {
 			principalId: context?.principal?.userId ?? "owner-selection",
 			projectId: "openwebui",
@@ -109,6 +125,7 @@ const handle = await startAdapterServer({
 				const managedInput = {
 					...input,
 					modelReaderContext: {
+						registerSettlement: input.modelReaderContext?.registerSettlement ?? registerReaderSettlement,
 						principal: { role: "user" as const, userId: principalId },
 						workspace: {
 							userId: principalId,
@@ -194,7 +211,12 @@ function redactDiagnostic(value: string): string {
 }
 
 function stop(): void {
-	handle.stop().then(
+	(async () => {
+		await handle.stop();
+		await Promise.allSettled([...readerSettlements]);
+		if (readerSettlementFailures.length > 0)
+			throw new AggregateError(readerSettlementFailures, "Fixture reader cleanup failed");
+	})().then(
 		() => process.exit(0),
 		() => process.exit(1),
 	);

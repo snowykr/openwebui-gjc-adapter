@@ -112,6 +112,7 @@ function publicationFixture(options: PublicationFixtureOptions = {}) {
 		state: "running",
 		start: unexpected,
 		dispose: unexpected,
+		createProducerScope: unexpected,
 		acquireAttachment: unexpected,
 		request: unexpected,
 		subscribeFrames: unexpected,

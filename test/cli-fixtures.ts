@@ -11,6 +11,7 @@ import type {
 	ManagedSdkPendingFrameSubscription,
 	TenantSessionKey,
 } from "../src/gjc/managed-sdk-runtime";
+import { ManagedSdkRuntime } from "../src/gjc/managed-sdk-runtime";
 import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import type {
 	GjcContinueSessionInput,
@@ -96,6 +97,32 @@ interface FakeManagedFrameSubscription {
  * or endpoint/attachment injection seam to adapter startup.
  */
 export class FakeManagedSdkRuntime implements ManagedSdkRuntimeDependency {
+	readonly #scopeRuntime = new ManagedSdkRuntime({
+		agentDir: "/scope-fixture",
+		deps: {
+			createRouter: () =>
+				new Proxy(
+					{},
+					{
+						get: () => {
+							throw new Error("Accounting fixture cannot use Router methods");
+						},
+					},
+				) as never,
+			createLifecycleService: () =>
+				new Proxy(
+					{},
+					{
+						get: () => {
+							throw new Error("Accounting fixture cannot use lifecycle methods");
+						},
+					},
+				) as never,
+		},
+	});
+	createProducerScope() {
+		return this.#scopeRuntime.createProducerScope();
+	}
 	state: ManagedSdkOwnerState = "new";
 	events: GjcTurnEvent[] = [{ type: "assistant", text: "assistant from gjc" }];
 	readonly requests: FakeManagedRequest[] = [];

@@ -1,5 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import type { ManagedSdkAttachment, ManagedSdkRuntime, TenantSessionKey } from "../src/gjc/managed-sdk-runtime";
+import { type ManagedSdkAttachment, ManagedSdkRuntime, type TenantSessionKey } from "../src/gjc/managed-sdk-runtime";
 import { GjcTurnCancelledError } from "../src/gjc/turn-runner";
 import {
 	createManagedModelReaderFactory,
@@ -40,6 +40,147 @@ const userContext = {
 };
 
 describe("managed model reader", () => {
+	test.each([false, true])("temporary stop drains admitted raw query before cleanup with expiry=%s", async expired => {
+		const fake = new FakeRuntime();
+		const entered = Promise.withResolvers<void>(),
+			gate = Promise.withResolvers<void>();
+		fake.queryHandler = async () => {
+			entered.resolve();
+			await gate.promise;
+			return { type: "query_response", ok: true, page: { items: [], complete: true } };
+		};
+		const reader = await createManagedModelReaderFactory({
+			runtime: fake.runtime,
+			timeoutMs: expired ? 50 : 1000,
+			registerSettlement: fake.registerSettlement,
+			temporary,
+		})();
+		const query = reader.getAvailableModels().catch(error => error);
+		await entered.promise;
+		const stop = Promise.resolve(reader.stop());
+		await Promise.resolve();
+		expect(fake.closed).toBeUndefined();
+		if (expired) await expect(stop).rejects.toMatchObject({ code: "timeout" });
+		gate.resolve();
+		await query;
+		if (expired) {
+			await expect(fake.settlements[0]!).rejects.toThrow("settlement failed");
+			expect(fake.closed).toBeUndefined();
+		} else {
+			await stop;
+			await fake.settlements[0];
+			expect(fake.closed).toBeDefined();
+			expect(fake.statusKeys).toHaveLength(1);
+		}
+	});
+
+	test("requires an actual settlement owner before any admission", async () => {
+		const fake = new FakeRuntime();
+		expect(() =>
+			createManagedModelReaderFactory({
+				runtime: fake.runtime,
+				resolveAttachment: async () => ({ tenant }),
+			} as never),
+		).toThrow("settlement owner");
+		const denied = new Error("owner registration failed");
+		let checks = 0;
+		await expect(
+			createManagedModelReaderFactory({
+				runtime: fake.runtime,
+				registerSettlement: () => {
+					throw denied;
+				},
+				resolveAttachment: async () => {
+					checks += 1;
+					return { tenant };
+				},
+			})(),
+		).rejects.toBe(denied);
+		expect(checks).toBe(0);
+		expect(fake.reconciles).toBe(0);
+	});
+
+	test.each(["resolver", "fence", "query", "stop"] as const)(
+		"actual reader settlement retains timed-out raw %s work",
+		async phase => {
+			const fake = new FakeRuntime();
+			const entered = Promise.withResolvers<void>(),
+				release = Promise.withResolvers<void>();
+			let blockFence = phase === "fence";
+			let settled = false;
+			const wait = async () => {
+				entered.resolve();
+				await release.promise;
+			};
+			const factory = createManagedModelReaderFactory({
+				runtime: fake.runtime,
+				timeoutMs: 50,
+				registerSettlement: promise => {
+					fake.registerSettlement(promise);
+					void promise.then(() => {
+						settled = true;
+					});
+				},
+				resolveAttachment: async () => {
+					if (phase === "resolver") await wait();
+					return { tenant };
+				},
+			});
+			const context = {
+				...userContext,
+				lease: {
+					assertFence: async () => {
+						if (blockFence) await wait();
+					},
+				},
+			};
+			if (phase === "resolver" || phase === "fence") {
+				const pending = factory(context);
+				await entered.promise;
+				await expect(pending).rejects.toThrow();
+			} else {
+				const reader = await factory(context);
+				if (phase === "query") {
+					fake.queryHandler = async () => {
+						await wait();
+						return { type: "query_response", ok: true, page: { items: [], complete: true } };
+					};
+					const pending = reader.getAvailableModels();
+					await entered.promise;
+					await expect(pending).rejects.toMatchObject({ code: "timeout" });
+				} else blockFence = true;
+				const stop = reader.stop();
+				if (phase === "stop") await entered.promise;
+				await expect(stop).rejects.toThrow();
+			}
+			expect(settled).toBe(false);
+			release.resolve();
+			await fake.settlements[0];
+			expect(settled).toBe(true);
+			expect(fake.closed).toBeUndefined();
+		},
+	);
+
+	test("temporary failed cleanup rejects registered settlement without borrowing another reader", async () => {
+		const fake = new FakeRuntime();
+		fake.status = "unknown";
+		const reader = await createManagedModelReaderFactory({
+			runtime: fake.runtime,
+			registerSettlement: fake.registerSettlement,
+			temporary,
+		})();
+		await expect(reader.stop()).rejects.toThrow("retirement");
+		await expect(fake.settlements[0]!).rejects.toThrow("settlement failed");
+		const independent = await createManagedModelReaderFactory({
+			runtime: fake.runtime,
+			registerSettlement: fake.registerSettlement,
+			resolveAttachment: async () => ({ tenant }),
+		})();
+		await independent.stop();
+		await fake.settlements[1];
+		expect(fake.closed).toBeDefined();
+	});
+
 	test.each(["success", "fence-failure", "cancelled"] as const)(
 		"retains original existing-reader scope and callbacks after caller mutation with %s",
 		async mode => {
@@ -70,7 +211,12 @@ describe("managed model reader", () => {
 				signal: controller.signal,
 			};
 			const resolved = { tenant: { ...tenant } };
-			const input = { runtime: fake.runtime, timeoutMs: 1000, resolveAttachment: async () => resolved };
+			const input = {
+				runtime: fake.runtime,
+				registerSettlement: fake.registerSettlement,
+				timeoutMs: 1000,
+				resolveAttachment: async () => resolved,
+			};
 			const pending = createManagedModelReaderFactory(input)(context);
 			const observed = pending.catch(error => error);
 			await entered.promise;
@@ -117,7 +263,12 @@ describe("managed model reader", () => {
 				}
 			},
 		};
-		const input = { runtime: fake.runtime, timeoutMs: 1000, temporary: original };
+		const input = {
+			runtime: fake.runtime,
+			registerSettlement: fake.registerSettlement,
+			timeoutMs: 1000,
+			temporary: original,
+		};
 		const pending = createManagedModelReaderFactory(input)();
 		await entered.promise;
 		Object.assign(original, {
@@ -161,6 +312,7 @@ describe("managed model reader", () => {
 				await expect(
 					createManagedModelReaderFactory({
 						runtime: fake.runtime,
+						registerSettlement: fake.registerSettlement,
 						timeoutMs: 50,
 						resolveAttachment: async () => {
 							await effect("resolver");
@@ -203,6 +355,7 @@ describe("managed model reader", () => {
 			try {
 				const reader = await createManagedModelReaderFactory({
 					runtime: fake.runtime,
+					registerSettlement: fake.registerSettlement,
 					timeoutMs: 1_000,
 					...(kind === "existing"
 						? {
@@ -248,7 +401,12 @@ describe("managed model reader", () => {
 						})
 					: undefined;
 			try {
-				const creation = createManagedModelReaderFactory({ runtime: fake.runtime, timeoutMs: 50, temporary })();
+				const creation = createManagedModelReaderFactory({
+					runtime: fake.runtime,
+					registerSettlement: fake.registerSettlement,
+					timeoutMs: 50,
+					temporary,
+				})();
 				if (phase === "close") {
 					const reader = await creation;
 					const failure = await Promise.resolve(reader.stop()).catch(error => error);
@@ -278,6 +436,7 @@ describe("managed model reader", () => {
 			await expect(
 				createManagedModelReaderFactory({
 					runtime: fake.runtime,
+					registerSettlement: fake.registerSettlement,
 					timeoutMs: 100,
 					temporary: {
 						...temporary,
@@ -309,6 +468,7 @@ describe("managed model reader", () => {
 			await expect(
 				createManagedModelReaderFactory({
 					runtime: fake.runtime,
+					registerSettlement: fake.registerSettlement,
 					timeoutMs,
 					resolveAttachment: async () => {
 						resolved = true;
@@ -334,6 +494,7 @@ describe("managed model reader", () => {
 		});
 		const reader = await createManagedModelReaderFactory({
 			runtime: fake.runtime,
+			registerSettlement: fake.registerSettlement,
 			resolveAttachment: async () => ({ tenant }),
 		})(userContext);
 		try {
@@ -367,6 +528,7 @@ describe("managed model reader", () => {
 			});
 			const reader = await createManagedModelReaderFactory({
 				runtime: fake.runtime,
+				registerSettlement: fake.registerSettlement,
 				resolveAttachment: async () => ({ tenant }),
 			})(userContext);
 			try {
@@ -392,6 +554,7 @@ describe("managed model reader", () => {
 		const clock = spyOn(Date, "now").mockImplementation(() => now);
 		const reader = await createManagedModelReaderFactory({
 			runtime: fake.runtime,
+			registerSettlement: fake.registerSettlement,
 			timeoutMs: 1_000,
 			temporary,
 		})();
@@ -425,6 +588,7 @@ describe("managed model reader", () => {
 		});
 		const reader = await createManagedModelReaderFactory({
 			runtime: fake.runtime,
+			registerSettlement: fake.registerSettlement,
 			timeoutMs: 50,
 			temporary: {
 				...temporary,
@@ -460,13 +624,23 @@ describe("managed model reader", () => {
 		};
 		const reader = await createManagedModelReaderFactory({
 			runtime: fake.runtime,
+			registerSettlement: fake.registerSettlement,
 			resolveAttachment: async () => ({ tenant }),
 		})(userContext);
 		const pending = reader.getAvailableModels().catch(error => error);
 		await admission;
-		await reader.stop();
+		let stopSettled = false;
+		const stopping = Promise.resolve(reader.stop()).then(() => {
+			stopSettled = true;
+		});
+		await Promise.resolve();
+		expect(stopSettled).toBe(false);
+		await expect(reader.getActiveProviders()).rejects.toThrow("stopped");
 		resolve({ type: "query_response", ok: true, page: { items: ["not-visible"], complete: true } });
-		expect(await pending).toMatchObject({ code: "operation_closed" });
+		expect(await pending).toBeInstanceOf(ManagedModelReaderUnavailableError);
+		await stopping;
+		await fake.settlements[0];
+		expect(stopSettled).toBe(true);
 		await expect(reader.getActiveProviders()).rejects.toThrow("stopped");
 		expect(fake.requests).toHaveLength(1);
 	});
@@ -475,6 +649,7 @@ describe("managed model reader", () => {
 		const fake = new FakeRuntime();
 		const reader = await createManagedModelReaderFactory({
 			runtime: fake.runtime,
+			registerSettlement: fake.registerSettlement,
 			resolveAttachment: async () => ({ tenant }),
 		})(userContext);
 
@@ -496,6 +671,7 @@ describe("managed model reader", () => {
 		const fake = new FakeRuntime();
 		const reader = await createManagedModelReaderFactory({
 			runtime: fake.runtime,
+			registerSettlement: fake.registerSettlement,
 			timeoutMs: 250,
 			temporary,
 		})();
@@ -542,7 +718,11 @@ describe("managed model reader", () => {
 		]) {
 			const fake = new FakeRuntime();
 			await expect(
-				createManagedModelReaderFactory({ runtime: fake.runtime, temporary: { ...temporary, ...change } })(),
+				createManagedModelReaderFactory({
+					runtime: fake.runtime,
+					registerSettlement: fake.registerSettlement,
+					temporary: { ...temporary, ...change },
+				})(),
 			).rejects.toThrow("prepared authority");
 			expect(fake.createCalls).toBe(0);
 			expect(fake.created).toBeUndefined();
@@ -562,7 +742,11 @@ describe("managed model reader", () => {
 							error: { code: "failed", message: "close failed" },
 						}
 					: { ok: true, operation: "session.close", result: { sessionId: "foreign-session" } };
-			const reader = await createManagedModelReaderFactory({ runtime: fake.runtime, temporary })();
+			const reader = await createManagedModelReaderFactory({
+				runtime: fake.runtime,
+				registerSettlement: fake.registerSettlement,
+				temporary,
+			})();
 			await expect(reader.stop()).rejects.toBeInstanceOf(ManagedModelReaderUnavailableError);
 			await expect(reader.stop()).rejects.toBeInstanceOf(ManagedModelReaderUnavailableError);
 			expect(fake.statusKeys).toEqual([{ ...tenant, sessionId: "catalog-session", generation: 11 }]);
@@ -575,7 +759,11 @@ describe("managed model reader", () => {
 		const controller = new AbortController();
 		controller.abort();
 		await expect(
-			createManagedModelReaderFactory({ runtime: fake.runtime, temporary })(undefined, controller.signal),
+			createManagedModelReaderFactory({
+				runtime: fake.runtime,
+				registerSettlement: fake.registerSettlement,
+				temporary,
+			})(undefined, controller.signal),
 		).rejects.toBeInstanceOf(GjcTurnCancelledError);
 		expect(fake.created).toBeUndefined();
 
@@ -584,10 +772,11 @@ describe("managed model reader", () => {
 			release = resolve;
 		});
 		const lateController = new AbortController();
-		const late = createManagedModelReaderFactory({ runtime: fake.runtime, temporary })(
-			undefined,
-			lateController.signal,
-		);
+		const late = createManagedModelReaderFactory({
+			runtime: fake.runtime,
+			registerSettlement: fake.registerSettlement,
+			temporary,
+		})(undefined, lateController.signal);
 		for (let attempt = 0; attempt < 20 && fake.createCalls < 1; attempt++) await Bun.sleep(1);
 		expect(fake.createCalls).toBe(1);
 		lateController.abort();
@@ -615,10 +804,12 @@ describe("managed model reader", () => {
 		};
 		const controller = new AbortController();
 		let settled = false;
-		const pending = createManagedModelReaderFactory({ runtime: fake.runtime, timeoutMs: 1_000, temporary })(
-			undefined,
-			controller.signal,
-		)
+		const pending = createManagedModelReaderFactory({
+			runtime: fake.runtime,
+			registerSettlement: fake.registerSettlement,
+			timeoutMs: 1_000,
+			temporary,
+		})(undefined, controller.signal)
 			.catch(error => error)
 			.finally(() => {
 				settled = true;
@@ -648,14 +839,22 @@ describe("managed model reader", () => {
 	test("cleans up after query failure and rejects replaced or unknown retirement proof", async () => {
 		const fake = new FakeRuntime();
 		fake.queryFailure = new Error("query unavailable");
-		const reader = await createManagedModelReaderFactory({ runtime: fake.runtime, temporary })();
+		const reader = await createManagedModelReaderFactory({
+			runtime: fake.runtime,
+			registerSettlement: fake.registerSettlement,
+			temporary,
+		})();
 		await expect(reader.getAvailableModels()).rejects.toThrow("query unavailable");
 		expect(fake.closed).toBeDefined();
 
 		for (const status of ["replaced", "unknown"] as const) {
 			const uncertain = new FakeRuntime();
 			uncertain.status = status;
-			const temporaryReader = await createManagedModelReaderFactory({ runtime: uncertain.runtime, temporary })();
+			const temporaryReader = await createManagedModelReaderFactory({
+				runtime: uncertain.runtime,
+				registerSettlement: uncertain.registerSettlement,
+				temporary,
+			})();
 			await expect(temporaryReader.stop()).rejects.toBeInstanceOf(ManagedModelReaderUnavailableError);
 		}
 	});
@@ -664,7 +863,11 @@ describe("managed model reader", () => {
 		const fake = new FakeRuntime();
 		fake.rejectTenant = true;
 		await expect(
-			createManagedModelReaderFactory({ runtime: fake.runtime, resolveAttachment: async () => ({ tenant }) })(),
+			createManagedModelReaderFactory({
+				runtime: fake.runtime,
+				registerSettlement: fake.registerSettlement,
+				resolveAttachment: async () => ({ tenant }),
+			})(),
 		).rejects.toThrow("tenant mismatch");
 		expect(fake.requests).toHaveLength(0);
 	});
@@ -700,12 +903,18 @@ describe("managed model reader", () => {
 				},
 			},
 		};
-		await createManagedModelReaderFactory({ runtime: fake.runtime, resolveAttachment: async () => ({ tenant }) })(
-			context,
-		);
+		await createManagedModelReaderFactory({
+			runtime: fake.runtime,
+			registerSettlement: fake.registerSettlement,
+			resolveAttachment: async () => ({ tenant }),
+		})(context);
 		expect(fenceCalls).toBe(2);
 		await expect(
-			createManagedModelReaderFactory({ runtime: fake.runtime, resolveAttachment: async () => ({ tenant }) })({
+			createManagedModelReaderFactory({
+				runtime: fake.runtime,
+				registerSettlement: fake.registerSettlement,
+				resolveAttachment: async () => ({ tenant }),
+			})({
 				...userContext,
 				workspace: { ...userContext.workspace, root: "/other-workspace" },
 			}),
@@ -714,6 +923,37 @@ describe("managed model reader", () => {
 });
 
 class FakeRuntime {
+	readonly #scopeRuntime = new ManagedSdkRuntime({
+		agentDir: "/scope-fixture",
+		deps: {
+			createRouter: () =>
+				new Proxy(
+					{},
+					{
+						get: () => {
+							throw new Error("Accounting fixture cannot use Router methods");
+						},
+					},
+				) as never,
+			createLifecycleService: () =>
+				new Proxy(
+					{},
+					{
+						get: () => {
+							throw new Error("Accounting fixture cannot use lifecycle methods");
+						},
+					},
+				) as never,
+		},
+	});
+	readonly settlements: Promise<void>[] = [];
+	readonly registerSettlement = (settled: Promise<void>): void => {
+		this.settlements.push(settled);
+		void settled.catch(() => undefined);
+	};
+	createProducerScope() {
+		return this.#scopeRuntime.createProducerScope();
+	}
 	private closeResolve: () => void = () => undefined;
 	readonly closeObserved = new Promise<void>(resolve => {
 		this.closeResolve = resolve;

@@ -9,6 +9,7 @@ export type ManagedSdkRuntimeDependency = Pick<
 	| "start"
 	| "reconcile"
 	| "dispose"
+	| "createProducerScope"
 	| "acquireAttachment"
 	| "request"
 	| "subscribeFrames"

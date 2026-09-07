@@ -404,4 +404,66 @@ describe("live OpenAI-compatible chat completion errors", () => {
 		);
 		expect(granted).toBe(false);
 	});
+	it.each([false, true])("chat settlement failure=%s retains lease until actual cleanup", async failed => {
+		const safeKey = "d".repeat(64);
+		const settlement = Promise.withResolvers<void>(),
+			released = Promise.withResolvers<void>();
+		let releases = 0;
+		const lease = {
+			renew: async () => lease,
+			assertFence: async () => {},
+			reference: { safeKey, holderId: "owner", generation: 1, operation: "turn" },
+			release: async () => {
+				releases += 1;
+				released.resolve();
+			},
+		} as unknown as WorkspaceLease;
+		const manager = { acquire: async () => lease };
+		const result = await handleChatCompletions({
+			request,
+			headers: { ...chatHeaders, "X-OpenWebUI-User-Id": "normal-1" },
+			projects: [project],
+			owner,
+			neutralWorkspace: "/tmp",
+			workspaceRegistry: {
+				open: async userId => ({ userId, safeKey, root: "/tmp", sessionRoot: "/tmp/.gjc/sessions" }),
+			},
+			workspaceLeaseManager: manager,
+			runner: {
+				run: async input => {
+					input.modelReaderContext!.registerSettlement!(settlement.promise);
+					return { content: "complete" };
+				},
+			},
+		});
+		expect(result.ok).toBe(false);
+		expect(releases).toBe(0);
+		let admitted = false;
+		await acquireWorkspaceAdmission(manager, safeKey, 30, 8).then(
+			release => {
+				admitted = true;
+				release();
+			},
+			() => undefined,
+		);
+		expect(admitted).toBe(false);
+		if (failed) {
+			settlement.reject(new Error("cleanup failed"));
+			await acquireWorkspaceAdmission(manager, safeKey, 30, 8).then(
+				release => {
+					admitted = true;
+					release();
+				},
+				() => undefined,
+			);
+			expect(admitted).toBe(false);
+			expect(releases).toBe(0);
+		} else {
+			settlement.resolve();
+			await released.promise;
+			const release = await acquireWorkspaceAdmission(manager, safeKey, 1000, 8);
+			release();
+			expect(releases).toBe(1);
+		}
+	});
 });
