@@ -763,6 +763,7 @@ async function assertPreparedManagedTenantFence(
 			!operations.some(operation => {
 				const lifecycle = operation.lifecycle;
 				return (
+					!("purpose" in operation && operation.purpose === "model-catalog") &&
 					lifecycle !== undefined &&
 					operation.state === "pending" &&
 					(lifecycle.state === "intent_prepared" || lifecycle.state === "invoking") &&

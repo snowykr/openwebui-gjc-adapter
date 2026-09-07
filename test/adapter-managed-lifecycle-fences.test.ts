@@ -6,6 +6,7 @@ import type { lifecycle, router } from "@gajae-code/coding-agent/sdk";
 import { buildAdapterServerOptions } from "../src/adapter-server-options";
 import {
 	createManagedLifecycleEvidence,
+	managedLifecycleEvidenceHash,
 	transitionManagedLifecycleEvidence,
 } from "../src/gjc/managed-lifecycle-evidence";
 import { ManagedSdkRuntime, type ManagedSdkRuntimeDeps, type TenantSessionKey } from "../src/gjc/managed-sdk-runtime";
@@ -205,6 +206,46 @@ async function fixture(
 		},
 	};
 }
+
+test.each(["intent_prepared", "invoking"] as const)(
+	"catalog %s reservation cannot authorize generic prepared creation",
+	async phase => {
+		const f = await fixture();
+		try {
+			const owner = f.mappings.reserveManagedCatalogScoped(f.prepared, {
+				operationId: "catalog-create",
+				prepared: f.prepared,
+				payloadHash: "c".repeat(64),
+			});
+			if (phase === "invoking")
+				f.mappings.advanceManagedCatalogScoped(
+					f.prepared,
+					owner,
+					managedLifecycleEvidenceHash(owner.lifecycle!),
+					transitionManagedLifecycleEvidence(owner.lifecycle!, phase),
+				);
+			const path = join(f.root, "sessions", "openwebui-session-mappings.json");
+			const before = await readFile(path);
+			expect(await f.deps.preparedTenantFence!(f.prepared)).toBe(false);
+			await expect(
+				f.runtime.createPreparedExternalLifecycleSession(
+					f.prepared,
+					{
+						actor: { id: f.prepared.principalId, namespace: "openwebui-gjc-adapter" },
+						capability: "session.create",
+						requestKey: f.prepared.requestKey,
+						target: { kind: "existing_path", path: f.prepared.canonicalWorkspace },
+					},
+					1_000,
+				),
+			).rejects.toThrow("Prepared tenant authority fence");
+			expect(f.calls).toEqual([]);
+			expect((await readFile(path)).equals(before)).toBe(true);
+		} finally {
+			await f.close();
+		}
+	},
+);
 
 test("production fences permit create acknowledgement, proof, prompt and immutable canonical replay", async () => {
 	const f = await fixture();
