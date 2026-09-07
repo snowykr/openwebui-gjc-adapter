@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import {
+	createManagedLateCreateAcknowledgement,
 	createManagedLifecycleEvidence,
 	lifecycleExactAuthority,
 	lifecyclePreparedAuthority,
@@ -22,6 +23,11 @@ import {
 } from "./turn-runner";
 
 export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<RouteGjcTurnResult> {
+	input = {
+		...input,
+		project: { ...input.project },
+		...(input.modelSelection === undefined ? {} : { modelSelection: { ...input.modelSelection } }),
+	};
 	throwIfAborted(input.signal);
 	const prepared = preparedAuthorityFor(input);
 	if (input.runner.startManagedSession === undefined)
@@ -50,6 +56,8 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 	let boundAuthority: ManagedTurnAuthority | undefined;
 	let authorityCompleted = false;
 	let promptMayHaveDispatched = false;
+	let admitted: ProvisionalSessionOperation | undefined;
+	let passiveAcknowledgement = false;
 	const markUncertain = () => {
 		if (!authorityCompleted) {
 			if (canTransitionManagedLifecycleState(lifecycleEvidence.state, "uncertain"))
@@ -124,7 +132,13 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 				requestKey: prepared.requestKey,
 				payloadHash: operation.detail!,
 			},
-			onLifecycleInvoking: () => recordLifecycle(transitionManagedLifecycleEvidence(lifecycleEvidence, "invoking")),
+			onLifecycleInvoking: () => {
+				recordLifecycle(transitionManagedLifecycleEvidence(lifecycleEvidence, "invoking"));
+				const reserved = input.mappings.provisionalOperation(input.chatId, input.userMessageId);
+				if (reserved?.lifecycle?.state !== "invoking")
+					throw new Error("Managed startup invocation lacks its durable provisional owner.");
+				admitted = structuredClone(reserved);
+			},
 			onLifecycleAcknowledged: async (acknowledged: ManagedTurnAuthority) => {
 				const authority = managedAuthorityFor(
 					prepared,
@@ -138,6 +152,17 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 					acknowledged.sessionId,
 				);
 				assertSameManagedAuthority(authority, acknowledged);
+				const retained = input.mappings.provisionalOperation(input.chatId, input.userMessageId);
+				if (retained?.state === "uncertain" && retained.lifecycle?.state === "uncertain") {
+					if (admitted === undefined) throw new Error("Managed startup lost its original invocation.");
+					input.mappings.recordLateCreateAcknowledgement(
+						input.chatId,
+						admitted,
+						createManagedLateCreateAcknowledgement(admitted, lifecycleExactAuthority(acknowledged)),
+					);
+					passiveAcknowledgement = true;
+					return;
+				}
 				recordLifecycle(
 					transitionManagedLifecycleEvidence(lifecycleEvidence, "acknowledged_unproven", {
 						acknowledged: lifecycleExactAuthority(acknowledged),
@@ -147,6 +172,11 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 					sessionId: authority.sessionId,
 					managedAuthority: authority,
 				});
+			},
+			beforeLifecycleProof: () => {
+				throwIfAborted(input.signal);
+				if (passiveAcknowledgement || lifecycleEvidence.state !== "acknowledged_unproven")
+					throw new Error("Passive create observation cannot authorize proof.");
 			},
 		} as const;
 		return await input.runner.startManagedSession(
@@ -176,7 +206,12 @@ export async function startNewMappedSession(input: RouteGjcTurnInput): Promise<R
 			onFailure,
 		);
 	} catch (error) {
-		if (error instanceof GjcTurnCancelledError && !promptMayHaveDispatched) {
+		if (
+			error instanceof GjcTurnCancelledError &&
+			!promptMayHaveDispatched &&
+			admitted === undefined &&
+			lifecycleEvidence.state === "intent_prepared"
+		) {
 			try {
 				input.mappings.discardPendingProvisionalOperation(input.chatId, operation);
 			} catch (discardError) {

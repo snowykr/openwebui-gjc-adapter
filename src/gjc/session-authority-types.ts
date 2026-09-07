@@ -1,5 +1,9 @@
 import type { NormalizedModelSelection } from "../contracts";
-import type { ManagedLateLifecycleAcknowledgement, ManagedLifecycleEvidence } from "./managed-lifecycle-evidence";
+import type {
+	ManagedLateCreateAcknowledgement,
+	ManagedLateLifecycleAcknowledgement,
+	ManagedLifecycleEvidence,
+} from "./managed-lifecycle-evidence";
 import type { GjcTurnEvent, ManagedTurnAuthority } from "./turn-runner";
 
 export const SESSION_AUTHORITY_VERSION = 2 as const;
@@ -180,6 +184,7 @@ export type ProvisionalSessionOperation = SessionOperation &
 	SessionAuthorityBinding & {
 		readonly chatId: string;
 		readonly projectId: string;
+		readonly lateCreateAcknowledgement?: ManagedLateCreateAcknowledgement;
 		readonly sessionId?: string;
 		readonly sessionFile?: string;
 		readonly activeLeaf?: string;

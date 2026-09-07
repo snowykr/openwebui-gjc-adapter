@@ -4,9 +4,11 @@ import type { NormalizedModelSelection } from "../contracts";
 import {
 	hasManagedHistoricalSourceChat,
 	isHistoricalSessionBinding,
+	isManagedLateCreateAcknowledgement,
 	isManagedLateLifecycleAcknowledgement,
 	isManagedLifecycleEvidence,
 	type ManagedHistoricalAssociationOwner,
+	type ManagedLateCreateAcknowledgement,
 	type ManagedLateLifecycleAcknowledgement,
 	type ManagedLifecycleEvidence,
 	managedHistoricalPublicationAssociation,
@@ -151,6 +153,7 @@ export type SessionAuthorityV3Mapping = SessionAuthorityV3Binding & {
 export type SessionAuthorityV3ProvisionalOperation = SessionAuthorityV3Operation & {
 	readonly chatId: string;
 	readonly projectId: string;
+	readonly lateCreateAcknowledgement?: ManagedLateCreateAcknowledgement;
 	readonly sessionFile?: string;
 	readonly activeLeaf?: string;
 } & (
@@ -458,6 +461,7 @@ function isProvisional(value: unknown): value is SessionAuthorityV3ProvisionalOp
 			"result",
 			"acknowledgedSuccessor",
 			"lifecycle",
+			"lateCreateAcknowledgement",
 			"chatId",
 			"projectId",
 			"sessionId",
@@ -468,17 +472,28 @@ function isProvisional(value: unknown): value is SessionAuthorityV3ProvisionalOp
 		])
 	)
 		return false;
+	const { lateCreateAcknowledgement, ...operation } = value;
 	return (
 		isNonEmptyString(value.chatId) &&
 		isNonEmptyString(value.projectId) &&
-		isOperation(value) &&
+		isOperation(operation) &&
+		(lateCreateAcknowledgement === undefined ||
+			(isManagedLateCreateAcknowledgement(
+				lateCreateAcknowledgement,
+				value as unknown as SessionAuthorityV3ProvisionalOperation,
+			) &&
+				value.chatId ===
+					JSON.stringify([
+						operation.lifecycle!.preparedAuthority.principalId,
+						operation.lifecycle!.preparedAuthority.chatId,
+					]))) &&
 		!(
 			value.historicalBinding !== undefined &&
-			value.lifecycle?.historicalSource !== undefined &&
+			operation.lifecycle?.historicalSource !== undefined &&
 			value.result !== undefined
 		) &&
 		validProjection(value) &&
-		validateLifecycleOwner(value.lifecycle, value.chatId, value.projectId, bindingIdentity(value)) &&
+		validateLifecycleOwner(operation.lifecycle, value.chatId, value.projectId, bindingIdentity(value)) &&
 		validateBinding(value, { chatId: value.chatId, projectId: value.projectId, sessionId: value.sessionId }, true)
 	);
 }

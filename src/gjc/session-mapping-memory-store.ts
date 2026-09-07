@@ -3,16 +3,20 @@ import {
 	assertManagedLifecycleEvidenceUpdate,
 	copyManagedLateLifecycleAcknowledgement,
 	copyManagedLifecycleEvidence,
+	createManagedLateCreateAcknowledgement,
 	createManagedLateLifecycleAcknowledgement,
 	createManagedRetirementEvidence,
+	isManagedLateCreateAcknowledgement,
 	isManagedLateLifecycleAcknowledgement,
 	isManagedLifecycleEvidence,
 	lifecycleExactAuthority,
 	lifecyclePreparedAuthority,
+	type ManagedLateCreateAcknowledgement,
 	type ManagedLateLifecycleAcknowledgement,
 	type ManagedLifecycleEvidence,
 	managedHistoricalPublicationAssociation,
 	managedLifecycleAdmissionHash,
+	managedProvisionalCreateAdmissionHash,
 	transitionManagedLifecycleEvidence,
 } from "./managed-lifecycle-evidence";
 import {
@@ -813,6 +817,72 @@ export class SessionMappingStore {
 		)
 			throw new Error("Managed lifecycle evidence does not match the requested tenant scope.");
 		this.writeLifecycleEvidence(canonical.key, operationId, payloadHash, evidence);
+	}
+	recordLateCreateAcknowledgement(
+		chatId: string,
+		admitted: ProvisionalSessionOperation,
+		observation: ManagedLateCreateAcknowledgement,
+	): void {
+		const principalId = admitted.lifecycle?.preparedAuthority.principalId;
+		if (principalId === undefined) throw new Error("Late create observation lacks an admitted owner.");
+		this.recordLateCreateAcknowledgementScoped({ principalId, chatId }, admitted, observation);
+	}
+	recordLateCreateAcknowledgementScoped(
+		scope: SessionMappingScope,
+		admitted: ProvisionalSessionOperation,
+		observation: ManagedLateCreateAcknowledgement,
+	): void {
+		const canonical = canonicalScopeFor(scope);
+		const admissionHash = managedProvisionalCreateAdmissionHash(admitted);
+		const prepared = admitted.lifecycle!.preparedAuthority;
+		if (prepared.principalId !== scope.principalId || prepared.chatId !== scope.chatId)
+			throw new Error("Late create observation does not match its admitted owner.");
+		const validated = createManagedLateCreateAcknowledgement(
+			admitted,
+			{ ...prepared, ...observation.acknowledged },
+			observation.observedAt,
+		);
+		if (!isDeepStrictEqual(validated, observation))
+			throw new Error("Late create observation does not match its original invocation.");
+		this.mutateAuthorityState((records, provisional) => {
+			const root = records.find(record => record.chatId === canonical.key);
+			if (
+				root !== undefined &&
+				(root.historicalBinding !== undefined ||
+					root.projectId !== prepared.projectId ||
+					!isScopedRecordFor(root, canonical))
+			)
+				throw new Error("Late create observation owner conflicts with the current mapping.");
+			const candidates = provisional.filter(
+				operation =>
+					operation.chatId === canonical.key &&
+					(operation.id === admitted.id || operation.ingressId === (admitted.ingressId ?? admitted.id)),
+			);
+			if (candidates.length !== 1)
+				throw new Error("Late create observation requires one retained provisional reservation.");
+			const retained = candidates[0]!;
+			if (
+				managedProvisionalCreateAdmissionHash(retained) !== admissionHash ||
+				!isManagedLateCreateAcknowledgement(observation, retained)
+			)
+				throw new Error("Late create observation conflicts with its retained reservation.");
+			if (retained.lateCreateAcknowledgement !== undefined) {
+				if (!isDeepStrictEqual(retained.lateCreateAcknowledgement, observation))
+					throw new Error("Late create observation is immutable.");
+				return { records, provisional };
+			}
+			return {
+				records,
+				provisional: provisional.map(operation =>
+					operation === retained
+						? {
+								...operation,
+								lateCreateAcknowledgement: { ...observation, acknowledged: { ...observation.acknowledged } },
+							}
+						: operation,
+				),
+			};
+		});
 	}
 	recordLateLifecycleAcknowledgement(
 		chatId: string,

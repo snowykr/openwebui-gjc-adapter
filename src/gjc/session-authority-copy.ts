@@ -141,6 +141,14 @@ export function copyProvisionalOperation(operation: ProvisionalSessionOperation)
 		...fields,
 		...copyOperation(fields),
 		...copySessionAuthorityBinding(operation),
+		...(operation.lateCreateAcknowledgement === undefined
+			? {}
+			: {
+					lateCreateAcknowledgement: {
+						...operation.lateCreateAcknowledgement,
+						acknowledged: { ...operation.lateCreateAcknowledgement.acknowledged },
+					},
+				}),
 		...(operation.attachment === undefined
 			? {}
 			: {

@@ -1,21 +1,24 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { lifecycleExactAuthority } from "../src/gjc/managed-lifecycle-evidence";
+import { lifecycleExactAuthority, lifecyclePreparedAuthority } from "../src/gjc/managed-lifecycle-evidence";
 import { type ManagedSdkAttachment, ManagedSdkRuntime } from "../src/gjc/managed-sdk-runtime";
 import { routeGjcTurn } from "../src/gjc/session-turn-router";
 import { SessionV3FileBackedMappingStore } from "../src/gjc/session-v3-file-backed-mapping-store";
 import {
+	type GjcStartNewSessionInput,
 	GjcTurnCancelledError,
 	type GjcTurnRunner,
 	type ManagedLifecycleControlOwner,
+	type ManagedPreparedTurnAuthority,
 	type ManagedTurnAuthority,
 } from "../src/gjc/turn-runner";
 import type { LiveGatewayRunnerInput } from "../src/live/chat-completions";
 import { createManagedV3GenerationStore } from "../src/live/gjc-managed-idle-reaper";
 import { createManagedSessionOperations, type ManagedLifecycleInput } from "../src/live/gjc-managed-session-operations";
 import { createManagedSuccessorFlow, type ManagedSuccessorInput } from "../src/live/gjc-managed-successor";
+import { createManagedGjcTurnRunner } from "../src/live/gjc-managed-turn-runner";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-gateway";
 import { controlOperationHash, lifecycleControlRequestKey } from "../src/live/gjc-routing-publication";
 import { managedPreparedAuthority } from "./gjc-lifecycle-fixtures";
@@ -65,6 +68,165 @@ function fixture() {
 }
 
 describe("managed routing persistence", () => {
+	test.each(["timeout", "lease-loss", "cancelled", "mutated-input", "write-failure", "replaced-reservation"] as const)(
+		"late original initial create remains prepared-owned after %s",
+		async mode => {
+			const f = fixture();
+			const entered = Promise.withResolvers<void>(),
+				response = Promise.withResolvers<void>();
+			const controller = new AbortController();
+			let current = true,
+				running = false,
+				creates = 0,
+				replacementCallbacks = 0;
+			const effects: string[] = [];
+			const prepared = lifecyclePreparedAuthority(managedPreparedAuthority());
+			const runtime = new ManagedSdkRuntime({
+				agentDir: "/isolated-late-initial-create",
+				deps: {
+					tenantFence: () => current,
+					preparedTenantFence: candidate =>
+						current &&
+						["principalId", "projectId", "canonicalWorkspace", "chatId", "leaseId", "epoch", "requestKey"].every(
+							field => Reflect.get(candidate, field) === Reflect.get(prepared, field),
+						),
+					createRouter: () =>
+						({
+							start: async () => {
+								running = true;
+							},
+							stop: async () => {
+								running = false;
+							},
+							reconcile: async () => {
+								effects.push("reconcile");
+							},
+							attachment: () => {
+								effects.push("attachment");
+								return null;
+							},
+							request: async () => {
+								effects.push("request");
+								throw new Error("Unexpected request");
+							},
+						}) as never,
+					createLifecycleService: () =>
+						({
+							createExternal: async () => {
+								creates += 1;
+								entered.resolve();
+								await response.promise;
+								return {
+									ok: true,
+									operation: "session.create",
+									result: { sessionId: "late-initial-session", endpointGeneration: 7 },
+								};
+							},
+							close: async () => {
+								effects.push("close");
+								throw new Error("Unexpected cleanup");
+							},
+						}) as never,
+				},
+			});
+			let failureSpy: ReturnType<typeof spyOn> | undefined;
+			let disposal: Promise<void> | undefined;
+			try {
+				await runtime.start();
+				const runner = createManagedGjcTurnRunner(runtime, 300);
+				const start = runner.startManagedSession;
+				let borrowed:
+					| (GjcStartNewSessionInput & { preparedManagedAuthority: ManagedPreparedTurnAuthority })
+					| undefined;
+				runner.startManagedSession = (input, ...args) => {
+					borrowed = input;
+					return start(input, ...args);
+				};
+				const routeInput = {
+					...f.input(),
+					preparedManagedAuthority: { ...prepared },
+					runner,
+					signal: controller.signal,
+				};
+				const pending = routeGjcTurn(routeInput).catch(error => error);
+				await Promise.race([
+					entered.promise,
+					pending.then(error => {
+						throw error;
+					}),
+				]);
+				if (mode === "mutated-input") {
+					const callback = () => {
+						replacementCallbacks += 1;
+					};
+					Object.assign(borrowed!, {
+						onLifecycleAcknowledged: callback,
+						onLifecycleInvoking: callback,
+						beforeLifecycleProof: callback,
+						signal: new AbortController().signal,
+					});
+					Object.assign(borrowed!.preparedManagedAuthority, { principalId: "foreign", requestKey: "replacement" });
+					Object.assign(borrowed!.lifecycleOperation!, { requestKey: "replacement" });
+					Object.assign(routeInput, { chatId: "foreign", userMessageId: "replacement" });
+				}
+				if (mode === "lease-loss") current = false;
+				if (mode === "cancelled") controller.abort();
+				expect(await pending).toBeInstanceOf(Error);
+				const uncertain = f.store.provisionalOperationScoped(f.scope, "user-1")!;
+				expect(uncertain.state).toBe("uncertain");
+				expect(uncertain.lifecycle!.state).toBe("uncertain");
+				expect(uncertain.sessionId).toBeUndefined();
+				expect(uncertain.managedAuthority).toBeUndefined();
+				if (mode === "write-failure")
+					failureSpy = spyOn(f.store, "recordLateCreateAcknowledgementScoped").mockImplementation(() => {
+						throw new Error("late create fsync failed");
+					});
+				if (mode === "replaced-reservation") {
+					const document = JSON.parse(readFileSync(f.file, "utf8"));
+					document.provisionalOperations[0].startedAt = new Date(
+						Date.parse(uncertain.startedAt) - 1000,
+					).toISOString();
+					writeFileSync(f.file, JSON.stringify(document));
+				}
+				const before = readFileSync(f.file),
+					priorEffects = [...effects];
+				response.resolve();
+				disposal = runtime.dispose();
+				if (mode === "write-failure" || mode === "replaced-reservation") {
+					await expect(disposal).rejects.toThrow("Original lifecycle outcome persistence failed");
+					expect(readFileSync(f.file).equals(before)).toBe(true);
+				} else {
+					await disposal;
+					const retained = f.store.provisionalOperationScoped(f.scope, "user-1")!;
+					expect(retained.lateCreateAcknowledgement!.acknowledged).toEqual({
+						sessionId: "late-initial-session",
+						generation: 7,
+					});
+					expect(retained.lifecycle).toEqual(uncertain.lifecycle);
+					expect(retained.sessionId).toBeUndefined();
+					expect(retained.managedAuthority).toBeUndefined();
+					expect(retained.result).toBeUndefined();
+					f.reopen();
+					expect(f.store.provisionalOperationScoped(f.scope, "user-1")).toEqual(retained);
+					const committed = readFileSync(f.file);
+					await expect(routeGjcTurn({ ...f.input(), runner })).rejects.toThrow("requires reconciliation");
+					expect(readFileSync(f.file).equals(committed)).toBe(true);
+				}
+				expect(effects).toEqual(priorEffects);
+				expect(creates).toBe(1);
+				expect(replacementCallbacks).toBe(0);
+				expect(running).toBe(false);
+				expect(f.store.getScoped(f.scope)).toBeUndefined();
+				expect(f.published).toHaveLength(0);
+			} finally {
+				response.resolve();
+				failureSpy?.mockRestore();
+				await (disposal ?? runtime.dispose()).catch(() => undefined);
+				f.close();
+			}
+		},
+	);
+
 	for (const operation of ["branch", "session.new", "session.resume"] as const) {
 		test.each(["same-source", "replacement", "write-failure", "mutated-input", "mutated-input-failure"] as const)(
 			`late original ${operation} receipt remains passive after timeout with %s`,

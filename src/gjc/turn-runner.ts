@@ -105,6 +105,8 @@ export interface GjcStartNewSessionInput {
 	/** Persists assigned lifecycle identity before attachment proof or prompt effects. */
 	readonly onLifecycleAcknowledged?: (authority: ManagedTurnAuthority) => void | Promise<void>;
 	readonly onLifecycleInvoking?: () => void | Promise<void>;
+	/** Renewed effect admission, separate from recording an original late outcome. */
+	readonly beforeLifecycleProof?: () => void | Promise<void>;
 	readonly lifecycleOperation?: {
 		readonly operationId: string;
 		readonly requestKey: string;

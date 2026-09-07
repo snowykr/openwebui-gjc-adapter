@@ -26,6 +26,7 @@
 
 ### Fixed
 
+- Retained late initial-create success under its exact prepared provisional reservation without adding a session binding or weakening uncertainty. Added strict provisional-only decoding, immutable atomic persistence, original callback ownership, and separate proof admission. Reused the canonical scoped-store helper after removing a stale duplicate from turn routing. Unpublished cleanup and original-incarnation recovery remain unresolved.
 - Extended passive late receipt capture to selected `session.resume`, requiring the original exact session and generation while preserving uncertainty, immutable callback ownership, and blocked recovery. No historical bootstrap or provisional observation authority is added.
 - Retained late original branch and `session.new` outcomes as immutable, tenant-scoped passive observations after canonical timeout. Bound observations to the original reservation without weakening lifecycle uncertainty or authorizing recovery, adoption, or cleanup. Delivered outcomes below runtime deadline races and separated durable receipt capture from renewed proof checks; persistence failures remain visible through disposal.
 - Separated bounded runtime stop from actual disposal, retaining raw calls, startup, reconciliation, and unsubscribed listener work until quiescence. Serialized reconciliation behind actual producers rather than timed-out observations. Late successful Router stop can settle cleanup; real failure retains runtime exclusion and dependent stores, including serving startup/shutdown failure paths.

@@ -85,6 +85,14 @@ export function scopedSessionMappingStore(
 			requireChat(actual);
 			return mappings.recordAcknowledgedSuccessorScoped(scope, operationId, operationHash, successor);
 		},
+		recordLateCreateAcknowledgement: (
+			actual: string,
+			admitted: Parameters<SessionMappingStore["recordLateCreateAcknowledgement"]>[1],
+			observation: Parameters<SessionMappingStore["recordLateCreateAcknowledgement"]>[2],
+		) => {
+			requireChat(actual);
+			mappings.recordLateCreateAcknowledgementScoped(scope, admitted, observation);
+		},
 		recordLateLifecycleAcknowledgement: (
 			actual: string,
 			admitted: Parameters<SessionMappingStore["recordLateLifecycleAcknowledgement"]>[1],

@@ -83,6 +83,7 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime, turnTimeo
 		operations,
 		forkManagedSuccessor: forkManagedSuccessor.fork,
 		async create(input) {
+			input = snapshotManagedStart(input);
 			throwIfAborted(input.signal);
 			const deadline = new ManagedOperationDeadline(turnTimeoutMs, "session.create/prompt");
 			try {
@@ -93,6 +94,11 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime, turnTimeo
 					signal: input.signal,
 					onAcknowledged: input.onLifecycleAcknowledged,
 					onInvoking: input.onLifecycleInvoking,
+					beforeProof: () => {
+						deadline.remaining();
+						throwIfAborted(input.signal);
+						return input.beforeLifecycleProof?.();
+					},
 					lifecycleOperation: input.lifecycleOperation,
 				});
 				const authority: ManagedTurnAuthority = {
@@ -292,6 +298,7 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime, turnTimeo
 		},
 		withLifecyclePublication: async (address, effect) => effect(managedLifecycleTransaction(address)),
 		async startManagedSession(input, publish, beforePrompt, onFailure) {
+			input = snapshotManagedStart(input);
 			throwIfAborted(input.signal);
 			const deadline = new ManagedOperationDeadline(turnTimeoutMs, "session.create/prompt");
 			try {
@@ -302,6 +309,11 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime, turnTimeo
 					signal: input.signal,
 					onAcknowledged: input.onLifecycleAcknowledged,
 					onInvoking: input.onLifecycleInvoking,
+					beforeProof: () => {
+						deadline.remaining();
+						throwIfAborted(input.signal);
+						return input.beforeLifecycleProof?.();
+					},
 					lifecycleOperation: input.lifecycleOperation,
 				});
 				const authority: ManagedTurnAuthority = {
@@ -365,6 +377,15 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime, turnTimeo
 				deadline.close();
 			}
 		},
+	};
+}
+
+function snapshotManagedStart(input: ManagedRunnerStartInput): ManagedRunnerStartInput {
+	return {
+		...input,
+		preparedManagedAuthority: { ...input.preparedManagedAuthority },
+		...(input.modelSelection === undefined ? {} : { modelSelection: { ...input.modelSelection } }),
+		...(input.lifecycleOperation === undefined ? {} : { lifecycleOperation: { ...input.lifecycleOperation } }),
 	};
 }
 

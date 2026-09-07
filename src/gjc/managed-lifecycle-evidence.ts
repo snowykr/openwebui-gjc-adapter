@@ -75,6 +75,110 @@ export interface ManagedLateLifecycleAcknowledgement {
 	readonly acknowledged: { readonly sessionId: string; readonly generation: number };
 }
 
+/** Initial create output retained by its prepared provisional owner, never a binding. */
+export interface ManagedLateCreateAcknowledgement {
+	readonly kind: "original-provisional-create-success";
+	readonly admissionHash: string;
+	readonly observedAt: string;
+	readonly acknowledged: { readonly sessionId: string; readonly generation: number };
+}
+
+export function managedProvisionalCreateAdmissionHash(operation: ProvisionalSessionOperation): string {
+	const evidence = operation.lifecycle;
+	if (
+		!isNonEmptyString(operation.id) ||
+		(operation.ingressId !== undefined && !isNonEmptyString(operation.ingressId)) ||
+		!isTimestamp(operation.startedAt) ||
+		!isManagedLifecycleEvidence(evidence) ||
+		operation.kind !== "create" ||
+		evidence.operation !== "session.create" ||
+		evidence.source !== undefined ||
+		evidence.sourceProofRef !== undefined ||
+		evidence.historicalSource !== undefined ||
+		operation.historicalBinding !== undefined ||
+		operation.managedAuthority !== undefined ||
+		operation.sessionId !== undefined ||
+		operation.sessionFile !== undefined ||
+		operation.activeLeaf !== undefined ||
+		operation.attachment !== undefined ||
+		operation.lateLifecycleAcknowledgement !== undefined ||
+		operation.projectId !== evidence.preparedAuthority.projectId ||
+		(operation.chatId !== evidence.preparedAuthority.chatId &&
+			operation.chatId !==
+				JSON.stringify([evidence.preparedAuthority.principalId, evidence.preparedAuthority.chatId])) ||
+		evidence.payloadHash !== operation.detail ||
+		Date.parse(evidence.recordedAt) < Date.parse(operation.startedAt)
+	)
+		throw new Error("Late create observation requires an exact prepared provisional reservation.");
+	return requestHash({
+		chatId: JSON.stringify([evidence.preparedAuthority.principalId, evidence.preparedAuthority.chatId]),
+		projectId: operation.projectId,
+		id: operation.id,
+		ingressId: operation.ingressId ?? operation.id,
+		kind: operation.kind,
+		startedAt: operation.startedAt,
+		detail: operation.detail,
+		lifecycle: Object.fromEntries(
+			identityFields.filter(field => evidence[field] !== undefined).map(field => [field, evidence[field]]),
+		),
+	});
+}
+
+export function createManagedLateCreateAcknowledgement(
+	admitted: ProvisionalSessionOperation,
+	acknowledged: ManagedTurnAuthority,
+	observedAt = new Date().toISOString(),
+): ManagedLateCreateAcknowledgement {
+	const admissionHash = managedProvisionalCreateAdmissionHash(admitted);
+	const evidence = admitted.lifecycle!;
+	if (
+		admitted.state !== "pending" ||
+		evidence.state !== "invoking" ||
+		proofFields.some(field => evidence[field] !== undefined) ||
+		admitted.result !== undefined ||
+		admitted.completedAt !== undefined ||
+		admitted.acknowledgedSuccessor !== undefined ||
+		admitted.lateCreateAcknowledgement !== undefined ||
+		!isAuthority(acknowledged) ||
+		!preparedFields.every(field => acknowledged[field] === evidence.preparedAuthority[field]) ||
+		!isTimestamp(observedAt) ||
+		Date.parse(observedAt) < Date.parse(evidence.recordedAt)
+	)
+		throw new Error("Late create observation does not match its original invocation.");
+	return {
+		kind: "original-provisional-create-success",
+		admissionHash,
+		observedAt,
+		acknowledged: { sessionId: acknowledged.sessionId, generation: acknowledged.generation },
+	};
+}
+
+export function isManagedLateCreateAcknowledgement(
+	value: unknown,
+	operation: ProvisionalSessionOperation,
+): value is ManagedLateCreateAcknowledgement {
+	try {
+		return (
+			hasOnlyKeys(value, ["kind", "admissionHash", "observedAt", "acknowledged"]) &&
+			value.kind === "original-provisional-create-success" &&
+			value.admissionHash === managedProvisionalCreateAdmissionHash(operation) &&
+			operation.state === "uncertain" &&
+			operation.lifecycle?.state === "uncertain" &&
+			proofFields.every(field => operation.lifecycle![field] === undefined) &&
+			operation.result === undefined &&
+			operation.completedAt === undefined &&
+			operation.acknowledgedSuccessor === undefined &&
+			isTimestamp(value.observedAt) &&
+			Date.parse(value.observedAt) >= Date.parse(operation.lifecycle.recordedAt) &&
+			hasOnlyKeys(value.acknowledged, ["sessionId", "generation"]) &&
+			isNonEmptyString(value.acknowledged.sessionId) &&
+			positiveInteger(value.acknowledged.generation)
+		);
+	} catch {
+		return false;
+	}
+}
+
 type LifecycleReservation = Pick<SessionOperation, "id" | "ingressId" | "kind" | "startedAt" | "detail" | "lifecycle">;
 
 /** Stable reservation identity, independent of changing lifecycle state and observation time. */
