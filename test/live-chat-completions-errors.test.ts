@@ -10,6 +10,7 @@ import type { OpenAIChatCompletionRequest } from "../src/live/openai-types";
 import type { OpenWebUIOwnerContext } from "../src/openwebui/auth";
 import type { RegisteredProject } from "../src/projects/registry";
 import type { WorkspaceLease } from "../src/security/workspace-lease";
+import { staticModelReaderFactory } from "./model-selection-fixtures";
 
 const project: RegisteredProject = {
 	id: "demo",
@@ -404,6 +405,65 @@ describe("live OpenAI-compatible chat completion errors", () => {
 		);
 		expect(granted).toBe(false);
 	});
+	it.each(["success", "late-failure", "early-failure"] as const)(
+		"background catalog settlement %s preserves workspace ownership",
+		async outcome => {
+			const safeKey = "e".repeat(64);
+			const settlement = Promise.withResolvers<void>();
+			const released = Promise.withResolvers<void>();
+			let releases = 0;
+			let registered = false;
+			const lease = {
+				renew: async () => lease,
+				assertFence: async () => {},
+				reference: { safeKey, holderId: "background-owner", generation: 1, operation: "turn" },
+				release: async () => {
+					releases++;
+					released.resolve();
+				},
+			} as unknown as WorkspaceLease;
+			const manager = { acquire: async () => lease };
+			const reader = staticModelReaderFactory();
+			const result = await handleChatCompletions({
+				request,
+				headers: { ...chatHeaders, "X-OpenWebUI-User-Id": "normal-1", "X-OpenWebUI-Task": "title" },
+				projects: [project],
+				owner,
+				workspaceRegistry: {
+					open: async userId => ({ userId, safeKey, root: "/tmp", sessionRoot: "/tmp/.gjc/sessions" }),
+				},
+				workspaceLeaseManager: manager,
+				modelReaderFactory: async (context, signal) => {
+					expect(context?.principal.userId).toBe("normal-1");
+					expect(context?.workspace?.safeKey).toBe(safeKey);
+					context!.registerSettlement!(settlement.promise);
+					registered = true;
+					if (outcome === "early-failure") settlement.reject(new Error("early cleanup failure"));
+					return reader(context, signal);
+				},
+				runner: {
+					run: () => {
+						throw new Error("Background tasks must not invoke a turn.");
+					},
+				},
+			});
+			expect(registered).toBe(true);
+			expect(result).toMatchObject({ ok: false, status: 503 });
+			expect(releases).toBe(0);
+			await expect(acquireWorkspaceAdmission(manager, safeKey, 30, 8)).rejects.toThrow();
+			if (outcome === "success") {
+				settlement.resolve();
+				await released.promise;
+				const release = await acquireWorkspaceAdmission(manager, safeKey, 1000, 8);
+				release();
+				expect(releases).toBe(1);
+			} else {
+				if (outcome === "late-failure") settlement.reject(new Error("late cleanup failure"));
+				await expect(acquireWorkspaceAdmission(manager, safeKey, 30, 8)).rejects.toThrow();
+				expect(releases).toBe(0);
+			}
+		},
+	);
 	it.each([false, true])("chat settlement failure=%s retains lease until actual cleanup", async failed => {
 		const safeKey = "d".repeat(64);
 		const settlement = Promise.withResolvers<void>(),

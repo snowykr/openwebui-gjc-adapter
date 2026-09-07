@@ -497,8 +497,26 @@ describe("adapter managed bootstrap composition", () => {
 	test.each([false, true])("late admission outcome rejects=%s stays owned until cleanup settles", async reject => {
 		const f = await fixture({ timeoutMs: 500 });
 		const acquisition = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
 		const cleaning = Promise.withResolvers<void>();
+		const started = Date.now();
+		const now = spyOn(Date, "now").mockReturnValue(started);
+		const nativeSetTimeout = globalThis.setTimeout;
+		let expire: (() => void) | undefined;
+		const timer = spyOn(globalThis, "setTimeout").mockImplementation(((
+			callback: (...args: unknown[]) => void,
+			milliseconds?: number,
+			...args: unknown[]
+		) => {
+			if (expire === undefined && milliseconds === 500) {
+				expire = () => callback(...args);
+				const handle = nativeSetTimeout(() => {}, 0);
+				clearTimeout(handle);
+				return handle;
+			}
+			return nativeSetTimeout(callback, milliseconds, ...args);
+		}) as typeof setTimeout);
 		let signal: AbortSignal | undefined;
 		let settled = false;
 		let acquired = false;
@@ -507,6 +525,7 @@ describe("adapter managed bootstrap composition", () => {
 			admission: {
 				admit: async request => {
 					signal = request.signal;
+					entered.resolve();
 					await acquisition.promise;
 					acquired = true;
 					if (reject) throw new Error("late acquisition failed");
@@ -522,6 +541,16 @@ describe("adapter managed bootstrap composition", () => {
 			settled = true;
 		});
 		try {
+			await Promise.race([
+				entered.promise,
+				attempt.result.then(() => {
+					throw new Error("Bootstrap completed before admission entered.");
+				}),
+			]);
+			expect(signal?.aborted).toBe(false);
+			expect(expire).toBeDefined();
+			now.mockReturnValue(started + 500);
+			expire!();
 			await expect(attempt.result).rejects.toThrow("bootstrap failed");
 			expect(signal?.aborted).toBe(true);
 			expect(settled).toBe(false);
@@ -538,6 +567,8 @@ describe("adapter managed bootstrap composition", () => {
 			expect(await Bun.file(`${f.sourcePath}.lock`).exists()).toBe(false);
 			expect(await readFile(f.sourcePath, "utf8")).toBe(f.original);
 		} finally {
+			timer.mockRestore();
+			now.mockRestore();
 			acquisition.resolve();
 			release.resolve();
 			await attempt.settled;

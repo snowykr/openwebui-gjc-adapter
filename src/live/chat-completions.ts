@@ -115,6 +115,7 @@ export async function handleChatCompletions(input: HandleChatCompletionsInput): 
 									principal,
 									workspace,
 									lease: backgroundLease,
+									registerSettlement: settled => backgroundLease!.registerSettlement(settled),
 									correlationId: `background:${headers.chatId}`,
 								},
 								signal,
