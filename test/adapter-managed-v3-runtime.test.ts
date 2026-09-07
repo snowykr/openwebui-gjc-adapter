@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { startActiveManagedRuntime } from "../src/adapter-managed-v3-runtime";
 import type { ManagedSdkRuntime, TenantSessionKey } from "../src/gjc/managed-sdk-runtime";
 import { SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
@@ -72,6 +72,43 @@ function runtime(status: "current" | "replaced" | "unknown" = "current", current
 }
 
 describe("startActiveManagedRuntime", () => {
+	test("passes remaining startup budget into each runtime proof boundary", async () => {
+		const fake = runtime();
+		const startTime = Date.now();
+		const clock = spyOn(Date, "now").mockReturnValue(startTime);
+		const budgets: unknown[] = [];
+		Object.assign(fake.runtime, {
+			start: async () => {
+				clock.mockReturnValue(startTime + 100);
+			},
+			reconcile: async (timeoutMs?: number) => {
+				budgets.push(timeoutMs);
+				clock.mockReturnValue(startTime + 200);
+			},
+			acquireAttachment: async (key: TenantSessionKey, timeoutMs?: number) => {
+				budgets.push(timeoutMs);
+				clock.mockReturnValue(startTime + 300);
+				return { tenant: key, generation: key.generation, isCurrent: () => true };
+			},
+			generationStatus: async (_key: TenantSessionKey, timeoutMs?: number) => {
+				budgets.push(timeoutMs);
+				return { status: "current" };
+			},
+		});
+		try {
+			const active = await startActiveManagedRuntime({
+				mappings: store([mapping()]),
+				runtime: fake.runtime,
+				turnTimeoutMs: 1000,
+				liveTenantFence: () => true,
+			});
+			expect(budgets).toEqual([900, 800, 700]);
+			await active.dispose();
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
 	test.each(["start", "reconcile", "acquireAttachment", "generationStatus", "liveTenantFence"] as const)(
 		"one startup budget bounds hanging %s and prevents late proof publication",
 		async phase => {

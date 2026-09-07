@@ -26,6 +26,7 @@
 
 ### Fixed
 
+- Passed the original remaining startup budget into canonical serving reconcile/acquisition/status and bootstrap adoption/commit reconciliation. These nested SDK calls no longer receive a fresh default timeout hidden behind the outer startup race.
 - Preserved uninvoked `cleanup_pending` lifecycle obligations during canonical restart instead of inventing an ambiguous cleanup call. The routing operation remains uncertain and non-serving; interrupted invocations still require reconciliation, with original acknowledgement and request identity retained.
 - Forwarded actual reader settlement registration through normal-user background model selection, retaining workspace exclusion for pending or failed cleanup. This does not supply missing managed catalog authority. Bootstrap late-admission tests now establish invocation before expiring the unchanged deadline.
 - Registered per-reader actual settlement before managed catalog effects and retained local/raw SDK producers below timeouts. Chat/catalog lease owners keep exclusion through pending or failed cleanup; one reader never stops the shared Router to settle itself. Original receipt persistence failures remain scope-local and globally owned. Temporary durable journaling, exact retirement, and cross-process recovery remain incomplete.

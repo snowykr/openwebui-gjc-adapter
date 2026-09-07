@@ -331,6 +331,43 @@ function withReassignment(
 }
 
 describe("adapter managed bootstrap composition", () => {
+	test("passes the original remaining budget into adoption proof and commit reconciliation", async () => {
+		const started = Date.now();
+		const clock = spyOn(Date, "now").mockReturnValue(started);
+		const f = await fixture({ timeoutMs: 1000, onResume: () => clock.mockReturnValue(started + 400) });
+		const budgets: unknown[] = [];
+		const createRuntime = f.input.createRuntime!;
+		try {
+			const attempt = startAdapterSessionAuthorityV3Activation({
+				...f.input,
+				createRuntime: (agentDir, deps) => {
+					const runtime = createRuntime(agentDir, deps);
+					const proof = runtime.proveLifecycleTenant.bind(runtime);
+					const reconcile = runtime.reconcile.bind(runtime);
+					runtime.proveLifecycleTenant = async (key, operation, timeoutMs) => {
+						budgets.push(timeoutMs);
+						const result = await proof(key, operation, timeoutMs);
+						clock.mockReturnValue(started + 600);
+						return result;
+					};
+					runtime.reconcile = async timeoutMs => {
+						budgets.push(timeoutMs);
+						await reconcile(timeoutMs);
+					};
+					return runtime;
+				},
+			});
+			const result = await attempt.result;
+			if (result.status !== "activated") throw new Error("Expected activated bootstrap.");
+			result.store.close();
+			await attempt.settled;
+			expect(budgets).toEqual([600, 400]);
+		} finally {
+			clock.mockRestore();
+			await f.cleanup();
+		}
+	});
+
 	test("bootstrap keeps the original finite mutation lease beyond thirty seconds", async () => {
 		const started = Date.now();
 		const now = spyOn(Date, "now").mockReturnValue(started);

@@ -77,11 +77,11 @@ async function start(options: StartActiveManagedRuntimeOptions): Promise<ActiveM
 			options.runtime.registerTenant(tenant);
 			// ManagedSdkRuntime serializes this boundary. Reconcile before every
 			// attachment acquisition so a replaced or provisional generation cannot escape.
-			await step(() => options.runtime.reconcile());
-			const acquired = await step(() => options.runtime.acquireAttachment(tenant));
+			await step(() => options.runtime.reconcile(deadline.remaining()));
+			const acquired = await step(() => options.runtime.acquireAttachment(tenant, deadline.remaining()));
 			if (acquired.generation !== tenant.generation || !acquired.isCurrent())
 				throw new Error("Canonical V3 mapping attachment is stale.");
-			const generation = await step(() => options.runtime.generationStatus(tenant));
+			const generation = await step(() => options.runtime.generationStatus(tenant, deadline.remaining()));
 			if (generation.status !== "current")
 				throw new Error("Canonical V3 mapping generation is replaced, provisional, or requires recovery.");
 			if (!(await step(async () => await options.liveTenantFence(tenant))))

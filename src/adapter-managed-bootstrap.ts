@@ -256,7 +256,7 @@ async function activate(
 				beforeBootstrapCommit: async () => {
 					if (proven.size !== targets.size)
 						throw new Error("Bootstrap commit requires this attempt's complete public proofs.");
-					if (runtime !== undefined) await step(() => runtime!.reconcile());
+					if (runtime !== undefined) await step(() => runtime!.reconcile(deadline.remaining()));
 					for (const proof of proven.values()) {
 						if (!(await currentAuthority(proof.prepared)))
 							throw new Error("Bootstrap generation or lease changed before canonical commit.");
@@ -443,11 +443,15 @@ async function activate(
 							);
 							const key = tenant(acknowledged);
 							const attachment = await step(() =>
-								runtime!.proveLifecycleTenant(key, {
-									operationId: target.operationId,
-									requestKey: ack.requestKey,
-									payloadHash: ack.payloadHash,
-								}),
+								runtime!.proveLifecycleTenant(
+									key,
+									{
+										operationId: target.operationId,
+										requestKey: ack.requestKey,
+										payloadHash: ack.payloadHash,
+									},
+									deadline.remaining(),
+								),
 							);
 							if (
 								!attachment.isCurrent() ||
