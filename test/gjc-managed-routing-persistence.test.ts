@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { lifecycleExactAuthority } from "../src/gjc/managed-lifecycle-evidence";
-import type { ManagedSdkAttachment } from "../src/gjc/managed-sdk-runtime";
+import { type ManagedSdkAttachment, ManagedSdkRuntime } from "../src/gjc/managed-sdk-runtime";
 import { routeGjcTurn } from "../src/gjc/session-turn-router";
 import { SessionV3FileBackedMappingStore } from "../src/gjc/session-v3-file-backed-mapping-store";
 import {
@@ -14,7 +14,8 @@ import {
 } from "../src/gjc/turn-runner";
 import type { LiveGatewayRunnerInput } from "../src/live/chat-completions";
 import { createManagedV3GenerationStore } from "../src/live/gjc-managed-idle-reaper";
-import type { ManagedSuccessorInput } from "../src/live/gjc-managed-successor";
+import { createManagedSessionOperations, type ManagedLifecycleInput } from "../src/live/gjc-managed-session-operations";
+import { createManagedSuccessorFlow, type ManagedSuccessorInput } from "../src/live/gjc-managed-successor";
 import { createGjcRoutingLiveGatewayRunner } from "../src/live/gjc-routing-gateway";
 import { controlOperationHash, lifecycleControlRequestKey } from "../src/live/gjc-routing-publication";
 import { managedPreparedAuthority } from "./gjc-lifecycle-fixtures";
@@ -64,6 +65,211 @@ function fixture() {
 }
 
 describe("managed routing persistence", () => {
+	for (const operation of ["branch", "session.new"] as const) {
+		test.each(["same-source", "replacement", "write-failure", "mutated-input", "mutated-input-failure"] as const)(
+			`late original ${operation} receipt remains passive after timeout with %s`,
+			async mode => {
+				const f = fixture();
+				const turn = operation === "branch" ? branchTurn() : lifecycleTurn(operation);
+				const entered = Promise.withResolvers<void>();
+				const response = Promise.withResolvers<void>();
+				let runtime: ManagedSdkRuntime | undefined;
+				let failureSpy: ReturnType<typeof spyOn> | undefined;
+				let disposal: Promise<void> | undefined;
+				let borrowed: ManagedSuccessorInput | ManagedLifecycleInput | undefined;
+				let replacementsCalled = 0;
+				const callerSignal = new AbortController();
+				try {
+					await routeGjcTurn(f.input());
+					const original = f.store.getScoped(f.scope)!;
+					const {
+						requestKey: _key,
+						authorityEpoch: _epoch,
+						...tenant
+					} = original.managedAuthority! as ManagedTurnAuthority & { authorityEpoch: string };
+					let forks = 0;
+					let running = false;
+					const effects: string[] = [];
+					const attachment = {
+						sessionId: tenant.sessionId,
+						generation: tenant.generation,
+						isCurrent: () => running,
+						send: () => {},
+					};
+					runtime = new ManagedSdkRuntime({
+						agentDir: "/isolated-late-fork",
+						deps: {
+							tenantFence: key =>
+								key.principalId === tenant.principalId &&
+								key.projectId === tenant.projectId &&
+								key.canonicalWorkspace === tenant.canonicalWorkspace &&
+								key.chatId === tenant.chatId &&
+								key.sessionId === tenant.sessionId &&
+								key.generation === tenant.generation &&
+								key.leaseId === tenant.leaseId &&
+								key.epoch === tenant.epoch,
+							preparedTenantFence: prepared =>
+								prepared.principalId === tenant.principalId &&
+								prepared.projectId === tenant.projectId &&
+								prepared.canonicalWorkspace === tenant.canonicalWorkspace &&
+								prepared.chatId === tenant.chatId &&
+								prepared.leaseId === tenant.leaseId &&
+								prepared.epoch === tenant.epoch &&
+								prepared.requestKey ===
+									lifecycleControlRequestKey(
+										original.managedAuthority!,
+										"session.create",
+										turn.userMessageId,
+										controlOperationHash(turn),
+									),
+							createRouter: () =>
+								({
+									start: async () => {
+										running = true;
+									},
+									stop: async () => {
+										running = false;
+									},
+									reconcile: async () => {
+										effects.push("reconcile");
+									},
+									attachment: (id: string, generation: number) => {
+										effects.push(`attachment:${id}`);
+										return id === tenant.sessionId && generation === tenant.generation ? attachment : null;
+									},
+								}) as never,
+							createLifecycleService: () =>
+								({
+									fork: async () => {
+										forks += 1;
+										entered.resolve();
+										await response.promise;
+										return {
+											ok: true,
+											operation: "session.fork",
+											result: { sessionId: "late-original-successor", endpointGeneration: 9 },
+										};
+									},
+									createExternal: async () => {
+										forks += 1;
+										entered.resolve();
+										await response.promise;
+										return {
+											ok: true,
+											operation: "session.create",
+											result: { sessionId: "late-original-successor", endpointGeneration: 9 },
+										};
+									},
+								}) as never,
+						},
+					});
+					runtime.registerTenant(tenant);
+					await runtime.start();
+					const flow = createManagedSuccessorFlow(runtime);
+					const runner = Object.assign(f.runner, {
+						forkManagedSuccessor: (input: ManagedSuccessorInput) => {
+							borrowed = { ...input, signal: callerSignal.signal };
+							return flow.fork(borrowed);
+						},
+					});
+					const operations = createManagedSessionOperations(runtime);
+					if (operation === "session.new")
+						Object.assign(runner, {
+							runControl: (async (_turn, _mapping, _lifecycle, _successor, _onDispatch, owner, execution) => {
+								borrowed = {
+									authority: owner!.preparedAuthority,
+									target: { path: tenant.canonicalWorkspace },
+									signal: callerSignal.signal,
+									timeoutMs: execution!.timeoutMs,
+									lifecycleOperation: owner!.lifecycleOperation,
+									onInvoking: () => owner!.onInvoking(),
+									onAcknowledged: value => owner!.onAcknowledged(value),
+									beforeProof: () => owner!.beforeProof?.(),
+								};
+								const result = await operations.create(borrowed);
+								return controlResult({ ...result.tenant, requestKey: owner!.source.requestKey });
+							}) satisfies NonNullable<GjcTurnRunner["runControl"]>,
+						});
+					const gateway = () =>
+						createGjcRoutingLiveGatewayRunner({ turnRunner: runner, mappings: f.store, turnTimeoutMs: 1000 });
+					const pending = gateway()
+						.run(turn)
+						.catch(error => error);
+					await entered.promise;
+					if (mode.startsWith("mutated-input")) {
+						const replacement = () => {
+							replacementsCalled += 1;
+						};
+						Object.assign(borrowed!, {
+							onInvoking: replacement,
+							onAcknowledged: replacement,
+							beforeProof: replacement,
+							publish: replacement,
+							signal: new AbortController().signal,
+							timeoutMs: 60_000,
+						});
+						Object.assign("source" in borrowed! ? borrowed.source : borrowed!.authority, {
+							principalId: "foreign",
+							sessionId: "replacement",
+							generation: 99,
+						});
+						Object.assign(borrowed!.target, { canonicalWorkspace: "/foreign", path: "/foreign" });
+						Object.assign(borrowed!.lifecycleOperation!, { requestKey: "replacement" });
+						callerSignal.abort();
+					}
+					expect(await pending).toBeInstanceOf(Error);
+					const uncertain = f.store.operationScoped(f.scope, turn.userMessageId)!;
+					expect(uncertain.state).toBe("uncertain");
+					expect(uncertain.lifecycle!.state).toBe("uncertain");
+					expect(uncertain.lateLifecycleAcknowledgement).toBeUndefined();
+					if (mode === "replacement")
+						f.store.setScoped(f.scope, {
+							...original,
+							sessionId: "replacement",
+							managedAuthority: { ...original.managedAuthority!, sessionId: "replacement", generation: 3 },
+						});
+					if (mode === "write-failure" || mode === "mutated-input-failure")
+						failureSpy = spyOn(f.store, "recordLateLifecycleAcknowledgementScoped").mockImplementation(() => {
+							throw new Error("late receipt fsync failed");
+						});
+					const before = readFileSync(f.file);
+					const calls = [...effects];
+					response.resolve();
+					disposal = runtime.dispose();
+					if (mode === "write-failure" || mode === "mutated-input-failure") {
+						await expect(disposal).rejects.toThrow("Original lifecycle outcome persistence failed");
+						expect(readFileSync(f.file).equals(before)).toBe(true);
+					} else {
+						await disposal;
+						const receipt = f.store.operationScoped(f.scope, turn.userMessageId)!;
+						expect(receipt.lateLifecycleAcknowledgement?.acknowledged).toEqual({
+							sessionId: "late-original-successor",
+							generation: 9,
+						});
+						expect(receipt.lifecycle).toEqual(uncertain.lifecycle);
+						expect(receipt.acknowledgedSuccessor).toBeUndefined();
+						expect(receipt.result).toBeUndefined();
+						f.reopen();
+						expect(f.store.operationScoped(f.scope, turn.userMessageId)).toEqual(receipt);
+						const retained = readFileSync(f.file);
+						await expect(gateway().run(turn)).rejects.toThrow("requires reconciliation");
+						expect(readFileSync(f.file).equals(retained)).toBe(true);
+					}
+					expect(effects).toEqual(calls);
+					expect(replacementsCalled).toBe(0);
+					expect(forks).toBe(1);
+					expect(runner.states).toHaveLength(0);
+					expect(runner.continues).toHaveLength(0);
+				} finally {
+					response.resolve();
+					failureSpy?.mockRestore();
+					await (disposal ?? runtime?.dispose())?.catch(() => undefined);
+					f.close();
+				}
+			},
+		);
+	}
+
 	for (const operation of ["steer", "session.new", "session.resume"] as const) {
 		test.each(["admission", "effect", "publication"] as const)(
 			`${operation} %s timeout cannot mutate from a late callback`,
@@ -347,6 +553,7 @@ describe("managed routing persistence", () => {
 							});
 							acknowledged = controlAuthority(owner!);
 							await owner!.onAcknowledged(acknowledged);
+							await owner!.beforeProof?.();
 							adopted = true;
 							return controlResult(acknowledged);
 						}) satisfies NonNullable<GjcTurnRunner["runControl"]>,
@@ -850,6 +1057,7 @@ describe("managed routing persistence", () => {
 						});
 						acknowledged = { ...input.target, sessionId: "acknowledged-target", generation: 9 };
 						await input.onAcknowledged?.(acknowledged);
+						await input.beforeProof?.();
 						adopted = true;
 						throw new Error("replacement must deny adoption");
 					},

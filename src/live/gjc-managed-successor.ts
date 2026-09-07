@@ -17,6 +17,8 @@ export interface ManagedSuccessorInput {
 	};
 	/** Persists the assigned target before cancellation, registration, or attachment proof. */
 	readonly onAcknowledged?: (authority: ManagedTurnAuthority) => Promise<void> | void;
+	/** Renewed caller authority, deliberately separate from passive durable receipt capture. */
+	readonly beforeProof?: () => Promise<void> | void;
 	/** Called only after the exact target generation is reconciled, fenced, and current. */
 	readonly publish: (successor: ManagedSdkAttachment) => Promise<void> | void;
 }
@@ -52,6 +54,12 @@ export function createManagedSuccessorFlow(
 ): ManagedSuccessorFlow {
 	return {
 		async fork(input) {
+			input = {
+				...input,
+				source: { ...input.source },
+				target: { ...input.target },
+				...(input.lifecycleOperation === undefined ? {} : { lifecycleOperation: { ...input.lifecycleOperation } }),
+			};
 			assertSuccessorAuthority(input.source, input.target);
 			throwIfAborted(input.signal);
 			const source = tenant(input.source);
@@ -66,6 +74,8 @@ export function createManagedSuccessorFlow(
 			let returnedTarget: TenantSessionKey | undefined;
 			let acknowledgedAuthority: ManagedTurnAuthority | undefined;
 			let acknowledgementPending = false;
+			let invalidAcknowledgement: unknown;
+			let proofAdmissionPending = false;
 			try {
 				// Reconciliation plus acquire re-proves source registration, currentness, and tenant fencing.
 				await step(() => runtime.reconcile(deadline.remaining()));
@@ -79,29 +89,47 @@ export function createManagedSuccessorFlow(
 				throwIfAborted(input.signal);
 				deadline.remaining();
 				invoked = true;
+				let outcomeObserved = false;
 				const outcome = await step(() =>
-					runtime.forkLifecycleSession(source, {
-						actor: { namespace: "openwebui-gjc-adapter", id: input.source.principalId },
-						capability: "session.fork",
-						requestKey: input.source.requestKey,
-						target: {
-							sourceSessionId: source.sessionId,
-							cwd: input.target.canonicalWorkspace,
+					runtime.forkLifecycleSession(
+						source,
+						{
+							actor: { namespace: "openwebui-gjc-adapter", id: input.source.principalId },
+							capability: "session.fork",
+							requestKey: input.source.requestKey,
+							target: {
+								sourceSessionId: source.sessionId,
+								cwd: input.target.canonicalWorkspace,
+							},
+							timeoutMs: deadline.remaining(),
 						},
-						timeoutMs: deadline.remaining(),
-					}),
+						async outcome => {
+							outcomeObserved = true;
+							if (!outcome.ok || outcome.operation !== "session.fork") return;
+							acknowledged = true;
+							returnedTarget = tenantFromFork(input.target, outcome);
+							if (returnedTarget === undefined) return;
+							try {
+								acknowledgedAuthority = managedSuccessorAuthority(input.source, returnedTarget);
+							} catch (error) {
+								invalidAcknowledgement = error;
+								return;
+							}
+							acknowledgementPending = true;
+							await input.onAcknowledged?.({ ...acknowledgedAuthority });
+							acknowledgementPending = false;
+						},
+					),
 				);
 				if (!outcome.ok || outcome.operation !== "session.fork") throw new Error("Managed session.fork failed.");
-				acknowledged = true;
-				returnedTarget = tenantFromFork(input.target, outcome);
-				if (returnedTarget === undefined)
+				if (invalidAcknowledgement !== undefined) throw invalidAcknowledgement;
+				if (!outcomeObserved || returnedTarget === undefined || acknowledgedAuthority === undefined)
 					throw new ManagedSuccessorUncertainError("Managed fork acknowledgement lacks a target identity.");
-				acknowledgedAuthority = managedSuccessorAuthority(input.source, returnedTarget);
-				acknowledgementPending = true;
-				await step(async () => input.onAcknowledged?.({ ...acknowledgedAuthority! }));
-				acknowledgementPending = false;
 				// An abort after lifecycle invocation is ambiguous even when the fork later acknowledges.
 				if (input.signal?.aborted) throw new GjcTurnCancelledError();
+				proofAdmissionPending = true;
+				await step(async () => input.beforeProof?.());
+				proofAdmissionPending = false;
 				if (input.lifecycleOperation === undefined)
 					await step(() => runtime.registerLifecycleTenant(returnedTarget!, deadline.remaining()));
 				const successor =
@@ -121,6 +149,11 @@ export function createManagedSuccessorFlow(
 				if (!invoked) throw error;
 				if (acknowledgementPending)
 					throw new ManagedSuccessorUncertainError("Managed successor acknowledgement persistence is uncertain.", {
+						cause: error,
+						acknowledgedAuthority,
+					});
+				if (proofAdmissionPending)
+					throw new ManagedSuccessorUncertainError("Managed successor proof admission was denied.", {
 						cause: error,
 						acknowledgedAuthority,
 					});

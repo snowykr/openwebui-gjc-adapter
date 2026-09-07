@@ -218,6 +218,10 @@ export function createManagedGjcTurnRunner(runtime: ManagedSdkRuntime, turnTimeo
 							if (!creating) assertResumedExactAuthority({ tenant: acknowledged }, owner.source);
 							await owner.onAcknowledged(acknowledged);
 						},
+						beforeProof: async () => {
+							beforeDispatch();
+							await owner.beforeProof?.();
+						},
 					});
 					beforeDispatch();
 					if (!creating) assertResumedExactAuthority(lifecycleResult, owner.source);

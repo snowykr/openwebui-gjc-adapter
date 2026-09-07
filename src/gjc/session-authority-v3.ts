@@ -4,8 +4,10 @@ import type { NormalizedModelSelection } from "../contracts";
 import {
 	hasManagedHistoricalSourceChat,
 	isHistoricalSessionBinding,
+	isManagedLateLifecycleAcknowledgement,
 	isManagedLifecycleEvidence,
 	type ManagedHistoricalAssociationOwner,
+	type ManagedLateLifecycleAcknowledgement,
 	type ManagedLifecycleEvidence,
 	managedHistoricalPublicationAssociation,
 	managedHistoricalSourceAssociation,
@@ -84,6 +86,7 @@ export interface SessionAuthorityV3Operation {
 	readonly result?: SessionAuthorityV3Result;
 	readonly acknowledgedSuccessor?: SessionAuthorityV3AcknowledgedSuccessor;
 	readonly lifecycle?: ManagedLifecycleEvidence;
+	readonly lateLifecycleAcknowledgement?: ManagedLateLifecycleAcknowledgement;
 }
 
 export type SessionAuthorityV3Tombstone = SessionAuthorityV3Binding & {
@@ -493,6 +496,7 @@ function isOperation(value: unknown): value is SessionAuthorityV3Operation {
 			"result",
 			"acknowledgedSuccessor",
 			"lifecycle",
+			"lateLifecycleAcknowledgement",
 			"chatId",
 			"projectId",
 			"sessionId",
@@ -538,6 +542,11 @@ function isOperation(value: unknown): value is SessionAuthorityV3Operation {
 }
 
 function validateOperationLifecycle(operation: SessionAuthorityV3Operation): boolean {
+	if (
+		operation.lateLifecycleAcknowledgement !== undefined &&
+		!isManagedLateLifecycleAcknowledgement(operation.lateLifecycleAcknowledgement, operation)
+	)
+		return false;
 	const lifecycle = operation.lifecycle;
 	if (lifecycle === undefined) return true;
 	const kind = {

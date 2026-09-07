@@ -35,6 +35,7 @@ export interface ManagedLifecycleInput {
 	readonly signal?: AbortSignal;
 	/** Durable owner acknowledgement, before registration, cancellation handling, or currentness proof. */
 	readonly onAcknowledged?: (authority: ManagedTurnAuthority) => void | Promise<void>;
+	readonly beforeProof?: () => void | Promise<void>;
 	readonly onInvoking?: () => void | Promise<void>;
 	readonly lifecycleOperation?: {
 		readonly operationId: string;
@@ -205,6 +206,12 @@ export function createManagedSessionOperations(
 		operation: "create" | "resume" | "fork" | "close" | "delete" | "list",
 		input: ManagedLifecycleInput,
 	): Promise<unknown> => {
+		input = {
+			...input,
+			authority: { ...input.authority },
+			target: structuredClone(input.target),
+			...(input.lifecycleOperation === undefined ? {} : { lifecycleOperation: { ...input.lifecycleOperation } }),
+		};
 		throwIfAborted(input.signal);
 		const deadline = new ManagedOperationDeadline(input.timeoutMs ?? defaultTimeoutMs, `session.${operation}`);
 		try {
@@ -213,6 +220,19 @@ export function createManagedSessionOperations(
 			const actor = { namespace: "openwebui-gjc-adapter", id: authority.principalId };
 			const requestKey = authority.requestKey;
 			const target = lifecycleTarget(operation, input.target);
+			let outcomeObserved = false;
+			const observeOutcome = async (raw: unknown) => {
+				outcomeObserved = true;
+				const outcome = externalOutcome(raw);
+				if (!isLifecycleSuccess(outcome)) return;
+				const assigned = tenantFromLifecycle(authority, outcome, operation, target);
+				if (assigned === undefined) return;
+				await input.onAcknowledged?.({
+					...assigned,
+					requestKey,
+					authorityEpoch: SESSION_AUTHORITY_V3_EPOCH,
+				} as ManagedTurnAuthority);
+			};
 			const invokeLifecycle = () => {
 				throwIfAborted(input.signal);
 				const timeoutMs = deadline.remaining();
@@ -227,6 +247,7 @@ export function createManagedSessionOperations(
 								target: { kind: "existing_path", path: requiredTargetString(target, "path") },
 							},
 							timeoutMs,
+							observeOutcome,
 						);
 					case "resume":
 						return runtime.resumeExternalLifecycleSession(
@@ -246,16 +267,20 @@ export function createManagedSessionOperations(
 							timeoutMs,
 						);
 					case "fork":
-						return runtime.forkLifecycleSession(requireExactTenant(key), {
-							actor,
-							capability: "session.fork",
-							requestKey,
-							target: {
-								sourceSessionId: requiredTargetString(target, "sourceSessionId"),
-								cwd: requiredTargetString(target, "cwd"),
+						return runtime.forkLifecycleSession(
+							requireExactTenant(key),
+							{
+								actor,
+								capability: "session.fork",
+								requestKey,
+								target: {
+									sourceSessionId: requiredTargetString(target, "sourceSessionId"),
+									cwd: requiredTargetString(target, "cwd"),
+								},
+								timeoutMs,
 							},
-							timeoutMs,
-						});
+							observeOutcome,
+						);
 					case "close":
 						return runtime.closeLifecycleSession(requireExactTenant(key), {
 							actor,
@@ -328,7 +353,11 @@ export function createManagedSessionOperations(
 					);
 				const acknowledged = { ...lifecycleTenant, requestKey, authorityEpoch: SESSION_AUTHORITY_V3_EPOCH };
 				deadline.remaining();
-				await deadline.wait(Promise.resolve(input.onAcknowledged?.(acknowledged)));
+				if (operation === "create" || operation === "fork") {
+					if (!outcomeObserved)
+						throw new Error("Managed lifecycle outcome was not observed by its durable owner.");
+				} else await deadline.wait(Promise.resolve(input.onAcknowledged?.(acknowledged)));
+				await deadline.wait(Promise.resolve(input.beforeProof?.()));
 				try {
 					throwIfAborted(input.signal);
 					return {

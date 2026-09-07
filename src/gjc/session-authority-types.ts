@@ -1,5 +1,5 @@
 import type { NormalizedModelSelection } from "../contracts";
-import type { ManagedLifecycleEvidence } from "./managed-lifecycle-evidence";
+import type { ManagedLateLifecycleAcknowledgement, ManagedLifecycleEvidence } from "./managed-lifecycle-evidence";
 import type { GjcTurnEvent, ManagedTurnAuthority } from "./turn-runner";
 
 export const SESSION_AUTHORITY_VERSION = 2 as const;
@@ -128,6 +128,7 @@ export interface SessionOperation {
 	readonly result?: SessionOperationResult;
 	readonly acknowledgedSuccessor?: AcknowledgedSuccessor;
 	readonly lifecycle?: ManagedLifecycleEvidence;
+	readonly lateLifecycleAcknowledgement?: ManagedLateLifecycleAcknowledgement;
 }
 export type SessionProjectReassignmentState = "pending" | "rolled_back" | "committed";
 export type ProjectReassignmentState = SessionProjectReassignmentState;

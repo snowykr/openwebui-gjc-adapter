@@ -836,9 +836,11 @@ describe("managed turn runner", () => {
 
 	test("session.new acknowledges assigned successor before currentness proof", async () => {
 		const fake = new RunnerRuntime();
-		fake.createPreparedExternalLifecycleSession = async (_prepared, request) => {
+		fake.createPreparedExternalLifecycleSession = async (_prepared, request, _timeoutMs, onOutcome) => {
 			fake.externalLifecycle.push(request);
-			return { ok: true, result: { sessionId: "new-session", endpointGeneration: 12 } };
+			const outcome = { ok: true as const, result: { sessionId: "new-session", endpointGeneration: 12 } };
+			await onOutcome?.(outcome);
+			return outcome;
 		};
 		const runner = createManagedGjcTurnRunner(fake.runtime);
 		let acknowledged = false;
@@ -1010,10 +1012,12 @@ describe("managed turn runner", () => {
 				endpointGeneration: operation === "session.new" ? 12 : authority.generation,
 			};
 			const order: string[] = [];
-			fake.createPreparedExternalLifecycleSession = async (_key, request) => {
+			fake.createPreparedExternalLifecycleSession = async (_key, request, _timeoutMs, onOutcome) => {
 				order.push("sdk");
 				fake.externalLifecycle.push(request);
-				return { ok: true, result: expected };
+				const outcome = { ok: true as const, result: expected };
+				await onOutcome?.(outcome);
+				return outcome;
 			};
 			fake.resumeExternalLifecycleSession = async (_key, request) => {
 				order.push("sdk");
@@ -1079,10 +1083,11 @@ describe("managed turn runner", () => {
 		"preserves %s acknowledgement persistence failure before registration or proof",
 		async operation => {
 			const fake = new RunnerRuntime();
-			fake.createPreparedExternalLifecycleSession = async () => ({
-				ok: true,
-				result: { sessionId: "new-session", endpointGeneration: 12 },
-			});
+			fake.createPreparedExternalLifecycleSession = async (_key, _request, _timeoutMs, onOutcome) => {
+				const outcome = { ok: true as const, result: { sessionId: "new-session", endpointGeneration: 12 } };
+				await onOutcome?.(outcome);
+				return outcome;
+			};
 			const input: LiveGatewayRunnerInput = {
 				...managedAbortAndPromptInput(),
 				control: operation === "session.new" ? { operation } : { operation, sessionId: authority.sessionId },
@@ -1268,9 +1273,16 @@ class RunnerRuntime {
 		this.externalLifecycle.push(request);
 		return lifecycleSuccess();
 	}
-	async createPreparedExternalLifecycleSession(_authority: unknown, request: Record<string, unknown>) {
+	async createPreparedExternalLifecycleSession(
+		_authority: unknown,
+		request: Record<string, unknown>,
+		_timeoutMs?: number,
+		onOutcome?: (outcome: unknown) => void | Promise<void>,
+	) {
 		this.externalLifecycle.push(request);
-		return lifecycleSuccess();
+		const outcome = lifecycleSuccess();
+		await onOutcome?.(outcome);
+		return outcome;
 	}
 	async resumeExternalLifecycleSession(_tenant: unknown, request?: Record<string, unknown>) {
 		if (request === undefined) throw new Error("Complete managed tenant authority is required.");
@@ -1383,10 +1395,16 @@ class RunnerRuntime {
 	async generationStatus() {
 		return { status: this.status };
 	}
-	async forkLifecycleSession(_tenantOrRequest: unknown, maybeRequest?: Record<string, unknown>) {
+	async forkLifecycleSession(
+		_tenantOrRequest: unknown,
+		maybeRequest?: Record<string, unknown>,
+		onOutcome?: (outcome: unknown) => void | Promise<void>,
+	) {
 		const request = maybeRequest ?? (_tenantOrRequest as Record<string, unknown>);
 		this.forkRequests.push(request);
-		return { ok: true as const, operation: "session.fork", result: this.forkResult };
+		const outcome = { ok: true as const, operation: "session.fork", result: this.forkResult };
+		await onOutcome?.(outcome);
+		return outcome;
 	}
 	async closeLifecycleSession(_tenantOrRequest?: unknown, _maybeRequest?: Record<string, unknown>) {
 		this.closeCalls += 1;

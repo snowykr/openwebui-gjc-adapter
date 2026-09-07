@@ -67,6 +67,107 @@ export interface ManagedLifecycleEvidence {
 	};
 }
 
+/** Original admitted success observed after timeout; never active or recovery authority. */
+export interface ManagedLateLifecycleAcknowledgement {
+	readonly kind: "original-admission-success";
+	readonly admissionHash: string;
+	readonly observedAt: string;
+	readonly acknowledged: { readonly sessionId: string; readonly generation: number };
+}
+
+type LifecycleReservation = Pick<SessionOperation, "id" | "ingressId" | "kind" | "startedAt" | "detail" | "lifecycle">;
+
+/** Stable reservation identity, independent of changing lifecycle state and observation time. */
+export function managedLifecycleAdmissionHash(operation: LifecycleReservation): string {
+	const evidence = operation.lifecycle;
+	if (
+		!isNonEmptyString(operation.id) ||
+		(operation.ingressId !== undefined && !isNonEmptyString(operation.ingressId)) ||
+		!isTimestamp(operation.startedAt) ||
+		!isManagedLifecycleEvidence(evidence) ||
+		evidence.source === undefined ||
+		!(
+			(operation.kind === "create" && evidence.operation === "session.create") ||
+			(operation.kind === "branch" && evidence.operation === "session.fork")
+		) ||
+		evidence.payloadHash !== operation.detail ||
+		Date.parse(evidence.recordedAt) < Date.parse(operation.startedAt)
+	)
+		throw new Error("Late lifecycle observation requires an exact successor reservation.");
+	return requestHash({
+		id: operation.id,
+		ingressId: operation.ingressId ?? operation.id,
+		kind: operation.kind,
+		startedAt: operation.startedAt,
+		detail: operation.detail,
+		lifecycle: Object.fromEntries(
+			identityFields.filter(field => evidence[field] !== undefined).map(field => [field, evidence[field]]),
+		),
+	});
+}
+
+export function createManagedLateLifecycleAcknowledgement(
+	admitted: SessionOperation,
+	acknowledged: ManagedTurnAuthority,
+	observedAt = new Date().toISOString(),
+): ManagedLateLifecycleAcknowledgement {
+	const admissionHash = managedLifecycleAdmissionHash(admitted);
+	const evidence = admitted.lifecycle!;
+	if (
+		admitted.state !== "pending" ||
+		evidence.state !== "invoking" ||
+		proofFields.some(field => evidence[field] !== undefined) ||
+		admitted.result !== undefined ||
+		admitted.acknowledgedSuccessor !== undefined ||
+		!isAuthority(acknowledged) ||
+		!preparedFields.every(field => acknowledged[field] === evidence.preparedAuthority[field]) ||
+		acknowledged.sessionId === evidence.source!.sessionId ||
+		!isTimestamp(observedAt) ||
+		Date.parse(observedAt) < Date.parse(evidence.recordedAt)
+	)
+		throw new Error("Late lifecycle observation does not match its original invocation.");
+	return {
+		kind: "original-admission-success",
+		admissionHash,
+		observedAt,
+		acknowledged: { sessionId: acknowledged.sessionId, generation: acknowledged.generation },
+	};
+}
+
+export function isManagedLateLifecycleAcknowledgement(
+	value: unknown,
+	operation: SessionOperation,
+): value is ManagedLateLifecycleAcknowledgement {
+	try {
+		return (
+			hasOnlyKeys(value, ["kind", "admissionHash", "observedAt", "acknowledged"]) &&
+			value.kind === "original-admission-success" &&
+			isHash(value.admissionHash) &&
+			value.admissionHash === managedLifecycleAdmissionHash(operation) &&
+			operation.state === "uncertain" &&
+			operation.lifecycle?.state === "uncertain" &&
+			proofFields.every(field => operation.lifecycle![field] === undefined) &&
+			operation.result === undefined &&
+			operation.completedAt === undefined &&
+			operation.acknowledgedSuccessor === undefined &&
+			isTimestamp(value.observedAt) &&
+			Date.parse(value.observedAt) >= Date.parse(operation.lifecycle.recordedAt) &&
+			hasOnlyKeys(value.acknowledged, ["sessionId", "generation"]) &&
+			isNonEmptyString(value.acknowledged.sessionId) &&
+			positiveInteger(value.acknowledged.generation) &&
+			value.acknowledged.sessionId !== operation.lifecycle.source!.sessionId
+		);
+	} catch {
+		return false;
+	}
+}
+
+export function copyManagedLateLifecycleAcknowledgement(
+	value: ManagedLateLifecycleAcknowledgement,
+): ManagedLateLifecycleAcknowledgement {
+	return { ...value, acknowledged: { ...value.acknowledged } };
+}
+
 /** Structural view shared by V3 and its inherited in-memory relational validator. */
 export interface ManagedHistoricalAssociationOwner {
 	readonly chatId: string;

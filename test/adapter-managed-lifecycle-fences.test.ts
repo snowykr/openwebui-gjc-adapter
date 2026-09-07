@@ -317,7 +317,7 @@ test("production branch retains its exact receipt after the effect replaces its 
 			ownerUserId: f.prepared.principalId,
 			control: { operation: "branch" as const },
 		};
-		await expect(gateway.run(turn)).rejects.toThrow("acknowledgement persistence is uncertain");
+		await expect(gateway.run(turn)).rejects.toThrow("proof admission was denied");
 		const receipt = f.mappings.operationScoped(f.prepared, "branch")!;
 		expect(receipt.state).toBe("uncertain");
 		expect(receipt.lifecycle?.state).toBe("uncertain");

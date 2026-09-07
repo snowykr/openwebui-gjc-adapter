@@ -1,4 +1,4 @@
-import { copyManagedLifecycleEvidence } from "./managed-lifecycle-evidence";
+import { copyManagedLateLifecycleAcknowledgement, copyManagedLifecycleEvidence } from "./managed-lifecycle-evidence";
 import type {
 	AcknowledgedSuccessor,
 	EndpointSessionAttachmentProof,
@@ -121,6 +121,13 @@ export function copyOperation(operation: SessionOperation | ManagedSessionOperat
 	return {
 		...operation,
 		...(operation.lifecycle === undefined ? {} : { lifecycle: copyManagedLifecycleEvidence(operation.lifecycle) }),
+		...(operation.lateLifecycleAcknowledgement === undefined
+			? {}
+			: {
+					lateLifecycleAcknowledgement: copyManagedLateLifecycleAcknowledgement(
+						operation.lateLifecycleAcknowledgement,
+					),
+				}),
 		...(operation.result === undefined ? {} : { result: copyOperationResult(operation.result) }),
 		...(operation.acknowledgedSuccessor === undefined
 			? {}

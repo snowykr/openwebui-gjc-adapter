@@ -265,7 +265,10 @@ class V3FileSessionAuthority extends SessionAuthority {
 	): void {
 		this.mutate(() => {
 			assertCurrent?.();
-			const next = mutation(this.entries(), this.provisionalEntries());
+			const records = this.entries(),
+				provisional = this.provisionalEntries();
+			const next = mutation(records, provisional);
+			if (next.records === records && next.provisional === provisional) return;
 			this.replaceAll(next.records, next.provisional);
 		}, assertCurrent);
 	}

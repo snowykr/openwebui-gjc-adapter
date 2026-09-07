@@ -1,13 +1,18 @@
 import { isDeepStrictEqual } from "node:util";
 import {
 	assertManagedLifecycleEvidenceUpdate,
+	copyManagedLateLifecycleAcknowledgement,
 	copyManagedLifecycleEvidence,
+	createManagedLateLifecycleAcknowledgement,
 	createManagedRetirementEvidence,
+	isManagedLateLifecycleAcknowledgement,
 	isManagedLifecycleEvidence,
 	lifecycleExactAuthority,
 	lifecyclePreparedAuthority,
+	type ManagedLateLifecycleAcknowledgement,
 	type ManagedLifecycleEvidence,
 	managedHistoricalPublicationAssociation,
+	managedLifecycleAdmissionHash,
 	transitionManagedLifecycleEvidence,
 } from "./managed-lifecycle-evidence";
 import {
@@ -809,6 +814,111 @@ export class SessionMappingStore {
 			throw new Error("Managed lifecycle evidence does not match the requested tenant scope.");
 		this.writeLifecycleEvidence(canonical.key, operationId, payloadHash, evidence);
 	}
+	recordLateLifecycleAcknowledgement(
+		chatId: string,
+		admitted: SessionOperation,
+		observation: ManagedLateLifecycleAcknowledgement,
+	): void {
+		const principalId = admitted.lifecycle?.preparedAuthority.principalId;
+		if (principalId === undefined) throw new Error("Late lifecycle observation lacks an admitted owner.");
+		this.recordLateLifecycleAcknowledgementScoped({ principalId, chatId }, admitted, observation);
+	}
+	recordLateLifecycleAcknowledgementScoped(
+		scope: SessionMappingScope,
+		admitted: SessionOperation,
+		observation: ManagedLateLifecycleAcknowledgement,
+	): void {
+		const canonical = canonicalScopeFor(scope);
+		const admissionHash = managedLifecycleAdmissionHash(admitted);
+		const prepared = admitted.lifecycle!.preparedAuthority;
+		if (
+			admitted.state !== "pending" ||
+			admitted.lifecycle!.state !== "invoking" ||
+			admitted.lifecycle!.acknowledged !== undefined ||
+			admitted.lifecycle!.proven !== undefined ||
+			admitted.lateLifecycleAcknowledgement !== undefined ||
+			prepared.principalId !== scope.principalId ||
+			prepared.chatId !== scope.chatId ||
+			observation.admissionHash !== admissionHash
+		)
+			throw new Error("Late lifecycle observation does not match its admitted owner.");
+		const validated = createManagedLateLifecycleAcknowledgement(
+			admitted,
+			{ ...prepared, ...observation.acknowledged },
+			observation.observedAt,
+		);
+		if (!isDeepStrictEqual(validated, observation))
+			throw new Error("Late lifecycle observation does not match its original invocation.");
+		this.mutateAuthorityState((records, provisional) => {
+			const root = records.find(record => record.chatId === canonical.key);
+			if (root === undefined || !isScopedRecordFor(root, canonical) || root.historicalBinding !== undefined)
+				throw new Error("Late lifecycle observation owner is unavailable.");
+			let matches = 0;
+			let changed = false;
+			const update = <T extends SessionAuthorityRecord | SessionAuthorityTombstone>(owner: T): T => {
+				const journal = owner.journal.map(operation => {
+					if (operation.id !== admitted.id && operation.ingressId !== (admitted.ingressId ?? admitted.id))
+						return operation;
+					matches += 1;
+					if (
+						owner.historicalBinding !== undefined ||
+						owner.projectId !== prepared.projectId ||
+						managedLifecycleAdmissionHash(operation) !== admissionHash ||
+						!isManagedLateLifecycleAcknowledgement(observation, operation)
+					)
+						throw new Error("Late lifecycle observation conflicts with its retained reservation.");
+					if (operation.lateLifecycleAcknowledgement !== undefined) {
+						if (!isDeepStrictEqual(operation.lateLifecycleAcknowledgement, observation))
+							throw new Error("Late lifecycle observation is immutable.");
+						return operation;
+					}
+					changed = true;
+					return {
+						...operation,
+						lateLifecycleAcknowledgement: copyManagedLateLifecycleAcknowledgement(observation),
+					};
+				});
+				if ("prior" in owner)
+					return { ...owner, journal, ...(owner.prior === undefined ? {} : { prior: update(owner.prior) }) };
+				const reassignment = "reassignment" in owner ? owner.reassignment : undefined;
+				const sourceTombstone =
+					reassignment?.sourceTombstone === undefined ? undefined : update(reassignment.sourceTombstone);
+				const priorTombstone =
+					reassignment?.priorTombstone === undefined
+						? undefined
+						: reassignment.sourceTombstone !== undefined &&
+								isDeepStrictEqual(reassignment.priorTombstone, reassignment.sourceTombstone.prior)
+							? sourceTombstone!.prior
+							: update(reassignment.priorTombstone);
+				return {
+					...owner,
+					journal,
+					...(reassignment === undefined
+						? {}
+						: {
+								reassignment: {
+									...reassignment,
+									...(sourceTombstone === undefined ? {} : { sourceTombstone }),
+									...(priorTombstone === undefined ? {} : { priorTombstone }),
+								},
+							}),
+				};
+			};
+			const updated = update(root);
+			if (
+				matches !== 1 ||
+				provisional.some(
+					operation =>
+						operation.chatId === canonical.key &&
+						(operation.id === admitted.id || operation.ingressId === (admitted.ingressId ?? admitted.id)),
+				)
+			)
+				throw new Error("Late lifecycle observation requires one retained reservation.");
+			return changed
+				? { records: records.map(record => (record === root ? updated : record)), provisional }
+				: { records, provisional };
+		});
+	}
 	private writeLifecycleEvidence(
 		chatId: string,
 		operationId: string,
@@ -864,7 +974,10 @@ export class SessionMappingStore {
 		});
 	}
 	protected mutateAuthorityState(mutation: AuthorityStateMutation): void {
-		const next = mutation(this.authority.entries(), this.authority.provisionalEntries());
+		const records = this.authority.entries(),
+			provisional = this.authority.provisionalEntries();
+		const next = mutation(records, provisional);
+		if (next.records === records && next.provisional === provisional) return;
 		(
 			this.authority as unknown as {
 				replaceAll: (

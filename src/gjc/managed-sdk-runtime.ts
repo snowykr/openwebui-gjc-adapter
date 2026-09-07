@@ -204,6 +204,7 @@ export class ManagedSdkRuntime {
 	#startPromise: Promise<void> | undefined;
 	#stopPromise: Promise<void> | undefined;
 	#disposePromise: Promise<void> | undefined;
+	#outcomePersistenceFailure: unknown;
 	#reconcileTail: Promise<void> = Promise.resolve();
 	#nextSubscriptionId = 1;
 
@@ -367,8 +368,11 @@ export class ManagedSdkRuntime {
 		authority: ManagedPreparedTurnAuthority,
 		request: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["createExternal"]>[0],
 		timeoutMs?: number,
+		onOutcome?: (
+			outcome: Awaited<ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["createExternal"]>>,
+		) => void | Promise<void>,
 	): ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["createExternal"]> {
-		return this.#invokePreparedCreate(authority, request, timeoutMs);
+		return this.#invokePreparedCreate(authority, request, timeoutMs, onOutcome);
 	}
 
 	resumeExternalLifecycleSession(
@@ -397,8 +401,19 @@ export class ManagedSdkRuntime {
 			| Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["fork"]>[0]
 			| ManagedLifecycleCall<Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["fork"]>[0]>,
 		request?: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["fork"]>[0],
+		onOutcome?: (
+			outcome: Awaited<ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["fork"]>>,
+		) => void | Promise<void>,
 	): ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["fork"]> {
-		return this.#invokeLifecycle("fork", tenantOrRequest, request, value => this.#lifecycle.fork(value));
+		return this.#invokeLifecycle(
+			"fork",
+			tenantOrRequest,
+			request,
+			value => this.#lifecycle.fork(value),
+			ACTIVE_ACCESS,
+			undefined,
+			onOutcome,
+		);
 	}
 
 	resumeLifecycleSession(
@@ -610,6 +625,7 @@ export class ManagedSdkRuntime {
 				// not discard ownership of an already-entered producer.
 				await this.#drain();
 			}
+			if (this.#outcomePersistenceFailure !== undefined) throw this.#outcomePersistenceFailure;
 		})().then(
 			() => {
 				this.#state = "stopped";
@@ -871,6 +887,7 @@ export class ManagedSdkRuntime {
 		invoke: (request: TRequest, tenant: TenantSessionKey) => Promise<TResult>,
 		access: ManagedSdkAccess = ACTIVE_ACCESS,
 		timeoutMs?: number,
+		onOutcome?: (outcome: TResult) => void | Promise<void>,
 	): Promise<TResult> {
 		const call = lifecycleCall(tenantOrRequest, request);
 		if (call === undefined)
@@ -889,6 +906,16 @@ export class ManagedSdkRuntime {
 			if (this.#registrations.get(generationIdentity(key)) !== registration)
 				throw new Error("Tenant registration changed before lifecycle invocation.");
 			const result = await invoke(external ? value : { ...value, timeoutMs: budget.remaining() }, key);
+			if (onOutcome !== undefined) {
+				try {
+					await onOutcome(structuredClone(result));
+				} catch (error) {
+					this.#outcomePersistenceFailure ??= new Error("Original lifecycle outcome persistence failed.", {
+						cause: error,
+					});
+					throw error;
+				}
+			}
 			// An applied identity must reach the durable owner before another fence
 			// can fail or hang. A mutation receipt never grants live authority.
 			if (method !== "list") return result;
@@ -904,6 +931,9 @@ export class ManagedSdkRuntime {
 		authority: ManagedPreparedTurnAuthority,
 		request: Parameters<ReturnType<typeof lifecycle.createSessionLifecycleService>["createExternal"]>[0],
 		timeoutMs?: number,
+		onOutcome?: (
+			outcome: Awaited<ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["createExternal"]>>,
+		) => void | Promise<void>,
 	): Promise<Awaited<ReturnType<ReturnType<typeof lifecycle.createSessionLifecycleService>["createExternal"]>>> {
 		assertPreparedAuthority(authority);
 		const prepared = Object.freeze({ ...authority });
@@ -926,7 +956,18 @@ export class ManagedSdkRuntime {
 			budget.remaining();
 			this.#assertOwner();
 			// Persist acknowledgement before adoption or live-authority checks.
-			return this.#lifecycle.createExternal(value);
+			const result = await this.#lifecycle.createExternal(value);
+			if (onOutcome !== undefined) {
+				try {
+					await onOutcome(structuredClone(result));
+				} catch (error) {
+					this.#outcomePersistenceFailure ??= new Error("Original lifecycle outcome persistence failed.", {
+						cause: error,
+					});
+					throw error;
+				}
+			}
+			return result;
 		});
 	}
 

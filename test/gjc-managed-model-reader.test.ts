@@ -708,6 +708,7 @@ class FakeRuntime {
 		authority: Parameters<ManagedSdkRuntime["createPreparedExternalLifecycleSession"]>[0],
 		request: Parameters<ManagedSdkRuntime["createPreparedExternalLifecycleSession"]>[1],
 		timeoutMs?: number,
+		onOutcome?: (outcome: unknown) => void | Promise<void>,
 	) {
 		if (
 			this.rejectTenant ||
@@ -729,7 +730,9 @@ class FakeRuntime {
 		this.created = request;
 		this.createTimeoutMs = timeoutMs;
 		await this.createGate;
-		return { ok: true, result: { sessionId: "catalog-session", endpointGeneration: 11 } };
+		const outcome = { ok: true, result: { sessionId: "catalog-session", endpointGeneration: 11 } };
+		await onOutcome?.(outcome);
+		return outcome;
 	}
 	async registerLifecycleTenant(key: TenantSessionKey, timeoutMs?: number) {
 		this.registrationTimeouts.push(timeoutMs);

@@ -75,6 +75,7 @@ export interface ManagedLifecycleControlOwner {
 	};
 	onInvoking(): void | Promise<void>;
 	onAcknowledged(authority: ManagedTurnAuthority): void | Promise<void>;
+	beforeProof?(): void | Promise<void>;
 }
 export interface ManagedCloseInput {
 	readonly authority: ManagedTurnAuthority;

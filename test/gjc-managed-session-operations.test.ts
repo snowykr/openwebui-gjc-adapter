@@ -504,10 +504,13 @@ class FakeRuntime {
 		_authority: unknown,
 		request: Record<string, unknown>,
 		timeoutMs?: number,
+		onOutcome?: (outcome: unknown) => void | Promise<void>,
 	) {
 		this.externalTimeouts.push(timeoutMs);
 		this.externalLifecycle.push({ operation: "create", request });
-		return lifecycleSuccess();
+		const outcome = lifecycleSuccess();
+		await onOutcome?.(outcome);
+		return outcome;
 	}
 	async resumeExternalLifecycleSession(_tenant: unknown, request: Record<string, unknown>, timeoutMs?: number) {
 		this.externalTimeouts.push(timeoutMs);
@@ -615,9 +618,15 @@ class FakeRuntime {
 		this.statusTimeouts.push(timeoutMs);
 		return { status: this.status };
 	}
-	async forkLifecycleSession(_tenant: unknown, request: Record<string, unknown>) {
+	async forkLifecycleSession(
+		_tenant: unknown,
+		request: Record<string, unknown>,
+		onOutcome?: (outcome: unknown) => void | Promise<void>,
+	) {
 		this.lifecycle.push({ operation: "fork", request });
-		return lifecycleSuccess();
+		const outcome = lifecycleSuccess();
+		await onOutcome?.(outcome);
+		return outcome;
 	}
 	async closeLifecycleSession(_tenant: unknown, request: Record<string, unknown>) {
 		this.lifecycle.push({ operation: "close", request });

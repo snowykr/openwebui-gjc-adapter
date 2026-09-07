@@ -327,8 +327,12 @@ export class FakeManagedSdkRuntime implements ManagedSdkRuntimeDependency {
 	async createPreparedExternalLifecycleSession(
 		authority: ManagedPreparedTurnAuthority,
 		_request: Readonly<Record<string, unknown>>,
+		_timeoutMs?: number,
+		onOutcome?: (outcome: unknown) => void | Promise<void>,
 	): Promise<Record<string, unknown>> {
-		return this.createSession(authority);
+		const outcome = await this.createSession(authority);
+		await onOutcome?.(outcome);
+		return outcome;
 	}
 
 	async createExternalLifecycleSession(_request: any, _second?: any): Promise<any> {

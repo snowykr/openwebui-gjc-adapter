@@ -1,4 +1,5 @@
 import {
+	createManagedLateLifecycleAcknowledgement,
 	createManagedLifecycleEvidence,
 	lifecycleExactAuthority,
 	lifecyclePreparedAuthority,
@@ -8,6 +9,7 @@ import { canTransitionManagedLifecycleState } from "../gjc/managed-lifecycle-sta
 import { ManagedOperationDeadline } from "../gjc/managed-operation-deadline";
 import type { ManagedSdkAttachment } from "../gjc/managed-sdk-runtime";
 import { scopedSessionMappingStore } from "../gjc/scoped-session-mapping-store";
+import type { SessionOperation } from "../gjc/session-authority-types";
 import type { routeGjcTurn, SessionMapping, SessionMappingStore } from "../gjc/session-router";
 import {
 	type GjcControlResult,
@@ -187,6 +189,8 @@ async function runManagedLifecycleControl(
 	};
 	mappings.beginOperation(turn.chatId, prepared);
 	let finished = false;
+	let admitted: SessionOperation | undefined;
+	let passiveAcknowledgement = false;
 	let evidence = createManagedLifecycleEvidence({
 		operation,
 		preparedAuthority: lifecyclePreparedAuthority(source),
@@ -214,6 +218,9 @@ async function runManagedLifecycleControl(
 			throwIfAborted(turn.signal);
 			current();
 			record(transitionManagedLifecycleEvidence(evidence, "invoking"));
+			admitted = structuredClone(mappings.operation(turn.chatId, turn.userMessageId));
+			if (admitted?.lifecycle?.state !== "invoking")
+				throw new Error("Managed control invocation was not durably reserved.");
 		},
 		onAcknowledged: authority => {
 			assertManagedAuthority(authority, {
@@ -223,6 +230,22 @@ async function runManagedLifecycleControl(
 			});
 			if (creating && authority.sessionId === source.sessionId)
 				throw new Error("Managed session.new returned the source session.");
+			const durable = mappings.operation(turn.chatId, turn.userMessageId);
+			if (
+				creating &&
+				durable?.state === "uncertain" &&
+				durable.lifecycle?.state === "uncertain" &&
+				durable.lifecycle.acknowledged === undefined
+			) {
+				if (admitted === undefined) throw new Error("Managed create lacks its original admitted reservation.");
+				mappings.recordLateLifecycleAcknowledgement(
+					turn.chatId,
+					admitted,
+					createManagedLateLifecycleAcknowledgement(admitted, lifecycleExactAuthority(authority)),
+				);
+				passiveAcknowledgement = true;
+				return;
+			}
 			record(
 				transitionManagedLifecycleEvidence(evidence, "acknowledged_unproven", {
 					acknowledged: lifecycleExactAuthority(authority),
@@ -233,6 +256,9 @@ async function runManagedLifecycleControl(
 					sessionId: authority.sessionId,
 					managedAuthority: managedAuthorityCopy(authority),
 				});
+		},
+		beforeProof: () => {
+			if (passiveAcknowledgement) throw new Error("Passive lifecycle observation cannot authorize proof.");
 			current();
 		},
 	};
@@ -366,6 +392,8 @@ async function runManagedBranch(
 			detail: hash,
 		});
 		const { sessionId: _sessionId, generation: _generation, ...target } = source;
+		let admitted: SessionOperation | undefined;
+		let passiveAcknowledgement = false;
 		let lifecycleEvidence = createManagedLifecycleEvidence({
 			operation: "session.fork",
 			preparedAuthority: lifecyclePreparedAuthority(target),
@@ -381,8 +409,8 @@ async function runManagedBranch(
 		try {
 			const forked = await step(() =>
 				flow({
-					source,
-					target,
+					source: { ...source },
+					target: { ...target },
 					timeoutMs: deadline.remaining(),
 					signal: turn.signal,
 					lifecycleOperation: {
@@ -395,6 +423,9 @@ async function runManagedBranch(
 						throwIfAborted(turn.signal);
 						assertCurrentBranchPredecessor(mappings, turn.chatId, existing, turn.userMessageId);
 						recordLifecycle(transitionManagedLifecycleEvidence(lifecycleEvidence, "invoking"));
+						admitted = structuredClone(mappings.operation(turn.chatId, turn.userMessageId));
+						if (admitted?.lifecycle?.state !== "invoking")
+							throw new Error("Managed fork invocation was not durably reserved.");
 					},
 					onAcknowledged: authority => {
 						assertManagedAuthority(authority, {
@@ -408,6 +439,22 @@ async function runManagedBranch(
 							authority.generation <= 0
 						)
 							throw new Error("Managed branch acknowledgement requires a distinct exact successor.");
+						const durable = mappings.operation(turn.chatId, turn.userMessageId);
+						if (
+							durable?.state === "uncertain" &&
+							durable.lifecycle?.state === "uncertain" &&
+							durable.lifecycle.acknowledged === undefined
+						) {
+							if (admitted === undefined)
+								throw new Error("Managed fork lacks its original admitted reservation.");
+							mappings.recordLateLifecycleAcknowledgement(
+								turn.chatId,
+								admitted,
+								createManagedLateLifecycleAcknowledgement(admitted, lifecycleExactAuthority(authority)),
+							);
+							passiveAcknowledgement = true;
+							return;
+						}
 						recordLifecycle(
 							transitionManagedLifecycleEvidence(lifecycleEvidence, "acknowledged_unproven", {
 								acknowledged: lifecycleExactAuthority(authority),
@@ -417,6 +464,9 @@ async function runManagedBranch(
 							sessionId: authority.sessionId,
 							managedAuthority: managedAuthorityCopy(authority),
 						});
+					},
+					beforeProof: () => {
+						if (passiveAcknowledgement) throw new Error("Passive lifecycle observation cannot authorize proof.");
 						deadline.remaining();
 						assertCurrentBranchPredecessor(mappings, turn.chatId, existing, turn.userMessageId);
 					},

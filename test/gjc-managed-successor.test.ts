@@ -540,7 +540,7 @@ describe("managed successor through real runtime admission", () => {
 			expect(f.closes).toEqual([]);
 			await expect(f.runtime.acquireAttachment(successorAuthority)).rejects.toThrow("not registered");
 		} finally {
-			await f.runtime.dispose();
+			await expect(f.runtime.dispose()).rejects.toThrow("Original lifecycle outcome persistence failed");
 		}
 	});
 
@@ -770,22 +770,28 @@ class FakeRuntime {
 		}
 		return token;
 	}
-	async forkLifecycleSession(tenant: TenantSessionKey, request: ForkRequest) {
+	async forkLifecycleSession(
+		tenant: TenantSessionKey,
+		request: ForkRequest,
+		onOutcome?: Parameters<ManagedSdkRuntime["forkLifecycleSession"]>[2],
+	) {
 		expect(tenant).toEqual(sourceTenant);
 		this.order.push("fork");
 		this.forks.push(request);
 		await this.afterPhase?.("fork");
 		this.afterFork?.();
 		if (this.forkFailure !== undefined) throw this.forkFailure;
-		return {
-			ok: true,
-			operation: "session.fork",
+		const outcome = {
+			ok: true as const,
+			operation: "session.fork" as const,
 			result: {
 				sessionId: successor.sessionId,
 				endpointGeneration: successor.endpointGeneration,
 				principalId: this.successorPrincipalId,
 			},
 		};
+		await onOutcome?.(outcome);
+		return outcome;
 	}
 	async closeLifecycleSession(tenant: TenantSessionKey, request: CloseRequest): Promise<CloseOutcome> {
 		expect(tenant).toMatchObject({ sessionId: successor.sessionId, generation: successor.endpointGeneration });
