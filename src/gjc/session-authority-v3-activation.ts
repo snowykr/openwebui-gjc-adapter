@@ -166,20 +166,36 @@ export function readSessionAuthorityV3ActiveMarker(canonicalPath: string): Sessi
  * and private activation files; it never inspects user workspaces, transcripts,
  * or artifacts.
  */
-export async function activateSessionAuthorityV3(
-	options: SessionAuthorityV3ActivationOptions,
-): Promise<SessionAuthorityV3ActivationResult> {
+export function startSessionAuthorityV3Activation(options: SessionAuthorityV3ActivationOptions): {
+	readonly result: Promise<SessionAuthorityV3ActivationResult>;
+	readonly settled: Promise<void>;
+} {
 	const deadline = new ManagedOperationDeadline(options.timeoutMs, "authority activation");
-	try {
-		return await deadline.wait(activateUnderDeadline(options, deadline));
-	} finally {
-		deadline.close();
-	}
+	const producers = new Set<Promise<unknown>>();
+	const track = <T>(promise: Promise<T>): Promise<T> => {
+		producers.add(promise);
+		void promise.then(
+			() => producers.delete(promise),
+			() => producers.delete(promise),
+		);
+		return promise;
+	};
+	const wait = <T>(promise: Promise<T>): Promise<T> => deadline.wait(track(promise));
+	const work = track(activateUnderDeadline(options, deadline, wait));
+	const result = deadline.wait(work).finally(() => deadline.close());
+	const settled = result
+		.catch(() => undefined)
+		.then(async () => {
+			while (producers.size > 0) await Promise.allSettled([...producers]);
+		});
+	void result.catch(() => undefined);
+	return Object.freeze({ result, settled });
 }
 
 async function activateUnderDeadline(
 	options: SessionAuthorityV3ActivationOptions,
 	deadline: ManagedOperationDeadline,
+	wait: <T>(promise: Promise<T>) => Promise<T>,
 ): Promise<SessionAuthorityV3ActivationResult> {
 	const canonicalPath = resolve(options.canonicalPath);
 	if (options.bootstrap !== undefined && (options.bindings !== undefined || options.resolveBindings !== undefined))
@@ -195,7 +211,7 @@ async function activateUnderDeadline(
 		throw new Error("Canonical activation requires held runtime and mutation lock capabilities.");
 	const assertLocks = async () => {
 		deadline.remaining();
-		await deadline.wait(options.runtimeLock.assertOwnsPath(canonicalPath));
+		await wait(options.runtimeLock.assertOwnsPath(canonicalPath));
 		options.mutationLock.assertHeld(canonicalPath);
 	};
 	await assertLocks();
@@ -206,9 +222,7 @@ async function activateUnderDeadline(
 	const recovered = recover(canonicalPath, markerPath, root, journalPath, options.mutationLock);
 	if (recovered !== undefined) return recovered;
 
-	const snapshot = await deadline.wait(
-		captureImmutableSnapshot(canonicalPath, root, assertLocks, options.afterBoundary),
-	);
+	const snapshot = await wait(captureImmutableSnapshot(canonicalPath, root, assertLocks, options.afterBoundary));
 	await assertLocks();
 
 	const privateV2 = join(root, "replay.v2.json");
@@ -344,12 +358,12 @@ async function activateUnderDeadline(
 			remaining: () => deadline.remaining(),
 		};
 		if (options.bootstrap !== undefined)
-			await deadline.wait(options.bootstrap({ ...context, stage: bootstrapStore.bootstrapStage(access) }));
+			await wait(options.bootstrap({ ...context, stage: bootstrapStore.bootstrapStage(access) }));
 		else
 			bindings =
 				options.resolveBindings === undefined
 					? (options.bindings ?? [])
-					: await deadline.wait(Promise.resolve(options.resolveBindings(decodedDocument, context)));
+					: await wait(Promise.resolve(options.resolveBindings(decodedDocument, context)));
 	} finally {
 		bootstrapAccess.delete(access);
 		bootstrapStore.close();
@@ -453,7 +467,7 @@ async function activateUnderDeadline(
 	let finalBootstrapCheck: (() => void) | undefined;
 	if (options.bootstrap !== undefined) {
 		deadline.remaining();
-		finalBootstrapCheck = await deadline.wait(options.beforeBootstrapCommit!());
+		finalBootstrapCheck = await wait(options.beforeBootstrapCommit!());
 		if (typeof finalBootstrapCheck !== "function")
 			throw new Error("Bootstrap commit requires a synchronous final proof check.");
 	}

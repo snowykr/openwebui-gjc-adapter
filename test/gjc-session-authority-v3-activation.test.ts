@@ -15,16 +15,20 @@ import { AuthorityMutationLock } from "../src/gjc/session-authority-file";
 import { FileSessionAuthority } from "../src/gjc/session-authority-persistence";
 import { parseSessionAuthorityV3Document, SESSION_AUTHORITY_V3_EPOCH } from "../src/gjc/session-authority-v3";
 import {
-	activateSessionAuthorityV3,
 	type SessionAuthorityV3ActivationBoundary,
 	type SessionAuthorityV3ActivationOptions,
 	type SessionAuthorityV3BootstrapAccess,
 	type SessionAuthorityV3BootstrapContext,
+	startSessionAuthorityV3Activation,
 } from "../src/gjc/session-authority-v3-activation";
 import { V3FileBackedSessionMappingStore } from "../src/gjc/session-v3-file-backed-mapping-store";
 import { RuntimeSingletonLock } from "../src/runtime-singleton-lock";
 
 const digest = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+
+function activateSessionAuthorityV3(options: SessionAuthorityV3ActivationOptions) {
+	return startSessionAuthorityV3Activation(options).result;
+}
 
 async function historicalFixture() {
 	const f = await fixture();
@@ -175,6 +179,51 @@ async function fixture() {
 }
 
 describe("session authority V3 activation", () => {
+	test("settlement drains a delayed bootstrap producer after its bounded result expires", async () => {
+		const f = await historicalFixture();
+		const lock = AuthorityMutationLock.acquire(f.canonicalPath);
+		const gate = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		let finished = false;
+		let revoked = false;
+		const attempt = startSessionAuthorityV3Activation({
+			canonicalPath: f.canonicalPath,
+			stagingRoot: join(f.root, "private"),
+			runtimeLock: f.runtimeLock,
+			mutationLock: lock,
+			timeoutMs: 1_000,
+			bootstrapTenantFence: () => true,
+			beforeBootstrapCommit: async () => () => {},
+			bootstrap: async context => {
+				entered.resolve();
+				await gate.promise;
+				try {
+					context.stage.read();
+				} catch {
+					revoked = true;
+				}
+			},
+		});
+		void attempt.settled.then(() => {
+			finished = true;
+		});
+		try {
+			await entered.promise;
+			await expect(attempt.result).rejects.toThrow("timed out");
+			expect(finished).toBe(false);
+			expect(await Bun.file(`${f.canonicalPath}.v3-active.json`).exists()).toBe(false);
+			lock.assertHeld(f.canonicalPath);
+			gate.resolve();
+			await attempt.settled;
+			expect(revoked).toBe(true);
+		} finally {
+			gate.resolve();
+			await attempt.settled;
+			lock.release();
+			await f.cleanup();
+		}
+	});
+
 	test.each(["symlink", "directory"] as const)(
 		"rejects a %s canonical source without snapshot effects",
 		async kind => {

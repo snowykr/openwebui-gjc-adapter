@@ -1,17 +1,25 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import * as filesystem from "node:fs/promises";
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { lifecycle, router } from "@gajae-code/coding-agent/sdk";
-import { type AdapterManagedBootstrapInput, activateAdapterSessionAuthorityV3 } from "../src/adapter-managed-bootstrap";
+import {
+	type AdapterManagedBootstrapInput,
+	startAdapterSessionAuthorityV3Activation,
+} from "../src/adapter-managed-bootstrap";
 import { ManagedSdkRuntime, type ManagedSdkRuntimeDeps } from "../src/gjc/managed-sdk-runtime";
 import type { SessionAuthorityTombstone } from "../src/gjc/session-authority-types";
 import { parseSessionAuthorityV3Document, type SessionAuthorityV3Document } from "../src/gjc/session-authority-v3";
 import type { SessionAuthorityV2Document } from "../src/gjc/session-authority-v3-migration";
 import { V3FileBackedSessionMappingStore } from "../src/gjc/session-v3-file-backed-mapping-store";
 import { RuntimeSingletonLock } from "../src/runtime-singleton-lock";
+
+function activateAdapterSessionAuthorityV3(input: AdapterManagedBootstrapInput) {
+	return startAdapterSessionAuthorityV3Activation(input).result;
+}
 
 async function fixture(
 	options: {
@@ -323,6 +331,285 @@ function withReassignment(
 }
 
 describe("adapter managed bootstrap composition", () => {
+	test.each(["lstat", "mkdir", "write", "reject"] as const)(
+		"source initialization %s cannot outlive successful cleanup settlement",
+		async phase => {
+			const f = await fixture({ timeoutMs: 1_000 });
+			await rm(f.sourcePath);
+			const entered = Promise.withResolvers<void>();
+			const gate = Promise.withResolvers<void>();
+			const pause = async () => {
+				entered.resolve();
+				await gate.promise;
+			};
+			const originalLstat = filesystem.lstat;
+			const originalMkdir = filesystem.mkdir;
+			const originalWrite = filesystem.writeFile;
+			const spy =
+				phase === "mkdir"
+					? spyOn(filesystem, "mkdir").mockImplementation((async (
+							...args: Parameters<typeof filesystem.mkdir>
+						) => {
+							if (args[0] === f.root) await pause();
+							return originalMkdir(...args);
+						}) as typeof filesystem.mkdir)
+					: phase === "write"
+						? spyOn(filesystem, "writeFile").mockImplementation(async (...args) => {
+								if (args[0] === f.sourcePath) await pause();
+								return originalWrite(...args);
+							})
+						: spyOn(filesystem, "lstat").mockImplementation((async (
+								...args: Parameters<typeof filesystem.lstat>
+							) => {
+								if (args[0] === f.sourcePath) {
+									await pause();
+									if (phase === "reject") throw new Error("late lstat failure");
+								}
+								return originalLstat(...args);
+							}) as typeof filesystem.lstat);
+			const attempt = startAdapterSessionAuthorityV3Activation(f.input);
+			let finished = false;
+			void attempt.settled.then(() => {
+				finished = true;
+			});
+			try {
+				await entered.promise;
+				await expect(attempt.result).rejects.toThrow("bootstrap failed");
+				expect(finished).toBe(false);
+				expect(await Bun.file(`${f.sourcePath}.lock`).exists()).toBe(true);
+				await expect(RuntimeSingletonLock.acquire(f.root)).rejects.toThrow("already owned");
+				expect(await Bun.file(f.sourcePath).exists()).toBe(false);
+				gate.resolve();
+				await attempt.settled;
+				expect(await Bun.file(f.sourcePath).exists()).toBe(phase === "write");
+				expect(await Bun.file(`${f.sourcePath}.lock`).exists()).toBe(false);
+				expect(f.calls).toEqual([]);
+			} finally {
+				gate.resolve();
+				await attempt.settled;
+				spy.mockRestore();
+				await f.cleanup();
+			}
+		},
+	);
+
+	test("admission receives only detached staged candidates before resolver and SDK effects", async () => {
+		const f = await fixture({ unscoped: true });
+		let admitted = false;
+		let released = false;
+		const resolver = f.input.authority.resolve;
+		const attempt = startAdapterSessionAuthorityV3Activation({
+			...f.input,
+			authority: {
+				resolve: async (...args) => {
+					expect(admitted).toBe(true);
+					return resolver(...args);
+				},
+			},
+			admission: {
+				admit: async request => {
+					expect(f.calls).toEqual([]);
+					expect(f.graph().mappings[0]!.historicalBinding).toEqual(request.candidates[0]!.source);
+					expect(request.candidates[0]!.principalId).toBe("owner");
+					expect(request.candidates[0]!.chatId).toBe("chat");
+					expect(request.manifestDigest).toMatch(/^[a-f0-9]{64}$/);
+					expect(request.remaining()).toBeGreaterThan(0);
+					await request.assertCurrent();
+					Reflect.set(request.candidates[0]!, "principalId", "foreign");
+					expect(await readFile(f.sourcePath, "utf8")).toBe(f.original);
+					admitted = true;
+				},
+				release: async () => {
+					expect(f.runtime().state).toBe("stopped");
+					expect(await Bun.file(`${f.sourcePath}.lock`).exists()).toBe(true);
+					released = true;
+				},
+			},
+		});
+		try {
+			const result = await attempt.result;
+			if (result.status !== "activated") throw new Error("Expected admitted activation.");
+			result.store.close();
+			await attempt.settled;
+			expect(released).toBe(true);
+			expect(await Bun.file(`${f.sourcePath}.lock`).exists()).toBe(false);
+		} finally {
+			await f.cleanup();
+		}
+	});
+
+	test("a later invalid candidate blocks all admission acquisitions", async () => {
+		const f = await fixture({
+			transformSource: source => ({
+				...source,
+				mappings: [
+					...source.mappings,
+					{
+						...source.mappings[0]!,
+						sessionId: "other",
+						header: { ...source.mappings[0]!.header, chatId: "unowned", sessionId: "other" },
+						chatId: "unowned",
+						operationId: "other",
+						journal: [],
+					},
+				],
+			}),
+		});
+		let acquisitions = 0;
+		try {
+			const attempt = startAdapterSessionAuthorityV3Activation({
+				...f.input,
+				configuredOwnerUserId: "",
+				admission: {
+					admit: async () => {
+						acquisitions++;
+					},
+					release: async () => {},
+				},
+			});
+			expect((await attempt.result).status).toBe("blocked");
+			await attempt.settled;
+			expect(acquisitions).toBe(0);
+			expect(f.calls).toEqual([]);
+		} finally {
+			await f.cleanup();
+		}
+	});
+
+	test.each([false, true])("late admission outcome rejects=%s stays owned until cleanup settles", async reject => {
+		const f = await fixture({ timeoutMs: 500 });
+		const acquisition = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const cleaning = Promise.withResolvers<void>();
+		let signal: AbortSignal | undefined;
+		let settled = false;
+		let acquired = false;
+		const attempt = startAdapterSessionAuthorityV3Activation({
+			...f.input,
+			admission: {
+				admit: async request => {
+					signal = request.signal;
+					await acquisition.promise;
+					acquired = true;
+					if (reject) throw new Error("late acquisition failed");
+				},
+				release: async () => {
+					expect(acquired).toBe(true);
+					cleaning.resolve();
+					await release.promise;
+				},
+			},
+		});
+		void attempt.settled.then(() => {
+			settled = true;
+		});
+		try {
+			await expect(attempt.result).rejects.toThrow("bootstrap failed");
+			expect(signal?.aborted).toBe(true);
+			expect(settled).toBe(false);
+			expect(f.calls).toEqual([]);
+			expect(await Bun.file(`${f.sourcePath}.lock`).exists()).toBe(true);
+			await expect(RuntimeSingletonLock.acquire(f.root)).rejects.toThrow("already owned");
+			acquisition.resolve();
+			await cleaning.promise;
+			expect(settled).toBe(false);
+			expect(await Bun.file(`${f.sourcePath}.lock`).exists()).toBe(true);
+			release.resolve();
+			await attempt.settled;
+			expect(f.calls).toEqual([]);
+			expect(await Bun.file(`${f.sourcePath}.lock`).exists()).toBe(false);
+			expect(await readFile(f.sourcePath, "utf8")).toBe(f.original);
+		} finally {
+			acquisition.resolve();
+			release.resolve();
+			await attempt.settled;
+			await f.cleanup();
+		}
+	});
+
+	test("concurrent failed activation does not release another attempt's admission", async () => {
+		const f = await fixture();
+		const gate = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		let released = 0;
+		const input = {
+			...f.input,
+			admission: {
+				admit: async () => {
+					entered.resolve();
+					await gate.promise;
+				},
+				release: async () => {
+					released++;
+				},
+			},
+		};
+		const first = startAdapterSessionAuthorityV3Activation(input);
+		try {
+			await entered.promise;
+			const second = startAdapterSessionAuthorityV3Activation(input);
+			await expect(second.result).rejects.toThrow("bootstrap failed");
+			await second.settled;
+			expect(released).toBe(0);
+			gate.resolve();
+			const result = await first.result;
+			if (result.status !== "activated") throw new Error("Expected first activation.");
+			result.store.close();
+			await first.settled;
+			expect(released).toBe(1);
+		} finally {
+			gate.resolve();
+			await first.settled;
+			await f.cleanup();
+		}
+	});
+
+	test("partial admission failure is cleaned without constructing an SDK runtime", async () => {
+		const f = await fixture();
+		let released = 0;
+		const attempt = startAdapterSessionAuthorityV3Activation({
+			...f.input,
+			admission: {
+				admit: async () => {
+					throw new Error("second acquisition failed");
+				},
+				release: async () => {
+					released++;
+				},
+			},
+		});
+		try {
+			await expect(attempt.result).rejects.toThrow("bootstrap failed");
+			await attempt.settled;
+			expect(released).toBe(1);
+			expect(f.calls).toEqual([]);
+			expect(await Bun.file(`${f.sourcePath}.lock`).exists()).toBe(false);
+		} finally {
+			await f.cleanup();
+		}
+	});
+
+	test("failed owned resource release rejects settlement and retains mutation exclusion", async () => {
+		const f = await fixture({ failStart: true });
+		const attempt = startAdapterSessionAuthorityV3Activation({
+			...f.input,
+			admission: {
+				admit: async () => {},
+				release: async () => {
+					throw new Error("lease release failed");
+				},
+			},
+		});
+		try {
+			await expect(attempt.result).rejects.toThrow("bootstrap failed");
+			await expect(attempt.settled).rejects.toThrow("lease release failed");
+			expect(f.runtime().state).toBe("stopped");
+			expect(await Bun.file(`${f.sourcePath}.lock`).exists()).toBe(true);
+		} finally {
+			await f.cleanup();
+		}
+	});
+
 	test.each(["admin", "explicit", "sessionless", "sessionless-result"] as const)(
 		"resolves unscoped %s history with one canonical live key",
 		async variant => {
@@ -798,8 +1085,9 @@ describe("adapter managed bootstrap composition", () => {
 				stop = resolve;
 			}),
 		});
+		const attempt = startAdapterSessionAuthorityV3Activation(f.input);
 		try {
-			await expect(activateAdapterSessionAuthorityV3(f.input)).rejects.toThrow("bootstrap failed");
+			await expect(attempt.result).rejects.toThrow("bootstrap failed");
 			expect(f.runtime().state).not.toBe("stopped");
 			expect(await Bun.file(`${f.sourcePath}.lock`).exists()).toBe(true);
 			expect(await readFile(f.sourcePath, "utf8")).toBe(f.original);
@@ -807,7 +1095,7 @@ describe("adapter managed bootstrap composition", () => {
 			stop();
 			await f.runtime().dispose();
 			expect(f.runtime().state).toBe("stopped");
-			await Promise.resolve();
+			await attempt.settled;
 			expect(await Bun.file(`${f.sourcePath}.lock`).exists()).toBe(false);
 		} finally {
 			resume();

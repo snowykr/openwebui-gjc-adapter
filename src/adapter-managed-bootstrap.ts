@@ -25,9 +25,9 @@ import type {
 	SessionAuthorityV3Tombstone,
 } from "./gjc/session-authority-v3";
 import {
-	activateSessionAuthorityV3,
 	type SessionAuthorityV3ActivationResult,
 	type SessionAuthorityV3BootstrapContext,
+	startSessionAuthorityV3Activation,
 } from "./gjc/session-authority-v3-activation";
 import { V3FileBackedSessionMappingStore } from "./gjc/session-v3-file-backed-mapping-store";
 import type { ManagedPreparedTurnAuthority } from "./gjc/turn-runner";
@@ -49,12 +49,34 @@ export interface ManagedBootstrapAuthorityResolver {
 	resolve(principalId: string, projectId: string): Promise<ManagedBootstrapAuthority | undefined>;
 }
 
+export interface ManagedBootstrapCandidate {
+	readonly source: HistoricalSessionBinding;
+	readonly principalId: string;
+	readonly chatId: string;
+	readonly projectId: string;
+	readonly retainedIntent?: SessionAuthorityV3Operation;
+}
+
+/** Owns acquisitions before admit starts, including outcomes arriving after timeout. */
+export interface ManagedBootstrapAdmission {
+	admit(input: {
+		readonly manifestDigest: string;
+		readonly candidates: readonly ManagedBootstrapCandidate[];
+		readonly signal: AbortSignal;
+		remaining(): number;
+		assertCurrent(): Promise<void>;
+	}): Promise<void>;
+	/** Closes admission and accounts for every attempted acquisition without replacing its identity. */
+	release(): Promise<void>;
+}
+
 export interface AdapterManagedBootstrapInput {
 	readonly locations: Pick<GjcRuntimeLocations, "agentDir"> & Readonly<{ stateRoot: string }>;
 	readonly configuredOwnerUserId: string;
 	readonly sourcePath: string;
 	readonly runtimeLock: RuntimeSingletonLock;
 	readonly authority: ManagedBootstrapAuthorityResolver;
+	readonly admission?: ManagedBootstrapAdmission;
 	readonly timeoutMs?: number;
 	/** Transport test seam; the coordinator always supplies the production purpose fences. */
 	readonly createRuntime?: (agentDir: string, deps: ManagedSdkRuntimeDeps) => ManagedSdkRuntime;
@@ -74,22 +96,54 @@ interface BootstrapTarget {
 	readonly operationId: string;
 }
 
-/** Restricted activation owns its Router, stage capabilities and one-time invocation admission. */
-export async function activateAdapterSessionAuthorityV3(
+export interface AdapterManagedBootstrapAttempt {
+	/** Bounded operation outcome; rejection alone is not proof of cleanup. */
+	readonly result: Promise<AdapterSessionAuthorityV3Activation>;
+	/** Resolves only after stop and owned resource cleanup; failure retains exclusion locks. */
+	readonly settled: Promise<void>;
+}
+
+/** The caller retains runtime ownership until settled succeeds, even when result times out. */
+export function startAdapterSessionAuthorityV3Activation(
 	input: AdapterManagedBootstrapInput,
-): Promise<AdapterSessionAuthorityV3Activation> {
+): AdapterManagedBootstrapAttempt {
 	for (const path of [input.locations.agentDir, input.locations.stateRoot, input.sourcePath])
 		if (!isAbsolute(path) || resolve(path) !== path)
 			throw new TypeError("Bootstrap paths must be canonical absolute paths.");
 	const deadline = new ManagedOperationDeadline(input.timeoutMs, "adapter authority bootstrap");
+	const completion = Promise.withResolvers<void>();
+	const result = activate(input, deadline, completion.resolve, completion.reject);
+	void result.catch(() => undefined);
+	void completion.promise.catch(() => undefined);
+	return Object.freeze({ result, settled: completion.promise });
+}
+
+async function activate(
+	input: AdapterManagedBootstrapInput,
+	deadline: ManagedOperationDeadline,
+	settled: () => void,
+	cleanupFailed: (error: unknown) => void,
+): Promise<AdapterSessionAuthorityV3Activation> {
+	const producers = new Set<Promise<unknown>>();
+	let closing = false;
 	const step = <T>(action: () => Promise<T>): Promise<T> => {
 		deadline.remaining();
-		return deadline.wait(action());
+		if (closing) throw new Error("Bootstrap work is closed.");
+		const work = action();
+		producers.add(work);
+		void work.then(
+			() => producers.delete(work),
+			() => producers.delete(work),
+		);
+		return deadline.wait(work);
 	};
 	let runtime: ManagedSdkRuntime | undefined;
 	let store: V3FileBackedSessionMappingStore | undefined;
 	let context: SessionAuthorityV3BootstrapContext | undefined;
 	let lock: AuthorityMutationLock | undefined;
+	const admissionController = new AbortController();
+	let admissionWork: Promise<void> | undefined;
+	let activationWork: ReturnType<typeof startSessionAuthorityV3Activation> | undefined;
 	const targets = new Map<string, BootstrapTarget>();
 	const invoking = new Set<string>();
 	const consumed = new Set<string>();
@@ -184,9 +238,15 @@ export async function activateAdapterSessionAuthorityV3(
 	try {
 		await step(() => input.runtimeLock.assertOwnsPath(input.sourcePath));
 		lock = AuthorityMutationLock.acquire(input.sourcePath);
-		await step(() => ensureLegacySource(input.sourcePath));
-		const activation = await step(() =>
-			activateSessionAuthorityV3({
+		await step(() =>
+			ensureLegacySource(input.sourcePath, () => {
+				deadline.remaining();
+				if (closing) throw new Error("Bootstrap work is closed.");
+				lock!.assertHeld(input.sourcePath);
+			}),
+		);
+		const activation = await step(() => {
+			activationWork = startSessionAuthorityV3Activation({
 				canonicalPath: input.sourcePath,
 				runtimeLock: input.runtimeLock,
 				mutationLock: lock!,
@@ -216,7 +276,8 @@ export async function activateAdapterSessionAuthorityV3(
 					if (graph.provisionalOperations.some(operation => operation.state !== "complete")) return;
 					const sessionIds = new Set<string>();
 					const destinations = new Set<string>();
-					// Complete all local source/owner checks before constructing the public runtime.
+					const candidates: ManagedBootstrapCandidate[] = [];
+					// Check the entire graph before admission can acquire any resource.
 					for (const mapping of graph.mappings) {
 						if (mapping.historicalBinding === undefined) {
 							// An earlier process's numeric generation cannot prove its original
@@ -246,10 +307,34 @@ export async function activateAdapterSessionAuthorityV3(
 							operation => operation.lifecycle?.historicalSource !== undefined,
 						);
 						if (previous !== undefined && previous.lifecycle?.state !== "intent_prepared") return;
-						const authority = await step(() => input.authority.resolve(scope.principalId, mapping.projectId));
+						candidates.push({
+							source,
+							...scope,
+							projectId: mapping.projectId,
+							...(previous === undefined ? {} : { retainedIntent: previous }),
+						});
+					}
+					if (candidates.length > 0 && input.admission !== undefined) {
+						deadline.remaining();
+						admissionWork = Promise.resolve().then(() => {
+							deadline.remaining();
+							return input.admission!.admit({
+								manifestDigest: current.manifestDigest,
+								candidates: structuredClone(candidates),
+								signal: admissionController.signal,
+								remaining: () => deadline.remaining(),
+								assertCurrent: current.assertCurrent,
+							});
+						});
+						await deadline.wait(admissionWork);
+					}
+					for (const candidate of candidates) {
+						const { source, projectId, retainedIntent: previous } = candidate;
+						const scope = { principalId: candidate.principalId, chatId: candidate.chatId };
+						const authority = await step(() => input.authority.resolve(scope.principalId, projectId));
 						if (
 							authority === undefined ||
-							authority.project.id !== mapping.projectId ||
+							authority.project.id !== projectId ||
 							!exactScopeString(authority.leaseId) ||
 							!exactScopeString(authority.epoch) ||
 							typeof authority.assertCurrent !== "function" ||
@@ -266,14 +351,14 @@ export async function activateAdapterSessionAuthorityV3(
 								current.manifestDigest,
 								source.provenance,
 								scope,
-								mapping.projectId,
+								projectId,
 								authority.canonicalWorkspace,
 								source.sessionId,
 							]),
 						);
 						const prepared: ManagedPreparedTurnAuthority = previous?.lifecycle?.preparedAuthority ?? {
 							...scope,
-							projectId: mapping.projectId,
+							projectId,
 							canonicalWorkspace: authority.canonicalWorkspace,
 							leaseId: authority.leaseId,
 							epoch: authority.epoch,
@@ -411,8 +496,9 @@ export async function activateAdapterSessionAuthorityV3(
 						}
 					}
 				},
-			}),
-		);
+			});
+			return activationWork.result;
+		});
 		context = undefined;
 		if (activation.status === "blocked") result = { status: "blocked", activation };
 		else {
@@ -422,12 +508,22 @@ export async function activateAdapterSessionAuthorityV3(
 	} catch (error) {
 		failures.push(error);
 	} finally {
+		closing = true;
 		context = undefined;
-		// No bootstrap attachment or purpose grant crosses the serving boundary.
-		let shutdown: Promise<void> | undefined;
+		admissionController.abort();
+		// Retain raw work, not just its deadline race, before releasing either owner.
+		const shutdown = Promise.resolve().then(() => runtime?.dispose());
+		const cleanup = (async () => {
+			await Promise.all([shutdown, admissionWork?.catch(() => undefined), activationWork?.settled]);
+			while (producers.size > 0) await Promise.allSettled([...producers]);
+			if (runtime !== undefined && runtime.state !== "stopped")
+				throw new Error("Bootstrap shutdown is unproven; mutation ownership remains held.");
+			if (admissionWork !== undefined) await input.admission!.release();
+			lock?.release();
+		})();
+		void cleanup.then(settled, cleanupFailed);
 		try {
-			shutdown = runtime?.dispose();
-			if (shutdown !== undefined) await deadline.wait(shutdown);
+			await deadline.wait(cleanup);
 		} catch (error) {
 			if (!failures.includes(error)) failures.push(error);
 		}
@@ -439,31 +535,7 @@ export async function activateAdapterSessionAuthorityV3(
 			}
 		}
 		if (runtime !== undefined && runtime.state !== "stopped") {
-			// An expired wait is not a shutdown receipt. Keep the owned mutation
-			// lease in place rather than allowing another attempt to overlap it.
 			failures.push(new Error("Bootstrap shutdown is unproven; mutation ownership remains held."));
-			const heldLock = lock;
-			if (shutdown !== undefined)
-				void shutdown.then(
-					() => {
-						if (runtime?.state === "stopped") {
-							try {
-								heldLock?.release();
-							} catch (error) {
-								console.error("Bootstrap shutdown completed but mutation ownership release failed:", error);
-							}
-						}
-					},
-					() => {
-						/* Failure is retained by the caller; no unproven lock release. */
-					},
-				);
-		} else {
-			try {
-				lock?.release();
-			} catch (error) {
-				failures.push(error);
-			}
 		}
 		deadline.close();
 	}
@@ -525,14 +597,16 @@ function sameTenant(value: unknown, key: TenantSessionKey): boolean {
 function hash(value: string): string {
 	return createHash("sha256").update(value).digest("hex");
 }
-async function ensureLegacySource(path: string): Promise<void> {
+async function ensureLegacySource(path: string, assertCurrent: () => void): Promise<void> {
 	try {
 		await lstat(path);
 		return;
 	} catch (error) {
 		if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
 	}
+	assertCurrent();
 	await mkdir(dirname(path), { recursive: true });
+	assertCurrent();
 	await writeFile(path, '{"kind":"openwebui-gjc-session-authority","version":2,"mappings":[]}\n', {
 		flag: "wx",
 		mode: 0o600,

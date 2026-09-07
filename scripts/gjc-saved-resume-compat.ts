@@ -6,12 +6,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { lifecycle } from "@gajae-code/coding-agent/sdk";
-import { activateAdapterSessionAuthorityV3 } from "../src/adapter-managed-bootstrap";
+import {
+	type AdapterManagedBootstrapAttempt,
+	startAdapterSessionAuthorityV3Activation,
+} from "../src/adapter-managed-bootstrap";
 import { ManagedOperationDeadline } from "../src/gjc/managed-operation-deadline";
 import { ManagedSdkRuntime } from "../src/gjc/managed-sdk-runtime";
 import { parseSessionAuthorityV3Document, type SessionAuthorityV3Document } from "../src/gjc/session-authority-v3";
 import { RuntimeSingletonLock } from "../src/runtime-singleton-lock";
-import { WorkspaceLeaseManager, workspaceLeaseId } from "../src/security/workspace-lease";
+import { type WorkspaceLease, WorkspaceLeaseManager, workspaceLeaseId } from "../src/security/workspace-lease";
 import { apiKey, providerResponse, writeLocalProviderConfig } from "./gjc-release-compat-fixtures";
 import { promptAndAwaitTerminal } from "./gjc-release-compat-runtime";
 import { connectFor, publicLifecycle, startPublicSdk, stopPublicSdk } from "./gjc-release-compat-sdk";
@@ -401,24 +404,54 @@ async function bootstrapProbe(
 	});
 	await writeFile(sourcePath, original);
 	const lock = await RuntimeSingletonLock.acquire(stateRoot);
-	const lease = await new WorkspaceLeaseManager({ stateRoot }).acquire({
-		safeKey: createHash("sha256").update(principalId).digest("hex"),
-		holderId: "public-bootstrap-probe",
-		operation: "migration",
-		leaseMs: 30_000,
-	});
+	let lease: WorkspaceLease | undefined;
+	let admissionReleased = false;
+	const stagePath = join(
+		stateRoot,
+		`session-authority-v3-${createHash("sha256").update(sourcePath).digest("hex").slice(0, 16)}`,
+		"historical.v3.json",
+	);
 	let runtime: ManagedSdkRuntime | undefined;
 	let initialGraph: SessionAuthorityV3Document | undefined;
+	let attempt: AdapterManagedBootstrapAttempt | undefined;
 	try {
-		const result = await activateAdapterSessionAuthorityV3({
+		attempt = startAdapterSessionAuthorityV3Activation({
 			locations: { agentDir, stateRoot },
 			sourcePath,
 			runtimeLock: lock,
 			configuredOwnerUserId: principalId,
 			timeoutMs: Math.min(25_000, budget.remaining()),
+			admission: {
+				admit: async request => {
+					initialGraph = parseSessionAuthorityV3Document(await readFile(stagePath));
+					if (
+						initialGraph === undefined ||
+						request.candidates.length !== 1 ||
+						request.candidates[0]!.principalId !== principalId ||
+						request.candidates[0]!.retainedIntent !== undefined ||
+						(await readFile(sourcePath, "utf8")) !== original
+					)
+						throw new Error("Probe admission lacks its original staged authority.");
+					await request.assertCurrent();
+					request.remaining();
+					request.signal.throwIfAborted();
+					lease = await new WorkspaceLeaseManager({ stateRoot }).acquire({
+						safeKey: createHash("sha256").update(principalId).digest("hex"),
+						holderId: "public-bootstrap-probe",
+						operation: "migration",
+						leaseMs: 30_000,
+					});
+				},
+				release: async () => {
+					if (runtime !== undefined && runtime.state !== "stopped")
+						throw new Error("Probe runtime has not stopped.");
+					await lease?.release();
+					admissionReleased = true;
+				},
+			},
 			authority: {
 				resolve: async (owner, projectId) =>
-					owner !== principalId || projectId !== "probe-project"
+					owner !== principalId || projectId !== "probe-project" || lease === undefined || admissionReleased
 						? undefined
 						: {
 								project: {
@@ -433,17 +466,12 @@ async function bootstrapProbe(
 								epoch: "exclusive-probe-epoch",
 								assertFence: async () => {
 									budget.remaining();
-									await lease.assertFence();
+									await lease!.assertFence();
 								},
-								assertCurrent: () => lease.assertFenceSync(),
+								assertCurrent: () => lease!.assertFenceSync(),
 							},
 			},
 			createRuntime: (directory, deps) => {
-				const stagePath = join(
-					stateRoot,
-					`session-authority-v3-${createHash("sha256").update(sourcePath).digest("hex").slice(0, 16)}`,
-					"historical.v3.json",
-				);
 				initialGraph = parseSessionAuthorityV3Document(readFileSync(stagePath));
 				runtime = new ManagedSdkRuntime({
 					agentDir: directory,
@@ -472,6 +500,7 @@ async function bootstrapProbe(
 				return runtime;
 			},
 		});
+		const result = await attempt.result;
 		if (result.status !== "activated") throw new Error("Scoped public historical bootstrap did not activate.");
 		try {
 			const document = parseSessionAuthorityV3Document(await readFile(sourcePath));
@@ -497,6 +526,7 @@ async function bootstrapProbe(
 					originalResultPreserved: true,
 					terminalReassignmentHistoryPreserved: terminalHistory,
 					unscopedOwnerResolved: unscoped,
+					postStageAdmissionReleased: admissionReleased,
 					bootstrapRuntimeStopped: true,
 					migrationOperationCount: record.journal.length - 1,
 				},
@@ -505,7 +535,7 @@ async function bootstrapProbe(
 			result.store.close();
 		}
 	} finally {
-		await lease.release();
+		await attempt?.settled;
 		await lock.release();
 	}
 }
