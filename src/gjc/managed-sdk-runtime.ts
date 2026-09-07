@@ -5,11 +5,13 @@ import {
 	copyManagedLifecycleEvidence,
 	isHistoricalSavedSession,
 	isHistoricalSessionBinding,
+	isManagedCatalogProvisional,
 	type ManagedHistoricalSavedSession,
 	type ManagedLifecycleEvidence,
+	managedProvisionalCreateAdmissionHash,
 } from "./managed-lifecycle-evidence";
-import type { HistoricalSessionBinding } from "./session-authority-types";
-import type { ManagedPreparedTurnAuthority } from "./turn-runner";
+import type { HistoricalSessionBinding, ProvisionalSessionOperation } from "./session-authority-types";
+import type { ManagedGenerationProof, ManagedPreparedTurnAuthority } from "./turn-runner";
 
 export const MANAGED_SDK_OWNER_STATES = [
 	"new",
@@ -57,6 +59,21 @@ export interface ManagedSdkHistoricalSelection {
 	readonly manifestDigest: string;
 	readonly historicalBinding: HistoricalSessionBinding;
 	readonly preparedAuthority: ManagedPreparedTurnAuthority;
+}
+
+export interface ManagedSdkCatalogReference {
+	readonly original: ProvisionalSessionOperation;
+	readonly expectedLifecycleHash: string;
+}
+
+export type ManagedSdkCatalogQuery = "models.list/current" | "providers.list/active" | "session.state";
+export type ManagedSdkCatalogAccess =
+	| Readonly<{ kind: "proof" }>
+	| Readonly<{ kind: "query"; name: ManagedSdkCatalogQuery }>;
+export interface ManagedSdkCatalogQueryOptions {
+	readonly cursor?: string;
+	readonly timeoutMs: number;
+	readonly beforeDispatch?: NonNullable<Parameters<router.SessionRouter["request"]>[4]>["beforeDispatch"];
 }
 
 export type ManagedSdkAccess =
@@ -107,6 +124,17 @@ export interface ManagedSdkRuntimeDeps {
 		operationId: string,
 		evidence: ManagedLifecycleEvidence,
 	) => boolean | Promise<boolean>;
+	/** Independent canonical catalog ownership. Neither fence grants active routing authority. */
+	readonly catalogFence?: (
+		reference: ManagedSdkCatalogReference,
+		tenant: TenantSessionKey,
+		access: ManagedSdkCatalogAccess,
+	) => boolean | Promise<boolean>;
+	readonly catalogFenceSync?: (
+		reference: ManagedSdkCatalogReference,
+		tenant: TenantSessionKey,
+		access: ManagedSdkCatalogAccess,
+	) => boolean;
 	readonly drainTimeoutMs?: number;
 	readonly maxFrameSubscriptions?: number;
 	readonly maxFramesPerSubscription?: number;
@@ -261,6 +289,8 @@ export class ManagedSdkRuntime {
 	readonly #preparedTenantFence: ManagedSdkRuntimeDeps["preparedTenantFence"];
 	readonly #historicalSelectionFence: ManagedSdkRuntimeDeps["historicalSelectionFence"];
 	readonly #historicalResumeFence: ManagedSdkRuntimeDeps["historicalResumeFence"];
+	readonly #catalogFence: ManagedSdkRuntimeDeps["catalogFence"];
+	readonly #catalogFenceSync: ManagedSdkRuntimeDeps["catalogFenceSync"];
 	readonly #drainTimeoutMs: number;
 	readonly #pending = new Set<PendingCall>();
 	readonly #producers = new Set<Promise<unknown>>();
@@ -303,6 +333,8 @@ export class ManagedSdkRuntime {
 		this.#preparedTenantFence = deps.preparedTenantFence;
 		this.#historicalSelectionFence = deps.historicalSelectionFence;
 		this.#historicalResumeFence = deps.historicalResumeFence;
+		this.#catalogFence = deps.catalogFence?.bind(deps);
+		this.#catalogFenceSync = deps.catalogFenceSync?.bind(deps);
 		this.#drainTimeoutMs = finiteTimeout(deps.drainTimeoutMs, DEFAULT_OPERATION_TIMEOUT_MS);
 		this.#maxSubscriptions = positiveLimit(deps.maxFrameSubscriptions, DEFAULT_MAX_SUBSCRIPTIONS);
 		this.#maxFramesPerSubscription = positiveLimit(
@@ -653,6 +685,159 @@ export class ManagedSdkRuntime {
 				throw new Error("Tenant registration changed during lifecycle proof.");
 			return this.#attachmentToken(key);
 		});
+	}
+
+	/** Currentness evidence only; no attachment capability or active-token promotion escapes. */
+	async proveCatalogSession(
+		reference: ManagedSdkCatalogReference,
+		tenant: TenantSessionKey,
+		timeoutMs?: number,
+	): Promise<ManagedGenerationProof> {
+		const ref = snapshotCatalogReference(reference, tenant);
+		const key = copyTenantKey(tenant);
+		const access: ManagedSdkCatalogAccess = Object.freeze({ kind: "proof" });
+		return this.#track(timeoutMs, async budget => {
+			await this.#assertCatalogAuthorized(ref, key, access);
+			budget.remaining();
+			this.#assertCatalogAuthorizedSync(ref, key, access);
+			budget.remaining();
+			this.#assertOwner();
+			this.registerTenant(key);
+			const registration = this.#registrations.get(generationIdentity(key));
+			const reconcile = this.#reconcileTail.then(async () => {
+				budget.remaining();
+				await this.#assertCatalogAuthorized(ref, key, access);
+				budget.remaining();
+				this.#assertCatalogAuthorizedSync(ref, key, access);
+				budget.remaining();
+				this.#assertCatalogRegistration(key, registration);
+				await this.#router.reconcile();
+			});
+			this.#reconcileTail = reconcile.catch(() => undefined);
+			await reconcile;
+			budget.remaining();
+			await this.#assertCatalogAuthorized(ref, key, access);
+			budget.remaining();
+			this.#assertCatalogAuthorizedSync(ref, key, access);
+			budget.remaining();
+			this.#catalogAttachment(key, registration);
+			return {
+				kind: "managed-generation",
+				sessionId: key.sessionId,
+				generation: key.generation,
+				leaseId: key.leaseId,
+				epoch: key.epoch,
+			};
+		});
+	}
+
+	async queryCatalog(
+		reference: ManagedSdkCatalogReference,
+		tenant: TenantSessionKey,
+		name: ManagedSdkCatalogQuery,
+		options: ManagedSdkCatalogQueryOptions,
+	): Promise<Record<string, unknown>> {
+		const ref = snapshotCatalogReference(reference, tenant);
+		const key = copyTenantKey(tenant);
+		if (!["models.list/current", "providers.list/active", "session.state"].includes(name))
+			throw new TypeError("Catalog query name is not permitted.");
+		if (
+			!isRecord(options) ||
+			Object.keys(options).some(field => !["cursor", "timeoutMs", "beforeDispatch"].includes(field)) ||
+			typeof options.timeoutMs !== "number"
+		)
+			throw new TypeError("Catalog query requires an explicit logical timeout and declared options.");
+		const { cursor, timeoutMs, beforeDispatch } = options;
+		if (cursor !== undefined && !exactHistoricalString(cursor))
+			throw new TypeError("Catalog cursor must be an exact nonempty string.");
+		if (beforeDispatch !== undefined && typeof beforeDispatch !== "function")
+			throw new TypeError("Catalog beforeDispatch must be a function.");
+		const callerBeforeDispatch = beforeDispatch?.bind(options);
+		const access: ManagedSdkCatalogAccess = Object.freeze({ kind: "query", name });
+		if (this.#catalogFenceSync === undefined) throw new Error("Catalog synchronous authority fence is unavailable.");
+		return this.#track(timeoutMs, async budget => {
+			const registration = this.#registrations.get(generationIdentity(key));
+			await this.#assertCatalogAuthorized(ref, key, access);
+			budget.remaining();
+			const raw = this.#catalogAttachment(key, registration);
+			const assertDispatch = () => {
+				budget.remaining();
+				this.#catalogAttachment(key, registration, raw);
+				this.#assertCatalogAuthorizedSync(ref, key, access);
+				budget.remaining();
+				this.#catalogAttachment(key, registration, raw);
+			};
+			assertDispatch();
+			const result = await this.#router.request(
+				key.sessionId,
+				{ type: "query_request", query: name, input: {}, ...(cursor === undefined ? {} : { cursor }) },
+				key.generation,
+				raw,
+				{
+					timeoutMs: budget.remaining(),
+					beforeDispatch: context => {
+						assertDispatch();
+						callerBeforeDispatch?.(context);
+						assertDispatch();
+					},
+				},
+			);
+			budget.remaining();
+			await this.#assertCatalogAuthorized(ref, key, access);
+			assertDispatch();
+			return result;
+		});
+	}
+
+	async #assertCatalogAuthorized(
+		reference: ManagedSdkCatalogReference,
+		key: TenantSessionKey,
+		access: ManagedSdkCatalogAccess,
+	): Promise<void> {
+		this.#assertOwner();
+		if (this.#catalogFence === undefined || (await this.#catalogFence(reference, key, access)) !== true)
+			throw new Error("Catalog authority fence was lost or unavailable.");
+		this.#assertOwner();
+	}
+
+	#assertCatalogAuthorizedSync(
+		reference: ManagedSdkCatalogReference,
+		key: TenantSessionKey,
+		access: ManagedSdkCatalogAccess,
+	): void {
+		this.#assertOwner();
+		if (this.#catalogFenceSync === undefined || this.#catalogFenceSync(reference, key, access) !== true)
+			throw new Error("Catalog synchronous authority fence was lost or unavailable.");
+		this.#assertOwner();
+	}
+
+	#assertCatalogRegistration(key: TenantSessionKey, registration: TenantSessionKey | undefined): void {
+		this.#assertOwner();
+		if (
+			registration === undefined ||
+			this.#registrations.get(generationIdentity(key)) !== registration ||
+			!sameTenantKey(key, registration)
+		)
+			throw new Error("Catalog tenant registration changed or is unavailable.");
+	}
+
+	#catalogAttachment(
+		key: TenantSessionKey,
+		registration: TenantSessionKey | undefined,
+		expected?: router.SessionAttachment,
+	): router.SessionAttachment {
+		this.#assertCatalogRegistration(key, registration);
+		const raw = this.#router.attachment(key.sessionId, key.generation);
+		if (
+			raw === null ||
+			raw === undefined ||
+			(expected !== undefined && raw !== expected) ||
+			raw.sessionId !== key.sessionId ||
+			raw.generation !== key.generation ||
+			!raw.isCurrent()
+		)
+			throw new Error("Catalog requires the current exact Router attachment.");
+		return raw;
 	}
 
 	unregisterTenant(key: TenantSessionKey): void {
@@ -1437,6 +1622,84 @@ function freezeHistoricalInput<T>(value: T): T {
 		Object.freeze(value);
 	}
 	return value;
+}
+
+function snapshotCatalogReference(
+	reference: ManagedSdkCatalogReference,
+	key: TenantSessionKey,
+): ManagedSdkCatalogReference {
+	assertTenantKey(key);
+	if (
+		!isRecord(reference) ||
+		Object.keys(reference).some(field => field !== "original" && field !== "expectedLifecycleHash")
+	)
+		throw new TypeError("Catalog requires its canonical original reservation reference.");
+	const ref = structuredClone(reference);
+	const original = ref.original;
+	if (
+		!isRecord(original) ||
+		!isManagedCatalogProvisional(original) ||
+		original.purpose !== "model-catalog" ||
+		original.state !== "pending" ||
+		original.lifecycle?.state !== "intent_prepared" ||
+		original.cleanup !== undefined ||
+		original.lateCreateAcknowledgement !== undefined ||
+		original.lateLifecycleAcknowledgement !== undefined ||
+		original.completedAt !== undefined ||
+		Object.keys(original).some(
+			field =>
+				![
+					"id",
+					"ingressId",
+					"kind",
+					"state",
+					"startedAt",
+					"detail",
+					"chatId",
+					"projectId",
+					"purpose",
+					"lifecycle",
+					"completedAt",
+					"result",
+					"acknowledgedSuccessor",
+					"sessionId",
+					"sessionFile",
+					"activeLeaf",
+					"attachment",
+					"managedAuthority",
+					"historicalBinding",
+					"cleanup",
+					"lateLifecycleAcknowledgement",
+					"lateCreateAcknowledgement",
+				].includes(field),
+		) ||
+		typeof ref.expectedLifecycleHash !== "string" ||
+		ref.expectedLifecycleHash.length !== 64 ||
+		!/^[a-f0-9]{64}$/.test(ref.expectedLifecycleHash)
+	)
+		throw new TypeError(
+			"Catalog requires an original pending prepared create without a child, passive receipt or serving binding.",
+		);
+	managedProvisionalCreateAdmissionHash(original);
+	const prepared = original.lifecycle.preparedAuthority;
+	if (
+		!exactHistoricalString(original.id) ||
+		(original.ingressId !== undefined && !exactHistoricalString(original.ingressId)) ||
+		!isAbsolute(prepared.canonicalWorkspace) ||
+		resolve(prepared.canonicalWorkspace) !== prepared.canonicalWorkspace ||
+		!(["principalId", "projectId", "canonicalWorkspace", "chatId", "sessionId", "leaseId", "epoch"] as const).every(
+			field => exactHistoricalString(key[field]),
+		) ||
+		!exactHistoricalString(prepared.requestKey) ||
+		prepared.principalId !== key.principalId ||
+		prepared.projectId !== key.projectId ||
+		prepared.canonicalWorkspace !== key.canonicalWorkspace ||
+		prepared.chatId !== key.chatId ||
+		prepared.leaseId !== key.leaseId ||
+		prepared.epoch !== key.epoch
+	)
+		throw new TypeError("Catalog reservation does not match the exact tenant scope and attempt lease.");
+	return freezeHistoricalInput(ref);
 }
 
 function assertTenantKey(key: TenantSessionKey): void {

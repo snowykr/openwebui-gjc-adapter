@@ -247,6 +247,107 @@ test.each(["intent_prepared", "invoking"] as const)(
 	},
 );
 
+test.each(["child", "lease", "dispatch", "response"] as const)(
+	"production catalog purpose access observes %s revocation without active authority",
+	async revoke => {
+		const controls: { afterRequestDispatch?: (frame: Record<string, unknown>) => void } = {};
+		const f = await fixture(controls);
+		try {
+			const path = join(f.root, "sessions", "openwebui-session-mappings.json");
+			const stale = new V3FileBackedSessionMappingStore(path);
+			try {
+				const original = f.mappings.reserveManagedCatalogScoped(f.prepared, {
+					operationId: "catalog-create",
+					prepared: f.prepared,
+					payloadHash: "c".repeat(64),
+				});
+				let current = f.mappings.advanceManagedCatalogScoped(
+					f.prepared,
+					original,
+					managedLifecycleEvidenceHash(original.lifecycle!),
+					transitionManagedLifecycleEvidence(original.lifecycle!, "invoking"),
+				);
+				const acknowledged = { ...f.prepared, sessionId: "catalog-session", generation: 7 };
+				current = f.mappings.advanceManagedCatalogScoped(
+					f.prepared,
+					original,
+					managedLifecycleEvidenceHash(current.lifecycle!),
+					transitionManagedLifecycleEvidence(current.lifecycle!, "acknowledged_unproven", { acknowledged }),
+				);
+				const { requestKey: _requestKey, ...key } = acknowledged;
+				f.attachments.set(key.sessionId, {
+					sessionId: key.sessionId,
+					generation: key.generation,
+					isCurrent: () => true,
+				} as router.SessionAttachment);
+				const proofRef = { original, expectedLifecycleHash: managedLifecycleEvidenceHash(current.lifecycle!) };
+				expect(await f.deps.catalogFence!(proofRef, key, { kind: "proof" })).toBe(true);
+				expect(await f.deps.catalogFence!(proofRef, key, { kind: "query", name: "session.state" })).toBe(false);
+				expect(
+					await f.deps.catalogFence!({ ...proofRef, expectedLifecycleHash: "0".repeat(64) }, key, {
+						kind: "proof",
+					}),
+				).toBe(false);
+				expect(await f.deps.catalogFence!(proofRef, { ...key, principalId: "foreign" }, { kind: "proof" })).toBe(
+					false,
+				);
+				const proof = await f.runtime.proveCatalogSession(proofRef, key, 1_000);
+				expect(proof.kind).toBe("managed-generation");
+				expect("isCurrent" in proof).toBe(false);
+				current = f.mappings.advanceManagedCatalogScoped(
+					f.prepared,
+					original,
+					managedLifecycleEvidenceHash(current.lifecycle!),
+					transitionManagedLifecycleEvidence(current.lifecycle!, "active_generation_proven", { proven: proof }),
+				);
+				const queryRef = { original, expectedLifecycleHash: managedLifecycleEvidenceHash(current.lifecycle!) };
+				expect(await f.deps.tenantFence!(key, { kind: "active" })).toBe(false);
+				await expect(f.runtime.acquireAttachment(key, 1_000)).rejects.toThrow("fence");
+				await f.runtime.queryCatalog(queryRef, key, "models.list/current", { timeoutMs: 1_000 });
+				expect(f.calls).toEqual(["models.list/current"]);
+				const reserveCleanup = () => {
+					stale.reserveManagedCatalogCleanupScoped(f.prepared, original, queryRef.expectedLifecycleHash, {
+						operationId: "catalog-close",
+						requestKey: "catalog-close-key",
+						payloadHash: "d".repeat(64),
+					});
+				};
+				if (revoke === "dispatch") {
+					await expect(
+						f.runtime.queryCatalog(queryRef, key, "models.list/current", {
+							timeoutMs: 1_000,
+							beforeDispatch: reserveCleanup,
+						}),
+					).rejects.toThrow("fence");
+				} else if (revoke === "response") {
+					controls.afterRequestDispatch = reserveCleanup;
+					await expect(
+						f.runtime.queryCatalog(queryRef, key, "models.list/current", { timeoutMs: 1_000 }),
+					).rejects.toThrow("fence");
+					controls.afterRequestDispatch = undefined;
+				} else if (revoke === "child") {
+					reserveCleanup();
+					expect(f.mappings.provisionalOperationScoped(f.prepared, original.id)!.cleanup).toBeUndefined();
+				} else await f.lease.release();
+				expect(f.deps.catalogFenceSync!(queryRef, key, { kind: "query", name: "models.list/current" })).toBe(false);
+				expect(await f.deps.catalogFence!(queryRef, key, { kind: "query", name: "models.list/current" })).toBe(
+					false,
+				);
+				await expect(
+					f.runtime.queryCatalog(queryRef, key, "models.list/current", { timeoutMs: 1_000 }),
+				).rejects.toThrow("fence");
+				expect(f.calls).toEqual(
+					revoke === "response" ? ["models.list/current", "models.list/current"] : ["models.list/current"],
+				);
+			} finally {
+				stale.close();
+			}
+		} finally {
+			await f.close();
+		}
+	},
+);
+
 test("production fences permit create acknowledgement, proof, prompt and immutable canonical replay", async () => {
 	const f = await fixture();
 	try {

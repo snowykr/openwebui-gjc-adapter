@@ -3,6 +3,11 @@ import * as fs from "node:fs";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+	lifecyclePreparedAuthority,
+	managedLifecycleEvidenceHash,
+	transitionManagedLifecycleEvidence,
+} from "../src/gjc/managed-lifecycle-evidence";
 import { canonicalSessionMappingKey } from "../src/gjc/session-authority";
 import { SessionAuthorityDurabilityError } from "../src/gjc/session-authority-persistence";
 import type { AcknowledgedSuccessor, SessionOperationResult } from "../src/gjc/session-authority-types";
@@ -103,6 +108,66 @@ const publication = (value: ReturnType<typeof replayMapping>) => ({
 });
 
 describe("SessionV3FileBackedMappingStore", () => {
+	test("catalog dispatch snapshots observe another writer without reconciliation or writes", () => {
+		const directory = mkdtempSync(join(tmpdir(), "gjc-v3-catalog-snapshot-"));
+		const filePath = join(directory, "authority.json");
+		const writer = new SessionV3FileBackedMappingStore(filePath);
+		const reader = new SessionV3FileBackedMappingStore(filePath);
+		const prepared = lifecyclePreparedAuthority(authority());
+		const scope = { principalId: prepared.principalId, chatId: prepared.chatId };
+		try {
+			const original = writer.reserveManagedCatalogScoped(scope, {
+				operationId: "catalog",
+				prepared,
+				payloadHash: "a".repeat(64),
+			});
+			let current = writer.advanceManagedCatalogScoped(
+				scope,
+				original,
+				managedLifecycleEvidenceHash(original.lifecycle!),
+				transitionManagedLifecycleEvidence(original.lifecycle!, "invoking"),
+			);
+			current = writer.advanceManagedCatalogScoped(
+				scope,
+				original,
+				managedLifecycleEvidenceHash(current.lifecycle!),
+				transitionManagedLifecycleEvidence(current.lifecycle!, "acknowledged_unproven", {
+					acknowledged: { ...prepared, sessionId: "catalog", generation: 2 },
+				}),
+			);
+			expect(reader.provisionalOperationScoped(scope, original.id)).toBeUndefined();
+			const bytes = readFileSync(filePath),
+				inode = fs.statSync(filePath).ino;
+			const observed = reader.catalogProvisionalSnapshot(scope, original.id)!;
+			expect(observed).toEqual(current);
+			Object.assign(observed.lifecycle!.acknowledged!, { sessionId: "mutated" });
+			expect(reader.catalogProvisionalSnapshot(scope, original.id)).toEqual(current);
+			expect(reader.catalogProvisionalSnapshot({ ...scope, principalId: "foreign" }, original.id)).toBeUndefined();
+			expect(readFileSync(filePath).equals(bytes)).toBe(true);
+			expect(fs.statSync(filePath).ino).toBe(inode);
+			const closing = writer.reserveManagedCatalogCleanupScoped(
+				scope,
+				original,
+				managedLifecycleEvidenceHash(current.lifecycle!),
+				{
+					operationId: "cleanup",
+					requestKey: "cleanup-key",
+					payloadHash: "b".repeat(64),
+				},
+			);
+			expect(reader.catalogProvisionalSnapshot(scope, original.id)).toEqual(closing);
+			expect(reader.catalogProvisionalSnapshot(scope, original.id)!.state).toBe("pending");
+			writeFileSync(filePath, "{}");
+			expect(() => reader.catalogProvisionalSnapshot(scope, original.id)).toThrow("valid canonical V3");
+			reader.close();
+			expect(() => reader.catalogProvisionalSnapshot(scope, original.id)).toThrow("store is closed");
+		} finally {
+			writer.close();
+			reader.close();
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
 	test("retains exact publication receipts and replay events through two project reassignments", () => {
 		const directory = mkdtempSync(join(tmpdir(), "gjc-v3-reassignment-history-"));
 		const filePath = join(directory, "authority.json");

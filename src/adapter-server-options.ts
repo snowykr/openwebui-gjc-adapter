@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import * as path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { createAdapterSessionCloser } from "./adapter-close-options";
 import { type ActiveManagedV3Runtime, startActiveManagedRuntime } from "./adapter-managed-v3-runtime";
 import {
@@ -16,9 +17,12 @@ import { assertResolvedAdapterConfig, loadConfiguredProjects, resolveAdapterConf
 import { buildRuntimeHealthChecks, type RuntimeIsolationDiagnostic } from "./adapter-runtime-health";
 import { type AdapterConfig, loadAdapterConfig, type ResolvedAdapterConfig } from "./config";
 import { SESSION_AUTHORITY_MAPPING_FILE } from "./config-env";
+import { isManagedCatalogProvisional, managedLifecycleEvidenceHash } from "./gjc/managed-lifecycle-evidence";
 import type { ManagedSdkRuntimeDependency, ManagedSdkTenantFence } from "./gjc/managed-sdk-dependency";
 import {
 	type ManagedSdkAccess,
+	type ManagedSdkCatalogAccess,
+	type ManagedSdkCatalogReference,
 	ManagedSdkRuntime,
 	type ManagedSdkRuntimeDeps,
 	type TenantSessionKey,
@@ -210,6 +214,23 @@ export async function buildResolvedAdapterServerOptions(
 			(key =>
 				assertActiveManagedV3TenantFence(key, mappings, workspaceRegistry, projectStore, workspaceLeaseManager));
 		const managedRuntimeDeps: ManagedSdkRuntimeDeps = {
+			catalogFence: async (reference, key, access) => {
+				if (!assertCatalogManagedTenantFence(reference, key, access, mappings, projectStore, workspaceLeaseManager))
+					return false;
+				try {
+					const lease = parseWorkspaceLeaseId(key.leaseId);
+					const workspace = await workspaceRegistry.resolveBySafeKey(lease.safeKey);
+					return (
+						workspace?.userId === key.principalId &&
+						path.resolve(workspace.root) === key.canonicalWorkspace &&
+						assertCatalogManagedTenantFence(reference, key, access, mappings, projectStore, workspaceLeaseManager)
+					);
+				} catch {
+					return false;
+				}
+			},
+			catalogFenceSync: (reference, key, access) =>
+				assertCatalogManagedTenantFence(reference, key, access, mappings, projectStore, workspaceLeaseManager),
 			tenantFence: async (key, access) => {
 				if (access.kind === "retirement") return retirementFence(key, access);
 				if (hasManagedRetirementBarrier(key, mappings)) return false;
@@ -777,6 +798,59 @@ async function assertPreparedManagedTenantFence(
 		)
 			return false;
 		await workspaceLeaseManager.assertFence(lease);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function assertCatalogManagedTenantFence(
+	reference: ManagedSdkCatalogReference,
+	key: TenantSessionKey,
+	access: ManagedSdkCatalogAccess,
+	mappings: V3FileBackedSessionMappingStore,
+	projectStore: SqliteProjectRegistrationStore | undefined,
+	workspaceLeaseManager: ReturnType<typeof createWorkspaceLeaseManager>,
+): boolean {
+	try {
+		const original = reference.original;
+		if (
+			!isManagedCatalogProvisional(original) ||
+			original.purpose !== "model-catalog" ||
+			original.state !== "pending" ||
+			original.lifecycle?.state !== "intent_prepared" ||
+			original.cleanup !== undefined ||
+			original.lateCreateAcknowledgement !== undefined ||
+			key.epoch !== SESSION_AUTHORITY_V3_EPOCH ||
+			projectStore?.getProject(key.projectId)?.status !== "linked" ||
+			(access.kind !== "proof" &&
+				(access.kind !== "query" ||
+					!["models.list/current", "providers.list/active", "session.state"].includes(access.name)))
+		)
+			return false;
+		const current = mappings.catalogProvisionalSnapshot(key, original.id);
+		const evidence = current?.lifecycle;
+		if (
+			current === undefined ||
+			current.state !== "pending" ||
+			current.cleanup !== undefined ||
+			current.lateCreateAcknowledgement !== undefined ||
+			evidence === undefined ||
+			evidence.state !== (access.kind === "proof" ? "acknowledged_unproven" : "active_generation_proven") ||
+			managedLifecycleEvidenceHash(evidence) !== reference.expectedLifecycleHash ||
+			current.id !== original.id ||
+			current.ingressId !== original.ingressId ||
+			current.startedAt !== original.startedAt ||
+			current.projectId !== original.projectId ||
+			current.detail !== original.detail ||
+			!isDeepStrictEqual(evidence.preparedAuthority, original.lifecycle!.preparedAuthority) ||
+			evidence.requestHash !== original.lifecycle!.requestHash ||
+			!isDeepStrictEqual(evidence.target, original.lifecycle!.target) ||
+			evidence.acknowledged === undefined ||
+			!Object.entries(key).every(([field, value]) => Reflect.get(evidence.acknowledged!, field) === value)
+		)
+			return false;
+		workspaceLeaseManager.assertFenceSync(parseWorkspaceLeaseId(key.leaseId));
 		return true;
 	} catch {
 		return false;

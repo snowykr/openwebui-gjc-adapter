@@ -3,16 +3,21 @@ import type { lifecycle, router } from "@gajae-code/coding-agent/sdk";
 import {
 	createManagedLifecycleEvidence,
 	type ManagedHistoricalSavedSession,
+	managedLifecycleEvidenceHash,
 	transitionManagedLifecycleEvidence,
 } from "../src/gjc/managed-lifecycle-evidence";
 import {
 	type ManagedSdkAccess,
+	type ManagedSdkCatalogAccess,
+	type ManagedSdkCatalogQueryOptions,
+	type ManagedSdkCatalogReference,
 	type ManagedSdkHistoricalSelection,
 	type ManagedSdkLifecycleOperation,
 	ManagedSdkRuntime,
 	type ManagedSdkRuntimeDeps,
 	type TenantSessionKey,
 } from "../src/gjc/managed-sdk-runtime";
+import type { ProvisionalSessionOperation } from "../src/gjc/session-authority-types";
 import type { ManagedPreparedTurnAuthority } from "../src/gjc/turn-runner";
 import { acquireWorkspaceAdmission } from "../src/live/chat-completions";
 import { createManagedModelReaderFactory } from "../src/live/gjc-managed-model-reader";
@@ -190,6 +195,9 @@ function fixture(
 		preparedFence?: ManagedSdkRuntimeDeps["preparedTenantFence"];
 		historicalSelectionFence?: ManagedSdkRuntimeDeps["historicalSelectionFence"];
 		historicalResumeFence?: ManagedSdkRuntimeDeps["historicalResumeFence"];
+		catalogFence?: ManagedSdkRuntimeDeps["catalogFence"];
+		catalogFenceSync?: ManagedSdkRuntimeDeps["catalogFenceSync"];
+		beforeRouterDispatch?: () => Promise<void>;
 		omitTenantFence?: boolean;
 		omitPreparedFence?: boolean;
 		request?: () => Promise<Record<string, unknown>>;
@@ -227,6 +235,13 @@ function fixture(
 	const listCalls: ListRequest[] = [];
 	const historicalResumeCalls: HistoricalResumeRequest[] = [];
 	const statusCalls: Array<{ sessionId: string; generation: number }> = [];
+	const routerRequests: Array<{
+		sessionId: string;
+		frame: Record<string, unknown>;
+		generation: number;
+		expected: router.SessionAttachment;
+		timeoutMs?: number;
+	}> = [];
 	let currentAttachment = attachment;
 	const lifecycleService: Pick<
 		LifecycleService,
@@ -306,9 +321,21 @@ function fixture(
 			_frame: Record<string, unknown>,
 			_generation: number,
 			_expected: router.SessionAttachment,
-			requestOptions?: { beforeDispatch?: (context: never) => void; onDispatch?: (context: never) => void },
+			requestOptions?: {
+				timeoutMs?: number;
+				beforeDispatch?: (context: never) => void;
+				onDispatch?: (context: never) => void;
+			},
 		) {
+			if (options.beforeRouterDispatch !== undefined) await options.beforeRouterDispatch();
 			requestOptions?.beforeDispatch?.({} as never);
+			routerRequests.push({
+				sessionId: _sessionId,
+				frame: _frame,
+				generation: _generation,
+				expected: _expected,
+				timeoutMs: requestOptions?.timeoutMs,
+			});
 			calls.push("request");
 			requestOptions?.onDispatch?.({} as never);
 			if (options.request !== undefined) return await options.request();
@@ -340,6 +367,8 @@ function fixture(
 			...(options.omitPreparedFence ? {} : { preparedTenantFence: options.preparedFence ?? (() => true) }),
 			historicalSelectionFence: options.historicalSelectionFence,
 			historicalResumeFence: options.historicalResumeFence,
+			catalogFence: options.catalogFence,
+			catalogFenceSync: options.catalogFenceSync,
 			...(options.drainTimeoutMs === undefined ? {} : { drainTimeoutMs: options.drainTimeoutMs }),
 			...(options.maxFrames === undefined ? {} : { maxFramesPerSubscription: options.maxFrames }),
 		},
@@ -357,6 +386,7 @@ function fixture(
 		listCalls,
 		historicalResumeCalls,
 		statusCalls,
+		routerRequests,
 		replaceAttachment() {
 			currentAttachment = foreignAttachment;
 		},
@@ -389,7 +419,751 @@ function invokeExternal(
 		: runtime.createExternalLifecycleSession(tenant, { ...request, ...readiness }, timeoutMs);
 }
 
+function catalogReference(
+	phase: "acknowledged_unproven" | "active_generation_proven" = "acknowledged_unproven",
+): ManagedSdkCatalogReference {
+	const original: ProvisionalSessionOperation = {
+		id: "catalog-1",
+		ingressId: "catalog-ingress-1",
+		purpose: "model-catalog",
+		kind: "create",
+		state: "pending",
+		chatId: tenant.chatId,
+		projectId: tenant.projectId,
+		startedAt: "2026-01-01T00:00:00.000Z",
+		detail: "a".repeat(64),
+		lifecycle: createManagedLifecycleEvidence(
+			{
+				operation: "session.create",
+				preparedAuthority: preparedAuthority(),
+				target: { kind: "existing_path", path: tenant.canonicalWorkspace },
+				payloadHash: "a".repeat(64),
+			},
+			"2026-01-01T00:00:00.000Z",
+		),
+	};
+	const acknowledged = transitionManagedLifecycleEvidence(
+		transitionManagedLifecycleEvidence(original.lifecycle!, "invoking", {}, "2026-01-01T00:00:01.000Z"),
+		"acknowledged_unproven",
+		{ acknowledged: { ...tenant, requestKey: preparedAuthority().requestKey } },
+		"2026-01-01T00:00:02.000Z",
+	);
+	const current =
+		phase === "acknowledged_unproven"
+			? acknowledged
+			: transitionManagedLifecycleEvidence(
+					acknowledged,
+					"active_generation_proven",
+					{
+						proven: {
+							kind: "managed-generation",
+							sessionId: tenant.sessionId,
+							generation: tenant.generation,
+							leaseId: tenant.leaseId,
+							epoch: tenant.epoch,
+						},
+					},
+					"2026-01-01T00:00:03.000Z",
+				);
+	return { original, expectedLifecycleHash: managedLifecycleEvidenceHash(current) };
+}
+
 describe("managed SDK runtime", () => {
+	test.each(["proof-reconcile", "proof-return", "query-return"] as const)(
+		"catalog %s rechecks synchronous authority after successful async validation",
+		async boundary => {
+			let granted = true;
+			let validations = 0;
+			const f = fixture({
+				catalogFence: async () => {
+					const admitted = granted;
+					validations += 1;
+					if (validations === (boundary === "proof-return" ? 3 : 2))
+						queueMicrotask(() => {
+							granted = false;
+						});
+					return admitted;
+				},
+				catalogFenceSync: () => granted,
+			});
+			await f.runtime.start();
+			try {
+				if (boundary === "query-return") {
+					f.runtime.registerTenant(tenant);
+					await expect(
+						f.runtime.queryCatalog(catalogReference("active_generation_proven"), tenant, "session.state", {
+							timeoutMs: 500,
+						}),
+					).rejects.toThrow("fence");
+					expect(f.routerRequests).toHaveLength(1);
+				} else {
+					await expect(f.runtime.proveCatalogSession(catalogReference(), tenant, 500)).rejects.toThrow("fence");
+					expect(f.calls.filter(call => call === "reconcile")).toHaveLength(
+						boundary === "proof-reconcile" ? 0 : 1,
+					);
+				}
+			} finally {
+				await f.runtime.dispose();
+			}
+		},
+	);
+
+	test("catalog proof returns only data and three closed queries never grant active tokens", async () => {
+		const proofRef = catalogReference(),
+			queryRef = catalogReference("active_generation_proven");
+		const accesses: ManagedSdkCatalogAccess[] = [];
+		let activeCalls = 0;
+		const result = { type: "query_response", ok: true, page: { items: [], complete: true } };
+		const f = fixture({
+			fence: () => {
+				activeCalls += 1;
+				return false;
+			},
+			preparedFence: () => {
+				activeCalls += 1;
+				return false;
+			},
+			catalogFence: async (ref, key, access) => {
+				accesses.push(access);
+				expect(Object.isFrozen(ref.original.lifecycle!.preparedAuthority)).toBe(true);
+				expect(Object.isFrozen(key)).toBe(true);
+				expect(Object.isFrozen(access)).toBe(true);
+				expect(ref).toEqual(access.kind === "proof" ? proofRef : queryRef);
+				expect(key).toEqual(tenant);
+				return true;
+			},
+			catalogFenceSync: (ref, key, access) => {
+				expect(ref).toEqual(access.kind === "proof" ? proofRef : queryRef);
+				expect(key).toEqual(tenant);
+				if (access.kind === "query")
+					expect(["models.list/current", "providers.list/active", "session.state"]).toContain(access.name);
+				return true;
+			},
+			request: async () => result,
+		});
+		await f.runtime.start();
+		const proof = await f.runtime.proveCatalogSession(proofRef, tenant, 500);
+		expect(proof).toEqual({
+			kind: "managed-generation",
+			sessionId: tenant.sessionId,
+			generation: tenant.generation,
+			leaseId: tenant.leaseId,
+			epoch: tenant.epoch,
+		});
+		expect(Object.keys(proof).sort()).toEqual(["epoch", "generation", "kind", "leaseId", "sessionId"]);
+		expect(f.calls).toEqual(["start", "reconcile"]);
+		for (const query of ["models.list/current", "providers.list/active", "session.state"] as const) {
+			expect(
+				await f.runtime.queryCatalog(queryRef, tenant, query, {
+					timeoutMs: 500,
+					...(query === "session.state" ? {} : { cursor: "opaque-page-2" }),
+				}),
+			).toBe(result);
+			expect(f.routerRequests.at(-1)).toMatchObject({
+				sessionId: tenant.sessionId,
+				generation: tenant.generation,
+				expected: f.attachment,
+				frame: {
+					type: "query_request",
+					query,
+					input: {},
+					...(query === "session.state" ? {} : { cursor: "opaque-page-2" }),
+				},
+			});
+			if (query === "session.state") expect(f.routerRequests.at(-1)!.frame).not.toHaveProperty("cursor");
+			expect(f.routerRequests.at(-1)!.timeoutMs).toBeGreaterThan(0);
+			expect(f.routerRequests.at(-1)!.timeoutMs!).toBeLessThanOrEqual(500);
+		}
+		expect(accesses.filter(access => access.kind === "proof")).toHaveLength(3);
+		expect(accesses.filter(access => access.kind === "query")).toHaveLength(6);
+		expect(activeCalls).toBe(0);
+		await expect(f.runtime.acquireAttachment(tenant)).rejects.toThrow("fence was lost");
+		const forged = { tenant, generation: tenant.generation, isCurrent: () => true };
+		await expect(f.runtime.request(forged, { type: "control_request", operation: "turn.prompt" })).rejects.toThrow(
+			"fence was lost",
+		);
+		expect(() => f.runtime.subscribeFrames(forged, "turn", { commandId: "command" }, () => {})).toThrow(
+			"Manager-issued",
+		);
+		expect(() => f.runtime.prepareFrameSubscription(forged, "turn", () => {})).toThrow("Manager-issued");
+		expect(f.createCalls).toEqual([]);
+		expect(f.closeCalls).toEqual([]);
+		expect(f.listCalls).toEqual([]);
+		expect(f.statusCalls).toEqual([]);
+		await f.runtime.dispose();
+	});
+
+	test.each(["missing-async", "missing-sync", "denied"] as const)(
+		"catalog query denies %s dedicated fencing despite active/prepared grants",
+		async mode => {
+			const f = fixture({
+				catalogFence: mode === "missing-async" ? undefined : async () => mode !== "denied",
+				catalogFenceSync: mode === "missing-sync" ? undefined : () => true,
+			});
+			await f.runtime.start();
+			await expect(f.runtime.proveCatalogSession(catalogReference(), tenant)).rejects.toThrow("authority fence");
+			f.runtime.registerTenant(tenant);
+			await expect(
+				f.runtime.queryCatalog(catalogReference("active_generation_proven"), tenant, "session.state", {
+					timeoutMs: 500,
+				}),
+			).rejects.toThrow("fence");
+			expect(f.routerRequests).toEqual([]);
+			expect(f.createCalls).toEqual([]);
+			await f.runtime.dispose();
+		},
+	);
+
+	test("catalog accepts canonical scoped reservation identity with declared undefined optional values", async () => {
+		const ref = catalogReference();
+		const original: ProvisionalSessionOperation = {
+			...ref.original,
+			chatId: JSON.stringify([tenant.principalId, tenant.chatId]),
+			sessionId: undefined,
+			sessionFile: undefined,
+			managedAuthority: undefined,
+			historicalBinding: undefined,
+			cleanup: undefined,
+			lateCreateAcknowledgement: undefined,
+			result: undefined,
+		};
+		const f = fixture({
+			catalogFence: async snapshot => {
+				expect(snapshot.original).toEqual(original);
+				expect(snapshot.expectedLifecycleHash).not.toBe(managedLifecycleEvidenceHash(original.lifecycle!));
+				return true;
+			},
+			catalogFenceSync: () => true,
+		});
+		await f.runtime.start();
+		await expect(f.runtime.proveCatalogSession({ ...ref, original }, tenant)).resolves.toMatchObject({
+			kind: "managed-generation",
+		});
+		await f.runtime.queryCatalog({ ...ref, original }, tenant, "session.state", { timeoutMs: 500 });
+		expect(f.routerRequests).toHaveLength(1);
+		Reflect.set(original, "unknown", undefined);
+		await expect(f.runtime.proveCatalogSession({ ...ref, original }, tenant)).rejects.toThrow();
+		await f.runtime.dispose();
+	});
+
+	test("catalog rejects malformed reservation, scope, current hash, children and passive evidence before ownership effects", async () => {
+		let fences = 0;
+		const f = fixture({
+			catalogFence: async () => {
+				fences += 1;
+				return true;
+			},
+			catalogFenceSync: () => true,
+		});
+		await f.runtime.start();
+		const mutations: Array<(ref: ManagedSdkCatalogReference) => void> = [
+			ref => {
+				Reflect.set(ref, "expectedLifecycleHash", "x".repeat(64));
+			},
+			ref => {
+				Reflect.set(ref, "expectedLifecycleHash", "a".repeat(63));
+			},
+			ref => {
+				Reflect.set(ref, "admissionHash", "a".repeat(64));
+			},
+			ref => {
+				Reflect.deleteProperty(ref.original, "purpose");
+			},
+			ref => {
+				Reflect.set(ref.original, "purpose", "serving");
+			},
+			ref => {
+				Reflect.set(ref.original, "kind", "close");
+			},
+			ref => {
+				Reflect.set(ref.original, "state", "uncertain");
+			},
+			ref => {
+				Reflect.set(ref.original, "id", "");
+			},
+			ref => {
+				Reflect.set(ref.original, "ingressId", "bad\nidentity");
+			},
+			ref => {
+				Reflect.set(ref.original, "startedAt", "invalid");
+			},
+			ref => {
+				Reflect.set(ref.original, "detail", "b".repeat(64));
+			},
+			ref => {
+				Reflect.set(ref.original, "projectId", "other");
+			},
+			ref => {
+				Reflect.set(ref.original, "chatId", "other");
+			},
+			ref => {
+				Reflect.set(ref.original, "cleanup", {});
+			},
+			ref => {
+				Reflect.set(ref.original, "lateCreateAcknowledgement", {});
+			},
+			ref => {
+				Reflect.set(ref.original, "lateLifecycleAcknowledgement", {});
+			},
+			ref => {
+				Reflect.set(ref.original, "managedAuthority", { ...tenant, requestKey: "key" });
+			},
+			ref => {
+				Reflect.set(ref.original, "historicalBinding", historicalSelection().historicalBinding);
+			},
+			ref => {
+				Reflect.set(ref.original, "sessionId", tenant.sessionId);
+			},
+			ref => {
+				Reflect.set(ref.original, "result", {});
+			},
+			ref => {
+				Reflect.set(ref.original, "completedAt", "2026-01-01T00:00:01.000Z");
+			},
+			ref => {
+				Reflect.set(ref.original, "attachment", {});
+			},
+			ref => {
+				Reflect.set(ref.original.lifecycle!, "state", "invoking");
+			},
+			ref => {
+				Reflect.set(ref.original.lifecycle!.target, "path", "/foreign");
+			},
+		];
+		for (const mutate of mutations) {
+			const ref = catalogReference();
+			mutate(ref);
+			await expect(f.runtime.proveCatalogSession(ref, tenant)).rejects.toThrow();
+			await expect(f.runtime.queryCatalog(ref, tenant, "session.state", { timeoutMs: 500 })).rejects.toThrow();
+		}
+		for (const field of ["principalId", "projectId", "canonicalWorkspace", "chatId", "leaseId", "epoch"] as const) {
+			const key = { ...tenant, [field]: "foreign" };
+			await expect(f.runtime.proveCatalogSession(catalogReference(), key)).rejects.toThrow();
+		}
+		await expect(f.runtime.proveCatalogSession(catalogReference(), { ...tenant, generation: 0 })).rejects.toThrow();
+		expect(fences).toBe(0);
+		expect(f.calls).toEqual(["start"]);
+		await f.runtime.dispose();
+	});
+
+	test("catalog query accepts no arbitrary names, frames, malformed cursor or undeclared options", async () => {
+		const f = fixture({ catalogFence: async () => true, catalogFenceSync: () => true });
+		await f.runtime.start();
+		const ref = catalogReference();
+		for (const invalid of ["turn.prompt", "models.list", "providers.list", "session.close", "", undefined]) {
+			const query = { name: "session.state" as const };
+			Reflect.set(query, "name", invalid);
+			await expect(f.runtime.queryCatalog(ref, tenant, query.name, { timeoutMs: 500 })).rejects.toThrow(
+				"query name",
+			);
+		}
+		for (const cursor of ["", " ", " padded", "padded ", "bad\nvalue", 1, {}, null]) {
+			const options: ManagedSdkCatalogQueryOptions = { timeoutMs: 500 };
+			Reflect.set(options, "cursor", cursor);
+			await expect(f.runtime.queryCatalog(ref, tenant, "session.state", options)).rejects.toThrow("cursor");
+		}
+		for (const field of ["frame", "input", "operation", "onDispatch", "access"]) {
+			const options = { timeoutMs: 500, [field]: {} };
+			await expect(f.runtime.queryCatalog(ref, tenant, "session.state", options)).rejects.toThrow(
+				"declared options",
+			);
+		}
+		const missing = { timeoutMs: 500 };
+		Reflect.deleteProperty(missing, "timeoutMs");
+		await expect(f.runtime.queryCatalog(ref, tenant, "session.state", missing)).rejects.toThrow(
+			"explicit logical timeout",
+		);
+		expect(f.routerRequests).toEqual([]);
+		await f.runtime.dispose();
+	});
+
+	test.each(["proof", "query"] as const)(
+		"catalog %s owner rejects wrong current hash and exact acknowledged generation",
+		async kind => {
+			const expected = catalogReference();
+			const f = fixture({
+				catalogFence: async (ref, key) =>
+					ref.expectedLifecycleHash === expected.expectedLifecycleHash &&
+					key.sessionId === tenant.sessionId &&
+					key.generation === tenant.generation,
+				catalogFenceSync: () => true,
+			});
+			await f.runtime.start();
+			f.runtime.registerTenant(tenant);
+			const invoke = (ref: ManagedSdkCatalogReference, key: TenantSessionKey) =>
+				kind === "proof"
+					? f.runtime.proveCatalogSession(ref, key)
+					: f.runtime.queryCatalog(ref, key, "session.state", { timeoutMs: 500 });
+			for (const key of [
+				{ ...tenant, sessionId: "foreign" },
+				{ ...tenant, generation: 8 },
+			])
+				await expect(invoke(expected, key)).rejects.toThrow("Catalog authority fence");
+			await expect(invoke({ ...expected, expectedLifecycleHash: "f".repeat(64) }, tenant)).rejects.toThrow(
+				"Catalog authority fence",
+			);
+			expect(f.calls).toEqual(["start"]);
+			await f.runtime.dispose();
+		},
+	);
+
+	test.each(["proof", "query"] as const)(
+		"catalog %s rechecks child/hash revocation after an awaited effect before disclosure",
+		async kind => {
+			let granted = true;
+			const entered = deferred<void>(),
+				release = deferred<void>();
+			const effect = async () => {
+				entered.resolve();
+				await release.promise;
+			};
+			const f = fixture({
+				catalogFence: async () => granted,
+				catalogFenceSync: () => granted,
+				reconcile: effect,
+				request: async () => {
+					await effect();
+					return { secret: "must-not-disclose" };
+				},
+			});
+			await f.runtime.start();
+			f.runtime.registerTenant(tenant);
+			const result = (
+				kind === "proof"
+					? f.runtime.proveCatalogSession(catalogReference(), tenant)
+					: f.runtime.queryCatalog(catalogReference("active_generation_proven"), tenant, "session.state", {
+							timeoutMs: 500,
+						})
+			).catch(error => error);
+			await entered.promise;
+			granted = false;
+			release.resolve();
+			expect(await result).toBeInstanceOf(Error);
+			expect(f.calls.filter(call => call === (kind === "proof" ? "reconcile" : "request"))).toHaveLength(1);
+			await f.runtime.dispose();
+		},
+	);
+
+	test.each(["router-await", "caller-hook"] as const)(
+		"catalog synchronous fence rejects child/hash changes during %s before dispatch",
+		async seam => {
+			let currentHash = catalogReference().expectedLifecycleHash;
+			const ref = { ...catalogReference(), expectedLifecycleHash: currentHash };
+			const entered = deferred<void>(),
+				release = deferred<void>();
+			const f = fixture({
+				catalogFence: async () => true,
+				catalogFenceSync: snapshot => snapshot.expectedLifecycleHash === currentHash,
+				beforeRouterDispatch:
+					seam === "router-await"
+						? async () => {
+								entered.resolve();
+								await release.promise;
+							}
+						: undefined,
+			});
+			await f.runtime.start();
+			f.runtime.registerTenant(tenant);
+			const result = f.runtime
+				.queryCatalog(ref, tenant, "session.state", {
+					timeoutMs: 500,
+					beforeDispatch: () => {
+						if (seam === "caller-hook") currentHash = "f".repeat(64);
+					},
+				})
+				.catch(error => error);
+			if (seam === "router-await") {
+				await entered.promise;
+				currentHash = "f".repeat(64);
+				release.resolve();
+			}
+			expect(await result).toBeInstanceOf(Error);
+			expect(f.routerRequests).toEqual([]);
+			expect(f.calls).not.toContain("request");
+			await f.runtime.dispose();
+		},
+	);
+
+	test("catalog snapshots reference/tenant/options and binds the original caller hook receiver before await", async () => {
+		const entered = deferred<void>(),
+			release = deferred<boolean>();
+		const ref = catalogReference("active_generation_proven"),
+			expected = structuredClone(ref),
+			key = { ...tenant };
+		let fences = 0,
+			called = 0;
+		const snapshots: ManagedSdkCatalogReference[] = [];
+		const f = fixture({
+			catalogFence: async (snapshot, held) => {
+				snapshots.push(snapshot);
+				expect(held).toEqual(tenant);
+				if (++fences === 1) {
+					entered.resolve();
+					return release.promise;
+				}
+				return true;
+			},
+			catalogFenceSync: snapshot => {
+				expect(snapshot).toEqual(expected);
+				return true;
+			},
+		});
+		await f.runtime.start();
+		f.runtime.registerTenant(tenant);
+		const options: ManagedSdkCatalogQueryOptions = {
+			timeoutMs: 500,
+			cursor: "original",
+			beforeDispatch() {
+				expect(this).toBe(options);
+				called += 1;
+			},
+		};
+		const result = f.runtime.queryCatalog(ref, key, "session.state", options);
+		await entered.promise;
+		Reflect.set(ref, "expectedLifecycleHash", "f".repeat(64));
+		Reflect.set(ref.original.lifecycle!.preparedAuthority, "leaseId", "other");
+		key.sessionId = "foreign";
+		Reflect.set(options, "cursor", "changed");
+		Reflect.set(options, "timeoutMs", 1);
+		Reflect.set(options, "beforeDispatch", () => {
+			throw new Error("replacement hook");
+		});
+		release.resolve(true);
+		await result;
+		expect(called).toBe(1);
+		expect(snapshots[0]).toEqual(expected);
+		expect(snapshots[1]).toBe(snapshots[0]);
+		expect(f.routerRequests[0]!.frame.cursor).toBe("original");
+		expect(f.routerRequests[0]!.sessionId).toBe(tenant.sessionId);
+		await f.runtime.dispose();
+	});
+
+	test.each(["lease", "attachment", "budget", "throw"] as const)(
+		"catalog rechecks dispatch authority after caller hook changes %s",
+		async changed => {
+			const f = fixture({ catalogFence: async () => true, catalogFenceSync: () => true });
+			await f.runtime.start();
+			f.runtime.registerTenant(tenant);
+			let now = performance.now();
+			const clock = spyOn(performance, "now").mockImplementation(() => now);
+			const failure = new Error("caller dispatch rejected");
+			try {
+				const outcome = await f.runtime
+					.queryCatalog(catalogReference(), tenant, "session.state", {
+						timeoutMs: 500,
+						beforeDispatch: () => {
+							if (changed === "lease") {
+								f.runtime.unregisterTenant(tenant);
+								f.runtime.registerTenant(tenant);
+							}
+							if (changed === "attachment") f.replaceAttachment();
+							if (changed === "budget") now += 501;
+							if (changed === "throw") throw failure;
+						},
+					})
+					.catch(error => error);
+				if (changed === "throw") expect(outcome).toBe(failure);
+				else expect(outcome).toBeInstanceOf(Error);
+				expect(f.routerRequests).toEqual([]);
+				expect(f.calls).not.toContain("request");
+			} finally {
+				clock.mockRestore();
+				await f.runtime.dispose();
+			}
+		},
+	);
+
+	test("catalog query retains the same shrinking budget across async admission and Router dispatch", async () => {
+		let now = performance.now();
+		const clock = spyOn(performance, "now").mockImplementation(() => now);
+		let fences = 0;
+		const f = fixture({
+			catalogFence: async () => {
+				if (++fences === 1) now += 200;
+				return true;
+			},
+			catalogFenceSync: () => true,
+		});
+		try {
+			await f.runtime.start();
+			f.runtime.registerTenant(tenant);
+			await f.runtime.queryCatalog(catalogReference(), tenant, "session.state", { timeoutMs: 500 });
+			expect(f.routerRequests[0]!.timeoutMs).toBe(300);
+			expect(fences).toBe(2);
+		} finally {
+			clock.mockRestore();
+			await f.runtime.dispose();
+		}
+	});
+
+	test.each(["proof", "query"] as const)(
+		"catalog %s rejects registration ABA and raw replacement after awaiting authority",
+		async kind => {
+			for (const replacement of ["registration", "raw"] as const) {
+				const entered = deferred<void>(),
+					release = deferred<void>();
+				const effect = async () => {
+					entered.resolve();
+					await release.promise;
+				};
+				const f = fixture({
+					catalogFence: async () => true,
+					catalogFenceSync: () => true,
+					reconcile: effect,
+					request: async () => {
+						await effect();
+						return { ok: true };
+					},
+				});
+				await f.runtime.start();
+				f.runtime.registerTenant(tenant);
+				const result = (
+					kind === "proof"
+						? f.runtime.proveCatalogSession(catalogReference(), tenant)
+						: f.runtime.queryCatalog(catalogReference(), tenant, "session.state", { timeoutMs: 500 })
+				).catch(error => error);
+				await entered.promise;
+				if (replacement === "registration") {
+					f.runtime.unregisterTenant(tenant);
+					f.runtime.registerTenant(tenant);
+				} else {
+					if (kind === "proof") Reflect.set(f.foreignAttachment, "generation", 8);
+					f.replaceAttachment();
+				}
+				release.resolve();
+				expect(await result).toBeInstanceOf(Error);
+				await f.runtime.dispose();
+			}
+		},
+	);
+
+	test.each(["proof", "query"] as const)(
+		"catalog %s pending authorization honors the original timeout without raw effects",
+		async kind => {
+			const entered = deferred<void>(),
+				release = deferred<boolean>();
+			const f = fixture({
+				catalogFence: async () => {
+					entered.resolve();
+					return release.promise;
+				},
+				catalogFenceSync: () => true,
+			});
+			await f.runtime.start();
+			f.runtime.registerTenant(tenant);
+			const result = (
+				kind === "proof"
+					? f.runtime.proveCatalogSession(catalogReference(), tenant, 15)
+					: f.runtime.queryCatalog(catalogReference(), tenant, "session.state", { timeoutMs: 15 })
+			).catch(error => error);
+			await entered.promise;
+			expect(await result).toMatchObject({ code: "timeout" });
+			release.resolve(true);
+			await f.runtime.dispose();
+			expect(f.calls).toEqual(["start", "stop"]);
+		},
+	);
+
+	test("catalog proof queues behind the retained raw reconcile without restarting its deadline", async () => {
+		const entered = deferred<void>(),
+			release = deferred<void>();
+		let reconciles = 0;
+		const f = fixture({
+			catalogFence: async () => true,
+			catalogFenceSync: () => true,
+			reconcile: async () => {
+				if (++reconciles === 1) {
+					entered.resolve();
+					await release.promise;
+				}
+			},
+		});
+		await f.runtime.start();
+		const prior = f.runtime.reconcile(15).catch(error => error);
+		await entered.promise;
+		expect(await prior).toMatchObject({ code: "timeout" });
+		await expect(f.runtime.proveCatalogSession(catalogReference(), tenant, 15)).rejects.toMatchObject({
+			code: "timeout",
+		});
+		expect(reconciles).toBe(1);
+		const admitted = f.runtime.proveCatalogSession(catalogReference(), tenant, 500);
+		release.resolve();
+		await admitted;
+		expect(reconciles).toBe(2);
+		await f.runtime.dispose();
+	});
+
+	test.each(["proof", "query"] as const)(
+		"catalog %s retains timed-out raw work in producer scope and disposal",
+		async kind => {
+			const entered = deferred<void>(),
+				release = deferred<void>();
+			const effect = async () => {
+				entered.resolve();
+				await release.promise;
+			};
+			const f = fixture({
+				drainTimeoutMs: 50,
+				catalogFence: async () => true,
+				catalogFenceSync: () => true,
+				reconcile: effect,
+				request: async () => {
+					await effect();
+					return { ok: true };
+				},
+			});
+			await f.runtime.start();
+			f.runtime.registerTenant(tenant);
+			const scope = f.runtime.createProducerScope();
+			let scoped = false,
+				disposed = false;
+			const result = scope
+				.run(async () =>
+					kind === "proof"
+						? await f.runtime.proveCatalogSession(catalogReference(), tenant, 15)
+						: await f.runtime.queryCatalog(catalogReference(), tenant, "session.state", { timeoutMs: 15 }),
+				)
+				.catch(error => error);
+			await entered.promise;
+			expect(await result).toMatchObject({ code: "timeout" });
+			void scope.seal().then(() => {
+				scoped = true;
+			});
+			const timers: (() => void)[] = [];
+			const nativeSetTimeout = globalThis.setTimeout;
+			const timer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void) => {
+				timers.push(callback);
+				const handle = nativeSetTimeout(() => {}, 0);
+				clearTimeout(handle);
+				return handle;
+			}) as typeof setTimeout);
+			const clock = spyOn(performance, "now").mockReturnValue(performance.now());
+			try {
+				const disposal = f.runtime.dispose().then(() => {
+					disposed = true;
+				});
+				timers[0]!();
+				for (let i = 0; i < 30 && !f.calls.includes("stop"); i++) await Promise.resolve();
+				expect(f.calls).toContain("stop");
+				timers[1]!();
+				await expect(f.runtime.stop()).rejects.toMatchObject({ code: "drain_timeout" });
+				expect(scoped).toBe(false);
+				expect(disposed).toBe(false);
+				release.resolve();
+				await disposal;
+				await scope.settled;
+				expect(scoped).toBe(true);
+				expect(disposed).toBe(true);
+				expect(f.calls.filter(call => call === (kind === "proof" ? "reconcile" : "request"))).toHaveLength(1);
+				expect(await result).toMatchObject({ code: "timeout" });
+			} finally {
+				release.resolve();
+				timer.mockRestore();
+				clock.mockRestore();
+			}
+		},
+	);
+
 	test("runtime disposal retains finite local scope producers but not idle scope lifetime", async () => {
 		const f = fixture({ drainTimeoutMs: 50 });
 		await f.runtime.start();

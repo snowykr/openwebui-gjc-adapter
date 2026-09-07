@@ -413,6 +413,21 @@ export class V3FileBackedSessionMappingStore extends SessionMappingStore {
 	get epoch(): string {
 		return this.authorityEpoch;
 	}
+	/** A dispatch fence reads current canonical bytes, never a different writer's stale in-memory view. */
+	catalogProvisionalSnapshot(
+		scope: { readonly principalId: string; readonly chatId: string },
+		operationId: string,
+	): ProvisionalSessionOperation | undefined {
+		if (this.#authority.closed) throw new Error("Session authority store is closed.");
+		const key = canonicalSessionMappingKey(scope.principalId, scope.chatId);
+		const document = parseSessionAuthorityV3Document(readFileSync(this.#authority.filePath));
+		if (document === undefined) throw new Error("Catalog admission requires valid canonical V3 authority.");
+		const candidates = document.provisionalOperations.filter(
+			operation => operation.chatId === key && operation.purpose === "model-catalog" && operation.id === operationId,
+		);
+		const operation = candidates.length === 1 ? candidates[0] : undefined;
+		return operation === undefined ? undefined : { ...fromV3Provisional(operation), chatId: scope.chatId };
+	}
 	bootstrapStage(access: SessionAuthorityV3BootstrapAccess): SessionAuthorityV3BootstrapStage {
 		const path = this.#authority.filePath;
 		const assertCurrent = () => assertBootstrapAccessCurrent(access, path);
